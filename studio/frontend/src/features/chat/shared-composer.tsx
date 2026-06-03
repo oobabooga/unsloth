@@ -615,6 +615,7 @@ export function SharedComposer({
         ? true
         : !(supportsTools || supportsBuiltinCodeExecution))) ||
     imageModeDisablesCode;
+  const mcpDisabled = modelLoaded && !supportsTools;
   // Images pill is only ever lit on OpenAI cloud's Responses-API models
   // and Gemini Nano Banana family. No local tool runtime fallback.
   const showImagePill = supportsBuiltinImageGeneration;
@@ -1230,7 +1231,7 @@ export function SharedComposer({
                 {artifactsEnabled ? <CheckIcon className="ml-auto" /> : null}
               </DropdownMenuItem>
               <DropdownMenuItem
-                disabled={!supportsTools}
+                disabled={mcpDisabled}
                 className={
                   mcpEnabledForChat ? "text-primary font-medium" : undefined
                 }

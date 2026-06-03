@@ -217,10 +217,13 @@ export function ChatMcpServersDialog({
   useEffect(() => {
     if (!open) return;
     refresh();
-    // Land on the create form when opened via "Add custom MCP".
+    // view isn't reset on close, so a form left open mid-create/edit would
+    // otherwise reappear on next open; pin back to the list when not adding.
     if (openToCreate) {
       setView({ kind: "create" });
       setForm(EMPTY_FORM);
+    } else {
+      setView({ kind: "list" });
     }
   }, [open, openToCreate, refresh]);
 
