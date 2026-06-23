@@ -78,20 +78,13 @@ jobs:
                   f"budget {budget} != 0.85 * working_set {int(ws * _APPLE_UNIFIED_MEMORY_FRACTION)}"
 
               # Demonstrate the cap end-to-end against this runner's REAL budget.
-              # Size the model to ~40% of the budget so the KV-cap path runs
+              # Stub the KV estimator (it has its own unit tests) at ~64 KB/token
+              # so native 262144 KV is ~16 GB, well over the runner's budget, and
+              # size the model to ~40% of the budget so the KV-cap path runs
               # regardless of how much RAM the runner has.
               b = LlamaCppBackend.__new__(LlamaCppBackend)
-              b._context_length = 262144
-              b._n_layers = 80
-              b._n_kv_heads = 8
-              b._n_heads = 64
-              b._embedding_length = 8192
-              b._kv_key_length = 128
-              b._kv_value_length = 128
-              for f in ("_kv_lora_rank", "_sliding_window", "_sliding_window_pattern",
-                        "_ssm_inner_size", "_full_attention_interval", "_key_length_mla",
-                        "_n_kv_heads_by_layer", "_kv_key_length_swa", "_kv_value_length_swa"):
-                  setattr(b, f, None)
+              b._can_estimate_kv = lambda: True
+              b._estimate_kv_cache_bytes = lambda n, *a, **k: 0 if n <= 0 else int(n * 64_000)
               budget_mib = budget // (1024 * 1024)
               model_size_fit = int(budget * 0.40)
               capped = b._fit_context_to_vram(
