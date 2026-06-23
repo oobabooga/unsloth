@@ -1,0 +1,86 @@
+# Throwaway staging CI: prove the DiffusionGemma runtime ships and runs on real
+# Macs (arm64 + x86_64). Installs Studio, then asserts the prebuilt
+# llama-diffusion-gemma-visual-server is present and launches (its dynamic libs,
+# incl. Metal, resolve). It does NOT download the 26B model: the smallest quant
+# is 16.8 GB, which exceeds a macOS runner's free disk. This validates diffusion
+# *support* on the box; full 26B inference needs a real Mac with enough RAM/disk.
+# Not for merge. All other workflows are deleted on this branch so only this runs.
+
+name: diffusion runtime smoke
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15,       arch: arm64 }
+          - { os: macos-15-intel, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show host
+        run: |
+          uname -m
+          sw_vers
+
+      - name: Install Studio (--local, --no-torch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Assert llama.cpp loads (server + quantize)
+        run: bash .github/scripts/assert-llama-loads.sh
+
+      - name: Assert DiffusionGemma runtime is installed and launches
+        run: |
+          LLAMA_DIR="${LLAMA_CPP_DIR:-$HOME/.unsloth/llama.cpp}"
+          DIFF="$(find "$LLAMA_DIR" -type f -name 'llama-diffusion-gemma-visual-server' 2>/dev/null | head -1)"
+          if [ -z "$DIFF" ]; then
+            echo "::error::llama-diffusion-gemma-visual-server not found under $LLAMA_DIR (diffusion runtime missing from prebuilt)"
+            exit 1
+          fi
+          echo "found: $DIFF"
+          # Launch it so dyld resolves every linked dylib (incl. libggml-metal).
+          # --version/--help exit fast; we only fail on a loader/symbol error.
+          out="$("$DIFF" --version 2>&1 || "$DIFF" --help 2>&1 || true)"
+          echo "---- diffusion server launch output (head) ----"
+          echo "$out" | head -8
+          if echo "$out" | grep -qiE 'dyld|library not loaded|symbol not found|image not found|killed|abort trap'; then
+            echo "::error::diffusion server failed to load its libraries on this macOS"
+            exit 1
+          fi
+          echo "DiffusionGemma visual server present and loads cleanly"
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-smoke-${{ matrix.arch }}-log
+          path: logs/install.log
+          retention-days: 7
