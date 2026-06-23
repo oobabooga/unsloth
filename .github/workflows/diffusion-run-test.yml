@@ -1,0 +1,158 @@
+# Throwaway staging CI: actually try to RUN the 26B DiffusionGemma GGUF end to
+# end on real Macs (arm64 + x86_64). Download the Q4_K_M (16.8 GB), load it in
+# Studio, and make API requests. This is best-effort: the model is far larger
+# than a free runner's RAM (7 GB arm64 / 14 GB x86_64) and may not fit on disk,
+# so load/generate may OOM or fail. The model step is non-fatal and prints a
+# RESULT line; all logs are uploaded either way. Not for merge.
+
+name: diffusion run (best-effort)
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15,       arch: arm64 }
+          - { os: macos-15-intel, arch: x86_64 }
+    env:
+      GGUF_REPO: unsloth/diffusiongemma-26B-A4B-it-GGUF
+      GGUF_VARIANT: Q4_K_M
+      GGUF_FILE: diffusiongemma-26B-A4B-it-Q4_K_M.gguf
+      STUDIO_PORT: '18899'
+      HF_HOME: ${{ github.workspace }}/hf-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Host info + free disk (best-effort)
+        run: |
+          uname -m; sw_vers
+          echo "RAM bytes: $(sysctl -n hw.memsize)"
+          echo "=== disk before ==="; df -h /
+          # Safe frees only (do not touch git or the active CLT toolchain).
+          sudo rm -rf ~/Library/Android/sdk /Users/runner/Library/Android/sdk 2>/dev/null || true
+          sudo rm -rf ~/.rustup ~/.cargo 2>/dev/null || true
+          xcrun simctl delete unavailable 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          echo "=== disk after ==="; df -h /
+
+      - name: Download diffusion GGUF (16.8 GB, best-effort)
+        id: download
+        continue-on-error: true
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p "$HF_HOME"
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
+          echo "=== disk after download ==="; df -h /
+          du -sh "$HF_HOME" 2>/dev/null || true
+
+      - name: Install Studio (--local, --no-torch)
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Boot Studio (API-only)
+        if: steps.download.outcome == 'success'
+        run: |
+          unsloth studio reset-password || true
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" -o /tmp/health.json && break
+            sleep 1
+          done
+          cat /tmp/health.json 2>/dev/null; echo
+
+      - name: Load + generate (best-effort, non-fatal)
+        if: steps.download.outcome == 'success'
+        run: |
+          set +e
+          B="http://127.0.0.1:${STUDIO_PORT}"
+          SECRET="$(cat "$HOME/.unsloth/studio/auth/.desktop_secret" 2>/dev/null)"
+          TOKEN="$(curl -s "$B/api/auth/desktop-login" -H 'Content-Type: application/json' \
+            -d "{\"secret\":\"$SECRET\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
+          if [ -z "$TOKEN" ]; then echo "RESULT: could not mint auth token"; exit 0; fi
+          echo "token: ${TOKEN:0:8}..."
+          AUTH="-H Authorization:Bearer\ $TOKEN"
+
+          echo "=== POST /api/inference/load ==="
+          curl -s -X POST "$B/api/inference/load" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"max_seq_length\":2048}" \
+            -o /tmp/load.json -w 'HTTP %{http_code} in %{time_total}s\n' --max-time 5400
+          echo "---- load response ----"; cat /tmp/load.json 2>/dev/null; echo
+
+          echo "=== poll /api/inference/status (~50 min max) ==="
+          loaded=0
+          for i in $(seq 1 300); do
+            st="$(curl -s "$B/api/inference/status" -H "Authorization: Bearer $TOKEN")"
+            am="$(echo "$st" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("active_model") or "")' 2>/dev/null)"
+            echo "[$i] active_model='${am}'"
+            if [ -n "$am" ]; then loaded=1; break; fi
+            sleep 10
+          done
+
+          if [ "$loaded" != "1" ]; then
+            echo "RESULT: model did not reach loaded state (likely OOM / too large for this runner)"
+            echo "---- studio.log (tail) ----"; tail -60 logs/studio.log 2>/dev/null
+            exit 0
+          fi
+
+          echo "=== POST /v1/chat/completions ==="
+          curl -s -X POST "$B/v1/chat/completions" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$GGUF_REPO\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one short sentence.\"}],\"max_tokens\":48}" \
+            -o /tmp/gen.json -w 'HTTP %{http_code} in %{time_total}s\n' --max-time 1800
+          echo "---- chat/completions response ----"; cat /tmp/gen.json 2>/dev/null; echo
+
+          if grep -q '"content"' /tmp/gen.json 2>/dev/null; then
+            echo "RESULT: GENERATION SUCCEEDED"
+          else
+            echo "=== chat failed; trying /api/inference/generate/stream ==="
+            curl -s -N -X POST "$B/api/inference/generate/stream" -H "Authorization: Bearer $TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"prompt\":\"Say hello.\",\"max_tokens\":48}" --max-time 1800 | head -40
+            echo "RESULT: chat/completions produced no content (see responses + studio.log)"
+          fi
+          echo "---- studio.log (tail) ----"; tail -40 logs/studio.log 2>/dev/null
+
+      - name: Upload logs + responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-run-${{ matrix.arch }}
+          path: |
+            logs/
+            /tmp/load.json
+            /tmp/gen.json
+          retention-days: 7
+          if-no-files-found: ignore
