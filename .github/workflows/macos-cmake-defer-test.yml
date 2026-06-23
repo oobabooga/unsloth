@@ -1,0 +1,100 @@
+# Throwaway staging CI: prove the "defer cmake on macOS" install.sh change works
+# on real Macs (arm64 + x86_64). For each arch we run install.sh twice:
+#   - remove_cmake=true : simulate a clean Mac with no cmake -> installer must NOT
+#     abort, must take the prebuilt path, and llama-server + llama-quantize must
+#     still load (the case this PR fixes).
+#   - remove_cmake=false: cmake present (default runner) -> no regression.
+# Not for merge. All other workflows are deleted on this branch so only this runs.
+
+name: macOS cmake-defer test
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.arch }} / cmake-removed=${{ matrix.remove_cmake }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15,       arch: arm64,  remove_cmake: true }
+          - { os: macos-15-intel, arch: x86_64, remove_cmake: true }
+          - { os: macos-15,       arch: arm64,  remove_cmake: false }
+          - { os: macos-15-intel, arch: x86_64, remove_cmake: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show host
+        run: |
+          uname -m
+          sw_vers
+          echo "xcode-select: $(xcode-select -p 2>/dev/null || echo none)"
+          echo "git:   $(command -v git || echo none)"
+          echo "cmake: $(command -v cmake || echo none)"
+
+      - name: Remove cmake (simulate clean Mac)
+        if: ${{ matrix.remove_cmake }}
+        run: |
+          brew uninstall --ignore-dependencies --force cmake 2>/dev/null || true
+          # Remove any cmake still resolvable on PATH (symlinks, standalone, etc.)
+          while command -v cmake >/dev/null 2>&1; do
+            target="$(command -v cmake)"
+            echo "removing $target"
+            sudo rm -f "$target" || break
+          done
+          if command -v cmake >/dev/null 2>&1; then
+            echo "::error::cmake still present at $(command -v cmake); cannot simulate clean Mac"
+            exit 1
+          fi
+          echo "cmake removed; git still present: $(command -v git || echo NONE)"
+
+      - name: Install Studio (--local, --no-torch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Assert deps step took the expected branch
+        run: |
+          if [ "${{ matrix.remove_cmake }}" = "true" ]; then
+            grep -q "using prebuilt llama.cpp (cmake not found)" logs/install.log \
+              || { echo "::error::expected the cmake-not-found prebuilt notice; installer did not defer"; exit 1; }
+            ! grep -qi "Homebrew is required" logs/install.log \
+              || { echo "::error::installer still demanded Homebrew"; exit 1; }
+          else
+            grep -q "all system dependencies found" logs/install.log \
+              || { echo "::error::expected 'all system dependencies found' with cmake present"; exit 1; }
+          fi
+          echo "deps branch OK"
+
+      - name: Assert llama.cpp loads (server + quantize)
+        run: bash .github/scripts/assert-llama-loads.sh
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-log-${{ matrix.arch }}-cmake-removed-${{ matrix.remove_cmake }}
+          path: logs/install.log
+          retention-days: 7
