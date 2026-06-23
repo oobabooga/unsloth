@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Throwaway CI for the Apple-Silicon unified-memory context cap (#5118, #6529).
+# All other workflows are deleted on this branch so only this runs. It exercises
+# the new code on REAL Mac hardware that we can't reach locally:
+#   - arm64 (Apple Silicon / Metal): the budget helper must read a real Metal
+#     working-set and the auto context must cap below native.
+#   - x86_64 (Intel): the helper must be a no-op (budget 0), confirming the fix
+#     is scoped to Apple Silicon.
+# Drop this commit before sending the real PR upstream.
+
+name: Apple ctx-cap test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "arm64 (Apple Silicon / Metal)", runner: "macos-latest",   arch: "arm64" }
+          - { label: "x86_64 (Intel, no-op)",          runner: "macos-15-intel", arch: "x86_64" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # Unit test stubs httpx/structlog/loggers, so it needs only pytest.
+          # The real-hardware probe imports core.inference.llama_cpp for real, so
+          # it needs the module's actual light deps (structlog/starlette via the
+          # loggers package, httpx, psutil). mlx is arm64-only and supplies the
+          # Metal working-set; on Intel the helper returns 0 before importing it.
+          python -m pip install pytest structlog starlette httpx psutil
+          if [ "${{ matrix.arch }}" = "arm64" ]; then python -m pip install mlx; fi
+
+      - name: Confirm runner architecture
+        run: python -c "import platform; print(platform.system(), platform.machine())"
+
+      - name: Unit tests (mocked)
+        working-directory: studio/backend
+        run: python -m pytest tests/test_llama_cpp_context_fit.py -q -p no:cacheprovider
+
+      - name: Real-hardware probe
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: .
+        run: |
+          python3 - <<'PY'
+          import platform
+          from core.inference.llama_cpp import (
+              LlamaCppBackend,
+              _APPLE_UNIFIED_MEMORY_FRACTION,
+          )
+
+          budget = LlamaCppBackend._apple_metal_memory_budget_bytes()
+          sysname, mach = platform.system(), platform.machine()
+          print(f"platform={sysname}/{mach}  budget={budget} bytes ({budget/1e9:.2f} GB)")
+
+          if sysname == "Darwin" and mach == "arm64":
+              import mlx.core as mx
+              ws = int(mx.device_info().get("max_recommended_working_set_size") or 0)
+              print(f"metal available={mx.metal.is_available()}  working_set={ws} ({ws/1e9:.2f} GB)")
+              assert budget > 0, "Apple Silicon must produce a non-zero budget"
+              assert budget == int(ws * _APPLE_UNIFIED_MEMORY_FRACTION), \
+                  f"budget {budget} != 0.85 * working_set {int(ws * _APPLE_UNIFIED_MEMORY_FRACTION)}"
+
+              # Demonstrate the cap end-to-end against this runner's REAL budget.
+              # Size the model to ~40% of the budget so the KV-cap path runs
+              # regardless of how much RAM the runner has.
+              b = LlamaCppBackend.__new__(LlamaCppBackend)
+              b._context_length = 262144
+              b._n_layers = 80
+              b._n_kv_heads = 8
+              b._n_heads = 64
+              b._embedding_length = 8192
+              b._kv_key_length = 128
+              b._kv_value_length = 128
+              for f in ("_kv_lora_rank", "_sliding_window", "_sliding_window_pattern",
+                        "_ssm_inner_size", "_full_attention_interval", "_key_length_mla",
+                        "_n_kv_heads_by_layer", "_kv_key_length_swa", "_kv_value_length_swa"):
+                  setattr(b, f, None)
+              budget_mib = budget // (1024 * 1024)
+              model_size_fit = int(budget * 0.40)
+              capped = b._fit_context_to_vram(
+                  262144, budget_mib, model_size_fit, None, budget_frac=1.0,
+              )
+              print(f"native 262144 -> capped {capped} (model {model_size_fit/1e9:.1f} GB, "
+                    f"budget {budget_mib} MiB)")
+              assert 0 < capped < 262144, f"expected a cap below native, got {capped}"
+              print("ARM64 OK: real Metal budget read and auto context capped below native.")
+
+          elif sysname == "Darwin" and mach in ("x86_64", "x64"):
+              assert budget == 0, f"x86_64 mac must be a no-op, got {budget}"
+              print("INTEL OK: helper is a no-op on x86_64 mac (budget 0); fix is Apple-Silicon-scoped.")
+
+          else:
+              assert budget == 0
+              print("non-mac: no-op (unexpected on this runner)")
+          PY
