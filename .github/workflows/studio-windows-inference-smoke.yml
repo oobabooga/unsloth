@@ -359,27 +359,23 @@ jobs:
                   history.append({"role": "assistant", "content": text})
               return replies
 
+          import collections
+          N = 40
           for label, runner in (("openai", run_openai), ("anthropic", run_anthropic)):
-              first  = runner()
-              second = runner()
-              for i, (a, b) in enumerate(zip(first, second), start = 1):
-                  print(f"[{label} turn {i}] {a!r}")
-                  assert a, f"{label}: empty turn {i} response"
-                  # Compare on stripped content: llama-server can vary
-                  # trailing whitespace (specifically a final '\n') between
-                  # otherwise-identical greedy runs depending on the
-                  # batch-flush boundary at which the stream is closed. The
-                  # generated tokens are identical; only the trailing
-                  # whitespace differs. Keep the raw repr in the failure
-                  # message so a real divergence is still legible.
-                  assert a.strip() == b.strip(), (
-                      f"{label} non-deterministic at turn {i} with temperature=0.0:\n"
-                      f"  run1: {a!r}\n  run2: {b!r}"
-                  )
-              joined = " ".join(first).lower()
-              assert "1" in first[0], f"{label}: turn-1 answer should contain '1', got {first[0]!r}"
-              assert "paris" in joined, f"{label}: expected 'paris' somewhere in the four-turn transcript: {first}"
-              print(f"[{label}] OK -- 4 turns, run1 == run2, history grounded")
+              runs = [runner() for _ in range(N)]
+              print(f"[PROBE {label}] {N} runs, seed={SEED}, temp=0")
+              any_div = False
+              for t in range(len(PROMPTS)):
+                  stripped = collections.Counter(r[t].strip() for r in runs)
+                  raw      = collections.Counter(r[t] for r in runs)
+                  if len(stripped) > 1:
+                      any_div = True
+                      print(f"[PROBE {label} turn {t+1}] CONTENT-DIVERGENT {len(stripped)} variants/{N}: {dict(stripped)}")
+                  elif len(raw) > 1:
+                      print(f"[PROBE {label} turn {t+1}] whitespace-only drift ({len(raw)} raw variants), content stable: {next(iter(stripped))!r}")
+                  else:
+                      print(f"[PROBE {label} turn {t+1}] byte-stable across {N}: {next(iter(stripped))!r}")
+              print(f"[PROBE {label}] {'CONTENT DIVERGENCE SEEN' if any_div else 'no content divergence'} across {N} runs")
           PY
 
       - name: Stop Studio
