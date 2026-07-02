@@ -12,6 +12,10 @@
 #>
 
 $ErrorActionPreference = 'Stop'
+# We deliberately launch child processes that exit non-zero (the SYSTEM
+# guard exits 1) and inspect their exit codes; keep PS7's native-command
+# error preference from turning those into terminating errors.
+$PSNativeCommandUseErrorActionPreference = $false
 $script:fails = 0
 $script:total = 0
 

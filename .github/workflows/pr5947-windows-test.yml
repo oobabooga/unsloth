@@ -30,7 +30,8 @@ jobs:
           Write-Host "LOCALAPPDATA : $env:LOCALAPPDATA"
           Write-Host "USERPROFILE  : $env:USERPROFILE"
           Write-Host "pwsh version : $($PSVersionTable.PSVersion)"
-          powershell -NoProfile -Command "$PSVersionTable.PSVersion.ToString()" | ForEach-Object { Write-Host "win-ps ver   : $_" }
+          $winps = powershell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          Write-Host "win-ps ver   : $winps"
 
       - name: Run LOCALAPPDATA guard tests
         shell: pwsh
