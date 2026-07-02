@@ -181,6 +181,55 @@ def test_browse_folders_hides_sensitive_dirs(monkeypatch, tmp_path):
     assert ".ssh" not in names
 
 
+def test_get_models_folder_response_creates_and_returns_dir(monkeypatch, tmp_path):
+    # The endpoint creates the cache dir on demand so the desktop "Open folder"
+    # action works even before the first download.
+    target = tmp_path / "hub"
+    monkeypatch.setattr(local_inventory, "_resolve_hf_cache_dir", lambda: target)
+
+    response = local_inventory.get_models_folder_response()
+
+    assert response == {"path": str(target)}
+    assert target.is_dir()
+
+
+def test_get_models_folder_response_reports_create_failure(monkeypatch, tmp_path):
+    target = tmp_path / "hub"
+    target.write_text("not a directory")
+    monkeypatch.setattr(local_inventory, "_resolve_hf_cache_dir", lambda: target)
+
+    with pytest.raises(HTTPException) as exc_info:
+        local_inventory.get_models_folder_response()
+
+    assert exc_info.value.status_code == 500
+    assert "Failed to create models folder" in exc_info.value.detail
+
+
+def test_get_models_folder_response_requires_directory(monkeypatch, tmp_path):
+    class MissingPath:
+        def __init__(self, value: Path):
+            self.value = value
+
+        def mkdir(self, *, parents: bool, exist_ok: bool):
+            assert parents is True
+            assert exist_ok is True
+
+        def is_dir(self):
+            return False
+
+        def __str__(self):
+            return str(self.value)
+
+    target = MissingPath(tmp_path / "hub")
+    monkeypatch.setattr(local_inventory, "_resolve_hf_cache_dir", lambda: target)
+
+    with pytest.raises(HTTPException) as exc_info:
+        local_inventory.get_models_folder_response()
+
+    assert exc_info.value.status_code == 500
+    assert "not a directory" in exc_info.value.detail
+
+
 def test_contained_link_path_confines_to_link_dir(tmp_path):
     link_dir = tmp_path / "ollama" / ".studio_links" / "abc123"
 
@@ -1580,6 +1629,34 @@ def test_variant_partial_accepts_variant_filtered_legacy_hashes(monkeypatch, tmp
         "Q5_K_M",
         incomplete_blob_hashes = {"main-q4"},
         variant_blob_hashes = frozenset({"main-q5"}),
+    )
+
+
+def test_variant_partial_accepts_completed_variant_in_non_latest_snapshot(monkeypatch, tmp_path):
+    """A verified GGUF update can prune an older snapshot and make that old
+    directory the newest by mtime. The variant is still complete when another
+    snapshot satisfies its manifest."""
+    monkeypatch.setattr(state_dir, "cache_root", lambda: tmp_path / "state")
+    repo_dir = tmp_path / "cache" / "models--Org--Repo"
+    old_snapshot = repo_dir / "snapshots" / "old"
+    new_snapshot = repo_dir / "snapshots" / "new"
+    old_snapshot.mkdir(parents = True)
+    new_snapshot.mkdir(parents = True)
+    (old_snapshot / "model-Q8_0.gguf").write_bytes(b"sibling")
+    (new_snapshot / "model-Q4_K_M.gguf").write_bytes(b"new")
+    assert download_manifest.write_manifest(
+        "model",
+        "Org/Repo",
+        "Q4_K_M",
+        [download_manifest.ExpectedFile(path = "model-Q4_K_M.gguf", size = 3)],
+        "http",
+    )
+
+    assert not inventory_scan.is_variant_partial(
+        "Org/Repo",
+        "Q4_K_M",
+        snapshot_dir = old_snapshot,
+        repo_cache_dir = repo_dir,
     )
 
 

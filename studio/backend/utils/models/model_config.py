@@ -44,13 +44,15 @@ from utils.subprocess_compat import (
 logger = get_logger(__name__)
 
 
+_OFFLINE_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
 def _env_offline() -> bool:
-    """True if HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE is set to a truthy value."""
-    return os.environ.get("HF_HUB_OFFLINE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ) or os.environ.get("TRANSFORMERS_OFFLINE", "").lower() in ("1", "true", "yes")
+    """True if an HF offline env var is truthy (canonical strip+lower parse, on/true/yes/1)."""
+    return (
+        os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in _OFFLINE_TRUE_VALUES
+        or os.environ.get("TRANSFORMERS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE_VALUES
+    )
 
 
 # ── Model size extraction ────────────────────────────────────
@@ -470,14 +472,27 @@ def load_model_config(
     model_name: str,
     use_auth: bool = False,
     token: Optional[str] = None,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
+    local_files_only: bool = False,
 ):
-    """Load model config with optional authentication control."""
+    """Load model config with optional authentication control.
+
+    ``trust_remote_code`` defaults to ``False``: capability detection and
+    metadata lookups must never execute a model repo's ``auto_map`` Python.
+    Deliberate remote-code loads pass the flag explicitly through
+    ``FastLanguageModel.from_pretrained`` with the user's own consent.
+
+    ``local_files_only`` keeps the config read on the local HF cache (offline
+    export), so an offline probe never blocks on the network.
+    """
     from transformers import AutoConfig
 
     if token:
         return AutoConfig.from_pretrained(
-            model_name, trust_remote_code = trust_remote_code, token = token
+            model_name,
+            trust_remote_code = trust_remote_code,
+            token = token,
+            local_files_only = local_files_only,
         )
 
     if not use_auth:
@@ -487,31 +502,83 @@ def load_model_config(
                 model_name,
                 trust_remote_code = trust_remote_code,
                 token = None,
+                local_files_only = local_files_only,
             )
 
     # Default auth (cached tokens)
     return AutoConfig.from_pretrained(
         model_name,
         trust_remote_code = trust_remote_code,
+        local_files_only = local_files_only,
     )
 
 
-# VLM architecture suffixes and known VLM model_type values.
-_VLM_ARCH_SUFFIXES = ("ForConditionalGeneration", "ForVisionText2Text")
-_VLM_MODEL_TYPES = {
-    "phi3_v",
-    "llava",
-    "llava_next",
-    "llava_onevision",
-    "internvl_chat",
-    "cogvlm2",
-    "minicpmv",
-    "gemma4",
-}
+# Detection sets come from the installed transformers registry, unioned with a
+# small curated set of auto_map VLMs (DeepSeek-OCR, Kimi, phi3_v) whose arch is
+# repo-defined and absent from the registry. ForConditionalGeneration is NOT a
+# vision signal (overloaded across text/audio/vision); ForVisionText2Text is.
+_VLM_ARCH_SUFFIXES = ("ForVisionText2Text",)
 
-# Audio-only models that share the ForConditionalGeneration suffix
-# (e.g. CsmForConditionalGeneration, WhisperForConditionalGeneration).
-_AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
+_CURATED_REMOTE_VLM_TYPES = frozenset(
+    {
+        "phi3_v",
+        "llava",
+        "llava_next",
+        "llava_onevision",
+        "internvl_chat",
+        "cogvlm2",
+        "minicpmv",
+        "gemma4",
+        "deepseek_vl_v2",
+        "kimi_k25",
+    }
+)
+
+# Fallbacks used only if the transformers registry import fails.
+_FALLBACK_AUDIO_MODEL_TYPES = frozenset({"csm", "whisper"})
+
+
+def _build_detection_sets():
+    """Return (vlm_model_types, vlm_class_names, audio_model_types) from the
+    installed transformers registry, unioned with the curated repo-code VLM
+    set. Reads only static name dicts -- no model is loaded, no code runs.
+    Falls back to curated/hardcoded values if transformers is unavailable.
+    """
+    try:
+        from transformers.models.auto import modeling_auto as _ma
+
+        def _names(attr):
+            d = getattr(_ma, attr, None)
+            return dict(d) if d else {}
+
+        itt = _names("MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES")
+        v2s = _names("MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES")
+        vlm_types = set(itt) | set(v2s) | set(_CURATED_REMOTE_VLM_TYPES)
+        vlm_classes = set(itt.values()) | set(v2s.values())
+
+        audio_types: set = set()
+        for attr in (
+            "MODEL_FOR_CTC_MAPPING_NAMES",
+            "MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES",
+            "MODEL_FOR_AUDIO_CLASSIFICATION_MAPPING_NAMES",
+            "MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES",
+            "MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING_NAMES",
+            "MODEL_FOR_AUDIO_XVECTOR_MAPPING_NAMES",
+        ):
+            audio_types |= set(_names(attr))
+        audio_types |= set(_FALLBACK_AUDIO_MODEL_TYPES)
+
+        return frozenset(vlm_types), frozenset(vlm_classes), frozenset(audio_types)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not build detection sets from transformers: %s", exc)
+        return (
+            frozenset(_CURATED_REMOTE_VLM_TYPES),
+            frozenset(),
+            frozenset(_FALLBACK_AUDIO_MODEL_TYPES),
+        )
+
+
+_VLM_MODEL_TYPES, _VLM_CLASS_NAMES, _AUDIO_ONLY_MODEL_TYPES = _build_detection_sets()
 
 # Pre-computed .venv_t5 paths and backend dir for subprocess version switching.
 # Vision check uses the Gemma 4 5.5 sidecar for existing Gemma 4 architectures.
@@ -524,19 +591,27 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent.parent)
 def _is_vlm(config) -> bool:
     architectures = getattr(config, "architectures", None) or []
     model_type = getattr(config, "model_type", None)
-    if model_type in _AUDIO_ONLY_MODEL_TYPES:
-        return False
-    return (
-        any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)
-        or hasattr(config, "vision_config")
+    explicit_vision = (
+        hasattr(config, "vision_config")
         or hasattr(config, "img_processor")
         or hasattr(config, "image_token_index")
+        or hasattr(config, "projector_config")
+    )
+    # Audio-only models are vision only if they carry an explicit vision sub-config.
+    if model_type in _AUDIO_ONLY_MODEL_TYPES and not explicit_vision:
+        return False
+    return (
+        explicit_vision
+        or any(x in _VLM_CLASS_NAMES for x in architectures)
+        or any(isinstance(x, str) and x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)
         or model_type in _VLM_MODEL_TYPES
     )
 
 
 def _raw_config_has_vision_config(
-    model_name: str, hf_token: Optional[str] = None
+    model_name: str,
+    hf_token: Optional[str] = None,
+    local_files_only: bool = False,
 ) -> Optional[bool]:
     try:
         if is_local_path(model_name):
@@ -548,18 +623,25 @@ def _raw_config_has_vision_config(
                     repo_id = model_name,
                     filename = "config.json",
                     token = hf_token,
+                    local_files_only = local_files_only,
                 )
             )
         config = json.loads(config_path.read_text())
         architectures = config.get("architectures") or []
         model_type = config.get("model_type")
-        if model_type in _AUDIO_ONLY_MODEL_TYPES:
-            return False
-        return (
-            any(isinstance(x, str) and x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)
-            or "vision_config" in config
+        explicit_vision = (
+            "vision_config" in config
             or "img_processor" in config
             or "image_token_index" in config
+            or "projector_config" in config
+        )
+        # Audio-only models are vision only if they carry an explicit vision sub-config.
+        if model_type in _AUDIO_ONLY_MODEL_TYPES and not explicit_vision:
+            return False
+        return (
+            explicit_vision
+            or any(isinstance(x, str) and x in _VLM_CLASS_NAMES for x in architectures)
+            or any(isinstance(x, str) and x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)
             or model_type in _VLM_MODEL_TYPES
         )
     except Exception as exc:
@@ -570,19 +652,25 @@ def _raw_config_has_vision_config(
 # why: inline _is_vlm and constants are prepended so the subprocess stays
 # self-contained and does not import the parent backend module graph.
 _VISION_CHECK_INLINE_HELPERS = (
-    "_VLM_ARCH_SUFFIXES = " + repr(_VLM_ARCH_SUFFIXES) + "\n"
-    "_VLM_MODEL_TYPES = " + repr(_VLM_MODEL_TYPES) + "\n"
-    "_AUDIO_ONLY_MODEL_TYPES = " + repr(_AUDIO_ONLY_MODEL_TYPES) + "\n"
+    "_VLM_ARCH_SUFFIXES = " + repr(tuple(_VLM_ARCH_SUFFIXES)) + "\n"
+    "_VLM_MODEL_TYPES = " + repr(set(_VLM_MODEL_TYPES)) + "\n"
+    "_VLM_CLASS_NAMES = " + repr(set(_VLM_CLASS_NAMES)) + "\n"
+    "_AUDIO_ONLY_MODEL_TYPES = " + repr(set(_AUDIO_ONLY_MODEL_TYPES)) + "\n"
     "def _is_vlm(config):\n"
     "    architectures = getattr(config, 'architectures', None) or []\n"
     "    model_type = getattr(config, 'model_type', None)\n"
-    "    if model_type in _AUDIO_ONLY_MODEL_TYPES:\n"
-    "        return False\n"
-    "    return (\n"
-    "        any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)\n"
-    "        or hasattr(config, 'vision_config')\n"
+    "    explicit_vision = (\n"
+    "        hasattr(config, 'vision_config')\n"
     "        or hasattr(config, 'img_processor')\n"
     "        or hasattr(config, 'image_token_index')\n"
+    "        or hasattr(config, 'projector_config')\n"
+    "    )\n"
+    "    if model_type in _AUDIO_ONLY_MODEL_TYPES and not explicit_vision:\n"
+    "        return False\n"
+    "    return (\n"
+    "        explicit_vision\n"
+    "        or any(x in _VLM_CLASS_NAMES for x in architectures)\n"
+    "        or any(isinstance(x, str) and x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures)\n"
     "        or model_type in _VLM_MODEL_TYPES\n"
     "    )\n"
 )
@@ -610,7 +698,8 @@ if backend_dir not in sys.path:
 try:
     from transformers import AutoConfig
 
-    kwargs = {"trust_remote_code": True}
+    # Capability detection never executes model repo code.
+    kwargs = {"trust_remote_code": False}
     if token:
         kwargs["token"] = token
     config = AutoConfig.from_pretrained(model_name, **kwargs)
@@ -701,27 +790,20 @@ def _token_fingerprint(token: Optional[str]) -> Optional[str]:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-# Cache vision detection per session to avoid repeated subprocess spawns.
-# Keyed by (normalized_model_name, token_fingerprint) to handle gated models.
-# Only definitive results are cached; transient failures (network, timeouts)
-# are NOT cached so they can be retried.
-_vision_detection_cache: Dict[Tuple[str, Optional[str]], bool] = {}
+# Vision detection cache keyed by (name, token, local_files_only); only definitive results cached.
+_vision_detection_cache: Dict[Tuple[str, Optional[str], bool], bool] = {}
 _vision_cache_lock = threading.Lock()
 
 
-def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
-    """
-    Detect vision-language models (VLMs) via architecture in config. Works for
-    fine-tuned models since they inherit the base architecture.
-
-    Models needing transformers 5.x are checked in a .venv_t5/ subprocess.
-    Results are cached per (model_name, token_fingerprint) for the process
-    lifetime; transient failures are not cached so they can be retried.
-
-    Args:
-        model_name: Model identifier (HF repo or local path)
-        hf_token: Optional HF token for gated/private models
-    """
+def is_vision_model(
+    model_name: str,
+    hf_token: Optional[str] = None,
+    local_files_only: bool = False,
+) -> bool:
+    """Detect VLMs via the config architecture (works for fine-tunes); transformers-5.x
+    models are checked in a .venv_t5/ subprocess. Cached per (model_name, token,
+    local_files_only) minus transient failures; local_files_only is in the key so an
+    offline probe never shares an online entry."""
     # Local GGUF models are served by llama-server. Their multimodal
     # capability comes from a companion mmproj, not a Transformers config.
     # Do not cache this lookup: a projector may be added beside an existing
@@ -754,7 +836,10 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
             exc,
         )
         resolved_name = model_name
-    cache_key = (resolved_name, _token_fingerprint(hf_token))
+    # Key on effective offline (kwarg OR env) so an offline probe can't poison a later
+    # online lookup once the env var is cleared.
+    effective_offline = bool(local_files_only or _env_offline())
+    cache_key = (resolved_name, _token_fingerprint(hf_token), effective_offline)
 
     # Lock-free fast path for cache hits. Sentinel distinguishes "key not found"
     # from "value is False" in a single atomic dict.get() call.
@@ -765,7 +850,7 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
 
     # Compute outside the lock so long-running detection isn't serialized across
     # models. Two concurrent calls may both run, but produce the same result.
-    result = _is_vision_model_uncached(resolved_name, hf_token)
+    result = _is_vision_model_uncached(resolved_name, hf_token, local_files_only = effective_offline)
     # Only cache definitive results; None is a transient failure, retry later.
     if result is not None:
         with _vision_cache_lock:
@@ -774,36 +859,46 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
     return False
 
 
-def _is_vision_model_uncached(model_name: str, hf_token: Optional[str] = None) -> Optional[bool]:
+def _is_vision_model_uncached(
+    model_name: str,
+    hf_token: Optional[str] = None,
+    local_files_only: bool = False,
+) -> Optional[bool]:
     """Uncached vision detection; use is_vision_model() instead.
 
     Returns True/False for definitive results, or None on transient errors
     (network, timeout, subprocess failure) so the caller knows not to cache.
     """
-    # Models needing transformers 5.x must be checked in a subprocess: the main
-    # process (transformers 4.57.x) doesn't recognize their architectures.
+    # Try the raw-config reader FIRST (code-free, version-independent): it classifies
+    # repo-code VLMs like DeepSeek-OCR via declarative vision_config with no remote-code
+    # execution or transformers-5.x subprocess.
+    raw = _raw_config_has_vision_config(
+        model_name, hf_token = hf_token, local_files_only = local_files_only
+    )
+    if raw is not None:
+        return raw
+
+    # Raw read failed transiently: fall back to AutoConfig (remote code DISABLED), via a
+    # transformers-5.x subprocess if needed. Skip that subprocess offline (it probes the network).
     from utils.transformers_version import needs_transformers_5
 
-    if needs_transformers_5(model_name):
+    if not local_files_only and needs_transformers_5(model_name):
         logger.info(
             "Model '%s' needs transformers 5.x -- checking vision via subprocess",
             model_name,
         )
-        result = _is_vision_model_subprocess(model_name, hf_token = hf_token)
-        if result is not None:
-            return result
-        return _raw_config_has_vision_config(model_name, hf_token = hf_token)
+        return _is_vision_model_subprocess(model_name, hf_token = hf_token)
 
     try:
-        config = load_model_config(model_name, use_auth = True, token = hf_token)
-
-        # Exclude audio-only models sharing the ForConditionalGeneration suffix
-        # (e.g. CsmForConditionalGeneration, WhisperForConditionalGeneration)
-        model_type = getattr(config, "model_type", None)
-        if model_type in _AUDIO_ONLY_MODEL_TYPES:
-            return False
+        config = load_model_config(
+            model_name,
+            use_auth = True,
+            token = hf_token,
+            local_files_only = local_files_only,
+        )
 
         if _is_vlm(config):
+            model_type = getattr(config, "model_type", None)
             archs = getattr(config, "architectures", None) or []
             logger.info(
                 "Model %s detected as VLM (model_type=%s, architectures=%s)",
@@ -840,8 +935,9 @@ def _is_vision_model_uncached(model_name: str, hf_token: Optional[str] = None) -
 
 VALID_AUDIO_TYPES = ("snac", "csm", "bicodec", "dac", "whisper", "audio_vlm")
 
-# Cache detection per session to avoid repeated API calls
-_audio_detection_cache: Dict[str, Optional[str]] = {}
+# Keyed like the vision cache by (name, token, local_files_only) so an unauthenticated
+# or offline miss cannot poison a later authenticated / online lookup.
+_audio_detection_cache: Dict[Tuple[str, Optional[str], bool], Optional[str]] = {}
 
 # Tokenizer token patterns → audio_type (all 6 types from tokenizer_config.json)
 _AUDIO_TOKEN_PATTERNS = {
@@ -860,29 +956,61 @@ _AUDIO_TOKEN_PATTERNS = {
 }
 
 
-def detect_audio_type(model_name: str, hf_token: Optional[str] = None) -> Optional[str]:
+def detect_audio_type(
+    model_name: str,
+    hf_token: Optional[str] = None,
+    local_files_only: bool = False,
+) -> Optional[str]:
     """Detect if a model is an audio model and return its type.
 
     Works for any model via tokenizer_config.json special tokens.
     Returns an audio_type string ('snac', 'csm', 'bicodec', 'dac', 'whisper',
     'audio_vlm') or None.
+
+    When local_files_only is True (offline export) the remote HuggingFace fetch
+    is skipped so detection never blocks on a network read; only the local HF
+    cache is consulted.
     """
-    if model_name in _audio_detection_cache:
-        return _audio_detection_cache[model_name]
+    # Normalize casing + include the token fingerprint (mirrors is_vision_model).
+    try:
+        if is_local_path(model_name):
+            resolved_name = normalize_path(model_name)
+        else:
+            resolved_name = resolve_cached_repo_id_case(model_name)
+    except Exception:
+        resolved_name = model_name
+    # Key on effective offline (kwarg OR env), matching where the remote fetch is skipped,
+    # so an offline negative can't poison a later online probe.
+    effective_offline = bool(local_files_only or _env_offline())
+    cache_key = (resolved_name, _token_fingerprint(hf_token), effective_offline)
+    if cache_key in _audio_detection_cache:
+        return _audio_detection_cache[cache_key]
 
-    result = _detect_audio_from_tokenizer(model_name, hf_token)
-
-    _audio_detection_cache[model_name] = result
+    result, definitive = _detect_audio_from_tokenizer(
+        model_name, hf_token, local_files_only = effective_offline
+    )
+    # Cache only definitive results; a transient read failure stays None and retries.
+    if definitive:
+        _audio_detection_cache[cache_key] = result
     if result:
         logger.info(f"Model {model_name} detected as audio model: audio_type={result}")
     return result
 
 
-def _detect_audio_from_tokenizer(model_name: str, hf_token: Optional[str] = None) -> Optional[str]:
+def _detect_audio_from_tokenizer(
+    model_name: str,
+    hf_token: Optional[str] = None,
+    local_files_only: bool = False,
+) -> Tuple[Optional[str], bool]:
     """Detect audio type from tokenizer special tokens.
 
-    Checks local HF cache first, then fetches tokenizer_config.json from HF;
-    examines added_tokens_decoder for distinctive patterns.
+    Checks local HF cache first, then (unless local_files_only) fetches
+    tokenizer_config.json from HF; examines added_tokens_decoder for distinctive
+    patterns.
+
+    Returns (audio_type_or_None, definitive). definitive is False only on a
+    transient read failure (network/timeout/5xx) so the caller skips caching and
+    retries; a successful read with no audio tokens is a definitive None.
     """
 
     def _check_token_patterns(tok_config: dict) -> Optional[str]:
@@ -894,6 +1022,8 @@ def _detect_audio_from_tokenizer(model_name: str, hf_token: Optional[str] = None
             if check_fn(token_contents):
                 return audio_type
         return None
+
+    read_any = False  # parsed at least one tokenizer_config -> a None is definitive
 
     # 1) Local HF cache first (works for gated/offline models)
     try:
@@ -909,38 +1039,55 @@ def _detect_audio_from_tokenizer(model_name: str, hf_token: Optional[str] = None
                         tok_file = snapshot / tok_path
                         if tok_file.exists():
                             tok_config = json.loads(tok_file.read_text())
+                            read_any = True
                             result = _check_token_patterns(tok_config)
                             if result:
-                                return result
+                                return result, True
     except Exception as e:
         logger.debug(f"Could not check local cache for {model_name}: {e}")
 
-    # 2) Fall back to HuggingFace API
+    # 2) Fall back to the HuggingFace API. This raw requests.get ignores the HF offline
+    #    flag, so gate it on local_files_only OR the env vars to skip the network offline.
+    if local_files_only or _env_offline():
+        return None, read_any
+
     try:
         import requests
         import os
+    except Exception:
+        return None, read_any
 
-        paths_to_try = ["tokenizer_config.json", "LLM/tokenizer_config.json"]
-        token = hf_token or os.environ.get("HF_TOKEN")
-        headers = {}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+    paths_to_try = ["tokenizer_config.json", "LLM/tokenizer_config.json"]
+    token = hf_token or os.environ.get("HF_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-        for tok_path in paths_to_try:
-            url = f"https://huggingface.co/{model_name}/resolve/main/{tok_path}"
+    transient = False  # a fetch failed for a non-404 reason (network/5xx)
+    for tok_path in paths_to_try:
+        url = f"https://huggingface.co/{model_name}/resolve/main/{tok_path}"
+        try:
             resp = requests.get(url, headers = headers, timeout = 15)
-            if not resp.ok:
-                continue
-
+        except Exception as e:
+            logger.debug(f"Could not fetch {tok_path} for {model_name}: {e}")
+            transient = True
+            continue
+        if resp.status_code == 404:
+            continue  # genuinely absent on this path
+        if not resp.ok:
+            transient = True  # 5xx/403/etc -- can't tell, don't cache
+            continue
+        try:
             tok_config = resp.json()
-            result = _check_token_patterns(tok_config)
-            if result:
-                return result
+        except Exception as e:
+            logger.debug(f"Bad tokenizer_config for {model_name}/{tok_path}: {e}")
+            transient = True
+            continue
+        read_any = True
+        result = _check_token_patterns(tok_config)
+        if result:
+            return result, True
 
-        return None
-    except Exception as e:
-        logger.debug(f"Could not detect audio type from tokenizer for {model_name}: {e}")
-        return None
+    # No audio tokens: definitive unless every attempt failed transiently.
+    return None, (read_any or not transient)
 
 
 def is_audio_input_type(audio_type: Optional[str]) -> bool:
@@ -2135,7 +2282,7 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
                     return base_model
 
         # Fallback: try training_args.bin (requires torch)
-        # TODO: torch.load default weights_only=True (torch >= 2.6) rejects pickled TrainingArguments; also an RCE sink for third-party LoRAs via this route, re-enable behind a trust check if needed.
+        # TODO: torch.load default weights_only=True (torch >= 2.6) rejects pickled TrainingArguments; also an remote code execution sink for third-party LoRAs via this route, re-enable behind a trust check if needed.
         # training_args_path = lora_path_obj / "training_args.bin"
         # if training_args_path.exists():
         #     try:
@@ -2169,6 +2316,74 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
         return None
 
 
+def get_base_model_from_lora_identifier(
+    identifier: str, hf_token: Optional[str] = None
+) -> Optional[str]:
+    """Resolve a LoRA adapter's base model for a LOCAL dir OR a REMOTE HF repo.
+
+    ``get_base_model_from_lora`` only reads a local adapter directory (it requires
+    ``is_dir()``). The SECURITY gates must also follow a *remote* adapter's base,
+    because the base model's code / weights are what execute on load: an attacker's
+    adapter repo can point ``base_model_name_or_path`` at a base carrying a poisoned
+    pickle or HIGH auto_map code. For a remote repo id we fetch ONLY the small
+    ``adapter_config.json`` (metadata; never a weight file) and read the base. Use
+    this in the gate paths so a remote LoRA base is scanned, not just the adapter.
+
+    Returns the base model id, or ``None`` when the identifier is not a LoRA adapter
+    or the base cannot be determined (the caller still scans the identifier itself).
+
+    A genuine 404 (no ``adapter_config.json`` / repo absent) is distinguished from a
+    transient error: the latter is retried once, then logged as a WARNING (a missed
+    base would be scanned by neither gate), so a network blip does not silently and
+    invisibly skip the base.
+    """
+    # Local path: reuse the existing directory reader (identical behavior).
+    try:
+        if is_local_path(identifier):
+            return get_base_model_from_lora(identifier)
+    except Exception:
+        return get_base_model_from_lora(identifier)
+
+    # Remote repo id: read base_model_name_or_path from adapter_config.json only.
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+
+    last_exc = None
+    for _attempt in range(2):  # one retry: a transient blip must not skip the base
+        try:
+            cfg_path = hf_hub_download(
+                identifier, "adapter_config.json", token = hf_token if hf_token else None
+            )
+        except (EntryNotFoundError, RepositoryNotFoundError):
+            # No adapter_config.json -> not a resolvable LoRA; caller scans the identifier.
+            return None
+        except Exception as exc:  # transient / auth / network -> retry once
+            last_exc = exc
+            continue
+        try:
+            with open(cfg_path, "r") as f:
+                base_model = json.load(f).get("base_model_name_or_path")
+        except Exception as exc:
+            logger.warning("Could not parse adapter_config.json for '%s': %s", identifier, exc)
+            return None
+        if base_model:
+            logger.info(
+                "Detected base model from remote adapter_config.json (%s): %s",
+                identifier,
+                base_model,
+            )
+        return base_model  # may be None if the key is absent (still a valid answer)
+
+    # Both attempts failed transiently: log loudly -- a missed base is gated by neither gate.
+    logger.warning(
+        "Could not resolve remote LoRA base for '%s' after retry (%s); its base, if "
+        "any, will not be added to the security scan targets.",
+        identifier,
+        type(last_exc).__name__ if last_exc else "unknown",
+    )
+    return None
+
+
 # Status indicators that appear in UI dropdowns
 UI_STATUS_INDICATORS = [" (Ready)", " (Loading...)", " (Active)", "↓ "]
 
@@ -2180,6 +2395,12 @@ def load_model_defaults(model_name: str) -> Dict[str, Any]:
     MODEL_NAME_MAPPING aliases, else falls back to default.yaml. Returns the
     parameter dict, or {} if none found.
     """
+    # No model selected yet (or a non-string id): nothing to load. Guard before
+    # the .lower() calls below so this doesn't raise and get logged as
+    # "Error loading model defaults for None: 'NoneType' object has no attribute
+    # 'lower'".
+    if not isinstance(model_name, str) or not model_name:
+        return {}
     try:
         script_dir = Path(__file__).parent.parent.parent
         defaults_dir = script_dir / "assets" / "configs" / "model_defaults"
@@ -2430,13 +2651,14 @@ class ModelConfig:
                 # download. include_denied: a transiently locked binary still
                 # exists (the lock clears long before the download finishes; the
                 # load itself reports a still-locked binary distinctly).
-                from core.inference.llama_cpp import LlamaCppBackend
+                from core.inference.llama_cpp import (
+                    LLAMA_SERVER_NOT_FOUND_DETAIL,
+                    LlamaCppBackend,
+                    LlamaServerNotFoundError,
+                )
 
                 if not LlamaCppBackend._find_llama_server_binary(include_denied = True):
-                    raise RuntimeError(
-                        "llama-server binary not found — cannot load GGUF models. "
-                        "Run setup.sh to build it, or set LLAMA_SERVER_PATH."
-                    )
+                    raise LlamaServerNotFoundError(LLAMA_SERVER_NOT_FOUND_DETAIL)
 
                 # list_gguf_variants() detects vision & resolves the variant
                 variants, has_vision = list_gguf_variants(identifier, hf_token = hf_token)

@@ -30,6 +30,7 @@ import numpy as np
 
 from utils.native_path_leases import child_env_without_native_path_secret
 from utils.subprocess_compat import windows_hidden_subprocess_kwargs
+from utils.process_lifetime import child_popen_kwargs
 
 from . import config
 
@@ -60,9 +61,8 @@ class LlamaServerBackend:
         self._binary: str | None = None
         # Sticky after an auto GPU start fails: later spawns stay on CPU.
         self._force_cpu = False
-        # Pooled client; requests pass full URLs, so a respawn's new port needs
-        # no rebuild.
-        self._client = httpx.Client(timeout = config.EMBED_REQUEST_TIMEOUT_S)
+        # Pooled client (full URLs per request survive a respawn); trust_env=False skips HTTP(S)_PROXY.
+        self._client = httpx.Client(timeout = config.EMBED_REQUEST_TIMEOUT_S, trust_env = False)
         atexit.register(self._shutdown)
 
     @property
@@ -267,6 +267,7 @@ class LlamaServerBackend:
             text = True,
             env = env,
             **windows_hidden_subprocess_kwargs(),
+            **child_popen_kwargs(),
         )
         self._process = proc
         self._port = port
@@ -303,7 +304,8 @@ class LlamaServerBackend:
                 logger.error("llama-server embedder exited early (code %s)", code)
                 return False
             try:
-                if httpx.get(url, timeout = 2.0).status_code == 200:
+                # trust_env=False: a proxy that 503s 127.0.0.1 must not block this probe.
+                if httpx.get(url, timeout = 2.0, trust_env = False).status_code == 200:
                     return True
             except (*_TRANSPORT_ERRORS, httpx.TimeoutException):
                 pass

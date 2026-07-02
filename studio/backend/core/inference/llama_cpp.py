@@ -13,7 +13,6 @@ import json
 import os
 import re
 import struct
-import structlog
 from loggers import get_logger
 import shutil
 import signal
@@ -40,15 +39,7 @@ from core.inference.llama_server_args import (
     strip_split_mode_only,
 )
 from core.tool_healing import (
-    _TC_END_TAG_RE,
-    _TC_FUNC_CLOSE_RE,
-    _TC_FUNC_START_RE,
-    _TC_JSON_START_RE,
-    _TC_PARAM_CLOSE_RE,
-    _TC_PARAM_START_RE,
     _TOOL_ALL_PATS,
-    _TOOL_CLOSED_PATS,
-    parse_tool_calls_from_text,
     strip_tool_call_markup,
 )
 from utils.native_path_leases import child_env_without_native_path_secret
@@ -56,6 +47,7 @@ from utils.hf_xet_fallback import hf_hub_download_with_xet_fallback
 from utils.subprocess_compat import (
     windows_hidden_subprocess_kwargs as _windows_hidden_subprocess_kwargs,
 )
+from utils.process_lifetime import child_popen_kwargs as _child_popen_kwargs
 from core.inference.tool_call_parser import (
     RAG_MAX_SEARCHES_PER_TURN,
     RAG_SEARCH_CAP_NUDGE,
@@ -75,6 +67,19 @@ from state.tool_approvals import (
 )
 
 logger = get_logger(__name__)
+
+
+class LlamaServerNotFoundError(RuntimeError):
+    """GGUF model needs the llama.cpp runtime but no llama-server is installed.
+    Subclasses RuntimeError so existing handlers still catch it."""
+
+
+# Shared so the from_identifier preflight and the load-time raise stay in sync.
+LLAMA_SERVER_NOT_FOUND_DETAIL = (
+    "This is a GGUF model, but the llama.cpp runtime (llama-server) is not "
+    "installed. Run `unsloth studio setup` to download the prebuilt runtime, "
+    "then try again. (Advanced: set LLAMA_SERVER_PATH to an existing binary.)"
+)
 
 
 # llama-server can serve HTTP 200 while running a model entirely on CPU when a
@@ -221,6 +226,10 @@ _MAX_REPROMPTS = 1
 # enough for reasoning-heavy GGUFs and max_tokens-omitting API clients.
 _DEFAULT_MAX_TOKENS_FLOOR = 32768
 _DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1200.0  # 20 min
+
+# Only large streamed tool payloads get an early provisional card; render_html
+# is exempt because it needs immediate artifact feedback.
+_PROVISIONAL_ARGS_MIN_CHARS = 256
 _DEFAULT_STREAM_STALL_TIMEOUT_S = 120.0  # 2 min
 _REPROMPT_MAX_CHARS = 2000
 _FORCED_REPEAT_PLAN_SIGNAL = re.compile(
@@ -365,6 +374,13 @@ def _period_from_layer_types(layer_types: list) -> Optional[int]:
     return None
 
 
+def _swa_entry_from_layer_types(lt) -> Optional[object]:
+    """Period int, or per-layer bool mask, from a transformers ``layer_types`` list."""
+    if isinstance(lt, list) and lt:
+        return _period_from_layer_types(lt) or ["full" not in str(t).lower() for t in lt]
+    return None
+
+
 def _fetch_swa_entry_from_hf(repo_id: str) -> Optional[object]:
     try:
         from huggingface_hub import hf_hub_download
@@ -378,10 +394,7 @@ def _fetch_swa_entry_from_hf(repo_id: str) -> Optional[object]:
     period = src.get("sliding_window_pattern")
     if isinstance(period, int) and period > 0:
         return period
-    lt = src.get("layer_types")
-    if isinstance(lt, list) and lt:
-        return _period_from_layer_types(lt) or ["full" not in str(t).lower() for t in lt]
-    return None
+    return _swa_entry_from_layer_types(src.get("layer_types"))
 
 
 def _arch_aliases(arch: str) -> tuple:
@@ -398,10 +411,7 @@ def _swa_entry_from_config_obj(cfg) -> Optional[object]:
     period = getattr(src, "sliding_window_pattern", None)
     if isinstance(period, int) and period > 0:
         return period
-    lt = getattr(src, "layer_types", None)
-    if isinstance(lt, list) and lt:
-        return _period_from_layer_types(lt) or ["full" not in str(t).lower() for t in lt]
-    return None
+    return _swa_entry_from_layer_types(getattr(src, "layer_types", None))
 
 
 _SWA_PATTERN_SOURCE_RE = re.compile(r"sliding_window_pattern\s*(?::\s*[\w\[\], ]*)?\s*=\s*(\d+)")
@@ -538,6 +548,27 @@ _TOOL_TEMPLATE_MARKERS = (
 )
 
 
+# Canonical reasoning_effort levels, weakest -> strongest. Used to read the
+# discrete set a template branches on (e.g. GLM-5.2 uses 'high' | 'max') so we
+# only ever offer levels the template actually understands.
+_REASONING_EFFORT_SCALE = ("minimal", "low", "medium", "high", "max")
+
+
+def _extract_reasoning_effort_levels(chat_template: str) -> list:
+    """Return the reasoning_effort levels a template references, in canonical
+    (weakest -> strongest) order.
+
+    Looks for the quoted literals (e.g. ``'high'`` / ``"max"``) the template
+    compares ``reasoning_effort`` against, so we surface exactly the levels it
+    branches on and nothing else.
+    """
+    return [
+        level
+        for level in _REASONING_EFFORT_SCALE
+        if f"'{level}'" in chat_template or f'"{level}"' in chat_template
+    ]
+
+
 def detect_reasoning_flags(
     chat_template: Optional[str],
     model_identifier: Optional[str] = None,
@@ -546,17 +577,20 @@ def detect_reasoning_flags(
 ) -> dict:
     """Classify a chat template's reasoning and tool-calling capabilities.
 
-    Returns the same five keys as the GGUF sniffer: ``supports_reasoning``,
-    ``reasoning_style`` (``"enable_thinking"`` | ``"reasoning_effort"``),
-    ``reasoning_always_on``, ``supports_preserve_thinking``,
-    ``supports_tools``. Used by both the llama-server backend at load time
-    and the safetensors/transformers paths in ``routes/inference`` so they
-    agree on what the frontend sees.
+    Returns the same six keys as the GGUF sniffer: ``supports_reasoning``,
+    ``reasoning_style`` (``"enable_thinking"`` | ``"reasoning_effort"`` |
+    ``"enable_thinking_effort"``), ``reasoning_always_on``,
+    ``reasoning_effort_levels``, ``supports_preserve_thinking``,
+    ``supports_tools``. A falsy ``chat_template`` yields the all-default dict.
+    Used by both the llama-server backend at load time and the
+    safetensors/transformers paths in ``routes/inference`` so they agree on
+    what the frontend sees.
     """
     flags = {
         "supports_reasoning": False,
         "reasoning_style": "enable_thinking",
         "reasoning_always_on": False,
+        "reasoning_effort_levels": [],
         "supports_preserve_thinking": False,
         "supports_tools": False,
     }
@@ -565,7 +599,25 @@ def detect_reasoning_flags(
     tpl = chat_template
     prefix = f"{log_source}: " if log_source else ""
 
-    if "enable_thinking" in tpl:
+    effort_levels = (
+        _extract_reasoning_effort_levels(tpl)
+        if ("reasoning_effort" in tpl and "enable_thinking" in tpl)
+        else []
+    )
+    if effort_levels:
+        # GLM-5.2-style: an enable_thinking on/off gate PLUS a reasoning_effort
+        # level among a discrete set (e.g. 'high' | 'max'). Distinct from
+        # gpt-oss (reasoning_effort only, no on/off gate) and Qwen
+        # (enable_thinking only). Disabling is enable_thinking=false; the levels
+        # are the quoted effort literals the template actually branches on.
+        flags["supports_reasoning"] = True
+        flags["reasoning_style"] = "enable_thinking_effort"
+        flags["reasoning_effort_levels"] = effort_levels
+        logger.info(
+            f"{prefix}model supports reasoning "
+            f"(enable_thinking + reasoning_effort: {effort_levels})"
+        )
+    elif "enable_thinking" in tpl:
         flags["supports_reasoning"] = True
         flags["reasoning_style"] = "enable_thinking"
         logger.info(f"{prefix}model supports reasoning (enable_thinking)")
@@ -603,10 +655,31 @@ def detect_reasoning_flags(
     return flags
 
 
+# Gemma 4 ships MTP as a separate drafter (no "-mtp" in the name). Gemma 3n
+# ships no drafter, so it is excluded -- it takes the normal non-MTP path.
+_GEMMA_MTP_FAMILY_RE = re.compile(r"gemma[-_]?4[-_]", re.IGNORECASE)
+
+
+def _is_gemma_mtp_family(name: Optional[str]) -> bool:
+    """Match Gemma 4 by name."""
+    return bool(name) and bool(_GEMMA_MTP_FAMILY_RE.search(name))
+
+
+def _is_gemma_mtp_name(model_identifier: Optional[str], gguf_path: Optional[str] = None) -> bool:
+    """Match Gemma 4 by id or GGUF filename."""
+    return _is_gemma_mtp_family(model_identifier) or _is_gemma_mtp_family(
+        Path(gguf_path).name if gguf_path else None
+    )
+
+
 def _is_mtp_model_name(model_identifier: Optional[str], gguf_path: Optional[str] = None) -> bool:
     """Name-based MTP detector. Fallback for the metadata signal."""
     for cand in (model_identifier, Path(gguf_path).name if gguf_path else None):
         if cand and "-mtp" in cand.lower():
+            return True
+        # Recognise Gemma 4 too, so a failed drafter download surfaces a
+        # fallback reason instead of silently defaulting.
+        if cand and _is_gemma_mtp_family(cand):
             return True
     return False
 
@@ -730,6 +803,10 @@ _MTP_MIN_SIZE_B = 3.0
 # of free (see _fit_context_to_vram), plus a byte-accurate MTP draft reserve.
 _CTX_FIT_VRAM_FRACTION = 0.95
 
+# Apple unified memory is shared with the OS, so tighter than VRAM. Matches the
+# 0.85 MLX uses in mlx_inference.py (_configure_memory_limits); not kept in sync.
+_APPLE_UNIFIED_MEMORY_FRACTION = 0.85
+
 # Flat MTP reserve, used only when GGUF dims are too sparse for the byte-accurate
 # reserve (_estimate_mtp_overhead_bytes). Applied to both the fit budget and pin.
 _MTP_VRAM_RESERVE_FRAC = 0.05
@@ -795,6 +872,23 @@ def _auto_mode_drops_mtp(
     if has_separate_drafter:
         return False
     return req_mode == "auto" and size_b is not None and size_b < _MTP_MIN_SIZE_B
+
+
+def _mla_mtp_auto_enabled() -> bool:
+    """Whether Auto may pick embedded MTP for an MLA model (GLM-5.2/DeepSeek/Kimi).
+
+    Off by default: llama.cpp's MLA/DSA MTP path keeps a duplicated full target-KV
+    context and recomputes the sparse-attention indexer every draft step, so it runs
+    ~2x slower than no speculation (GLM-5.2 bench: 27 vs 45 tok/s, flat across draft
+    depth and 96-100% acceptance) -- the opposite of the vLLM/SGLang speedup on the
+    same model. Set UNSLOTH_MLA_MTP_ENABLED=1 to let Auto promote MLA MTP again once
+    that path is optimized upstream. Forced mtp / mtp+ngram ignore this gate."""
+    return os.environ.get("UNSLOTH_MLA_MTP_ENABLED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _extra_args_set_spec_type(extra_args: Optional[Iterable[str]]) -> bool:
@@ -1133,9 +1227,9 @@ class LlamaCppBackend:
     """Manages a llama-server subprocess for GGUF model inference.
 
     Lifecycle:
-        1. load_model() — start llama-server with the GGUF file
-        2. generate_chat_completion() — proxy to /v1/chat/completions, stream back
-        3. unload_model() — terminate the subprocess
+        1. load_model(): start llama-server with the GGUF file
+        2. generate_chat_completion(): proxy to /v1/chat/completions, stream back
+        3. unload_model(): terminate the subprocess
     """
 
     def __init__(self):
@@ -1171,11 +1265,15 @@ class LlamaCppBackend:
         self._supports_reasoning: bool = False
         self._reasoning_always_on: bool = False
         self._reasoning_style: str = "enable_thinking"
+        self._reasoning_effort_levels: list = []
         self._supports_preserve_thinking: bool = False
         self._supports_tools: bool = False
         self._cache_type_kv: Optional[str] = None
         # Whether --split-mode tensor was applied on the active load.
         self._tensor_parallel: bool = False
+        # Layer load kept multi-GPU only to honor a downgraded tensor request, so a
+        # later explicit tensor-off reloads instead of deduping to it (#6659).
+        self._layer_preserves_tensor_intent: bool = False
         self._reasoning_default: bool = True
         self._speculative_type: Optional[str] = None
         # Canonical UI-facing mode the user requested
@@ -1213,8 +1311,12 @@ class LlamaCppBackend:
         self._nextn_predict_layers: Optional[int] = None
         self._lock = threading.Lock()
         # Wraps load_model() end-to-end so concurrent loads serialise and never
-        # coexist as two llama-server processes (#5401).
-        self._serial_load_lock = threading.Lock()
+        # coexist as two llama-server processes (#5401). RLock so MTP-crash
+        # recovery can re-acquire it for its nested load_model.
+        self._serial_load_lock = threading.RLock()
+        # Serialises mid-session respawns so many generations hitting a killed
+        # server trigger at most one reload (see _respawn_if_dead).
+        self._respawn_lock = threading.Lock()
         # Set by the in-app updater while it swaps prebuilt binaries; load_model()
         # rejects fast so no server starts from a half-swapped binary.
         self._llama_update_in_progress = False
@@ -1225,6 +1327,18 @@ class LlamaCppBackend:
         self._extra_args: Optional[List[str]] = None
         self._extra_args_source: Optional[tuple[str, Optional[str]]] = None
         self._requested_n_ctx: int = 0
+        # Raw kwargs of the last healthy load, for the MTP-crash reload. Memory-only
+        # (carries hf_token, never logged); single-flight via the lock below.
+        self._last_load_kwargs: Optional[dict] = None
+        self._mtp_runtime_fallback_lock = threading.Lock()
+        self._mtp_runtime_fallback_in_progress = False
+        # Background watchdog so an MTP+tensor crash recovers even when no request
+        # observes it (direct proxy endpoints, or nothing in flight).
+        self._mtp_watchdog_thread: Optional[threading.Thread] = None
+        self._mtp_watchdog_stop = threading.Event()
+        # True when the launch actually runs MTP+tensor (Studio- or user/env-driven);
+        # gates the probe, watchdog, and recovery so pass-through MTP is covered.
+        self._mtp_runtime_fallback_active = False
         self._stdout_lines: list[str] = []
         self._stdout_thread: Optional[threading.Thread] = None
         # llama-server tee log (see _drain_stdout / _kill_process).
@@ -1266,6 +1380,12 @@ class LlamaCppBackend:
         return f"http://127.0.0.1:{self._port}"
 
     @property
+    def _auth_headers(self) -> "Optional[dict[str, str]]":
+        """Bearer header matching the --api-key direct-stream mode uses, else
+        None (so unauthenticated llama-server calls don't get a spurious 401)."""
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+
+    @property
     def model_identifier(self) -> Optional[str]:
         return self._model_identifier
 
@@ -1285,6 +1405,11 @@ class LlamaCppBackend:
     @property
     def gguf_path(self) -> Optional[str]:
         return self._gguf_path
+
+    @property
+    def hf_repo(self) -> Optional[str]:
+        """HF repo of the loaded model, or None for local/native file loads."""
+        return self._hf_repo
 
     @property
     def mtp_draft_path(self) -> Optional[str]:
@@ -1439,6 +1564,12 @@ class LlamaCppBackend:
         return self._reasoning_style
 
     @property
+    def reasoning_effort_levels(self) -> list:
+        """Discrete reasoning_effort levels the template offers (e.g. GLM-5.2's
+        ['high', 'max']). Empty unless reasoning_style == 'enable_thinking_effort'."""
+        return self._reasoning_effort_levels
+
+    @property
     def supports_preserve_thinking(self) -> bool:
         return self._supports_preserve_thinking
 
@@ -1447,6 +1578,10 @@ class LlamaCppBackend:
         return self._reasoning_default
 
     def _reasoning_kwargs(self, enable_thinking: bool) -> dict:
+        if self._reasoning_style == "enable_thinking_effort":
+            # GLM-5.2-style: enable_thinking is the on/off gate; when on, leave
+            # the template's default effort (max) in place.
+            return {"enable_thinking": enable_thinking}
         if self._reasoning_style == "reasoning_effort":
             return {"reasoning_effort": "high" if enable_thinking else "low"}
         return {"enable_thinking": enable_thinking}
@@ -1467,7 +1602,20 @@ class LlamaCppBackend:
         # Always-on reasoning models hardcode <think> tags and don't consume
         # enable_thinking / reasoning_effort -- skip.
         if self._supports_reasoning and not self._reasoning_always_on:
-            if self._reasoning_style == "reasoning_effort":
+            if self._reasoning_style == "enable_thinking_effort":
+                # GLM-5.2-style: enable_thinking gates thinking on/off, and the
+                # reasoning_effort level (e.g. 'high' | 'max') is only meaningful
+                # while thinking is on. Disabling is enable_thinking=false; a raw
+                # API caller can also disable via the OpenAI-style
+                # reasoning_effort="none" sentinel. We never coerce off into a
+                # 'low' effort the way gpt-oss does (those models genuinely
+                # cannot disable).
+                thinking_off = enable_thinking is False or reasoning_effort == "none"
+                if enable_thinking is not None or reasoning_effort == "none":
+                    kwargs["enable_thinking"] = not thinking_off
+                if not thinking_off and reasoning_effort in self._reasoning_effort_levels:
+                    kwargs["reasoning_effort"] = reasoning_effort
+            elif self._reasoning_style == "reasoning_effort":
                 if reasoning_effort in ("none", "low", "medium", "high"):
                     kwargs["reasoning_effort"] = reasoning_effort
                 elif reasoning_effort == "minimal":
@@ -1499,6 +1647,11 @@ class LlamaCppBackend:
         return self._tensor_parallel
 
     @property
+    def layer_preserves_tensor_intent(self) -> bool:
+        """True when a downgraded tensor request kept this layer load multi-GPU."""
+        return self._layer_preserves_tensor_intent
+
+    @property
     def speculative_type(self) -> Optional[str]:
         return self._speculative_type
 
@@ -1514,6 +1667,30 @@ class LlamaCppBackend:
         return self._spec_draft_n_max
 
     # ── Binary discovery ──────────────────────────────────────────
+
+    @staticmethod
+    def _resolved_studio_root_and_is_legacy() -> "tuple[Optional[Path], bool]":
+        """Resolve the Studio install root and classify it as the legacy
+        ~/.unsloth/studio root vs. a custom (env/venv-inferred) root.
+
+        Returns (resolved_root, is_legacy). On any import/resolution failure the
+        root is treated as legacy and resolved_root is None -- callers must read
+        resolved_root only when is_legacy is False. Shared by
+        _find_llama_server_binary (discovery) and _kill_orphaned_servers
+        (cleanup) so the two never disagree on which root is legacy.
+        """
+        try:
+            from utils.paths.storage_roots import studio_root as _sr  # noqa: WPS433
+
+            resolved = _sr()
+            legacy_studio = Path.home() / ".unsloth" / "studio"
+            try:
+                is_legacy = resolved.resolve() == legacy_studio.resolve()
+            except (OSError, ValueError):
+                is_legacy = resolved == legacy_studio
+            return (None if is_legacy else resolved), is_legacy
+        except (ImportError, OSError, ValueError):
+            return None, True
 
     @staticmethod
     def _find_llama_server_binary(*, include_denied: bool = False) -> Optional[str]:
@@ -1601,33 +1778,16 @@ class LlamaCppBackend:
         # 2-4. Match installer layout: env-mode -> $STUDIO_HOME/llama.cpp;
         # default/HOME-redirect -> ~/.unsloth/llama.cpp (sibling of studio).
         legacy_llama = Path.home() / ".unsloth" / "llama.cpp"
-        try:
-            from utils.paths.storage_roots import studio_root as _sr  # noqa: WPS433
-
-            _resolved_sr = _sr()
-            _legacy_studio = Path.home() / ".unsloth" / "studio"
-            try:
-                _is_legacy = _resolved_sr.resolve() == _legacy_studio.resolve()
-            except (OSError, ValueError):
-                _is_legacy = _resolved_sr == _legacy_studio
-            if _is_legacy:
-                search_roots = [legacy_llama]
-            else:
-                # _kill_orphaned_servers excludes the legacy root in custom
-                # mode; discovery must match so we never spawn a server we
-                # then refuse to clean up. UNSLOTH_LLAMA_CPP_PATH (handled
-                # earlier) is the explicit way to share a build across roots.
-                search_roots = [_resolved_sr / "llama.cpp"]
-        except (ImportError, OSError, ValueError):
+        _resolved_sr, _is_legacy = LlamaCppBackend._resolved_studio_root_and_is_legacy()
+        if _is_legacy:
             search_roots = [legacy_llama]
-        _seen_roots: set[str] = set()
-        _unique_roots: list[Path] = []
-        for r in search_roots:
-            k = str(r)
-            if k not in _seen_roots:
-                _seen_roots.add(k)
-                _unique_roots.append(r)
-        for unsloth_home in _unique_roots:
+        else:
+            # _kill_orphaned_servers excludes the legacy root in custom mode;
+            # discovery must match so we never spawn a server we then refuse to
+            # clean up. UNSLOTH_LLAMA_CPP_PATH (handled earlier) is the explicit
+            # way to share a build across roots.
+            search_roots = [_resolved_sr / "llama.cpp"]
+        for unsloth_home in search_roots:
             hit, locked = _scan_pinned(_layout_candidates(unsloth_home))
             if locked is not None:
                 return _unavailable(locked)
@@ -1716,6 +1876,7 @@ class LlamaCppBackend:
                 [bin_path, "--help"],
                 capture_output = True,
                 text = True,
+                errors = "replace",
                 timeout = 10,
                 check = False,
                 env = probe_env,
@@ -1849,11 +2010,42 @@ class LlamaCppBackend:
         return total
 
     @staticmethod
-    def _amd_apu_wants_unified_memory() -> bool:
+    def _resolve_visible_physical_ids() -> Optional[list[int]]:
+        """Physical GPU ids behind the active visibility mask (HIP/ROCR/CUDA on
+        ROCm, CUDA otherwise). None when no mask is set; empty list for an empty
+        mask. Shared by the APU / datacenter / free-memory probes so they agree
+        on the ordinal->physical mapping."""
+        try:
+            import torch
+            is_rocm = getattr(torch.version, "hip", None) is not None
+        except Exception:
+            is_rocm = False
+        if is_rocm:
+            hip_v = os.environ.get("HIP_VISIBLE_DEVICES")
+            rocr_v = os.environ.get("ROCR_VISIBLE_DEVICES")
+            cvd = (
+                hip_v
+                if hip_v is not None
+                else rocr_v
+                if rocr_v is not None
+                else os.environ.get("CUDA_VISIBLE_DEVICES")
+            )
+        else:
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cvd is None:
+            return None
+        try:
+            return [int(x.strip()) for x in cvd.split(",") if x.strip()]
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _amd_apu_wants_unified_memory(gpu_indices = None) -> bool:
         """True only for AMD unified-memory APUs (gfx1150/gfx1151), where
-        GGML_CUDA_ENABLE_UNIFIED_MEMORY lets llama.cpp use shared system RAM.
-        False elsewhere (the env hurts discrete GPUs). ROCm reuses torch.cuda.*;
-        gcnArchName suffix is stripped."""
+        GGML_CUDA_ENABLE_UNIFIED_MEMORY lets llama.cpp use shared system RAM (it
+        hurts discrete GPUs). gpu_indices (PHYSICAL ids) scopes the check to the
+        selected GPUs, so a dGPU on a mixed host is not treated as unified-memory;
+        None means every visible GPU."""
         try:
             import torch
 
@@ -1861,12 +2053,25 @@ class LlamaCppBackend:
                 return False
             if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
                 return False
-            for _i in range(torch.cuda.device_count()):
+            # Map visible ordinal -> physical id via the active ROCm mask (HIP,
+            # then ROCR, then CUDA), mirroring _get_gpu_memory's ROCm branch.
+            physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
+            arch_by_id: dict[int, str] = {}
+            for ordinal in range(torch.cuda.device_count()):
                 try:
-                    _arch = getattr(torch.cuda.get_device_properties(_i), "gcnArchName", "") or ""
+                    _arch = (
+                        getattr(torch.cuda.get_device_properties(ordinal), "gcnArchName", "") or ""
+                    )
                 except Exception:
                     continue
-                if _arch.split(":")[0].strip().lower() in {"gfx1150", "gfx1151"}:
+                pid = (
+                    physical_ids[ordinal]
+                    if physical_ids is not None and ordinal < len(physical_ids)
+                    else ordinal
+                )
+                arch_by_id[pid] = _arch.split(":")[0].strip().lower()
+            for _i in list(gpu_indices) if gpu_indices is not None else list(arch_by_id):
+                if arch_by_id.get(_i) in {"gfx1150", "gfx1151"}:
                     return True
         except Exception:
             return False
@@ -1902,13 +2107,7 @@ class LlamaCppBackend:
 
             # Mirror _get_gpu_free_memory: map visible ordinal -> physical id via
             # CUDA_VISIBLE_DEVICES; unset/unparsable leaves physical id == ordinal.
-            physical_ids: Optional[list[int]] = None
-            cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if cvd is not None:
-                try:
-                    physical_ids = [int(x.strip()) for x in cvd.split(",") if x.strip()]
-                except ValueError:
-                    physical_ids = None
+            physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
 
             pattern = LlamaCppBackend._DATACENTER_GPU_RE
             names_by_id: dict[int, str] = {}
@@ -1977,6 +2176,34 @@ class LlamaCppBackend:
         index; empty if no supported GPU is reachable. Thin wrapper over
         ``_get_gpu_memory`` for callers that only need free VRAM."""
         return [(idx, free) for idx, free, _total in LlamaCppBackend._get_gpu_memory()]
+
+    @staticmethod
+    def _apple_metal_memory_budget_bytes() -> int:
+        """Unified-memory budget for GGUF context fitting on Apple Silicon.
+
+        No GPU is enumerated on Metal, so the context would default to native and
+        over-commit unified memory ("Compute error." at decode, #5118/#6529). Use a
+        fraction of MLX's Metal working-set, else total RAM; 0 off Apple Silicon or
+        when unresolvable, so callers skip the cap.
+        """
+        from utils.hardware import is_apple_silicon
+
+        if not is_apple_silicon():
+            return 0
+        rec_bytes = 0
+        try:
+            import mlx.core as mx
+            if mx.metal.is_available():
+                rec_bytes = int(mx.device_info().get("max_recommended_working_set_size") or 0)
+        except Exception:
+            rec_bytes = 0
+        if rec_bytes <= 0:
+            try:
+                import psutil
+                rec_bytes = int(psutil.virtual_memory().total)
+            except Exception:
+                return 0
+        return int(rec_bytes * _APPLE_UNIFIED_MEMORY_FRACTION)
 
     @staticmethod
     def _get_gpu_memory() -> list[tuple[int, int, int]]:
@@ -2062,29 +2289,12 @@ class LlamaCppBackend:
             # feed these IDs back into the subprocess as CVD, so visible ordinals
             # must be translated to physical indices first; otherwise CVD=2,3
             # gets rewritten to 0,1 and targets the wrong GPUs.
-            physical_ids: Optional[list[int]] = None
             # Match utils/hardware/hardware.py::_get_parent_visible_gpu_spec:
             # treat an empty mask (HIP_VISIBLE_DEVICES="") as "no GPUs" rather
             # than falling through. ``or`` would coerce "" to the wrong source.
-            if getattr(torch.version, "hip", None) is not None:
-                hip_v = os.environ.get("HIP_VISIBLE_DEVICES")
-                rocr_v = os.environ.get("ROCR_VISIBLE_DEVICES")
-                cvd = (
-                    hip_v
-                    if hip_v is not None
-                    else rocr_v
-                    if rocr_v is not None
-                    else os.environ.get("CUDA_VISIBLE_DEVICES")
-                )
-            else:
-                cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if cvd is not None:
-                try:
-                    # Empty mask (CVD="") yields an empty list -> no GPUs,
-                    # consistent with the nvidia-smi path.
-                    physical_ids = [int(x.strip()) for x in cvd.split(",") if x.strip()]
-                except ValueError:
-                    physical_ids = None
+            # Empty mask (CVD="") yields an empty list -> no GPUs, consistent
+            # with the nvidia-smi path.
+            physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
             gpus = []
             for ordinal in range(torch.cuda.device_count()):
                 free_bytes, total_bytes = torch.cuda.mem_get_info(ordinal)
@@ -2099,6 +2309,48 @@ class LlamaCppBackend:
         except Exception as e:
             logger.debug(f"torch GPU probe failed: {e}")
             return []
+
+    @staticmethod
+    def _available_system_memory_mib() -> Optional[int]:
+        """Available system RAM in MiB (psutil, then /proc/meminfo), or None if
+        neither is readable. On a unified-memory APU this, not the ROCm-reported
+        VRAM, is the real ceiling: the weights load into shared system RAM."""
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available // (1024 * 1024))
+        except Exception:
+            pass
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024  # kB -> MiB
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _apu_ram_shortfall_message(
+        model_size_bytes: int,
+        avail_mib: Optional[int],
+        headroom_mib: int = 2048,
+    ) -> Optional[str]:
+        """On a unified-memory APU, return a user-facing refusal when the weights
+        cannot fit in available system RAM (else None). Weights only: KV/context
+        auto-reduce, so counting them too would refuse loads that would succeed.
+        None avail (unknown RAM) never refuses."""
+        if avail_mib is None:
+            return None
+        need_mib = model_size_bytes / (1024 * 1024)
+        if need_mib <= avail_mib - headroom_mib:
+            return None
+        return (
+            f"This model needs about {need_mib / 1024:.0f} GB but only about "
+            f"{avail_mib / 1024:.0f} GB of memory is available. On a unified-memory "
+            "APU the weights load into system RAM, so a larger model is stopped by "
+            "the OS mid-load. Use a smaller or more quantized GGUF, or free memory "
+            "(on WSL, raise the memory limit in .wslconfig)."
+        )
 
     # Skip the wait when the last kill is older than this; the driver has
     # already reclaimed the prior process's allocations.
@@ -2185,6 +2437,37 @@ class LlamaCppBackend:
     # KV cache types llama.cpp accepts in tensor mode. A quantized KV cache
     # aborts a --split-mode tensor load, so it's dropped for the tensor attempt.
     _TENSOR_PARALLEL_KV_TYPES = frozenset({"f16", "bf16", "f32"})
+
+    # (binary, mtime, model) that aborted on --split-mode tensor this process (#6415
+    # geometry limit, e.g. MQA n_head_kv=1). Model-keyed so one model's abort doesn't
+    # skip tensor for others; tensor is tried by default, recorded only on a real abort.
+    _tensor_split_abort_keys: set[tuple[str, int, str]] = set()
+
+    @classmethod
+    def _tensor_split_cache_key(
+        cls, binary: Optional[str], model: Optional[str]
+    ) -> Optional[tuple[str, int, str]]:
+        """(path, mtime_ns, model) key; ns mtime re-probes a same-second binary swap."""
+        if not binary or not model:
+            return None
+        try:
+            mtime = Path(binary).stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        return (binary, mtime, model)
+
+    @classmethod
+    def _tensor_split_aborts(cls, binary: Optional[str], model: Optional[str]) -> bool:
+        """True if (binary, model) aborted on --split-mode tensor this session."""
+        key = cls._tensor_split_cache_key(binary, model)
+        return key is not None and key in cls._tensor_split_abort_keys
+
+    @classmethod
+    def _record_tensor_split_abort(cls, binary: Optional[str], model: Optional[str]) -> None:
+        """Remember a (binary, model) that aborts on --split-mode tensor."""
+        key = cls._tensor_split_cache_key(binary, model)
+        if key is not None:
+            cls._tensor_split_abort_keys.add(key)
 
     @staticmethod
     def _windows_pip_nvidia_dll_dirs(prefix: str) -> list[str]:
@@ -2281,8 +2564,7 @@ class LlamaCppBackend:
 
             lib_dirs = []
             # WSL: system HIP before the bundle's (which segfaults on /dev/dxg).
-            for _wsl_rocm in _wsl_system_rocm_lib_dirs():
-                lib_dirs.append(_wsl_rocm)
+            lib_dirs.extend(_wsl_system_rocm_lib_dirs())
             if lib_dirs:
                 env.setdefault("HSA_ENABLE_DXG_DETECTION", "1")
             lib_dirs.append(binary_dir)
@@ -2294,33 +2576,8 @@ class LlamaCppBackend:
             import glob as _glob
 
             for _nv_pattern in [
-                os.path.join(
-                    sys.prefix,
-                    "lib",
-                    "python*",
-                    "site-packages",
-                    "nvidia",
-                    "cu*",
-                    "lib",
-                ),
-                os.path.join(
-                    sys.prefix,
-                    "lib",
-                    "python*",
-                    "site-packages",
-                    "nvidia",
-                    "cudnn",
-                    "lib",
-                ),
-                os.path.join(
-                    sys.prefix,
-                    "lib",
-                    "python*",
-                    "site-packages",
-                    "nvidia",
-                    "nvjitlink",
-                    "lib",
-                ),
+                os.path.join(sys.prefix, "lib", "python*", "site-packages", "nvidia", _sub, "lib")
+                for _sub in ("cu*", "cudnn", "nvjitlink")
             ]:
                 for _nv_dir in _glob.glob(_nv_pattern):
                     if os.path.isdir(_nv_dir):
@@ -2351,8 +2608,12 @@ class LlamaCppBackend:
         usable_fraction: Optional[float] = None,
         total_by_idx: Optional[dict[int, int]] = None,
         per_device_overhead_bytes: int = 0,
+        min_gpus: int = 1,
     ) -> tuple[Optional[list[int]], bool]:
         """Pick GPU(s) for a model from estimated VRAM and free memory.
+
+        ``min_gpus`` (default 1, capped at ``len(gpus)``) keeps a downgraded
+        tensor/multi-GPU request spread instead of collapsing to one card.
 
         ``model_size_bytes`` should include weights and estimated KV cache.
         ``usable_fraction`` (default ``_GPU_PIN_VRAM_FRACTION``) provides
@@ -2372,9 +2633,11 @@ class LlamaCppBackend:
         if not gpus:
             return None, True
 
+        min_gpus = max(1, min(min_gpus, len(gpus)))
         model_size_mib = model_size_bytes / (1024 * 1024)
         if usable_fraction is None:
             usable_fraction = LlamaCppBackend._GPU_PIN_VRAM_FRACTION
+        overhead_mib = per_device_overhead_bytes / (1024 * 1024)
 
         # Per-GPU usable budget: free - (1-frac)*total when total is known, else
         # the legacy free*frac (also covers a total-0 two-column probe).
@@ -2388,19 +2651,26 @@ class LlamaCppBackend:
         # card can have less usable room than a less-used small one.
         ranked = sorted(gpus, key = lambda g: _usable(g[0], g[1]), reverse = True)
 
-        # Try 1 GPU at the usable-VRAM threshold.
-        if _usable(ranked[0][0], ranked[0][1]) >= model_size_mib:
+        # Cap a downgraded multi-GPU request to the usable count so it doesn't pull
+        # in a near-full card to hit min_gpus. No-op for the default min_gpus == 1.
+        usable_count = sum(1 for idx, free_mib in ranked if _usable(idx, free_mib) > overhead_mib)
+        min_gpus = max(1, min(min_gpus, usable_count or 1))
+
+        # Try 1 GPU at the usable-VRAM threshold (only when one device is allowed).
+        if min_gpus <= 1 and _usable(ranked[0][0], ranked[0][1]) >= model_size_mib:
             return [ranked[0][0]], False
 
-        # Try N GPUs (accumulate usable memory from most-free). Each GPU past the
-        # first adds a fixed per-device overhead the pool must hold.
-        overhead_mib = per_device_overhead_bytes / (1024 * 1024)
+        # Try N GPUs (most-free first); each past the first adds per-device overhead.
+        # Require at least min_gpus devices before accepting a fit.
         cumulative = 0.0
         selected = []
         for idx, free_mib in ranked:
             selected.append(idx)
             cumulative += _usable(idx, free_mib)
-            if cumulative >= model_size_mib + (len(selected) - 1) * overhead_mib:
+            if (
+                len(selected) >= min_gpus
+                and cumulative >= model_size_mib + (len(selected) - 1) * overhead_mib
+            ):
                 return sorted(selected), False
 
         # Too large even for all GPUs; let --fit handle it
@@ -2434,6 +2704,12 @@ class LlamaCppBackend:
         if self._n_kv_heads_by_layer is not None and layer_idx < len(self._n_kv_heads_by_layer):
             return self._n_kv_heads_by_layer[layer_idx]
         return fallback
+
+    def _legacy_head_dim(self) -> int:
+        """Head-dim fallback for GGUFs without explicit key/value dims. Reached
+        only via the legacy branch of _can_estimate_kv(), so _embedding_length
+        is non-None here."""
+        return self._embedding_length // self._n_heads if self._n_heads else 128  # type: ignore[operator]
 
     def _estimate_kv_cache_bytes(
         self,
@@ -2498,7 +2774,7 @@ class LlamaCppBackend:
             n_attn = -(-n_layers // fai) if fai > 0 else n_layers  # ceiling division
             if key_len is not None and val_len is not None:
                 return int(n_attn * n_ctx * n_kv * (key_len + val_len) * bpe)
-            head_dim = self._embedding_length // self._n_heads if self._n_heads else 128  # type: ignore[operator]
+            head_dim = self._legacy_head_dim()
             return int(n_attn * n_ctx * n_kv * 2 * head_dim * bpe)
 
         # Path 3: Sliding window (Gemma 2/3/3n/4, gpt-oss, Cohere2 ...). Pattern
@@ -2565,7 +2841,7 @@ class LlamaCppBackend:
             return int(n_layers_kv * n_ctx * n_kv * (key_len + val_len) * bpe)
 
         # Path 5: Legacy fallback (old GGUFs without explicit dimensions)
-        head_dim = self._embedding_length // self._n_heads if self._n_heads else 128  # type: ignore[operator]
+        head_dim = self._legacy_head_dim()
         return int(2 * n_kv * head_dim * n_layers_kv * n_ctx * bpe)
 
     def _draft_backend_for(self, drafter_path: str) -> Optional["LlamaCppBackend"]:
@@ -2658,11 +2934,16 @@ class LlamaCppBackend:
         drafter_path: Optional[str] = None,
         draft_weights_bytes: int = 0,
         n_parallel: int = 1,
+        mtp_keeps_target_ctx: bool = True,
     ) -> Optional[int]:
         """MTP draft reserve at ``n_ctx`` = draft KV (grows with ctx) + separate-
-        drafter weights. The verify buffer rides in the ctx-fit headroom (no tuned
-        constant). None when the draft KV can't be sized (caller keeps the flat
-        fallback). ``draft_weights_bytes`` is the drafter file size (0 for embedded)."""
+        drafter weights + (MTP + MLA only) a duplicated target KV context. The
+        verify buffer rides in the ctx-fit headroom (no tuned constant). None when
+        the draft KV can't be sized (caller keeps the flat fallback).
+        ``draft_weights_bytes`` is the drafter file size (0 for embedded).
+        ``mtp_keeps_target_ctx`` is True for MTP draft modes (which keep the
+        duplicated target context) and False for separate-drafter spec modes
+        (draft-simple/draft-eagle3), which do not."""
         draft_kv = self._mtp_draft_kv_bytes(
             n_ctx,
             drafter_path = drafter_path,
@@ -2671,13 +2952,28 @@ class LlamaCppBackend:
             n_parallel = n_parallel,
         )
         weights = max(0, draft_weights_bytes)
+        # MLA models (GLM-5.x, DeepSeek, Kimi-K2) under MTP keep a *second* full copy
+        # of the target model's KV context for draft verification -- llama.cpp's
+        # `ctx_tgt=yes` -- allocated at f16 regardless of the main cache type. It is
+        # ~the main KV again and dwarfs the embedded draft head (GLM-5.2 @ 1M ctx:
+        # a ~2 GiB head next to a ~89 GiB target copy), so omitting it lets auto-fit
+        # pick a context that fits on paper but OOMs cublasCreate at the first
+        # decode. Gated on both MLA (kv_lora_rank present) and the engaged mode
+        # actually being MTP: non-MLA MTP (Qwen/Gemma) keeps no such copy, and the
+        # separate-drafter spec modes (draft-simple/draft-eagle3) load a small
+        # distinct drafter with its own KV -- already counted in draft_kv/weights --
+        # rather than duplicating the target, so they must not be charged for it.
+        target_ctx_copy = 0
+        if mtp_keeps_target_ctx and self._kv_lora_rank is not None:
+            target_ctx_copy = self._estimate_kv_cache_bytes(n_ctx, "f16", n_parallel = n_parallel)
         if draft_kv is None:
-            # KV unsized (exotic/remote drafter): still reserve known weights so a
-            # large drafter can't launch over budget (the small unsized KV rides in
-            # the cushion). Nothing known -> None, so the caller keeps the flat
-            # fallback.
-            return weights if weights > 0 else None
-        return draft_kv + weights
+            # KV unsized (exotic/remote drafter): still reserve known weights + any
+            # MLA target copy so a large config can't launch over budget (the small
+            # unsized draft KV rides in the cushion). Nothing known -> None, so the
+            # caller keeps the flat fallback.
+            total = weights + target_ctx_copy
+            return total if total > 0 else None
+        return draft_kv + weights + target_ctx_copy
 
     _DEFAULT_N_UBATCH = 512  # llama.cpp --ubatch default; Studio does not override it
     _COMPUTE_BUFFER_SAFETY = 1.15  # upper-bound margin on the compute-buffer estimate
@@ -2782,7 +3078,7 @@ class LlamaCppBackend:
         if model_footprint + kv + _mtp_at(requested_ctx) <= budget_bytes:
             return requested_ctx
 
-        # Weights alone exceed budget -- reducing ctx can't help; --fit handles it.
+        # Weights + compute buffer alone exceed budget -- reducing ctx can't help.
         if model_footprint >= budget_bytes:
             logger.debug(
                 "Model footprint exceeds GPU budget before KV cache",
@@ -2903,9 +3199,10 @@ class LlamaCppBackend:
                         except (ValueError, OSError):
                             # Log file closed under us; tee silently.
                             pass
-        except (ValueError, OSError):
-            # Pipe closed -- process terminating.
-            pass
+        except Exception:
+            # Never let the drain thread die: a full stdout pipe can deadlock
+            # llama-server (Windows). Pipe-closed on exit is the common case.
+            logger.debug("llama-server stdout drain stopped", exc_info = True)
 
     # GGUF KV type sizes for fast skipping
     _GGUF_TYPE_SIZE = {
@@ -2971,6 +3268,7 @@ class LlamaCppBackend:
         self._supports_reasoning = False
         self._reasoning_always_on = False
         self._reasoning_style = "enable_thinking"
+        self._reasoning_effort_levels = []
         self._reasoning_default = True
         self._supports_preserve_thinking = False
         self._supports_tools = False
@@ -3108,8 +3406,8 @@ class LlamaCppBackend:
                                 attr = arch_keys.get(key)
                                 if attr == "n_kv_heads" and val_a is not None:
                                     self._n_kv_heads_by_layer = [int(x) for x in val_a]
-                                    if self._n_kv_heads is None and val_a:
-                                        self._n_kv_heads = max(int(x) for x in val_a)
+                                    if self._n_kv_heads is None and self._n_kv_heads_by_layer:
+                                        self._n_kv_heads = max(self._n_kv_heads_by_layer)
                                 elif attr == "sliding_window_pattern" and val_a is not None:
                                     self._sliding_window_pattern = [bool(x) for x in val_a]
                                     sliding_window_pattern_period = None
@@ -3190,6 +3488,7 @@ class LlamaCppBackend:
                 )
                 self._supports_reasoning = flags["supports_reasoning"]
                 self._reasoning_style = flags["reasoning_style"]
+                self._reasoning_effort_levels = flags.get("reasoning_effort_levels", [])
                 self._reasoning_always_on = flags["reasoning_always_on"]
                 self._supports_preserve_thinking = flags["supports_preserve_thinking"]
                 self._supports_tools = flags["supports_tools"]
@@ -3207,8 +3506,6 @@ class LlamaCppBackend:
         alongside llama-server. Returns None if neither can be found.
         """
         import importlib.util
-        import os
-        import sys
 
         # Visual-server binary: env override, else next to llama-server or in the
         # install's build/bin (where the prebuilt/installer puts it). .exe on Windows.
@@ -3268,8 +3565,6 @@ class LlamaCppBackend:
         visual decoder) and wait for health. Presents the same /v1 + /health
         interface as llama-server, so the rest of Studio is unchanged.
         """
-        import os
-
         assets = self._find_diffusion_assets()
         if assets is None:
             raise RuntimeError(
@@ -3329,28 +3624,16 @@ class LlamaCppBackend:
         except OSError as e:
             logger.debug(f"Could not open diffusion runner log file: {e}")
 
-        # PR_SET_PDEATHSIG: the shim (and its visual server) die with this backend
-        # process, so a Studio crash/restart never orphans a GPU process.
-        popen_kwargs = dict(_windows_hidden_subprocess_kwargs())
-        if sys.platform.startswith("linux"):  # prctl/libc.so.6 are Linux-only
-
-            def _pdeathsig():
-                try:
-                    import ctypes
-                    import signal as _signal
-                    ctypes.CDLL("libc.so.6", use_errno = True).prctl(1, _signal.SIGTERM)
-                except Exception:
-                    pass
-
-            popen_kwargs["preexec_fn"] = _pdeathsig
-
+        # The shim (and its visual server) die with this backend process, so a
+        # Studio crash/restart never orphans a GPU process.
         self._process = subprocess.Popen(
             cmd,
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
             text = True,
             env = env,
-            **popen_kwargs,
+            **_windows_hidden_subprocess_kwargs(),
+            **_child_popen_kwargs(),
         )
         self._stdout_thread = threading.Thread(
             target = self._drain_stdout, daemon = True, name = "diffusion-stdout"
@@ -3390,9 +3673,8 @@ class LlamaCppBackend:
             # (auto-sized to VRAM). Read it back so the UI context bar shows the real budget.
             chosen = maxtok
             try:
-                import re as _re
                 for _ln in reversed(self._stdout_lines):
-                    _m = _re.search(r"MAXTOK=(\d+)", _ln)
+                    _m = re.search(r"MAXTOK=(\d+)", _ln)
                     if _m:
                         chosen = int(_m.group(1))
                         break
@@ -3415,12 +3697,22 @@ class LlamaCppBackend:
         hf_repo: str,
         hf_variant: Optional[str] = None,
         hf_token: Optional[str] = None,
+        force: bool = False,
+        allow_smaller_fallback: bool = True,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         """Download GGUF file(s) from HuggingFace. Returns local path.
 
         Runs WITHOUT self._lock so unload_model() can set _cancel_event at
         any time; checks it between each shard download.
+
+        ``force`` re-fetches even when a (possibly stale) blob is cached.
+        ``allow_smaller_fallback=False`` raises on low disk instead of silently
+        switching to a smaller quant. ``cancel_event`` overrides
+        ``self._cancel_event`` so an update can use a private event without
+        touching the shared one; defaults to the shared event.
         """
+        cancel_event = cancel_event if cancel_event is not None else self._cancel_event
         try:
             import huggingface_hub  # noqa: F401 -- presence check only
         except ImportError:
@@ -3486,21 +3778,22 @@ class LlamaCppBackend:
             # cold whenever free disk is below the full weight footprint,
             # even though nothing needs downloading.
             already_cached_bytes = 0
-            for p in path_infos:
-                if not p.size:
-                    continue
-                try:
-                    cached_path = try_to_load_from_cache(hf_repo, p.path)
-                except Exception:
-                    cached_path = None
-                if isinstance(cached_path, str) and os.path.exists(cached_path):
+            if not force:
+                for p in path_infos:
+                    if not p.size:
+                        continue
                     try:
-                        on_disk = os.path.getsize(cached_path)
-                    except OSError:
-                        on_disk = 0
-                    # Satisfied only when the full blob is present.
-                    if on_disk >= p.size:
-                        already_cached_bytes += p.size
+                        cached_path = try_to_load_from_cache(hf_repo, p.path)
+                    except Exception:
+                        cached_path = None
+                    if isinstance(cached_path, str) and os.path.exists(cached_path):
+                        try:
+                            on_disk = os.path.getsize(cached_path)
+                        except OSError:
+                            on_disk = 0
+                        # Satisfied only when the full blob is present.
+                        if on_disk >= p.size:
+                            already_cached_bytes += p.size
 
             total_download_bytes = max(0, total_bytes - already_cached_bytes)
 
@@ -3523,6 +3816,13 @@ class LlamaCppBackend:
                 )
 
                 if total_download_bytes > free_bytes:
+                    if not allow_smaller_fallback:
+                        # Update path: never silently switch to a smaller quant;
+                        # surface the disk shortfall for the requested variant.
+                        raise RuntimeError(
+                            f"Not enough disk space to download {gguf_filename}. "
+                            f"Only {free_gb:.1f} GB free in {cache_dir}"
+                        )
                     smaller = self._find_smallest_fitting_variant(
                         hf_repo,
                         free_bytes,
@@ -3563,7 +3863,7 @@ class LlamaCppBackend:
         )
         logger.info(f"Resolving GGUF: {gguf_label}")
         try:
-            if self._cancel_event.is_set():
+            if cancel_event.is_set():
                 raise RuntimeError("Cancelled")
             dl_start = time.monotonic()
             # Xet primary, HTTP fallback on stall; per-file so finished shards stay cached.
@@ -3571,26 +3871,24 @@ class LlamaCppBackend:
                 hf_repo,
                 gguf_filename,
                 hf_token,
-                cancel_event = self._cancel_event,
+                cancel_event = cancel_event,
                 on_status = lambda m: logger.info(m),
+                force_download = force,
             )
             for shard in gguf_extra_shards:
-                if self._cancel_event.is_set():
+                if cancel_event.is_set():
                     raise RuntimeError("Cancelled")
                 logger.info(f"Resolving GGUF shard: {shard}")
                 hf_hub_download_with_xet_fallback(
                     hf_repo,
                     shard,
                     hf_token,
-                    cancel_event = self._cancel_event,
+                    cancel_event = cancel_event,
+                    force_download = force,
                 )
-        except RuntimeError as e:
-            if "Cancelled" in str(e):
-                raise
-            raise RuntimeError(
-                f"Failed to download GGUF file '{gguf_filename}' from {hf_repo}: {e}"
-            )
         except Exception as e:
+            if isinstance(e, RuntimeError) and "Cancelled" in str(e):
+                raise
             raise RuntimeError(
                 f"Failed to download GGUF file '{gguf_filename}' from {hf_repo}: {e}"
             )
@@ -3609,6 +3907,7 @@ class LlamaCppBackend:
         hf_token: Optional[str],
         pick: Callable[[list[str]], Optional[str]],
         label: str,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
         """Resolve and fetch a companion GGUF (mmproj / MTP drafter) by name.
 
@@ -3616,16 +3915,38 @@ class LlamaCppBackend:
         (offline, same fallback as _download_gguf), then hf_hub_download.
         Runs WITHOUT self._lock (like _download_gguf); honors _cancel_event so
         an /unload between the main download and here skips the fetch.
+        ``cancel_event`` overrides ``self._cancel_event`` (defaults to it).
         """
-        if self._cancel_event.is_set():
+        cancel_event = cancel_event if cancel_event is not None else self._cancel_event
+        if cancel_event.is_set():
             return None
 
         target: Optional[str] = None
-        try:
-            from huggingface_hub import list_repo_files
-            target = pick(list_repo_files(hf_repo, token = hf_token))
-        except Exception as e:
-            logger.debug(f"Could not list repo files for {label}: {e}")
+        from huggingface_hub import list_repo_files
+
+        # Retry a transient listing blip; permanent repo/auth errors and offline
+        # mode are not retried (offline raises at once -> fall through to cache).
+        for attempt in range(3):
+            if cancel_event.is_set():
+                return None
+            try:
+                target = pick(list_repo_files(hf_repo, token = hf_token))
+                break
+            except Exception as e:
+                if type(e).__name__ in (
+                    "RepositoryNotFoundError",
+                    "GatedRepoError",
+                    "RevisionNotFoundError",
+                    "EntryNotFoundError",
+                    "OfflineModeIsEnabled",
+                ):
+                    logger.debug(f"Could not list repo files for {label}: {e}")
+                    break
+                logger.debug(
+                    f"Could not list repo files for {label} (attempt {attempt + 1}/3): {e}"
+                )
+                if attempt < 2:
+                    cancel_event.wait(2**attempt)
 
         if target is None:
             try:
@@ -3639,7 +3960,7 @@ class LlamaCppBackend:
             except Exception as e:
                 logger.debug(f"Offline cache lookup for {label} failed: {e}")
 
-        if target is None or self._cancel_event.is_set():
+        if target is None or cancel_event.is_set():
             return None
 
         try:
@@ -3649,7 +3970,7 @@ class LlamaCppBackend:
                 hf_repo,
                 target,
                 hf_token,
-                cancel_event = self._cancel_event,
+                cancel_event = cancel_event,
             )
         except Exception as e:
             logger.warning(f"Could not download {label}: {e}")
@@ -3660,11 +3981,13 @@ class LlamaCppBackend:
         *,
         hf_repo: str,
         hf_token: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
         """Download the mmproj (vision projection) file from a GGUF repo.
 
         Prefers mmproj-F16.gguf, else any mmproj*.gguf. Returns the local
-        path, or None if none exists.
+        path, or None if none exists. ``cancel_event`` overrides
+        ``self._cancel_event`` (defaults to it).
         """
 
         def _pick_mmproj(candidates: list[str]) -> Optional[str]:
@@ -3685,6 +4008,7 @@ class LlamaCppBackend:
             hf_token = hf_token,
             pick = _pick_mmproj,
             label = "mmproj",
+            cancel_event = cancel_event,
         )
 
     def _download_mtp(
@@ -3796,7 +4120,10 @@ class LlamaCppBackend:
 
     @staticmethod
     def _classify_llama_start_failure(
-        output: str, gguf_path: Optional[str], model_identifier: Optional[str]
+        output: str,
+        gguf_path: Optional[str],
+        model_identifier: Optional[str],
+        returncode: Optional[int] = None,
     ) -> str:
         """Explain *why* llama-server failed to start, from its output.
 
@@ -3867,6 +4194,24 @@ class LlamaCppBackend:
                     "different model, or use this model directly through "
                     "Ollama instead."
                 )
+
+        # SIGKILL with no diagnostic output is the OOM killer (e.g. a model too
+        # large for the WSL VM's RAM cap); name it actionably.
+        if returncode == -9:
+            return (
+                "llama-server was stopped by the operating system (signal 9), "
+                "most likely out of memory. Try a smaller or more quantized "
+                "GGUF, lower the context length, or free memory (on WSL, raise "
+                "the memory limit in .wslconfig)."
+            )
+        # SIGTERM is also how an unload/cancel or a supervisor stops the server,
+        # so report it neutrally rather than blaming memory.
+        if returncode == -15:
+            return (
+                "llama-server was terminated (signal 15) before it became "
+                "healthy. If you cancelled or unloaded the model this is "
+                "expected; otherwise check the llama-server log for the cause."
+            )
 
         # Fallback: genuinely unknown failure (OOM, missing binary ...).
         return (
@@ -4047,6 +4392,96 @@ class LlamaCppBackend:
         )
 
     @staticmethod
+    def _output_has_nonprojector_diagnostic(output: str) -> bool:
+        """True when the output already names a concrete non-projector cause (out
+        of memory, an unsupported architecture, a tensor-parallel limit). A hard
+        crash carrying such a marker must surface that error, not be silently
+        retried text-only as if the vision projector were at fault; a bare crash
+        with no marker still gets the text-only retry.
+        """
+        text = (output or "").lower()
+        return any(
+            m in text
+            for m in (
+                "out of memory",
+                "failed to allocate",
+                "unknown model architecture",
+                "split_mode_tensor not implemented",
+            )
+        )
+
+    @staticmethod
+    def _is_tensor_split_assert(output: str) -> bool:
+        """True only for the #6415 split-axis warmup assert (GGML_BACKEND_SPLIT_AXIS_*),
+        not any ggml assert/abort, so an unrelated invariant isn't cached. stderr is
+        merged into output."""
+        text = (output or "").lower()
+        if "ggml_assert" not in text and "ggml_abort" not in text:
+            return False
+        # the split-axis enum token, unique to this assert (not the source file).
+        return "split_axis" in text
+
+    @staticmethod
+    def _is_signal_crash(returncode: Optional[int]) -> bool:
+        """True only on a hard fault (SIGSEGV/SIGABRT/SIGILL/SIGFPE/SIGBUS or a
+        Windows 0xC0000000+ status), not SIGKILL/SIGTERM/SIGINT (OOM killer /
+        unload) nor a clean exit or still-running (None) process.
+        """
+        if returncode is None:
+            return False
+        if returncode >= 0xC0000000:  # Windows access violation / illegal instruction
+            return True
+        return -returncode in (4, 6, 7, 8, 11)  # SIGILL SIGABRT SIGBUS SIGFPE SIGSEGV
+
+    @staticmethod
+    def _is_abort_exit(returncode: Optional[int]) -> bool:
+        """Windows CRT abort() exit code (3) from GGML_ASSERT on MSVC -- not a POSIX
+        signal or 0xC0000000+ NTSTATUS."""
+        return returncode == 3
+
+    @classmethod
+    def _should_record_tensor_split_abort(cls, returncode: Optional[int], output: str) -> bool:
+        """The #6415 split-axis abort: the marker plus a hard crash (POSIX signal or
+        Windows abort exit). Marker required so a generic crash isn't cached."""
+        return cls._is_tensor_split_assert(output) and (
+            cls._is_signal_crash(returncode) or cls._is_abort_exit(returncode)
+        )
+
+    @staticmethod
+    def _with_flash_attn_off(cmd: list[str]) -> Optional[list[str]]:
+        """Return cmd with flash attention forced off, or None when its effective
+        (last-wins) value is already off/absent so there is nothing to retry. FA
+        kernels hard-crash at startup on some ROCm builds; disabling FA keeps
+        vision and MTP, the least destructive rung. A bare --flash-attn/-fa reads
+        as on, so it counts toward the effective value and is neutralised too;
+        every form is flipped in place (length preserved for downstream slices)."""
+        out = list(cmd)
+
+        def explicit(i):
+            nxt = out[i + 1] if i + 1 < len(out) else None
+            return nxt if nxt in ("on", "auto", "off") else None
+
+        effective = None
+        for i, tok in enumerate(out):
+            if tok.startswith(("--flash-attn=", "-fa=")):
+                effective = tok.partition("=")[2]
+            elif tok in ("--flash-attn", "-fa"):
+                effective = explicit(i) or "on"
+        if effective not in ("on", "auto"):
+            return None
+        for i, tok in enumerate(out):
+            if tok.startswith(("--flash-attn=", "-fa=")):
+                flag, _, value = tok.partition("=")
+                if value in ("on", "auto"):
+                    out[i] = f"{flag}=off"
+            elif tok in ("--flash-attn", "-fa"):
+                if explicit(i) in ("on", "auto"):
+                    out[i + 1] = "off"
+                elif explicit(i) is None:  # bare flag (reads as on) -> explicit off
+                    out[i] = f"{tok}=off"
+        return out
+
+    @staticmethod
     def _strip_mmproj_args(cmd: list[str]) -> list[str]:
         """Return cmd without the '--mmproj <path>' pair (text-only retry).
         Every other flag is preserved; a no-op when --mmproj is absent.
@@ -4061,6 +4496,16 @@ class LlamaCppBackend:
                 skip_value = True
                 continue
             out.append(tok)
+        return out
+
+    @staticmethod
+    def _redacted_cmd_for_log(cmd: "list[str]") -> "list[str]":
+        """Copy of cmd with the value after --api-key replaced by <redacted>."""
+        out = list(cmd)
+        if "--api-key" in out:
+            ki = out.index("--api-key") + 1
+            if ki < len(out):
+                out[ki] = "<redacted>"
         return out
 
     def _start_llama_process(self, cmd: list[str], env: dict) -> None:
@@ -4099,12 +4544,7 @@ class LlamaCppBackend:
 
         # Log the argv per attempt (the text-only mmproj retry re-enters here
         # with --mmproj stripped), redacting the API key.
-        _log_cmd = list(cmd)
-        if "--api-key" in _log_cmd:
-            _ki = _log_cmd.index("--api-key") + 1
-            if _ki < len(_log_cmd):
-                _log_cmd[_ki] = "<redacted>"
-        logger.info(f"Starting llama-server: {' '.join(_log_cmd)}")
+        logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 
         self._process = subprocess.Popen(
             cmd,
@@ -4113,7 +4553,11 @@ class LlamaCppBackend:
             text = True,
             env = env,
             **_windows_hidden_subprocess_kwargs(),
+            **_child_popen_kwargs(),
         )
+        # Cross-session backstop: record the PID so a later startup can reap this
+        # server if parent-death cleanup did not run (macOS / best-effort failure).
+        self._record_server_pid(self._process.pid)
 
         # Start background thread to drain stdout and prevent pipe deadlock
         self._stdout_thread = threading.Thread(
@@ -4147,6 +4591,8 @@ class LlamaCppBackend:
         n_gpu_layers: Optional[int] = None,  # caller compat, unused
         n_parallel: int = 1,
         extra_args: Optional[List[str]] = None,
+        # Route-level tensor->layer fallback retry: keep the layer split multi-GPU.
+        preserve_multi_gpu_on_layer: bool = False,
     ) -> bool:
         """Start llama-server with a GGUF model.
 
@@ -4156,6 +4602,30 @@ class LlamaCppBackend:
 
         Returns True if the server started and the health check passed.
         """
+        # Raw load inputs so the runtime MTP-crash reload can replay this model
+        # without MTP. Committed to _last_load_kwargs only on a healthy load.
+        _pending_load_kwargs = {
+            "gguf_path": gguf_path,
+            "mmproj_path": mmproj_path,
+            "mtp_draft_path": mtp_draft_path,
+            "hf_repo": hf_repo,
+            "hf_variant": hf_variant,
+            "hf_token": hf_token,
+            "model_identifier": model_identifier,
+            "is_vision": is_vision,
+            "n_ctx": n_ctx,
+            "chat_template_override": chat_template_override,
+            "cache_type_kv": cache_type_kv,
+            "speculative_type": speculative_type,
+            "spec_draft_n_max": spec_draft_n_max,
+            "tensor_parallel": tensor_parallel,
+            "n_threads": n_threads,
+            "n_gpu_layers": n_gpu_layers,
+            "n_parallel": n_parallel,
+            "extra_args": list(extra_args) if extra_args is not None else None,
+            # Replayed by _respawn_if_dead so a downgraded model stays multi-GPU.
+            "preserve_multi_gpu_on_layer": preserve_multi_gpu_on_layer,
+        }
         # Serialise the whole load so concurrent /load calls never leave two
         # llama-server processes alive (#5401 / #5161). Doesn't block /unload.
         with self._serial_load_lock:
@@ -4178,6 +4648,7 @@ class LlamaCppBackend:
                 chat_template_override = chat_template_override,
                 extra_args = extra_args,
                 is_vision = is_vision,
+                preserve_multi_gpu_on_layer = preserve_multi_gpu_on_layer,
             ):
                 logger.info(
                     f"load_model: backend already in target state for "
@@ -4191,36 +4662,8 @@ class LlamaCppBackend:
                     except Exception as exc:
                         logger.debug("Fast-path audio probe failed: %s", exc)
                         detected = None
-                    if detected in ("snac", "bicodec", "dac"):
-                        with self._lock:
-                            if not self._healthy:
-                                return False
-                            try:
-                                self.init_audio_codec(detected)
-                                self._is_audio = True
-                                self._audio_type = detected
-                            except Exception as exc:
-                                logger.warning(
-                                    "Failed to init audio codec '%s': %s",
-                                    detected,
-                                    exc,
-                                )
-                                self._audio_probed = False
-                                return False
-                    elif detected:
-                        # csm / whisper / audio_vlm: track type but keep
-                        # _is_audio False -- GGUF TTS routing only fires for
-                        # snac/bicodec/dac.
-                        with self._lock:
-                            if not self._healthy:
-                                return False
-                            self._audio_type = detected
-                    # Re-derive after a retried probe (_mmproj_has_audio persists).
-                    from utils.models.model_config import is_audio_input_type
-
-                    self._has_audio_input = bool(is_audio_input_type(self._audio_type)) or bool(
-                        self._mmproj_has_audio
-                    )
+                    if not self._apply_detected_audio(detected):
+                        return False
                 if not self._healthy:
                     return False
                 return True
@@ -4291,6 +4734,9 @@ class LlamaCppBackend:
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).
             if self._is_diffusion:
+                # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
+                # prior load (this path skips the command builder that clears it).
+                self._layer_preserves_tensor_intent = False
                 with self._lock:
                     if self._cancel_event.is_set():
                         logger.info("Load cancelled before diffusion server start")
@@ -4315,11 +4761,11 @@ class LlamaCppBackend:
                         "(access-denied; antivirus or an in-flight install). "
                         "Retry the load once it is released."
                     )
-                raise RuntimeError(
-                    "llama-server binary not found. "
-                    "Run setup.sh to build it, install llama.cpp, "
-                    "or set LLAMA_SERVER_PATH environment variable."
-                )
+                # Reached only after the diffusion early-return above, so this is a
+                # genuine llama-server-backed GGUF with no runtime. Raise the typed
+                # error so /load returns the actionable 400 (not a generic 500), the
+                # same message remote validation already shows.
+                raise LlamaServerNotFoundError(LLAMA_SERVER_NOT_FOUND_DETAIL)
 
             # Outside ``self._lock`` so /unload, /cancel, /status aren't
             # blocked. ``unload_model`` also records the kill, so the
@@ -4444,6 +4890,10 @@ class LlamaCppBackend:
                         "Vision-capable GGUF loaded without a usable mmproj; "
                         "image input will be disabled for this session"
                     )
+                model_size = None  # set in the fit try; used by the APU RAM guard
+                # Layer-fallback min GPUs; raised below on a tensor downgrade. Bound
+                # before the try so the --fit-on except path still has it (no UnboundLocal).
+                _layer_min_gpus = 1
                 try:
                     gguf_size = self._get_gguf_size_bytes(model_path)
                     # Include GPU-loaded mmproj in the fit budget (#5825).
@@ -4526,8 +4976,15 @@ class LlamaCppBackend:
                         self._nextn_predict_layers
                         or _is_mtp_model_name(model_identifier, model_path)
                         or bool(mtp_draft_path)
+                    ) and not (
+                        # Drafterless Gemma falls back to ngram-mod; reserve no
+                        # drafter VRAM for it (mirrors the launch resolver).
+                        _is_gemma_mtp_name(model_identifier, model_path)
+                        and not mtp_draft_path
+                        and not self._nextn_predict_layers
                     )
                     _mtp_binary_ok = True
+                    _mtp_probe_raised = False
                     if not _user_mtp_via_extras:
                         try:
                             _mtp_binary_ok = bool(
@@ -4535,19 +4992,32 @@ class LlamaCppBackend:
                             )
                         except Exception:
                             _mtp_binary_ok = False
-                    _mtp_will_engage = bool(
-                        _user_mtp_via_extras
-                        or _user_draft_via_extras
-                        or (
-                            not _extra_args_set_spec_type(extra_args)
-                            and _mtp_binary_ok
-                            and _mtp_model_for_fit
-                            and (
-                                _mtp_effective in ("mtp", "mtp+ngram")
-                                or (_mtp_effective == "auto" and not _mtp_sub_3b_for_fit)
-                            )
+                            _mtp_probe_raised = True
+                    _auto_studio_mtp = (
+                        not _extra_args_set_spec_type(extra_args)
+                        and _mtp_model_for_fit
+                        and (
+                            _mtp_effective in ("mtp", "mtp+ngram")
+                            or (_mtp_effective == "auto" and not _mtp_sub_3b_for_fit)
+                        )
+                        and (
+                            _mtp_binary_ok
+                            # Reserve on a raised (uncached) probe too: it re-probes in
+                            # _build_speculative_flags and may still engage MTP (embedded
+                            # head or separate drafter -- _mtp_model_for_fit covers both).
+                            or _mtp_probe_raised
                         )
                     )
+                    _mtp_will_engage = bool(
+                        _user_mtp_via_extras or _user_draft_via_extras or _auto_studio_mtp
+                    )
+                    # The duplicated full target-KV copy (ctx_tgt) is an MTP-only
+                    # cost: the MTP head runs a second context over the target
+                    # model's own KV geometry. The separate-drafter spec modes
+                    # (draft-simple/draft-eagle3, reached via _user_draft_via_extras)
+                    # load a small distinct drafter with its own KV and keep no such
+                    # copy, so only charge it when the engaged mode is truly MTP.
+                    _engaged_is_mtp = bool(_user_mtp_via_extras or _auto_studio_mtp)
 
                     # Effective draft depth: extras win (last-wins at launch), else
                     # the field, else the platform default (2 GPU / 3 CPU).
@@ -4616,6 +5086,7 @@ class LlamaCppBackend:
                                 drafter_path = _mtp_draft_for_budget,
                                 draft_weights_bytes = _mtp_draft_weights,
                                 n_parallel = n_parallel,
+                                mtp_keeps_target_ctx = _engaged_is_mtp,
                             )
                             is not None
                         ):
@@ -4631,6 +5102,7 @@ class LlamaCppBackend:
                                 _dp: Optional[str] = _mtp_draft_for_budget,
                                 _w: int = _mtp_draft_weights,
                                 _np: int = n_parallel,
+                                _mtp: bool = _engaged_is_mtp,
                             ) -> int:
                                 v = self._estimate_mtp_overhead_bytes(
                                     ctx,
@@ -4640,6 +5112,7 @@ class LlamaCppBackend:
                                     drafter_path = _dp,
                                     draft_weights_bytes = _w,
                                     n_parallel = _np,
+                                    mtp_keeps_target_ctx = _mtp,
                                 )
                                 return v if v is not None else 0
 
@@ -4701,6 +5174,39 @@ class LlamaCppBackend:
                         else 0.0
                     )
                     _pin_fraction = self._GPU_PIN_VRAM_FRACTION - _flat_mtp_reserve
+                    # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
+                    _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
+
+                    def _restore_after_tensor_downgrade():
+                        # Restore the quantized KV + extras tensor dropped (layer
+                        # split supports them), minus --split-mode.
+                        nonlocal cache_type_kv, _cache_type_from_env, extra_args
+                        if _tensor_dropped_cache_type_kv is not None:
+                            cache_type_kv = _tensor_dropped_cache_type_kv
+                            _cache_type_from_env = False
+                        extra_args = strip_split_mode_only(
+                            _tensor_dropped_extra_args
+                            if _tensor_dropped_extra_args is not None
+                            else extra_args
+                        )
+
+                    # The route fallback retry is tensor-off; keep it multi-GPU.
+                    if preserve_multi_gpu_on_layer:
+                        _layer_min_gpus = max(_layer_min_gpus, len(gpus))
+
+                    if tensor_parallel and self._tensor_split_aborts(binary, model_identifier):
+                        # Aborted on tensor for this model this session (#6415); skip
+                        # tensor upfront, layer split serves it.
+                        logger.info(
+                            "Tensor parallelism skipped: this llama.cpp build aborted "
+                            "on --split-mode tensor for this model earlier this "
+                            "session; using layer split across %d GPU(s).",
+                            len(gpus),
+                        )
+                        tensor_parallel = False
+                        # Keep the multi-GPU request (gated on it, not the cache).
+                        _layer_min_gpus = max(_layer_min_gpus, len(gpus))
+                        _restore_after_tensor_downgrade()
 
                     # Tensor mode replicates a compute buffer on every GPU, so drop
                     # GPUs below that reserve from the set up front (gpu_indices
@@ -4739,22 +5245,15 @@ class LlamaCppBackend:
                             len(gpus),
                         )
                         tensor_parallel = False
+                        # GPUs below tensor's compute-buffer reserve can still do layer
+                        # split, so keep multi-GPU (mirrors the budget/geometry drops);
+                        # _select_gpus caps unusable cards.
+                        if len(gpus) >= 2:
+                            _layer_min_gpus = max(_layer_min_gpus, len(gpus))
                         # Layer split supports a quantized KV the tensor attempt
-                        # dropped; restore it and re-emit it (clear the env flag the
-                        # tensor re-adoption may have set, so the restored type wins
-                        # over a stale inherited env on the layer launch).
-                        if _tensor_dropped_cache_type_kv is not None:
-                            cache_type_kv = _tensor_dropped_cache_type_kv
-                            _cache_type_from_env = False
-                        # Restore the original extras (with the real, possibly
-                        # asymmetric, --cache-type-k/-v the tensor attempt stripped),
-                        # then drop the user --split-mode tensor so the downgrade
-                        # actually applies (extras are appended last).
-                        extra_args = strip_split_mode_only(
-                            _tensor_dropped_extra_args
-                            if _tensor_dropped_extra_args is not None
-                            else extra_args
-                        )
+                        # dropped; restore the original cache type + extras (minus
+                        # --split-mode) so the layer launch re-emits them.
+                        _restore_after_tensor_downgrade()
 
                     if tensor_parallel and tp_gpus:
                         # Pooled usable budget (after each device's compute buffer)
@@ -4787,18 +5286,13 @@ class LlamaCppBackend:
                                 "per-device compute buffers; falling back to layer split."
                             )
                             tensor_parallel = False
-                            # Restore the dropped quantized KV (layer split supports
-                            # it); clear the env flag so the restored type is emitted.
-                            if _tensor_dropped_cache_type_kv is not None:
-                                cache_type_kv = _tensor_dropped_cache_type_kv
-                                _cache_type_from_env = False
-                            # Restore the original (possibly asymmetric) cache extras
-                            # too, dropping only the user --split-mode tensor.
-                            extra_args = strip_split_mode_only(
-                                _tensor_dropped_extra_args
-                                if _tensor_dropped_extra_args is not None
-                                else extra_args
-                            )
+                            # Weights needed >1 card, so keep multi-GPU across the
+                            # usable tensor GPUs.
+                            if len(tp_gpus) >= 2:
+                                _layer_min_gpus = max(_layer_min_gpus, len(tp_gpus))
+                            # Restore the dropped quantized KV + cache extras (minus
+                            # --split-mode); layer split supports them.
+                            _restore_after_tensor_downgrade()
 
                     if tensor_parallel and tp_gpus:
                         # Tensor-parallel allocation; see _plan_tensor_parallel.
@@ -4899,6 +5393,7 @@ class LlamaCppBackend:
                                 usable_fraction = _pin_fraction,
                                 total_by_idx = total_by_idx,
                                 per_device_overhead_bytes = _pipeline_overhead_bytes,
+                                min_gpus = _layer_min_gpus,
                             )
                             # No silent shrink: effective_ctx stays == requested_ctx.
                         else:
@@ -4909,7 +5404,22 @@ class LlamaCppBackend:
                             ranked = sorted(
                                 gpus, key = lambda g: _gpu_usable(g, pin_fraction), reverse = True
                             )
-                            for n_gpus in range(1, len(ranked) + 1):
+                            # Skips _select_gpus, so apply its cap: count only cards
+                            # whose usable VRAM clears the per-device layer overhead.
+                            _pipeline_overhead_mib = _pipeline_overhead_bytes / (1024 * 1024)
+                            _auto_min_gpus = max(
+                                1,
+                                min(
+                                    _layer_min_gpus,
+                                    sum(
+                                        1
+                                        for g in ranked
+                                        if _gpu_usable(g, pin_fraction) > _pipeline_overhead_mib
+                                    )
+                                    or 1,
+                                ),
+                            )
+                            for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
                                 subset = ranked[:n_gpus]
                                 pool_budget = _pool_budget_mib(subset, pin_fraction)
                                 _ms = _subset_model_size(n_gpus)
@@ -4939,7 +5449,7 @@ class LlamaCppBackend:
                                 # at 131k may pin fine with a 4096 KV (#5106).
                                 effective_ctx = min(4096, effective_ctx)
                                 if effective_ctx > 0:
-                                    for n_gpus in range(1, len(ranked) + 1):
+                                    for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
                                         subset = ranked[:n_gpus]
                                         kv = self._estimate_kv_cache_bytes(
                                             effective_ctx,
@@ -4975,11 +5485,58 @@ class LlamaCppBackend:
                             usable_fraction = _pin_fraction,
                             total_by_idx = total_by_idx,
                             per_device_overhead_bytes = _pipeline_overhead_bytes,
+                            min_gpus = _layer_min_gpus,
                         )
                         if use_fit and not explicit_ctx:
                             # Weights don't fit on any subset; default UI to 4096
                             # so the slider isn't on an unusable native ctx.
                             effective_ctx = min(4096, effective_ctx) if effective_ctx > 0 else 4096
+
+                    elif _apple_budget_mib > 0 and effective_ctx > 0:
+                        # No GPU on Metal: the branches above are skipped and the context
+                        # stays at native, over-committing unified memory (#5118, #6529).
+                        # Cap with the same fit math (--fit on stays as a backstop); only
+                        # auto context shrinks, explicit is honored.
+                        native_ctx_for_cap = self._context_length or effective_ctx
+                        # Reserve the flat MTP fraction up front like the discrete
+                        # _pin_fraction, so an unsized MTP draft (e.g. Qwen3.6-MTP, #6529)
+                        # can't over-commit. No-op when MTP is off; exclusive with the
+                        # byte-accurate _mtp_bytes reserve.
+                        _apple_fit_budget_mib = int(
+                            _apple_budget_mib * max(0.0, 1.0 - _flat_mtp_reserve)
+                        )
+                        if self._can_estimate_kv():
+                            cap = self._fit_context_to_vram(
+                                native_ctx_for_cap,
+                                _apple_fit_budget_mib,
+                                model_size_fit,
+                                cache_type_kv,
+                                n_parallel = n_parallel,
+                                mtp_engaged = _mtp_reserves_gpu,
+                                mtp_overhead_fn = mtp_overhead_fn,
+                                budget_frac = 1.0,
+                                total_mib = None,
+                            )
+                            _cap_footprint_mib = (
+                                model_size_fit
+                                + self._estimate_kv_cache_bytes(
+                                    cap, cache_type_kv, n_parallel = n_parallel
+                                )
+                                + _mtp_bytes(cap)
+                            ) / (1024 * 1024)
+                            # Fit returns the request unchanged when it fits OR weights
+                            # exceed budget; only the latter over-commits, so floor to 4096.
+                            max_available_ctx = (
+                                cap
+                                if _cap_footprint_mib <= _apple_fit_budget_mib
+                                else min(4096, native_ctx_for_cap)
+                            )
+                        else:
+                            # No KV estimate: mirror the discrete file-size-only fallback
+                            # and floor to 4096 rather than launch at native and over-commit.
+                            max_available_ctx = min(4096, native_ctx_for_cap)
+                        if not explicit_ctx:
+                            effective_ctx = max_available_ctx
 
                     # MTP reserve at the final context, for the logs below.
                     _mtp_reserve_bytes = _mtp_bytes(effective_ctx) if _mtp_will_engage else 0
@@ -5025,6 +5582,17 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
+                # Unified-memory APUs load weights into system RAM (under WSL the VM
+                # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
+                # oversize load the OS would otherwise kill mid-flight. Base model
+                # only: an optional MTP drafter is dropped by the MTP-drop fallback.
+                if model_size is not None and self._amd_apu_wants_unified_memory(gpu_indices):
+                    _ram_msg = self._apu_ram_shortfall_message(
+                        model_size, self._available_system_memory_mib()
+                    )
+                    if _ram_msg:
+                        raise RuntimeError(_ram_msg)
+
                 # Audio input straight from the mmproj (clip.has_audio_encoder),
                 # independent of token names.
                 self._mmproj_has_audio = False
@@ -5054,6 +5622,15 @@ class LlamaCppBackend:
                     # Error out at n_ctx instead of silently rotating the KV cache; frontend catches it and points the user at "Context Length".
                     "--no-context-shift",
                 ]
+
+                # Report a clean public model id (matching GET /v1/models) rather
+                # than the raw -m path in llama-server's own /v1/models and the
+                # "model" field of its chat/completions responses.
+                from core.inference.model_ids import public_model_id
+
+                _alias = public_model_id(self._model_identifier or model_path)
+                if _alias:
+                    cmd.extend(["--alias", _alias])
 
                 fully_gpu_offloaded = False
                 if use_fit:
@@ -5148,12 +5725,15 @@ class LlamaCppBackend:
                             ]
                         )
                     self._tensor_parallel = True
+                    self._layer_preserves_tensor_intent = False
                     logger.info(
                         "Tensor parallelism: --split-mode tensor, --tensor-split %s",
                         tp_tensor_split,
                     )
                 else:
                     self._tensor_parallel = False
+                    # > 1 only when a tensor request was downgraded but kept multi-GPU.
+                    self._layer_preserves_tensor_intent = _layer_min_gpus > 1
 
                 # Speculative decoding. See _build_speculative_flags for the
                 # mode resolution, benchmarks, and llama.cpp references.
@@ -5187,6 +5767,7 @@ class LlamaCppBackend:
                     )
                     self._supports_reasoning = flags["supports_reasoning"]
                     self._reasoning_style = flags["reasoning_style"]
+                    self._reasoning_effort_levels = flags.get("reasoning_effort_levels", [])
                     self._reasoning_always_on = flags["reasoning_always_on"]
                     self._supports_preserve_thinking = flags["supports_preserve_thinking"]
                     self._supports_tools = flags["supports_tools"]
@@ -5235,10 +5816,9 @@ class LlamaCppBackend:
                     logger.info(f"Using mmproj for vision: {launch_mmproj_path}")
 
                 # Option C: --api-key for direct client access when enabled
-                import os as _os
                 import secrets as _secrets
 
-                if _os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
+                if os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
                     self._api_key = _secrets.token_urlsafe(32)
                     cmd.extend(["--api-key", self._api_key])
                     logger.info("llama-server started with --api-key for direct streaming")
@@ -5274,12 +5854,7 @@ class LlamaCppBackend:
                     cmd.extend(str(a) for a in extra_args)
                     logger.info(f"Appending user extra args to llama-server: {list(extra_args)}")
 
-                _log_cmd = list(cmd)
-                if "--api-key" in _log_cmd:
-                    _ki = _log_cmd.index("--api-key") + 1
-                    if _ki < len(_log_cmd):
-                        _log_cmd[_ki] = "<redacted>"
-                logger.info(f"Starting llama-server: {' '.join(_log_cmd)}")
+                logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 
                 # Library paths so llama-server finds its shared libs and CUDA DLLs.
                 env = self._llama_server_env_for_binary(binary)
@@ -5324,7 +5899,7 @@ class LlamaCppBackend:
 
                 # AMD unified-memory APUs (gfx1150/gfx1151): let llama.cpp use
                 # shared system RAM. setdefault so a user value wins.
-                if self._amd_apu_wants_unified_memory():
+                if self._amd_apu_wants_unified_memory(gpu_indices):
                     env.setdefault("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "1")
                     logger.info("AMD unified-memory APU: set GGML_CUDA_ENABLE_UNIFIED_MEMORY=1")
 
@@ -5375,6 +5950,9 @@ class LlamaCppBackend:
                 # retry once with --fit off before declaring the load failed.
                 # Never retry when fit was requested (use_fit) or the caller
                 # passed an explicit fit flag via extra args.
+                # Argv actually launched (post --fit off / MTP); text-only retry strips this.
+                _last_spawn_cmd = list(cmd)
+
                 def _spawn_and_wait(run_cmd, *, label = ""):
                     """Start llama-server with run_cmd and wait for health.
 
@@ -5382,6 +5960,7 @@ class LlamaCppBackend:
                     crashes during startup and run_cmd is eligible (see
                     _fit_off_retry_eligible).
                     """
+                    nonlocal _last_spawn_cmd
                     _fit_retry_allowed = self._fit_off_retry_eligible(run_cmd, use_fit)
                     for _spawn_attempt in (0, 1):
                         # Defensive kill: drop an orphan Popen a concurrent load may
@@ -5416,6 +5995,7 @@ class LlamaCppBackend:
                             # Best-effort; never block the load on logging.
                             logger.debug(f"Could not open llama-server log file: {e}")
                             self._llama_log_path = None
+                        _last_spawn_cmd = list(run_cmd)
                         self._process = subprocess.Popen(
                             run_cmd,
                             stdout = subprocess.PIPE,
@@ -5423,7 +6003,9 @@ class LlamaCppBackend:
                             text = True,
                             env = env,
                             **_windows_hidden_subprocess_kwargs(),
+                            **_child_popen_kwargs(),
                         )
+                        self._record_server_pid(self._process.pid)
 
                         # Background thread to drain stdout (prevents pipe deadlock)
                         self._stdout_thread = threading.Thread(
@@ -5435,7 +6017,17 @@ class LlamaCppBackend:
                         _startup_crashed = (
                             self._process.poll() is not None and self._process.returncode != 0
                         )
-                        if _spawn_attempt == 0 and _fit_retry_allowed and _startup_crashed:
+                        # A split-axis abort (#6415) is fit-independent: skip the
+                        # --fit off retry and let the caller latch it.
+                        _split_axis_crash = self._is_tensor_split_assert(
+                            "\n".join(self._stdout_lines[-50:])
+                        )
+                        if (
+                            _spawn_attempt == 0
+                            and _fit_retry_allowed
+                            and _startup_crashed
+                            and not _split_axis_crash
+                        ):
                             logger.warning(
                                 "llama-server crashed during startup (exit code %s) "
                                 "with the default memory-fit step enabled; Studio "
@@ -5481,6 +6073,95 @@ class LlamaCppBackend:
                 )
 
                 healthy = _spawn_and_wait(cmd)
+                # #6415 split-mode tensor warmup abort. Latch it on THIS first spawn:
+                # the flash-attn-off retry below can't run tensor (needs flash_attn),
+                # so its output drops the marker and recording later would miss it,
+                # looping every load. Record and raise to the route's layer fallback,
+                # skipping the futile flash-attn/MTP retries.
+                if not healthy and self._tensor_parallel and not self._cancel_event.is_set():
+                    _ts_out = "\n".join(self._stdout_lines[-50:])
+                    _ts_rc = self._process.poll() if self._process is not None else None
+                    if self._should_record_tensor_split_abort(_ts_rc, _ts_out):
+                        LlamaCppBackend._record_tensor_split_abort(binary, model_identifier)
+                        self._kill_process()
+                        raise RuntimeError(
+                            "llama-server aborted on --split-mode tensor "
+                            "(split-axis geometry); retrying with layer split."
+                        )
+                # Flash-attention kernels hard-crash at startup on some ROCm/GPU
+                # builds (frequently inside the vision tower). Disabling FA keeps
+                # both vision and MTP, so retry that way before dropping either.
+                # Only on a hard fault with FA on; a cancel/unload stops respawn.
+                if not healthy and not self._cancel_event.is_set():
+                    _fa_rc = self._process.poll() if self._process is not None else None
+                    _fa_cmd = (
+                        self._with_flash_attn_off(_last_spawn_cmd)
+                        if self._is_signal_crash(_fa_rc)
+                        else None
+                    )
+                    if _fa_cmd is not None:
+                        logger.warning(
+                            "llama-server hard-crashed at startup (exit %s) with "
+                            "flash attention on; retrying once with --flash-attn "
+                            "off (keeps vision and MTP).",
+                            _fa_rc,
+                        )
+                        self._kill_process()
+                        cmd = _fa_cmd
+                        healthy = _spawn_and_wait(_fa_cmd, label = "-noflash")
+
+                # MTP from Studio's spec flags or the user's (extra_args
+                # --spec-type / LLAMA_ARG_SPEC_TYPE). The env reaches the child
+                # only when neither emits a spec flag, so consult it only then.
+                _launch_spec_env: Mapping[str, str] = (
+                    os.environ
+                    if (not _extra_args_set_spec_type(extra_args) and not spec_flags)
+                    else {}
+                )
+                _spec_requested_mtp = any(
+                    "mtp" in str(t).lower() for t in spec_flags
+                ) or _extra_args_requests_mtp(extra_args, env = _launch_spec_env)
+                # Is the launched server actually running MTP+tensor? Gates the
+                # probe/watchdog/recovery; cleared if the MTP-drop fallback wins.
+                _mtp_active_for_launched_server = bool(
+                    self._tensor_parallel and _spec_requested_mtp
+                )
+                # MTP can pass /health then crash the flash-attn kernel on the
+                # first decode under tensor; probe one generation so the fallback
+                # catches that too. Tensor-only, so ordinary MTP stays probe-free.
+                if (
+                    healthy
+                    and self._tensor_parallel
+                    and _spec_requested_mtp
+                    and not self._cancel_event.is_set()
+                    and not self._probe_mtp_decode()
+                ):
+                    # A first-decode hard fault is usually the FA kernel: retry
+                    # FA-off (keeps MTP) before dropping speculative decoding below.
+                    _probe_rc = self._process.poll() if self._process is not None else None
+                    _fa_cmd = (
+                        self._with_flash_attn_off(_last_spawn_cmd)
+                        if self._is_signal_crash(_probe_rc)
+                        else None
+                    )
+                    healthy = False
+                    if _fa_cmd is not None:
+                        logger.warning(
+                            "MTP first-decode hard-crashed (exit %s) with flash "
+                            "attention on; retrying with --flash-attn off.",
+                            _probe_rc,
+                        )
+                        self._kill_process()
+                        cmd = _fa_cmd
+                        healthy = (
+                            _spawn_and_wait(_fa_cmd, label = "-noflash-mtp")
+                            and self._probe_mtp_decode()
+                        )
+                    if not healthy:
+                        logger.warning(
+                            "MTP speculative decoding crashed on the first decode "
+                            "under tensor parallelism; retrying without it."
+                        )
                 # Any MTP request can abort the server: a separate drafter
                 # (Gemma) on a binary that predates its arch, or an embedded
                 # head (Qwen) the binary cannot build. Retry once with the
@@ -5488,8 +6169,8 @@ class LlamaCppBackend:
                 # loads. Gate on the spec block (not the drafter path, which
                 # off/ngram local loads also carry) and keep
                 # _requested_spec_mode so a duplicate /load doesn't thrash. The
-                # cancel check stops an /unload-killed attempt respawning.
-                _spec_requested_mtp = any("mtp" in str(t).lower() for t in spec_flags)
+                # cancel check stops an /unload-killed attempt respawning. A
+                # decode-probe failure above also routes here.
                 if not healthy and _spec_requested_mtp and not self._cancel_event.is_set():
                     # Blame the binary only when the output shows MTP itself
                     # failing (unknown arch / draft or context build); an
@@ -5535,29 +6216,49 @@ class LlamaCppBackend:
                         + ["--spec-default"]
                         + cmd[_spec_start + len(spec_flags) :]
                     )
+                    # User/env MTP survives in the tail; llama.cpp takes the last
+                    # spec flag, so a trailing --spec-default overrides it too.
+                    if _extra_args_requests_mtp(extra_args, env = _launch_spec_env):
+                        fallback_cmd.append("--spec-default")
                     healthy = _spawn_and_wait(fallback_cmd, label = "-retry")
                     if healthy:
                         self._speculative_type = "default"
+                        _mtp_active_for_launched_server = False
 
-                # A vision GGUF launched with --mmproj can abort when the
-                # installed llama.cpp is too old for the model's projector
-                # ("Unknown projector type"); in that one case retry once
-                # text-only rather than failing the whole load.
+                # A too-old llama.cpp can reject a model's --mmproj projector
+                # (format message or a bare SIGSEGV); retry once text-only.
                 if not healthy:
                     out = "\n".join(self._stdout_lines[-50:])
+                    # Read the crash code before _kill_process() clears _process.
+                    _crash_rc = self._process.poll() if self._process is not None else None
                     self._kill_process()
-                    if launched_with_mmproj and self._is_projector_incompatibility(out):
+                    # The #6415 split-axis abort is latched earlier (first spawn).
+                    # Skip if a cancel/unload is pending (mirrors the MTP guard).
+                    if (
+                        launched_with_mmproj
+                        and not self._cancel_event.is_set()
+                        and (
+                            self._is_projector_incompatibility(out)
+                            or (
+                                self._is_signal_crash(_crash_rc)
+                                and not self._output_has_nonprojector_diagnostic(out)
+                            )
+                        )
+                    ):
                         logger.warning(
                             "llama-server could not load this model's vision "
                             "projector (--mmproj). The installed llama.cpp build is "
                             "likely too old for it. Loading text-only for this "
                             "session; run 'unsloth studio update' to enable vision."
                         )
-                        cmd = self._strip_mmproj_args(cmd)
+                        cmd = self._strip_mmproj_args(_last_spawn_cmd)
                         self._is_vision = False
                         self._mmproj_has_audio = False
                         self._start_llama_process(cmd, env)
                         if not self._wait_for_health(timeout = 600.0):
+                            # Read the exit code before _kill_process() clears it, so
+                            # an OS-killed text-only retry still gets the OOM message.
+                            _retry_rc = self._process.poll() if self._process is not None else None
                             self._kill_process()
                             raise RuntimeError(
                                 "Vision projector incompatible with this llama.cpp "
@@ -5566,6 +6267,7 @@ class LlamaCppBackend:
                                     "\n".join(self._stdout_lines[-50:]),
                                     gguf_path,
                                     self._model_identifier,
+                                    _retry_rc,
                                 )
                             )
                     else:
@@ -5574,6 +6276,7 @@ class LlamaCppBackend:
                                 out,
                                 gguf_path,
                                 self._model_identifier,
+                                _crash_rc,
                             )
                         )
 
@@ -5587,6 +6290,11 @@ class LlamaCppBackend:
                     self._extra_args = list(extra_args)
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
+                # Commit the known-good snapshot + whether MTP+tensor is live, then
+                # watch this load for a mid-generation crash.
+                self._last_load_kwargs = _pending_load_kwargs
+                self._mtp_runtime_fallback_active = _mtp_active_for_launched_server
+                self._start_mtp_crash_watchdog()
 
                 # Catch silent CPU fallback when GPU was intended (#5106).
                 self._gpu_offload_active = self._classify_gpu_offload(
@@ -5630,37 +6338,8 @@ class LlamaCppBackend:
             except Exception as exc:
                 logger.debug("Audio probe failed: %s", exc)
                 detected = None
-            if detected in ("snac", "bicodec", "dac"):
-                with self._lock:
-                    if not self._healthy:
-                        return False
-                    try:
-                        self.init_audio_codec(detected)
-                        self._is_audio = True
-                        self._audio_type = detected
-                    except Exception as exc:
-                        # Surface as HTTP 500 (matches pre-PR contract).
-                        logger.warning(
-                            "Failed to init audio codec '%s': %s",
-                            detected,
-                            exc,
-                        )
-                        self._audio_probed = False
-                        return False
-            elif detected:
-                # csm / whisper / audio_vlm: track type but keep _is_audio
-                # False -- GGUF TTS routing only fires for snac/bicodec/dac.
-                with self._lock:
-                    if not self._healthy:
-                        return False
-                    self._audio_type = detected
-
-            # Audio input = token probe (audio_vlm/whisper) OR mmproj encoder.
-            from utils.models.model_config import is_audio_input_type
-
-            self._has_audio_input = bool(is_audio_input_type(self._audio_type)) or bool(
-                self._mmproj_has_audio
-            )
+            if not self._apply_detected_audio(detected):
+                return False
 
             if not self._healthy:
                 return False
@@ -5745,6 +6424,24 @@ class LlamaCppBackend:
         _mtp_too_small = (
             _mtp_size_b is not None and _mtp_size_b < _MTP_MIN_SIZE_B and not bool(mtp_draft_path)
         )
+        # Drafterless Gemma (name-only MTP, no embedded head): emitting MTP
+        # would abort llama-server, so every mode below falls back instead.
+        _mtp_drafter_missing = (
+            _is_gemma_mtp_name(model_identifier, model_path)
+            and not mtp_draft_path
+            and not self._nextn_predict_layers
+        )
+        # Embedded MTP head on an MLA model (GLM-5.2/DeepSeek/Kimi, detected by
+        # kv_lora_rank): llama.cpp's MLA/DSA MTP path is ~2x slower than no spec,
+        # so Auto drops it (override via the Settings dropdown / forced mtp, or
+        # UNSLOTH_MLA_MTP_ENABLED=1). Separate drafters (Gemma, mtp_draft_path) and
+        # non-MLA embedded heads (Qwen, no kv_lora_rank) are unaffected.
+        _auto_mla_embedded_mtp = (
+            bool(self._nextn_predict_layers)
+            and self._kv_lora_rank is not None
+            and not bool(mtp_draft_path)
+            and not _mla_mtp_auto_enabled()
+        )
 
         if user_owns_spec_type:
             # User --spec-type wins outright; suppress auto-emit to avoid a
@@ -5791,6 +6488,8 @@ class LlamaCppBackend:
             if mtp_draft_path:
                 flags.extend(["--model-draft", mtp_draft_path])
                 logger.info(f"Using separate MTP drafter: {mtp_draft_path}")
+            spec_value = mtp_token
+            ngram_knobs: list[str] = []
             if chain_ngram:
                 ngram_knobs = _build_ngram_mod_flags(caps)
                 if ngram_knobs:
@@ -5800,25 +6499,8 @@ class LlamaCppBackend:
                         "llama-server lacks ngram-mod tuning "
                         "flags; loading MTP only (no ngram chain)"
                     )
-                    spec_value = mtp_token
-                flags.extend(
-                    [
-                        "--spec-type",
-                        spec_value,
-                        n_max_flag,
-                        str(draft_n_max),
-                    ]
-                )
-                flags.extend(ngram_knobs)
-            else:
-                flags.extend(
-                    [
-                        "--spec-type",
-                        mtp_token,
-                        n_max_flag,
-                        str(draft_n_max),
-                    ]
-                )
+            flags.extend(["--spec-type", spec_value, n_max_flag, str(draft_n_max)])
+            flags.extend(ngram_knobs)
             self._speculative_type = "draft-mtp"
             chain_label = "chained ngram-mod" if chain_ngram else "MTP-only"
             logger.info(f"Spec decoding: {mtp_token} ({chain_label})")
@@ -5838,6 +6520,20 @@ class LlamaCppBackend:
             self._speculative_type = "ngram-mod"
             logger.info("Spec decoding: ngram-mod")
             return True
+
+        def _fallback_drafter_not_found() -> None:
+            """Drafterless Gemma: use ngram-mod (or spec-default) and record why."""
+            logger.warning(
+                "Model %s is MTP-capable but no drafter or head was found; "
+                "falling back. Check network or run `unsloth studio update`.",
+                model_identifier,
+            )
+            if self.probe_server_capabilities(binary).get("supports_ngram_mod"):
+                _emit_ngram_mod()
+            else:
+                flags.append("--spec-default")
+                self._speculative_type = "default"
+            self._spec_fallback_reason = "drafter_not_found"
 
         if effective_mode == "off":
             return flags  # nothing to emit
@@ -5859,6 +6555,10 @@ class LlamaCppBackend:
                 flags.append("--spec-default")
                 self._speculative_type = "default"
                 return flags
+            if _mtp_drafter_missing:
+                # Drafterless: draft-mtp would abort llama-server, so fall back.
+                _fallback_drafter_not_found()
+                return flags
             if _mtp_too_small:
                 logger.warning(
                     f"Forcing MTP on a {_mtp_size_b:.1f}B model; "
@@ -5877,6 +6577,10 @@ class LlamaCppBackend:
                 )
                 _emit_ngram_mod()
                 return flags
+            if _mtp_drafter_missing:
+                # No head/drafter: keep ngram-mod, drop the draft-mtp chain.
+                _fallback_drafter_not_found()
+                return flags
             if _mtp_too_small:
                 logger.warning(
                     f"Forcing MTP+Ngram on a {_mtp_size_b:.1f}B model; "
@@ -5888,14 +6592,42 @@ class LlamaCppBackend:
 
         # effective_mode == "auto": the promotion path. llama.cpp #22673:
         # MTP is compatible with mmproj, so there's no vision gate.
-        if is_mtp_model and not _mtp_too_small:
-            # GPU: MTP-only. CPU/Mac: chain ngram-mod + MTP.
-            _emit_mtp(chain_ngram = not gpus)
+        if _auto_mla_embedded_mtp:
+            # MLA embedded-MTP (GLM-5.2 et al.): the MTP path regresses vs spec-off
+            # on llama.cpp today, so Auto drops it and falls back to ngram-mod (or
+            # spec-off if unsupported), mirroring the sub-3B branch. Forced mtp /
+            # mtp+ngram (handled above) still engage; UNSLOTH_MLA_MTP_ENABLED=1
+            # re-enables this promotion once upstream optimizes the path.
+            self._spec_fallback_reason = "mla_mtp_disabled"
+            _mla_caps = self.probe_server_capabilities(binary)
+            if _mla_caps.get("supports_ngram_mod"):
+                logger.info(
+                    "Auto: MLA embedded-MTP model detected; llama.cpp's MLA/DSA "
+                    "MTP path is slower than no speculation, so using ngram-mod "
+                    "instead. Override via the Studio Speculative Decoding "
+                    "dropdown or UNSLOTH_MLA_MTP_ENABLED=1."
+                )
+                _emit_ngram_mod()
+            else:
+                logger.info(
+                    "Auto: MLA embedded-MTP model detected; disabling speculative "
+                    "decoding (this llama-server does not advertise ngram-mod). "
+                    "Override via the dropdown or UNSLOTH_MLA_MTP_ENABLED=1."
+                )
+                # spec-off: emit nothing, mirroring the sub-3B no-ngram path.
+        elif is_mtp_model and not _mtp_too_small:
+            if _mtp_drafter_missing:
+                # Name-only MTP, drafter did not resolve (download failed/absent).
+                _fallback_drafter_not_found()
+            else:
+                # GPU: MTP-only. CPU/Mac: chain ngram-mod + MTP.
+                _emit_mtp(chain_ngram = not gpus)
         elif is_mtp_model and _mtp_too_small:
             # Sub-3B fallback: drop the MTP draft head, keep ngram-mod when
             # the binary supports it.
-            _small_caps = self.probe_server_capabilities(binary)
-            if _small_caps.get("supports_ngram_mod"):
+            if _mtp_drafter_missing:
+                _fallback_drafter_not_found()
+            elif self.probe_server_capabilities(binary).get("supports_ngram_mod"):
                 logger.info(
                     f"MTP GGUF detected but model size {_mtp_size_b:.1f}B "
                     "is below the 3B speedup threshold; using ngram-mod "
@@ -5932,6 +6664,7 @@ class LlamaCppBackend:
         spec_draft_n_max: Optional[int] = None,
         tensor_parallel: bool = False,
         mtp_draft_path: Optional[str] = None,
+        preserve_multi_gpu_on_layer: bool = False,
     ) -> bool:
         """True iff the live server already satisfies these load kwargs.
 
@@ -5974,6 +6707,17 @@ class LlamaCppBackend:
         # server. An identical request would downgrade the same way.
         if not _tensor_parallel_matches_loaded(extra_args, tensor_parallel, self._tensor_parallel):
             return False
+        # Preserved tensor->layer fallback + an EXPLICIT tensor drop: reload so
+        # placement re-selects instead of keeping the all-GPU mask (mirrors the route,
+        # #6659). preserve_multi_gpu_on_layer carries the route's carry-forward decision
+        # (True for an implicit same-settings reload), so those still dedupe -- the HF
+        # auto-pick / local-dir flows skip the route guard and only reach here.
+        if (
+            self._layer_preserves_tensor_intent
+            and not _effective_tensor_parallel(extra_args, tensor_parallel)
+            and not preserve_multi_gpu_on_layer
+        ):
+            return False
 
         # Compare on the canonical requested mode. With --spec-type in
         # extra_args the backend stores None; mirror that here.
@@ -5983,6 +6727,16 @@ class LlamaCppBackend:
             req_mode = _canonicalize_spec_mode(speculative_type) or "auto"
         backend_mode = self._requested_spec_mode
         if req_mode != backend_mode:
+            return False
+
+        # Prior HF load fell back with drafter_not_found; a same-settings reload
+        # must retry the download in load_model, not dedupe to the stale fallback
+        # (HF loads resolve the drafter there, so gguf_path is None here).
+        if (
+            self._spec_fallback_reason == "drafter_not_found"
+            and gguf_path is None
+            and req_mode in ("auto", "mtp", "mtp+ngram")
+        ):
             return False
 
         # spec_draft_n_max only matters when an MTP variant is engaged. Compare
@@ -6050,6 +6804,8 @@ class LlamaCppBackend:
             self._hf_repo = None
             self._mtp_draft_path = None
             self._spec_fallback_reason = None
+            self._last_load_kwargs = None
+            self._mtp_runtime_fallback_active = False
             self._hf_variant = None
             self._is_vision = False
             self._is_audio = False
@@ -6067,11 +6823,13 @@ class LlamaCppBackend:
             self._supports_reasoning = False
             self._reasoning_always_on = False
             self._reasoning_style = "enable_thinking"
+            self._reasoning_effort_levels = []
             self._reasoning_default = True
             self._supports_preserve_thinking = False
             self._supports_tools = False
             self._cache_type_kv = None
             self._tensor_parallel = False
+            self._layer_preserves_tensor_intent = False
             self._speculative_type = None
             self._requested_spec_mode = None
             self._spec_draft_n_max = None
@@ -6096,7 +6854,6 @@ class LlamaCppBackend:
             # Clean up temp chat template file.
             if hasattr(self, "_chat_template_file") and self._chat_template_file:
                 try:
-                    import os
                     os.unlink(self._chat_template_file.name)
                 except Exception:
                     pass
@@ -6113,6 +6870,9 @@ class LlamaCppBackend:
 
     def _kill_process(self):
         """Terminate the subprocess if running."""
+        # Stop the watchdog before a deliberate kill so a planned reload/unload
+        # isn't seen as a crash; a real crash never routes through here.
+        self._stop_mtp_crash_watchdog()
         if self._process is None:
             return
         try:
@@ -6131,6 +6891,7 @@ class LlamaCppBackend:
                 self._stats_logger.stop()
                 self._stats_logger = None
             self._process = None
+            self._clear_server_pid()
             # Clear healthy so a /load during the replacement's warm-up can't
             # short-circuit against the previous server's health (#5401).
             self._healthy = False
@@ -6150,6 +6911,198 @@ class LlamaCppBackend:
                 self._llama_log_fh = None
 
     @staticmethod
+    def _server_pidfile_path() -> Optional[Path]:
+        """Pidfile recording the live llama-server PID, under the active studio root
+        (per-root, so concurrent Studios with distinct UNSLOTH_STUDIO_HOME stay
+        isolated, mirroring the reaper's custom-root isolation)."""
+        try:
+            from utils.paths.storage_roots import studio_root  # noqa: WPS433
+            return studio_root() / "llama-server.pid"
+        except Exception:
+            return None
+
+    @classmethod
+    def _record_server_pid(cls, pid: int) -> None:
+        """Best-effort record of the spawned llama-server PID for orphan reaping.
+
+        Stores ``pid:starttime`` so a later startup can reject a PID that has
+        since been recycled to a different process (see ``_pid_start_identity``).
+        A bare ``pid`` (no identity) is still accepted on read for compatibility.
+        """
+        path = cls._server_pidfile_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents = True, exist_ok = True)
+            path.write_text(f"{pid}:{cls._pid_start_identity(pid)}")
+        except Exception as e:
+            logger.debug(f"Could not write llama-server pidfile: {e}")
+
+    @classmethod
+    def _clear_server_pid(cls) -> None:
+        """Best-effort removal of the llama-server pidfile."""
+        path = cls._server_pidfile_path()
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok = True)
+        except Exception as e:
+            logger.debug(f"Could not remove llama-server pidfile: {e}")
+
+    @staticmethod
+    def _pid_is_llama_server(pid: int) -> bool:
+        """True only if pid is a live process whose binary is a llama-server. Guards
+        against PID reuse before killing a recorded orphan; returns False on any
+        uncertainty so an unrelated process is never killed."""
+        try:
+            import psutil
+            try:
+                proc = psutil.Process(pid)
+                if (proc.name() or "").lower().startswith("llama-server"):
+                    return True
+                return Path(proc.exe() or "").name.lower().startswith("llama-server")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return False
+        except ImportError:
+            pass
+        if sys.platform != "linux":
+            return False
+        try:
+            if Path(os.readlink(f"/proc/{pid}/exe")).name.lower().startswith("llama-server"):
+                return True
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                tokens = fh.read().split(b"\x00")
+            first = tokens[0].decode("utf-8", "replace") if tokens else ""
+            return Path(first).name.lower().startswith("llama-server")
+        except OSError:
+            return False
+
+    @staticmethod
+    def _pid_start_identity(pid: int) -> str:
+        """Stable per-PID identity (process start time) guarding against PID reuse.
+
+        Returns a token string, or "" when it cannot be determined (the caller
+        then falls back to the llama-server name check only)."""
+        try:
+            import psutil
+            try:
+                return str(psutil.Process(pid).create_time())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return ""
+        except ImportError:
+            pass
+        if sys.platform == "linux":
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as fh:
+                    data = fh.read()
+                # field 22 (starttime), counted from after the ")" that closes comm.
+                return data[data.rfind(b")") + 2 :].split()[19].decode()
+            except (OSError, IndexError):
+                return ""
+        return ""
+
+    @staticmethod
+    def _pid_parent_is_alive(pid: int) -> bool:
+        """True if the recorded server's parent is still running, i.e. the server is
+        NOT orphaned. Lets the cross-session reap kill only a true orphan (parent
+        gone) and never a live server owned by a running Studio, regardless of which
+        process performs the sweep. Biased toward "alive" on uncertainty so a live
+        server is never mistakenly reaped."""
+        try:
+            import psutil
+
+            try:
+                ppid = psutil.Process(pid).ppid()
+            except psutil.NoSuchProcess:
+                return False  # the recorded server itself is gone
+            except psutil.Error:
+                return True  # cannot tell -- never risk killing a live server
+            if ppid <= 1:
+                return False  # reparented to init -> orphan
+            return psutil.pid_exists(ppid)
+        except ImportError:
+            pass
+        if sys.platform == "linux":
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as fh:
+                    data = fh.read()
+                ppid = int(data[data.rfind(b")") + 2 :].split()[1])
+            except (OSError, IndexError, ValueError):
+                return False
+            if ppid <= 1:
+                return False
+            return Path(f"/proc/{ppid}").exists()
+        return False
+
+    @staticmethod
+    def _unlink_pidfile(path: Path) -> None:
+        """Best-effort removal of a resolved pidfile path."""
+        try:
+            path.unlink(missing_ok = True)
+        except Exception:
+            pass
+
+    @classmethod
+    def _reap_recorded_pid(cls) -> int:
+        """Kill the exact llama-server PID recorded at spawn, but only when it is a
+        genuine orphan -- its parent (the Studio that spawned it) is gone. This is
+        the cross-session backstop the parent-death reaper (Job Object /
+        PR_SET_PDEATHSIG) cannot cover: an orphan left by an already-dead Studio
+        (macOS, a best-effort failure, or a pre-existing orphan). Path-independent,
+        so it also catches an orphan the install-root match would miss.
+
+        A live server whose parent is still running is never reaped, so constructing
+        a second backend in-process (the helper / advisor paths each build a
+        LlamaCppBackend) cannot kill the active chat server. A recorded PID that has
+        been recycled to a different process is rejected by the start-time identity
+        and the llama-server name check, so unrelated user processes are never
+        touched. SIGKILL falls back to SIGTERM on Windows, where os.kill maps it to
+        TerminateProcess and SIGKILL is undefined."""
+        path = cls._server_pidfile_path()
+        if path is None or not path.exists():
+            return 0
+
+        pid = -1
+        identity = ""
+        try:
+            pid_str, _, identity = path.read_text().strip().partition(":")
+            pid = int(pid_str)
+        except Exception:
+            pid = -1
+
+        if pid <= 0:
+            cls._unlink_pidfile(path)  # garbage record
+            return 0
+        if pid == os.getpid():
+            return 0  # never our own pid; leave the record alone
+
+        if cls._pid_parent_is_alive(pid):
+            # Live server with a running parent -> not an orphan; keep the record so
+            # a later startup can still reap it if that parent later dies abnormally.
+            return 0
+
+        # Parent is gone: candidate orphan. Reject a PID recycled to something else.
+        if identity and cls._pid_start_identity(pid) != identity:
+            cls._unlink_pidfile(path)
+            return 0
+
+        killed = 0
+        if cls._pid_is_llama_server(pid):
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                killed = 1
+                logger.info(f"Killed orphaned llama-server from pidfile (pid={pid})")
+            except (ProcessLookupError, PermissionError):
+                pass
+            except Exception as e:
+                logger.debug(f"Could not kill recorded llama-server pid {pid}: {e}")
+        cls._unlink_pidfile(path)
+        return killed
+
+    @staticmethod
     def _kill_orphaned_servers() -> int:
         """Kill orphaned llama-server processes started by studio.
 
@@ -6166,7 +7119,11 @@ class LlamaCppBackend:
         Returns the count of processes killed; callers arm the VRAM-settle
         wait on a positive count.
         """
-        killed = 0
+        # Cross-session backstop first: reap the exact PID we recorded at spawn,
+        # but only if it is a true orphan whose parent is gone (so a helper backend
+        # built while a chat server is live can never kill it). The root-gated
+        # enumeration below stays as a fallback.
+        killed = LlamaCppBackend._reap_recorded_pid()
         try:
             # -- Build the ownership allowlist --------------------------------
             # exact_binaries -- env var overrides (exact path match).
@@ -6174,20 +7131,10 @@ class LlamaCppBackend:
             install_roots: list[Path] = []
 
             # Env-mode custom root (mirrors _find_llama_server_binary).
-            _is_custom_root = False
-            try:
-                from utils.paths.storage_roots import studio_root as _sr  # noqa: WPS433
-
-                _resolved_sr = _sr()
-                _legacy_studio = Path.home() / ".unsloth" / "studio"
-                try:
-                    _is_custom_root = _resolved_sr.resolve() != _legacy_studio.resolve()
-                except (OSError, ValueError):
-                    _is_custom_root = _resolved_sr != _legacy_studio
-                if _is_custom_root:
-                    install_roots.append(_resolved_sr / "llama.cpp")
-            except (ImportError, OSError, ValueError):
-                pass
+            _resolved_sr, _is_legacy = LlamaCppBackend._resolved_studio_root_and_is_legacy()
+            _is_custom_root = not _is_legacy
+            if _is_custom_root:
+                install_roots.append(_resolved_sr / "llama.cpp")
 
             # Primary install dir (default mode only). Env-mode skips this so a
             # custom-root Studio can't kill a default-install Studio's server.
@@ -6342,6 +7289,143 @@ class LlamaCppBackend:
                 return False
         return True
 
+    def _probe_mtp_decode(self, timeout: float = 60.0) -> bool:
+        """One tiny /completion to confirm MTP survives the first decode.
+
+        MTP-draft can pass /health yet crash the flash-attn kernel only once
+        tokens generate (e.g. under --split-mode tensor). False on any error so
+        the caller can drop MTP and retry.
+        """
+        url = f"{self.base_url}/completion"
+        payload = {"prompt": "Hi", "n_predict": 4, "temperature": 0.0, "stream": False}
+        try:
+            resp = httpx.post(
+                url,
+                json = payload,
+                timeout = timeout,
+                headers = self._auth_headers,
+                trust_env = False,
+            )
+        except Exception as e:
+            logger.debug(f"MTP decode probe failed: {e}")
+            return False
+        if resp.status_code != 200:
+            logger.debug(f"MTP decode probe returned HTTP {resp.status_code}")
+            return False
+        # A crash can drop the connection or kill the process right after a reply.
+        if self._process is not None and self._process.poll() is not None:
+            return False
+        return True
+
+    def _maybe_recover_from_mtp_crash(self, exc: Optional[BaseException] = None) -> bool:
+        """Schedule one background reload without MTP after a mid-generation death.
+
+        MTP+tensor can crash the flash-attn kernel on a later request, after
+        load_model returned, past the load-time fallback and decode probe. Not a
+        persistent ban: a fresh load re-tries MTP. Returns True if scheduled.
+        """
+        # Cheap async-safe gate: only our live MTP+tensor launch, not cancelled,
+        # with a snapshot to replay.
+        if self._cancel_event.is_set():
+            return False
+        if not self._mtp_runtime_fallback_active:
+            return False
+        if not self._last_load_kwargs or self._process is None:
+            return False
+        # Single-flight: the first failure claims the reload.
+        with self._mtp_runtime_fallback_lock:
+            if self._mtp_runtime_fallback_in_progress:
+                return False
+            self._mtp_runtime_fallback_in_progress = True
+        snapshot = dict(self._last_load_kwargs)
+        proc = self._process
+
+        def _recover():
+            try:
+                # Confirm the process really exited (the error can arrive a beat
+                # early) so a transient stream error can't disable MTP.
+                deadline = time.monotonic() + 5.0
+                while proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if proc.poll() is None:
+                    logger.debug("Generation error but llama-server is alive; keeping MTP.")
+                    return
+                logger.warning(
+                    "llama-server exited mid-generation with MTP under tensor "
+                    "parallelism (%s); reloading without speculative decoding.",
+                    type(exc).__name__ if exc is not None else "server exited",
+                )
+                # Re-check under the load lock (RLock allows the nested
+                # load_model) so a newer load isn't clobbered by this stale replay.
+                requested_mode = snapshot.get("speculative_type")
+                with self._serial_load_lock:
+                    if self._cancel_event.is_set():
+                        logger.info("MTP-crash reload skipped: load was cancelled/unloaded.")
+                        return
+                    if self._process is not proc:
+                        logger.info("MTP-crash reload skipped: a newer load is already active.")
+                        return
+                    if self._last_load_kwargs != snapshot:
+                        logger.info("MTP-crash reload skipped: load settings changed.")
+                        return
+                    snapshot["speculative_type"] = "off"
+                    # Drop user/env MTP too: append a last-wins --spec-default.
+                    _ea = list(snapshot.get("extra_args") or [])
+                    if _extra_args_requests_mtp(_ea, env = os.environ):
+                        _ea.append("--spec-default")
+                        snapshot["extra_args"] = _ea
+                    self.load_model(**snapshot)
+                    # Restore the requested mode + reason load_model("off") cleared,
+                    # so /status shows the user's mode + note (like the startup fallback).
+                    self._requested_spec_mode = _canonicalize_spec_mode(requested_mode)
+                    self._spec_fallback_reason = "runtime_error"
+                logger.info("Reloaded without MTP after the tensor-parallel crash.")
+            except Exception as e:
+                logger.error(f"Reload without MTP failed: {e}")
+            finally:
+                with self._mtp_runtime_fallback_lock:
+                    self._mtp_runtime_fallback_in_progress = False
+
+        threading.Thread(target = _recover, daemon = True, name = "mtp-crash-reload").start()
+        return True
+
+    def _start_mtp_crash_watchdog(self) -> None:
+        """Background poll that recovers on an MTP+tensor crash even when no
+        request observes it (direct proxy endpoints, or nothing in flight).
+
+        Armed only for a live MTP+tensor launch; the no-MTP reload disarms it, so
+        it can't loop.
+        """
+        if not self._mtp_runtime_fallback_active:
+            return
+        proc = self._process
+        if proc is None:
+            return
+        # Replace any prior watchdog (loads are serialised, so at most one).
+        self._stop_mtp_crash_watchdog()
+        stop = threading.Event()
+        self._mtp_watchdog_stop = stop
+
+        def _watch():
+            # Exit on stop or process death. _kill_process sets stop before
+            # terminating, so re-check it: only a real crash (stop unset) recovers.
+            while not stop.wait(1.0):
+                if proc.poll() is not None:
+                    if not stop.is_set():
+                        self._maybe_recover_from_mtp_crash()
+                    return
+
+        t = threading.Thread(target = _watch, daemon = True, name = "mtp-crash-watchdog")
+        self._mtp_watchdog_thread = t
+        t.start()
+
+    def _stop_mtp_crash_watchdog(self) -> None:
+        """Signal the crash watchdog to exit; called before any deliberate kill."""
+        stop = getattr(self, "_mtp_watchdog_stop", None)
+        if stop is not None:
+            stop.set()
+        self._mtp_watchdog_thread = None
+
     def _wait_for_health(
         self,
         timeout: float = 120.0,
@@ -6349,7 +7433,7 @@ class LlamaCppBackend:
     ) -> bool:
         """Poll llama-server's /health until 200; also detect early exit/crash."""
         deadline = time.monotonic() + timeout
-        url = f"http://127.0.0.1:{self._port}/health"
+        url = f"{self.base_url}/health"
 
         while time.monotonic() < deadline:
             # Process crashed?
@@ -6373,7 +7457,9 @@ class LlamaCppBackend:
                 return False
 
             try:
-                resp = httpx.get(url, timeout = 2.0)
+                # trust_env=False: skip ambient HTTP(S)_PROXY, which if it 503s
+                # for 127.0.0.1 loops the probe until timeout and hangs load.
+                resp = httpx.get(url, timeout = 2.0, trust_env = False)
                 if resp.status_code == 200:
                     return True
             except (
@@ -6418,9 +7504,9 @@ class LlamaCppBackend:
         The memory-fit step or ``--parallel`` slot split can leave this below
         the requested ``-c``; requests are validated against this value.
         """
-        url = f"http://127.0.0.1:{self._port}/props"
+        url = f"{self.base_url}/props"
         try:
-            resp = httpx.get(url, timeout = 5.0)
+            resp = httpx.get(url, timeout = 5.0, trust_env = False)
             if resp.status_code != 200:
                 return None
             settings = resp.json().get("default_generation_settings") or {}
@@ -6490,6 +7576,35 @@ class LlamaCppBackend:
         return result
 
     # ── Generation (proxy to llama-server) ────────────────────────
+
+    @contextlib.contextmanager
+    def _open_stream(self, url: str, payload: dict, cancel_event):
+        """Open a streaming POST to llama-server, retrying through prefill, and
+        yield ``(response, first_token_deadline)`` once a 200 lands. Owns the
+        httpx.Client + auth headers for the stream's lifetime; raises
+        RuntimeError on a non-200. Shared scaffold for the streaming consumers,
+        which differ only in how they parse the SSE body."""
+        stream_timeout = httpx.Timeout(connect = 10, read = 0.5, write = 10, pool = 10)
+        with httpx.Client(
+            timeout = stream_timeout,
+            limits = httpx.Limits(max_keepalive_connections = 0),
+            trust_env = False,
+        ) as client:
+            first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
+            with self._stream_with_retry(
+                client,
+                url,
+                payload,
+                cancel_event,
+                headers = self._auth_headers,
+                first_token_deadline = first_token_deadline,
+            ) as response:
+                if response.status_code != 200:
+                    error_body = response.read().decode()
+                    raise RuntimeError(
+                        f"llama-server returned {response.status_code}: {error_body}"
+                    )
+                yield response, first_token_deadline
 
     @staticmethod
     def _iter_text_cancellable(
@@ -6639,6 +7754,38 @@ class LlamaCppBackend:
         finally:
             _cancel_closed.set()
 
+    def _respawn_if_dead(self) -> bool:
+        """Relaunch the llama-server if its process has exited.
+
+        A loaded chat model can be SIGKILL'd mid-session (usually GPU/RAM pressure
+        from a training run on the same box), leaving a defunct process while
+        ``is_loaded`` still reads True. Replay the last ``load_model`` call to
+        recover, returning True once healthy. Serialised on ``_respawn_lock`` so
+        many generations hitting the dead server trigger at most one reload.
+        """
+        with self._respawn_lock:
+            proc = self._process
+            if proc is None:
+                return False
+            if proc.poll() is None:
+                # Process is alive: either a concurrent caller already respawned
+                # it (healthy), or this connection error wasn't a dead server.
+                return self._healthy
+            kwargs = self._last_load_kwargs
+            if not kwargs:
+                return False
+            logger.warning(
+                f"llama-server for '{self._model_identifier}' exited "
+                f"(code {proc.returncode}); respawning to recover the session"
+            )
+            with self._lock:
+                self._healthy = False
+            try:
+                return bool(self.load_model(**kwargs))
+            except Exception as exc:
+                logger.error(f"Failed to respawn llama-server: {exc}")
+                return False
+
     def generate_chat_completion(
         self,
         messages: list[dict],
@@ -6656,6 +7803,7 @@ class LlamaCppBackend:
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
         seed: Optional[int] = None,
+        _allow_respawn_retry: bool = True,
     ) -> Generator[Union[str, dict], None, None]:
         """
         Send a chat completion to llama-server and stream tokens back.
@@ -6707,125 +7855,140 @@ class LlamaCppBackend:
         _metadata_finish_reason = None
 
         try:
-            # Prefill can use the long first-token timeout; body reads are lowered after headers.
-            stream_timeout = httpx.Timeout(connect = 10, read = 0.5, write = 10, pool = 10)
-            _auth_headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-            with httpx.Client(
-                timeout = stream_timeout, limits = httpx.Limits(max_keepalive_connections = 0)
-            ) as client:
-                first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
-                with self._stream_with_retry(
-                    client,
-                    url,
-                    payload,
+            with self._open_stream(url, payload, cancel_event) as (
+                response,
+                first_token_deadline,
+            ):
+                buffer = ""
+                has_content_tokens = False
+                reasoning_text = ""
+                for raw_chunk in self._iter_text_cancellable(
+                    response,
                     cancel_event,
-                    headers = _auth_headers,
                     first_token_deadline = first_token_deadline,
-                ) as response:
-                    if response.status_code != 200:
-                        error_body = response.read().decode()
-                        raise RuntimeError(
-                            f"llama-server returned {response.status_code}: {error_body}"
-                        )
+                ):
+                    buffer += raw_chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
 
-                    buffer = ""
-                    has_content_tokens = False
-                    reasoning_text = ""
-                    for raw_chunk in self._iter_text_cancellable(
-                        response,
-                        cancel_event,
-                        first_token_deadline = first_token_deadline,
-                    ):
-                        buffer += raw_chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
+                        if not line:
+                            continue
+                        if line == "data: [DONE]":
+                            if in_thinking:
+                                if has_content_tokens:
+                                    # Real thinking + content: close the tag
+                                    cumulative += "</think>"
+                                    yield cumulative
+                                else:
+                                    # Only reasoning_content, no content:
+                                    # model put its whole reply in reasoning
+                                    # (e.g. Qwen3 always-think). Show it as
+                                    # the main response, not a thinking block.
+                                    cumulative = reasoning_text
+                                    yield cumulative
+                            _stream_done = True
+                            break  # exit inner while
+                        if not line.startswith("data: "):
+                            continue
 
-                            if not line:
+                        try:
+                            data = json.loads(line[6:])
+                            # Diffusion frame (per-step canvas) from the shim: forward untouched so
+                            # the frontend renders it in place. No assistant text, so it never enters
+                            # the cumulative content.
+                            if data.get("type") == "diffusion_frame":
+                                yield data
                                 continue
-                            if line == "data: [DONE]":
-                                if in_thinking:
-                                    if has_content_tokens:
-                                        # Real thinking + content: close the tag
+                            # Capture server timings/usage from final chunks.
+                            _chunk_timings = data.get("timings")
+                            if _chunk_timings:
+                                _metadata_timings = _chunk_timings
+                            _chunk_usage = data.get("usage")
+                            if _chunk_usage:
+                                _metadata_usage = _chunk_usage
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                _fr = choices[0].get("finish_reason")
+                                if _fr:
+                                    _metadata_finish_reason = _fr
+
+                                # Reasoning/thinking tokens: llama-server
+                                # sends these as "reasoning_content"; wrap
+                                # in <think> tags for the frontend parser.
+                                reasoning = delta.get("reasoning_content", "")
+                                if reasoning:
+                                    reasoning_text += reasoning
+                                    if not in_thinking:
+                                        cumulative += "<think>"
+                                        in_thinking = True
+                                    cumulative += reasoning
+                                    yield cumulative
+
+                                token = delta.get("content", "")
+                                if token:
+                                    has_content_tokens = True
+                                    if in_thinking:
                                         cumulative += "</think>"
-                                        yield cumulative
-                                    else:
-                                        # Only reasoning_content, no content:
-                                        # model put its whole reply in reasoning
-                                        # (e.g. Qwen3 always-think). Show it as
-                                        # the main response, not a thinking block.
-                                        cumulative = reasoning_text
-                                        yield cumulative
-                                _stream_done = True
-                                break  # exit inner while
-                            if not line.startswith("data: "):
-                                continue
+                                        in_thinking = False
+                                    cumulative += token
+                                    yield cumulative
+                        except json.JSONDecodeError:
+                            logger.debug(f"Skipping malformed SSE line: {line[:100]}")
+                    if _stream_done:
+                        break  # exit outer for
+                if _metadata_usage or _metadata_timings or _metadata_finish_reason:
+                    _metadata_usage = _backfill_usage_from_timings(
+                        _metadata_usage, _metadata_timings
+                    )
+                    yield {
+                        "type": "metadata",
+                        # Never None: a finish-only metadata event (no usage,
+                        # no timings) would otherwise crash consumers that do
+                        # usage.get(...) on the non-streaming paths.
+                        "usage": _metadata_usage or {},
+                        "timings": _metadata_timings,
+                        "finish_reason": _metadata_finish_reason,
+                    }
 
-                            try:
-                                data = json.loads(line[6:])
-                                # Diffusion frame (per-step canvas) from the shim: forward untouched so
-                                # the frontend renders it in place. No assistant text, so it never enters
-                                # the cumulative content.
-                                if data.get("type") == "diffusion_frame":
-                                    yield data
-                                    continue
-                                # Capture server timings/usage from final chunks.
-                                _chunk_timings = data.get("timings")
-                                if _chunk_timings:
-                                    _metadata_timings = _chunk_timings
-                                _chunk_usage = data.get("usage")
-                                if _chunk_usage:
-                                    _metadata_usage = _chunk_usage
-                                choices = data.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    _fr = choices[0].get("finish_reason")
-                                    if _fr:
-                                        _metadata_finish_reason = _fr
-
-                                    # Reasoning/thinking tokens: llama-server
-                                    # sends these as "reasoning_content"; wrap
-                                    # in <think> tags for the frontend parser.
-                                    reasoning = delta.get("reasoning_content", "")
-                                    if reasoning:
-                                        reasoning_text += reasoning
-                                        if not in_thinking:
-                                            cumulative += "<think>"
-                                            in_thinking = True
-                                        cumulative += reasoning
-                                        yield cumulative
-
-                                    token = delta.get("content", "")
-                                    if token:
-                                        has_content_tokens = True
-                                        if in_thinking:
-                                            cumulative += "</think>"
-                                            in_thinking = False
-                                        cumulative += token
-                                        yield cumulative
-                            except json.JSONDecodeError:
-                                logger.debug(f"Skipping malformed SSE line: {line[:100]}")
-                        if _stream_done:
-                            break  # exit outer for
-                    if _metadata_usage or _metadata_timings or _metadata_finish_reason:
-                        _metadata_usage = _backfill_usage_from_timings(
-                            _metadata_usage, _metadata_timings
-                        )
-                        yield {
-                            "type": "metadata",
-                            # Never None: a finish-only metadata event (no usage,
-                            # no timings) would otherwise crash consumers that do
-                            # usage.get(...) on the non-streaming paths.
-                            "usage": _metadata_usage or {},
-                            "timings": _metadata_timings,
-                            "finish_reason": _metadata_finish_reason,
-                        }
-
-        except httpx.ConnectError:
+        except httpx.ConnectError as e:
+            # Server already down. If this was an MTP+tensor crash, recover by
+            # reloading without MTP (scheduled in the background) and fail this
+            # request. Otherwise the server was likely SIGKILL'd by GPU pressure
+            # from a concurrent training run: respawn the same config and retry the
+            # generation once (bounded by the private flag, no duplicate output).
+            if self._maybe_recover_from_mtp_crash(e):
+                raise RuntimeError("Lost connection to llama-server")
+            if _allow_respawn_retry and not cumulative and self._respawn_if_dead():
+                logger.warning(
+                    "llama-server was unreachable; respawned it and retrying the generation"
+                )
+                yield from self.generate_chat_completion(
+                    messages,
+                    image_b64 = image_b64,
+                    temperature = temperature,
+                    top_p = top_p,
+                    top_k = top_k,
+                    min_p = min_p,
+                    max_tokens = max_tokens,
+                    repetition_penalty = repetition_penalty,
+                    presence_penalty = presence_penalty,
+                    stop = stop,
+                    cancel_event = cancel_event,
+                    enable_thinking = enable_thinking,
+                    reasoning_effort = reasoning_effort,
+                    preserve_thinking = preserve_thinking,
+                    seed = seed,
+                    _allow_respawn_retry = False,
+                )
+                return
             raise RuntimeError("Lost connection to llama-server")
         except Exception as e:
             if cancel_event is not None and cancel_event.is_set():
                 return
+            # Died mid-generation: recover MTP, re-raise unchanged for this request.
+            self._maybe_recover_from_mtp_crash(e)
             raise
 
     # ── Tool-calling agentic loop ──────────────────────────────
@@ -6883,6 +8046,15 @@ class LlamaCppBackend:
         _accumulated_completion_tokens = 0
         _accumulated_predicted_ms = 0.0
         _accumulated_predicted_n = 0
+        # GGUF buffers reasoning; emit server-side timing before answer text.
+        _reasoning_started_at: Optional[float] = None
+        _reasoning_summary_emitted = False
+
+        def _reasoning_summary_event(started_at: float) -> dict:
+            return {
+                "type": "reasoning_summary",
+                "duration_ms": round((time.monotonic() - started_at) * 1000.0),
+            }
 
         def _strip_tool_markup(
             text: str,
@@ -6900,6 +8072,47 @@ class LlamaCppBackend:
             for pat in _TOOL_ALL_PATS:
                 text = pat.sub("", text)
             return text
+
+        def _build_metadata_event(usage, timings, finish_reason):
+            """Final usage+timings metadata event for the given pass, merging its
+            usage/timings with the running cross-iteration accumulators. None when
+            there is nothing to report."""
+            _fu = _backfill_usage_from_timings(usage, timings) or {}
+            _fp = _fu.get("prompt_tokens", 0)
+            _tc = _fu.get("completion_tokens", 0) + _accumulated_completion_tokens
+            if not (usage or timings or _accumulated_completion_tokens or finish_reason):
+                return None
+            _mt = dict(timings) if timings else {}
+            if _accumulated_predicted_ms or _accumulated_predicted_n:
+                _mt["predicted_ms"] = _mt.get("predicted_ms", 0) + _accumulated_predicted_ms
+                _mt["predicted_n"] = _mt.get("predicted_n", 0) + _accumulated_predicted_n
+                if _mt["predicted_ms"] > 0:
+                    _mt["predicted_per_second"] = _mt["predicted_n"] / (
+                        _mt["predicted_ms"] / 1000.0
+                    )
+            _usage = {
+                "prompt_tokens": _fp,
+                "completion_tokens": _tc,
+                "total_tokens": _fp + _tc,
+            }
+            # Preserve KV-cache hit details (cached_tokens) so the tool path
+            # reports them like the standard non-tool path does, not always 0.
+            if _fu.get("prompt_tokens_details"):
+                _usage["prompt_tokens_details"] = _fu["prompt_tokens_details"]
+            return {
+                "type": "metadata",
+                "usage": _usage,
+                "timings": _mt,
+                "finish_reason": finish_reason,
+            }
+
+        def _flush_reasoning_and_buffer():
+            """Append buffered reasoning (as a <think> block) then the held
+            content_buffer to the cumulative display text."""
+            nonlocal cumulative_display
+            if reasoning_accum:
+                cumulative_display += "<think>" + reasoning_accum + "</think>"
+            cumulative_display += content_buffer
 
         tool_controller = ToolLoopController(
             tools = tools,
@@ -6939,7 +8152,7 @@ class LlamaCppBackend:
             if not active_tools:
                 _append_budget_exhausted_nudge = False
                 break
-            _tool_xml_signals = TOOL_XML_SIGNALS if active_tools else ()
+            _tool_xml_signals = TOOL_XML_SIGNALS
 
             # Build payload -- stream: True so we detect tool signals
             # in the first 1-2 chunks without a non-streaming penalty.
@@ -6972,10 +8185,6 @@ class LlamaCppBackend:
                 payload["seed"] = seed
 
             try:
-                _auth_headers = (
-                    {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-                )
-
                 # ── Speculative buffer state machine ──────────────────
                 # BUFFERING: accumulate content, check for tool signals
                 # STREAMING: no tool detected, yield tokens to caller
@@ -6988,6 +8197,9 @@ class LlamaCppBackend:
                 content_buffer = ""  # Raw content held during BUFFERING
                 content_accum = ""  # All content tokens (for tool parsing)
                 reasoning_accum = ""
+                # Time each reasoning pass so final answers can replace tool timing.
+                _reasoning_started_at = None
+                _reasoning_summary_emitted = False
                 cumulative_display = ""  # Cumulative yielded text (with <think>)
                 in_thinking = False
                 has_content_tokens = False
@@ -6998,197 +8210,258 @@ class LlamaCppBackend:
                 _iter_finish_reason = None
                 _stream_done = False
                 _last_emitted = ""
-                provisional_render_html_tool_call_ids = set()
+                # Provisional tool_start cards already shown, keyed by tool_call_id.
+                provisional_started_tool_calls: dict[str, str] = {}
+                resolved_provisional_tool_call_ids: set[str] = set()
                 _suppress_visible_output = _forced_tool_call_pending
 
-                stream_timeout = httpx.Timeout(
-                    connect = 10,
-                    read = 0.5,
-                    write = 10,
-                    pool = 10,
-                )
-                with httpx.Client(
-                    timeout = stream_timeout,
-                    limits = httpx.Limits(max_keepalive_connections = 0),
-                ) as client:
-                    first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
-                    with self._stream_with_retry(
-                        client,
-                        url,
-                        payload,
+                with self._open_stream(url, payload, cancel_event) as (
+                    response,
+                    first_token_deadline,
+                ):
+                    raw_buf = ""
+                    for raw_chunk in self._iter_text_cancellable(
+                        response,
                         cancel_event,
-                        headers = _auth_headers,
                         first_token_deadline = first_token_deadline,
-                    ) as response:
-                        if response.status_code != 200:
-                            error_body = response.read().decode()
-                            raise RuntimeError(
-                                f"llama-server returned {response.status_code}: {error_body}"
-                            )
+                    ):
+                        raw_buf += raw_chunk
+                        while "\n" in raw_buf:
+                            line, raw_buf = raw_buf.split("\n", 1)
+                            line = line.strip()
 
-                        raw_buf = ""
-                        for raw_chunk in self._iter_text_cancellable(
-                            response,
-                            cancel_event,
-                            first_token_deadline = first_token_deadline,
-                        ):
-                            raw_buf += raw_chunk
-                            while "\n" in raw_buf:
-                                line, raw_buf = raw_buf.split("\n", 1)
-                                line = line.strip()
+                            if not line:
+                                continue
+                            if line == "data: [DONE]":
+                                # Flush thinking state for STREAMING
+                                if detect_state == _S_STREAMING and in_thinking:
+                                    if has_content_tokens:
+                                        cumulative_display += "</think>"
+                                        if not _suppress_visible_output:
+                                            yield {
+                                                "type": "content",
+                                                "text": _strip_tool_markup(
+                                                    cumulative_display,
+                                                    final = True,
+                                                ),
+                                            }
+                                    else:
+                                        cumulative_display = reasoning_accum
+                                        if not _suppress_visible_output:
+                                            yield {
+                                                "type": "content",
+                                                "text": cumulative_display,
+                                            }
+                                _stream_done = True
+                                break  # exit inner while
+                            if not line.startswith("data: "):
+                                continue
 
-                                if not line:
+                            try:
+                                chunk_data = json.loads(line[6:])
+                                _ct = chunk_data.get("timings")
+                                if _ct:
+                                    _iter_timings = _ct
+                                _cu = chunk_data.get("usage")
+                                if _cu:
+                                    _iter_usage = _cu
+
+                                choices = chunk_data.get("choices", [])
+                                if not choices:
                                     continue
-                                if line == "data: [DONE]":
-                                    # Flush thinking state for STREAMING
-                                    if detect_state == _S_STREAMING and in_thinking:
-                                        if has_content_tokens:
+
+                                delta = choices[0].get("delta", {})
+                                _fr = choices[0].get("finish_reason")
+                                if _fr:
+                                    _iter_finish_reason = _fr
+
+                                # ── Structured tool_calls ──
+                                tc_deltas = delta.get("tool_calls")
+                                if tc_deltas:
+                                    # Preserve any visible preface before draining
+                                    # the structured tool call.
+                                    has_structured_tc = True
+                                    detect_state = _S_DRAINING
+                                    for tc_d in tc_deltas:
+                                        idx = tc_d.get("index", 0)
+                                        if idx not in tool_calls_acc:
+                                            tool_calls_acc[idx] = {
+                                                "id": tc_d.get("id", f"call_{idx}"),
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "",
+                                                    "arguments": "",
+                                                },
+                                            }
+                                        elif tc_d.get("id"):
+                                            # Update ID if a real one
+                                            # arrives on a later delta.
+                                            tool_calls_acc[idx]["id"] = tc_d["id"]
+                                        func = tc_d.get("function", {})
+                                        if func.get("name"):
+                                            tool_calls_acc[idx]["function"]["name"] += func["name"]
+                                        if func.get("arguments"):
+                                            tool_calls_acc[idx]["function"]["arguments"] += func[
+                                                "arguments"
+                                            ]
+                                        current_name = tool_calls_acc[idx]["function"].get(
+                                            "name", ""
+                                        )
+                                        fallback_id = f"call_{idx}"
+                                        current_id = tool_calls_acc[idx].get("id", fallback_id)
+                                        already_started = (
+                                            current_id in provisional_started_tool_calls
+                                        )
+                                        # Empty/synthetic ids cannot reconcile with real starts.
+                                        has_real_id = bool(current_id) and current_id != fallback_id
+                                        # Show one early card per eligible streamed tool call.
+                                        _is_completed_one_shot = (
+                                            current_name == "render_html"
+                                            and _tool_succeeded("render_html")
+                                        )
+                                        # render_html is one-shot.
+                                        _one_shot_already_provisional = (
+                                            current_name == "render_html"
+                                            and "render_html"
+                                            in provisional_started_tool_calls.values()
+                                        )
+                                        # Later parallel cards only reconcile when parallel use is enabled.
+                                        _confirm_gated = (
+                                            confirm_tool_calls and not bypass_permissions
+                                        )
+                                        # Keep small-argument tools on the normal path.
+                                        _args_len = len(
+                                            tool_calls_acc[idx]["function"].get("arguments", "")
+                                        )
+                                        _payload_is_large = (
+                                            current_name == "render_html"
+                                            or _args_len >= _PROVISIONAL_ARGS_MIN_CHARS
+                                        )
+                                        if (
+                                            current_name
+                                            and (idx == 0 or not disable_parallel_tool_use)
+                                            and has_real_id
+                                            and not already_started
+                                            and not _is_completed_one_shot
+                                            and not _one_shot_already_provisional
+                                            and not _confirm_gated
+                                            and _payload_is_large
+                                            and any(
+                                                (tool.get("function") or {}).get("name")
+                                                == current_name
+                                                for tool in active_tools
+                                            )
+                                        ):
+                                            provisional_started_tool_calls[current_id] = (
+                                                current_name
+                                            )
+                                            yield {
+                                                "type": "tool_start",
+                                                "tool_name": current_name,
+                                                "tool_call_id": current_id,
+                                                "arguments": {},
+                                                "provenance": tool_event_provenance(
+                                                    provisional = True,
+                                                ),
+                                            }
+                                    continue
+
+                                # ── Reasoning tokens ──
+                                # Yield only in STREAMING. In BUFFERING and
+                                # DRAINING, accumulate silently so we don't
+                                # corrupt the consumer's prev_text tracker
+                                # (routes/inference.py never resets it
+                                # between tool iterations).
+                                reasoning = delta.get("reasoning_content", "")
+                                if reasoning:
+                                    if _reasoning_started_at is None:
+                                        _reasoning_started_at = time.monotonic()
+                                    reasoning_accum += reasoning
+                                    if detect_state == _S_STREAMING:
+                                        if not in_thinking:
+                                            cumulative_display += "<think>"
+                                            in_thinking = True
+                                        cumulative_display += reasoning
+                                        if not _suppress_visible_output:
+                                            yield {
+                                                "type": "content",
+                                                "text": cumulative_display,
+                                            }
+
+                                # ── Content tokens ──
+                                token = delta.get("content", "")
+                                if token:
+                                    # First answer token ends reasoning.
+                                    if (
+                                        _reasoning_started_at is not None
+                                        and not _reasoning_summary_emitted
+                                    ):
+                                        _reasoning_summary_emitted = True
+                                        yield _reasoning_summary_event(_reasoning_started_at)
+                                    has_content_tokens = True
+                                    content_accum += token
+
+                                    if detect_state == _S_DRAINING:
+                                        pass  # accumulate silently
+
+                                    elif detect_state == _S_STREAMING:
+                                        if in_thinking:
                                             cumulative_display += "</think>"
+                                            in_thinking = False
+                                        cumulative_display += token
+                                        cleaned = _strip_tool_markup_streaming(cumulative_display)
+                                        if len(cleaned) > len(_last_emitted):
+                                            _last_emitted = cleaned
                                             if not _suppress_visible_output:
                                                 yield {
                                                     "type": "content",
-                                                    "text": _strip_tool_markup(
-                                                        cumulative_display,
-                                                        final = True,
-                                                    ),
-                                                }
-                                        else:
-                                            cumulative_display = reasoning_accum
-                                            if not _suppress_visible_output:
-                                                yield {
-                                                    "type": "content",
-                                                    "text": cumulative_display,
-                                                }
-                                    _stream_done = True
-                                    break  # exit inner while
-                                if not line.startswith("data: "):
-                                    continue
-
-                                try:
-                                    chunk_data = json.loads(line[6:])
-                                    _ct = chunk_data.get("timings")
-                                    if _ct:
-                                        _iter_timings = _ct
-                                    _cu = chunk_data.get("usage")
-                                    if _cu:
-                                        _iter_usage = _cu
-
-                                    choices = chunk_data.get("choices", [])
-                                    if not choices:
-                                        continue
-
-                                    delta = choices[0].get("delta", {})
-                                    _fr = choices[0].get("finish_reason")
-                                    if _fr:
-                                        _iter_finish_reason = _fr
-
-                                    # ── Structured tool_calls ──
-                                    tc_deltas = delta.get("tool_calls")
-                                    if tc_deltas:
-                                        # llama-server can emit visible assistant
-                                        # preface content before native structured
-                                        # tool_calls. Preserve content_accum as
-                                        # the assistant pre-tool text and still
-                                        # drain/execute the structured call.
-                                        has_structured_tc = True
-                                        detect_state = _S_DRAINING
-                                        for tc_d in tc_deltas:
-                                            idx = tc_d.get("index", 0)
-                                            if idx not in tool_calls_acc:
-                                                tool_calls_acc[idx] = {
-                                                    "id": tc_d.get("id", f"call_{idx}"),
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": "",
-                                                        "arguments": "",
-                                                    },
-                                                }
-                                            elif tc_d.get("id"):
-                                                # Update ID if a real one
-                                                # arrives on a later delta.
-                                                tool_calls_acc[idx]["id"] = tc_d["id"]
-                                            func = tc_d.get("function", {})
-                                            if func.get("name"):
-                                                tool_calls_acc[idx]["function"]["name"] += func[
-                                                    "name"
-                                                ]
-                                            if func.get("arguments"):
-                                                tool_calls_acc[idx]["function"]["arguments"] += (
-                                                    func["arguments"]
-                                                )
-                                            current_name = tool_calls_acc[idx]["function"].get(
-                                                "name", ""
-                                            )
-                                            fallback_id = f"call_{idx}"
-                                            current_id = tool_calls_acc[idx].get("id", fallback_id)
-                                            already_started = (
-                                                current_id in provisional_render_html_tool_call_ids
-                                            )
-                                            has_real_id = current_id != fallback_id
-                                            if (
-                                                current_name == "render_html"
-                                                and not _tool_succeeded("render_html")
-                                                and any(
-                                                    (
-                                                        (tool.get("function") or {}).get("name")
-                                                        == "render_html"
-                                                    )
-                                                    for tool in active_tools
-                                                )
-                                                and not already_started
-                                                and not provisional_render_html_tool_call_ids
-                                                and has_real_id
-                                            ):
-                                                provisional_render_html_tool_call_ids.add(
-                                                    current_id
-                                                )
-                                                yield {
-                                                    "type": "tool_start",
-                                                    "tool_name": "render_html",
-                                                    "tool_call_id": current_id,
-                                                    "arguments": {},
-                                                    "provenance": tool_event_provenance(
-                                                        provisional = True,
-                                                    ),
-                                                }
-                                        continue
-
-                                    # ── Reasoning tokens ──
-                                    # Yield only in STREAMING. In BUFFERING and
-                                    # DRAINING, accumulate silently so we don't
-                                    # corrupt the consumer's prev_text tracker
-                                    # (routes/inference.py never resets it
-                                    # between tool iterations).
-                                    reasoning = delta.get("reasoning_content", "")
-                                    if reasoning:
-                                        reasoning_accum += reasoning
-                                        if detect_state == _S_STREAMING:
-                                            if not in_thinking:
-                                                cumulative_display += "<think>"
-                                                in_thinking = True
-                                            cumulative_display += reasoning
-                                            if not _suppress_visible_output:
-                                                yield {
-                                                    "type": "content",
-                                                    "text": cumulative_display,
+                                                    "text": cleaned,
                                                 }
 
-                                    # ── Content tokens ──
-                                    token = delta.get("content", "")
-                                    if token:
-                                        has_content_tokens = True
-                                        content_accum += token
+                                    elif detect_state == _S_BUFFERING:
+                                        content_buffer += token
+                                        stripped_buf = content_buffer.lstrip()
+                                        if not stripped_buf:
+                                            continue
 
-                                        if detect_state == _S_DRAINING:
-                                            pass  # accumulate silently
+                                        # Check tool signal prefixes.
+                                        is_prefix = False
+                                        is_match = False
+                                        for sig in _tool_xml_signals:
+                                            if stripped_buf.startswith(sig):
+                                                is_match = True
+                                                break
+                                            if sig.startswith(stripped_buf):
+                                                is_prefix = True
+                                                break
 
-                                        elif detect_state == _S_STREAMING:
-                                            if in_thinking:
-                                                cumulative_display += "</think>"
-                                                in_thinking = False
-                                            cumulative_display += token
+                                        if is_match:
+                                            # Tool signal -- flush any visible
+                                            # prefix before DRAINING so the
+                                            # route sends it before tool_start.
+                                            _flush_reasoning_and_buffer()
                                             cleaned = _strip_tool_markup_streaming(
-                                                cumulative_display
+                                                cumulative_display,
+                                                force = True,
+                                            )
+                                            if len(cleaned) > len(_last_emitted):
+                                                _last_emitted = cleaned
+                                                if not _suppress_visible_output:
+                                                    yield {
+                                                        "type": "content",
+                                                        "text": cleaned,
+                                                    }
+                                            detect_state = _S_DRAINING
+                                        elif is_prefix and len(stripped_buf) < _MAX_BUFFER_CHARS:
+                                            pass  # keep buffering
+                                        else:
+                                            # Not a tool -- flush buffer
+                                            detect_state = _S_STREAMING
+                                            # Flush reasoning accumulated
+                                            # during BUFFERING.
+                                            _flush_reasoning_and_buffer()
+                                            cleaned = _strip_tool_markup(
+                                                cumulative_display,
                                             )
                                             if len(cleaned) > len(_last_emitted):
                                                 _last_emitted = cleaned
@@ -7198,73 +8471,10 @@ class LlamaCppBackend:
                                                         "text": cleaned,
                                                     }
 
-                                        elif detect_state == _S_BUFFERING:
-                                            content_buffer += token
-                                            stripped_buf = content_buffer.lstrip()
-                                            if not stripped_buf:
-                                                continue
-
-                                            # Check tool signal prefixes.
-                                            is_prefix = False
-                                            is_match = False
-                                            for sig in _tool_xml_signals:
-                                                if stripped_buf.startswith(sig):
-                                                    is_match = True
-                                                    break
-                                                if sig.startswith(stripped_buf):
-                                                    is_prefix = True
-                                                    break
-
-                                            if is_match:
-                                                # Tool signal -- flush any visible
-                                                # prefix before DRAINING so the
-                                                # route sends it before tool_start.
-                                                if reasoning_accum:
-                                                    cumulative_display += "<think>"
-                                                    cumulative_display += reasoning_accum
-                                                    cumulative_display += "</think>"
-                                                cumulative_display += content_buffer
-                                                cleaned = _strip_tool_markup_streaming(
-                                                    cumulative_display,
-                                                    force = True,
-                                                )
-                                                if len(cleaned) > len(_last_emitted):
-                                                    _last_emitted = cleaned
-                                                    if not _suppress_visible_output:
-                                                        yield {
-                                                            "type": "content",
-                                                            "text": cleaned,
-                                                        }
-                                                detect_state = _S_DRAINING
-                                            elif (
-                                                is_prefix and len(stripped_buf) < _MAX_BUFFER_CHARS
-                                            ):
-                                                pass  # keep buffering
-                                            else:
-                                                # Not a tool -- flush buffer
-                                                detect_state = _S_STREAMING
-                                                # Flush reasoning accumulated
-                                                # during BUFFERING.
-                                                if reasoning_accum:
-                                                    cumulative_display += "<think>"
-                                                    cumulative_display += reasoning_accum
-                                                    cumulative_display += "</think>"
-                                                cumulative_display += content_buffer
-                                                cleaned = _strip_tool_markup(
-                                                    cumulative_display,
-                                                )
-                                                if len(cleaned) > len(_last_emitted):
-                                                    _last_emitted = cleaned
-                                                    if not _suppress_visible_output:
-                                                        yield {
-                                                            "type": "content",
-                                                            "text": cleaned,
-                                                        }
-
-                                except json.JSONDecodeError:
-                                    logger.debug(f"Skipping malformed SSE line: {line[:100]}")
-                            if _stream_done:
-                                break  # exit outer for
+                            except json.JSONDecodeError:
+                                logger.debug(f"Skipping malformed SSE line: {line[:100]}")
+                        if _stream_done:
+                            break  # exit outer for
 
                 # ── Resolve BUFFERING at stream end ──
                 if detect_state == _S_BUFFERING:
@@ -7275,11 +8485,7 @@ class LlamaCppBackend:
                         detect_state = _S_STREAMING
                         if content_buffer:
                             # Flush reasoning first.
-                            if reasoning_accum:
-                                cumulative_display += "<think>"
-                                cumulative_display += reasoning_accum
-                                cumulative_display += "</think>"
-                            cumulative_display += content_buffer
+                            _flush_reasoning_and_buffer()
                             if not _suppress_visible_output:
                                 yield {
                                     "type": "content",
@@ -7289,9 +8495,10 @@ class LlamaCppBackend:
                                     ),
                                 }
                         elif reasoning_accum and not has_content_tokens:
-                            # Reasoning-only response: show reasoning as plain
-                            # text, matching the final streaming pass for
-                            # models that put everything in reasoning.
+                            # Reasoning-only reply: show it as plain text.
+                            if _reasoning_started_at is not None and not _reasoning_summary_emitted:
+                                _reasoning_summary_emitted = True
+                                yield _reasoning_summary_event(_reasoning_started_at)
                             cumulative_display = reasoning_accum
                             if not _suppress_visible_output:
                                 yield {
@@ -7400,31 +8607,11 @@ class LlamaCppBackend:
 
                         # Content was already streamed.  Yield metadata.
                         yield {"type": "status", "text": ""}
-                        _fu = _backfill_usage_from_timings(_iter_usage, _iter_timings) or {}
-                        _fc = _fu.get("completion_tokens", 0)
-                        _fp = _fu.get("prompt_tokens", 0)
-                        _tc = _fc + _accumulated_completion_tokens
-                        if _iter_usage or _iter_timings or _accumulated_completion_tokens:
-                            _mt = dict(_iter_timings) if _iter_timings else {}
-                            if _accumulated_predicted_ms or _accumulated_predicted_n:
-                                _mt["predicted_ms"] = (
-                                    _mt.get("predicted_ms", 0) + _accumulated_predicted_ms
-                                )
-                                _tn = _mt.get("predicted_n", 0) + _accumulated_predicted_n
-                                _mt["predicted_n"] = _tn
-                                _tms = _mt["predicted_ms"]
-                                if _tms > 0:
-                                    _mt["predicted_per_second"] = _tn / (_tms / 1000.0)
-                            yield {
-                                "type": "metadata",
-                                "usage": {
-                                    "prompt_tokens": _fp,
-                                    "completion_tokens": _tc,
-                                    "total_tokens": _fp + _tc,
-                                },
-                                "timings": _mt,
-                                "finish_reason": _iter_finish_reason,
-                            }
+                        _meta = _build_metadata_event(
+                            _iter_usage, _iter_timings, _iter_finish_reason
+                        )
+                        if _meta is not None:
+                            yield _meta
                         return
 
                     # Safety net caught tool XML -- treat as tool call.
@@ -7475,31 +8662,11 @@ class LlamaCppBackend:
                             content_accum = _strip_tool_markup(content_accum, final = True)
                         if content_accum:
                             yield {"type": "content", "text": content_accum}
-                        _fu = _backfill_usage_from_timings(_iter_usage, _iter_timings) or {}
-                        _fc = _fu.get("completion_tokens", 0)
-                        _fp = _fu.get("prompt_tokens", 0)
-                        _tc = _fc + _accumulated_completion_tokens
-                        if _iter_usage or _iter_timings or _accumulated_completion_tokens:
-                            _mt = dict(_iter_timings) if _iter_timings else {}
-                            if _accumulated_predicted_ms or _accumulated_predicted_n:
-                                _mt["predicted_ms"] = (
-                                    _mt.get("predicted_ms", 0) + _accumulated_predicted_ms
-                                )
-                                _tn = _mt.get("predicted_n", 0) + _accumulated_predicted_n
-                                _mt["predicted_n"] = _tn
-                                _tms = _mt["predicted_ms"]
-                                if _tms > 0:
-                                    _mt["predicted_per_second"] = _tn / (_tms / 1000.0)
-                            yield {
-                                "type": "metadata",
-                                "usage": {
-                                    "prompt_tokens": _fp,
-                                    "completion_tokens": _tc,
-                                    "total_tokens": _fp + _tc,
-                                },
-                                "timings": _mt,
-                                "finish_reason": _iter_finish_reason,
-                            }
+                        _meta = _build_metadata_event(
+                            _iter_usage, _iter_timings, _iter_finish_reason
+                        )
+                        if _meta is not None:
+                            yield _meta
                         return
 
                 # ── Execute tool calls ──
@@ -7522,20 +8689,30 @@ class LlamaCppBackend:
                 for tc in tool_calls or []:
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
-                    provisional_render_html_match = (
-                        tool_name == "render_html"
-                        and tc.get("id") in provisional_render_html_tool_call_ids
-                    )
+                    provisional_match = tc.get("id") in provisional_started_tool_calls
                     decision = tool_controller.prepare_call(
                         tc,
                         forced = _forced_tool_call_pending,
-                        provisional = provisional_render_html_match,
+                        provisional = provisional_match,
                     )
 
                     if not decision.should_execute:
                         if content_text and not assistant_appended:
                             conversation.append(assistant_msg)
                             assistant_appended = True
+                        if provisional_match:
+                            # A provisional tool card is already on screen for this
+                            # id; close it so it never dangles when the controller
+                            # turns the call into an internal no-op (duplicate /
+                            # disabled / render_html_repeat).
+                            resolved_provisional_tool_call_ids.add(decision.tool_call_id)
+                            yield {
+                                "type": "tool_end",
+                                "tool_name": decision.tool_name,
+                                "tool_call_id": decision.tool_call_id,
+                                "result": "",
+                                "provenance": decision.provenance,
+                            }
                         completion = tool_controller.record_noop(decision)
                         conversation.append(completion.model_message())
                         if _forced_tool_call_pending:
@@ -7580,6 +8757,7 @@ class LlamaCppBackend:
                             == "deny"
                         ):
                             decision_slot = None
+                            resolved_provisional_tool_call_ids.add(decision.tool_call_id)
                             yield {
                                 "type": "tool_end",
                                 "tool_name": decision.tool_name,
@@ -7623,11 +8801,24 @@ class LlamaCppBackend:
                         if decision.tool_name == "search_knowledge_base":
                             _kb_search_count += 1
                     completion = tool_controller.record_result(decision, result)
+                    resolved_provisional_tool_call_ids.add(decision.tool_call_id)
                     yield completion.tool_end_event()
                     conversation.append(completion.tool_message())
 
                     if _forced_tool_call_pending:
                         _forced_tool_call_pending = False
+
+                # Close provisional cards not resolved by execution/no-op handling.
+                for _pid, _pname in provisional_started_tool_calls.items():
+                    if _pid not in resolved_provisional_tool_call_ids:
+                        resolved_provisional_tool_call_ids.add(_pid)
+                        yield {
+                            "type": "tool_end",
+                            "tool_name": _pname,
+                            "tool_call_id": _pid,
+                            "result": "",
+                            "provenance": tool_event_provenance(provisional = True),
+                        }
 
                 # Clear tool status badge before next generation/final pass.
                 yield {"type": "status", "text": ""}
@@ -7637,10 +8828,32 @@ class LlamaCppBackend:
                 continue
 
             except httpx.ConnectError:
+                # Mark unresolved provisional cards as failed before raising.
+                for _pid, _pname in provisional_started_tool_calls.items():
+                    if _pid not in resolved_provisional_tool_call_ids:
+                        resolved_provisional_tool_call_ids.add(_pid)
+                        yield {
+                            "type": "tool_end",
+                            "tool_name": _pname,
+                            "tool_call_id": _pid,
+                            "result": "Error: lost connection to llama-server before the tool call completed.",
+                            "provenance": tool_event_provenance(provisional = True),
+                        }
                 raise RuntimeError("Lost connection to llama-server")
             except Exception as e:
                 if cancel_event is not None and cancel_event.is_set():
                     return
+                # Same cleanup for other mid-iteration failures.
+                for _pid, _pname in provisional_started_tool_calls.items():
+                    if _pid not in resolved_provisional_tool_call_ids:
+                        resolved_provisional_tool_call_ids.add(_pid)
+                        yield {
+                            "type": "tool_end",
+                            "tool_name": _pname,
+                            "tool_call_id": _pid,
+                            "result": "Error: the tool call was interrupted before it completed.",
+                            "provenance": tool_event_provenance(provisional = True),
+                        }
                 raise
 
         # ── Tool iteration cap reached -- synthesize final answer ──
@@ -7694,131 +8907,107 @@ class LlamaCppBackend:
         in_thinking = False
         has_content_tokens = False
         reasoning_text = ""
+        _final_reasoning_started_at: Optional[float] = None
+        _final_reasoning_summary_emitted = False
         _metadata_usage = None
         _metadata_timings = None
         _metadata_finish_reason = None
         _stream_done = False
 
         try:
-            stream_timeout = httpx.Timeout(connect = 10, read = 0.5, write = 10, pool = 10)
-            _auth_headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-            with httpx.Client(
-                timeout = stream_timeout, limits = httpx.Limits(max_keepalive_connections = 0)
-            ) as client:
-                first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
-                with self._stream_with_retry(
-                    client,
-                    url,
-                    stream_payload,
+            with self._open_stream(url, stream_payload, cancel_event) as (
+                response,
+                first_token_deadline,
+            ):
+                buffer = ""
+                for raw_chunk in self._iter_text_cancellable(
+                    response,
                     cancel_event,
-                    headers = _auth_headers,
                     first_token_deadline = first_token_deadline,
-                ) as response:
-                    if response.status_code != 200:
-                        error_body = response.read().decode()
-                        raise RuntimeError(
-                            f"llama-server returned {response.status_code}: {error_body}"
-                        )
+                ):
+                    buffer += raw_chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
 
-                    buffer = ""
-                    for raw_chunk in self._iter_text_cancellable(
-                        response,
-                        cancel_event,
-                        first_token_deadline = first_token_deadline,
-                    ):
-                        buffer += raw_chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
+                        if not line:
+                            continue
+                        if line == "data: [DONE]":
+                            if in_thinking:
+                                if (
+                                    _final_reasoning_started_at is not None
+                                    and not _final_reasoning_summary_emitted
+                                ):
+                                    _final_reasoning_summary_emitted = True
+                                    yield _reasoning_summary_event(_final_reasoning_started_at)
+                                if has_content_tokens:
+                                    cumulative += "</think>"
+                                    yield {
+                                        "type": "content",
+                                        "text": _strip_tool_markup(cumulative, final = True),
+                                    }
+                                else:
+                                    cumulative = reasoning_text
+                                    yield {"type": "content", "text": cumulative}
+                            _stream_done = True
+                            break  # exit inner while
+                        if not line.startswith("data: "):
+                            continue
 
-                            if not line:
-                                continue
-                            if line == "data: [DONE]":
-                                if in_thinking:
-                                    if has_content_tokens:
+                        try:
+                            chunk_data = json.loads(line[6:])
+                            # Capture server timings/usage from final chunks.
+                            _chunk_timings = chunk_data.get("timings")
+                            if _chunk_timings:
+                                _metadata_timings = _chunk_timings
+                            _chunk_usage = chunk_data.get("usage")
+                            if _chunk_usage:
+                                _metadata_usage = _chunk_usage
+                            choices = chunk_data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                _fr = choices[0].get("finish_reason")
+                                if _fr:
+                                    _metadata_finish_reason = _fr
+
+                                reasoning = delta.get("reasoning_content", "")
+                                if reasoning:
+                                    if _final_reasoning_started_at is None:
+                                        _final_reasoning_started_at = time.monotonic()
+                                    reasoning_text += reasoning
+                                    if not in_thinking:
+                                        cumulative += "<think>"
+                                        in_thinking = True
+                                    cumulative += reasoning
+                                    yield {"type": "content", "text": cumulative}
+
+                                token = delta.get("content", "")
+                                if token:
+                                    if (
+                                        _final_reasoning_started_at is not None
+                                        and not _final_reasoning_summary_emitted
+                                    ):
+                                        _final_reasoning_summary_emitted = True
+                                        yield _reasoning_summary_event(_final_reasoning_started_at)
+                                    has_content_tokens = True
+                                    if in_thinking:
                                         cumulative += "</think>"
-                                        yield {
-                                            "type": "content",
-                                            "text": _strip_tool_markup(cumulative, final = True),
-                                        }
-                                    else:
-                                        cumulative = reasoning_text
-                                        yield {"type": "content", "text": cumulative}
-                                _stream_done = True
-                                break  # exit inner while
-                            if not line.startswith("data: "):
-                                continue
-
-                            try:
-                                chunk_data = json.loads(line[6:])
-                                # Capture server timings/usage from final chunks.
-                                _chunk_timings = chunk_data.get("timings")
-                                if _chunk_timings:
-                                    _metadata_timings = _chunk_timings
-                                _chunk_usage = chunk_data.get("usage")
-                                if _chunk_usage:
-                                    _metadata_usage = _chunk_usage
-                                choices = chunk_data.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    _fr = choices[0].get("finish_reason")
-                                    if _fr:
-                                        _metadata_finish_reason = _fr
-
-                                    reasoning = delta.get("reasoning_content", "")
-                                    if reasoning:
-                                        reasoning_text += reasoning
-                                        if not in_thinking:
-                                            cumulative += "<think>"
-                                            in_thinking = True
-                                        cumulative += reasoning
-                                        yield {"type": "content", "text": cumulative}
-
-                                    token = delta.get("content", "")
-                                    if token:
-                                        has_content_tokens = True
-                                        if in_thinking:
-                                            cumulative += "</think>"
-                                            in_thinking = False
-                                        cumulative += token
-                                        cleaned = _strip_tool_markup(cumulative)
-                                        # Emit only when cleaned text grows (monotonic).
-                                        if len(cleaned) > len(_last_emitted):
-                                            _last_emitted = cleaned
-                                            yield {"type": "content", "text": cleaned}
-                            except json.JSONDecodeError:
-                                logger.debug(f"Skipping malformed SSE line: {line[:100]}")
-                        if _stream_done:
-                            break  # exit outer for
-                    _final_usage = _metadata_usage or {}
-                    _final_completion = _final_usage.get("completion_tokens", 0)
-                    _final_prompt = _final_usage.get("prompt_tokens", 0)
-                    _total_completion = _final_completion + _accumulated_completion_tokens
-                    if _metadata_usage or _metadata_timings or _metadata_finish_reason:
-                        _merged_timings = dict(_metadata_timings) if _metadata_timings else {}
-                        if _accumulated_predicted_ms or _accumulated_predicted_n:
-                            _merged_timings["predicted_ms"] = (
-                                _merged_timings.get("predicted_ms", 0) + _accumulated_predicted_ms
-                            )
-                            _total_predicted_n = (
-                                _merged_timings.get("predicted_n", 0) + _accumulated_predicted_n
-                            )
-                            _merged_timings["predicted_n"] = _total_predicted_n
-                            _total_predicted_ms = _merged_timings["predicted_ms"]
-                            if _total_predicted_ms > 0:
-                                _merged_timings["predicted_per_second"] = _total_predicted_n / (
-                                    _total_predicted_ms / 1000.0
-                                )
-                        yield {
-                            "type": "metadata",
-                            "usage": {
-                                "prompt_tokens": _final_prompt,
-                                "completion_tokens": _total_completion,
-                                "total_tokens": _final_prompt + _total_completion,
-                            },
-                            "timings": _merged_timings,
-                            "finish_reason": _metadata_finish_reason,
-                        }
+                                        in_thinking = False
+                                    cumulative += token
+                                    cleaned = _strip_tool_markup(cumulative)
+                                    # Emit only when cleaned text grows (monotonic).
+                                    if len(cleaned) > len(_last_emitted):
+                                        _last_emitted = cleaned
+                                        yield {"type": "content", "text": cleaned}
+                        except json.JSONDecodeError:
+                            logger.debug(f"Skipping malformed SSE line: {line[:100]}")
+                    if _stream_done:
+                        break  # exit outer for
+                _meta = _build_metadata_event(
+                    _metadata_usage, _metadata_timings, _metadata_finish_reason
+                )
+                if _meta is not None:
+                    yield _meta
 
         except httpx.ConnectError:
             raise RuntimeError("Lost connection to llama-server")
@@ -7856,8 +9045,6 @@ class LlamaCppBackend:
                         continue
                     if not isinstance(block, dict):
                         return True
-                    if block.get("type") == "text" and isinstance(block.get("text"), str):
-                        continue
                     if isinstance(block.get("text"), str):
                         continue
                     return True
@@ -7878,9 +9065,7 @@ class LlamaCppBackend:
                 parts = []
                 for block in content:
                     if isinstance(block, dict):
-                        if block.get("type") == "text" and isinstance(block.get("text"), str):
-                            parts.append(block["text"])
-                        elif isinstance(block.get("text"), str):
+                        if isinstance(block.get("text"), str):
                             parts.append(block["text"])
                     elif isinstance(block, str):
                         parts.append(block)
@@ -7895,8 +9080,7 @@ class LlamaCppBackend:
             system_text = _block_text(system)
 
         try:
-            _auth_headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-            with httpx.Client(timeout = 10, headers = _auth_headers) as client:
+            with httpx.Client(timeout = 10, headers = self._auth_headers, trust_env = False) as client:
 
                 def _tokenize(text: str) -> int:
                     r = client.post(
@@ -7924,7 +9108,7 @@ class LlamaCppBackend:
                 try:
                     # llama-server's /apply-template renders tool declarations
                     # into the prompt when ``tools`` is supplied, so pass them
-                    # through — otherwise tool-schema tokens go uncounted.
+                    # through, otherwise tool-schema tokens go uncounted.
                     template_body = {"messages": template_messages}
                     if tools:
                         template_body["tools"] = tools
@@ -7975,12 +9159,44 @@ class LlamaCppBackend:
             logger.debug(f"Audio type detection failed: {e}")
             return None
 
+    def _apply_detected_audio(self, detected: Optional[str]) -> bool:
+        """Apply a probed audio codec under self._lock. Returns True to continue
+        the load (codec inited OK, or nothing to init), False to abort (server
+        unhealthy or codec init failed). Shared by the fast-path retry and the
+        main load path."""
+        if detected in ("snac", "bicodec", "dac"):
+            with self._lock:
+                if not self._healthy:
+                    return False
+                try:
+                    self.init_audio_codec(detected)
+                    self._is_audio = True
+                    self._audio_type = detected
+                except Exception as exc:
+                    # Surface as HTTP 500 (matches pre-PR contract).
+                    logger.warning("Failed to init audio codec '%s': %s", detected, exc)
+                    self._audio_probed = False
+                    return False
+        elif detected:
+            # csm / whisper / audio_vlm: track type but keep _is_audio False --
+            # GGUF TTS routing only fires for snac/bicodec/dac.
+            with self._lock:
+                if not self._healthy:
+                    return False
+                self._audio_type = detected
+        # Audio input = token probe (audio_vlm/whisper) OR mmproj encoder.
+        from utils.models.model_config import is_audio_input_type
+
+        self._has_audio_input = bool(is_audio_input_type(self._audio_type)) or bool(
+            self._mmproj_has_audio
+        )
+        return True
+
     def _detect_audio_type_strict(self) -> Optional[str]:
         """Codec name on match, None on non-audio, raises on transport/JSON errors."""
         if not self.is_loaded:
             return None
-        _auth_headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-        with httpx.Client(timeout = 10, headers = _auth_headers) as client:
+        with httpx.Client(timeout = 10, headers = self._auth_headers, trust_env = False) as client:
 
             def _detok(tid: int) -> str:
                 # Non-200 means "marker not in vocab" -- keep probing.
@@ -8094,8 +9310,11 @@ class LlamaCppBackend:
         if need_ids:
             payload["n_probs"] = 1
 
-        _auth_headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-        with httpx.Client(timeout = httpx.Timeout(300, connect = 10), headers = _auth_headers) as client:
+        with httpx.Client(
+            timeout = httpx.Timeout(300, connect = 10),
+            headers = self._auth_headers,
+            trust_env = False,
+        ) as client:
             resp = client.post(f"{self.base_url}/completion", json = payload)
             if resp.status_code != 200:
                 raise RuntimeError(f"llama-server returned {resp.status_code}: {resp.text}")

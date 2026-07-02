@@ -41,6 +41,8 @@ export interface LoadModelRequest {
   gguf_variant?: string | null;
   /** Allow loading models with custom code (e.g. NVIDIA Nemotron). Only enable for repos you trust. */
   trust_remote_code?: boolean;
+  /** sha256 fingerprint pinning user approval of this exact custom-code version. */
+  approved_remote_code_fingerprint?: string | null;
   chat_template_override?: string | null;
   cache_type_kv?: string | null;
   /**
@@ -72,6 +74,8 @@ export interface ValidateModelResponse {
   is_lora?: boolean;
   is_vision?: boolean;
   requires_trust_remote_code?: boolean;
+  // HF flagged unsafe files, so the load is hard-blocked pending dialog review.
+  requires_security_review?: boolean;
   /** Native context length from the local GGUF header; null until downloaded. */
   context_length?: number | null;
 }
@@ -80,7 +84,9 @@ export interface GgufVariantDetail {
   filename: string;
   quant: string;
   size_bytes: number;
+  download_size_bytes?: number;
   downloaded?: boolean;
+  update_available?: boolean;
 }
 
 export interface GgufVariantsResponse {
@@ -88,6 +94,8 @@ export interface GgufVariantsResponse {
   variants: GgufVariantDetail[];
   has_vision: boolean;
   default_variant: string | null;
+  /** Native max context from GGUF metadata; present once a variant is downloaded. */
+  context_length?: number | null;
 }
 
 export function isMultimodalResponse(
@@ -133,7 +141,8 @@ export interface LoadModelResponse {
   max_context_length?: number | null;
   native_context_length?: number | null;
   supports_reasoning?: boolean;
-  reasoning_style?: "enable_thinking" | "reasoning_effort";
+  reasoning_style?: "enable_thinking" | "reasoning_effort" | "enable_thinking_effort";
+  reasoning_effort_levels?: string[];
   reasoning_always_on?: boolean;
   supports_preserve_thinking?: boolean;
   supports_tools?: boolean;
@@ -172,7 +181,8 @@ export interface InferenceStatusResponse {
   } | null;
   requires_trust_remote_code?: boolean;
   supports_reasoning?: boolean;
-  reasoning_style?: "enable_thinking" | "reasoning_effort";
+  reasoning_style?: "enable_thinking" | "reasoning_effort" | "enable_thinking_effort";
+  reasoning_effort_levels?: string[];
   reasoning_always_on?: boolean;
   supports_preserve_thinking?: boolean;
   supports_tools?: boolean;
@@ -190,7 +200,10 @@ export interface InferenceStatusResponse {
   /**
    * Why MTP was disabled on the loaded model despite being requested.
    * "binary_no_mtp" / "binary_outdated" -> updating llama.cpp would re-enable
-   * it; "runtime_error" -> the current build could not run it. Null otherwise.
+   * it; "runtime_error" -> the current build could not run it;
+   * "mla_mtp_disabled" -> an Auto-mode policy downgrade for MLA models
+   * (GLM-5.2 et al.) whose llama.cpp MTP path is slower than no speculation
+   * (updating won't help; choose MTP in Settings to force it). Null otherwise.
    */
   spec_fallback_reason?: string | null;
 }
@@ -339,6 +352,9 @@ export interface OpenAIChatCompletionsRequest {
     mode: "hybrid" | "lexical" | "dense";
     autoinject?: boolean;
     autoinject_min_score?: number;
+
+    whole_doc?: boolean;
+    context_length?: number;
   };
   auto_heal_tool_calls?: boolean;
   max_tool_calls_per_message?: number;
