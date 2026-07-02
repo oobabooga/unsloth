@@ -1,0 +1,38 @@
+name: PR5947 Windows LOCALAPPDATA guard
+
+# Throwaway workflow for the oobabooga/unsloth fork only: exercises the
+# LOCALAPPDATA systemprofile guard from studio/setup.ps1 on real Windows
+# runners. All other CI is intentionally removed on this branch so only
+# this job runs. Do not merge.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guard-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    name: guard / ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        shell: pwsh
+        run: |
+          Write-Host "Runner label : ${{ matrix.runner }}"
+          Write-Host "OS           : $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "whoami       : $(whoami)"
+          Write-Host "LOCALAPPDATA : $env:LOCALAPPDATA"
+          Write-Host "USERPROFILE  : $env:USERPROFILE"
+          Write-Host "pwsh version : $($PSVersionTable.PSVersion)"
+          $winps = powershell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          Write-Host "win-ps ver   : $winps"
+
+      - name: Run LOCALAPPDATA guard tests
+        shell: pwsh
+        run: ./studio/tests/pr5947_localappdata_windows.ps1
