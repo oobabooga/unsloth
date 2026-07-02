@@ -83,6 +83,7 @@ export interface TrainingRuntimeState {
   startError: string | null;
   startModelName: string | null;
   startDatasetName: string | null;
+  startProjectName: string | null;
   startFromResume: boolean;
   sseConnected: boolean;
   firstStepReceived: boolean;
@@ -90,7 +91,8 @@ export interface TrainingRuntimeState {
   currentStep: number;
   totalSteps: number;
   currentEpoch: number;
-  currentLoss: number;
+  // null while the latest reported loss is non-finite
+  currentLoss: number | null;
   currentLearningRate: number;
   progressPercent: number;
   elapsedSeconds: number | null;
@@ -120,6 +122,7 @@ export interface TrainingRuntimeActions {
     modelName: string | null,
     datasetName: string | null,
     fromResume?: boolean,
+    projectName?: string | null,
   ) => void;
   setSseConnected: (value: boolean) => void;
   setLastEventId: (value: number | null) => void;
@@ -146,6 +149,9 @@ export interface TrainingViewData {
   currentEpoch: number | null;
   currentNumTokens: number | null;
   outputDir: string | null;
+  // True when a newer run reused this run's output_dir (resume), so its
+  // on-disk contents no longer match this (older) run's metrics.
+  resumedLater?: boolean;
   progressPercent: number;
   elapsedSeconds: number | null;
   etaSeconds: number | null;
@@ -156,6 +162,7 @@ export interface TrainingViewData {
 
   // Config summary
   modelName: string;
+  projectName: string | null;
   trainingMethod: string;
 
   // Time-series (for ChartsSection)
