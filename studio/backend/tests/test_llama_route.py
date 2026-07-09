@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import sys
 import threading
 import types
@@ -39,6 +40,7 @@ def _load_route():
         auth_pkg.__path__ = []
         auth_mod = types.ModuleType("auth.authentication")
         auth_mod.get_current_subject = lambda: "test"
+        auth_mod.is_host_session = lambda request = None: True
         for name, stub in (("auth", auth_pkg), ("auth.authentication", auth_mod)):
             if name not in sys.modules:
                 sys.modules[name] = stub
@@ -114,10 +116,30 @@ def test_status_handler_runs_off_event_loop(monkeypatch):
         }
 
     monkeypatch.setattr(rl, "get_update_status", fake_status)
-    out = asyncio.run(rl.llama_update_status(force_refresh = False, current_subject = "t"))
+    out = asyncio.run(
+        rl.llama_update_status(force_refresh = False, current_subject = "t", host_session = True)
+    )
     assert out.source_build is True
+    assert out.host_only is False
     # Detection ran in a worker thread, not the event-loop thread.
     assert seen["thread"] is not threading.main_thread()
+
+
+def test_status_handler_hides_update_for_remote_client(monkeypatch):
+    # A non-host caller must not probe the host / GitHub, and gets a
+    # non-actionable host-only status with no tags leaked.
+    def fail_status(force_refresh = False):
+        raise AssertionError("detection must not run for a remote client")
+
+    monkeypatch.setattr(rl, "get_update_status", fail_status)
+    out = asyncio.run(
+        rl.llama_update_status(force_refresh = False, current_subject = "t", host_session = False)
+    )
+    assert out.host_only is True
+    assert out.update_available is False
+    assert out.supported is False
+    assert out.installed_tag is None
+    assert out.latest_tag is None
 
 
 def test_update_handler_runs_off_event_loop(monkeypatch):
@@ -128,6 +150,35 @@ def test_update_handler_runs_off_event_loop(monkeypatch):
         return {"started": True, "reason": None, "job": {"state": "running"}}
 
     monkeypatch.setattr(rl, "start_update", fake_start)
-    out = asyncio.run(rl.llama_update(current_subject = "t"))
+    out = asyncio.run(rl.llama_update(current_subject = "t", host_session = True))
     assert out.started is True
     assert seen["thread"] is not threading.main_thread()
+
+
+def test_update_handler_rejects_remote_client(monkeypatch):
+    # The apply path is the real security gate: a remote caller (stale banner,
+    # crafted/replayed request) must be rejected before the installer runs.
+    def fail_start():
+        raise AssertionError("installer must not start for a remote client")
+
+    monkeypatch.setattr(rl, "start_update", fail_start)
+    with pytest.raises(rl.HTTPException) as exc_info:
+        asyncio.run(rl.llama_update(current_subject = "t", host_session = False))
+    assert exc_info.value.status_code == 403
+
+
+def _depends_on_host_session(handler) -> bool:
+    from fastapi import params
+    for param in inspect.signature(handler).parameters.values():
+        default = param.default
+        if isinstance(default, params.Depends) and default.dependency is rl.is_host_session:
+            return True
+    return False
+
+
+def test_update_routes_are_wired_to_host_session_gate():
+    # The handler-branch tests pass host_session as a kwarg, bypassing DI; this
+    # guards the wiring itself, so silently dropping the Depends can't reopen the
+    # gate while the branch tests still pass.
+    assert _depends_on_host_session(rl.llama_update_status)
+    assert _depends_on_host_session(rl.llama_update)

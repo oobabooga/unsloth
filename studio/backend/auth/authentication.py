@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import ipaddress
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import jwt
 
@@ -94,6 +95,60 @@ def is_desktop_access_token(token: str) -> bool:
         return False
 
     return payload.get("sub") == subject and payload.get("desktop") is True
+
+
+def _is_loopback_host(host: Optional[str]) -> bool:
+    try:
+        if not host:
+            return False
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback:
+            return True
+        # A dual-stack socket reports an IPv4 peer as an IPv4-mapped IPv6
+        # address (e.g. ::ffff:127.0.0.1); is_loopback only started resolving
+        # this itself in Python 3.12.12 (gh-117566), and this project supports
+        # 3.9+, so check the mapped address explicitly.
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return mapped is not None and mapped.is_loopback
+    except ValueError:
+        return False
+
+
+def is_host_session(request: Request) -> bool:
+    """True when a request originates from the host-local Studio session.
+
+    The update endpoints install or swap binaries on the host machine, so they
+    must be restricted to that machine: a remote LAN or web client, even with a
+    valid JWT, must not see or trigger them.
+
+    Primary signal is the ``desktop`` JWT claim, minted only by the host's
+    ``/api/auth/desktop-login`` and stable behind a reverse proxy. As a secondary
+    signal a loopback socket peer counts as host-local, but only when the request
+    carries no forwarding header: behind the managed Cloudflare tunnel (or any
+    reverse proxy) every remote visitor's socket peer is loopback, so a
+    ``CF-Connecting-IP`` / ``X-Forwarded-For`` / ``X-Real-IP`` / ``Forwarded``
+    header means the real client is elsewhere and loopback no longer proves
+    locality.
+    """
+    auth_header = request.headers.get("authorization")
+    if auth_header:
+        parts = auth_header.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer" and is_desktop_access_token(parts[1]):
+            return True
+
+    client = request.client
+    if not client or not _is_loopback_host(client.host):
+        return False
+    # Presence, not truthiness: an empty forwarding header still means the
+    # request was proxied, so it must not let a loopback peer pass as host.
+    if (
+        request.headers.get("cf-connecting-ip") is not None
+        or request.headers.get("x-forwarded-for") is not None
+        or request.headers.get("x-real-ip") is not None
+        or request.headers.get("forwarded") is not None
+    ):
+        return False
+    return True
 
 
 def create_refresh_token(subject: str, *, desktop: bool = False) -> str:
