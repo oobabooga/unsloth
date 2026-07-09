@@ -16,7 +16,10 @@ import {
   PlayIcon,
 } from "@hugeicons/core-free-icons";
 import { TrainIcon } from "../components/train-icon";
-import { HUB_POST_DOWNLOAD_ACTIONS_VISIBLE } from "../lib/hub-feature-flags";
+import {
+  HUB_NON_GGUF_RUN_ACTIONS_VISIBLE,
+  HUB_POST_DOWNLOAD_ACTIONS_VISIBLE,
+} from "../lib/hub-feature-flags";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useEffect, useState } from "react";
 import { useHfTokenStore } from "../stores/hf-token-store";
@@ -158,6 +161,7 @@ export function SafetensorsDownloadCard({
   const showActionPair = isDownloaded && !downloading && (canRun || !!onTrain);
   const showUnavailableAction =
     isDownloaded && !downloading && !canRun && !onTrain;
+  const runActionsVisible = HUB_NON_GGUF_RUN_ACTIONS_VISIBLE;
   const canDelete =
     (isDownloaded || isPartial) &&
     !downloading &&
@@ -238,17 +242,16 @@ export function SafetensorsDownloadCard({
             )}
           </div>
         </div>
-        {/* Divider sits above the Download CTA; in the action-pair state it hides with the pair. */}
-        {(!showActionPair || HUB_POST_DOWNLOAD_ACTIONS_VISIBLE) && <CardDivider />}
+        {/* Divider sits above the bottom CTA row; it drops only when the action pair is gated off. */}
+        {(!showActionPair || runActionsVisible) && <CardDivider />}
         {showActionPair ? (
           <div
             className={cn(
               "group/pair flex h-9 shrink-0 items-stretch gap-1.5",
-              // Run+Train pair hidden until Hub→chat / Hub→train pickers ship.
-              !HUB_POST_DOWNLOAD_ACTIONS_VISIBLE && "hidden",
+              !runActionsVisible && "hidden",
             )}
           >
-            {onTrain && (
+            {onTrain && HUB_POST_DOWNLOAD_ACTIONS_VISIBLE && (
               <button
                 type="button"
                 onClick={onTrain}
