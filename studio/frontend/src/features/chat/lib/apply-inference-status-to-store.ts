@@ -6,6 +6,7 @@ import { mergeBackendRecommendedInference } from "../presets/preset-policy";
 import { clampReasoningEffortToLevels } from "../provider-capabilities";
 import {
   CHAT_REASONING_ENABLED_KEY,
+  loadedGpuMemoryFields,
   type ReasoningEffort,
   type ReasoningStyle,
   loadOptionalBool,
@@ -119,6 +120,10 @@ function ensureActiveModelInStoreList(
 
 export type ApplyInferenceStatusOptions = {
   previousCheckpoint?: string;
+  /** activeGgufVariant BEFORE the caller's setCheckpoint synced it to the
+   * status -- without it a variant-only switch underneath the tab reads as
+   * steady state and the hydration reseed keeps the old quant's baselines. */
+  previousGgufVariant?: string | null;
 };
 
 /** Mirror refresh() hydration so adopted CLI models get reasoning/tools flags. */
@@ -144,9 +149,13 @@ export function applyActiveModelStatusToStore(
     );
   }
 
+  const previousGgufVariant =
+    options.previousGgufVariant !== undefined
+      ? options.previousGgufVariant
+      : store.activeGgufVariant;
   const hydratingExistingModel =
     previousCheckpoint !== checkpointId ||
-    store.activeGgufVariant !== (status.gguf_variant ?? null);
+    previousGgufVariant !== (status.gguf_variant ?? null);
   const supportsReasoning = status.supports_reasoning ?? false;
   const reasoningAlwaysOn = status.reasoning_always_on ?? false;
   const reasoningStyle = status.reasoning_style ?? "enable_thinking";
@@ -214,30 +223,78 @@ export function applyActiveModelStatusToStore(
     loadedIsMultimodal: isMultimodalResponse(status),
     loadedIsDiffusion: status.is_diffusion ?? false,
     specFallbackReason: status.spec_fallback_reason ?? null,
+    // The spec / KV seeds share the GPU-fields reseed mechanism below: a
+    // non-GGUF status leaves their loaded baselines null, so the "unseeded"
+    // guard re-fires every refresh -- hold them too while a staged pick's
+    // settings are being edited, or the refresh resets the staged edit.
+    // hydratingExistingModel reopens every load-param seed: when the active
+    // model changed underneath this tab (auto-switch, another client), the
+    // old model's baselines are stale and must adopt the new status.
     ...(seedLoadParams &&
-      prevState.loadedSpeculativeType === null && {
+      prevState.pendingSelection == null &&
+      (prevState.loadedSpeculativeType === null || hydratingExistingModel) && {
         speculativeType: currentSpecType,
         loadedSpeculativeType: currentSpecType,
       }),
     ...(seedLoadParams &&
+      prevState.pendingSelection == null &&
       status.spec_draft_n_max !== undefined &&
-      prevState.loadedSpecDraftNMax === null &&
-      prevState.specDraftNMax === null && {
+      (hydratingExistingModel ||
+        (prevState.loadedSpecDraftNMax === null &&
+          prevState.specDraftNMax === null)) && {
         specDraftNMax: status.spec_draft_n_max ?? null,
         loadedSpecDraftNMax: status.spec_draft_n_max ?? null,
       }),
     ...(seedLoadParams &&
+      prevState.pendingSelection == null &&
       status.cache_type_kv !== undefined &&
-      prevState.loadedKvCacheDtype === null && {
+      (prevState.loadedKvCacheDtype === null || hydratingExistingModel) && {
         kvCacheDtype: status.cache_type_kv,
         loadedKvCacheDtype: status.cache_type_kv,
       }),
     ...(seedLoadParams &&
+      prevState.pendingSelection == null &&
       status.tensor_parallel !== undefined &&
-      prevState.loadedTensorParallel === null && {
+      (prevState.loadedTensorParallel === null || hydratingExistingModel) && {
         tensorParallel: status.tensor_parallel,
         loadedTensorParallel: status.tensor_parallel,
       }),
+    // A non-GGUF status never sets loadedGpuMemoryMode, so this "unseeded"
+    // guard stays true across refreshes there and the reseed repeats. That
+    // repeat is an idempotent reset -- except while the user is editing a
+    // staged GGUF pick (pendingSelection), whose Manual knob edits it would
+    // clobber mid-edit, so hold the seeding until the staging resolves.
+    ...(seedLoadParams &&
+      prevState.pendingSelection == null &&
+      (prevState.loadedGpuMemoryMode === null || hydratingExistingModel) &&
+      loadedGpuMemoryFields(status)),
+    // A Manual + Auto-layers load with a positive context pin sent the pin as
+    // max_seq_length, and status only exposes the RESOLVED context -- re-seed
+    // the pin from the requested value (parity with the load paths'
+    // keepCustomCtx) or the next Apply sends 0 and silently reverts the model
+    // to auto-fit sizing. The seed always BASELINES: a hydrated model without
+    // an applicable pin clears it, so a previous model's pin can't survive a
+    // model change underneath and reload the new model at the old length.
+    ...(seedLoadParams &&
+      prevState.pendingSelection == null &&
+      (prevState.loadedGpuMemoryMode === null || hydratingExistingModel) &&
+      (() => {
+        // Baseline unconditionally (even for a non-GGUF status): a pin only
+        // applies to a Manual + Auto-layers GGUF, so anything else clears it --
+        // otherwise a previous GGUF's pin survives a model change underneath
+        // and reloads the new model at the old length.
+        const pin =
+          status.is_gguf &&
+          status.gpu_memory_mode === "manual" &&
+          (status.gpu_layers ?? -1) < 0 &&
+          (status.requested_context_length ?? 0) > 0
+            ? status.requested_context_length
+            : null;
+        return {
+          customContextLength: pin,
+          loadedCustomContextLength: pin,
+        };
+      })()),
     ...(status.chat_template_override !== undefined &&
       prevState.loadedChatTemplateOverride === null &&
       prevState.chatTemplateOverride === null && {
@@ -297,7 +354,8 @@ export async function tryAdoptServerActiveModel(): Promise<boolean> {
   if (previousCheckpoint) {
     return true;
   }
+  const previousGgufVariant = useChatRuntimeStore.getState().activeGgufVariant;
   store.setCheckpoint(checkpointId, status.gguf_variant);
-  applyActiveModelStatusToStore(status, { previousCheckpoint });
+  applyActiveModelStatusToStore(status, { previousCheckpoint, previousGgufVariant });
   return true;
 }

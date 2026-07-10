@@ -2,6 +2,10 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { getAuthToken } from "@/features/auth";
+import {
+  loadRememberedLoadSettings,
+  rememberedLoadSettingsKey,
+} from "@/components/assistant-ui/model-selector/remembered-load-settings";
 import { projectHasSources } from "@/features/rag/api/rag-api";
 import { apiUrl } from "@/lib/api-base";
 import { parseParamCountB } from "@/lib/model-size";
@@ -40,12 +44,18 @@ import {
 import {
   type PendingImageEditReference,
   type RagAutoInject,
+  GPU_LAYERS_AUTO,
+  loadedGpuMemoryFields,
+  reconcilePersistedGpuIds,
   resolveLoadedSpeculativeSettings,
   resolveSpeculativeSettingsForLoad,
+  persistGpuMemoryModeOnLoad,
   resolveToolsEnabledOnLoad,
   saveSpeculativeType,
   useChatRuntimeStore,
 } from "../stores/chat-runtime-store";
+import { resolveFitMaxSeqLength } from "../presets/preset-policy";
+import { ensureGpuDeviceCache } from "@/hooks/use-gpu-info";
 import { useExternalProvidersStore } from "../stores/external-providers-store";
 import type { ModelType } from "../types";
 import { isMultimodalResponse } from "../types/api";
@@ -63,11 +73,17 @@ import {
   listStoredChatThreads,
   updateStoredChatThread,
 } from "../utils/chat-history-storage";
+import {
+  readLastLocalModelLoad,
+  recordLastLocalModelLoad,
+  type LastLocalModelKind,
+} from "../utils/last-local-model-load";
 import { getImageInputUnavailableReason } from "../utils/image-input-support";
 import {
   hasClosedThinkTag,
   parseAssistantContent,
 } from "../utils/parse-assistant-content";
+import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
 import {
   generateAudio,
   listCachedGguf,
@@ -1309,6 +1325,30 @@ const BIG_ENDIAN_GGUF_FILENAME_RE = /(^|[-_])be(?:[._-]|$)/gi;
 const GGUF_KNOWN_QUANT_RE =
   /(UD-)?(MXFP[0-9]+(?:_[A-Z0-9]+)*|IQ[0-9]+_[A-Z]+(?:_[A-Z0-9]+)?|TQ[0-9]+_[0-9]+|Q[0-9]+_K_[A-Z]+|Q[0-9]+_[0-9]+|Q[0-9]+_K|BF16|F16|F32)/i;
 
+type AutoLoadCandidate = {
+  id: string;
+  kind: LastLocalModelKind;
+  ggufVariant: string | null;
+  maxSeqLength: number;
+  successLabel: string;
+};
+
+function autoLoadCandidateKey(
+  kind: LastLocalModelKind,
+  id: string,
+  ggufVariant?: string | null,
+): string {
+  return `${kind}:${id.toLowerCase()}:${(ggufVariant ?? "").toLowerCase()}`;
+}
+
+function findCachedRepo<T extends { repo_id: string }>(
+  repos: T[],
+  id: string,
+): T | undefined {
+  const normalized = id.toLowerCase();
+  return repos.find((repo) => repo.repo_id.toLowerCase() === normalized);
+}
+
 function hasBigEndianGgufMarker(filename: string, quant?: string | null): boolean {
   const normalized = filename.replace(/\\/g, "/").toLowerCase();
   const separatorIndex = normalized.lastIndexOf("/");
@@ -1357,20 +1397,34 @@ async function autoLoadSmallestModel(): Promise<{
   const hfToken = store.hfToken || null;
   const trustRemoteCode = store.params.trustRemoteCode ?? false;
   const specSettings = resolveSpeculativeSettingsForLoad();
+  const lastLoaded = readLastLocalModelLoad();
   const toastId = toast("Loading a model…", {
-    description: "Auto-selecting the smallest downloaded model.",
+    description: lastLoaded
+      ? "Loading last used model."
+      : "Auto-selecting the smallest downloaded model.",
     duration: 5000,
     closeButton: true,
   });
   let blockedByTrustRemoteCode = false;
   let hadNonTrustFailure = false;
   let loadAttempts = 0;
+  const skippedAutoLoadCandidates = new Set<string>();
 
   async function canAutoLoad(payload: {
     model_path: string;
     max_seq_length: number;
     is_lora: boolean;
     gguf_variant?: string | null;
+    // GGUF-only, passed by the caller so the guard sizes the exact placement
+    // its /load will send (remembered-derived on the candidate path, live store
+    // on the default-download path). The safetensors fallback omits them: it
+    // loads via HF auto-placement (no gpu_ids), so validating an explicit-GPU/
+    // manual placement it won't use could wrongly skip a model that would fit.
+    gpu_ids?: number[];
+    gpu_memory_mode?: "auto" | "manual";
+    gpu_layers?: number;
+    // Decides whether the guard charges the separate MTP drafter.
+    speculative_type?: string | null;
   }): Promise<boolean> {
     const validation = await validateModel({
       ...payload,
@@ -1389,11 +1443,296 @@ async function autoLoadSmallestModel(): Promise<{
     }
     return true;
   }
+
+  async function loadAutoLoadCandidate(
+    candidate: AutoLoadCandidate,
+  ): Promise<boolean> {
+    if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
+      return false;
+    }
+    const currentStore = useChatRuntimeStore.getState();
+    const remembered = loadRememberedLoadSettings(
+      rememberedLoadSettingsKey({
+        id: candidate.id,
+        ggufVariant: candidate.ggufVariant,
+      }),
+    );
+    const effectiveMaxSeqLength = resolveLoadMaxSeqLength({
+      modelId: candidate.id,
+      ggufVariant: candidate.ggufVariant,
+      isGguf: candidate.kind === "gguf",
+      customContextLength: remembered?.contextLength ?? null,
+      ggufContextLength: null,
+      currentCheckpoint: currentStore.params.checkpoint,
+      activeGgufVariant: currentStore.activeGgufVariant,
+      maxSeqLength: candidate.maxSeqLength,
+      presetSource: currentStore.activePresetSource,
+    });
+    // The GPU knobs are per-model, so read them from the same remembered
+    // settings that fed effectiveMaxSeqLength -- on a background auto-load the
+    // live store holds session defaults, not the saved Manual mode / layer pin /
+    // GPU pick. Absent fields fall back the way applyRememberedLoadSettings
+    // does: the mode to the store (a persisted standing preference), the
+    // per-model knobs to their defaults. The saved GPU pick is reconciled
+    // against the GPUs present now, like the interactive restore.
+    const effectiveGpuMemoryMode =
+      remembered?.gpuMemoryMode ?? currentStore.gpuMemoryMode;
+    const effectiveGpuLayers = remembered?.gpuLayers ?? GPU_LAYERS_AUTO;
+    const effectiveNCpuMoe = remembered?.nCpuMoe ?? 0;
+    if (remembered?.selectedGpuIds != null) {
+      // Warm the device cache first: on a cold cache the reconcile passes the
+      // saved pick through unvalidated, and a stale cross-host pick then fails
+      // the load with the picker hidden.
+      await ensureGpuDeviceCache();
+    }
+    const effectiveGpuIds =
+      remembered?.selectedGpuIds !== undefined
+        ? reconcilePersistedGpuIds(remembered.selectedGpuIds)
+        : null;
+    // Under Manual GPU memory + Auto layers, llama.cpp's --fit owns context
+    // sizing, so send 0 (or the pinned length). GGUF-only; a no-op otherwise.
+    // The context pin is per-model, so read it from the same remembered settings
+    // that fed effectiveMaxSeqLength -- not the live store, which holds the pin
+    // for whatever the user last touched, or null on a background auto-load.
+    const fitMaxSeqLength = resolveFitMaxSeqLength(
+      candidate.kind === "gguf",
+      effectiveGpuMemoryMode,
+      effectiveGpuLayers,
+      remembered?.contextLength ?? null,
+      effectiveMaxSeqLength,
+    );
+    const effectiveSpeculativeType =
+      remembered?.speculativeType ?? specSettings.speculativeType;
+    const effectiveSpecDraftNMax =
+      remembered?.specDraftNMax ?? specSettings.specDraftNMax;
+    if (
+      !(await canAutoLoad({
+        model_path: candidate.id,
+        max_seq_length: fitMaxSeqLength,
+        is_lora: false,
+        gguf_variant: candidate.ggufVariant,
+        // The same remembered-derived knobs the load below sends.
+        ...(candidate.kind === "gguf"
+          ? {
+              gpu_ids: effectiveGpuIds ?? undefined,
+              gpu_memory_mode: effectiveGpuMemoryMode,
+              gpu_layers: effectiveGpuLayers,
+              speculative_type: effectiveSpeculativeType,
+            }
+          : {}),
+      }))
+    ) {
+      skippedAutoLoadCandidates.add(
+        autoLoadCandidateKey(candidate.kind, candidate.id, candidate.ggufVariant),
+      );
+      return false;
+    }
+    loadAttempts += 1;
+    const loadResp = await loadModel({
+      model_path: candidate.id,
+      hf_token: hfToken,
+      max_seq_length: fitMaxSeqLength,
+      load_in_4bit: true,
+      is_lora: false,
+      gguf_variant: candidate.ggufVariant,
+      trust_remote_code: trustRemoteCode,
+      cache_type_kv: remembered?.kvCacheDtype ?? null,
+      speculative_type: effectiveSpeculativeType,
+      spec_draft_n_max: effectiveSpecDraftNMax,
+      tensor_parallel: remembered?.tensorParallel ?? false,
+      // GGUF-only: the safetensors fallback loads via HF auto-placement (no
+      // explicit pins). The split ratio is deliberately never remembered
+      // (positionally bound to an exact GPU set), so auto-load leaves llama.cpp's
+      // free-VRAM default in charge rather than sending a stale store value.
+      ...(candidate.kind === "gguf"
+        ? {
+            gpu_memory_mode: effectiveGpuMemoryMode,
+            gpu_layers: effectiveGpuLayers,
+            n_cpu_moe: effectiveNCpuMoe,
+            gpu_ids: effectiveGpuIds ?? undefined,
+          }
+        : {}),
+    });
+    saveSpeculativeType(effectiveSpeculativeType);
+    // Self-gates on is_gguf (and skips diffusion), so it only persists for a
+    // real GGUF chat load; the mode arg is inert on other kinds.
+    persistGpuMemoryModeOnLoad(loadResp, effectiveGpuMemoryMode);
+    useChatRuntimeStore
+      .getState()
+      .setCheckpoint(candidate.id, candidate.ggufVariant ?? undefined);
+    const store = useChatRuntimeStore.getState();
+    store.setModelRequiresTrustRemoteCode(
+      loadResp.requires_trust_remote_code ?? false,
+    );
+    store.setParams({
+      ...store.params,
+      maxTokens:
+        candidate.kind === "gguf"
+          ? loadResp.context_length ?? 131072
+          : effectiveMaxSeqLength,
+    });
+    const autoModel: ChatModelSummary = {
+      id: candidate.id,
+      name: loadResp.display_name ?? candidate.id,
+      isVision: loadResp.is_vision ?? false,
+      isLora: loadResp.is_lora ?? false,
+      isGguf: loadResp.is_gguf ?? candidate.kind === "gguf",
+      isAudio: loadResp.is_audio ?? false,
+      audioType: loadResp.audio_type ?? null,
+      hasAudioInput: loadResp.has_audio_input ?? false,
+    };
+    if (!store.models.some((m) => m.id === candidate.id)) {
+      store.setModels([...store.models, autoModel]);
+    }
+    if (candidate.kind === "gguf") {
+      // Keep an explicit Manual+Auto context pin the load just applied (so a
+      // later Apply doesn't silently revert it to auto-fit sizing), mirroring
+      // the interactive path's keepCustomCtx; other cases baseline on
+      // ggufContextLength.
+      const keepCustomCtx =
+        effectiveGpuMemoryMode === "manual" &&
+        effectiveGpuLayers < 0 &&
+        (remembered?.contextLength ?? 0) > 0
+          ? (remembered?.contextLength ?? null)
+          : null;
+      useChatRuntimeStore.setState({
+        ggufContextLength: loadResp.context_length ?? 131072,
+        ggufMaxContextLength:
+          loadResp.max_context_length ?? loadResp.context_length ?? 131072,
+        ggufNativeContextLength: loadResp.native_context_length ?? null,
+        supportsReasoning: loadResp.supports_reasoning ?? false,
+        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
+        reasoningEnabled: loadResp.supports_reasoning ?? false,
+        ...reasoningCapsFromLoad(loadResp),
+        supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
+        supportsTools: loadResp.supports_tools ?? false,
+        ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
+        kvCacheDtype: loadResp.cache_type_kv ?? null,
+        loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
+        tensorParallel: loadResp.tensor_parallel ?? false,
+        loadedTensorParallel: loadResp.tensor_parallel ?? false,
+        customContextLength: keepCustomCtx,
+        loadedCustomContextLength: keepCustomCtx,
+        ...loadedGpuMemoryFields(loadResp),
+        defaultChatTemplate: loadResp.chat_template ?? null,
+        chatTemplateOverride: null,
+        loadedChatTemplateOverride: null,
+        loadedIsMultimodal: isMultimodalResponse(loadResp),
+        loadedIsDiffusion: loadResp.is_diffusion ?? false,
+        ...resolveLoadedSpeculativeSettings(loadResp),
+      });
+    } else {
+      useChatRuntimeStore.setState({
+        supportsReasoning: loadResp.supports_reasoning ?? false,
+        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
+        reasoningEnabled: loadResp.supports_reasoning ?? false,
+        ...reasoningCapsFromLoad(loadResp),
+        supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
+        supportsTools: loadResp.supports_tools ?? false,
+        ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
+        kvCacheDtype: loadResp.cache_type_kv ?? null,
+        loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
+        tensorParallel: loadResp.tensor_parallel ?? false,
+        loadedTensorParallel: loadResp.tensor_parallel ?? false,
+        // Non-GGUF response: clears any stale GPU baseline a prior manual-GPU
+        // GGUF load left, matching the interactive/status sibling load paths.
+        ...loadedGpuMemoryFields(loadResp),
+        defaultChatTemplate: loadResp.chat_template ?? null,
+        chatTemplateOverride: null,
+        loadedChatTemplateOverride: null,
+        ...resolveLoadedSpeculativeSettings(loadResp),
+        loadedIsMultimodal: isMultimodalResponse(loadResp),
+        loadedIsDiffusion: loadResp.is_diffusion ?? false,
+      });
+    }
+    if (!(loadResp.is_lora ?? false)) {
+      recordLastLocalModelLoad({
+        id: candidate.id,
+        kind: candidate.kind,
+        ggufVariant: candidate.ggufVariant,
+      });
+    }
+    toast.success(candidate.successLabel, { id: toastId });
+    return true;
+  }
   try {
     const [ggufRepos, modelRepos] = await Promise.all([
       listCachedGguf().catch(() => []),
       listCachedModels().catch(() => []),
     ]);
+
+    if (lastLoaded) {
+      if (lastLoaded.kind === "gguf") {
+        const repo = findCachedRepo(ggufRepos, lastLoaded.id);
+        if (repo && lastLoaded.ggufVariant) {
+          try {
+            const variants = await listGgufVariants(repo.repo_id);
+            const variant = variants.variants.find(
+              (entry) =>
+                entry.downloaded &&
+                entry.quant?.toLowerCase() ===
+                  lastLoaded.ggufVariant?.toLowerCase() &&
+                isAutoLoadableGgufVariant(entry),
+            );
+            if (variant) {
+              toast("Loading last used model…", {
+                id: toastId,
+                description: `${repo.repo_id} (${variant.quant})`,
+                duration: 5000,
+              });
+              if (
+                await loadAutoLoadCandidate({
+                  id: repo.repo_id,
+                  kind: "gguf",
+                  ggufVariant: variant.quant,
+                  maxSeqLength: 0,
+                  successLabel: `Loaded ${repo.repo_id} (${variant.quant})`,
+                })
+              ) {
+                return { loaded: true, blockedByTrustRemoteCode: false };
+              }
+            }
+          } catch {
+            hadNonTrustFailure = true;
+            skippedAutoLoadCandidates.add(
+              autoLoadCandidateKey("gguf", repo.repo_id, lastLoaded.ggufVariant),
+            );
+          }
+        }
+      } else {
+        const repo = findCachedRepo(modelRepos, lastLoaded.id);
+        if (repo) {
+          try {
+            toast("Loading last used model…", {
+              id: toastId,
+              description: repo.repo_id,
+              duration: 5000,
+            });
+            if (
+              await loadAutoLoadCandidate({
+                id: repo.repo_id,
+                kind: "model",
+                ggufVariant: null,
+                maxSeqLength: store.params.maxSeqLength,
+                successLabel: `Loaded ${repo.repo_id}`,
+              })
+            ) {
+              return { loaded: true, blockedByTrustRemoteCode: false };
+            }
+          } catch {
+            hadNonTrustFailure = true;
+            skippedAutoLoadCandidates.add(
+              autoLoadCandidateKey("model", repo.repo_id),
+            );
+          }
+        }
+      }
+      toast("Loading a model…", {
+        id: toastId,
+        description: "Auto-selecting the smallest downloaded model.",
+        duration: 5000,
+      });
+    }
 
     // GGUF first: smallest-total-size repo, then its smallest variant.
     if (ggufRepos.length > 0) {
@@ -1408,82 +1747,23 @@ async function autoLoadSmallestModel(): Promise<{
           if (downloaded.length > 0) {
             const variant = downloaded[0];
             if (
-              !(await canAutoLoad({
-                model_path: repo.repo_id,
-                max_seq_length: 0,
-                is_lora: false,
-                gguf_variant: variant.quant,
-              }))
+              skippedAutoLoadCandidates.has(
+                autoLoadCandidateKey("gguf", repo.repo_id, variant.quant),
+              )
             ) {
               continue;
             }
-            loadAttempts += 1;
-            const loadResp = await loadModel({
-              model_path: repo.repo_id,
-              hf_token: hfToken,
-              max_seq_length: 0,
-              load_in_4bit: true,
-              is_lora: false,
-              gguf_variant: variant.quant,
-              trust_remote_code: trustRemoteCode,
-              speculative_type: specSettings.speculativeType,
-              spec_draft_n_max: specSettings.specDraftNMax,
-            });
-            saveSpeculativeType(specSettings.speculativeType);
-            useChatRuntimeStore
-              .getState()
-              .setCheckpoint(repo.repo_id, variant.quant);
-            const store = useChatRuntimeStore.getState();
-            store.setModelRequiresTrustRemoteCode(
-              loadResp.requires_trust_remote_code ?? false,
-            );
-            store.setParams({
-              ...store.params,
-              maxTokens: loadResp.context_length ?? 131072,
-            });
-            // Add to store so the selector shows the name.
-            const autoModel: ChatModelSummary = {
-              id: repo.repo_id,
-              name: loadResp.display_name ?? repo.repo_id,
-              isVision: loadResp.is_vision ?? false,
-              isLora: loadResp.is_lora ?? false,
-              isGguf: loadResp.is_gguf ?? false,
-              isAudio: loadResp.is_audio ?? false,
-              audioType: loadResp.audio_type ?? null,
-              hasAudioInput: loadResp.has_audio_input ?? false,
-            };
-            const existingModels = store.models;
-            if (!existingModels.some((m) => m.id === repo.repo_id)) {
-              store.setModels([...existingModels, autoModel]);
+            if (
+              await loadAutoLoadCandidate({
+                id: repo.repo_id,
+                kind: "gguf",
+                ggufVariant: variant.quant,
+                maxSeqLength: 0,
+                successLabel: `Loaded ${repo.repo_id} (${variant.quant})`,
+              })
+            ) {
+              return { loaded: true, blockedByTrustRemoteCode: false };
             }
-            useChatRuntimeStore.setState({
-              ggufContextLength: loadResp.context_length ?? 131072,
-              ggufMaxContextLength:
-                loadResp.max_context_length ??
-                loadResp.context_length ??
-                131072,
-              supportsReasoning: loadResp.supports_reasoning ?? false,
-              reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-              reasoningEnabled: loadResp.supports_reasoning ?? false,
-              ...reasoningCapsFromLoad(loadResp),
-              supportsPreserveThinking:
-                loadResp.supports_preserve_thinking ?? false,
-              supportsTools: loadResp.supports_tools ?? false,
-              ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
-              kvCacheDtype: loadResp.cache_type_kv ?? null,
-              loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
-              tensorParallel: loadResp.tensor_parallel ?? false,
-              loadedTensorParallel: loadResp.tensor_parallel ?? false,
-              defaultChatTemplate: loadResp.chat_template ?? null,
-              chatTemplateOverride: null,
-              loadedChatTemplateOverride: null,
-              loadedIsMultimodal: isMultimodalResponse(loadResp),
-              ...resolveLoadedSpeculativeSettings(loadResp),
-            });
-            toast.success(`Loaded ${repo.repo_id} (${variant.quant})`, {
-              id: toastId,
-            });
-            return { loaded: true, blockedByTrustRemoteCode: false };
           }
         } catch {
           hadNonTrustFailure = true;
@@ -1501,64 +1781,23 @@ async function autoLoadSmallestModel(): Promise<{
         if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) break;
         try {
           if (
-            !(await canAutoLoad({
-              model_path: repo.repo_id,
-              max_seq_length: 4096,
-              is_lora: false,
-              gguf_variant: null,
-            }))
+            skippedAutoLoadCandidates.has(
+              autoLoadCandidateKey("model", repo.repo_id),
+            )
           ) {
             continue;
           }
-          loadAttempts += 1;
-          const sfLoadResp = await loadModel({
-            model_path: repo.repo_id,
-            hf_token: hfToken,
-            max_seq_length: 4096,
-            load_in_4bit: true,
-            is_lora: false,
-            gguf_variant: null,
-            trust_remote_code: trustRemoteCode,
-            speculative_type: specSettings.speculativeType,
-            spec_draft_n_max: specSettings.specDraftNMax,
-          });
-          saveSpeculativeType(specSettings.speculativeType);
-          useChatRuntimeStore.getState().setCheckpoint(repo.repo_id);
-          const store = useChatRuntimeStore.getState();
-          store.setModelRequiresTrustRemoteCode(
-            sfLoadResp.requires_trust_remote_code ?? false,
-          );
-          store.setParams({ ...store.params, maxTokens: 4096 });
-          useChatRuntimeStore.setState({
-            supportsReasoning: sfLoadResp.supports_reasoning ?? false,
-            reasoningAlwaysOn: sfLoadResp.reasoning_always_on ?? false,
-            reasoningEnabled: sfLoadResp.supports_reasoning ?? false,
-            ...reasoningCapsFromLoad(sfLoadResp),
-            supportsPreserveThinking:
-              sfLoadResp.supports_preserve_thinking ?? false,
-            supportsTools: sfLoadResp.supports_tools ?? false,
-            // Parity with the GGUF branch above.
-            ...resolveToolsEnabledOnLoad(sfLoadResp.supports_tools ?? false),
-            defaultChatTemplate: sfLoadResp.chat_template ?? null,
-            chatTemplateOverride: null,
-            loadedChatTemplateOverride: null,
-            ...resolveLoadedSpeculativeSettings(sfLoadResp),
-          });
-          const sfModel: ChatModelSummary = {
-            id: repo.repo_id,
-            name: sfLoadResp.display_name ?? repo.repo_id,
-            isVision: sfLoadResp.is_vision ?? false,
-            isLora: sfLoadResp.is_lora ?? false,
-            isGguf: sfLoadResp.is_gguf ?? false,
-          };
-          if (!store.models.some((m) => m.id === repo.repo_id)) {
-            store.setModels([...store.models, sfModel]);
+          if (
+            await loadAutoLoadCandidate({
+              id: repo.repo_id,
+              kind: "model",
+              ggufVariant: null,
+              maxSeqLength: 4096,
+              successLabel: `Loaded ${repo.repo_id}`,
+            })
+          ) {
+            return { loaded: true, blockedByTrustRemoteCode: false };
           }
-          useChatRuntimeStore.setState({
-            loadedIsMultimodal: isMultimodalResponse(sfLoadResp),
-          });
-          toast.success(`Loaded ${repo.repo_id}`, { id: toastId });
-          return { loaded: true, blockedByTrustRemoteCode: false };
         } catch {
           hadNonTrustFailure = true;
           continue;
@@ -1585,12 +1824,19 @@ async function autoLoadSmallestModel(): Promise<{
       duration: 30000,
     });
     try {
+      const rt = useChatRuntimeStore.getState();
       if (
         !(await canAutoLoad({
           model_path: "unsloth/Qwen3.5-4B-MTP-GGUF",
           max_seq_length: 0,
           is_lora: false,
           gguf_variant: "UD-Q4_K_XL",
+          // The same live-store knobs the load below sends (a fresh default
+          // model has no remembered settings to prefer).
+          gpu_ids: rt.selectedGpuIds ?? undefined,
+          gpu_memory_mode: rt.gpuMemoryMode,
+          gpu_layers: rt.gpuLayers,
+          speculative_type: specSettings.speculativeType,
         }))
       ) {
         toast.dismiss(toastId);
@@ -1600,15 +1846,28 @@ async function autoLoadSmallestModel(): Promise<{
       const loadResp = await loadModel({
         model_path: "unsloth/Qwen3.5-4B-MTP-GGUF",
         hf_token: hfToken,
-        max_seq_length: 0,
+        max_seq_length: resolveFitMaxSeqLength(
+          /* isGguf */ true,
+          rt.gpuMemoryMode,
+          rt.gpuLayers,
+          rt.customContextLength,
+          0,
+        ),
         load_in_4bit: true,
         is_lora: false,
         gguf_variant: "UD-Q4_K_XL",
         trust_remote_code: trustRemoteCode,
         speculative_type: specSettings.speculativeType,
         spec_draft_n_max: specSettings.specDraftNMax,
+        // GPU Memory is a standing preference, so honor it on auto-load.
+        gpu_memory_mode: rt.gpuMemoryMode,
+        gpu_layers: rt.gpuLayers,
+        n_cpu_moe: rt.nCpuMoe,
+        tensor_split: rt.splitRatio ?? undefined,
+        gpu_ids: rt.selectedGpuIds ?? undefined,
       });
       saveSpeculativeType(specSettings.speculativeType);
+      persistGpuMemoryModeOnLoad(loadResp, rt.gpuMemoryMode);
       useChatRuntimeStore
         .getState()
         .setCheckpoint("unsloth/Qwen3.5-4B-MTP-GGUF", "UD-Q4_K_XL");
@@ -1645,10 +1904,19 @@ async function autoLoadSmallestModel(): Promise<{
         loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
         tensorParallel: loadResp.tensor_parallel ?? false,
         loadedTensorParallel: loadResp.tensor_parallel ?? false,
+        ...loadedGpuMemoryFields(loadResp),
+        // Drives the GPU Memory controls' diffusion gate; set alongside the
+        // GPU fields on every load path so the gate can't read stale.
+        loadedIsDiffusion: loadResp.is_diffusion ?? false,
         defaultChatTemplate: loadResp.chat_template ?? null,
         chatTemplateOverride: null,
         loadedIsMultimodal: isMultimodalResponse(loadResp),
         ...resolveLoadedSpeculativeSettings(loadResp),
+      });
+      recordLastLocalModelLoad({
+        id: "unsloth/Qwen3.5-4B-MTP-GGUF",
+        kind: "gguf",
+        ggufVariant: "UD-Q4_K_XL",
       });
       toast.success("Loaded Qwen3.5-4B-MTP (UD-Q4_K_XL)", { id: toastId });
       return { loaded: true, blockedByTrustRemoteCode: false };

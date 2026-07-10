@@ -22,11 +22,22 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Collection, Generator, Iterable, List, Mapping, Optional, Union
+from typing import (
+    Callable,
+    Collection,
+    Generator,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Union,
+)
 
 import httpx
 
 from core.inference.llama_server_args import (
+    _LAYER_OFFLOAD_FLAGS,
     _effective_tensor_parallel,
     _tensor_parallel_matches_loaded,
     extra_args_disable_mmproj,
@@ -98,6 +109,10 @@ logger = get_logger(__name__)
 class LlamaServerNotFoundError(RuntimeError):
     """GGUF model needs the llama.cpp runtime but no llama-server is installed.
     Subclasses RuntimeError so existing handlers still catch it."""
+
+
+class _LlamaStreamCancelled(Exception):
+    """Internal signal for an expected client/request cancellation."""
 
 
 # Shared so the from_identifier preflight and the load-time raise stay in sync.
@@ -1104,13 +1119,29 @@ def _mla_mtp_auto_enabled() -> bool:
     )
 
 
+def _cmd_forces_tensor_split_mode(cmd: "Iterable[str]") -> bool:
+    """True when the argv's LAST -sm/--split-mode value is "tensor" (last-wins,
+    matching llama-server's CLI parse). Non-tensor modes are inert with zero
+    offloaded layers, so only tensor forces GPU visibility."""
+    args = [str(a) for a in cmd] if cmd else []
+    last: Optional[str] = None
+    for i, raw in enumerate(args):
+        flag, eq, inline = raw.partition("=")
+        if flag in ("-sm", "--split-mode"):
+            last = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
+    return (last or "").strip().lower() == "tensor"
+
+
 def _extra_args_set_spec_type(extra_args: Optional[Iterable[str]]) -> bool:
     """User passed --spec-type / --spec-default? llama-server takes one
     --spec-type (comma-separated to chain), so suppress auto-emit."""
     return _extra_args_set_any_flag(extra_args, {"--spec-type", "--spec-default"})
 
 
-_GPU_OFFLOAD_OVERRIDE_FLAGS = frozenset({"-ngl", "--gpu-layers", "--n-gpu-layers", "-fit", "--fit"})
+# Layer-offload override detection. Single-sourced from llama_server_args, which
+# also strips these (plus the MoE flags) from inherited extras; sharing the layer
+# set keeps detection and stripping from drifting.
+_GPU_OFFLOAD_OVERRIDE_FLAGS = _LAYER_OFFLOAD_FLAGS
 _THREAD_OVERRIDE_FLAGS = frozenset({"-t", "--threads"})
 
 
@@ -1548,6 +1579,17 @@ class LlamaCppBackend:
         self._cache_type_kv: Optional[str] = None
         # Whether --split-mode tensor was applied on the active load.
         self._tensor_parallel: bool = False
+        # GPU memory strategy applied on the active load ("auto"/"manual").
+        self._gpu_memory_mode: str = "auto"
+        # Manual-mode load options (echoed back so the UI round-trips them).
+        self._gpu_layers: int = -1
+        # MoE expert layers to keep on CPU (--n-cpu-moe); 0 = none.
+        self._n_cpu_moe: int = 0
+        # Relative model share per GPU (--tensor-split), in GPU order; None =
+        # default (llama.cpp splits by free VRAM).
+        self._tensor_split: Optional[List[float]] = None
+        # User-picked physical GPU indices (None = automatic selection).
+        self._gpu_ids: Optional[List[int]] = None
         # Layer load kept multi-GPU only to honor a downgraded tensor request, so a
         # later explicit tensor-off reloads instead of deduping to it (#6659).
         self._layer_preserves_tensor_intent: bool = False
@@ -1562,6 +1604,11 @@ class LlamaCppBackend:
         self._spec_draft_n_max: Optional[int] = None
         # KV-cache estimation fields (populated by _read_gguf_metadata)
         self._n_layers: Optional[int] = None
+        # MoE metadata (populated by _read_gguf_metadata): expert count (>0 =
+        # MoE) and leading dense-layer count (offsets --n-cpu-moe, which counts
+        # from layer 0). See the n_moe_layers property.
+        self._n_experts: Optional[int] = None
+        self._leading_dense_block_count: Optional[int] = None
         self._n_kv_heads: Optional[int] = None
         self._n_kv_heads_by_layer: Optional[list[int]] = None
         self._n_heads: Optional[int] = None
@@ -1960,6 +2007,62 @@ class LlamaCppBackend:
         return self._tensor_parallel
 
     @property
+    def gpu_memory_mode(self) -> str:
+        """Active GPU memory strategy: 'auto' or 'manual' (gpu_layers < 0 = Auto/--fit, >= 0 = pinned)."""
+        return self._gpu_memory_mode
+
+    @property
+    def gpu_layers(self) -> int:
+        """Requested --gpu-layers for manual mode (-1 when not manual)."""
+        return self._gpu_layers
+
+    @property
+    def n_cpu_moe(self) -> int:
+        """MoE expert layers manual mode kept on CPU (--n-cpu-moe); 0 = none."""
+        return self._n_cpu_moe
+
+    @property
+    def tensor_split(self) -> Optional[List[float]]:
+        """Manual-mode relative model share per GPU (--tensor-split); None =
+        default (split by free VRAM)."""
+        return self._tensor_split
+
+    @property
+    def gpu_ids(self) -> Optional[List[int]]:
+        """User-picked physical GPU indices, or None for automatic selection."""
+        return self._gpu_ids
+
+    @property
+    def n_layers(self) -> Optional[int]:
+        """Model layer count (GGUF block_count), or None if unknown."""
+        return self._n_layers
+
+    @property
+    def n_moe_layers(self) -> int:
+        """Number of MoE expert layers (the --n-cpu-moe ceiling), 0 if not MoE.
+
+        block_count minus the leading dense layers (which carry no experts):
+        --n-cpu-moe counts from layer 0, so those dense layers are no-ops.
+        """
+        if not self._n_experts or not self._n_layers:
+            return 0
+        return max(0, self._n_layers - (self._leading_dense_block_count or 0))
+
+    @staticmethod
+    def _resolve_cpu_moe_flag(
+        n_cpu_moe: int, n_moe_layers: int, leading_dense: int
+    ) -> Optional[int]:
+        """The --n-cpu-moe value (absolute first-N layers), or None to omit it.
+
+        Clamps the requested count to the model's MoE layers, then offsets past
+        the leading dense layers (--n-cpu-moe counts from layer 0). Returns None
+        for nothing-to-offload (0 requested) or a non-MoE model.
+        """
+        if n_cpu_moe <= 0 or n_moe_layers <= 0:
+            return None
+        return leading_dense + min(n_cpu_moe, n_moe_layers)
+
+    @property
     def layer_preserves_tensor_intent(self) -> bool:
         """True when a downgraded tensor request kept this layer load multi-GPU."""
         return self._layer_preserves_tensor_intent
@@ -2160,6 +2263,7 @@ class LlamaCppBackend:
                 "spec_draft_n_max_flag": None,
                 "supports_kv_unified": False,
                 "supports_fit_ctx": False,
+                "supports_fit_target": False,
                 "supports_cache_ram": False,
                 "supports_ctx_checkpoints": False,
                 "supports_no_cache_prompt": False,
@@ -2179,6 +2283,7 @@ class LlamaCppBackend:
         spec_draft_n_max_flag: Optional[str] = None
         supports_kv_unified = False
         supports_fit_ctx = False
+        supports_fit_target = False
         supports_cache_ram = False
         supports_ctx_checkpoints = False
         supports_no_cache_prompt = False
@@ -2276,6 +2381,7 @@ class LlamaCppBackend:
 
             supports_kv_unified = _is_real("--kv-unified")
             supports_fit_ctx = _is_real("--fit-ctx")
+            supports_fit_target = _is_real("--fit-target")
             supports_cache_ram = _is_real("--cache-ram")
             supports_ctx_checkpoints = _is_real("--ctx-checkpoints")
             supports_no_cache_prompt = _is_real("--no-cache-prompt")
@@ -2292,6 +2398,7 @@ class LlamaCppBackend:
             "spec_draft_n_max_flag": spec_draft_n_max_flag,
             "supports_kv_unified": supports_kv_unified,
             "supports_fit_ctx": supports_fit_ctx,
+            "supports_fit_target": supports_fit_target,
             "supports_cache_ram": supports_cache_ram,
             "supports_ctx_checkpoints": supports_ctx_checkpoints,
             "supports_no_cache_prompt": supports_no_cache_prompt,
@@ -2375,6 +2482,61 @@ class LlamaCppBackend:
             return [int(x.strip()) for x in cvd.split(",") if x.strip()]
         except ValueError:
             return None
+
+    @staticmethod
+    def _emit_child_gpu_visibility(env: dict, pinned: str) -> None:
+        """Write the child's GPU visibility mask (CUDA, plus the HIP mirror on
+        ROCm, where narrowing only CUDA_VISIBLE_DEVICES leaves an AMD child
+        seeing the full set). Do NOT also set ROCR_VISIBLE_DEVICES to the same
+        value: ROCR filters at the HSA/ROCr layer and HIP at the HIP layer, so
+        setting both with the same physical indices applies the mask twice --
+        ROCR reduces the visible set and re-indexes it from 0, then HIP indexes
+        into the already-reduced set. A single non-zero pin (e.g. "1") then
+        points out of range at the HIP layer, HIP enumerates 0 devices, and
+        llama.cpp falls back to CPU ("ggml_cuda_init: no ROCm-capable device is
+        detected"). The HIP mask alone narrows correctly; clear any inherited
+        ROCR mask so it can't double up."""
+        env["CUDA_VISIBLE_DEVICES"] = pinned
+        try:
+            import torch as _torch
+            if getattr(_torch.version, "hip", None) is not None:
+                env["HIP_VISIBLE_DEVICES"] = pinned
+                env.pop("ROCR_VISIBLE_DEVICES", None)
+        except Exception as e:
+            logger.debug("Failed to set ROCm visibility env vars for child: %s", e)
+
+    @staticmethod
+    def _pin_visible_gpu_order_for_split(env: dict) -> None:
+        """Pin the child's GPU enumeration to the picker's order for a manual
+        ``--tensor-split`` across the whole visible set. CUDA's default
+        FASTEST_FIRST enumeration applies the shares to the wrong cards on
+        heterogeneous hosts (#5025), and CUDA_DEVICE_ORDER only fixes the
+        numbering base: an inherited numeric visibility mask ALSO defines
+        enumeration order, so a reordered parent mask (CUDA_VISIBLE_DEVICES=3,1)
+        would still hand the shares to the wrong cards. The UI built the split
+        positionally over get_backend_visible_gpu_info's device list (ascending
+        physical via nvidia-smi, inherited mask order on the torch fallback), so
+        re-emit the same set in that report order -- not an assumed ascending
+        sort. The visible set itself never changes. No mask, an empty mask, or a
+        UUID/MIG mask (which resolves to None) is left alone -- the multi-GPU
+        controls are hidden for the latter."""
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        inherited = LlamaCppBackend._resolve_visible_physical_ids()
+        if not inherited:
+            return
+        order = None
+        try:
+            from utils.hardware import get_backend_visible_gpu_info
+            info = get_backend_visible_gpu_info()
+            if info.get("available") and info.get("index_kind") == "physical":
+                reported = [d["index"] for d in info.get("devices", [])]
+                if sorted(reported) == sorted(inherited):
+                    order = reported
+        except Exception as e:
+            logger.debug("Could not read reported GPU order for split pin: %s", e)
+        if order is None:
+            order = sorted(inherited)
+        LlamaCppBackend._emit_child_gpu_visibility(env, ",".join(str(i) for i in order))
 
     @staticmethod
     def _amd_apu_wants_unified_memory(gpu_indices = None) -> bool:
@@ -3848,6 +4010,8 @@ class LlamaCppBackend:
         self._supports_preserve_thinking = False
         self._supports_tools = False
         self._n_layers = None
+        self._n_experts = None
+        self._leading_dense_block_count = None
         self._n_kv_heads = None
         self._n_kv_heads_by_layer = None
         self._n_heads = None
@@ -3937,6 +4101,8 @@ class LlamaCppBackend:
                                     arch_keys = {
                                         f"{arch}.context_length": "context_length",
                                         f"{arch}.block_count": "n_layers",
+                                        f"{arch}.expert_count": "n_experts",
+                                        f"{arch}.leading_dense_block_count": "leading_dense_block_count",
                                         f"{arch}.attention.head_count_kv": "n_kv_heads",
                                         f"{arch}.attention.head_count": "n_heads",
                                         f"{arch}.embedding_length": "embedding_length",
@@ -4135,6 +4301,7 @@ class LlamaCppBackend:
         model_identifier: str,
         n_ctx: int,
         extra_args: Optional[List[str]],
+        gpu_ids: Optional[List[int]] = None,
     ) -> bool:
         """Launch the OpenAI-compat diffusion shim (which drives the on-device
         visual decoder) and wait for health. Presents the same /v1 + /health
@@ -4160,7 +4327,16 @@ class LlamaCppBackend:
         # CUDA_VISIBLE_DEVICES="" to force CPU serving. Keep the visual-server child
         # CPU-masked (empty --gpu) so the shim does not re-expose GPU 0 via its default.
         cpu_only = self._effective_gpu_count() == 0
-        gpu = "" if cpu_only else os.environ.get("DG_GPU", "0")
+        # Honor the GPU picker first: the diffusion runner takes a single device,
+        # so use the lowest selected GPU (matches the sorted set recorded below, so
+        # the device used == the echoed gpu_ids[0]). With no pick, fall back to the
+        # CPU-only mask, else DG_GPU / 0.
+        if gpu_ids:
+            gpu = str(sorted(gpu_ids)[0])
+        elif cpu_only:
+            gpu = ""
+        else:
+            gpu = os.environ.get("DG_GPU", "0")
 
         cmd = list(shim_cmd) + [
             "--gguf",
@@ -4188,6 +4364,11 @@ class LlamaCppBackend:
             env.setdefault("UNSLOTH_ALLOW_CPU", "1")
         env["DG_VISUAL_BIN"] = visual_bin
         env["DG_GPU"] = gpu
+        if gpu_ids:
+            # The visual server remasks via CUDA_VISIBLE_DEVICES=<gpu>; pin PCI
+            # order (as the llama-server path does) so the picked physical id maps
+            # to the GPU the picker showed, not CUDA's default fastest-first order.
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         # The file-override shim imports its sibling visual_engine; put its dir on PYTHONPATH.
         # (The zoo-package shim is an installed module and needs no PYTHONPATH change.)
         if extra_pythonpath:
@@ -4233,6 +4414,18 @@ class LlamaCppBackend:
         self._model_identifier = model_identifier
         self._cache_type_kv = None
         self._gpu_offload_active = True
+        # Diffusion doesn't use the llama.cpp GPU-memory knobs; reset them to
+        # defaults (the picked device is still recorded below) so /load, /status
+        # and reload dedup don't report a previous GGUF's manual settings.
+        self._gpu_memory_mode = "auto"
+        self._gpu_layers = -1
+        self._n_cpu_moe = 0
+        self._tensor_split = None
+        # Record only the single device the runner actually uses (the lowest
+        # selected GPU, chosen above) -- not the whole pick. The diffusion runner
+        # is single-device, so echoing a multi-GPU list would misreport placement
+        # in /status and let a re-Apply dedup against GPUs the runner never used.
+        self._gpu_ids = [sorted(gpu_ids)[0]] if gpu_ids else None
         if hf_variant:
             self._hf_variant = hf_variant
         elif gguf_path:
@@ -5342,6 +5535,11 @@ class LlamaCppBackend:
         speculative_type: Optional[str] = None,
         spec_draft_n_max: Optional[int] = None,
         tensor_parallel: bool = False,
+        gpu_memory_mode: Literal["auto", "manual"] = "auto",
+        gpu_layers: int = -1,
+        n_cpu_moe: int = 0,
+        tensor_split: Optional[List[float]] = None,
+        gpu_ids: Optional[List[int]] = None,
         n_threads: Optional[int] = None,
         n_gpu_layers: Optional[int] = None,  # caller compat, unused
         n_parallel: int = 1,
@@ -5374,6 +5572,14 @@ class LlamaCppBackend:
             "speculative_type": speculative_type,
             "spec_draft_n_max": spec_draft_n_max,
             "tensor_parallel": tensor_parallel,
+            # GPU-memory placement: replayed on respawn so a server SIGKILL'd by
+            # GPU/RAM pressure reloads onto the same devices with the same
+            # offload, not the auto defaults.
+            "gpu_memory_mode": gpu_memory_mode,
+            "gpu_layers": gpu_layers,
+            "n_cpu_moe": n_cpu_moe,
+            "tensor_split": list(tensor_split) if tensor_split is not None else None,
+            "gpu_ids": list(gpu_ids) if gpu_ids is not None else None,
             "n_threads": n_threads,
             "n_gpu_layers": n_gpu_layers,
             "n_parallel": n_parallel,
@@ -5400,6 +5606,11 @@ class LlamaCppBackend:
                 speculative_type = speculative_type,
                 spec_draft_n_max = spec_draft_n_max,
                 tensor_parallel = tensor_parallel,
+                gpu_memory_mode = gpu_memory_mode,
+                gpu_layers = gpu_layers,
+                n_cpu_moe = n_cpu_moe,
+                tensor_split = tensor_split,
+                gpu_ids = gpu_ids,
                 chat_template_override = chat_template_override,
                 extra_args = extra_args,
                 is_vision = is_vision,
@@ -5518,6 +5729,7 @@ class LlamaCppBackend:
                         model_identifier = model_identifier,
                         n_ctx = n_ctx,
                         extra_args = extra_args,
+                        gpu_ids = gpu_ids,
                     )
 
             if not binary:
@@ -5579,6 +5791,62 @@ class LlamaCppBackend:
                 # use the same helper so a healthy env-driven tensor server matches.
                 split_mode_override = parse_split_mode_override(extra_args)
                 tensor_parallel = _effective_tensor_parallel(extra_args, tensor_parallel)
+                # Zero GPU layers leaves nothing to split: --split-mode tensor or
+                # a per-GPU ratio at gpu_layers=0 launches tensor mode with no
+                # offloaded work -- and under the CPU-only GPU mask below, with
+                # no visible devices at all, which aborts the server instead of
+                # the intended CPU-only load. Drop both for this launch (a user
+                # --split-mode in extras still wins last-wins and keeps the GPUs
+                # visible via the mask's own gate).
+                if gpu_memory_mode == "manual" and gpu_layers == 0:
+                    if tensor_parallel or tensor_split:
+                        logger.info(
+                            "Manual gpu_layers=0: dropping tensor split/parallel "
+                            "flags (nothing to split on the GPU)"
+                        )
+                    tensor_parallel = False
+                    tensor_split = None
+                # Record the requested strategy for /status and the load
+                # response. 'manual' has no fallback, so the request value is the
+                # value actually applied.
+                self._gpu_memory_mode = gpu_memory_mode
+                # The layer/MoE/split knobs apply only with an explicit offload
+                # (manual + gpu_layers >= 0); else record defaults so /status and
+                # /load don't report knobs the server never applied.
+                if gpu_memory_mode == "manual" and gpu_layers >= 0:
+                    self._gpu_layers = gpu_layers
+                    self._n_cpu_moe = n_cpu_moe
+                    self._tensor_split = tensor_split
+                else:
+                    self._gpu_layers = -1
+                    self._n_cpu_moe = 0
+                    self._tensor_split = None
+                self._gpu_ids = sorted(gpu_ids) if gpu_ids else None
+                # Manual offload skips the TP planner but still emits --split-mode
+                # tensor at launch; drop it when fewer than 2 GPUs are in use --
+                # tensor split is a no-op there and aborts on some architectures.
+                # Done before the cache-drop below so a quantized KV survives.
+                if (
+                    tensor_parallel
+                    and gpu_memory_mode == "manual"
+                    and gpu_layers >= 0
+                    and self._effective_gpu_count(sorted(gpu_ids) if gpu_ids else None) < 2
+                ):
+                    logger.info(
+                        "Tensor parallelism requested in manual mode but fewer "
+                        "than 2 GPUs are in use; ignoring (needs >= 2)."
+                    )
+                    tensor_parallel = False
+                # Drop TP for manual + Auto layers before the cache-drop below (like
+                # the <2-GPU guard above), so a requested quantized KV survives into
+                # the --fit load rather than being stripped for a tensor attempt.
+                if tensor_parallel and gpu_memory_mode == "manual" and gpu_layers < 0:
+                    logger.info(
+                        "Manual mode with Auto layers hands memory management to "
+                        "llama.cpp --fit, which is incompatible with tensor "
+                        "parallelism; ignoring the tensor split."
+                    )
+                    tensor_parallel = False
                 # Tensor mode aborts on a quantized KV cache, so drop it for the
                 # tensor attempt (and strip any inherited/explicit --cache-type
                 # that would re-impose it when appended last). Layer split does
@@ -5659,6 +5927,12 @@ class LlamaCppBackend:
                         "Vision-capable GGUF loaded without a usable mmproj; "
                         "image input will be disabled for this session"
                     )
+                # Seed before the try: the except (GPU-selection failure ->
+                # --fit on) falls through to the launch which reads this, and the
+                # probe that assigns it may throw first. Captured before manual
+                # empty `gpus` so the speculative defaults stay GPU-aware and the
+                # CPU-fallback check still knows GPUs were present.
+                _detected_gpus: list[tuple[int, int]] = []
                 model_size = None  # set in the fit try; used by the APU RAM guard
                 # Layer-fallback min GPUs; raised below on a tensor downgrade. Bound
                 # before the try so the --fit-on except path still has it (no UnboundLocal).
@@ -5676,6 +5950,18 @@ class LlamaCppBackend:
                     _gpu_mem = self._get_gpu_memory(binary)
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
+                    # GPU picker: restrict every mode to the chosen devices, so
+                    # auto selection only considers them and manual mask to
+                    # them (the env block below pins CUDA/HIP_VISIBLE_DEVICES).
+                    if gpu_ids:
+                        _picked = set(gpu_ids)
+                        gpus = [g for g in gpus if g[0] in _picked]
+
+                    # GPUs the model will run on -- captured before manual
+                    # empty `gpus` to bypass the planner. bool() drives the
+                    # GPU-aware speculative defaults; the list feeds the
+                    # CPU-fallback check.
+                    _detected_gpus = list(gpus)
 
                     def _gpu_usable(g, frac = _CTX_FIT_VRAM_FRACTION):
                         # Per-GPU usable budget for ranking: free - (1-frac)*total.
@@ -5706,6 +5992,44 @@ class LlamaCppBackend:
                     # Default UI ceiling to the native context length;
                     # GPU/VRAM-fit logic below may shrink it on limited HW.
                     max_available_ctx = self._context_length or effective_ctx
+
+                    # Manual + Auto layers (the Manual default): hand memory
+                    # management to llama.cpp's --fit. Emptying the probed GPU set
+                    # no-ops the selection/TP planning below, leaving gpu_indices
+                    # None (an explicit gpu_ids pick still pins below) and use_fit
+                    # True. An explicit context is honored (--fit optimizes around
+                    # it); 0 lets --fit size it.
+                    if gpu_memory_mode == "manual" and gpu_layers < 0:
+                        # Tensor parallelism was already dropped above (before the
+                        # cache-drop), so a quantized KV survives into this --fit load.
+                        gpus = []
+                        effective_ctx = requested_ctx if requested_ctx > 0 else 0
+                        original_ctx = effective_ctx
+                        # --fit aborts under --split-mode tensor; a raw extras
+                        # --split-mode/--tensor-split (appended last) would
+                        # otherwise reach llama-server. Strip it like the TP
+                        # downgrade does.
+                        extra_args = strip_split_mode_only(extra_args)
+                    elif gpu_memory_mode == "manual":
+                        # Manual offload (--gpu-layers + --fit off): no automatic
+                        # device masking (a gpu_ids pick still pins below) or
+                        # context cap -- the user owns both. tensor_parallel is
+                        # honored but skips the memory-based planner (gpus = []);
+                        # the toggle just emits --split-mode tensor (split by free
+                        # VRAM, or by the Split ratio if set).
+                        gpus = []
+                        effective_ctx = (
+                            requested_ctx if requested_ctx > 0 else (self._context_length or 0)
+                        )
+                        original_ctx = effective_ctx
+                        # Strip the user --split-mode when the toggle owns the split
+                        # (TP engaged -> Studio emits --split-mode tensor) or when the
+                        # user asked for tensor (which aborts on a single GPU even if
+                        # the manual <2-GPU guard downgraded TP). Otherwise keep their
+                        # non-tensor mode (row/none/layer) -- the toggle can't express
+                        # those.
+                        if tensor_parallel or split_mode_override == "tensor":
+                            extra_args = strip_split_mode_only(extra_args)
 
                     # Will MTP engage? If so, auto-fit reserves draft-model VRAM.
                     # Mirrors _build_speculative_flags: forced mtp/mtp+ngram always
@@ -5794,7 +6118,10 @@ class LlamaCppBackend:
                     _extra_n_max = _extra_args_spec_draft_n_max(extra_args)
                     _mtp_eff_n_max = _extra_n_max if _extra_n_max is not None else spec_draft_n_max
                     if _mtp_eff_n_max is None:
-                        _mtp_eff_n_max = 2 if gpus else 3
+                        # _detected_gpus (not gpus) so manual -- which empty
+                        # gpus to bypass the planner -- keep the GPU draft depth the
+                        # launch flags also use, instead of the CPU default.
+                        _mtp_eff_n_max = 2 if _detected_gpus else 3
                     # Separate-drafter weights live on GPU (an embedded head is
                     # already in model_size). Size the drafter the launch loads, by
                     # precedence: extras --model-draft (last-wins), else Studio's
@@ -5932,7 +6259,8 @@ class LlamaCppBackend:
                     # honor it, cap only if it fits no combination. Auto (native):
                     # prefer fewer GPUs with reduced context (multi-GPU is slower).
                     gpu_indices, use_fit = None, True
-                    # Per-GPU weight proportions for tensor mode (None = even).
+                    # Per-GPU weight proportions for tensor mode (None lets
+                    # llama.cpp split by free VRAM).
                     tp_tensor_split: Optional[list[int]] = None
                     explicit_ctx = requested_ctx > 0
                     # Flat MTP reserve fraction: used only as the fallback when the
@@ -6007,7 +6335,12 @@ class LlamaCppBackend:
                     # GPUs below that reserve from the set up front (gpu_indices
                     # becomes the CUDA_VISIBLE_DEVICES mask, fully excluding them).
                     tp_gpus = gpus
-                    if tensor_parallel:
+                    # Manual mode owns the layer count and context, so it skips
+                    # the memory-based planner; its toggle still emits
+                    # --split-mode tensor below (split by free VRAM, or by the
+                    # Split ratio if set). auto plans here.
+                    plan_tp = tensor_parallel and gpu_memory_mode != "manual"
+                    if plan_tp:
                         # Deterministic per-device compute buffer (replicated on
                         # every device in tensor mode); flat fallback when dims
                         # are unavailable. _plan_tensor_parallel uses the same.
@@ -6026,7 +6359,7 @@ class LlamaCppBackend:
                         # free yet have no budget left.
                         tp_gpus = [g for g in gpus if _gpu_usable(g) >= reserve_mib]
 
-                    if tensor_parallel and len(tp_gpus) < 2:
+                    if plan_tp and len(tp_gpus) < 2:
                         # Tensor parallelism needs >= 2 usable GPUs. On a single
                         # GPU --split-mode tensor is a no-op; with 0 GPUs (CPU-only
                         # or probe failed) it must not reach llama-server; and a
@@ -6442,6 +6775,12 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
+                # GPU picker: when no narrower subset was chosen (manual, or
+                # a failed/file-size selection), pin the whole picked set so the
+                # model can't spill onto an unpicked GPU.
+                if gpu_ids and gpu_indices is None:
+                    gpu_indices = sorted(gpu_ids)
+
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
                 # oversize load the OS would otherwise kill mid-flight. Base model
@@ -6478,8 +6817,6 @@ class LlamaCppBackend:
                     model_path,
                     "--port",
                     str(self._port),
-                    "-c",
-                    str(effective_ctx) if effective_ctx > 0 else "0",
                     "--parallel",
                     str(n_parallel),
                     "--flash-attn",
@@ -6487,6 +6824,17 @@ class LlamaCppBackend:
                     # Error out at n_ctx instead of silently rotating the KV cache; frontend catches it and points the user at "Context Length".
                     "--no-context-shift",
                 ]
+                # A positive context is always passed (in auto-fit, --fit then
+                # optimizes the gpu-layer offload around it). When auto-fit has
+                # no explicit context, omit -c so --fit sizes it to fit VRAM:
+                # "-c 0" would instead pin the FULL native context (llama.cpp's
+                # -c handler sets fit_params_min_ctx = UINT32_MAX on value 0,
+                # disabling --fit's reduction). See gpu_memory_mode.
+                auto_fit = gpu_memory_mode == "manual" and gpu_layers < 0
+                if effective_ctx > 0:
+                    cmd.extend(["-c", str(effective_ctx)])
+                elif not auto_fit:
+                    cmd.extend(["-c", "0"])
 
                 # Report a clean public model id (matching GET /v1/models) rather
                 # than the raw -m path in llama-server's own /v1/models and the
@@ -6498,7 +6846,60 @@ class LlamaCppBackend:
                     cmd.extend(["--alias", _alias])
 
                 fully_gpu_offloaded = False
-                if use_fit:
+                # Set when a positional --tensor-split is emitted, so the env block
+                # can pin CUDA to PCI order even without a GPU subset (see below).
+                manual_tensor_split_emitted = False
+                if gpu_memory_mode == "manual" and gpu_layers >= 0:
+                    # Pin the user's layer count and disable auto-fit. --fit off
+                    # also means _ctx_integrity_flags must not add --fit-ctx.
+                    use_fit = False
+                    cmd.extend(["--gpu-layers", str(gpu_layers), "--fit", "off"])
+                    # Keep the first n_cpu_moe MoE layers' experts on CPU.
+                    moe_flag = self._resolve_cpu_moe_flag(
+                        n_cpu_moe,
+                        self.n_moe_layers,
+                        self._leading_dense_block_count or 0,
+                    )
+                    if moe_flag is not None:
+                        cmd.extend(["--n-cpu-moe", str(moe_flag)])
+                    # Distribute the model across GPUs by the user's per-GPU shares
+                    # (--tensor-split). Works with the default layer split and with
+                    # tensor parallelism; --fit off means no fit/tensor abort. Only
+                    # when >1 GPU is in use AND the list matches that count: the
+                    # field is hidden (not cleared) when the picker narrows to one,
+                    # and a direct caller can send a stale ratio for a different
+                    # GPU set -- either way a mismatched split aborts llama-server
+                    # at launch, so fall back to the free-VRAM default instead.
+                    _split_gpus = self._effective_gpu_count(gpu_indices)
+                    if tensor_split and _split_gpus > 1:
+                        # Sanitized-positive total, mirroring the training guard:
+                        # an all-zero/non-positive split assigns nothing anywhere.
+                        try:
+                            _split_total = sum(max(float(x), 0.0) for x in tensor_split)
+                        except (TypeError, ValueError):
+                            _split_total = 0.0
+                        if len(tensor_split) == _split_gpus and _split_total > 0:
+                            # Emit the same clamped-non-negative shares the
+                            # training guard validated, so a negative entry from
+                            # a direct caller can't launch a different placement
+                            # than the one the guard approved.
+                            _sanitized_split = [max(float(x), 0.0) for x in tensor_split]
+                            cmd.extend(
+                                ["--tensor-split", ",".join(f"{x:g}" for x in _sanitized_split)]
+                            )
+                            self._tensor_split = _sanitized_split
+                            manual_tensor_split_emitted = True
+                        else:
+                            logger.warning(
+                                "Dropping manual --tensor-split (%d entries for "
+                                "%d GPUs, sanitized total %s); llama.cpp's "
+                                "free-VRAM split applies instead",
+                                len(tensor_split),
+                                _split_gpus,
+                                _split_total,
+                            )
+                            self._tensor_split = None
+                elif use_fit:
                     cmd.extend(["--fit", "on"])
                 elif gpu_indices is not None:
                     # Fits on selected GPU(s) -- force all layers on GPU. --fit off is
@@ -6579,9 +6980,11 @@ class LlamaCppBackend:
                     self._cache_type_kv = None
 
                 # Tensor parallelism: split the model across GPUs by tensor
-                # rather than by layer. Multi-GPU only -- a no-op on a single
-                # GPU. Default (layer split) is left implicit by omitting the
-                # flag. See llama.cpp --split-mode.
+                # rather than by layer. The UI only offers it on multi-GPU; a
+                # direct single-GPU caller is redundant (supported archs no-op,
+                # unsupported ones abort and the /load path retries layer split).
+                # Default (layer split) is left implicit by omitting the flag.
+                # See llama.cpp --split-mode.
                 if tensor_parallel:
                     cmd.extend(["--split-mode", "tensor"])
                     if tp_tensor_split and len(tp_tensor_split) > 1:
@@ -6613,7 +7016,7 @@ class LlamaCppBackend:
                     extra_args = extra_args,
                     model_identifier = model_identifier,
                     model_path = model_path,
-                    gpus = bool(gpus),
+                    gpus = bool(_detected_gpus),
                     binary = binary,
                     mtp_draft_path = launch_mtp_draft_path,
                 )
@@ -6789,28 +7192,42 @@ class LlamaCppBackend:
                 # CUDA_VISIBLE_DEVICES leaves an AMD child seeing the full set, so
                 # set HIP_VISIBLE_DEVICES too. Vulkan is pinned via --device
                 # (above), not here.
-                if gpu_indices is not None and not is_vulkan_backend:
-                    pinned = ",".join(str(i) for i in gpu_indices)
-                    env["CUDA_VISIBLE_DEVICES"] = pinned
-                    try:
-                        import torch as _torch
-                        if getattr(_torch.version, "hip", None) is not None:
-                            env["HIP_VISIBLE_DEVICES"] = pinned
-                            # Do NOT also set ROCR_VISIBLE_DEVICES to the same
-                            # value. ROCR_VISIBLE_DEVICES filters at the HSA/ROCr
-                            # layer and HIP_VISIBLE_DEVICES at the HIP layer, so
-                            # setting both with the same physical indices applies
-                            # the mask twice: ROCR reduces the visible set and
-                            # re-indexes it from 0, then HIP indexes into the
-                            # already-reduced set. A single non-zero pin (e.g.
-                            # "1") then points out of range at the HIP layer, HIP
-                            # enumerates 0 devices, and llama.cpp falls back to
-                            # CPU ("ggml_cuda_init: no ROCm-capable device is
-                            # detected"). The HIP mask alone narrows correctly;
-                            # clear any inherited ROCR mask so it can't double up.
-                            env.pop("ROCR_VISIBLE_DEVICES", None)
-                    except Exception as e:
-                        logger.debug("Failed to set ROCm visibility env vars for child: %s", e)
+                # A deliberate zero-offload load with no GPU companions runs
+                # entirely on CPU, yet a visible CUDA device still costs the
+                # child a ~0.5 GB context + compute scratch that the guard's
+                # zero estimate and the CPU-only classification deliberately
+                # report as free. Hide the GPUs so the load is exactly what it
+                # claims: zero VRAM (verified: GPU stays at idle baseline and
+                # generation runs). Companion loads keep the normal masking, and
+                # a user --device in extras keeps control of its own devices.
+                _cpu_only_zero_offload = (
+                    gpu_memory_mode == "manual"
+                    and gpu_layers == 0
+                    and not is_vulkan_backend
+                    and not any(a == "--device" or str(a).startswith("--device=") for a in cmd)
+                    # Only a user-forced TENSOR split keeps the GPUs visible (it
+                    # aborts under zero devices); row/layer modes are inert with
+                    # nothing offloaded, so they don't defeat the zero-VRAM mask.
+                    and not _cmd_forces_tensor_split_mode(cmd)
+                    and not self._cmd_has_gpu_companion(cmd, env)
+                )
+                if _cpu_only_zero_offload:
+                    self._emit_child_gpu_visibility(env, "-1")
+                elif gpu_indices is not None and not is_vulkan_backend:
+                    # When the user picked GPUs by index, align CUDA's ordering
+                    # with the PCI-bus order the picker enumerated (nvidia-smi),
+                    # so "GPU 1" in the UI is GPU 1 to llama.cpp -- not CUDA's
+                    # default FASTEST_FIRST order (#5025).
+                    if gpu_ids:
+                        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                    self._emit_child_gpu_visibility(env, ",".join(str(i) for i in gpu_indices))
+                elif manual_tensor_split_emitted and not is_vulkan_backend:
+                    # A manual per-GPU ratio across ALL GPUs (no explicit pick, so
+                    # no CUDA_VISIBLE_DEVICES mask above): the UI built the
+                    # --tensor-split list in ascending physical/PCI index order,
+                    # so pin the child's enumeration to that order too. The whole
+                    # visible set stays in use; only its ordering is fixed.
+                    self._pin_visible_gpu_order_for_split(env)
 
                 # Captured before any text-only fallback strips it from cmd.
                 launched_with_mmproj = "--mmproj" in cmd
@@ -6969,7 +7386,6 @@ class LlamaCppBackend:
                 self._effective_context_length = (
                     effective_ctx if effective_ctx > 0 else self._context_length
                 )
-                self._reconcile_effective_ctx_with_server()
                 self._max_context_length = (
                     max_available_ctx if max_available_ctx > 0 else self._effective_context_length
                 )
@@ -7154,6 +7570,10 @@ class LlamaCppBackend:
                             "session; run 'unsloth studio update' to enable vision."
                         )
                         cmd = self._strip_mmproj_args(_last_spawn_cmd)
+                        # This retry bypasses _spawn_and_wait, so refresh the
+                        # launched-argv snapshot itself -- the zero-offload
+                        # classification below must not see the stripped --mmproj.
+                        _last_spawn_cmd = list(cmd)
                         self._is_vision = False
                         self._mmproj_has_audio = False
                         self._start_llama_process(cmd, env)
@@ -7184,6 +7604,13 @@ class LlamaCppBackend:
 
                 self._healthy = True
 
+                # Server is up: adopt the real per-request context it allocated
+                # -- the length --fit chose, or a --parallel slot split -- so the
+                # reported context_length matches reality. (Querying /props
+                # before the spawn above always failed; the seeded value was the
+                # requested/native length.)
+                self._reconcile_effective_ctx_with_server()
+
                 # Commit caller intent only after _healthy=True so a failed start
                 # can't poison the next inheritance check. None keeps prior, []
                 # clears, list sets. Source records hf_variant for the route's
@@ -7198,11 +7625,24 @@ class LlamaCppBackend:
                 self._mtp_runtime_fallback_active = _mtp_active_for_launched_server
                 self._start_mtp_crash_watchdog()
 
-                # Catch silent CPU fallback when GPU was intended (#5106).
-                self._gpu_offload_active = self._classify_gpu_offload(
-                    gpu_indices is not None or use_fit, gpus or []
-                )
-                if self._gpu_offload_active is False:
+                # Catch silent CPU fallback when GPU was intended (#5106). Manual
+                # offload (no picker) leaves gpu_indices None and use_fit False, so
+                # include its GPU-layer intent; use the preserved probe since
+                # auto-layers/manual empty `gpus`. A deliberate zero-offload load
+                # classifies by its launched argv instead: the main model is
+                # CPU-only by construction and must read False (not None), or
+                # training needlessly unloads a server holding no VRAM.
+                _deliberate_cpu_only = gpu_memory_mode == "manual" and gpu_layers == 0
+                if _deliberate_cpu_only:
+                    self._gpu_offload_active = self._zero_offload_gpu_flag(
+                        _last_spawn_cmd, _detected_gpus, env
+                    )
+                else:
+                    self._gpu_offload_active = self._classify_gpu_offload(
+                        gpu_indices is not None or use_fit or gpu_memory_mode == "manual",
+                        _detected_gpus,
+                    )
+                if self._gpu_offload_active is False and not _deliberate_cpu_only:
                     logger.warning(
                         "llama-server appears to have loaded the model entirely "
                         "on CPU even though Studio detected at least one GPU. "
@@ -7565,6 +8005,11 @@ class LlamaCppBackend:
         gguf_path: Optional[str] = None,
         spec_draft_n_max: Optional[int] = None,
         tensor_parallel: bool = False,
+        gpu_memory_mode: Literal["auto", "manual"] = "auto",
+        gpu_layers: int = -1,
+        n_cpu_moe: int = 0,
+        tensor_split: Optional[List[float]] = None,
+        gpu_ids: Optional[List[int]] = None,
         mtp_draft_path: Optional[str] = None,
         preserve_multi_gpu_on_layer: bool = False,
     ) -> bool:
@@ -7619,6 +8064,31 @@ class LlamaCppBackend:
             and not _effective_tensor_parallel(extra_args, tensor_parallel)
             and not preserve_multi_gpu_on_layer
         ):
+            return False
+
+        # The diffusion runner is mode-agnostic (always "auto", ignores the
+        # layer/MoE/split knobs), so a standing manual preference in the
+        # request must not force a needless reload -- only the GPU pick matters.
+        if not self._is_diffusion:
+            # A GPU-memory-mode flip (Unsloth / manual) must always reload.
+            if self._gpu_memory_mode != gpu_memory_mode:
+                return False
+            # Manual: a layer-count change always reloads (covers Auto(-1) <-> a
+            # pinned count); MoE/split only matter with an explicit offload.
+            if gpu_memory_mode == "manual" and (
+                self._gpu_layers != gpu_layers
+                or (
+                    gpu_layers >= 0
+                    and (
+                        self._n_cpu_moe != n_cpu_moe
+                        or (self._tensor_split or None) != (tensor_split or None)
+                    )
+                )
+            ):
+                return False
+        # A changed GPU pick must reload (compare order-insensitively; None/[]
+        # both mean automatic).
+        if (self._gpu_ids or None) != (sorted(gpu_ids) if gpu_ids else None):
             return False
 
         # Compare on the canonical requested mode. With --spec-type in
@@ -7689,6 +8159,40 @@ class LlamaCppBackend:
             return None
         return classify_gpu_offload_lines(self._stdout_lines)
 
+    @staticmethod
+    def _cmd_has_gpu_companion(cmd: list, env: Optional[Mapping[str, str]] = None) -> bool:
+        """True when the argv/env carries a GPU companion: any --mmproj form, or
+        a drafter (Studio's --model-draft, the extras aliases, or the
+        LLAMA_ARG_SPEC_DRAFT_* env) -- these offload to the GPU regardless of
+        the main ``--gpu-layers``. A drafter explicitly forced to CPU
+        (--spec-draft-ngl 0 / --spec-draft-device cpu) doesn't count."""
+        if any(str(a).startswith("--mmproj") for a in cmd):
+            return True
+        if _extra_args_mtp_draft_path(cmd, env) is None:
+            return False
+        return not _extra_args_draft_offloaded_to_cpu(cmd, env)
+
+    @staticmethod
+    def _zero_offload_gpu_flag(
+        spawn_cmd: list,
+        detected_gpus: list,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> Optional[bool]:
+        """GPU-residency flag for a deliberate manual zero-offload load. The
+        main model is CPU-only by construction, but launched companions (mmproj
+        / a drafter) offload to the GPU regardless of ``--gpu-layers`` -- and
+        the counted-offload classifier, keyed on the main model's layer line,
+        can't see them. True when a companion is in the launched argv or env
+        (the server still holds VRAM, so training must unload it), False when
+        none is (nothing to free; training leaves the server alone), None
+        without a detected GPU (the existing no-signal convention). The drafter
+        check reuses the extras parser, so pass-through aliases (-md,
+        --spec-draft-model, HF forms) and the LLAMA_ARG_SPEC_DRAFT_* env count
+        too, not just the Studio-emitted --model-draft."""
+        if not detected_gpus:
+            return None
+        return LlamaCppBackend._cmd_has_gpu_companion(spawn_cmd, env)
+
     def load_cancelled(self) -> bool:
         """True if a load was cancelled (e.g. via unload/_cancel_event) and not
         yet consumed by the next load_model. Lets the tensor->layer fallback
@@ -7731,11 +8235,18 @@ class LlamaCppBackend:
             self._supports_tools = False
             self._cache_type_kv = None
             self._tensor_parallel = False
+            self._gpu_memory_mode = "auto"
+            self._gpu_layers = -1
+            self._n_cpu_moe = 0
+            self._tensor_split = None
+            self._gpu_ids = None
             self._layer_preserves_tensor_intent = False
             self._speculative_type = None
             self._requested_spec_mode = None
             self._spec_draft_n_max = None
             self._n_layers = None
+            self._n_experts = None
+            self._leading_dense_block_count = None
             self._n_kv_heads = None
             self._n_kv_heads_by_layer = None
             self._n_heads = None
@@ -8401,14 +8912,27 @@ class LlamaCppBackend:
         ``--kv-unified`` default, silently splitting ``-c`` into per-slot
         windows of ``-c / N``; restore the shared pool so one request can use
         the full context. With ``--fit on``, ``--fit-ctx`` floors the fit step
-        at an explicitly requested ctx (default floor is 4096) so it offloads
-        or fails instead of silently shrinking the window.
+        -- at an explicitly requested ctx, else 8192 -- so it offloads or fails
+        instead of silently shrinking the window to a tiny size, and
+        ``--fit-target`` tightens the per-device VRAM margin so the fit packs
+        more onto the GPU.
         """
         flags: list[str] = []
         if n_parallel > 1 and caps.get("supports_kv_unified"):
             flags.append("--kv-unified")
-        if use_fit and requested_ctx > 0 and effective_ctx > 0 and caps.get("supports_fit_ctx"):
-            flags.extend(["--fit-ctx", str(effective_ctx)])
+        if use_fit and caps.get("supports_fit_ctx"):
+            if requested_ctx > 0 and effective_ctx > 0:
+                # Floor the fit step at the explicitly requested ctx.
+                flags.extend(["--fit-ctx", str(effective_ctx)])
+            else:
+                # Auto ctx: floor at 8192 so --fit doesn't shrink the window
+                # below a usable size.
+                flags.extend(["--fit-ctx", "8192"])
+        if use_fit and caps.get("supports_fit_target"):
+            # llama.cpp's --fit leaves 1 GiB free per device by default;
+            # tighten that to 512 MiB so it packs more of the model onto
+            # the GPU before spilling to system RAM.
+            flags.extend(["--fit-target", "512"])
         return flags
 
     def _query_server_n_ctx(self) -> Optional[int]:
@@ -8616,7 +9140,7 @@ class LlamaCppBackend:
     ):
         """Open one streaming POST and let cancel interrupt prefill or reads."""
         if cancel_event is not None and cancel_event.is_set():
-            raise GeneratorExit
+            raise _LlamaStreamCancelled
 
         _cancel_closed = threading.Event()
         _response_ref: list = [None]
@@ -8661,13 +9185,13 @@ class LlamaCppBackend:
             ) as response:
                 _response_ref[0] = response
                 if cancel_event is not None and cancel_event.is_set():
-                    raise GeneratorExit
+                    raise _LlamaStreamCancelled
                 yield response
                 return
         except (httpx.RequestError, RuntimeError):
             # Response was closed by the cancel watcher
             if cancel_event is not None and cancel_event.is_set():
-                raise GeneratorExit
+                raise _LlamaStreamCancelled
             raise
         finally:
             _cancel_closed.set()
@@ -8870,6 +9394,8 @@ class LlamaCppBackend:
                         "finish_reason": _metadata_finish_reason,
                     }
 
+        except _LlamaStreamCancelled:
+            return
         except httpx.ConnectError as e:
             # Server already down. If this was an MTP+tensor crash, recover by
             # reloading without MTP (scheduled in the background) and fail this
@@ -9994,6 +10520,8 @@ class LlamaCppBackend:
                         break
                 continue
 
+            except _LlamaStreamCancelled:
+                return
             except httpx.ConnectError:
                 # Mark unresolved provisional cards as failed before raising.
                 for _pid, _pname in provisional_started_tool_calls.items():
@@ -10176,6 +10704,8 @@ class LlamaCppBackend:
                 if _meta is not None:
                     yield _meta
 
+        except _LlamaStreamCancelled:
+            return
         except httpx.ConnectError:
             raise RuntimeError("Lost connection to llama-server")
         except Exception as e:
