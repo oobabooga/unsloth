@@ -37,9 +37,12 @@ jobs:
       - name: Show real drive layout
         run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free
 
+      # test_linux_external_media_paths.py and test_browse_denylist.py are
+      # POSIX-host suites (their fixtures feed /run and /etc paths through the
+      # real os.path); they are exercised by the ubuntu Backend CI, not here.
       - name: Browse and drive-root suites on real Windows (mocked-platform tests included)
         working-directory: studio/backend
-        run: python -m pytest tests/test_windows_real_drive_browse.py tests/test_windows_external_drive_paths.py tests/test_linux_external_media_paths.py tests/test_browse_denylist.py tests/test_browse_folders_route.py -v --tb=short
+        run: python -m pytest tests/test_windows_real_drive_browse.py tests/test_windows_external_drive_paths.py tests/test_browse_folders_route.py -v --tb=short
 
       - name: Hub browse suite (separate invocation, pre-existing collection-order clash)
         working-directory: studio/backend

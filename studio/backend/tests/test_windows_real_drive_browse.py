@@ -99,13 +99,24 @@ def test_realpath_expands_8dot3_short_names_before_denylist():
     assert is_denied_system_path(real)
 
 
-def test_realpath_strips_device_prefix_before_denylist():
-    """\\\\?\\C:\\Windows must resolve to the plain form the denylist keys on."""
-    from storage.studio_db import is_denied_system_path
+def test_device_namespace_requests_are_refused_by_browse():
+    """Real Windows realpath KEEPS the \\\\?\\ prefix (it does not normalize to
+    the plain form the denylist keys on), so the containment gate must be what
+    refuses device-namespace requests. Assert that property end to end."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
 
-    real = os.path.realpath("\\\\?\\" + _system_root())
-    assert not real.startswith("\\\\?\\")
-    assert is_denied_system_path(real)
+    import routes.models as models_route
+    from auth.authentication import get_current_subject
+
+    app = FastAPI()
+    app.include_router(models_route.router, prefix = "/api/models")
+    app.dependency_overrides[get_current_subject] = lambda: "tester"
+    client = TestClient(app)
+
+    for device_path in ("\\\\?\\" + _system_root(), "\\\\?\\" + _system_drive_root()):
+        resp = client.get("/api/models/browse-folders", params = {"path": device_path})
+        assert resp.status_code != 200, f"{device_path} browsed: {resp.text[:200]}"
 
 
 def test_allowlist_containment_on_real_drives():
