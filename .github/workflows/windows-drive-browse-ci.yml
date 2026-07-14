@@ -1,0 +1,46 @@
+# Throwaway CI for verifying unslothai/unsloth PR #7082 on a real Windows
+# filesystem. Runs the PR's browse/drive-root test suites unmocked on
+# windows-latest, plus tests/test_windows_real_drive_browse.py, which drives
+# the real GetLogicalDrives bitmask, real C:/D: drives, 8.3 short names,
+# \\?\ realpath behavior, and the /api/models/browse-folders route end to end.
+# Do not merge.
+
+name: Windows drive-browse real-FS test
+
+on:
+  push:
+    branches: [pr7082-windows-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-real-fs:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install backend test dependencies (minimal, no torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi httpx pytest structlog pyjwt cryptography sqlalchemy python-multipart pyyaml jinja2 "numpy<3" "datasets==4.3.0" "huggingface-hub==0.36.2" psutil packaging typer aiofiles requests
+
+      - name: Show real drive layout
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free
+
+      - name: Browse and drive-root suites on real Windows (mocked-platform tests included)
+        working-directory: studio/backend
+        run: python -m pytest tests/test_windows_real_drive_browse.py tests/test_windows_external_drive_paths.py tests/test_linux_external_media_paths.py tests/test_browse_denylist.py tests/test_browse_folders_route.py -v --tb=short
+
+      - name: Hub browse suite (separate invocation, pre-existing collection-order clash)
+        working-directory: studio/backend
+        run: python -m pytest hub/tests/test_model_services.py -q --tb=short
