@@ -141,12 +141,24 @@ jobs:
           done
           jq -e '.status == "healthy"' /tmp/h1.json >/dev/null || { echo "::error::instance 1 unhealthy"; tail -100 logs/studio1.log; exit 1; }
 
-          PW=$(cat "$HOME/.unsloth/studio/auth/.bootstrap_password")
-          echo "::add-mask::$PW"
+          # The bootstrap password is flagged "change required"; a token minted
+          # from it is rejected (403) by protected endpoints like
+          # /api/inference/load. Rotate to a real password first, exactly as the
+          # upstream Windows smoke does, and use the post-rotation token.
+          OLD=$(cat "$HOME/.unsloth/studio/auth/.bootstrap_password")
+          NEW="CIRotated-$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$OLD"; echo "::add-mask::$NEW"
+          OLD_TOKEN=$(curl -fs -X POST "http://127.0.0.1:${PORT1}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$OLD\"}" | jq -r .access_token)
+          [ -n "$OLD_TOKEN" ] && [ "$OLD_TOKEN" != "null" ] || { echo "::error::bootstrap login failed"; exit 1; }
+          curl -fs -X POST "http://127.0.0.1:${PORT1}/api/auth/change-password" \
+            -H "Authorization: Bearer $OLD_TOKEN" -H 'content-type: application/json' \
+            -d "{\"current_password\":\"$OLD\",\"new_password\":\"$NEW\"}" > /dev/null
           TOKEN=$(curl -fs -X POST "http://127.0.0.1:${PORT1}/api/auth/login" \
             -H 'content-type: application/json' \
-            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
-          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::login failed"; exit 1; }
+            -d "{\"username\":\"unsloth\",\"password\":\"$NEW\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::post-rotation login failed"; exit 1; }
           echo "::add-mask::$TOKEN"
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
