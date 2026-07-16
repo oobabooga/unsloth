@@ -1,0 +1,294 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# THROWAWAY CI MIRROR for unslothai/unsloth#7182 -- DO NOT MERGE.
+#
+# PR #7182 stops the startup orphan reaper (_kill_orphaned_servers) from
+# killing a live llama-server owned by another running Studio instance. It
+# was verified live on Linux; this job proves the same behaviour on the
+# free windows-latest runner, where process/parent semantics differ (no
+# reparent-to-PID-1, aggressive PID recycling, Job Object child cleanup).
+#
+# The reaper runs at every Studio backend startup and only touches
+# llama-server binaries under a Studio install root. Two default-install
+# instances therefore share ~/.unsloth/llama.cpp, so instance 2's reaper
+# sees instance 1's live server -- exactly the reported bug condition.
+#
+# Assertions (a GREEN run == the fix works on Windows):
+#   1. Instance 1 loads a model -> live llama-server L1 (parent = instance 1,
+#      alive). Booting instance 2 must NOT kill L1 (pre-fix it did).
+#   2. A genuine orphan (parent process exited) under the same install root
+#      IS still reaped when instance 3 boots, while L1 survives the same
+#      sweep -- proving the fix narrows the reaper rather than disabling it.
+#   3. Instance 1 still serves generations after both reaper sweeps.
+
+name: Reaper mirror CI (#7182)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  two-instance-reaper:
+    name: live server survives second instance + orphan still reaped
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      GGUF_REPO: unsloth/gemma-3-270m-it-GGUF
+      GGUF_VARIANT: UD-Q4_K_XL
+      GGUF_FILE: gemma-3-270m-it-UD-Q4_K_XL.gguf
+      PORT1: '18888'
+      PORT2: '18889'
+      PORT3: '18890'
+      ORPHAN_PORT: '18891'
+      HF_HOME: ${{ github.workspace }}/hf-cache
+      # Windows defaults to cp1252; hf download / Studio CLI print "✓" and
+      # crash otherwise.
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Restore HF_HOME cache for ${{ env.GGUF_REPO }}
+        id: cache-hf
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: hf-cache
+          key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-v2
+
+      - name: Prime HF_HOME with the GGUF
+        id: prime-hf
+        if: steps.cache-hf.outputs.cache-hit != 'true' || steps.cache-hf.outcome != 'success'
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p hf-cache
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
+
+      - name: Save HF_HOME cache for ${{ env.GGUF_REPO }}
+        if: always() && steps.prime-hf.outcome == 'success'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: hf-cache
+          key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-v2
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch {}
+          }
+
+      - name: Install Studio (--local, --no-torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert the Windows llama.cpp prebuilt is present
+        run: |
+          BIN="$HOME/.unsloth/llama.cpp/build/bin/Release/llama-server.exe"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::no llama-server.exe at $BIN"
+            ls -la "$HOME/.unsloth/llama.cpp/build/bin" || true
+            exit 1
+          fi
+          echo "llama-server.exe present at $BIN"
+
+      - name: Add Studio shim to GITHUB_PATH
+        run: cygpath -w "$HOME/.unsloth/studio/bin" >> "$GITHUB_PATH"
+
+      - name: Reset auth
+        run: unsloth studio reset-password
+
+      - name: Boot instance 1 + load model + capture live server
+        run: |
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$PORT1" > logs/studio1.log 2>&1 &
+          echo "STUDIO1_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            curl -fs "http://127.0.0.1:${PORT1}/api/health" > /tmp/h1.json 2>/dev/null && \
+              jq -e '.status == "healthy"' /tmp/h1.json >/dev/null && break
+            sleep 1
+          done
+          jq -e '.status == "healthy"' /tmp/h1.json >/dev/null || { echo "::error::instance 1 unhealthy"; tail -100 logs/studio1.log; exit 1; }
+
+          PW=$(cat "$HOME/.unsloth/studio/auth/.bootstrap_password")
+          echo "::add-mask::$PW"
+          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${PORT1}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::login failed"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          for attempt in 1 2 3; do
+            HTTP=$(curl -s -o /tmp/load.json -w '%{http_code}' \
+              -X POST "http://127.0.0.1:${PORT1}/api/inference/load" \
+              -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+              --max-time 600 \
+              -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}")
+            [ "$HTTP" = "200" ] && break
+            echo "::warning::load attempt $attempt returned $HTTP"; cat /tmp/load.json || true; sleep 10
+          done
+          [ "$HTTP" = "200" ] || { echo "::error::model load failed"; exit 1; }
+          jq '{status, is_gguf}' /tmp/load.json
+
+          # Exactly one llama-server.exe exists now: instance 1's live server.
+          L1_PID=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name = 'llama-server.exe'\" | Select-Object -First 1).ProcessId" | tr -d '\r')
+          L1_PPID=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name = 'llama-server.exe'\" | Select-Object -First 1).ParentProcessId" | tr -d '\r')
+          [ -n "$L1_PID" ] || { echo "::error::no live llama-server after load"; exit 1; }
+          PALIVE=$(powershell -NoProfile -Command "if (Get-Process -Id $L1_PPID -ErrorAction SilentlyContinue) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          echo "live server L1_PID=$L1_PID parent=$L1_PPID parentState=$PALIVE"
+          [ "$PALIVE" = "ALIVE" ] || { echo "::error::live server parent not alive; test premise broken"; exit 1; }
+          echo "L1_PID=$L1_PID" >> "$GITHUB_ENV"
+
+      - name: Instance 1 serves a generation (baseline)
+        run: |
+          HTTP=$(curl -s -o /tmp/gen1.json -w '%{http_code}' \
+            -X POST "http://127.0.0.1:${PORT1}/v1/chat/completions" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            --max-time 120 \
+            -d '{"model":"default","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":16,"temperature":0.0}')
+          [ "$HTTP" = "200" ] || { echo "::error::baseline generation returned $HTTP"; cat /tmp/gen1.json; exit 1; }
+          jq -e '.choices[0].message.content | length > 0' /tmp/gen1.json >/dev/null || { echo "::error::empty baseline generation"; exit 1; }
+          echo "baseline generation OK"
+
+      - name: Boot instance 2 -> live server must be SPARED
+        run: |
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$PORT2" > logs/studio2.log 2>&1 &
+          echo "STUDIO2_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            curl -fs "http://127.0.0.1:${PORT2}/api/health" > /tmp/h2.json 2>/dev/null && \
+              jq -e '.status == "healthy"' /tmp/h2.json >/dev/null && break
+            sleep 1
+          done
+          jq -e '.status == "healthy"' /tmp/h2.json >/dev/null || { echo "::error::instance 2 unhealthy"; tail -100 logs/studio2.log; exit 1; }
+          # Give the startup reaper a moment to run its sweep.
+          sleep 8
+          STATE=$(powershell -NoProfile -Command "if (Get-Process -Id $L1_PID -ErrorAction SilentlyContinue) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          echo "after instance 2 boot: L1_PID=$L1_PID is $STATE"
+          if [ "$STATE" != "ALIVE" ]; then
+            echo "::error::REGRESSION -- instance 2 killed instance 1's live llama-server (pid=$L1_PID)"
+            grep -i "killed orphaned" logs/studio2.log || true
+            exit 1
+          fi
+          if grep -qi "Killed orphaned llama-server process (pid=$L1_PID)" logs/studio2.log; then
+            echo "::error::instance 2 log shows it reaped the live server"
+            exit 1
+          fi
+          echo "PASS: live server spared by second instance"
+
+      - name: Create a true orphan under the install root
+        run: |
+          LLAMA_WIN=$(cygpath -w "$HOME/.unsloth/llama.cpp/build/bin/Release/llama-server.exe")
+          MODEL_PATH=$(find "$HF_HOME" -name "$GGUF_FILE" | head -1)
+          [ -n "$MODEL_PATH" ] || { echo "::error::gguf not found under HF_HOME"; exit 1; }
+          MODEL_WIN=$(cygpath -w "$MODEL_PATH")
+          # Start-Process makes llama-server a child of THIS pwsh; when the
+          # -Command returns, pwsh exits and the server is orphaned (its PPID
+          # points at the now-dead pwsh, not reparented on Windows).
+          powershell -NoProfile -Command "\$p = Start-Process -FilePath '$LLAMA_WIN' -ArgumentList '-m','$MODEL_WIN','--host','127.0.0.1','--port','$ORPHAN_PORT','-ngl','0','-c','512' -PassThru -WindowStyle Hidden; Set-Content -Path '$GITHUB_WORKSPACE/orphan_pid.txt' -Value \$p.Id"
+          ORPHAN_PID=$(tr -d '\r' < "$GITHUB_WORKSPACE/orphan_pid.txt")
+          [ -n "$ORPHAN_PID" ] || { echo "::error::failed to spawn orphan"; exit 1; }
+          echo "ORPHAN_PID=$ORPHAN_PID" >> "$GITHUB_ENV"
+          # Let the server come up and the parent pwsh fully exit.
+          sleep 10
+          ALIVE=$(powershell -NoProfile -Command "if (Get-Process -Id $ORPHAN_PID -ErrorAction SilentlyContinue) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          OPPID=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"ProcessId = $ORPHAN_PID\").ParentProcessId" | tr -d '\r')
+          PALIVE=$(powershell -NoProfile -Command "if ($OPPID -and (Get-Process -Id $OPPID -ErrorAction SilentlyContinue)) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          echo "orphan pid=$ORPHAN_PID state=$ALIVE parent=$OPPID parentState=$PALIVE"
+          [ "$ALIVE" = "ALIVE" ] || { echo "::error::orphan did not stay resident"; exit 1; }
+          [ "$PALIVE" = "DEAD" ] || { echo "::error::orphan parent still alive; PID may have been recycled -- not a true orphan"; exit 1; }
+          echo "true orphan established (parent dead)"
+
+      - name: Boot instance 3 -> orphan REAPED, live server SPARED (same sweep)
+        run: |
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$PORT3" > logs/studio3.log 2>&1 &
+          echo "STUDIO3_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            curl -fs "http://127.0.0.1:${PORT3}/api/health" > /tmp/h3.json 2>/dev/null && \
+              jq -e '.status == "healthy"' /tmp/h3.json >/dev/null && break
+            sleep 1
+          done
+          jq -e '.status == "healthy"' /tmp/h3.json >/dev/null || { echo "::error::instance 3 unhealthy"; tail -100 logs/studio3.log; exit 1; }
+          sleep 8
+          ORPHAN_STATE=$(powershell -NoProfile -Command "if (Get-Process -Id $ORPHAN_PID -ErrorAction SilentlyContinue) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          L1_STATE=$(powershell -NoProfile -Command "if (Get-Process -Id $L1_PID -ErrorAction SilentlyContinue) {'ALIVE'} else {'DEAD'}" | tr -d '\r')
+          echo "after instance 3 boot: orphan=$ORPHAN_STATE live=$L1_STATE"
+          echo "--- instance 3 reaper log lines ---"; grep -i "killed orphaned" logs/studio3.log || echo "(none)"
+          if [ "$ORPHAN_STATE" != "DEAD" ]; then
+            echo "::error::orphan was NOT reaped -- reaping regressed"
+            exit 1
+          fi
+          if [ "$L1_STATE" != "ALIVE" ]; then
+            echo "::error::live server killed during the orphan sweep"
+            exit 1
+          fi
+          grep -qi "Killed orphaned llama-server process (pid=$ORPHAN_PID)" logs/studio3.log || \
+            echo "::warning::orphan is dead but no matching reaper log line (still acceptable)"
+          echo "PASS: orphan reaped, live server spared in the same sweep"
+
+      - name: Instance 1 still serves after both sweeps
+        run: |
+          HTTP=$(curl -s -o /tmp/gen2.json -w '%{http_code}' \
+            -X POST "http://127.0.0.1:${PORT1}/v1/chat/completions" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            --max-time 120 \
+            -d '{"model":"default","messages":[{"role":"user","content":"Say goodbye in one word."}],"max_tokens":16,"temperature":0.0}')
+          [ "$HTTP" = "200" ] || { echo "::error::post-sweep generation returned $HTTP"; cat /tmp/gen2.json; exit 1; }
+          jq -e '.choices[0].message.content | length > 0' /tmp/gen2.json >/dev/null || { echo "::error::empty post-sweep generation"; exit 1; }
+          echo "PASS: instance 1 still serving after two reaper sweeps"
+
+      - name: Stop Studio instances
+        if: always()
+        shell: cmd
+        run: echo Stop (no-op; runner reclaims child processes at job end)
+
+      - name: Collect logs
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p logs/llama-server
+          cp -v "$HOME"/.unsloth/studio/logs/llama-server/*.log logs/llama-server/ 2>/dev/null || echo "no llama-server logs"
+
+      - name: Upload logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: reaper-mirror-logs
+          path: |
+            logs/studio1.log
+            logs/studio2.log
+            logs/studio3.log
+            logs/install.log
+            logs/llama-server
