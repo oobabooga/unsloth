@@ -19,6 +19,7 @@ from hub.utils import inventory_scan as hf_cache_scan
 from hub.utils.gguf import extract_quant_label, extract_quant_token
 from hub.utils.hf_cache_state import (
     INCOMPLETE_SUFFIX,
+    iter_repo_cache_dirs,
     purge_partial_repo,
     purge_repo_cache_dirs,
 )
@@ -316,6 +317,8 @@ def reclaim_replaced_gguf_variant(
     variant: str,
     keep_main_hashes: frozenset[str],
     hf_token: Optional[str] = None,
+    *,
+    hub_cache: Optional[str | Path] = None,
 ) -> dict:
     """Prune stale main-GGUF files for a variant after a replacement verified.
 
@@ -366,12 +369,22 @@ def reclaim_replaced_gguf_variant(
             "reason": "scan_failed",
         }
 
+    if hub_cache is None:
+        from utils.hf_cache_settings import get_hf_cache_paths
+        hub_cache = get_hf_cache_paths().hub_cache
+    try:
+        target_hub_cache = Path(hub_cache).expanduser().resolve(strict = False)
+    except (OSError, RuntimeError, ValueError):
+        target_hub_cache = Path(hub_cache).expanduser()
+
     candidate_repos = [
         repo_info
         for hf_cache in cache_scans
         for repo_info in hf_cache.repos
         if str(getattr(repo_info, "repo_type", "")) == "model"
         and str(getattr(repo_info, "repo_id", "")).lower() == repo_id.lower()
+        and getattr(repo_info, "repo_path", None)
+        and Path(repo_info.repo_path).parent.resolve(strict = False) == target_hub_cache
     ]
     try:
         matched_repo_ids = resolve_destructive_repo_ids(
@@ -493,10 +506,24 @@ def reclaim_replaced_gguf_variant(
 
 
 def _loaded_id_matches_repo(loaded_id: str, repo_id: str) -> bool:
-    """True when *loaded_id* is *repo_id* or a file within it; ``/``-boundary aware so ``org/model`` doesn't match sibling ``org/model-v2``."""
+    """Match a loaded repo ID or an on-disk path inside any copy of the repo."""
     rid = repo_id.lower()
     lid = loaded_id.lower()
-    return lid == rid or lid.startswith(f"{rid}/")
+    if lid == rid or lid.startswith(f"{rid}/"):
+        return True
+
+    try:
+        loaded_path = Path(loaded_id).expanduser().resolve(strict = False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for repo_dir in iter_repo_cache_dirs("model", repo_id):
+        try:
+            resolved_repo = repo_dir.resolve(strict = False)
+            if loaded_path == resolved_repo or loaded_path.is_relative_to(resolved_repo):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
 
 
 def _loaded_repo_variant_blocks_delete(

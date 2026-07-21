@@ -130,6 +130,10 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 def hf_cache(tmp_path, monkeypatch):
     """Point ``huggingface_hub.constants.HF_HUB_CACHE`` at a temp dir."""
     monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        "utils.hf_cache_settings.get_hf_cache_paths",
+        lambda: _types.SimpleNamespace(hub_cache = tmp_path),
+    )
     return tmp_path
 
 
@@ -431,6 +435,40 @@ class TestGgufVariantFileResolution:
             patch("core.inference.llama_cpp.hf_hub_download_with_xet_fallback", fail_download),
         ):
             out = backend._download_mmproj(hf_repo = requested_repo)
+
+        assert out == str(snap / "mmproj-F16.gguf")
+
+    def test_download_companion_uses_selected_cache_not_import_time_default(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        import_time_cache = tmp_path / "import-time-cache"
+        selected_cache = tmp_path / "selected-cache"
+        monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(import_time_cache))
+        monkeypatch.setattr(
+            "utils.hf_cache_settings.get_hf_cache_paths",
+            lambda: _types.SimpleNamespace(hub_cache = selected_cache),
+        )
+        repo = "unsloth/vision-GGUF"
+        snap = _build_cache(selected_cache, repo, {"mmproj-F16.gguf": 4})
+        backend = LlamaCppBackend()
+
+        offline_error = type("OfflineModeIsEnabled", (Exception,), {})
+
+        def fail_list(*_args, **_kwargs):
+            raise offline_error("offline")
+
+        def fail_download(*_args, **_kwargs):
+            raise AssertionError("selected-cache companion must not download")
+
+        with (
+            patch("huggingface_hub.list_repo_files", fail_list),
+            patch(
+                "core.inference.llama_cpp.hf_hub_download_with_xet_fallback",
+                fail_download,
+            ),
+        ):
+            out = backend._download_mmproj(hf_repo = repo)
 
         assert out == str(snap / "mmproj-F16.gguf")
 
