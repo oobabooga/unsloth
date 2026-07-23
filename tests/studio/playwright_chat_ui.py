@@ -936,6 +936,144 @@ with sync_playwright() as p:
             page.keyboard.press("Escape")
         page.wait_for_timeout(300)
 
+    # Check the behavior users receive on each CI platform. Do not synthesize
+    # Linux on macOS or Windows: render-linux is production platform detection,
+    # not a public theme setting. Set the theme class only after preserving the
+    # real platform state, and wait for style recalculation before sampling.
+    step("chat typography platform, theme, and opt-out behavior")
+    typography_matrix = robust_evaluate(
+        page,
+        """async () => {
+            const root = document.documentElement;
+            const assistant = Array.from(
+                document.querySelectorAll('.aui-assistant-message-root')
+            );
+            const user = Array.from(
+                document.querySelectorAll('.aui-user-message-root')
+            );
+            if (assistant.length === 0 || user.length === 0) {
+                return { error: 'chat message roots are missing' };
+            }
+
+            const saved = {
+                cls: root.getAttribute('class'),
+                chatFont: root.getAttribute('data-chat-font'),
+                uiFont: root.getAttribute('data-ui-font'),
+            };
+            const ua = navigator.userAgent.toLowerCase();
+            const actualRenderLinux = root.classList.contains('render-linux');
+            const isDesktopLinux = ua.includes('linux') && !ua.includes('android');
+            const nextFrame = () => new Promise(requestAnimationFrame);
+            const read = () => {
+                const role = (nodes) => {
+                    const styles = nodes.map((node) => {
+                        const style = getComputedStyle(node);
+                        return {
+                            fontWeight: style.fontWeight,
+                            letterSpacing: style.letterSpacing,
+                        };
+                    });
+                    return {
+                        fontWeight: [...new Set(
+                            styles.map((style) => style.fontWeight)
+                        )],
+                        letterSpacing: [...new Set(
+                            styles.map((style) => style.letterSpacing)
+                        )],
+                    };
+                };
+                return {
+                    assistant: role(assistant),
+                    user: role(user),
+                };
+            };
+
+            try {
+                root.classList.remove('dark', 'no-font-smoothing');
+                root.removeAttribute('data-chat-font');
+                root.removeAttribute('data-ui-font');
+                await nextFrame();
+                await nextFrame();
+                const light = read();
+
+                root.classList.add('dark');
+                await nextFrame();
+                await nextFrame();
+                const dark = read();
+
+                root.classList.add('no-font-smoothing');
+                await nextFrame();
+                const smoothingOff = read();
+                root.classList.remove('no-font-smoothing');
+
+                root.setAttribute('data-chat-font', '');
+                await nextFrame();
+                const chatFont = read();
+                root.removeAttribute('data-chat-font');
+
+                root.setAttribute('data-ui-font', '');
+                await nextFrame();
+                const uiFont = read();
+
+                return {
+                    actualRenderLinux,
+                    isDesktopLinux,
+                    light,
+                    dark,
+                    smoothingOff,
+                    chatFont,
+                    uiFont,
+                };
+            } finally {
+                if (saved.cls === null) root.removeAttribute('class');
+                else root.setAttribute('class', saved.cls);
+                if (saved.chatFont === null) root.removeAttribute('data-chat-font');
+                else root.setAttribute('data-chat-font', saved.chatFont);
+                if (saved.uiFont === null) root.removeAttribute('data-ui-font');
+                else root.setAttribute('data-ui-font', saved.uiFont);
+            }
+        }""",
+    )
+    if typography_matrix.get("error"):
+        fail(typography_matrix["error"])
+    if typography_matrix["actualRenderLinux"] != typography_matrix["isDesktopLinux"]:
+        fail(f"desktop Linux detection mismatch: {typography_matrix!r}")
+
+    # Linux receives the calibrated default-font values. Other desktop
+    # platforms retain their native baseline, including after a dark-theme
+    # transition. Opt-outs restore the same baseline on every platform.
+    if typography_matrix["isDesktopLinux"]:
+        expected = {
+            "light": ("390", "0.155px"),
+            "dark": ("350", "0.3565px"),
+        }
+    else:
+        expected = {
+            "light": ("410", "0.155px"),
+            "dark": ("410", "0.31px"),
+        }
+    expected.update(
+        {
+            "smoothingOff": ("410", "0.31px"),
+            "chatFont": ("410", "0.31px"),
+            "uiFont": ("410", "0.31px"),
+        }
+    )
+    for branch, (expected_weight, expected_spacing) in expected.items():
+        for role in ("assistant", "user"):
+            actual = typography_matrix[branch][role]
+            if actual["fontWeight"] != [expected_weight]:
+                fail(
+                    f"chat font weight {branch}/{role}: expected {expected_weight}, "
+                    f"got {actual['fontWeight']!r}"
+                )
+            if actual["letterSpacing"] != [expected_spacing]:
+                fail(
+                    f"chat letter spacing {branch}/{role}: expected {expected_spacing}, "
+                    f"got {actual['letterSpacing']!r}"
+                )
+    info("OK chat typography behavior")
+
     # ─────────────────────────────────────────────────────
     # 9. Theme toggle -- multiple cycles + computed-bg-color check
     # (light is near-white >240; dark is near-black <40).
