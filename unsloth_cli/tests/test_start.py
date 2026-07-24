@@ -2144,7 +2144,9 @@ def test_connect_load_knobs_reach_server_even_when_id_loaded(fake_studio):
     ]
 
 
-@pytest.mark.parametrize("command_name", ["claude", "codex", "openclaw", "opencode", "hermes", "pi"])
+@pytest.mark.parametrize(
+    "command_name", ["claude", "codex", "openclaw", "opencode", "hermes", "pi"]
+)
 def test_start_agents_expose_gpu_memory_mode_option(command_name):
     import inspect
 

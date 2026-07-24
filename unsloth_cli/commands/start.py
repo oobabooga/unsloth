@@ -2940,9 +2940,7 @@ def claude(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
@@ -3060,9 +3058,7 @@ def codex(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
@@ -3161,9 +3157,7 @@ def openclaw(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
@@ -3244,9 +3238,7 @@ def opencode(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
@@ -3409,9 +3401,7 @@ def hermes(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
@@ -3466,9 +3456,7 @@ def pi(
     base, key, entry = _connect(
         api_key,
         model,
-        LoadOptions(
-            gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
+        LoadOptions(gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode),
         serve = serve,
         launch = launch,
         server_options = ServerOptions(
