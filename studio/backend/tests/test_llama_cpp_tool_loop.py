@@ -343,6 +343,46 @@ def test_reasoning_only_reply_matches_no_tool_path_with_tools(monkeypatch):
     )
 
 
+def _assert_reasoning_only_raw_consumer_gets_one_balanced_think_block(monkeypatch, with_tools):
+    stream = [
+        _sse({"reasoning_content": "The capital of France is Paris."}),
+        _done(),
+    ]
+    backend = _make_backend(monkeypatch, [stream], [])
+
+    if with_tools:
+        items = list(
+            backend.generate_chat_completion_with_tools(
+                messages = [{"role": "user", "content": "capital of France?"}],
+                tools = [{"type": "function", "function": {"name": "web_search"}}],
+                max_tool_iterations = 1,
+                promote_reasoning_only = False,
+            )
+        )
+        cumulatives = [item["text"] for item in items if item.get("type") == "content"]
+    else:
+        items = list(
+            backend.generate_chat_completion(
+                messages = [{"role": "user", "content": "capital of France?"}],
+                promote_reasoning_only = False,
+            )
+        )
+        cumulatives = [item for item in items if isinstance(item, str)]
+
+    assert cumulatives[-1] == "<think>The capital of France is Paris.</think>"
+    assert all(
+        current.startswith(previous) for previous, current in zip([""] + cumulatives, cumulatives)
+    )
+
+
+def test_reasoning_only_raw_consumer_without_tools_gets_one_balanced_think_block(monkeypatch):
+    _assert_reasoning_only_raw_consumer_gets_one_balanced_think_block(monkeypatch, False)
+
+
+def test_reasoning_only_raw_consumer_with_tools_gets_one_balanced_think_block(monkeypatch):
+    _assert_reasoning_only_raw_consumer_gets_one_balanced_think_block(monkeypatch, True)
+
+
 def test_reasoning_before_structured_tool_closes_think_block(monkeypatch):
     # Regression: reasoning streamed live during BUFFERING must be closed with
     # </think> before a structured tool_call drains, so consumers without a

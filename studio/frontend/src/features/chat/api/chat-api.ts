@@ -997,6 +997,61 @@ function parseSseEvent(rawEvent: string): string[] {
   return dataLines;
 }
 
+function hasNonWhitespaceText(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => hasNonWhitespaceText(item));
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return ["thinking", "text", "content", "reasoning", "summary"].some(
+    (key) => key in record && hasNonWhitespaceText(record[key]),
+  );
+}
+
+function classifyStructuredDeltaContent(content: unknown): {
+  hasAssistantContent: boolean;
+  hasReasoningContent: boolean;
+} {
+  if (typeof content === "string") {
+    return {
+      hasAssistantContent: hasNonWhitespaceText(content),
+      hasReasoningContent: false,
+    };
+  }
+  if (!Array.isArray(content)) {
+    return {
+      hasAssistantContent: false,
+      hasReasoningContent: false,
+    };
+  }
+
+  let hasAssistantContent = false;
+  let hasReasoningContent = false;
+  for (const part of content) {
+    if (typeof part === "string") {
+      hasAssistantContent ||= hasNonWhitespaceText(part);
+      continue;
+    }
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    const record = part as Record<string, unknown>;
+    if (record.type === "thinking" || record.type === "reasoning") {
+      hasReasoningContent ||= hasNonWhitespaceText(record);
+    } else if (record.type === "text" || record.type === "output_text") {
+      const text =
+        typeof record.text === "string" ? record.text : record.content;
+      hasAssistantContent ||= hasNonWhitespaceText(text);
+    }
+  }
+  return { hasAssistantContent, hasReasoningContent };
+}
+
 export async function* streamChatCompletions(
   payload: OpenAIChatCompletionsRequest,
   signal: AbortSignal,
@@ -1135,23 +1190,14 @@ export async function* streamChatCompletions(
         for (const choice of parsedChoices ?? []) {
           const delta = choice.delta;
           if (delta) {
-            const content = delta.content;
-            if (
-              (typeof content === "string" && content.length > 0) ||
-              (Array.isArray(content) && content.length > 0)
-            ) {
-              sawAssistantContent = true;
-            }
+            const contentState = classifyStructuredDeltaContent(delta.content);
+            sawAssistantContent ||= contentState.hasAssistantContent;
+            sawReasoningContent ||= contentState.hasReasoningContent;
             const reasoning =
               delta.reasoning_content ??
               delta.reasoning ??
               delta.reasoning_details;
-            if (
-              (typeof reasoning === "string" && reasoning.length > 0) ||
-              (Array.isArray(reasoning) && reasoning.length > 0)
-            ) {
-              sawReasoningContent = true;
-            }
+            sawReasoningContent ||= hasNonWhitespaceText(reasoning);
           }
           if (choice.finish_reason) {
             terminalFinishReason = choice.finish_reason;

@@ -309,7 +309,10 @@ _DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1200.0  # 20 min
 
 
 def _finalize_reasoning_only_cumulative(
-    cumulative: str, reasoning_text: str, finish_reason: Optional[str]
+    cumulative: str,
+    reasoning_text: str,
+    finish_reason: Optional[str],
+    promote_reasoning_only: bool,
 ) -> str:
     """Close a live thinking block and promote it only after a clean stop.
 
@@ -317,9 +320,13 @@ def _finalize_reasoning_only_cumulative(
     bare reasoning at EOF makes the final snapshot shorter, so suffix-based
     route consumers drop the intended fallback. Keep the snapshot append-only.
     A length-truncated thought is not a final answer, so close it without
-    promotion and let the client surface the ``length`` terminal state.
+    promotion and let the client surface the ``length`` terminal state. Raw
+    consumers that do not split reasoning from visible content can disable the
+    fallback to avoid returning the same reasoning twice.
     """
-    visible_fallback = "" if finish_reason == "length" else reasoning_text
+    visible_fallback = (
+        reasoning_text if promote_reasoning_only and finish_reason != "length" else ""
+    )
     return cumulative + "</think>" + visible_fallback
 
 
@@ -10572,6 +10579,7 @@ class LlamaCppBackend:
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
         seed: Optional[int] = None,
+        promote_reasoning_only: bool = True,
         _allow_respawn_retry: bool = True,
     ) -> Generator[Union[str, dict], None, None]:
         """
@@ -10658,6 +10666,7 @@ class LlamaCppBackend:
                                         cumulative,
                                         reasoning_text,
                                         _metadata_finish_reason,
+                                        promote_reasoning_only,
                                     )
                                     yield cumulative
                             _stream_done = True
@@ -10755,6 +10764,7 @@ class LlamaCppBackend:
                     reasoning_effort = reasoning_effort,
                     preserve_thinking = preserve_thinking,
                     seed = seed,
+                    promote_reasoning_only = promote_reasoning_only,
                     _allow_respawn_retry = False,
                 )
                 return
@@ -10796,6 +10806,7 @@ class LlamaCppBackend:
         confirm_tool_calls: bool = False,
         bypass_permissions: bool = False,
         permission_mode: Optional[str] = None,
+        promote_reasoning_only: bool = True,
     ) -> Generator[dict, None, None]:
         """
         Agentic loop: let the model call tools, execute them, and continue.
@@ -11142,6 +11153,7 @@ class LlamaCppBackend:
                                             cumulative_display,
                                             reasoning_accum,
                                             _iter_finish_reason,
+                                            promote_reasoning_only,
                                         )
                                         if not _suppress_visible_output:
                                             yield {
@@ -11610,6 +11622,7 @@ class LlamaCppBackend:
                                 cumulative_display,
                                 reasoning_accum,
                                 _iter_finish_reason,
+                                promote_reasoning_only,
                             )
                             if not _suppress_visible_output:
                                 yield {
@@ -12178,6 +12191,7 @@ class LlamaCppBackend:
                                         cumulative,
                                         reasoning_text,
                                         _metadata_finish_reason,
+                                        promote_reasoning_only,
                                     )
                                     yield {"type": "content", "text": cumulative}
                             _stream_done = True
