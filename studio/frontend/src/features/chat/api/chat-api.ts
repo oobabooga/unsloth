@@ -50,6 +50,21 @@ export class StreamInterruptedError extends Error {
   }
 }
 
+/**
+ * Thrown when a reasoning model consumes its output budget before emitting any
+ * standard content. Keeping this distinct from a dropped connection lets the
+ * chat UI explain why a completed stream contains only a thinking panel.
+ */
+export class GenerationLengthError extends Error {
+  constructor() {
+    super(
+      "The model reached the Max Tokens limit before producing a final answer. " +
+        "Increase Max Tokens or disable thinking, then retry.",
+    );
+    this.name = "GenerationLengthError";
+  }
+}
+
 export function notifyChatHistoryUpdated(): void {
   if (typeof window !== "undefined") {
     window.dispatchEvent(new Event(CHAT_HISTORY_UPDATED_EVENT));
@@ -1009,6 +1024,19 @@ export async function* streamChatCompletions(
   // EOF without `[DONE]` or a finish_reason chunk means the stream was cut
   // mid-generation: surface as interrupted, not silent success.
   let sawTerminalSignal = false;
+  let terminalFinishReason: string | null = null;
+  let sawAssistantContent = false;
+  let sawReasoningContent = false;
+
+  const throwIfReasoningOnlyLength = () => {
+    if (
+      terminalFinishReason === "length" &&
+      sawReasoningContent &&
+      !sawAssistantContent
+    ) {
+      throw new GenerationLengthError();
+    }
+  };
 
   try {
     while (true) {
@@ -1018,6 +1046,7 @@ export async function* streamChatCompletions(
         if (!sawTerminalSignal) {
           throw new StreamInterruptedError();
         }
+        throwIfReasoningOnlyLength();
         break;
       }
 
@@ -1039,6 +1068,7 @@ export async function* streamChatCompletions(
         if (dataText === "[DONE]") {
           completed = true;
           sawTerminalSignal = true;
+          throwIfReasoningOnlyLength();
           return;
         }
 
@@ -1094,11 +1124,40 @@ export async function* streamChatCompletions(
         }
         // finish_reason is a valid terminal signal for providers that close
         // the stream without an explicit [DONE] sentinel.
-        const finishReason = (
+        const parsedChoices = (
           parsed as {
-            choices?: Array<{ finish_reason?: string | null }>;
+            choices?: Array<{
+              delta?: Record<string, unknown>;
+              finish_reason?: string | null;
+            }>;
           }
-        ).choices?.[0]?.finish_reason;
+        ).choices;
+        for (const choice of parsedChoices ?? []) {
+          const delta = choice.delta;
+          if (delta) {
+            const content = delta.content;
+            if (
+              (typeof content === "string" && content.length > 0) ||
+              (Array.isArray(content) && content.length > 0)
+            ) {
+              sawAssistantContent = true;
+            }
+            const reasoning =
+              delta.reasoning_content ??
+              delta.reasoning ??
+              delta.reasoning_details;
+            if (
+              (typeof reasoning === "string" && reasoning.length > 0) ||
+              (Array.isArray(reasoning) && reasoning.length > 0)
+            ) {
+              sawReasoningContent = true;
+            }
+          }
+          if (choice.finish_reason) {
+            terminalFinishReason = choice.finish_reason;
+          }
+        }
+        const finishReason = parsedChoices?.[0]?.finish_reason;
         if (finishReason) {
           sawTerminalSignal = true;
         }

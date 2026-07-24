@@ -307,6 +307,22 @@ def _native_linux_system_rocm_lib_dirs(binary_dir: str = "") -> "list[str]":
 _DEFAULT_MAX_TOKENS_FLOOR = 32768
 _DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1200.0  # 20 min
 
+
+def _finalize_reasoning_only_cumulative(
+    cumulative: str, reasoning_text: str, finish_reason: Optional[str]
+) -> str:
+    """Close a live thinking block and promote it only after a clean stop.
+
+    Local inference streams cumulative snapshots. Replacing ``<think>...`` with
+    bare reasoning at EOF makes the final snapshot shorter, so suffix-based
+    route consumers drop the intended fallback. Keep the snapshot append-only.
+    A length-truncated thought is not a final answer, so close it without
+    promotion and let the client surface the ``length`` terminal state.
+    """
+    visible_fallback = "" if finish_reason == "length" else reasoning_text
+    return cumulative + "</think>" + visible_fallback
+
+
 # Only large streamed tool payloads get an early provisional card; render_html
 # is exempt because it needs immediate artifact feedback.
 _PROVISIONAL_ARGS_MIN_CHARS = 256
@@ -10638,7 +10654,11 @@ class LlamaCppBackend:
                                     # model put its whole reply in reasoning
                                     # (e.g. Qwen3 always-think). Show it as
                                     # the main response, not a thinking block.
-                                    cumulative = reasoning_text
+                                    cumulative = _finalize_reasoning_only_cumulative(
+                                        cumulative,
+                                        reasoning_text,
+                                        _metadata_finish_reason,
+                                    )
                                     yield cumulative
                             _stream_done = True
                             break  # exit inner while
@@ -11118,7 +11138,11 @@ class LlamaCppBackend:
                                                 ),
                                             }
                                     else:
-                                        cumulative_display = reasoning_accum
+                                        cumulative_display = _finalize_reasoning_only_cumulative(
+                                            cumulative_display,
+                                            reasoning_accum,
+                                            _iter_finish_reason,
+                                        )
                                         if not _suppress_visible_output:
                                             yield {
                                                 "type": "content",
@@ -11582,7 +11606,11 @@ class LlamaCppBackend:
                             if _reasoning_started_at is not None and not _reasoning_summary_emitted:
                                 _reasoning_summary_emitted = True
                                 yield _reasoning_summary_event(_reasoning_started_at)
-                            cumulative_display = reasoning_accum
+                            cumulative_display = _finalize_reasoning_only_cumulative(
+                                cumulative_display,
+                                reasoning_accum,
+                                _iter_finish_reason,
+                            )
                             if not _suppress_visible_output:
                                 yield {
                                     "type": "content",
@@ -12146,7 +12174,11 @@ class LlamaCppBackend:
                                         "text": _strip_tool_markup(cumulative, final = True),
                                     }
                                 else:
-                                    cumulative = reasoning_text
+                                    cumulative = _finalize_reasoning_only_cumulative(
+                                        cumulative,
+                                        reasoning_text,
+                                        _metadata_finish_reason,
+                                    )
                                     yield {"type": "content", "text": cumulative}
                             _stream_done = True
                             break  # exit inner while
