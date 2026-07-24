@@ -1592,9 +1592,7 @@ class TestAnthropicMessagesToolRouting:
             )
         payload = _basic_payload(**payload_fields)
 
-        response = _drive(
-            anthropic_messages(payload, request = self._Request(), current_subject = "t")
-        )
+        response = _drive(anthropic_messages(payload, request = self._Request(), current_subject = "t"))
         if stream:
             body = self._sse_blob(self._consume_response(response))
             assert body.count(reasoning) == 1

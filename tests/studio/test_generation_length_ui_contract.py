@@ -19,7 +19,7 @@ CHAT_API = (
 def test_length_detection_classifies_visible_and_reasoning_content():
     source = CHAT_API.read_text(encoding = "utf-8")
 
-    assert 'return value.trim().length > 0;' in source
+    assert "return value.trim().length > 0;" in source
     assert 'record.type === "thinking" || record.type === "reasoning"' in source
     assert 'record.type === "text" || record.type === "output_text"' in source
     assert "sawAssistantContent ||= contentState.hasAssistantContent;" in source

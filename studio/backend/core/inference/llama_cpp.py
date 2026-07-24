@@ -309,10 +309,7 @@ _DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1200.0  # 20 min
 
 
 def _finalize_reasoning_only_cumulative(
-    cumulative: str,
-    reasoning_text: str,
-    finish_reason: Optional[str],
-    promote_reasoning_only: bool,
+    cumulative: str, reasoning_text: str, finish_reason: Optional[str], promote_reasoning_only: bool
 ) -> str:
     """Close a live thinking block and promote it only after a clean stop.
 
