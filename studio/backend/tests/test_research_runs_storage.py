@@ -1857,7 +1857,7 @@ def test_synthesis_audit_precedes_the_report(research_home, monkeypatch):
     ]
 
 
-def test_last_tool_step_does_not_send_pre_action_state_to_synthesis(research_home, monkeypatch):
+def test_last_tool_step_preserves_pre_action_state_for_synthesis(research_home, monkeypatch):
     _create(budgets = {**_SCRAPE_BUDGETS, "maxSteps": 1})
 
     def fake_tool(name, arguments, *args, **kwargs):
@@ -1885,10 +1885,8 @@ def test_last_tool_step_does_not_send_pre_action_state_to_synthesis(research_hom
 
     assert completed["status"] == "completed"
     assert len(synthesis_prompts) == 2
-    assert all("STALE before the final search result" not in prompt for prompt in synthesis_prompts)
-    assert all(
-        "The final result may resolve this gap." not in prompt for prompt in synthesis_prompts
-    )
+    assert all("STALE before the final search result" in prompt for prompt in synthesis_prompts)
+    assert all("The final result may resolve this gap." in prompt for prompt in synthesis_prompts)
 
 
 def test_auto_scrape_persists_chunk_excerpt_for_resume(research_home, monkeypatch):

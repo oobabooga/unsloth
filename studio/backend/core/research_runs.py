@@ -1722,7 +1722,6 @@ class ResearchSupervisor:
         notes: list[str] = []
         decision_notes: list[str] = []
         research_state: dict[str, Any] = {}
-        terminal_research_state: dict[str, Any] = {}
         sources: list[dict] = []
         document_sources: list[dict] = []
         used_queries: set[str] = set()
@@ -1881,7 +1880,6 @@ class ResearchSupervisor:
                     next_state = _normalize_research_state(action.get("researchState"))
                     if next_state:
                         research_state = next_state
-                        terminal_research_state = next_state
                     break
                 action = _next_unused_seed_action(run["plan"], used_queries)
                 if action is None:
@@ -2123,7 +2121,7 @@ class ResearchSupervisor:
         )
         audit_evidence_text, [audit_state_json] = _fit_synthesis_context(
             notes,
-            [terminal_research_state],
+            [research_state],
         )
         audit_response, audit_reasoning, _audit_finish_reason = await self._stream_completion(
             run,
@@ -2182,7 +2180,7 @@ class ResearchSupervisor:
                 continue
         evidence_text, [synthesis_audit_json, synthesis_state_json] = _fit_synthesis_context(
             notes,
-            [synthesis_audit, terminal_research_state],
+            [synthesis_audit, research_state],
         )
         synthesis_messages = [
             {
