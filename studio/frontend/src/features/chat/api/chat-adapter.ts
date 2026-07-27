@@ -1512,12 +1512,33 @@ async function autoLoadSmallestModel(): Promise<{
   const trustRemoteCode = store.params.trustRemoteCode ?? false;
   const specSettings = resolveSpeculativeSettingsForLoad();
   const lastLoaded = readLastLocalModelLoad();
-  const toastId = toast.loading("Loading a model…", {
+  let autoLoadToastDismissed = false;
+  const toastId = toast.message("Loading a model…", {
     description: lastLoaded
       ? "Loading last used model."
       : "Auto-selecting the smallest downloaded model.",
+    duration: Number.POSITIVE_INFINITY,
     closeButton: true,
+    onDismiss: () => {
+      autoLoadToastDismissed = true;
+    },
   });
+  const updateAutoLoadToast = (message: string, description: string): void => {
+    if (autoLoadToastDismissed) return;
+    toast.message(message, {
+      id: toastId,
+      description,
+      duration: Number.POSITIVE_INFINITY,
+    });
+  };
+  const showAutoLoadSuccess = (message: string): void => {
+    const options = { description: undefined, duration: 5000 };
+    if (autoLoadToastDismissed) {
+      toast.success(message, options);
+      return;
+    }
+    toast.success(message, { ...options, id: toastId });
+  };
   let blockedByTrustRemoteCode = false;
   let hadNonTrustFailure = false;
   let loadAttempts = 0;
@@ -1773,7 +1794,7 @@ async function autoLoadSmallestModel(): Promise<{
         ggufVariant: candidate.ggufVariant,
       });
     }
-    toast.success(candidate.successLabel, { id: toastId });
+    showAutoLoadSuccess(candidate.successLabel);
     return true;
   }
   try {
@@ -1799,10 +1820,10 @@ async function autoLoadSmallestModel(): Promise<{
                 isAutoLoadableGgufVariant(entry),
             );
             if (variant) {
-              toast.loading("Loading last used model…", {
-                id: toastId,
-                description: `${repo.repo_id} (${variant.quant})`,
-              });
+              updateAutoLoadToast(
+                "Loading last used model…",
+                `${repo.repo_id} (${variant.quant})`,
+              );
               if (
                 await loadAutoLoadCandidate({
                   id: repo.repo_id,
@@ -1827,10 +1848,7 @@ async function autoLoadSmallestModel(): Promise<{
         const repo = findCachedRepo(modelRepos, lastLoaded.id);
         if (repo) {
           try {
-            toast.loading("Loading last used model…", {
-              id: toastId,
-              description: repo.repo_id,
-            });
+            updateAutoLoadToast("Loading last used model…", repo.repo_id);
             if (
               await loadAutoLoadCandidate({
                 id: repo.repo_id,
@@ -1851,10 +1869,10 @@ async function autoLoadSmallestModel(): Promise<{
           }
         }
       }
-      toast.loading("Loading a model…", {
-        id: toastId,
-        description: "Auto-selecting the smallest downloaded model.",
-      });
+      updateAutoLoadToast(
+        "Loading a model…",
+        "Auto-selecting the smallest downloaded model.",
+      );
     }
 
     // GGUF first: smallest-total-size repo, then its smallest variant.
@@ -1945,11 +1963,10 @@ async function autoLoadSmallestModel(): Promise<{
     }
 
     // No cached models — try downloading a small default GGUF.
-    toast.loading("Downloading a small model…", {
-      id: toastId,
-      description:
-        "No downloaded models found. Fetching Qwen3.5-4B-MTP (UD-Q4_K_XL).",
-    });
+    updateAutoLoadToast(
+      "Downloading a small model…",
+      "No downloaded models found. Fetching Qwen3.5-4B-MTP (UD-Q4_K_XL).",
+    );
     try {
       const rt = useChatRuntimeStore.getState();
       if (
@@ -2045,7 +2062,7 @@ async function autoLoadSmallestModel(): Promise<{
         kind: "gguf",
         ggufVariant: "UD-Q4_K_XL",
       });
-      toast.success("Loaded Qwen3.5-4B-MTP (UD-Q4_K_XL)", { id: toastId });
+      showAutoLoadSuccess("Loaded Qwen3.5-4B-MTP (UD-Q4_K_XL)");
       return { loaded: true, blockedByTrustRemoteCode: false };
     } catch {
       toast.dismiss(toastId);
