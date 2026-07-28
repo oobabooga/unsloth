@@ -116,7 +116,8 @@ export function normalizePresetLoadConfig(
     ...(nCpuMoe !== undefined ? { nCpuMoe } : {}),
   };
 
-  return hasPresetLoadConfig(normalized) ? normalized : undefined;
+  const coalesced = coalesceDefaultLoadKnobs(normalized);
+  return hasPresetLoadConfig(coalesced) ? coalesced : undefined;
 }
 
 export function hasPresetLoadConfig(
@@ -164,9 +165,8 @@ export function capturePresetLoadConfig(): PresetLoadConfig | undefined {
       ? { nCpuMoe: snapshot.nCpuMoe }
       : {}),
   };
-  return hasPresetLoadConfig(coalesceDefaultLoadKnobs(captured))
-    ? coalesceDefaultLoadKnobs(captured)
-    : undefined;
+  const coalesced = coalesceDefaultLoadKnobs(captured);
+  return hasPresetLoadConfig(coalesced) ? coalesced : undefined;
 }
 
 function coalesceDefaultLoadKnobs(
@@ -212,6 +212,7 @@ export function applyPresetLoadConfig(
     gpuLayers: config.gpuLayers,
     nCpuMoe: config.nCpuMoe,
     selectedGpuIds: store.selectedGpuIds,
+    selectedGpuIndexKind: store.selectedGpuIndexKind,
   });
 }
 

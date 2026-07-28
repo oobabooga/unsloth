@@ -1249,18 +1249,27 @@ def _get_cached_system_gpu_info(logger) -> tuple[dict[str, Any], dict[str, Any]]
             )
             enriched_devices.append(enriched_dev)
 
-        # Whether GGUF loads accept an explicit gpu_ids pick. /load and /validate
-        # 400 picks on XPU hosts, where no visibility mask speaks torch-xpu
-        # ordinals. A Vulkan build IS pinnable: its picks are ggml ordinals, the
-        # same space `--device Vulkan<i>` uses, so check it first and let it
-        # through even on an XPU host (the XPU ban is about torch ordinals).
-        is_vulkan_build = False
+        # Vulkan has its own compact ordinal space, independent of torch and
+        # CUDA_VISIBLE_DEVICES. Keep torch's view global and expose the ggml
+        # records separately for the GGUF picker.
+        gguf_devices = enriched_devices
         try:
             from core.inference.llama_cpp import LlamaCppBackend
             from utils.hardware import DeviceType, get_device
 
-            is_vulkan_build = LlamaCppBackend._is_vulkan_backend()
-            gpu_ids_supported = is_vulkan_build or get_device() != DeviceType.XPU
+            # A Vulkan build is pinnable even on an XPU host, since its picks are
+            # ggml ordinals rather than torch ones, but only once the probe has
+            # enumerated some: an empty namespace has nothing valid to offer.
+            if LlamaCppBackend._is_vulkan_backend():
+                gguf_devices = LlamaCppBackend._get_vulkan_gpu_info()
+                gpu_ids_supported = bool(gguf_devices)
+            else:
+                # XPU indices cannot yet be applied safely across Level Zero's
+                # FLAT and COMPOSITE hierarchy modes. A proven CPU-only
+                # llama.cpp build cannot apply a CUDA pin either.
+                gpu_ids_supported = (
+                    get_device() != DeviceType.XPU and not LlamaCppBackend._backend_lacks_gpu_lib()
+                )
         except Exception as e:
             logger.debug(f"Could not resolve gpu_ids support: {e}")
             gpu_ids_supported = True
@@ -1272,6 +1281,8 @@ def _get_cached_system_gpu_info(logger) -> tuple[dict[str, Any], dict[str, Any]]
             **visibility_info,
             "available": visibility_info.get("available", False),
             "devices": enriched_devices,
+            "backend": visibility_info.get("backend"),
+            "gguf_devices": gguf_devices,
             "gguf_gpu_ids_supported": gpu_ids_supported,
         }
 

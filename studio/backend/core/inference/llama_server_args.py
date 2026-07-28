@@ -188,6 +188,10 @@ _TEMPLATE_FLAGS: frozenset[str] = frozenset(
 _SPLIT_MODE_FLAGS: frozenset[str] = frozenset({"-sm", "--split-mode"})
 _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
+# llama.cpp placement flags. Opt-in (users may pass them under auto-select):
+# stripped only when gpu_ids is set, so they cannot override the selected pool
+# or choose a main GPU outside it (#7188).
+_DEVICE_FLAGS: frozenset[str] = frozenset({"--device", "-dev", "--main-gpu", "-mg"})
 
 # GPU-offload flags. Stripped only when the GPU Memory mode owns offload
 # (manual emits --fit / --gpu-layers / --n-cpu-moe); in auto, a user's
@@ -205,7 +209,13 @@ _SHADOWING_FLAGS: frozenset[str] = (
 
 # Shadowing flags that take no value -- strip the flag only, not the next token.
 _BOOLEAN_SHADOWING_FLAGS: frozenset[str] = frozenset(
-    {"--spec-default", "--jinja", "--no-jinja", "-cmoe", "--cpu-moe"}
+    {
+        "--spec-default",
+        "--jinja",
+        "--no-jinja",
+        "-cmoe",
+        "--cpu-moe",
+    }
 )
 
 
@@ -461,6 +471,7 @@ def strip_shadowing_flags(
     strip_split_mode: bool = True,
     strip_tensor_split: bool = False,
     strip_offload: bool = False,
+    strip_device: bool = False,
 ) -> list[str]:
     """Strip flags that shadow first-class Unsloth settings.
 
@@ -474,7 +485,8 @@ def strip_shadowing_flags(
     ``--tensor-split`` (the Tensor Parallelism toggle owns the whole split).
     ``strip_tensor_split`` removes ``--tensor-split`` *alone*, so manual mode can
     replace an inherited per-GPU ratio while leaving the user's ``--split-mode``
-    row/none/layer choice intact.
+    row/none/layer choice intact. ``strip_device`` is enabled when ``gpu_ids``
+    owns placement.
     """
     shadowing: set[str] = set()
     if strip_context:
@@ -491,6 +503,8 @@ def strip_shadowing_flags(
         shadowing |= _TENSOR_SPLIT_FLAGS
     if strip_offload:
         shadowing |= _OFFLOAD_SHADOWING_FLAGS
+    if strip_device:
+        shadowing |= _DEVICE_FLAGS
 
     tokens = [str(a) for a in (args or [])]
     out: list[str] = []

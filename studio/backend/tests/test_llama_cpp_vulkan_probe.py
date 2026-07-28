@@ -53,6 +53,7 @@ _maybe_stub("loggers", _build_loggers_stub)
 _maybe_stub("structlog", lambda: _types.ModuleType("structlog"))
 
 from core.inference import llama_cpp as _llama_mod  # noqa: E402
+from core.inference._vulkan_probe import _igpu_flags_and_names  # noqa: E402
 from core.inference.llama_cpp import (  # noqa: E402
     LlamaCppBackend,
     _llama_lib_dir,
@@ -61,6 +62,29 @@ from core.inference.llama_cpp import (  # noqa: E402
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+
+
+class _FakeCFunction:
+    def __init__(self, result):
+        self.result = result
+
+    def __call__(self, *_args):
+        return self.result
+
+
+def test_missing_description_symbol_keeps_igpu_detection():
+    base = _types.SimpleNamespace(
+        ggml_backend_reg_dev_count = _FakeCFunction(1),
+        ggml_backend_reg_dev_get = _FakeCFunction(1),
+        ggml_backend_dev_type = _FakeCFunction(2),
+        ggml_backend_dev_name = _FakeCFunction(b"Legacy Vulkan iGPU"),
+    )
+    lib = _types.SimpleNamespace(ggml_backend_vk_reg = _FakeCFunction(1))
+
+    flags, names = _igpu_flags_and_names(base, lib, 1)
+
+    assert flags == [True]
+    assert names == ["Legacy Vulkan iGPU"]
 
 
 def _make_vulkan_install(tmp_path: Path) -> str:
@@ -97,8 +121,10 @@ def _row(
     free_bytes: int,
     is_igpu: int,
     total_bytes: int = 0,
+    name: str | None = None,
 ) -> str:
-    return f"{idx}\t{free_bytes}\t{is_igpu}\t{total_bytes}"
+    row = f"{idx}\t{free_bytes}\t{is_igpu}\t{total_bytes}"
+    return f"{row}\t{name}" if name is not None else row
 
 
 def test_integrated_gpu_leaves_host_margin(tmp_path):
@@ -120,6 +146,59 @@ def test_discrete_gpu_free_is_untouched_and_total_passed_through(tmp_path):
     with _mock_probe(rows):
         gpus = LlamaCppBackend._get_gpu_free_memory_vulkan(binary)
     assert gpus == [(0, 6 * 1024, 24 * 1024)], gpus
+
+
+def test_vulkan_device_info_exposes_names_and_pinnable_ordinals(tmp_path):
+    binary = _make_vulkan_install(tmp_path)
+    rows = [
+        _row(0, 6 * GIB, is_igpu = 0, total_bytes = 24 * GIB, name = "Radeon W7900"),
+        _row(1, 7 * GIB, is_igpu = 0, total_bytes = 8 * GIB, name = "Radeon W7500"),
+    ]
+    with _mock_probe(rows):
+        devices = LlamaCppBackend._get_vulkan_gpu_info(binary)
+
+    assert [(d["index"], d["index_kind"], d["name"]) for d in devices] == [
+        (0, "vulkan", "Radeon W7900"),
+        (1, "vulkan", "Radeon W7500"),
+    ]
+    assert devices[0]["memory_total_gb"] == 24
+    assert devices[0]["vram_total_gb"] == 24
+    assert devices[0]["vram_free_gb"] == 6
+    assert devices[0]["vram_used_gb"] == 18
+    assert devices[0]["vram_utilization_pct"] == 75.0
+
+
+def test_vulkan_device_info_keeps_two_decimals_on_a_non_round_card(tmp_path):
+    """Whole-GiB fixtures cannot tell 1dp from 2dp, nor a x100 from a x1000."""
+    binary = _make_vulkan_install(tmp_path)
+    rows = [_row(0, 3 * GIB // 2, is_igpu = 0, total_bytes = 13 * GIB // 2, name = "Arc A770")]
+    with _mock_probe(rows):
+        [device] = LlamaCppBackend._get_vulkan_gpu_info(binary)
+
+    assert device["memory_total_gb"] == 6.5
+    assert device["vram_free_gb"] == 1.5
+    assert device["vram_used_gb"] == 5.0
+    assert device["vram_utilization_pct"] == 76.9
+
+
+def test_vulkan_device_info_accepts_legacy_four_column_probe(tmp_path):
+    binary = _make_vulkan_install(tmp_path)
+    with _mock_probe([_row(2, 7 * GIB, is_igpu = 0, total_bytes = 8 * GIB)]):
+        devices = LlamaCppBackend._get_vulkan_gpu_info(binary)
+    assert devices[0]["name"] == "Vulkan2"
+
+
+def test_vulkan_device_info_does_not_advertise_shared_ram_as_vram(tmp_path):
+    binary = _make_vulkan_install(tmp_path)
+    rows = [_row(0, 30 * GIB, is_igpu = 1, total_bytes = 32 * GIB, name = "Integrated GPU")]
+    with _mock_probe(rows):
+        [device] = LlamaCppBackend._get_vulkan_gpu_info(binary)
+
+    assert device["memory_total_gb"] == 0
+    assert device["vram_total_gb"] == 0
+    assert device["vram_free_gb"] == 0
+    assert device["vram_used_gb"] is None
+    assert device["vram_utilization_pct"] is None
 
 
 def test_large_discrete_gpu_is_untouched(tmp_path):
@@ -187,6 +266,22 @@ def test_shell_wrapper_entrypoint_resolves_to_real_lib_dir(tmp_path):
     os.chmod(wrapper, 0o755)
     assert _llama_lib_dir(str(wrapper)) == bindir
     assert LlamaCppBackend._is_vulkan_backend(str(wrapper)) is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason = "soname versioning is POSIX")
+def test_versioned_only_vulkan_soname_is_probed(tmp_path):
+    # Split-library install: only the versioned soname libggml-vulkan.so.0 exists
+    # (no unversioned dev symlink). The reader must still classify Vulkan and run
+    # the probe instead of returning [] and rejecting gpu_ids before launch (#7188).
+    bindir = tmp_path / "build" / "bin"
+    bindir.mkdir(parents = True)
+    binary = bindir / "llama-server"
+    binary.write_bytes(b"stub")
+    (bindir / (_vulkan_lib_filename() + ".0")).write_bytes(b"stub")
+    rows = [_row(0, 23 * GIB, is_igpu = 0, total_bytes = 24 * GIB)]
+    with _mock_probe(rows):
+        gpus = LlamaCppBackend._get_gpu_free_memory_vulkan(str(binary))
+    assert gpus == [(0, 23 * 1024, 24 * 1024)], gpus
 
 
 if __name__ == "__main__":

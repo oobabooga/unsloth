@@ -137,7 +137,13 @@ def test_active_model_config_round_trips_gpu_fields():
     a sidebar/hub-gear reload cannot silently reset manual GPU settings, and
     "Remember settings" cannot persist a GPU-less config over a saved one."""
     src = _read("features/model-picker/hooks/use-active-model-config.ts")
-    for field in ("gpuMemoryMode", "gpuLayers", "nCpuMoe", "selectedGpuIds"):
+    for field in (
+        "gpuMemoryMode",
+        "gpuLayers",
+        "nCpuMoe",
+        "selectedGpuIds",
+        "selectedGpuIndexKind",
+    ):
         assert field in src, field
     assert "if (!isGguf)" in src and "return base" in src
     for rel in (
@@ -151,6 +157,24 @@ def test_active_model_config_round_trips_gpu_fields():
     assert "export function gpuFieldsSignature" in shared
 
 
+def test_deferred_gpu_pick_keeps_its_index_namespace():
+    """A remembered pick restored before GPU discovery must keep its namespace
+    until load-time reconciliation, or Vulkan IDs can be reused as physical IDs."""
+    store = _read("features/chat/stores/chat-runtime-store.ts")
+    assert "selectedGpuIndexKind: GpuIndexKind | null;" in store
+
+    apply = _read("features/model-picker/model-config/apply-per-model-config.ts")
+    assert "selectedGpuIndexKind: s.selectedGpuIndexKind" in apply
+    assert "config.selectedGpuIndexKind === undefined" in apply
+    assert 'config.selectedGpuIndexKind ?? "physical"' not in apply
+
+    runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
+    assert "stateBeforeUnload.selectedGpuIndexKind," in runtime
+
+    compare = _read("features/chat/shared-composer.tsx")
+    assert "store.selectedGpuIndexKind," in compare
+
+
 def test_gpu_picker_round_trips_requested_pool_not_fitted_subset():
     """A GGUF fit may narrow [0, 1] to [0], but load/status hydration must keep
     [0, 1] as the editable pool so a later reload can grow back onto GPU 1."""
@@ -158,10 +182,13 @@ def test_gpu_picker_round_trips_requested_pool_not_fitted_subset():
     assert types.count("requested_gpu_ids?: number[] | null") >= 2
 
     store = _read("features/chat/stores/chat-runtime-store.ts")
-    assert "resp.requested_gpu_ids ?? resp.gpu_ids ?? null" in store
+    assert 'hasOwnProperty.call(resp, "requested_gpu_ids")' in store
+    assert "const reportedGpuIds = requestedGpuIdsFromResponse(resp)" in store
+    assert "reportedGpuIds != null && gpuIndexKind != null" in store
 
     status = _read("features/chat/lib/apply-inference-status-to-store.ts")
-    assert "status.requested_gpu_ids ?? status.gpu_ids ?? null" in status
+    assert "const incomingGpuFields = loadedGpuMemoryFields(status)" in status
+    assert "const incomingGpuIds = incomingGpuFields.loadedGpuIds" in status
 
 
 def test_compare_load_uses_each_models_gpu_config():
@@ -170,7 +197,9 @@ def test_compare_load_uses_each_models_gpu_config():
     assert "ownConfig.gpuLayers ?? compareLoadKnobs.gpuLayers" in src
     assert "ownConfig.nCpuMoe ?? compareLoadKnobs.nCpuMoe" in src
     assert "if (ownConfig.selectedGpuIds != null)" in src
-    assert "reconcilePersistedGpuIds(ownConfig.selectedGpuIds)" in src
+    assert "ownConfig.selectedGpuIndexKind," in src
+    assert "compareLoadKnobs.selectedGpuIndexKind," in src
+    assert src.count("resolvedIsDiffusion === true") >= 2
     for field in (
         "gpu_memory_mode: effectiveGpuMemoryMode",
         "gpu_layers: effectiveGpuLayers",
@@ -178,6 +207,10 @@ def test_compare_load_uses_each_models_gpu_config():
         "gpu_ids: effectiveSelectedGpuIds ?? undefined",
     ):
         assert field in src
+
+    page = _read("features/chat/chat-page.tsx")
+    assert page.count("isDiffusion: meta.isDiffusion") >= 2
+    assert "isDiffusion: globalIsDiffusion" in page
 
 
 def test_active_native_gguf_metadata_uses_path_token():
@@ -342,7 +375,7 @@ def test_fixed_layer_gguf_pins_displayed_context():
     instead of sending native/0 and recreating the OOM."""
     src = _read("features/model-picker/components/model-config-page.tsx")
     assert "const pinFixedLayerContext =" in src
-    assert 'config.gpuMemoryMode === "manual"' in src
+    assert 'loadableConfig.gpuMemoryMode === "manual"' in src
     assert "customContextLength: activeLoadedContext" in src
 
 
@@ -418,7 +451,7 @@ def test_reset_persists_null_max_length_and_substitutes_only_for_load():
     assert "const effectiveLoadConfig" in src
     # The persisted record is saved from effectiveRuntimeConfig; the load request
     # carries effectiveLoadConfig (with any committed context input).
-    assert "onRun(effectiveLoadConfig)" in src
+    assert "onRun(effectiveLoadConfig, classifiedIsDiffusion)" in src
     assert "savePerModelConfig(" in src
 
 
@@ -530,7 +563,7 @@ def test_compare_pane_non_gguf_falls_back_to_app_default():
     assert (
         "const effectiveMaxSeqLength = ownConfig.customContextLength ?? "
         "normalizeMaxSeqLength(ownConfig.maxSeqLength) ?? "
-        "(isGgufLoad ? 0 : DEFAULT_MAX_SEQ_LENGTH);" in src
+        "(targetIsGguf ? 0 : DEFAULT_MAX_SEQ_LENGTH);" in src
     )
     # The buggy fallback to the active model's shared runtime value must not return.
     assert "(isGgufLoad ? 0 : maxSeqLength)" not in src
@@ -546,6 +579,82 @@ def test_default_gpu_mode_clears_manual_knobs():
     assert "gpuLayers: undefined," in src
     assert "nCpuMoe: undefined," in src
     assert "selectedGpuIds: undefined," in src
+    assert "selectedGpuIndexKind: undefined," in src
+
+
+def test_requested_gpu_pick_survives_fit_narrowing_and_namespace_changes():
+    store = _read("features/chat/stores/chat-runtime-store.ts")
+    assert "requestedGpuIdsFromResponse(resp)" in store
+    gpu_info = _read("hooks/use-gpu-info.ts")
+    assert 'savedIndexKind === undefined ? "physical" : savedIndexKind' in gpu_info
+    assert "expectedIndexKind !== null" in gpu_info
+    assert "expectedIndexKind !== currentIndexKind" in gpu_info
+    assert "cachedPinnableGpuIndexKind" in gpu_info
+    config = _read("features/model-picker/model-config/per-model-config.ts")
+    assert '"selectedGpuIndexKind"' in config
+
+
+def test_staged_gpu_pick_reconciles_with_async_namespace_discovery():
+    page = _read("features/model-picker/components/model-config-page.tsx")
+    assert "reconcileGpuSelection(" in page
+    assert "setConfig((current)" in page
+    assert "reconcileConfigGpuSelection(" in page
+    assert "gpuIndexKind" in page
+    assert "pinnableDevices" in page
+    assert "reconciled.ids === null ? undefined : reconciled.indexKind" in " ".join(page.split())
+    assert "selectsAll ? null : next" not in page
+    gpu_info = _read("hooks/use-gpu-info.ts")
+    assert 'inferenceGpu?.backend === "vulkan"' in gpu_info
+    assert "!inferenceGpu.available" in gpu_info
+
+
+def test_compare_classifies_gguf_before_reconciling_gpu_ids():
+    compare = _read("features/chat/shared-composer.tsx")
+    metadata = compare.index("fetchGgufStagedMetadata(")
+    reconcile = compare.index("reconcilePersistedGpuIds(", metadata)
+    validate = compare.index("const validation = await validateModel(", reconcile)
+    load = compare.index("const resp = await loadModel(", validate)
+    assert metadata < reconcile < validate < load
+    assert compare.count("resolvedIsDiffusion") >= 3
+    assert "prepareHfTokenForUse(" in compare
+    page = _read("features/model-picker/components/model-config-page.tsx")
+    assert "isDiffusion?: boolean" in page
+    assert "onRun(effectiveLoadConfig, classifiedIsDiffusion)" in page
+
+
+def test_cpu_only_llama_build_hides_gpu_picker():
+    src = (WORKDIR / "studio" / "backend" / "main.py").read_text(encoding = "utf-8")
+    assert "and not LlamaCppBackend._backend_lacks_gpu_lib()" in src
+
+
+def test_vulkan_gguf_devices_do_not_replace_global_gpu_info():
+    backend = (WORKDIR / "studio" / "backend" / "main.py").read_text(encoding = "utf-8")
+    assert '"gguf_devices": gguf_devices' in backend
+    assert "gguf_devices = LlamaCppBackend._get_vulkan_gpu_info()" in backend
+    assert "enriched_devices = LlamaCppBackend._get_vulkan_gpu_info()" not in backend
+    frontend = _read("hooks/use-gpu-info.ts")
+    assert "data?.gpu?.gguf_devices ?? data?.gpu?.devices" in frontend
+
+
+def test_diffusion_picker_hides_and_clears_unsupported_memory_modes():
+    api = _read("features/chat/api/chat-api.ts")
+    assert "isDiffusion: res.is_diffusion ?? false" in api
+
+    page = _read("features/model-picker/components/model-config-page.tsx")
+    assert 'className={isDiffusion ? "hidden" : ROW_CLASS}' in page
+    assert "withoutUnsupportedDiffusionSettings(config, gpuIndexKind)" in page
+    assert "reconcileConfigGpuSelection(" in page
+    assert "resolvedIsDiffusion" in page
+    assert "stagedMetadataPending ||" in page
+    assert "config.selectedGpuIds != null" in page
+    for field in (
+        'gpuMemoryMode: "auto"',
+        "gpuLayers: undefined",
+        "nCpuMoe: undefined",
+        "selectedGpuIds: undefined",
+        "selectedGpuIndexKind: undefined",
+    ):
+        assert field in page
 
 
 def test_legacy_migration_is_idempotent_and_non_destructive():
@@ -595,7 +704,16 @@ def test_vulkan_inference_devices_are_the_pickable_set():
     )
     # Pinnable on the ggml ordinal space, gated on the backend's own support flag.
     assert "const picksAccepted = inference.gguf_gpu_ids_supported !== false;" in src
-    assert 'physicalIndex: picksAccepted && d.index_kind === "vulkan",' in src
-    # The torch fallback keeps its physical-only gate and the XPU ban.
-    assert 'data?.device_backend !== "xpu" &&' in src
-    assert 'physicalIndex: pinnableBackend && d.index_kind === "physical",' in src
+    assert 'pinnable: picksAccepted && d.index_kind === "vulkan",' in src
+    # A Vulkan ordinal is not a CUDA ID, so the torch-side diffusion runner
+    # cannot take the pick even when llama-server can.
+    assert "diffusionPinnable: false," in src
+    # The torch fallback keeps the XPU ban for torch ordinals only: a Vulkan
+    # ordinal stays pickable even when this list arrives from an XPU host.
+    assert (
+        "pinnable: pinnableBackend && "
+        '(d.index_kind === "vulkan" || '
+        '(data?.device_backend !== "xpu" && d.index_kind === "physical")),' in src
+    )
+    # Only a physical CUDA/ROCm index is ever handed to the diffusion runner.
+    assert 'diffusionPinnable: diffusionBackend && d.index_kind === "physical",' in src

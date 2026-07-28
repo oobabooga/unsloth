@@ -37,9 +37,9 @@ fi
 #                             Only use "master" temporarily when the latest release
 #                             is missing support for a new model architecture.
 #
-#   UNSLOTH_LLAMA_CPP_BACKEND : "auto" (default) or "cpu". When "cpu", forces
-#                               the CPU-only prebuilt bundle on GPU hosts.
-#                               Fixes Intel iGPU Vulkan crashes (#7213).
+#   UNSLOTH_LLAMA_CPP_BACKEND : "auto" (default), "cpu", or "vulkan". "cpu"
+#                               forces the CPU-only prebuilt. "vulkan" selects
+#                               Vulkan even when CUDA or ROCm is detected.
 # ──────────────────────────────────────────────────────────────────────────
 _DEFAULT_LLAMA_PR_FORCE=""
 _DEFAULT_LLAMA_SOURCE="https://github.com/ggml-org/llama.cpp"
@@ -1238,6 +1238,18 @@ _LLAMA_FORCE_COMPILE="${UNSLOTH_LLAMA_FORCE_COMPILE:-0}"
 _REQUESTED_LLAMA_TAG="${UNSLOTH_LLAMA_TAG:-${_DEFAULT_LLAMA_TAG}}"
 _HOST_SYSTEM="$(uname -s 2>/dev/null || true)"
 _HOST_MACHINE="$(uname -m 2>/dev/null || true)"
+_source_backend_choice="$(printf '%s' "${UNSLOTH_LLAMA_CPP_BACKEND:-auto}" | awk '{$1=$1; print tolower($0)}')"
+_source_legacy_force_vulkan="$(printf '%s' "${UNSLOTH_FORCE_VULKAN:-}" | awk '{$1=$1; print tolower($0)}')"
+_explicit_vulkan_source_build=false
+if [ "$_HOST_SYSTEM" != "Darwin" ] && [ "$_source_backend_choice" != "cpu" ]; then
+    if [ "$_source_backend_choice" = "vulkan" ]; then
+        _explicit_vulkan_source_build=true
+    else
+        case "$_source_legacy_force_vulkan" in
+            1|true|yes|on) _explicit_vulkan_source_build=true ;;
+        esac
+    fi
+fi
 
 # Pick the release repo install_llama_prebuilt.py plans against. Every host this
 # installer supports now pulls its llama.cpp prebuilt from the unslothai fork: it
@@ -1373,6 +1385,10 @@ fi
 
 if [ "$_LOCAL_LLAMA_CPP_LINKED" = true ]; then
     : # local directory linked above; skip prebuilt install
+elif [ "$_explicit_vulkan_source_build" = true ] && [ "$_NEED_LLAMA_SOURCE_BUILD" = true ]; then
+    step "llama.cpp" "Vulkan was explicitly requested, but this installation requires a source build" "$C_ERR"
+    substep "Vulkan source builds are not supported by this installer; use the prebuilt Vulkan bundle or unset the Vulkan override"
+    exit 1
 elif [ "$_LLAMA_FORCE_COMPILE" = "1" ]; then
     step "llama.cpp" "UNSLOTH_LLAMA_FORCE_COMPILE=1 -- skipping prebuilt" "$C_WARN"
     _NEED_LLAMA_SOURCE_BUILD=true
@@ -1413,11 +1429,10 @@ else
         # through to the CPU prebuilt instead of breaking the install.
         _PREBUILT_CMD+=(--has-rocm)
     fi
-    # UNSLOTH_LLAMA_CPP_BACKEND=cpu (case-insensitive, trimmed) forces the CPU-only
-    # prebuilt via --force-cpu, bypassing Vulkan/CUDA/ROCm. Fixes Intel iGPU crash (#7213).
-    # No effect on macOS: the universal bundle already runs on CPU (Metal is a runtime
-    # -ngl choice), so warn instead of writing a misleading forced-CPU marker.
+    # The normalized override affects llama.cpp only, not the training backend.
     _llama_backend="$(printf '%s' "${UNSLOTH_LLAMA_CPP_BACKEND:-auto}" | awk '{$1=$1; print tolower($0)}')"
+    _legacy_force_vulkan="$(printf '%s' "${UNSLOTH_FORCE_VULKAN:-}" | awk '{$1=$1; print tolower($0)}')"
+    _explicit_vulkan_backend=false
     case "$_llama_backend" in
         cpu)
             if [ "$_HOST_SYSTEM" = "Darwin" ]; then
@@ -1426,9 +1441,23 @@ else
                 _PREBUILT_CMD+=(--force-cpu)
             fi
             ;;
+        vulkan)
+            if [ "$_HOST_SYSTEM" = "Darwin" ]; then
+                step "llama.cpp" "Vulkan has no effect on macOS; the universal build uses Metal" "$C_WARN" >&2
+            else
+                _PREBUILT_CMD+=(--llama-backend vulkan)
+                _explicit_vulkan_backend=true
+                step "llama.cpp" "Vulkan selected for GGUF inference; the PyTorch training backend is unchanged" "$C_OK"
+            fi
+            ;;
         ""|auto) ;;
-        *) step "llama.cpp" "Ignoring UNSLOTH_LLAMA_CPP_BACKEND='$UNSLOTH_LLAMA_CPP_BACKEND' (expected 'auto' or 'cpu')" "$C_WARN" >&2 ;;
+        *) step "llama.cpp" "Ignoring UNSLOTH_LLAMA_CPP_BACKEND='$UNSLOTH_LLAMA_CPP_BACKEND' (expected 'auto', 'cpu', or 'vulkan')" "$C_WARN" >&2 ;;
     esac
+    if [ "$_llama_backend" != "cpu" ] && [ "$_HOST_SYSTEM" != "Darwin" ]; then
+        case "$_legacy_force_vulkan" in
+            1|true|yes|on) _explicit_vulkan_backend=true ;;
+        esac
+    fi
     _PREBUILT_LOG="$(mktemp)"
     set +e
     if _is_verbose; then
@@ -1468,15 +1497,28 @@ else
         substep "free up disk or move UNSLOTH_STUDIO_HOME/TMPDIR to a larger volume, then re-run"
         _LLAMA_CPP_NO_SPACE=true
         _has_local_llama_server "$LLAMA_CPP_DIR" || _LLAMA_CPP_DEGRADED=true
+        # A preserved CUDA/ROCm/CPU server does not satisfy an explicit Vulkan
+        # request, and it leaves _LLAMA_CPP_DEGRADED false, so without this the
+        # run reports success on the backend the user asked to replace.
+        if [ "$_explicit_vulkan_backend" = true ]; then
+            step "llama.cpp" "Vulkan was explicitly requested, so the installer will not keep the existing backend" "$C_ERR"
+            exit 1
+        fi
     else
-        step "llama.cpp" "prebuilt install failed (continuing)" "$C_WARN"
+        step "llama.cpp" "prebuilt install failed" "$C_WARN"
         print_llama_error_log "$_PREBUILT_LOG"
         rm -f "$_PREBUILT_LOG"
         if [ -d "$LLAMA_CPP_DIR" ]; then
             substep "prebuilt update failed; existing install restored"
         fi
-        substep "falling back to source build"
-        _NEED_LLAMA_SOURCE_BUILD=true
+        if [ "$_explicit_vulkan_backend" = true ]; then
+            step "llama.cpp" "Vulkan was explicitly requested, so the installer will not substitute a ROCm or CPU source build" "$C_ERR"
+            substep "check the download error above or try a different UNSLOTH_LLAMA_RELEASE_TAG"
+            exit 1
+        else
+            substep "falling back to source build"
+            _NEED_LLAMA_SOURCE_BUILD=true
+        fi
     fi
 fi
 

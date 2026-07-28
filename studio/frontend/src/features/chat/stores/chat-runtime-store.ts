@@ -2,7 +2,12 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { mirrorHfTokenInto, useHfTokenStore } from "@/features/hub";
-import { cachedPinnableGpuIndices } from "@/hooks/use-gpu-info";
+import {
+  cachedPinnableGpuIndexKind,
+  reconcileCachedGpuSelection,
+  type ReconciledGpuSelection,
+  type GpuIndexKind,
+} from "@/hooks/use-gpu-info";
 import { toast } from "@/lib/toast";
 import { create } from "zustand";
 import { isExternalModelId, parseExternalModelId } from "../external-providers";
@@ -628,14 +633,35 @@ export function rebalanceSplit(
 // set), so a saved [1] on a now-1-GPU host doesn't get sent and rejected with no
 // way to clear it. A null pick (= automatic) passes through unchanged, and an
 // unpopulated device cache leaves the pick alone (the backend still guards).
+// An explicit null namespace means discovery had not completed when the live
+// state was captured, while an absent namespace is a legacy physical-ID pick.
 export function reconcilePersistedGpuIds(
   ids: number[] | null,
+  savedIndexKind?: GpuIndexKind | null,
+  forDiffusion = false,
 ): number[] | null {
-  if (ids == null) return ids;
-  const pinnable = cachedPinnableGpuIndices();
-  if (pinnable === null) return ids; // cache not ready: can't validate, keep it
-  const kept = ids.filter((i) => pinnable.includes(i));
-  return kept.length > 0 ? kept : null;
+  return reconcilePersistedGpuSelection(
+    ids,
+    savedIndexKind,
+    forDiffusion,
+  ).ids;
+}
+
+export function reconcilePersistedGpuSelection(
+  ids: number[] | null,
+  savedIndexKind?: GpuIndexKind | null,
+  forDiffusion = false,
+): ReconciledGpuSelection {
+  return reconcileCachedGpuSelection(ids, savedIndexKind, forDiffusion);
+}
+
+export function requestedGpuIdsFromResponse(resp: {
+  gpu_ids?: number[] | null;
+  requested_gpu_ids?: number[] | null;
+}): number[] | null {
+  return Object.prototype.hasOwnProperty.call(resp, "requested_gpu_ids")
+    ? (resp.requested_gpu_ids ?? null)
+    : (resp.gpu_ids ?? null);
 }
 
 // Store fields derived from a load/status response's GPU-memory settings.
@@ -664,6 +690,7 @@ export function loadedGpuMemoryFields(resp: {
     // baseline clears to null so Reset preserves the preference, not a stale mode.
     return {
       selectedGpuIds: null,
+      selectedGpuIndexKind: null,
       loadedGpuIds: null,
       loadedGpuMemoryMode: null,
       gpuLayers: GPU_LAYERS_AUTO,
@@ -679,7 +706,16 @@ export function loadedGpuMemoryFields(resp: {
   const mode = resp.gpu_memory_mode ?? "auto";
   // Keep the user's placement pool editable across status/load hydration.
   // gpu_ids remains the effective fitted subset for diagnostics.
-  const gpuIds = resp.requested_gpu_ids ?? resp.gpu_ids ?? null;
+  const reportedGpuIds = requestedGpuIdsFromResponse(resp);
+  const gpuIndexKind =
+    reportedGpuIds == null
+      ? null
+      : cachedPinnableGpuIndexKind(resp.is_diffusion === true);
+  // A numeric ID is unsafe to adopt or persist until discovery says whether it
+  // is a physical CUDA/ROCm ID or a Vulkan ordinal. A later status refresh can
+  // restore the requested pool after the shared system cache is warm.
+  const gpuIds =
+    reportedGpuIds != null && gpuIndexKind != null ? reportedGpuIds : null;
   // Layer/MoE/split knobs apply (and are reported) only in manual mode; in auto
   // the server ignores them, so don't seed the loaded baseline or the editable
   // knobs with values it never applied. In manual, the server reports gpu_layers
@@ -719,6 +755,7 @@ export function loadedGpuMemoryFields(resp: {
     moeLayerCount: resp.n_moe_layers ?? null,
     // The picker reflects the requested placement pool, not a fitted subset.
     selectedGpuIds: gpuIds,
+    selectedGpuIndexKind: gpuIds == null ? null : gpuIndexKind,
     loadedGpuIds: gpuIds,
     ...manualKnobs,
   };
@@ -944,8 +981,10 @@ type ChatRuntimeStore = {
   ggufLayerCount: number | null;
   /** MoE expert-layer count: the nCpuMoe slider max; 0/null hides the slider. */
   moeLayerCount: number | null;
-  /** Picked physical GPU indices (null = use all / automatic). */
+  /** Picked IDs in the backend-declared GPU namespace (null = automatic). */
   selectedGpuIds: number[] | null;
+  /** Namespace used by selectedGpuIds; kept with deferred persisted picks. */
+  selectedGpuIndexKind: GpuIndexKind | null;
   loadedGpuIds: number[] | null;
   /** Persisted: expand every On Device GGUF repo's quantizations by default
    *  instead of waiting for a click. */
@@ -1084,7 +1123,10 @@ type ChatRuntimeStore = {
   setGpuLayers: (value: number) => void;
   setNCpuMoe: (value: number) => void;
   setSplitRatio: (value: number[] | null) => void;
-  setSelectedGpuIds: (ids: number[] | null) => void;
+  setSelectedGpuIds: (
+    ids: number[] | null,
+    indexKind?: GpuIndexKind | null,
+  ) => void;
   setExpandQuantizations: (value: boolean) => void;
   setShowAllQuantizations: (value: boolean) => void;
   setFitOnDeviceOnly: (value: boolean) => void;
@@ -1403,6 +1445,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   ggufLayerCount: null,
   moeLayerCount: null,
   selectedGpuIds: null,
+  selectedGpuIndexKind: null,
   loadedGpuIds: null,
   expandQuantizations: loadBool(CHAT_EXPAND_QUANTIZATIONS_KEY, false),
   showAllQuantizations: loadBool(CHAT_SHOW_ALL_QUANTIZATIONS_KEY, true),
@@ -1672,6 +1715,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       ggufLayerCount: null,
       moeLayerCount: null,
       selectedGpuIds: null,
+      selectedGpuIndexKind: null,
       loadedGpuIds: null,
       loadedIsMultimodal: false,
       loadedIsDiffusion: false,
@@ -2029,7 +2073,12 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setGpuLayers: (gpuLayers) => set({ gpuLayers }),
   setNCpuMoe: (nCpuMoe) => set({ nCpuMoe }),
   setSplitRatio: (splitRatio) => set({ splitRatio }),
-  setSelectedGpuIds: (selectedGpuIds) => set({ selectedGpuIds }),
+  setSelectedGpuIds: (selectedGpuIds, selectedGpuIndexKind = null) =>
+    set({
+      selectedGpuIds,
+      selectedGpuIndexKind:
+        selectedGpuIds == null ? null : selectedGpuIndexKind,
+    }),
   setExpandQuantizations: (expandQuantizations) => {
     saveBool(CHAT_EXPAND_QUANTIZATIONS_KEY, expandQuantizations);
     set({ expandQuantizations });

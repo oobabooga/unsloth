@@ -1598,7 +1598,10 @@ async function autoLoadSmallestModel(): Promise<{
     }
     const effectiveGpuIds =
       config.selectedGpuIds !== undefined
-        ? reconcilePersistedGpuIds(config.selectedGpuIds)
+        ? reconcilePersistedGpuIds(
+            config.selectedGpuIds,
+            config.selectedGpuIndexKind,
+          )
         : null;
     // Under Manual GPU memory + Auto layers, llama.cpp's --fit owns context
     // sizing, so send 0 (or the pinned length). GGUF-only; a no-op otherwise.
@@ -1957,6 +1960,13 @@ async function autoLoadSmallestModel(): Promise<{
     });
     try {
       const rt = useChatRuntimeStore.getState();
+      if (rt.selectedGpuIds != null) {
+        await ensureGpuDeviceCache();
+      }
+      const defaultGpuIds = reconcilePersistedGpuIds(
+        rt.selectedGpuIds,
+        rt.selectedGpuIndexKind,
+      );
       if (
         !(await canAutoLoad({
           model_path: "unsloth/Qwen3.5-4B-MTP-GGUF",
@@ -1965,7 +1975,7 @@ async function autoLoadSmallestModel(): Promise<{
           gguf_variant: "UD-Q4_K_XL",
           // The same live-store GPU pick the load below sends (a fresh default
           // model has no remembered settings to prefer).
-          gpu_ids: rt.selectedGpuIds ?? undefined,
+          gpu_ids: defaultGpuIds ?? undefined,
           gpu_memory_mode: rt.gpuMemoryMode,
         }))
       ) {
@@ -1996,7 +2006,7 @@ async function autoLoadSmallestModel(): Promise<{
         gpu_memory_mode: rt.gpuMemoryMode,
         gpu_layers: GPU_LAYERS_AUTO,
         n_cpu_moe: 0,
-        gpu_ids: rt.selectedGpuIds ?? undefined,
+        gpu_ids: defaultGpuIds ?? undefined,
       });
       saveSpeculativeType(specSettings.speculativeType);
       persistGpuMemoryModeOnLoad(loadResp, rt.gpuMemoryMode);

@@ -21,15 +21,81 @@ export interface GpuInfo {
 
 export interface SystemGpuDevice {
   index: number;
+  indexKind: GpuIndexKind | null;
   name: string;
   memoryTotalGb: number;
-  /** Free VRAM at fetch time. Degrades to the total when the utilization
-   * probe had no usage data; 0 only when the total is unknown too. */
+  /** Free VRAM at fetch time, or total VRAM when usage is unavailable. */
   memoryFreeGb: number;
-  /** "physical" = `index` is a stable physical/PCI id safe to pin via gpu_ids;
-   *  "relative" = an ordinal into a parent CUDA_VISIBLE_DEVICES mask, which the
-   *  backend can't map back, so the picker must not offer it. */
-  physicalIndex: boolean;
+  /** Whether `index` is safe to send as gpu_ids. */
+  pinnable: boolean;
+  /** Whether the separate DiffusionGemma runner can use this physical ID. */
+  diffusionPinnable: boolean;
+}
+
+export type GpuIndexKind = "physical" | "vulkan";
+
+export interface ReconciledGpuSelection {
+  ids: number[] | null;
+  indexKind: GpuIndexKind | null;
+}
+
+export interface PinnableGpuContext {
+  devices: SystemGpuDevice[] | null;
+  ids: number[] | null;
+  indexKind: GpuIndexKind | null | undefined;
+}
+
+export function pinnableGpuContext(
+  devices: SystemGpuDevice[] | null,
+  forDiffusion = false,
+): PinnableGpuContext {
+  if (devices === null) {
+    return { devices: null, ids: null, indexKind: undefined };
+  }
+  const pinnable = devices.filter((device) =>
+    forDiffusion ? device.diffusionPinnable : device.pinnable,
+  );
+  const indexKind = pinnable[0]?.indexKind ?? null;
+  if (
+    pinnable.length <= 1 ||
+    indexKind === null ||
+    !pinnable.every((device) => device.indexKind === indexKind)
+  ) {
+    return { devices: pinnable, ids: [], indexKind: null };
+  }
+  return {
+    devices: pinnable,
+    ids: pinnable.map((device) => device.index),
+    indexKind,
+  };
+}
+
+export function reconcileGpuSelection(
+  ids: number[] | null,
+  savedIndexKind: GpuIndexKind | null | undefined,
+  currentIndexKind: GpuIndexKind | null | undefined,
+  pinnableIds: number[] | null,
+): ReconciledGpuSelection {
+  if (ids == null) return { ids: null, indexKind: null };
+  if (currentIndexKind === undefined || pinnableIds === null) {
+    return {
+      ids,
+      indexKind:
+        savedIndexKind === undefined ? "physical" : savedIndexKind,
+    };
+  }
+  const expectedIndexKind =
+    savedIndexKind === undefined ? "physical" : savedIndexKind;
+  if (
+    currentIndexKind === null ||
+    (expectedIndexKind !== null && expectedIndexKind !== currentIndexKind)
+  ) {
+    return { ids: null, indexKind: null };
+  }
+  const kept = ids.filter((id) => pinnableIds.includes(id));
+  return kept.length
+    ? { ids: kept, indexKind: currentIndexKind }
+    : { ids: null, indexKind: null };
 }
 
 const DEFAULT_GPU: GpuInfo = {
@@ -46,6 +112,10 @@ const DEFAULT_GPU: GpuInfo = {
 // One module-level cache so every GPU hook shares a single /api/system fetch.
 let cachedSystem: SystemInfoResponse | null = null;
 let systemPromise: Promise<SystemInfoResponse | null> | null = null;
+// An unavailable Vulkan probe answers gguf_devices as an empty list, so the
+// picker starts hidden and only useInferenceGpuInfo retries. Without this,
+// hooks that fetch once never see the recovery and stay hidden until remount.
+const systemSubscribers = new Set<(data: SystemInfoResponse | null) => void>();
 
 async function fetchSystemOnce(force = false): Promise<SystemInfoResponse | null> {
   if (!force && cachedSystem) return cachedSystem;
@@ -55,6 +125,7 @@ async function fetchSystemOnce(force = false): Promise<SystemInfoResponse | null
       const res = await authFetch("/api/system");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       cachedSystem = (await res.json()) as SystemInfoResponse;
+      systemSubscribers.forEach((notify) => notify(cachedSystem));
       return cachedSystem;
     } catch {
       return null;
@@ -112,28 +183,44 @@ function toGpuDevices(data: SystemInfoResponse | null): SystemGpuDevice[] {
       .filter((d) => typeof d.index === "number")
       .map((d) => ({
         index: d.index as number,
+        indexKind: d.index_kind === "vulkan" ? ("vulkan" as const) : null,
         name: d.name ?? `GPU ${d.index}`,
         memoryTotalGb: d.memory_total_gb ?? 0,
         memoryFreeGb: d.vram_free_gb ?? 0,
-        physicalIndex: picksAccepted && d.index_kind === "vulkan",
+        pinnable: picksAccepted && d.index_kind === "vulkan",
+        // The DiffusionGemma runner is torch-side and never speaks ggml
+        // ordinals, so a Vulkan pick is not usable there.
+        diffusionPinnable: false,
       }));
   }
   // Otherwise the torch view is the pickable set. Unpinnable configurations
-  // must hide every pick surface: XPU indices are torch-xpu ordinals no
-  // applicator speaks, so /load and /validate 400 them, and the backend reports
-  // gpu.gguf_gpu_ids_supported. Absent support info defaults to pinnable
-  // (older backend).
-  const pinnableBackend =
-    data?.device_backend !== "xpu" &&
-    data?.gpu?.gguf_gpu_ids_supported !== false;
-  return (data?.gpu?.devices ?? [])
+  // must hide every pick surface: the backend reports gguf_gpu_ids_supported,
+  // and absent support info defaults to pinnable (older backend). GGUF
+  // placement may use a different namespace from the global torch view, so
+  // prefer the gguf list when the backend sends one.
+  const pinnableBackend = data?.gpu?.gguf_gpu_ids_supported !== false;
+  const diffusionBackend =
+    data?.device_backend === "cuda" || data?.device_backend === "rocm";
+  return (data?.gpu?.gguf_devices ?? data?.gpu?.devices ?? [])
     .filter((d) => typeof d.index === "number")
     .map((d) => ({
       index: d.index as number,
+      indexKind:
+        d.index_kind === "physical" || d.index_kind === "vulkan"
+          ? d.index_kind
+          : null,
       name: d.name ?? `GPU ${d.index}`,
       memoryTotalGb: d.memory_total_gb ?? 0,
       memoryFreeGb: d.vram_free_gb ?? 0,
-      physicalIndex: pinnableBackend && d.index_kind === "physical",
+      // The XPU ban is about torch-xpu ordinals no applicator speaks, so /load
+      // and /validate 400 them. A Vulkan ordinal is not one of those, so it
+      // stays pickable even when this list arrives from an XPU host.
+      pinnable:
+        pinnableBackend &&
+        (d.index_kind === "vulkan" ||
+          (data?.device_backend !== "xpu" && d.index_kind === "physical")),
+      diffusionPinnable:
+        diffusionBackend && d.index_kind === "physical",
     }));
 }
 
@@ -197,42 +284,77 @@ export function useGpuDevices(): SystemGpuDevice[] {
     // No early return on cachedSystem: a consumer mounting as the cache fills
     // (between render and effect) would otherwise stay stuck at the default.
     let cancelled = false;
-    fetchSystemOnce().then((d) => {
-      if (!cancelled) setDevices(toGpuDevices(d));
-    });
+    let lastSerialized: string | null = null;
+    const sync = (data: SystemInfoResponse | null) => {
+      if (cancelled) return;
+      const next = toGpuDevices(data);
+      // Every refresh builds a fresh array, so compare by value or a 3s Vulkan
+      // retry loop would re-render this hook forever.
+      const serialized = JSON.stringify(next);
+      if (serialized === lastSerialized) return;
+      lastSerialized = serialized;
+      setDevices(next);
+    };
+    systemSubscribers.add(sync);
+    fetchSystemOnce().then(sync);
     return () => {
       cancelled = true;
+      systemSubscribers.delete(sync);
     };
   }, []);
   return devices;
 }
 
-/**
- * Await the shared /api/system fetch so cachedPinnableGpuIndices (and the
- * store's reconcilePersistedGpuIds) can validate a persisted pick before a
- * load path sends it -- on a cold cache the reconcile passes ids through
- * unvalidated, and a stale cross-host pick then fails /load with the picker
- * hidden. Resolves immediately once the module cache is warm; a failed fetch
- * keeps the cache cold, preserving the "can't validate, backend guards"
- * degradation.
- */
+/** Whether device discovery is settled enough to rewrite remembered UI state. */
+export function gpuDeviceCacheReady(): boolean {
+  if (cachedSystem === null) {
+    return false;
+  }
+  const inferenceGpu = cachedSystem.inference_gpu;
+  return !(
+    inferenceGpu?.backend === "vulkan" &&
+    !inferenceGpu.available
+  );
+}
+
+/** Warm the shared system cache before validating persisted GPU IDs. */
 export async function ensureGpuDeviceCache(): Promise<void> {
   await fetchSystemOnce();
 }
 
-/**
- * Pinnable physical GPU indices from the already-fetched /api/system cache, for
- * non-React code (the store) that needs to validate a persisted `gpu_ids` pick
- * without triggering a fetch. Returns:
- *  - `null` when the cache isn't populated yet (caller can't validate, so keep
- *    the pick and let the backend guard reject a truly bad one);
- *  - `[]` when the host has no pinnable multi-GPU set (single GPU, or relative/
- *    UUID-masked indices) -- the picker is hidden, so any saved pick is stale;
- *  - the physical indices otherwise.
- */
-export function cachedPinnableGpuIndices(): number[] | null {
-  if (!cachedSystem) return null;
-  const physical = toGpuDevices(cachedSystem).filter((d) => d.physicalIndex);
-  // Mirrors the sheet's showGpuPicker gate: only a 2+ physical-GPU host can pin.
-  return physical.length > 1 ? physical.map((d) => d.index) : [];
+/** Cached pinnable IDs, null before fetch, or [] when pinning is unavailable. */
+export function cachedPinnableGpuIndices(
+  forDiffusion = false,
+): number[] | null {
+  return pinnableGpuContext(
+    cachedSystem ? toGpuDevices(cachedSystem) : null,
+    forDiffusion,
+  ).ids;
+}
+
+/** Cached index namespace, undefined before fetch and null when unavailable. */
+export function cachedPinnableGpuIndexKind(
+  forDiffusion = false,
+): GpuIndexKind | null | undefined {
+  return pinnableGpuContext(
+    cachedSystem ? toGpuDevices(cachedSystem) : null,
+    forDiffusion,
+  ).indexKind;
+}
+
+export function reconcileCachedGpuSelection(
+  ids: number[] | null,
+  savedIndexKind?: GpuIndexKind | null,
+  forDiffusion = false,
+): ReconciledGpuSelection {
+  const context = pinnableGpuContext(
+    cachedSystem ? toGpuDevices(cachedSystem) : null,
+    forDiffusion,
+  );
+  return reconcileGpuSelection(
+    ids,
+    savedIndexKind,
+    context.indexKind,
+    context.ids,
+  );
 }

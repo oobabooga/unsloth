@@ -48,7 +48,13 @@ def test_system_gpu_info_preserves_vulkan_visibility_metrics(monkeypatch):
 
     from core.inference.llama_cpp import LlamaCppBackend
 
+    # _get_vulkan_gpu_info only ever emits ggml ordinals, so tag the stub the way
+    # production does rather than reusing the torch-side "relative" record.
+    gguf_device = {**vulkan_device, "index_kind": "vulkan"}
     monkeypatch.setattr(LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda: True))
+    monkeypatch.setattr(
+        LlamaCppBackend, "_get_vulkan_gpu_info", staticmethod(lambda: [gguf_device])
+    )
     monkeypatch.setattr(main, "_system_gpu_cache", None)
 
     gpu, inference_gpu = main._get_cached_system_gpu_info(SimpleNamespace(debug = lambda *args: None))
@@ -59,9 +65,41 @@ def test_system_gpu_info_preserves_vulkan_visibility_metrics(monkeypatch):
     # A Vulkan llama.cpp build accepts gpu_ids even when torch training is
     # CPU-only: the pick is a ggml ordinal, not a torch device index.
     assert gpu["gguf_gpu_ids_supported"] is True
+    # Torch's view stays empty; the ggml ordinals ride in their own list.
     assert gpu["devices"] == []
+    assert gpu["gguf_devices"] == [gguf_device]
     assert inference_gpu["backend"] == "vulkan"
     assert inference_gpu["devices"] == [vulkan_device]
+
+
+def test_system_gpu_info_withholds_gguf_pin_when_the_vulkan_probe_enumerates_nothing(monkeypatch):
+    """A Vulkan build whose probe returns no ordinals has nothing valid to pin,
+    so the picker must be told pins are unsupported rather than offered an empty
+    namespace it would 400 on."""
+    import utils.hardware as hardware
+
+    monkeypatch.setattr(
+        hardware,
+        "get_backend_visible_gpu_info",
+        lambda: {"available": False, "backend": "cpu", "devices": [], "index_kind": "relative"},
+    )
+    monkeypatch.setattr(
+        hardware,
+        "get_visible_gpu_utilization",
+        lambda: {"available": False, "backend": "cpu", "devices": []},
+    )
+    monkeypatch.setattr(hardware, "get_vulkan_inference_gpu_info", lambda: None)
+
+    from core.inference.llama_cpp import LlamaCppBackend
+
+    monkeypatch.setattr(LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda: True))
+    monkeypatch.setattr(LlamaCppBackend, "_get_vulkan_gpu_info", staticmethod(lambda: []))
+    monkeypatch.setattr(main, "_system_gpu_cache", None)
+
+    gpu, _ = main._get_cached_system_gpu_info(SimpleNamespace(debug = lambda *args: None))
+
+    assert gpu["gguf_devices"] == []
+    assert gpu["gguf_gpu_ids_supported"] is False
 
 
 def test_system_gpu_info_keeps_forced_vulkan_separate_from_training_metrics(monkeypatch):

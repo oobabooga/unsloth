@@ -7,7 +7,7 @@ import {
   normalizeSpeculativeType,
   readPersistedGpuMemoryMode,
   readPersistedSpeculativeType,
-  reconcilePersistedGpuIds,
+  reconcilePersistedGpuSelection,
   useChatRuntimeStore,
 } from "@/features/chat";
 import {
@@ -20,7 +20,10 @@ function cleanTemplate(value: string | null | undefined): string | null {
   return value?.trim() ? value : null;
 }
 
-export function applyPerModelConfigToRuntime(config: PerModelConfig): void {
+export function applyPerModelConfigToRuntime(
+  config: PerModelConfig,
+  options: { isDiffusion?: boolean } = {},
+): void {
   // Fall back to the standing default when the model has no saved
   // maxSeqLength. maxSeqLength is the only per-model field carried on
   // params (the rest are reset below), so without this a model with no
@@ -32,6 +35,14 @@ export function applyPerModelConfigToRuntime(config: PerModelConfig): void {
   if (maxSeqLength !== store.params.maxSeqLength) {
     store.setParams({ ...store.params, maxSeqLength });
   }
+  const gpuSelection =
+    config.selectedGpuIds !== undefined
+      ? reconcilePersistedGpuSelection(
+          config.selectedGpuIds,
+          config.selectedGpuIndexKind,
+          options.isDiffusion,
+        )
+      : { ids: null, indexKind: null };
   useChatRuntimeStore.setState({
     customContextLength: config.customContextLength ?? null,
     kvCacheDtype: config.kvCacheDtype ?? null,
@@ -50,18 +61,17 @@ export function applyPerModelConfigToRuntime(config: PerModelConfig): void {
     gpuLayers: config.gpuLayers ?? GPU_LAYERS_AUTO,
     nCpuMoe: config.nCpuMoe ?? 0,
     splitRatio: null,
-    selectedGpuIds:
-      config.selectedGpuIds !== undefined
-        ? reconcilePersistedGpuIds(config.selectedGpuIds)
-        : null,
+    selectedGpuIds: gpuSelection.ids,
+    selectedGpuIndexKind: gpuSelection.indexKind,
   });
 }
 
 export function applyModelLoadConfigToRuntime(
   config: PerModelConfig | null | undefined,
+  options: { isDiffusion?: boolean } = {},
 ): boolean {
   const hasConfig = config != null;
-  applyPerModelConfigToRuntime(config ?? DEFAULT_PER_MODEL_CONFIG);
+  applyPerModelConfigToRuntime(config ?? DEFAULT_PER_MODEL_CONFIG, options);
   return hasConfig;
 }
 
@@ -86,6 +96,7 @@ export function currentRuntimePerModelConfig(
     gpuLayers: s.gpuLayers,
     nCpuMoe: s.nCpuMoe,
     selectedGpuIds: s.selectedGpuIds,
+    selectedGpuIndexKind: s.selectedGpuIndexKind,
   };
 }
 
@@ -110,15 +121,22 @@ export function perModelConfigsEqual(
 
 // Serialize the per-model GPU knobs with the same "absent == default"
 // coalescing the store applies: mode auto/absent, gpuLayers Auto (< 0) /
-// absent, nCpuMoe 0 / absent, and the GPU pick (null / absent = all GPUs).
+// absent, nCpuMoe 0 / absent, and null / absent GPU picks as automatic.
 export function gpuFieldsSignature(config: PerModelConfig): string {
+  const gpuSelection =
+    config.selectedGpuIds == null
+      ? "automatic"
+      : [
+          [...config.selectedGpuIds].sort((a, b) => a - b).join(","),
+          config.selectedGpuIndexKind === undefined
+            ? "physical"
+            : (config.selectedGpuIndexKind ?? "deferred"),
+        ].join("@");
   return [
     config.gpuMemoryMode ?? "auto",
     config.gpuLayers == null || config.gpuLayers < 0 ? -1 : config.gpuLayers,
     config.nCpuMoe ?? 0,
-    config.selectedGpuIds == null
-      ? "all"
-      : [...config.selectedGpuIds].sort((a, b) => a - b).join(","),
+    gpuSelection,
   ].join("|");
 }
 

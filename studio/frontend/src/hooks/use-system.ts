@@ -20,12 +20,15 @@ export interface GpuDevice {
 export interface SystemGpuInfo {
   available: boolean;
   backend?: string;
-  /** Whether GGUF loads accept explicit physical GPU IDs. */
+  /** Whether GGUF loads accept explicit gpu_ids in the device records'
+   * declared index space. */
   gguf_gpu_ids_supported?: boolean;
   backend_cuda_visible_devices?: string | null;
   parent_visible_gpu_ids?: number[];
   index_kind?: string;
   devices: GpuDevice[];
+  /** GGUF placement devices, using Vulkan ordinals when applicable. */
+  gguf_devices?: GpuDevice[];
 }
 
 /** Sum dedicated VRAM while counting a shared host-memory pool only once. */

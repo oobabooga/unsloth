@@ -222,9 +222,8 @@ export function applyActiveModelStatusToStore(
     incomingGpuMode === "manual" ? (status.n_cpu_moe ?? null) : null;
   const incomingSplit =
     incomingGpuMode === "manual" ? (status.tensor_split ?? null) : null;
-  const incomingGpuIds = status.is_gguf
-    ? (status.requested_gpu_ids ?? status.gpu_ids ?? null)
-    : null;
+  const incomingGpuFields = loadedGpuMemoryFields(status);
+  const incomingGpuIds = incomingGpuFields.loadedGpuIds;
   const gpuStatusChanged =
     prevState.loadedGpuMemoryMode !== incomingGpuMode ||
     prevState.loadedGpuLayers !== incomingGpuLayers ||
@@ -244,7 +243,6 @@ export function applyActiveModelStatusToStore(
     prevState.selectedGpuIds,
     prevState.loadedGpuIds,
   );
-  const incomingGpuFields = loadedGpuMemoryFields(status);
   // A same-model reload from another client advances every loaded baseline.
   // Preserve each editable group only when this tab has an unapplied change.
   const preserveSameModelEdits = gpuStatusChanged && !hydratingExistingModel;
@@ -261,7 +259,10 @@ export function applyActiveModelStatusToStore(
         customContextLength: prevState.customContextLength,
       }),
     ...(preserveSameModelEdits &&
-      gpuIdsEditPending && { selectedGpuIds: prevState.selectedGpuIds }),
+      gpuIdsEditPending && {
+        selectedGpuIds: prevState.selectedGpuIds,
+        selectedGpuIndexKind: prevState.selectedGpuIndexKind,
+      }),
   };
 
   useChatRuntimeStore.setState({
