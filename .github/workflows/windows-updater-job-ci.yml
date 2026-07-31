@@ -73,7 +73,7 @@ jobs:
 
       - name: Build signed Studio 9.9.2 NSIS updater
         env:
-          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/updater.key
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: windows-updater-e2e
         run: |
           npx --prefix studio tauri build \
