@@ -68,6 +68,8 @@ const DEFAULT_UPDATE_POLICY: DesktopUpdatePolicy = {
   releasePageBaseUrl: "https://github.com/unslothai/unsloth/releases/tag/",
   releaseTagPrefix: "desktop-v",
 };
+const WINDOWS_UPDATER_E2E =
+  import.meta.env.VITE_WINDOWS_UPDATER_E2E === "1";
 
 const UPDATE_VERSION_RE = /^v?\d+\.\d+\.\d+(?:(?:[-+][0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)|(?:\.(?:post|dev|rc)\d*)|(?:(?:post|dev|rc|a|b)\d*))?$/;
 
@@ -201,6 +203,10 @@ export function useTauriUpdate(isExternalServer = false) {
       try {
         const update = await checkDesktopUpdate();
         if (update) {
+          if (WINDOWS_UPDATER_E2E) {
+            await update.downloadAndInstall();
+            return;
+          }
           updateRef.current = update;
           setInfo({
             version: update.version,

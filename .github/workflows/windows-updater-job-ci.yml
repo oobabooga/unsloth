@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-name: Windows updater Job Object CI
+name: Windows updater live CI
 
 on:
   push:
@@ -17,12 +17,14 @@ concurrency:
 
 jobs:
   windows-updater-job:
-    name: Windows updater process handoff
+    name: Live Windows in-app update
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     defaults:
       run:
         shell: bash
+    env:
+      VITE_WINDOWS_UPDATER_E2E: '1'
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,3 +55,75 @@ jobs:
       - name: Build Windows desktop binary
         working-directory: studio/src-tauri
         run: cargo build --locked
+
+      - name: Install pinned Tauri CLI
+        run: npm ci --prefix studio --no-fund --no-audit
+
+      - name: Generate ephemeral updater key and target configuration
+        run: |
+          npx --prefix studio tauri signer generate \
+            --ci \
+            --password windows-updater-e2e \
+            --write-keys "$RUNNER_TEMP/updater.key"
+          python .github/scripts/windows-updater-e2e-config.py \
+            --version 9.9.2 \
+            --endpoint http://127.0.0.1:8765/latest.json \
+            --public-key "$RUNNER_TEMP/updater.key.pub" \
+            --output "$RUNNER_TEMP/windows-updater-target.json"
+
+      - name: Build signed Studio 9.9.2 NSIS updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: windows-updater-e2e
+        run: |
+          npx --prefix studio tauri build \
+            --bundles nsis \
+            --config "$RUNNER_TEMP/windows-updater-target.json"
+
+      - name: Stage local update feed
+        shell: pwsh
+        run: |
+          $feed = Join-Path $env:RUNNER_TEMP "windows-updater-feed"
+          New-Item -ItemType Directory -Force $feed | Out-Null
+          $installer = Get-ChildItem "studio/src-tauri/target/release/bundle/nsis/*-setup.exe" |
+            Select-Object -First 1
+          if (-not $installer) { throw "NSIS updater executable was not produced" }
+          $signaturePath = "$($installer.FullName).sig"
+          if (-not (Test-Path $signaturePath)) {
+            throw "NSIS updater signature was not produced: $signaturePath"
+          }
+          Copy-Item $installer.FullName (Join-Path $feed "studio-9.9.2-setup.exe")
+          $metadata = @{
+            version = "9.9.2"
+            notes = "Windows updater live test"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = (Get-Content $signaturePath -Raw)
+                url = "http://127.0.0.1:8765/studio-9.9.2-setup.exe"
+              }
+              "windows-x86_64-nsis" = @{
+                signature = (Get-Content $signaturePath -Raw)
+                url = "http://127.0.0.1:8765/studio-9.9.2-setup.exe"
+              }
+            }
+          }
+          $metadata | ConvertTo-Json -Depth 6 |
+            Set-Content (Join-Path $feed "latest.json") -Encoding utf8
+          Get-ChildItem $feed | Format-Table Name, Length
+
+      - name: Build live Studio 9.9.1 updater client
+        run: |
+          python .github/scripts/windows-updater-e2e-config.py \
+            --version 9.9.1 \
+            --endpoint http://127.0.0.1:8765/latest.json \
+            --public-key "$RUNNER_TEMP/updater.key.pub" \
+            --output "$RUNNER_TEMP/windows-updater-source.json"
+          npx --prefix studio tauri build \
+            --debug \
+            --no-bundle \
+            --config "$RUNNER_TEMP/windows-updater-source.json"
+
+      - name: Launch Studio and complete live in-app update
+        shell: pwsh
+        run: .github/scripts/windows-updater-live-e2e.ps1

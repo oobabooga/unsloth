@@ -51,6 +51,8 @@ const MIN_WINDOW_WIDTH = 900;
 const MIN_WINDOW_HEIGHT = 600;
 const SETUP_WINDOW_WIDTH = 760;
 const SETUP_WINDOW_HEIGHT = 560;
+const WINDOWS_UPDATER_E2E =
+  import.meta.env.VITE_WINDOWS_UPDATER_E2E === "1";
 const MINIMUM_APP_WINDOW_SIZE: LogicalWindowSize = {
   width: MIN_WINDOW_WIDTH,
   height: MIN_WINDOW_HEIGHT,
@@ -442,20 +444,25 @@ function TauriWrapper({ children }: { children: ReactNode }) {
       {children}
     </>
   ) : (
-    <StartupScreen
-      status={startupStatus}
-      logs={logs}
-      error={error}
-      currentStepIndex={currentStepIndex}
-      progressDetail={startupProgressDetail}
-      elevationPackages={elevationPackages}
-      onInstall={startInstall}
-      onRetry={retry}
-      onRetryInstall={retryInstall}
-      onApproveElevation={approveElevation}
-      onStartServer={retry}
-      onCopyDiagnostics={copyDiagnostics}
-    />
+    <>
+      {WINDOWS_UPDATER_E2E ? (
+        <TauriUpdateLayer isExternalServer={false} />
+      ) : null}
+      <StartupScreen
+        status={startupStatus}
+        logs={logs}
+        error={error}
+        currentStepIndex={currentStepIndex}
+        progressDetail={startupProgressDetail}
+        elevationPackages={elevationPackages}
+        onInstall={startInstall}
+        onRetry={retry}
+        onRetryInstall={retryInstall}
+        onApproveElevation={approveElevation}
+        onStartServer={retry}
+        onCopyDiagnostics={copyDiagnostics}
+      />
+    </>
   );
 
   if (!usesCustomTitlebar) {
