@@ -25,17 +25,54 @@ use simplelog::{
     CombinedLogger, Config, LevelFilter, SharedLogger, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
-/// Serializes the exit paths that must reap the backend: the tray "Quit" item,
+/// Serializes the exit paths that must reap the backend: explicit quit requests,
 /// the Unix termination signal listener, and `RunEvent::Exit`. Exactly one path
 /// runs cleanup; the others block until it is done, so the process never exits
 /// out from under a cleanup that is still killing the backend tree.
 static TERMINATION_CLEANUP: Once = Once::new();
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+struct QuitRequest;
+
+impl QuitRequest {
+    fn begin() -> Option<Self> {
+        QUIT_REQUESTED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
+    }
+
+    fn commit(self) {
+        // Keep later requests suppressed while `app.exit` reaches the event loop.
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for QuitRequest {
+    fn drop(&mut self) {
+        QUIT_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod quit_request_tests {
+    use super::QuitRequest;
+
+    #[test]
+    fn canceled_quit_allows_a_later_request() {
+        let request = QuitRequest::begin().expect("first quit request should start");
+        assert!(QuitRequest::begin().is_none());
+        drop(request);
+        assert!(QuitRequest::begin().is_some());
+    }
+}
 
 #[tauri::command]
 fn has_saved_window_state(app: tauri::AppHandle) -> bool {
@@ -108,7 +145,7 @@ fn set_training_active(state: tauri::State<'_, TrainingActivityState>, active: b
     }
 }
 
-/// Ask before quitting mid-training (true to proceed). Tray Quit only, as below.
+/// Ask before quitting mid-training (true to proceed). Explicit quit requests only.
 fn confirm_quit_during_training(app: &tauri::AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
@@ -133,8 +170,8 @@ fn confirm_quit_during_training(app: &tauri::AppHandle) -> bool {
 }
 
 /// Ask before quitting mid-install (true to proceed): `cleanup_child_processes` SIGTERMs the
-/// installer, leaving a venv that looks healthy but cannot start. Tray Quit only, since
-/// RunEvent::Exit must never block on a dialog nobody can answer.
+/// installer, leaving a venv that looks healthy but cannot start. Explicit quit requests only,
+/// since RunEvent::Exit must never block on a dialog nobody can answer.
 fn confirm_quit_during_install(app: &tauri::AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
@@ -259,6 +296,31 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(request) = QuitRequest::begin() else {
+        return Ok(());
+    };
+
+    // Run cleanup off the UI callback, but only exit after the backend tree has
+    // been reaped. Exiting first can leave the backend orphaned while cleanup waits.
+    std::thread::Builder::new()
+        .name("desktop-explicit-quit".to_string())
+        .spawn(move || {
+            if !confirm_quit_during_install(&app) {
+                return;
+            }
+            if !confirm_quit_during_training(&app) {
+                return;
+            }
+            cleanup_child_processes(&app);
+            request.commit();
+            app.exit(0);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Could not start desktop cleanup: {error}"))
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let open = MenuItemBuilder::with_id("open", "Open Unsloth").build(app)?;
     let toggle = MenuItemBuilder::with_id("toggle", "Start/Stop Server").build(app)?;
@@ -277,21 +339,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = app.emit("tray-toggle-server", ());
             }
             "quit" => {
-                // Run cleanup off the menu callback, but only exit after the
-                // backend tree has been reaped. Exiting first can terminate this
-                // process while a detached cleanup thread is still waiting,
-                // leaving the backend orphaned.
-                let app_handle = app.clone();
-                std::thread::spawn(move || {
-                    if !confirm_quit_during_install(&app_handle) {
-                        return;
-                    }
-                    if !confirm_quit_during_training(&app_handle) {
-                        return;
-                    }
-                    cleanup_child_processes(&app_handle);
-                    app_handle.exit(0);
-                });
+                if let Err(error) = quit_app(app.clone()) {
+                    warn!("Tray quit failed: {error}");
+                }
             }
             _ => {}
         })
@@ -382,6 +432,7 @@ fn main() {
             native_intents::reveal_path_token,
             native_intents::open_path_token,
             has_saved_window_state,
+            quit_app,
         ])
         .setup(|app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]

@@ -298,6 +298,30 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
+def test_desktop_window_exposes_native_quit_with_tray_cleanup():
+    main = TAURI_MAIN.read_text(encoding = "utf-8")
+    sidebar = APP_SIDEBAR.read_text(encoding = "utf-8")
+    customizer = (
+        FRONTEND / "features/settings/components/sidebar-menu-customizer.tsx"
+    ).read_text(encoding = "utf-8")
+
+    quit_app = main.split("fn quit_app", 1)[1].split("\n}\n", 1)[0]
+    tray_quit = main.split('"quit" =>', 1)[1].split("\n", 5)
+
+    assert "QuitRequest::begin()" in quit_app
+    assert "confirm_quit_during_install(&app)" in quit_app
+    assert "confirm_quit_during_training(&app)" in quit_app
+    assert "cleanup_child_processes(&app)" in quit_app
+    assert "app.exit(0)" in quit_app
+    assert any("quit_app(app.clone())" in line for line in tray_quit)
+    assert "fn quit_app(app: tauri::AppHandle)" in main
+    assert "            quit_app," in main
+
+    assert 'await invoke("quit_app")' in sidebar
+    assert 'isTauri ? "common.quit" : "common.shutdown"' in sidebar
+    assert 'isTauri ? "common.quit" : "common.shutdown"' in customizer
+
+
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():
     source = APP_PROVIDER.read_text(encoding = "utf-8")
 

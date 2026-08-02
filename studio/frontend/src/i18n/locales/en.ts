@@ -12,6 +12,7 @@ export const en = {
     help: "Help",
     loading: "Loading...",
     new: "New",
+    quit: "Quit Unsloth",
     rename: "Rename",
     save: "Save",
     saving: "Saving...",
