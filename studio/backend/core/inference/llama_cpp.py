@@ -3956,6 +3956,7 @@ class LlamaCppBackend:
 
     @classmethod
     def probe_server_capabilities(cls, binary: Optional[str] = None) -> dict[str, object]:
+        """Parse and cache llama-server feature flags, coalescing cold probes."""
         with cls._capability_probe_lock:
             return cls._probe_server_capabilities_locked(binary)
 

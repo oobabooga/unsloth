@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-import time
+from concurrent.futures import Future
 from pathlib import Path
 
 _BACKEND = Path(__file__).resolve().parents[1]
@@ -96,30 +96,53 @@ def test_status_probes_run_off_event_loop(monkeypatch):
     assert response.llama_cpp_latest_tag == "b2"
 
 
-def test_concurrent_status_probes_use_one_worker(monkeypatch):
+def test_concurrent_status_probes_share_one_future(monkeypatch):
+    source: Future = Future()
+    submissions = []
+
+    def _submit(*args):
+        submissions.append(args)
+        return source
+
+    monkeypatch.setattr(inference_route, "_LLAMA_STATUS_PROBE_FUTURE", None)
+    monkeypatch.setattr(inference_route._LLAMA_STATUS_PROBE_EXECUTOR, "submit", _submit)
+
+    first = inference_route._submit_llama_cpp_status_probe(_FakeLlamaBackend)
+    second = inference_route._submit_llama_cpp_status_probe(_FakeLlamaBackend)
+
+    assert first is source
+    assert second is source
+    assert len(submissions) == 1
+
+
+def test_cancelled_status_waiter_does_not_cancel_shared_probe(monkeypatch):
     _patch_status_dependencies(monkeypatch)
-    active = 0
-    max_active = 0
-    lock = threading.Lock()
-
-    def _probe(_backend):
-        nonlocal active, max_active
-        with lock:
-            active += 1
-            max_active = max(max_active, active)
-        time.sleep(0.02)
-        with lock:
-            active -= 1
-        return True, {}
-
-    monkeypatch.setattr(inference_route, "_probe_llama_cpp_status", _probe)
+    source: Future = Future()
+    monkeypatch.setattr(
+        inference_route,
+        "_submit_llama_cpp_status_probe",
+        lambda _backend: source,
+    )
 
     async def _run():
-        await asyncio.gather(
-            inference_route.get_status(current_subject = "test"),
-            inference_route.get_status(current_subject = "test"),
+        first = asyncio.create_task(
+            inference_route.get_status(current_subject = "first")
         )
+        second = asyncio.create_task(
+            inference_route.get_status(current_subject = "second")
+        )
+        await asyncio.sleep(0)
+        first.cancel()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("the cancelled status waiter completed")
+        assert not source.cancelled()
+        source.set_result((True, {}))
+        return await second
 
-    asyncio.run(_run())
+    response = asyncio.run(_run())
 
-    assert max_active == 1
+    assert response.llama_cpp_supports_mtp is True

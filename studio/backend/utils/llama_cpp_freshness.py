@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import threading
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -77,9 +78,14 @@ def _fetch_latest_release_tag(repo: str, timeout: float = 5.0) -> Optional[str]:
 
 
 def latest_published_release(repo: str, *, force_refresh: bool = False) -> Optional[str]:
-    """Latest release tag for `repo`. Memo + disk-cached (24h TTL).
-    None when offline and never previously cached."""
-    with _release_lock:
+    """Latest release tag with 24h success caching and brief failure caching.
+
+    Returns None when offline and never previously cached.
+    """
+    # Explicit checks retain their pre-existing parallel behavior. Only recurring
+    # status reads serialize so they cannot occupy shared workers behind this lock.
+    guard = nullcontext() if force_refresh else _release_lock
+    with guard:
         return _flow.latest_published_release(
             repo,
             force_refresh = force_refresh,
@@ -238,7 +244,12 @@ def reset_caches(*, drop_disk: bool = False) -> None:
     open (off) instead of pointing at the just-replaced build."""
     with _release_lock:
         _flow.reset_caches(
-            (_marker_cache, _release_memo, _release_failed_at, _assets_memo),
+            (
+                _marker_cache,
+                _release_memo,
+                _release_failed_at,
+                _assets_memo,
+            ),
             drop_disk = drop_disk,
             cache_dir = lambda: _cache_dir(),
         )

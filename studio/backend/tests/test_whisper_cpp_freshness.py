@@ -147,6 +147,23 @@ def test_check_prebuilt_freshness_reports_stale_when_old_and_behind(monkeypatch,
     assert info["latest_tag"] == "v1.9.1-unsloth.3"
 
 
+def test_latest_published_release_caches_failure_and_reset_allows_retry(monkeypatch):
+    calls = []
+
+    def _failed_fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
+    assert fr.latest_published_release("unslothai/whisper.cpp") is None
+    assert fr.latest_published_release("unslothai/whisper.cpp") is None
+
+    fr.reset_caches()
+
+    assert fr.latest_published_release("unslothai/whisper.cpp") is None
+    assert calls == ["unslothai/whisper.cpp", "unslothai/whisper.cpp"]
+
+
 def test_marker_reader_prefers_install_root_over_packaging_marker(tmp_path):
     root_marker = _write_marker(tmp_path, release_tag = "v1.9.1-unsloth.2")
     binary = _fake_binary(tmp_path)

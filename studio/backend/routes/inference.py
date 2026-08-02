@@ -24,7 +24,7 @@ from loggers import get_logger
 import asyncio
 import threading
 import weakref
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 
@@ -7718,6 +7718,8 @@ _LLAMA_STATUS_PROBE_EXECUTOR = ThreadPoolExecutor(
     max_workers = 1,
     thread_name_prefix = "llama-status-probe",
 )
+_LLAMA_STATUS_PROBE_FUTURE: Optional[Future] = None
+_LLAMA_STATUS_PROBE_FUTURE_LOCK = threading.Lock()
 
 
 def _probe_llama_cpp_status(llama_backend) -> tuple[bool, dict]:
@@ -7725,8 +7727,8 @@ def _probe_llama_cpp_status(llama_backend) -> tuple[bool, dict]:
     try:
         binary = type(llama_backend)._find_llama_server_binary()
         capabilities = type(llama_backend).probe_server_capabilities(binary)
-        # Fail open on inconclusive probes: False means a definitive
-        # "binary lacks MTP" to API consumers.
+        # Treat a discovered but inconclusive binary as compatible. No usable
+        # binary or probe result remains unavailable to API consumers.
         supports_mtp = bool(
             capabilities.get("supports_mtp", False)
             or (
@@ -7746,6 +7748,20 @@ def _probe_llama_cpp_status(llama_backend) -> tuple[bool, dict]:
     return supports_mtp, freshness
 
 
+def _submit_llama_cpp_status_probe(llama_backend) -> Future:
+    """Share one in-flight probe across concurrent status requests."""
+    global _LLAMA_STATUS_PROBE_FUTURE
+    with _LLAMA_STATUS_PROBE_FUTURE_LOCK:
+        if (
+            _LLAMA_STATUS_PROBE_FUTURE is None
+            or _LLAMA_STATUS_PROBE_FUTURE.done()
+        ):
+            _LLAMA_STATUS_PROBE_FUTURE = _LLAMA_STATUS_PROBE_EXECUTOR.submit(
+                _probe_llama_cpp_status, llama_backend
+            )
+        return _LLAMA_STATUS_PROBE_FUTURE
+
+
 @router.get("/status", response_model = InferenceStatusResponse)
 async def get_status(current_subject: str = Depends(get_current_subject)):
     """
@@ -7757,8 +7773,9 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
 
         # A cold capability probe can exec llama-server, and a cold freshness
         # check reads GitHub. Neither may block streaming on the event loop.
-        _supports_mtp, _freshness = await asyncio.get_running_loop().run_in_executor(
-            _LLAMA_STATUS_PROBE_EXECUTOR, _probe_llama_cpp_status, llama_backend
+        # One disconnected waiter must not cancel the probe shared by the rest.
+        _supports_mtp, _freshness = await asyncio.shield(
+            asyncio.wrap_future(_submit_llama_cpp_status_probe(llama_backend))
         )
         _stale = bool(_freshness.get("stale"))
         _installed_tag = _freshness.get("installed_tag")

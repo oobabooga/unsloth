@@ -183,14 +183,20 @@ def latest_published_release(
     fetch: Callable[[str], Optional[str]],
     save: Callable[[str, Optional[str]], None],
 ) -> Optional[str]:
-    """Latest release tag for `repo`. Memo + disk-cached (24h TTL).
-    None when offline and never previously cached."""
+    """Latest release tag for `repo`.
+
+    Successful results use a 24h memory and disk cache. Failed lookups use a
+    brief in-process TTL. Returns None when offline and never previously cached.
+    """
     if not repo:
         return None
     now = time.time()
     if not force_refresh:
         last_failure = failed_at.get(repo)
-        if last_failure is not None and now - last_failure < RELEASE_FAILURE_CACHE_TTL_SECONDS:
+        if (
+            last_failure is not None
+            and time.monotonic() - last_failure < RELEASE_FAILURE_CACHE_TTL_SECONDS
+        ):
             cached = memo.get(repo)
             if cached:
                 return cached[1]
@@ -205,7 +211,7 @@ def latest_published_release(
             return disk[1]
     latest = fetch(repo)
     if latest is None:
-        failed_at[repo] = now
+        failed_at[repo] = time.monotonic()
         # Keep the last-good disk value rather than poison it with None.
         disk = load_disk_cache(repo, cache_dir())
         if disk:

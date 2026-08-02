@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import types as _types
 from concurrent.futures import ThreadPoolExecutor
@@ -199,10 +200,12 @@ def test_latest_published_release_returns_none_on_network_failure(monkeypatch):
 
 
 def test_latest_published_release_retries_after_failure_ttl(monkeypatch):
-    now = [1000.0]
+    wall_now = [1000.0]
+    monotonic_now = [100.0]
     calls = []
 
-    monkeypatch.setattr(fr._flow.time, "time", lambda: now[0])
+    monkeypatch.setattr(fr._flow.time, "time", lambda: wall_now[0])
+    monkeypatch.setattr(fr._flow.time, "monotonic", lambda: monotonic_now[0])
 
     def _fetch(repo, timeout = 5.0):
         calls.append(repo)
@@ -212,27 +215,88 @@ def test_latest_published_release_retries_after_failure_ttl(monkeypatch):
     assert fr.latest_published_release("unslothai/llama.cpp") is None
     assert fr.latest_published_release("unslothai/llama.cpp") is None
 
-    now[0] += fr._flow.RELEASE_FAILURE_CACHE_TTL_SECONDS + 1
+    # A wall-clock rollback must not extend this in-process failure TTL.
+    wall_now[0] -= 500
+    monotonic_now[0] += fr._flow.RELEASE_FAILURE_CACHE_TTL_SECONDS + 1
     assert fr.latest_published_release("unslothai/llama.cpp") == "b9999"
+    assert calls == ["unslothai/llama.cpp", "unslothai/llama.cpp"]
+
+
+def test_latest_published_release_force_refresh_bypasses_failure_ttl(monkeypatch):
+    calls = []
+
+    def _fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None if len(calls) == 1 else "b9999"
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _fetch)
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+    assert (
+        fr.latest_published_release("unslothai/llama.cpp", force_refresh = True)
+        == "b9999"
+    )
+    assert fr.latest_published_release("unslothai/llama.cpp") == "b9999"
+    assert calls == ["unslothai/llama.cpp", "unslothai/llama.cpp"]
+
+
+def test_reset_caches_clears_release_failure_memo(monkeypatch):
+    calls = []
+
+    def _failed_fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+
+    fr.reset_caches()
+
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
     assert calls == ["unslothai/llama.cpp", "unslothai/llama.cpp"]
 
 
 def test_latest_published_release_coalesces_concurrent_failures(monkeypatch):
     calls = []
 
+    class _GateLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._count_lock = threading.Lock()
+            self._all_waiting = threading.Event()
+            self._release = threading.Event()
+            self._attempts = 0
+
+        def __enter__(self):
+            with self._count_lock:
+                self._attempts += 1
+                if self._attempts == 4:
+                    self._all_waiting.set()
+            assert self._release.wait(timeout = 1)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    gate = _GateLock()
+
     def _failed_fetch(repo, timeout = 5.0):
         calls.append(repo)
-        time.sleep(0.02)
         return None
 
     monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
+    monkeypatch.setattr(fr, "_release_lock", gate)
     with ThreadPoolExecutor(max_workers = 4) as pool:
-        results = list(
-            pool.map(
-                lambda _index: fr.latest_published_release("unslothai/llama.cpp"),
-                range(4),
-            )
-        )
+        futures = [
+            pool.submit(fr.latest_published_release, "unslothai/llama.cpp")
+            for _index in range(4)
+        ]
+        try:
+            assert gate._all_waiting.wait(timeout = 1)
+        finally:
+            gate._release.set()
+        results = [future.result() for future in futures]
 
     assert results == [None] * 4
     assert calls == ["unslothai/llama.cpp"]
