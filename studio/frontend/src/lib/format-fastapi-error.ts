@@ -36,6 +36,37 @@ export function formatFastApiDetail(detail: unknown): string | null {
 }
 
 /**
+ * Render FastAPI and OpenAI-compatible error bodies into a message.
+ *
+ * Studio's `/api/*` routes use `{detail}` while its `/v1/*` routes use the
+ * OpenAI-compatible `{error: {message}}` envelope. Keep both response shapes
+ * readable for frontend callers that can reach either API surface.
+ */
+export function formatApiErrorBody(
+  body: unknown,
+): string | null {
+  if (!body || typeof body !== "object") return null;
+
+  const payload = body as {
+    detail?: unknown;
+    message?: unknown;
+    error?: unknown;
+  };
+  const formatted = formatFastApiDetail(payload.detail);
+  if (formatted) return formatted;
+  if (typeof payload.message === "string" && payload.message) {
+    return payload.message;
+  }
+  if (payload.error && typeof payload.error === "object") {
+    const message = (payload.error as { message?: unknown }).message;
+    if (typeof message === "string" && message) {
+      return message;
+    }
+  }
+  return null;
+}
+
+/**
  * Convert a (likely non-ok) Response into the best human-readable error
  * message. Used by *-api.ts wrappers so toasts read `field: msg` instead
  * of `[object Object]` or `Request failed (422)`.
@@ -45,15 +76,8 @@ export async function readFastApiError(
   fallbackPrefix: string = "Request failed",
 ): Promise<string> {
   try {
-    const payload = (await response.json()) as {
-      detail?: unknown;
-      message?: string;
-    };
-    const formatted = formatFastApiDetail(payload.detail);
+    const formatted = formatApiErrorBody(await response.json());
     if (formatted) return formatted;
-    if (typeof payload.message === "string" && payload.message) {
-      return payload.message;
-    }
   } catch {
     // fall through
   }

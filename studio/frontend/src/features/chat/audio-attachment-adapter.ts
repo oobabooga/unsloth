@@ -4,6 +4,7 @@
 import {
   AUDIO_ACCEPT,
   MAX_AUDIO_SIZE,
+  MAX_AUDIO_SIZE_LABEL,
   fileToBase64,
 } from "@/lib/audio-utils";
 import type {
@@ -52,7 +53,7 @@ export class AudioAttachmentAdapter implements AttachmentAdapter {
       throw new Error(unavailableReason);
     }
     if (file.size > MAX_AUDIO_SIZE) {
-      const sizeReason = "Audio size exceeds 50MB limit";
+      const sizeReason = `Audio size exceeds ${MAX_AUDIO_SIZE_LABEL} limit`;
       toast.error(sizeReason);
       throw new Error(sizeReason);
     }
