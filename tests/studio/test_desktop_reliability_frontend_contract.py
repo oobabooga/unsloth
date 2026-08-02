@@ -21,6 +21,8 @@ THREAD = FRONTEND / "components/assistant-ui/thread.tsx"
 THREAD_SIDEBAR = FRONTEND / "features/chat/thread-sidebar.tsx"
 SHARED_COMPOSER = FRONTEND / "features/chat/shared-composer.tsx"
 TITLEBAR = FRONTEND / "components/tauri/window-titlebar.tsx"
+SHEET = FRONTEND / "components/ui/sheet.tsx"
+RESEARCH_ACTIVITY_PANEL = FRONTEND / "features/chat/components/research-activity-panel.tsx"
 NATIVE_DIALOGS = REPO / "studio/src-tauri/src/native_file_dialogs.rs"
 NATIVE_CLIPBOARD = REPO / "studio/src-tauri/src/native_clipboard.rs"
 TAURI_MAIN = REPO / "studio/src-tauri/src/main.rs"
@@ -432,6 +434,32 @@ def test_tauri_collapse_removes_the_icon_rail_but_web_keeps_it():
     )
     assert "aria-hidden={(hasPinMode && !pinned && collapseToZero) || undefined}" in primitive
     assert "inert={(hasPinMode && !pinned && collapseToZero) || undefined}" in primitive
+
+
+def test_fixed_sheets_start_below_the_custom_titlebar():
+    provider = APP_PROVIDER.read_text(encoding = "utf-8")
+    sheet = SHEET.read_text(encoding = "utf-8")
+    research_activity_panel = RESEARCH_ACTIVITY_PANEL.read_text(encoding = "utf-8")
+
+    assert 'const CUSTOM_TITLEBAR_HEIGHT = "34px";' in provider
+    for property_name in (
+        "--studio-custom-titlebar-height",
+        "--studio-content-top-inset",
+        "--studio-hidden-route-top-inset",
+    ):
+        assert f'"{property_name}": CUSTOM_TITLEBAR_HEIGHT,' in provider
+    assert "<SheetViewportInsetProvider top={CUSTOM_TITLEBAR_HEIGHT}>" in provider
+    assert 'position === "fixed" && side !== "bottom"' in sheet
+    assert "{ top: viewportTopInset, ...style }" in sheet
+    assert "data-[side=left]:top-0 data-[side=left]:bottom-0" in sheet
+    assert "data-[side=right]:top-0" in sheet
+    assert "data-[side=right]:bottom-0" in sheet
+    assert "data-[side=left]:inset-y-0" not in sheet
+    assert "data-[side=right]:inset-y-0" not in sheet
+    assert "data-[side=left]:h-full" not in sheet
+    assert "data-[side=right]:h-full" not in sheet
+    assert "studio-custom-titlebar-height" not in research_activity_panel
+    assert 'variant === "sheet" && "h-full"' in research_activity_panel
 
 
 def test_visible_mac_sidebar_header_is_a_drag_region():
