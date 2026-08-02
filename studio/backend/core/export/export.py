@@ -995,7 +995,6 @@ class ExportBackend:
         imatrix_kw = {"imatrix_file": imatrix_file} if imatrix_file is not None else {}
 
         output_path: Optional[str] = None
-        model_tmp_to_cleanup: Optional[str] = None
         try:
             # Normalize to a lowercased list so multiple quants come from one model load.
             if isinstance(quantization_method, (list, tuple)):
@@ -1037,62 +1036,29 @@ class ExportBackend:
                 # On WSL, patch out sudo check before llama.cpp build
                 _apply_wsl_sudo_patch()
 
-                # convert_to_gguf writes output relative to cwd (repo root);
-                # snapshot existing .gguf so we can diff and relocate afterwards.
-                cwd = os.getcwd()
-                pre_existing_ggufs = set(glob.glob(os.path.join(cwd, "*.gguf")))
+                # Keep every intermediate below one directory created by this export. The model
+                # path and its derived _gguf sibling both stay inside this ownership boundary.
+                with tempfile.TemporaryDirectory(
+                    prefix = "_tmp_model_", dir = abs_save_dir
+                ) as model_tmp_root:
+                    _model_tmp = os.path.join(model_tmp_root, "model")
+                    _gguf_tmp = f"{_model_tmp}_gguf"
+                    os.mkdir(_gguf_tmp)
+                    self.current_model.save_pretrained_gguf(
+                        _model_tmp,
+                        self.current_tokenizer,
+                        quantization_method = quant_method,
+                        **imatrix_kw,
+                    )
 
-                pre_existing_subs = {d.name for d in Path(abs_save_dir).iterdir() if d.is_dir()}
-
-                # Avoid clobbering an existing user-owned model/ directory.
-                import uuid
-
-                _model_tmp = os.path.join(abs_save_dir, f"_tmp_model_{uuid.uuid4().hex[:8]}")
-                model_tmp_to_cleanup = _model_tmp
-                self.current_model.save_pretrained_gguf(
-                    _model_tmp,
-                    self.current_tokenizer,
-                    quantization_method = quant_method,
-                    **imatrix_kw,
-                )
-
-                # Relocate the .gguf that convert_to_gguf wrote to cwd (repo root).
-                new_ggufs = set(glob.glob(os.path.join(cwd, "*.gguf"))) - pre_existing_ggufs
-                for src in sorted(new_ggufs):
-                    dest = os.path.join(abs_save_dir, os.path.basename(src))
-                    shutil.move(src, dest)
-                    logger.info(f"Relocated GGUF: {os.path.basename(src)} → {abs_save_dir}/")
-
-                # Flatten GGUF files from subdirs created during this export.
-                for sub in list(Path(abs_save_dir).iterdir()):
-                    if not sub.is_dir():
-                        continue
-                    if sub.name in pre_existing_subs:
-                        continue
-                    for src in sub.glob("*.gguf"):
+                    for src in Path(_gguf_tmp).glob("*.gguf"):
                         dest = os.path.join(abs_save_dir, src.name)
                         shutil.move(str(src), dest)
                         logger.info(f"Relocated GGUF: {src.name} → {abs_save_dir}/")
-                    shutil.rmtree(str(sub), ignore_errors = True)
-                    logger.info(f"Cleaned up subdirectory: {sub.name}")
-
-                # For non-PEFT models, save_pretrained_gguf leaves a *_gguf dir at
-                # the checkpoint path; relocate its GGUFs and clean it up.
-                if self.current_checkpoint:
-                    ckpt = Path(self.current_checkpoint)
-                    gguf_dir = ckpt.parent / f"{ckpt.name}_gguf"
-                    if gguf_dir.is_dir() and gguf_dir.resolve() != Path(abs_save_dir).resolve():
-                        for src in gguf_dir.glob("*.gguf"):
-                            dest = os.path.join(abs_save_dir, src.name)
-                            shutil.move(str(src), dest)
-                            logger.info(f"Relocated GGUF: {src.name} → {abs_save_dir}/")
-                        # Also relocate Ollama Modelfile if present
-                        modelfile = gguf_dir / "Modelfile"
-                        if modelfile.is_file():
-                            shutil.move(str(modelfile), os.path.join(abs_save_dir, "Modelfile"))
-                            logger.info(f"Relocated Modelfile → {abs_save_dir}/")
-                        shutil.rmtree(str(gguf_dir), ignore_errors = True)
-                        logger.info(f"Cleaned up intermediate GGUF dir: {gguf_dir}")
+                    modelfile = Path(_gguf_tmp) / "Modelfile"
+                    if modelfile.is_file():
+                        shutil.move(str(modelfile), os.path.join(abs_save_dir, "Modelfile"))
+                        logger.info(f"Relocated Modelfile → {abs_save_dir}/")
 
                 # Write export metadata so the Chat page can identify the base model
                 self._write_export_metadata(abs_save_dir)
@@ -1131,8 +1097,6 @@ class ExportBackend:
             )
 
         except Exception as e:
-            if model_tmp_to_cleanup:
-                shutil.rmtree(model_tmp_to_cleanup, ignore_errors = True)
             logger.error(f"Error exporting GGUF model: {e}")
             import traceback
 

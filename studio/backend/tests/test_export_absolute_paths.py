@@ -287,9 +287,9 @@ def test_gguf_export_cleans_temp_dir_when_post_processing_fails(tmp_path, monkey
 
     class _Model:
         def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
-            Path(model_save_path).mkdir(parents = True)
+            Path(model_save_path).mkdir(parents = True, exist_ok = True)
             (Path(model_save_path) / "model.safetensors").write_bytes(b"weights")
-            (cwd / "converted.gguf").write_bytes(b"gguf")
+            (Path(f"{model_save_path}_gguf") / "converted.gguf").write_bytes(b"gguf")
 
     backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
     backend.current_model = _Model()
@@ -301,6 +301,59 @@ def test_gguf_export_cleans_temp_dir_when_post_processing_fails(tmp_path, monkey
     assert success is False
     assert "move failed" in message
     assert output_path is None
+    assert list(save_dir.glob("_tmp_model_*")) == []
+
+
+def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
+    _install_export_backend_stubs(monkeypatch)
+    export_mod = _load_module(
+        "test_core_export_backend_owned_temp", "core/export/export.py", monkeypatch
+    )
+
+    cwd = tmp_path / "cwd"
+    save_dir = tmp_path / "export"
+    checkpoint = tmp_path / "Qwen3-8B"
+    checkpoint_gguf = tmp_path / "Qwen3-8B_gguf"
+    cwd.mkdir()
+    checkpoint.mkdir()
+    checkpoint_gguf.mkdir()
+    notes = checkpoint_gguf / "notes.txt"
+    imatrix = checkpoint_gguf / "imatrix.dat"
+    old_gguf = checkpoint_gguf / "old.Q4_K_M.gguf"
+    concurrent_dir = save_dir / "user-created"
+    concurrent_cwd_gguf = cwd / "unrelated.gguf"
+    notes.write_text("keep", encoding = "utf-8")
+    imatrix.write_bytes(b"imatrix")
+    old_gguf.write_bytes(b"old")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
+
+    class _Model:
+        def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
+            output_dir = Path(f"{model_save_path}_gguf")
+            assert output_dir.is_dir()
+            (output_dir / "new.Q4_K_M.gguf").write_bytes(b"new")
+            (output_dir / "Modelfile").write_text("FROM new.Q4_K_M.gguf", encoding = "utf-8")
+            concurrent_dir.mkdir()
+            (concurrent_dir / "notes.txt").write_text("keep", encoding = "utf-8")
+            concurrent_cwd_gguf.write_bytes(b"unrelated")
+
+    backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
+    backend.current_model = _Model()
+    backend.current_tokenizer = object()
+    backend.current_checkpoint = str(checkpoint)
+
+    success, _, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+
+    assert success is True
+    assert output_path == str(save_dir.resolve())
+    assert (save_dir / "new.Q4_K_M.gguf").read_bytes() == b"new"
+    assert (save_dir / "Modelfile").is_file()
+    assert notes.read_text(encoding = "utf-8") == "keep"
+    assert imatrix.read_bytes() == b"imatrix"
+    assert old_gguf.read_bytes() == b"old"
+    assert (concurrent_dir / "notes.txt").read_text(encoding = "utf-8") == "keep"
+    assert concurrent_cwd_gguf.read_bytes() == b"unrelated"
     assert list(save_dir.glob("_tmp_model_*")) == []
 
 

@@ -1865,12 +1865,14 @@ def save_to_gguf(
     is_vlm: bool = False,
     is_gpt_oss: bool = False,
     imatrix = None,
+    gguf_directory: Optional[Union[str, os.PathLike]] = None,
 ):
     """
     Orchestrates the complete GGUF conversion process.
     Handles installation, conversion, and quantization.
     `imatrix` is a local importance-matrix path (already resolved); it is forwarded to
     llama-quantize and is required for the IQ low-bit quant types.
+    `gguf_directory` can place outputs separately from the model input directory.
     """
     # print_output True only if UNSLOTH_ENABLE_LOGGING=1
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
@@ -2040,7 +2042,10 @@ def save_to_gguf(
                 )
 
     # Move initial GGUF files into a dedicated _gguf directory
-    gguf_directory = f"{model_directory}_gguf"
+    if gguf_directory is None:
+        gguf_directory = f"{model_directory}_gguf"
+    else:
+        gguf_directory = os.fspath(gguf_directory)
     os.makedirs(gguf_directory, exist_ok = True)
     moved_files = []
     for fpath in initial_files:
@@ -3004,6 +3009,10 @@ def unsloth_save_pretrained_gguf(
     del arguments["is_processor"]
     del arguments["imatrix_file"]  # only used by the gguf quantize step, not the 16bit merge
 
+    # Keep the requested output independent from the source checkpoint. Non-PEFT models below
+    # reuse their existing weights as conversion input, but the caller still owns the destination.
+    gguf_directory = f"{save_directory}_gguf"
+
     # Step 3: Fix tokenizer BOS token if needed
     if is_processor:
         fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer.tokenizer)
@@ -3132,6 +3141,7 @@ def unsloth_save_pretrained_gguf(
             is_vlm = is_vlm,  # Pass VLM flag
             is_gpt_oss = is_gpt_oss,  # Pass gpt_oss Flag
             imatrix = imatrix_path,
+            gguf_directory = gguf_directory,
         )
     except Exception as e:
         if IS_KAGGLE_ENVIRONMENT:
@@ -3145,7 +3155,6 @@ def unsloth_save_pretrained_gguf(
             raise RuntimeError(f"Unsloth: GGUF conversion failed: {e}")
 
     # Step 9: Create Ollama modelfile
-    gguf_directory = f"{save_directory}_gguf"
     modelfile_location = None
     ollama_success = False
     if all_file_locations:
