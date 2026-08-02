@@ -16,6 +16,7 @@ llama version policy and the per-module caches its tests patch.
 from __future__ import annotations
 
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,8 @@ _INSTALL_MARKER_NAME = "UNSLOTH_PREBUILT_INFO.json"
 
 _marker_cache: dict[str, Optional[dict]] = {}
 _release_memo: dict[str, tuple[float, Optional[str]]] = {}
+_release_failed_at: dict[str, float] = {}
+_release_lock = threading.Lock()
 # Newest-release asset sizes (name -> bytes), memoized like the tag (24h TTL).
 _assets_memo: dict[str, tuple[float, dict[str, int]]] = {}
 
@@ -76,14 +79,16 @@ def _fetch_latest_release_tag(repo: str, timeout: float = 5.0) -> Optional[str]:
 def latest_published_release(repo: str, *, force_refresh: bool = False) -> Optional[str]:
     """Latest release tag for `repo`. Memo + disk-cached (24h TTL).
     None when offline and never previously cached."""
-    return _flow.latest_published_release(
-        repo,
-        force_refresh = force_refresh,
-        memo = _release_memo,
-        cache_dir = lambda: _cache_dir(),
-        fetch = lambda r: _fetch_latest_release_tag(r),
-        save = lambda r, tag: _save_disk_cache(r, tag),
-    )
+    with _release_lock:
+        return _flow.latest_published_release(
+            repo,
+            force_refresh = force_refresh,
+            memo = _release_memo,
+            failed_at = _release_failed_at,
+            cache_dir = lambda: _cache_dir(),
+            fetch = lambda r: _fetch_latest_release_tag(r),
+            save = lambda r, tag: _save_disk_cache(r, tag),
+        )
 
 
 def _fetch_latest_release_assets(repo: str, timeout: float = 5.0) -> Optional[dict[str, int]]:
@@ -231,8 +236,9 @@ def reset_caches(*, drop_disk: bool = False) -> None:
     (see its last-good fallback) and the banner could linger. Dropping the disk
     cache makes latest read as None in that offline case, so the banner fails
     open (off) instead of pointing at the just-replaced build."""
-    _flow.reset_caches(
-        (_marker_cache, _release_memo, _assets_memo),
-        drop_disk = drop_disk,
-        cache_dir = lambda: _cache_dir(),
-    )
+    with _release_lock:
+        _flow.reset_caches(
+            (_marker_cache, _release_memo, _release_failed_at, _assets_memo),
+            drop_disk = drop_disk,
+            cache_dir = lambda: _cache_dir(),
+        )

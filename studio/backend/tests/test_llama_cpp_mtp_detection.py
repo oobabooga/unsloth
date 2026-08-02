@@ -14,7 +14,9 @@ import inspect
 import os
 import struct
 import sys
+import time
 import types as _types
+from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec as _find_spec
 from pathlib import Path
 
@@ -1024,6 +1026,34 @@ def test_probe_server_capabilities_caches_by_mtime(tmp_path):
     caps2 = LlamaCppBackend.probe_server_capabilities(str(fake))
     assert caps2["mtp_token"] == "draft-mtp"
     assert caps2["supports_mtp"] is True
+
+
+def test_probe_server_capabilities_coalesces_concurrent_calls(tmp_path, monkeypatch):
+    fake = tmp_path / "llama-server"
+    fake.write_text("stub")
+    calls = []
+
+    def _run(*_args, **_kwargs):
+        calls.append(True)
+        time.sleep(0.02)
+        return _types.SimpleNamespace(
+            returncode = 0,
+            stdout = "--spec-type none,draft-mtp,ngram-mod",
+            stderr = "",
+        )
+
+    _clear_caps_cache()
+    monkeypatch.setattr("core.inference.llama_cpp.subprocess.run", _run)
+    with ThreadPoolExecutor(max_workers = 4) as pool:
+        results = list(
+            pool.map(
+                lambda _index: LlamaCppBackend.probe_server_capabilities(str(fake)),
+                range(4),
+            )
+        )
+
+    assert all(result["supports_mtp"] is True for result in results)
+    assert calls == [True]
 
 
 # spec_draft_n_max plumbing (first-class --spec-draft-n-max override).

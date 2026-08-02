@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import types as _types
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -185,8 +186,56 @@ def test_latest_published_release_uses_disk_cache(monkeypatch):
 
 
 def test_latest_published_release_returns_none_on_network_failure(monkeypatch):
-    monkeypatch.setattr(fr, "_fetch_latest_release_tag", lambda repo, timeout = 5.0: None)
+    calls = []
+
+    def _failed_fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
     assert fr.latest_published_release("unslothai/llama.cpp") is None
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+    assert calls == ["unslothai/llama.cpp"]
+
+
+def test_latest_published_release_retries_after_failure_ttl(monkeypatch):
+    now = [1000.0]
+    calls = []
+
+    monkeypatch.setattr(fr._flow.time, "time", lambda: now[0])
+
+    def _fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None if len(calls) == 1 else "b9999"
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _fetch)
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+    assert fr.latest_published_release("unslothai/llama.cpp") is None
+
+    now[0] += fr._flow.RELEASE_FAILURE_CACHE_TTL_SECONDS + 1
+    assert fr.latest_published_release("unslothai/llama.cpp") == "b9999"
+    assert calls == ["unslothai/llama.cpp", "unslothai/llama.cpp"]
+
+
+def test_latest_published_release_coalesces_concurrent_failures(monkeypatch):
+    calls = []
+
+    def _failed_fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        time.sleep(0.02)
+        return None
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
+    with ThreadPoolExecutor(max_workers = 4) as pool:
+        results = list(
+            pool.map(
+                lambda _index: fr.latest_published_release("unslothai/llama.cpp"),
+                range(4),
+            )
+        )
+
+    assert results == [None] * 4
+    assert calls == ["unslothai/llama.cpp"]
 
 
 def test_latest_published_release_keeps_old_cache_on_transient_failure(monkeypatch, tmp_path):
@@ -196,8 +245,16 @@ def test_latest_published_release_keeps_old_cache_on_transient_failure(monkeypat
     cache_file = cache_dir / "unslothai__llama.cpp.json"
     yesterday = time.time() - 25 * 60 * 60  # > 24h
     cache_file.write_text(json.dumps({"fetched_at": yesterday, "latest_tag": "b9000"}))
-    monkeypatch.setattr(fr, "_fetch_latest_release_tag", lambda repo, timeout = 5.0: None)
+    calls = []
+
+    def _failed_fetch(repo, timeout = 5.0):
+        calls.append(repo)
+        return None
+
+    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
     assert fr.latest_published_release("unslothai/llama.cpp") == "b9000"
+    assert fr.latest_published_release("unslothai/llama.cpp") == "b9000"
+    assert calls == ["unslothai/llama.cpp"]
 
 
 # check_prebuilt_freshness end-to-end.

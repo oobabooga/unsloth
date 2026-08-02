@@ -24,6 +24,9 @@ logger = structlog.get_logger(__name__)
 
 # 24h TTL keeps the GitHub call off the hot path and within rate limits.
 RELEASE_CACHE_TTL_SECONDS = 24 * 60 * 60
+# Briefly memoize failed lookups so recurring status reads do not retry an
+# unreachable GitHub endpoint on every request.
+RELEASE_FAILURE_CACHE_TTL_SECONDS = 60
 
 
 def read_install_marker(
@@ -175,6 +178,7 @@ def latest_published_release(
     *,
     force_refresh: bool,
     memo: dict[str, tuple[float, Optional[str]]],
+    failed_at: dict[str, float],
     cache_dir: Callable[[], Path],
     fetch: Callable[[str], Optional[str]],
     save: Callable[[str, Optional[str]], None],
@@ -185,6 +189,13 @@ def latest_published_release(
         return None
     now = time.time()
     if not force_refresh:
+        last_failure = failed_at.get(repo)
+        if last_failure is not None and now - last_failure < RELEASE_FAILURE_CACHE_TTL_SECONDS:
+            cached = memo.get(repo)
+            if cached:
+                return cached[1]
+            disk = load_disk_cache(repo, cache_dir())
+            return disk[1] if disk else None
         cached = memo.get(repo)
         if cached and now - cached[0] < RELEASE_CACHE_TTL_SECONDS:
             return cached[1]
@@ -194,12 +205,14 @@ def latest_published_release(
             return disk[1]
     latest = fetch(repo)
     if latest is None:
+        failed_at[repo] = now
         # Keep the last-good disk value rather than poison it with None.
         disk = load_disk_cache(repo, cache_dir())
         if disk:
             memo[repo] = disk
             return disk[1]
         return None
+    failed_at.pop(repo, None)
     memo[repo] = (now, latest)
     save(repo, latest)
     return latest
