@@ -298,6 +298,17 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
+def test_windows_webview_disables_browser_features():
+    source = TAURI_MAIN.read_text(encoding = "utf-8")
+    setup = source.split(".setup(|app|", 1)[1].split(".on_window_event", 1)[0]
+    guard = source.split("fn disable_windows_browser_features", 1)[1].split("\n}\n", 1)[0]
+
+    assert '#[cfg(windows)]\nfn disable_windows_browser_features' in source
+    assert "settings.SetAreBrowserAcceleratorKeysEnabled(false)" in guard
+    assert "settings.SetAreDefaultContextMenusEnabled(false)" in guard
+    assert '#[cfg(windows)]\n            disable_windows_browser_features(app)?;' in setup
+
+
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():
     source = APP_PROVIDER.read_text(encoding = "utf-8")
 

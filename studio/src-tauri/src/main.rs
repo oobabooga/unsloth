@@ -94,6 +94,39 @@ fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+#[cfg(windows)]
+fn disable_windows_browser_features(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows_core::Interface;
+
+    let window = app.get_webview_window("main").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
+    })?;
+    window.with_webview(|webview| unsafe {
+        let settings = match webview
+            .controller()
+            .CoreWebView2()
+            .and_then(|webview| webview.Settings())
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                warn!("Could not access Windows WebView settings: {error}");
+                return;
+            }
+        };
+        if let Err(error) = settings
+            .cast::<ICoreWebView2Settings3>()
+            .and_then(|settings| settings.SetAreBrowserAcceleratorKeysEnabled(false))
+        {
+            warn!("Could not disable Windows browser accelerator keys: {error}");
+        }
+        if let Err(error) = settings.SetAreDefaultContextMenusEnabled(false) {
+            warn!("Could not disable Windows default context menus: {error}");
+        }
+    })?;
+    Ok(())
+}
+
 /// A Tauri quit never fires beforeunload, so the frontend mirrors run state here.
 pub type TrainingActivityState = std::sync::Arc<std::sync::Mutex<bool>>;
 
@@ -393,6 +426,8 @@ fn main() {
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             setup_custom_titlebar(app)?;
+            #[cfg(windows)]
+            disable_windows_browser_features(app)?;
             setup_tray(app)?;
             #[cfg(unix)]
             setup_unix_termination_signals(app)?;
