@@ -96,6 +96,44 @@ def test_status_probes_run_off_event_loop(monkeypatch):
     assert response.llama_cpp_latest_tag == "b2"
 
 
+def test_blocked_status_probe_does_not_block_event_loop(monkeypatch):
+    _patch_status_dependencies(monkeypatch)
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    probe_finished = threading.Event()
+
+    def _blocked_probe(_backend):
+        probe_started.set()
+        release_probe.wait(timeout = 1)
+        probe_finished.set()
+        return True, {}
+
+    monkeypatch.setattr(inference_route, "_LLAMA_STATUS_PROBE_FUTURE", None)
+    monkeypatch.setattr(inference_route, "_probe_llama_cpp_status", _blocked_probe)
+
+    async def _run():
+        status_task = asyncio.create_task(
+            inference_route.get_status(current_subject = "test")
+        )
+
+        async def _wait_for_probe_start():
+            while not probe_started.is_set():
+                await asyncio.sleep(0)
+
+        try:
+            await asyncio.wait_for(_wait_for_probe_start(), timeout = 1)
+            assert await asyncio.create_task(asyncio.sleep(0, result = True))
+            assert not probe_finished.is_set()
+            assert not status_task.done()
+        finally:
+            release_probe.set()
+        return await status_task
+
+    response = asyncio.run(_run())
+
+    assert response.llama_cpp_supports_mtp is True
+
+
 def test_concurrent_status_probes_share_one_future(monkeypatch):
     source: Future = Future()
     submissions = []

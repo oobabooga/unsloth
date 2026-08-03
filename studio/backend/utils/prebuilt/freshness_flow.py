@@ -190,7 +190,9 @@ def latest_published_release(
     """
     if not repo:
         return None
-    now = time.time()
+    # Success timestamps persist to disk and need wall time. Failure timestamps
+    # are process-local and use monotonic time so clock changes cannot extend them.
+    wall_now = time.time()
     if not force_refresh:
         last_failure = failed_at.get(repo)
         if (
@@ -203,10 +205,10 @@ def latest_published_release(
             disk = load_disk_cache(repo, cache_dir())
             return disk[1] if disk else None
         cached = memo.get(repo)
-        if cached and now - cached[0] < RELEASE_CACHE_TTL_SECONDS:
+        if cached and wall_now - cached[0] < RELEASE_CACHE_TTL_SECONDS:
             return cached[1]
         disk = load_disk_cache(repo, cache_dir())
-        if disk and now - disk[0] < RELEASE_CACHE_TTL_SECONDS:
+        if disk and wall_now - disk[0] < RELEASE_CACHE_TTL_SECONDS:
             memo[repo] = disk
             return disk[1]
     latest = fetch(repo)
@@ -219,7 +221,7 @@ def latest_published_release(
             return disk[1]
         return None
     failed_at.pop(repo, None)
-    memo[repo] = (now, latest)
+    memo[repo] = (wall_now, latest)
     save(repo, latest)
     return latest
 

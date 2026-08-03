@@ -82,8 +82,9 @@ def latest_published_release(repo: str, *, force_refresh: bool = False) -> Optio
 
     Returns None when offline and never previously cached.
     """
-    # Explicit checks retain their pre-existing parallel behavior. Only recurring
-    # status reads serialize so they cannot occupy shared workers behind this lock.
+    # Explicit refreshes keep their existing parallel behavior and never queue
+    # behind a status poll. Ordinary reads serialize so overlapping polls share
+    # one fetch result.
     guard = nullcontext() if force_refresh else _release_lock
     with guard:
         return _flow.latest_published_release(
