@@ -94,34 +94,79 @@ fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(windows)]
-fn disable_windows_browser_features(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+#[cfg(all(windows, not(debug_assertions)))]
+fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_11;
+    use webview2_com::{AcceleratorKeyPressedEventHandler, ContextMenuRequestedEventHandler};
     use windows_core::Interface;
+    use windows_core::BOOL;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_F5, VK_R};
 
     let window = app.get_webview_window("main").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
     })?;
     window.with_webview(|webview| unsafe {
-        let settings = match webview
-            .controller()
-            .CoreWebView2()
-            .and_then(|webview| webview.Settings())
+        // Event handlers take effect immediately and avoid disabling unrelated browser features
+        // such as DevTools, keyboard zoom, spellcheck, and editing context menus.
+        let controller = webview.controller();
+        let accelerator_handler =
+            AcceleratorKeyPressedEventHandler::create(Box::new(move |_, event_args| {
+                let Some(event_args) = event_args else {
+                    return Ok(());
+                };
+                let mut virtual_key = 0;
+                event_args.VirtualKey(&mut virtual_key)?;
+                let control_down = GetKeyState(i32::from(VK_CONTROL)) < 0;
+                if virtual_key == u32::from(VK_F5)
+                    || (virtual_key == u32::from(VK_R) && control_down)
+                {
+                    event_args.SetHandled(true)?;
+                }
+                Ok(())
+            }));
+        let mut accelerator_token = 0;
+        if let Err(error) =
+            controller.add_AcceleratorKeyPressed(&accelerator_handler, &mut accelerator_token)
         {
-            Ok(settings) => settings,
+            warn!("Could not block Windows refresh shortcuts: {error}");
+        }
+
+        let core_webview = match controller.CoreWebView2() {
+            Ok(core_webview) => core_webview,
             Err(error) => {
-                warn!("Could not access Windows WebView settings: {error}");
+                warn!("Could not access the Windows WebView: {error}");
                 return;
             }
         };
-        if let Err(error) = settings
-            .cast::<ICoreWebView2Settings3>()
-            .and_then(|settings| settings.SetAreBrowserAcceleratorKeysEnabled(false))
+        let core_webview11 = match core_webview.cast::<ICoreWebView2_11>() {
+            Ok(core_webview11) => core_webview11,
+            Err(error) => {
+                warn!("Could not customize the Windows context menu: {error}");
+                return;
+            }
+        };
+        let context_menu_handler =
+            ContextMenuRequestedEventHandler::create(Box::new(move |_, event_args| {
+                let Some(event_args) = event_args else {
+                    return Ok(());
+                };
+                let target = event_args.ContextMenuTarget()?;
+                let mut is_editable = BOOL::default();
+                let mut has_selection = BOOL::default();
+                target.IsEditable(&mut is_editable)?;
+                target.HasSelection(&mut has_selection)?;
+                // Keep native editing and selection menus, but hide the browser page menu that
+                // exposes Refresh, Save as, Print, and other browser-only actions.
+                if !is_editable.as_bool() && !has_selection.as_bool() {
+                    event_args.SetHandled(true)?;
+                }
+                Ok(())
+            }));
+        let mut context_menu_token = 0;
+        if let Err(error) =
+            core_webview11.add_ContextMenuRequested(&context_menu_handler, &mut context_menu_token)
         {
-            warn!("Could not disable Windows browser accelerator keys: {error}");
-        }
-        if let Err(error) = settings.SetAreDefaultContextMenusEnabled(false) {
-            warn!("Could not disable Windows default context menus: {error}");
+            warn!("Could not filter the Windows context menu: {error}");
         }
     })?;
     Ok(())
@@ -426,8 +471,8 @@ fn main() {
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             setup_custom_titlebar(app)?;
-            #[cfg(windows)]
-            disable_windows_browser_features(app)?;
+            #[cfg(all(windows, not(debug_assertions)))]
+            setup_windows_browser_guards(app)?;
             setup_tray(app)?;
             #[cfg(unix)]
             setup_unix_termination_signals(app)?;

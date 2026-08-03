@@ -298,15 +298,24 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
-def test_windows_webview_disables_browser_features():
+def test_windows_webview_filters_refresh_without_disabling_editing_features():
     source = TAURI_MAIN.read_text(encoding = "utf-8")
     setup = source.split(".setup(|app|", 1)[1].split(".on_window_event", 1)[0]
-    guard = source.split("fn disable_windows_browser_features", 1)[1].split("\n}\n", 1)[0]
+    guard = source.split("fn setup_windows_browser_guards", 1)[1].split("\n}\n", 1)[0]
 
-    assert '#[cfg(windows)]\nfn disable_windows_browser_features' in source
-    assert "settings.SetAreBrowserAcceleratorKeysEnabled(false)" in guard
-    assert "settings.SetAreDefaultContextMenusEnabled(false)" in guard
-    assert '#[cfg(windows)]\n            disable_windows_browser_features(app)?;' in setup
+    assert '#[cfg(all(windows, not(debug_assertions)))]\nfn setup_windows_browser_guards' in source
+    assert "AcceleratorKeyPressedEventHandler::create" in guard
+    assert "VK_CONTROL, VK_F5, VK_R" in guard
+    assert "event_args.SetHandled(true)?;" in guard
+    assert "ContextMenuRequestedEventHandler::create" in guard
+    assert "target.IsEditable(&mut is_editable)?;" in guard
+    assert "target.HasSelection(&mut has_selection)?;" in guard
+    assert "SetAreBrowserAcceleratorKeysEnabled" not in guard
+    assert "SetAreDefaultContextMenusEnabled" not in guard
+    assert (
+        '#[cfg(all(windows, not(debug_assertions)))]\n'
+        '            setup_windows_browser_guards(app)?;'
+    ) in setup
 
 
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():
