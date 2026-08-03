@@ -1038,9 +1038,9 @@ class ExportBackend:
 
                 # Keep every intermediate below one directory created by this export. The model
                 # path and its derived _gguf sibling both stay inside this ownership boundary.
-                with tempfile.TemporaryDirectory(
-                    prefix = "_tmp_model_", dir = abs_save_dir
-                ) as model_tmp_root:
+                # Cleanup must not replace a successful export or the original conversion error.
+                model_tmp_root = tempfile.mkdtemp(prefix = "_tmp_model_", dir = abs_save_dir)
+                try:
                     _model_tmp = os.path.join(model_tmp_root, "model")
                     _gguf_tmp = f"{_model_tmp}_gguf"
                     os.mkdir(_gguf_tmp)
@@ -1051,14 +1051,23 @@ class ExportBackend:
                         **imatrix_kw,
                     )
 
-                    for src in Path(_gguf_tmp).glob("*.gguf"):
+                    relocated_ggufs = []
+                    for src in sorted(Path(_gguf_tmp).glob("*.gguf")):
                         dest = os.path.join(abs_save_dir, src.name)
                         shutil.move(str(src), dest)
+                        relocated_ggufs.append(dest)
                         logger.info(f"Relocated GGUF: {src.name} → {abs_save_dir}/")
+                    if not relocated_ggufs:
+                        raise RuntimeError(
+                            "GGUF conversion produced no files in its output directory"
+                        )
+
                     modelfile = Path(_gguf_tmp) / "Modelfile"
                     if modelfile.is_file():
                         shutil.move(str(modelfile), os.path.join(abs_save_dir, "Modelfile"))
                         logger.info(f"Relocated Modelfile → {abs_save_dir}/")
+                finally:
+                    shutil.rmtree(model_tmp_root, ignore_errors = True)
 
                 # Write export metadata so the Chat page can identify the base model
                 self._write_export_metadata(abs_save_dir)

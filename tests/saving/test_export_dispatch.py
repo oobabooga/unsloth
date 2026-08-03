@@ -9,6 +9,7 @@ regressions that pure AST checks cannot (e.g. wrong scheme/suffix/outtype passed
 from __future__ import annotations
 
 import inspect
+import os
 
 import pytest
 
@@ -138,7 +139,10 @@ def test_gguf_lora_push_to_hub_is_rejected(tmp_path):
         )
 
 
-def test_non_peft_gguf_uses_checkpoint_as_input_not_output(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trailing_separator", [False, True])
+def test_non_peft_gguf_uses_checkpoint_as_input_not_output(
+    monkeypatch, tmp_path, trailing_separator
+):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     requested = tmp_path / "export" / "model"
@@ -172,9 +176,10 @@ def test_non_peft_gguf_uses_checkpoint_as_input_not_output(monkeypatch, tmp_path
 
     monkeypatch.setattr(save_mod, "save_to_gguf", _save_to_gguf)
 
+    requested_arg = f"{requested}{os.sep}" if trailing_separator else str(requested)
     result = save_mod.unsloth_save_pretrained_gguf(
         model,
-        str(requested),
+        requested_arg,
         tokenizer = tokenizer,
         quantization_method = "q8_0",
     )

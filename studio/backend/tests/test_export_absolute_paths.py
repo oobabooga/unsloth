@@ -304,6 +304,71 @@ def test_gguf_export_cleans_temp_dir_when_post_processing_fails(tmp_path, monkey
     assert list(save_dir.glob("_tmp_model_*")) == []
 
 
+def test_gguf_export_fails_when_owned_output_has_no_gguf(tmp_path, monkeypatch):
+    _install_export_backend_stubs(monkeypatch)
+    export_mod = _load_module(
+        "test_core_export_backend_empty_owned_output", "core/export/export.py", monkeypatch
+    )
+
+    save_dir = tmp_path / "export"
+    checkpoint_gguf = tmp_path / "checkpoint_gguf"
+    monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
+
+    class _Model:
+        def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
+            checkpoint_gguf.mkdir()
+            (checkpoint_gguf / "misdirected.gguf").write_bytes(b"gguf")
+
+    backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
+    backend.current_model = _Model()
+    backend.current_tokenizer = object()
+    backend.current_checkpoint = str(tmp_path / "checkpoint")
+
+    success, message, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+
+    assert success is False
+    assert "produced no files" in message
+    assert output_path is None
+    assert (checkpoint_gguf / "misdirected.gguf").read_bytes() == b"gguf"
+    assert not (save_dir / "export_metadata.json").exists()
+    assert list(save_dir.glob("_tmp_model_*")) == []
+
+
+def test_gguf_export_ignores_owned_temp_cleanup_failure(tmp_path, monkeypatch):
+    _install_export_backend_stubs(monkeypatch)
+    export_mod = _load_module(
+        "test_core_export_backend_cleanup_failure", "core/export/export.py", monkeypatch
+    )
+
+    save_dir = tmp_path / "export"
+    monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
+
+    class _Model:
+        def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
+            (Path(f"{model_save_path}_gguf") / "converted.gguf").write_bytes(b"gguf")
+
+    cleanup_calls = []
+
+    def _fail_unless_ignored(path, ignore_errors = False):
+        assert ignore_errors is True
+        cleanup_calls.append(Path(path))
+
+    monkeypatch.setattr(export_mod.shutil, "rmtree", _fail_unless_ignored)
+    backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
+    backend.current_model = _Model()
+    backend.current_tokenizer = object()
+    backend.current_checkpoint = None
+
+    success, message, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+
+    assert success is True, message
+    assert output_path == str(save_dir.resolve())
+    assert (save_dir / "converted.gguf").read_bytes() == b"gguf"
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0].parent == save_dir
+    assert list(save_dir.glob("_tmp_model_*")) == cleanup_calls
+
+
 def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
     _install_export_backend_stubs(monkeypatch)
     export_mod = _load_module(
