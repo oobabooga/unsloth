@@ -341,8 +341,12 @@ def test_first_app_layout_survives_a_stale_setup_window_size():
 
 def test_hidden_desktop_routes_scroll_without_moving_custom_titlebar():
     source = APP_PROVIDER.read_text(encoding = "utf-8")
+    compact_source = " ".join(source.split())
     hidden_routes = source.split("const HIDDEN_TITLEBAR_SIDEBAR_ROUTES", 1)[1].split(
         "]);", 1
+    )[0]
+    native_mac_chrome = source.split("if (usesNativeMacTitlebar)", 1)[1].split(
+        "return <>{content}</>;", 1
     )[0]
     custom_chrome = source.split("const showSidebarSurface", 1)[1].split(
         "function AppearanceCustomizationEffect", 1
@@ -350,12 +354,14 @@ def test_hidden_desktop_routes_scroll_without_moving_custom_titlebar():
 
     assert '"/onboarding"' in hidden_routes
     assert (
-        'const contentOverflowClass = hidesTitlebarSidebar\n'
-        '    ? "overflow-x-hidden overflow-y-auto"\n'
-        '    : "overflow-hidden";'
-        in source
+        'const contentOverflowClass = hidesTitlebarSidebar '
+        '? "overflow-x-hidden overflow-y-auto" : "overflow-hidden";'
+        in compact_source
     )
-    assert source.count("${contentOverflowClass}") == 2
+    assert (
+        'className={`relative h-dvh min-h-0 bg-background ${contentOverflowClass}`}'
+        in native_mac_chrome
+    )
     assert 'className="relative h-dvh min-h-0 overflow-hidden bg-background"' in custom_chrome
     assert 'className={`h-full min-h-0 ${contentOverflowClass}`}' in custom_chrome
 
