@@ -461,7 +461,7 @@ fn main() {
                 // Hide window instead of closing, because this is a tray app.
                 // Processes keep running so the backend stays available.
                 // Full cleanup happens via:
-                //   - Tray "Quit" menu item (explicit user action)
+                //   - Explicit Quit actions from the tray or profile menu
                 //   - The Unix termination signal listener (logout, kill, Ctrl-C)
                 //   - RunEvent::Exit, for framework-driven exits
                 let _ = window.hide();

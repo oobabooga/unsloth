@@ -306,16 +306,18 @@ def test_desktop_window_exposes_native_quit_with_tray_cleanup():
     ).read_text(encoding = "utf-8")
 
     quit_app = main.split("fn quit_app", 1)[1].split("\n}\n", 1)[0]
-    tray_quit = main.split('"quit" =>', 1)[1].split("\n", 5)
+    tray_menu = main.split(".on_menu_event", 1)[1].split(".on_tray_icon_event", 1)[0]
+    tray_quit = tray_menu.split('"quit" =>', 1)[1].split("_ => {}", 1)[0]
+    invoke_handler = main.split("tauri::generate_handler![", 1)[1].split("])", 1)[0]
 
     assert "QuitRequest::begin()" in quit_app
     assert "confirm_quit_during_install(&app)" in quit_app
     assert "confirm_quit_during_training(&app)" in quit_app
     assert "cleanup_child_processes(&app)" in quit_app
     assert "app.exit(0)" in quit_app
-    assert any("quit_app(app.clone())" in line for line in tray_quit)
+    assert "quit_app(app.clone())" in tray_quit
     assert "fn quit_app(app: tauri::AppHandle)" in main
-    assert "            quit_app," in main
+    assert "quit_app," in invoke_handler
 
     assert 'await invoke("quit_app")' in sidebar
     assert 'isTauri ? "common.quit" : "common.shutdown"' in sidebar
