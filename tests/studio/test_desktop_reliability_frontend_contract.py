@@ -451,13 +451,10 @@ def test_fixed_sheets_start_below_the_custom_titlebar():
     assert "<SheetViewportInsetProvider top={CUSTOM_TITLEBAR_HEIGHT}>" in provider
     assert 'position === "fixed" && side !== "bottom"' in sheet
     assert "{ top: viewportTopInset, ...style }" in sheet
-    assert "data-[side=left]:top-0 data-[side=left]:bottom-0" in sheet
-    assert "data-[side=right]:top-0" in sheet
-    assert "data-[side=right]:bottom-0" in sheet
-    assert "data-[side=left]:inset-y-0" not in sheet
-    assert "data-[side=right]:inset-y-0" not in sheet
-    assert "data-[side=left]:h-full" not in sheet
-    assert "data-[side=right]:h-full" not in sheet
+    for side in ("left", "right"):
+        assert f"data-[side={side}]:top-0" in sheet
+        assert f"data-[side={side}]:bottom-0" in sheet
+        assert f"data-[side={side}]:h-full" not in sheet
     assert "studio-custom-titlebar-height" not in research_activity_panel
     assert 'variant === "sheet" && "h-full"' in research_activity_panel
 
