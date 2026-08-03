@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   MAX_AUDIO_SIZE,
   MAX_AUDIO_SIZE_LABEL,
+  getAudioSizeError,
 } from "../src/lib/audio-utils.ts";
 
 test("chat audio uses the backend's raw upload limit", () => {
@@ -24,4 +25,12 @@ test("chat audio uses the backend's raw upload limit", () => {
   assert.ok(Number.isInteger(limitMb));
   assert.equal(MAX_AUDIO_SIZE, limitMb * 1024 * 1024);
   assert.equal(MAX_AUDIO_SIZE_LABEL, `${limitMb}MB`);
+});
+
+test("chat audio accepts the exact limit and explains oversized files", () => {
+  assert.equal(getAudioSizeError(MAX_AUDIO_SIZE), null);
+  assert.equal(
+    getAudioSizeError(MAX_AUDIO_SIZE + 1),
+    `Audio size exceeds ${MAX_AUDIO_SIZE_LABEL} limit`,
+  );
 });

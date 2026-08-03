@@ -42,9 +42,7 @@ export function formatFastApiDetail(detail: unknown): string | null {
  * OpenAI-compatible `{error: {message}}` envelope. Keep both response shapes
  * readable for frontend callers that can reach either API surface.
  */
-export function formatApiErrorBody(
-  body: unknown,
-): string | null {
+export function formatApiErrorBody(body: unknown): string | null {
   if (!body || typeof body !== "object") return null;
 
   const payload = body as {
