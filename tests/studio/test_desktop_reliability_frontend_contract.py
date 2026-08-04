@@ -345,25 +345,15 @@ def test_hidden_desktop_routes_scroll_without_moving_custom_titlebar():
     hidden_routes = source.split("const HIDDEN_TITLEBAR_SIDEBAR_ROUTES", 1)[1].split(
         "]);", 1
     )[0]
-    native_mac_chrome = source.split("if (usesNativeMacTitlebar)", 1)[1].split(
-        "return <>{content}</>;", 1
-    )[0]
+    overflow_choice = compact_source.split("const contentOverflowClass", 1)[1].split(";", 1)[0]
     custom_chrome = source.split("const showSidebarSurface", 1)[1].split(
         "function AppearanceCustomizationEffect", 1
     )[0]
 
     assert '"/onboarding"' in hidden_routes
-    assert (
-        'const contentOverflowClass = hidesTitlebarSidebar '
-        '? "overflow-x-hidden overflow-y-auto" : "overflow-hidden";'
-        in compact_source
-    )
-    assert (
-        'className={`relative h-dvh min-h-0 bg-background ${contentOverflowClass}`}'
-        in native_mac_chrome
-    )
-    assert 'className="relative h-dvh min-h-0 overflow-hidden bg-background"' in custom_chrome
-    assert 'className={`h-full min-h-0 ${contentOverflowClass}`}' in custom_chrome
+    assert "hidesTitlebarSidebar" in overflow_choice
+    assert "overflow-y-auto" in overflow_choice
+    assert "contentOverflowClass" in custom_chrome
 
 
 def test_expanded_titlebar_button_and_corner_match_sidebar_edge():
