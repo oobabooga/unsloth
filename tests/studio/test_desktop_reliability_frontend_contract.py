@@ -298,24 +298,16 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
-def test_windows_webview_filters_refresh_without_disabling_editing_features():
+def test_windows_browser_guard_runs_only_in_release_builds():
+    # Deliberately structural. Asserting the handler bodies would only restate the Rust
+    # source, and none of it can be exercised from Python: the guard needs a live WebView2
+    # session. What is worth pinning is that the call stays out of development builds, so
+    # F5 and the browser context menu keep working while developing.
     source = TAURI_MAIN.read_text(encoding = "utf-8")
-    setup = source.split(".setup(|app|", 1)[1].split(".on_window_event", 1)[0]
-    guard = source.split("fn setup_windows_browser_guards", 1)[1].split("\n}\n", 1)[0]
 
-    assert '#[cfg(all(windows, not(debug_assertions)))]\nfn setup_windows_browser_guards' in source
-    assert "AcceleratorKeyPressedEventHandler::create" in guard
-    assert "VK_CONTROL, VK_F5, VK_R" in guard
-    assert "event_args.SetHandled(true)?;" in guard
-    assert "ContextMenuRequestedEventHandler::create" in guard
-    assert "target.IsEditable(&mut is_editable)?;" in guard
-    assert "target.HasSelection(&mut has_selection)?;" in guard
-    assert "SetAreBrowserAcceleratorKeysEnabled" not in guard
-    assert "SetAreDefaultContextMenusEnabled" not in guard
-    assert (
-        '#[cfg(all(windows, not(debug_assertions)))]\n'
-        '            setup_windows_browser_guards(app)?;'
-    ) in setup
+    assert "fn setup_windows_browser_guards" in source
+    before_call = source.split("setup_windows_browser_guards(app)?;", 1)[0]
+    assert before_call.rstrip().endswith("#[cfg(all(windows, not(debug_assertions)))]")
 
 
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():

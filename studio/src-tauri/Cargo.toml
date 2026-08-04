@@ -47,9 +47,14 @@ gtk = "0.18"
 elevated-command = "1.1.2"
 
 [target.'cfg(windows)'.dependencies]
+# webview2-com must resolve to the same major that Tauri's PlatformWebview::controller()
+# returns, and windows-core to the major webview2-com builds its interfaces on. Tauri
+# re-exports neither, so a Tauri bump can leave Cargo resolving two copies side by side.
+# That is a compile error rather than a silent misbehaviour, and setup_windows_browser_guards
+# in main.rs annotates the controller type so the error names the crate. Only Windows builds
+# compile that code, so a skew surfaces there first.
 webview2-com = "0.38"
 windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
-# Keep this aligned with webview2-com because its COM interfaces use this type version.
 windows-core = "0.61.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
 

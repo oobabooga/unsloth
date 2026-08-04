@@ -94,9 +94,16 @@ fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+// Compiled on every Windows build, but only called in release. Gating the body on
+// `debug_assertions` too would hide a `webview2-com` / Tauri version skew until the
+// release build, which no pull request job compiles.
+#[cfg(windows)]
+#[cfg_attr(debug_assertions, allow(dead_code))]
 fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_11;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Controller, ICoreWebView2_11, COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND,
+        COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_PAGE,
+    };
     use webview2_com::{AcceleratorKeyPressedEventHandler, ContextMenuRequestedEventHandler};
     use windows_core::Interface;
     use windows_core::BOOL;
@@ -108,7 +115,12 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
     window.with_webview(|webview| unsafe {
         // Event handlers take effect immediately and avoid disabling unrelated browser features
         // such as DevTools, keyboard zoom, spellcheck, and editing context menus.
-        let controller = webview.controller();
+        //
+        // The annotation is deliberate: Tauri does not re-export `webview2-com`, so this crate
+        // depends on it directly. If a Tauri bump moves `controller()` to a different
+        // `webview2-com` major, this line fails with "perhaps two different versions of crate
+        // `webview2_com` are being used" instead of an opaque error inside the handler calls.
+        let controller: ICoreWebView2Controller = webview.controller();
         let accelerator_handler =
             AcceleratorKeyPressedEventHandler::create(Box::new(move |_, event_args| {
                 let Some(event_args) = event_args else {
@@ -151,13 +163,24 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
                     return Ok(());
                 };
                 let target = event_args.ContextMenuTarget()?;
+                let mut kind = COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND::default();
                 let mut is_editable = BOOL::default();
+                let mut has_link_uri = BOOL::default();
                 let mut has_selection = BOOL::default();
+                target.Kind(&mut kind)?;
                 target.IsEditable(&mut is_editable)?;
+                target.HasLinkUri(&mut has_link_uri)?;
                 target.HasSelection(&mut has_selection)?;
-                // Keep native editing and selection menus, but hide the browser page menu that
-                // exposes Refresh, Save as, Print, and other browser-only actions.
-                if !is_editable.as_bool() && !has_selection.as_bool() {
+                // Only the bare page menu is browser chrome worth hiding, because it is the one
+                // offering Refresh, Save as, and Print. Every other target keeps its native menu:
+                // Image, Audio and Video carry Save as and Copy, links carry Copy link address,
+                // and editable or selected targets carry the editing commands. WebView2 reports
+                // links as a Page target with a link URI rather than a kind of its own.
+                let is_bare_page = kind == COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_PAGE
+                    && !is_editable.as_bool()
+                    && !has_link_uri.as_bool()
+                    && !has_selection.as_bool();
+                if is_bare_page {
                     event_args.SetHandled(true)?;
                 }
                 Ok(())
