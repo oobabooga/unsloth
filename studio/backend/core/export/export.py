@@ -1042,17 +1042,27 @@ class ExportBackend:
                 model_tmp_root = tempfile.mkdtemp(prefix = "_tmp_model_", dir = abs_save_dir)
                 try:
                     _model_tmp = os.path.join(model_tmp_root, "model")
-                    _gguf_tmp = f"{_model_tmp}_gguf"
-                    os.mkdir(_gguf_tmp)
-                    self.current_model.save_pretrained_gguf(
+                    _gguf_tmp = Path(f"{_model_tmp}_gguf")
+                    _gguf_tmp.mkdir()
+                    result = self.current_model.save_pretrained_gguf(
                         _model_tmp,
                         self.current_tokenizer,
                         quantization_method = quant_method,
                         **imatrix_kw,
                     )
 
+                    # save.py owns the output-directory convention and reports it back, so read
+                    # it instead of re-deriving the _gguf suffix here. Honor it only while it
+                    # stays inside the root this export created; anything outside is not ours to
+                    # move from, and falling back leaves the empty-output check to reject it.
+                    reported = result.get("gguf_directory") if isinstance(result, dict) else None
+                    if reported:
+                        reported_dir = Path(reported).resolve()
+                        if reported_dir.is_relative_to(Path(model_tmp_root).resolve()):
+                            _gguf_tmp = reported_dir
+
                     relocated_ggufs = []
-                    for src in sorted(Path(_gguf_tmp).glob("*.gguf")):
+                    for src in sorted(_gguf_tmp.glob("*.gguf")):
                         dest = os.path.join(abs_save_dir, src.name)
                         shutil.move(str(src), dest)
                         relocated_ggufs.append(dest)
@@ -1062,7 +1072,7 @@ class ExportBackend:
                             "GGUF conversion produced no files in its output directory"
                         )
 
-                    modelfile = Path(_gguf_tmp) / "Modelfile"
+                    modelfile = _gguf_tmp / "Modelfile"
                     if modelfile.is_file():
                         shutil.move(str(modelfile), os.path.join(abs_save_dir, "Modelfile"))
                         logger.info(f"Relocated Modelfile → {abs_save_dir}/")

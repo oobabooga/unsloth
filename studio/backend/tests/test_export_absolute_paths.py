@@ -467,6 +467,38 @@ def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch, merges_into_
     assert list(save_dir.glob("_tmp_model_*")) == []
 
 
+def test_gguf_export_ignores_reported_output_outside_owned_root(tmp_path, monkeypatch):
+    _install_export_backend_stubs(monkeypatch)
+    export_mod = _load_module(
+        "test_core_export_backend_unowned_report", "core/export/export.py", monkeypatch
+    )
+
+    save_dir = tmp_path / "export"
+    checkpoint_gguf = tmp_path / "checkpoint_gguf"
+    checkpoint_gguf.mkdir()
+    (checkpoint_gguf / "unowned.Q4_K_M.gguf").write_bytes(b"unowned")
+    monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
+
+    class _Model:
+        def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
+            # A convention drift that lands outside the export-owned root must not
+            # authorize moving the user's files.
+            return {"gguf_directory": str(checkpoint_gguf)}
+
+    backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
+    backend.current_model = _Model()
+    backend.current_tokenizer = object()
+    backend.current_checkpoint = None
+
+    success, message, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+
+    assert success is False
+    assert "produced no files" in message
+    assert output_path is None
+    assert (checkpoint_gguf / "unowned.Q4_K_M.gguf").read_bytes() == b"unowned"
+    assert list(save_dir.glob("_tmp_model_*")) == []
+
+
 def test_save_directory_validator_rejects_windows_parent_segments(monkeypatch):
     _install_pydantic_stub(monkeypatch)
     export_models = _load_module("test_models_export", "models/export.py", monkeypatch)
