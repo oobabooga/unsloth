@@ -23,7 +23,7 @@ const yaml = await import("js-yaml");
 const { useTrainingConfigStore } = await import(
   "../src/features/training/stores/training-config-store.ts"
 );
-const { parseYamlConfig } = await import(
+const { parseYamlConfig, serializeConfigToYaml } = await import(
   "../src/features/training/lib/yaml-config.ts"
 );
 const { mapBackendModelConfigToTrainingPatch } = await import(
@@ -144,4 +144,33 @@ test("a blank number is treated as absent, not as zero", () => {
     0,
     "a real 0 still applies; only the blank is ignored",
   );
+});
+
+test("saving and reloading a config keeps the logging settings", () => {
+  seedTunedModelDefaults();
+  useTrainingConfigStore.setState({
+    enableWandb: true,
+    wandbProject: "my-project",
+    enableTensorboard: true,
+    tensorboardDir: "my-runs",
+    logFrequency: 25,
+  });
+
+  const saved = serializeConfigToYaml(useTrainingConfigStore.getState(), false);
+
+  useTrainingConfigStore.setState({
+    enableWandb: false,
+    wandbProject: "",
+    enableTensorboard: false,
+    tensorboardDir: "",
+    logFrequency: 1,
+  });
+  importConfig(saved);
+
+  const after = useTrainingConfigStore.getState();
+  assert.equal(after.enableWandb, true);
+  assert.equal(after.wandbProject, "my-project");
+  assert.equal(after.enableTensorboard, true);
+  assert.equal(after.tensorboardDir, "my-runs");
+  assert.equal(after.logFrequency, 25);
 });

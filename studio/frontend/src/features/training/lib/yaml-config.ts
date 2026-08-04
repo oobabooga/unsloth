@@ -105,6 +105,16 @@ export function serializeConfigToYaml(
   const config = {
     training,
     lora,
+    // parseYamlConfig reads this section back and every shipped model config
+    // ships one, so leaving it out loses the user's wandb/tensorboard settings
+    // on the next load.
+    logging: {
+      enable_wandb: state.enableWandb,
+      wandb_project: state.wandbProject,
+      enable_tensorboard: state.enableTensorboard,
+      tensorboard_dir: state.tensorboardDir,
+      log_frequency: state.logFrequency,
+    },
   };
 
   return yaml.dump(config, { lineWidth: -1, noRefs: true });
