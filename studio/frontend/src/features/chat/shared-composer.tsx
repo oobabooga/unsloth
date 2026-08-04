@@ -30,7 +30,11 @@ import {
 } from "@/features/chat/adapters/studio-dictation-adapter";
 import type { StudioDictationSession } from "@/features/chat/adapters/studio-web-speech-dictation-adapter";
 import { useVoiceSettingsStore } from "@/features/settings/stores/voice-settings-store";
-import { AUDIO_ACCEPT, MAX_AUDIO_SIZE, fileToBase64 } from "@/lib/audio-utils";
+import {
+  AUDIO_ACCEPT,
+  fileToBase64,
+  getAudioSizeError,
+} from "@/lib/audio-utils";
 import { isTauri } from "@/lib/api-base";
 import { isDownloadCancelled } from "@/lib/native-files";
 import { isMultimodalResponse } from "./types/api";
@@ -851,11 +855,17 @@ export function SharedComposer({
       if (!files?.length) return;
       const next: PendingImage[] = [];
       let droppedImageForUnavailable = false;
+      let audioSizeError: string | null = null;
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         if (!file) continue;
         // Handle audio files
-        if (file.type.match(/^audio\//i) && file.size <= MAX_AUDIO_SIZE) {
+        if (file.type.match(/^audio\//i)) {
+          const sizeError = getAudioSizeError(file.size);
+          if (sizeError) {
+            audioSizeError ??= sizeError;
+            continue;
+          }
           fileToBase64(file).then((base64) => {
             setPendingAudio({ name: file.name, base64, contentType: file.type });
             setPendingAudioStore(base64, file.name);
@@ -874,6 +884,9 @@ export function SharedComposer({
       if (droppedImageForUnavailable && attachUnavailableReason) {
         toast.error(attachUnavailableReason);
       }
+      if (audioSizeError) {
+        toast.error(audioSizeError);
+      }
       setPendingImages((prev) => [...prev, ...next]);
     },
     [setPendingAudioStore, attachUnavailableReason],
@@ -884,9 +897,11 @@ export function SharedComposer({
       pasteClipboardFiles(
         event,
         async (files) => {
+          // Oversized audio counts as recognized so `addFiles` can name the
+          // limit; rejecting it here would fall back to the generic message.
           const supported = files.some(
             (file) =>
-              (file.type.match(/^audio\//i) && file.size <= MAX_AUDIO_SIZE) ||
+              file.type.match(/^audio\//i) ||
               (file.type.match(/^image\/(jpeg|png|webp|gif)$/i) &&
                 file.size <= MAX_IMAGE_SIZE),
           );
