@@ -149,10 +149,10 @@ jobs:
               print(f'pypi_version={pypi_version}', file=output)
           PY
 
-      # One version string must mean exactly one set of signed binaries. Assets
-      # are uploaded without --clobber, so a rerun of an already-released
-      # version fails in publish-release anyway; catching it here costs seconds
-      # instead of three platform builds and a notarization round trip.
+      # One version string must mean exactly one set of signed binaries, so
+      # publish-release refuses a version that already has a tag or a release.
+      # Repeating that check here costs seconds instead of three platform
+      # builds and a notarization round trip.
       - name: Guard against republishing an existing version
         shell: bash
         env:
@@ -161,8 +161,12 @@ jobs:
           DESKTOP_RELEASE_TAG: ${{ steps.prepare.outputs.desktop_release_tag }}
         run: |
           set -euo pipefail
+          # `gh release delete` keeps the tag unless it is told otherwise, and a
+          # leftover tag alone is enough to fail this step, so spell the retry out.
+          retry_hint="To retry a failed publish of this version, remove the release and its tag together: gh release delete ${DESKTOP_RELEASE_TAG} --cleanup-tag"
           if gh api "repos/${GH_REPO}/git/ref/tags/${DESKTOP_RELEASE_TAG}" >/dev/null 2>&1; then
             echo "Tag ${DESKTOP_RELEASE_TAG} already exists. Release a new studio_version instead of rebuilding a shipped one." >&2
+            echo "$retry_hint" >&2
             exit 1
           fi
           # A draft carries no tag ref yet, only a pending target commitish, and
@@ -171,6 +175,7 @@ jobs:
           # contents:write token, which does, before it creates anything.
           if gh release view "$DESKTOP_RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release ${DESKTOP_RELEASE_TAG} already exists. Release a new studio_version instead of rebuilding a shipped one." >&2
+            echo "$retry_hint" >&2
             exit 1
           fi
 
@@ -1279,7 +1284,9 @@ jobs:
           if gh api "repos/${GH_REPO}/git/ref/tags/${DESKTOP_RELEASE_TAG}" >/dev/null 2>&1 \
             || gh release view "$DESKTOP_RELEASE_TAG" >/dev/null 2>&1; then
             echo "Refusing to republish ${DESKTOP_RELEASE_TAG}: a release or tag for this version already exists." >&2
-            echo "Delete it deliberately or release a new studio_version; one version tag serves one set of binaries." >&2
+            echo "Release a new studio_version, or, to retry this one, remove the release and its tag together:" >&2
+            echo "  gh release delete ${DESKTOP_RELEASE_TAG} --cleanup-tag" >&2
+            echo "A plain 'gh release delete' leaves the tag behind, which this guard also rejects." >&2
             exit 1
           fi
 
