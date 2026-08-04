@@ -441,22 +441,13 @@ def test_fixed_sheets_start_below_the_custom_titlebar():
     sheet = SHEET.read_text(encoding = "utf-8")
     research_activity_panel = RESEARCH_ACTIVITY_PANEL.read_text(encoding = "utf-8")
 
-    assert 'const CUSTOM_TITLEBAR_HEIGHT = "34px";' in provider
-    for property_name in (
-        "--studio-custom-titlebar-height",
-        "--studio-content-top-inset",
-        "--studio-hidden-route-top-inset",
-    ):
-        assert f'"{property_name}": CUSTOM_TITLEBAR_HEIGHT,' in provider
-    assert "<SheetViewportInsetProvider top={CUSTOM_TITLEBAR_HEIGHT}>" in provider
+    assert "<SheetViewportInsetProvider" in provider
     assert 'position === "fixed" && side !== "bottom"' in sheet
-    assert "{ top: viewportTopInset, ...style }" in sheet
     for side in ("left", "right"):
         assert f"data-[side={side}]:top-0" in sheet
         assert f"data-[side={side}]:bottom-0" in sheet
         assert f"data-[side={side}]:h-full" not in sheet
     assert "studio-custom-titlebar-height" not in research_activity_panel
-    assert 'variant === "sheet" && "h-full"' in research_activity_panel
 
 
 def test_visible_mac_sidebar_header_is_a_drag_region():

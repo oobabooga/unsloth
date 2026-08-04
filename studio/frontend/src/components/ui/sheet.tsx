@@ -92,6 +92,7 @@ function SheetContent({
 }) {
   const [contentEl, setContentEl] = useState<HTMLDivElement | null>(null);
   const viewportTopInset = useContext(SheetViewportTopInsetContext);
+  // This inline top wins over any top-* utility passed through className.
   const contentStyle =
     position === "fixed" && side !== "bottom"
       ? { top: viewportTopInset, ...style }
