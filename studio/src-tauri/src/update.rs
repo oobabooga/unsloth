@@ -77,6 +77,11 @@ fn spawn_update(
     String,
 > {
     let mut update = state.lock().map_err(|e| e.to_string())?;
+    // Checked under the same lock the child is stored under, so a quit that is
+    // already reaping cannot race a fresh updater past it.
+    if crate::quit_in_progress() {
+        return Err(crate::QUIT_IN_PROGRESS_ERROR.to_string());
+    }
     if update.child.is_some() {
         return Err("Update is already running.".to_string());
     }

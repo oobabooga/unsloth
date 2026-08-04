@@ -39,6 +39,21 @@ use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 static TERMINATION_CLEANUP: Once = Once::new();
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Message returned to the UI when a spawn is refused because the app is quitting.
+pub(crate) const QUIT_IN_PROGRESS_ERROR: &str = "Unsloth is quitting.";
+
+/// True once an explicit quit has begun, until it is canceled at a confirmation
+/// dialog. Every entry point that spawns a child `cleanup_child_processes` reaps
+/// must refuse while this is set: cleanup takes each handle out of its state before
+/// it blocks on the kill, so a spawn that lands inside that window stores a fresh
+/// child that the already-consumed `TERMINATION_CLEANUP` can never reap, and the
+/// process survives the app on Unix because it leads its own process group.
+pub(crate) fn quit_in_progress() -> bool {
+    QUIT_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Ownership of the in-progress quit. Dropping it reopens the app for business,
+/// which is what must happen when the user answers "Keep installing" and stays.
 struct QuitRequest;
 
 impl QuitRequest {
@@ -63,13 +78,15 @@ impl Drop for QuitRequest {
 
 #[cfg(test)]
 mod quit_request_tests {
-    use super::QuitRequest;
+    use super::{quit_in_progress, QuitRequest};
 
     #[test]
-    fn canceled_quit_allows_a_later_request() {
+    fn canceled_quit_reopens_the_spawn_gate() {
         let request = QuitRequest::begin().expect("first quit request should start");
+        assert!(quit_in_progress());
         assert!(QuitRequest::begin().is_none());
         drop(request);
+        assert!(!quit_in_progress());
         assert!(QuitRequest::begin().is_some());
     }
 }

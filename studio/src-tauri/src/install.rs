@@ -299,6 +299,11 @@ fn spawn_script(
     String,
 > {
     let mut install = state.lock().map_err(|e| e.to_string())?;
+    // Checked under the same lock the child is stored under, so a quit that is
+    // already reaping cannot race a fresh installer past it.
+    if crate::quit_in_progress() {
+        return Err(crate::QUIT_IN_PROGRESS_ERROR.to_string());
+    }
     if install.child.is_some() {
         return Err("Installation is already running.".to_string());
     }
