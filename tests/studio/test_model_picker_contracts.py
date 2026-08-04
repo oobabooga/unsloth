@@ -410,10 +410,10 @@ def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
     block = re.search(r"onSelect\(repoId, \{.*?\n\s*\}", picker, re.S)
     assert block and "loadId: downloaded === true ? loadId : undefined," in block.group(0)
     # localPath alone: preferLocalCache would answer from disk and drop the undownloaded quants.
-    assert (
-        "listGgufVariants(repoId, hfToken, localSource ? { localPath: localSource } : undefined)"
-        in picker
-    )
+    listing = picker.split("// The row's own directory", 1)[1].split(".then((res)", 1)[0]
+    assert "listGgufVariants(repoId, hfToken, {" in listing
+    assert "...(localSource ? { localPath: localSource } : {})," in listing
+    assert re.search(r"^\s*preferLocalCache:", listing, re.M) is None
     assert "cachePath={c.cache_path}" in picker
 
     # A reload rebuilds its target from the checkpoint id, so the resident model remembers the pin.
@@ -528,11 +528,11 @@ def test_chat_autoload_scopes_variant_lookup_to_cached_repo_path():
     assert auto_load.count("preferLocalCache: true") >= 2
     assert auto_load.count("localPath: repo.cache_path") >= 2
 
-    chat_api = _read("features/chat/api/chat-api.ts")
-    variants_fn = chat_api.split("export async function listGgufVariants", 1)[1]
-    variants_fn = variants_fn.split("export interface KvCacheEstimate", 1)[0]
-    assert 'params.set("prefer_local_cache", "true")' in variants_fn
-    assert 'params.set("local_path", localPath)' in variants_fn
+    request = _read("features/chat/api/gguf-variants-request.ts")
+    query_fn = request.split("export function ggufVariantsQuery", 1)[1]
+    query_fn = query_fn.split("export function ggufVariantsAbort", 1)[0]
+    assert 'params.set("prefer_local_cache", "true")' in query_fn
+    assert 'params.set("local_path", localPath)' in query_fn
 
 
 def test_cache_location_update_invalidates_frontend_inventory():
@@ -583,10 +583,11 @@ def test_local_mtp_warning_covers_path_and_native_gguf_sources():
     # Switching models must drop both together: a kept flag would classify the
     # newly selected model by the old one's provenance.
     store = _read("features/chat/stores/chat-runtime-store.ts")
-    reset = re.search(r"setCheckpoint: \(modelId, ggufVariant\) =>.*?\}\),", store, re.S)
-    assert reset
-    assert "activeModelIsLocal: false" in reset.group(0)
-    assert "specFallbackReason: null" in reset.group(0)
+    reset = store.split("setCheckpoint: (modelId, ggufVariant, options) =>", 1)[1].split(
+        "setActiveThreadId:", 1
+    )[0]
+    assert "activeModelIsLocal: false" in reset
+    assert "specFallbackReason: null" in reset
     assert "isLocalGguf" in src.split('specFallbackReason === "drafter_not_found"', 1)[1]
 
 
@@ -1068,7 +1069,7 @@ def test_parallel_slots_control_cleared_when_the_load_never_sent_them():
     # so it cannot swallow the fresh-default path below and stay green.
     candidate = adapter.split("async function loadAutoLoadCandidate", 1)[1]
     gguf_branch, non_gguf_rest = candidate.split('if (candidate.kind === "gguf") {', 1)[1].split(
-        "\n    } else {\n", 1
+        "} else {", 1
     )
     non_gguf_branch = non_gguf_rest.split("if (!(loadResp.is_lora ?? false)) {", 1)[0]
     # The cached-GGUF branch keeps the remembered override via the gated local...
