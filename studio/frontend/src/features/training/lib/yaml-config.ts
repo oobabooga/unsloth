@@ -107,8 +107,9 @@ export function serializeConfigToYaml(
     training,
     lora,
     // parseYamlConfig reads this section back and every shipped model config
-    // ships one, so leaving it out loses the user's wandb/tensorboard settings
-    // on the next load.
+    // ships one. Imports are sparse patches, so omitting it does not clear the
+    // current store; it makes the saved file an incomplete record, and a fresh
+    // store loads it with the wandb/tensorboard settings back at defaults.
     logging: {
       enable_wandb: state.enableWandb,
       wandb_project: state.wandbProject,
