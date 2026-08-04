@@ -178,15 +178,20 @@ def latest_published_release(
     *,
     force_refresh: bool,
     memo: dict[str, tuple[float, Optional[str]]],
-    failed_at: dict[str, float],
     cache_dir: Callable[[], Path],
     fetch: Callable[[str], Optional[str]],
     save: Callable[[str, Optional[str]], None],
+    failed_at: Optional[dict[str, float]] = None,
 ) -> Optional[str]:
     """Latest release tag for `repo`.
 
-    Successful results use a 24h memory and disk cache. Failed lookups use a
-    brief in-process TTL. Returns None when offline and never previously cached.
+    Successful results use a 24h memory and disk cache. Returns None when
+    offline and never previously cached.
+
+    Pass ``failed_at`` (a caller-owned dict) to also cache failed lookups for
+    ``RELEASE_FAILURE_CACHE_TTL_SECONDS``. Callers on a polled request path want
+    this so an unreachable GitHub is not retried on every request. Omitting it
+    keeps the retry-every-call behavior, which is what one-shot callers want.
     """
     if not repo:
         return None
@@ -194,7 +199,7 @@ def latest_published_release(
     # are process-local and use monotonic time so clock changes cannot extend them.
     wall_now = time.time()
     if not force_refresh:
-        last_failure = failed_at.get(repo)
+        last_failure = failed_at.get(repo) if failed_at is not None else None
         if (
             last_failure is not None
             and time.monotonic() - last_failure < RELEASE_FAILURE_CACHE_TTL_SECONDS
@@ -213,14 +218,16 @@ def latest_published_release(
             return disk[1]
     latest = fetch(repo)
     if latest is None:
-        failed_at[repo] = time.monotonic()
+        if failed_at is not None:
+            failed_at[repo] = time.monotonic()
         # Keep the last-good disk value rather than poison it with None.
         disk = load_disk_cache(repo, cache_dir())
         if disk:
             memo[repo] = disk
             return disk[1]
         return None
-    failed_at.pop(repo, None)
+    if failed_at is not None:
+        failed_at.pop(repo, None)
     memo[repo] = (wall_now, latest)
     save(repo, latest)
     return latest

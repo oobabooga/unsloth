@@ -12,10 +12,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import time
 import types as _types
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -254,52 +252,6 @@ def test_reset_caches_clears_release_failure_memo(monkeypatch):
 
     assert fr.latest_published_release("unslothai/llama.cpp") is None
     assert calls == ["unslothai/llama.cpp", "unslothai/llama.cpp"]
-
-
-def test_latest_published_release_coalesces_concurrent_failures(monkeypatch):
-    calls = []
-
-    class _GateLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self._count_lock = threading.Lock()
-            self._all_waiting = threading.Event()
-            self._release = threading.Event()
-            self._attempts = 0
-
-        def __enter__(self):
-            with self._count_lock:
-                self._attempts += 1
-                if self._attempts == 4:
-                    self._all_waiting.set()
-            assert self._release.wait(timeout = 1)
-            self._lock.acquire()
-            return self
-
-        def __exit__(self, *_args):
-            self._lock.release()
-
-    gate = _GateLock()
-
-    def _failed_fetch(repo, timeout = 5.0):
-        calls.append(repo)
-        return None
-
-    monkeypatch.setattr(fr, "_fetch_latest_release_tag", _failed_fetch)
-    monkeypatch.setattr(fr, "_release_lock", gate)
-    with ThreadPoolExecutor(max_workers = 4) as pool:
-        futures = [
-            pool.submit(fr.latest_published_release, "unslothai/llama.cpp")
-            for _index in range(4)
-        ]
-        try:
-            assert gate._all_waiting.wait(timeout = 1)
-        finally:
-            gate._release.set()
-        results = [future.result() for future in futures]
-
-    assert results == [None] * 4
-    assert calls == ["unslothai/llama.cpp"]
 
 
 def test_latest_published_release_keeps_old_cache_on_transient_failure(monkeypatch, tmp_path):

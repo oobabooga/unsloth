@@ -7773,7 +7773,9 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
 
         # A cold capability probe can exec llama-server, and a cold freshness
         # check reads GitHub. Neither may block streaming on the event loop.
-        # One disconnected waiter must not cancel the probe shared by the rest.
+        # The shield is load-bearing: asyncio.wrap_future forwards cancellation
+        # to the pooled Future, so a client disconnecting while the probe is
+        # still queued would cancel the probe every other waiter is sharing.
         _supports_mtp, _freshness = await asyncio.shield(
             asyncio.wrap_future(_submit_llama_cpp_status_probe(llama_backend))
         )

@@ -3952,18 +3952,9 @@ class LlamaCppBackend:
 
     # Cached on (path, mtime); `unsloth studio update` bumps mtime.
     _capability_cache: dict[tuple[str, int], dict[str, object]] = {}
-    _capability_probe_lock = threading.Lock()
 
     @classmethod
     def probe_server_capabilities(cls, binary: Optional[str] = None) -> dict[str, object]:
-        """Parse and cache llama-server feature flags, coalescing cold probes."""
-        with cls._capability_probe_lock:
-            return cls._probe_server_capabilities_locked(binary)
-
-    @classmethod
-    def _probe_server_capabilities_locked(
-        cls, binary: Optional[str] = None
-    ) -> dict[str, object]:
         """Parse `llama-server --help` for feature flags. Returns
         {found, mtp_token, supports_mtp, ngram_mod_flavor,
         supports_ngram_mod, spec_draft_n_max_flag, cache flag support}.
