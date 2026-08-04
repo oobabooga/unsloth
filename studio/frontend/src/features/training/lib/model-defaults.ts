@@ -46,7 +46,11 @@ type ModelDefaultsPatch = Partial<
 function toNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string") {
-    const parsed = Number(value);
+    // Number("") and Number("  ") are 0, so a blank would read as a real 0.
+    // Treat it as "key absent" instead and keep the current value.
+    const trimmed = value.trim();
+    if (trimmed === "") return undefined;
+    const parsed = Number(trimmed);
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
@@ -71,6 +75,10 @@ function toStringArray(value: unknown): string[] | undefined {
 function toGradientCheckpointing(
   value: unknown,
 ): TrainingConfigState["gradientCheckpointing"] | undefined {
+  // YAML parses an unquoted true/false as a boolean, and shipped model configs
+  // (e.g. llama/unsloth_Llama-3.2-1B-Instruct.yaml) write it that way. Without
+  // this those models' checkpointing default is dropped on the floor.
+  if (typeof value === "boolean") return value ? "true" : "none";
   if (value === "none" || value === "true" || value === "unsloth" || value === "mlx") {
     // On Mac, map "unsloth" → "mlx" since Unsloth GC is GPU-only
     if (usePlatformStore.getState().deviceType === "mac" && value === "unsloth") {

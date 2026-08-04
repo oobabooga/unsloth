@@ -31,7 +31,8 @@ interface BackendTrainingDefaults {
   vision_image_size?: number | string | null;
   packing?: boolean;
   train_on_completions?: boolean;
-  gradient_checkpointing?: "none" | "true" | "unsloth";
+  // Shipped model configs write this as a YAML boolean as often as a string.
+  gradient_checkpointing?: "none" | "true" | "unsloth" | boolean;
   trust_remote_code?: boolean;
 }
 
