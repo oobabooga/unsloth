@@ -8,9 +8,15 @@
 #   - Tauri CLI version drift (we pin 2.10.1, matching release-desktop.yml)
 #   - frontend output not picked up by Tauri's distDir
 #
-# Linux-only on a free `ubuntu-latest` runner. Mac and Windows desktop builds
-# stay in release-desktop.yml (manual `workflow_dispatch`) because they need
-# code-signing secrets and ~30 min of runner time each.
+# The build job is Linux-only on a free `ubuntu-latest` runner. Mac and Windows
+# desktop builds stay in release-desktop.yml (manual `workflow_dispatch`) because
+# they need code-signing secrets and ~30 min of runner time each.
+#
+# A second, compile-only job type-checks the crate for Windows. `src/main.rs`
+# carries `#[cfg(windows)]` code that no Linux job compiles, and it cannot be
+# cross-checked from Linux either: `ring` builds a static library through cc-rs,
+# which needs MSVC `lib.exe`. Without this job the first compiler to see that
+# code is the manual release build.
 
 name: Unsloth Tauri CI
 
@@ -136,3 +142,50 @@ jobs:
             studio/src-tauri/target/debug
             studio/frontend/dist
           retention-days: 3
+
+  windows-check:
+    name: Tauri Windows type check (compile only)
+    runs-on: windows-latest
+    # Two profiles, so a cold cache checks the dependency tree twice.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
+
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+        with:
+          workspaces: studio/src-tauri -> target
+          key: windows-check
+
+      - name: Placeholder frontend dist
+        # `tauri::generate_context!` only requires that `frontendDist` exists, and
+        # nothing here inspects its contents. Running the real `npm ci` + `vite build`
+        # again would roughly double the cost of a job whose whole purpose is to put a
+        # compiler in front of the `#[cfg(windows)]` Rust. The Linux job above already
+        # proves the real frontend output is wired into Tauri.
+        shell: bash
+        run: |
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><title>ci</title>' > studio/frontend/dist/index.html
+
+      - name: cargo check (Windows)
+        working-directory: studio/src-tauri
+        # `--all-targets` so the crate's unit tests are type-checked too. This does not
+        # run them: the Linux job owns `cargo test`, and the Windows-only code paths
+        # need a real WebView2 session that no runner provides.
+        #
+        # Both profiles run because `main.rs` gates Windows code on `debug_assertions` in
+        # both directions: `setup_windows_browser_guards` is only called when it is off,
+        # while deep-link registration and the dev backend lookup in `process.rs` only
+        # compile when it is on. Checking one profile would leave the other uncompiled.
+        #
+        # `shell: bash` for `set -e`. windows-latest defaults to pwsh, which does not stop
+        # on a non-zero exit from a native command, so a debug-only compile error would be
+        # printed and then overwritten by the release check's status.
+        shell: bash
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --release

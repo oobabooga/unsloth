@@ -94,6 +94,123 @@ fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+// Compiled on every Windows build, but only called in release. Gating the body on
+// `debug_assertions` too would hide a `webview2-com` / Tauri version skew until the
+// release build, which no pull request job compiles.
+#[cfg(windows)]
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Controller, ICoreWebView2_11, COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND,
+        COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_PAGE,
+    };
+    use webview2_com::{AcceleratorKeyPressedEventHandler, ContextMenuRequestedEventHandler};
+    use windows_core::Interface;
+    use windows_core::BOOL;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_CONTROL, VK_F5, VK_MENU, VK_R, VK_SHIFT,
+    };
+
+    let window = app.get_webview_window("main").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
+    })?;
+    window.with_webview(|webview| unsafe {
+        // Handlers rather than the `AreBrowserAcceleratorKeysEnabled` and
+        // `AreDefaultContextMenusEnabled` settings: those are all-or-nothing, taking DevTools,
+        // keyboard zoom, spellcheck, and editing menus with them, and a setting changed after
+        // the first navigation only applies to the next one. Tauri exposes neither, so the COM
+        // route is the only one available from here anyway.
+        //
+        // The annotation is deliberate: Tauri does not re-export `webview2-com`, so this crate
+        // depends on it directly. If a Tauri bump moves `controller()` to a different
+        // `webview2-com` major, the mismatch fails on this line, naming the crate, instead of
+        // as an opaque error inside the handler calls.
+        let controller: ICoreWebView2Controller = webview.controller();
+        let accelerator_handler =
+            AcceleratorKeyPressedEventHandler::create(Box::new(move |_, event_args| {
+                let Some(event_args) = event_args else {
+                    return Ok(());
+                };
+                let mut virtual_key = 0;
+                event_args.VirtualKey(&mut virtual_key)?;
+                let control_down = GetKeyState(i32::from(VK_CONTROL)) < 0;
+                // AltGr reports as left Ctrl plus right Alt, so a bare Ctrl test would swallow
+                // printable AltGr combinations such as AltGr+R. Either Alt clears the arm:
+                // Windows treats left Ctrl plus left Alt as the same character-generating
+                // sequence, and Ctrl+Alt+R is not a refresh accelerator in the first place.
+                let alt_down = GetKeyState(i32::from(VK_MENU)) < 0;
+                // Ctrl+Shift+R stays live on purpose, as the one way back from a broken
+                // renderer. The frontend has no error boundary, so an unhandled render error
+                // leaves a blank window, and with every refresh path gone the only remaining
+                // action would be tray Quit, which stops a running job. Two modifiers are not
+                // hit by accident, which is the entire reason F5 and Ctrl+R are blocked.
+                let shift_down = GetKeyState(i32::from(VK_SHIFT)) < 0;
+                if virtual_key == u32::from(VK_F5)
+                    || (virtual_key == u32::from(VK_R) && control_down && !alt_down && !shift_down)
+                {
+                    event_args.SetHandled(true)?;
+                }
+                Ok(())
+            }));
+        let mut accelerator_token = 0;
+        if let Err(error) =
+            controller.add_AcceleratorKeyPressed(&accelerator_handler, &mut accelerator_token)
+        {
+            warn!("Could not block Windows refresh shortcuts: {error}");
+        }
+
+        let core_webview = match controller.CoreWebView2() {
+            Ok(core_webview) => core_webview,
+            Err(error) => {
+                warn!("Could not access the Windows WebView: {error}");
+                return;
+            }
+        };
+        let core_webview11 = match core_webview.cast::<ICoreWebView2_11>() {
+            Ok(core_webview11) => core_webview11,
+            Err(error) => {
+                warn!("Could not customize the Windows context menu: {error}");
+                return;
+            }
+        };
+        let context_menu_handler =
+            ContextMenuRequestedEventHandler::create(Box::new(move |_, event_args| {
+                let Some(event_args) = event_args else {
+                    return Ok(());
+                };
+                let target = event_args.ContextMenuTarget()?;
+                let mut kind = COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND::default();
+                let mut is_editable = BOOL::default();
+                let mut has_link_uri = BOOL::default();
+                let mut has_selection = BOOL::default();
+                target.Kind(&mut kind)?;
+                target.IsEditable(&mut is_editable)?;
+                target.HasLinkUri(&mut has_link_uri)?;
+                target.HasSelection(&mut has_selection)?;
+                // Only the bare page menu is browser chrome worth hiding, because it is the one
+                // offering Refresh, Save as, and Print. Every other target keeps its native menu:
+                // Image, Audio and Video carry Save as and Copy, links carry Copy link address,
+                // and editable or selected targets carry the editing commands. WebView2 reports
+                // links as a Page target with a link URI rather than a kind of its own.
+                let is_bare_page = kind == COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_PAGE
+                    && !is_editable.as_bool()
+                    && !has_link_uri.as_bool()
+                    && !has_selection.as_bool();
+                if is_bare_page {
+                    event_args.SetHandled(true)?;
+                }
+                Ok(())
+            }));
+        let mut context_menu_token = 0;
+        if let Err(error) =
+            core_webview11.add_ContextMenuRequested(&context_menu_handler, &mut context_menu_token)
+        {
+            warn!("Could not filter the Windows context menu: {error}");
+        }
+    })?;
+    Ok(())
+}
+
 /// A Tauri quit never fires beforeunload, so the frontend mirrors run state here.
 pub type TrainingActivityState = std::sync::Arc<std::sync::Mutex<bool>>;
 
@@ -393,6 +510,8 @@ fn main() {
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             setup_custom_titlebar(app)?;
+            #[cfg(all(windows, not(debug_assertions)))]
+            setup_windows_browser_guards(app)?;
             setup_tray(app)?;
             #[cfg(unix)]
             setup_unix_termination_signals(app)?;

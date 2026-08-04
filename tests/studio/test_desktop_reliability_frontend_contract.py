@@ -298,6 +298,18 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
+def test_windows_browser_guard_runs_only_in_release_builds():
+    # Deliberately structural. Asserting the handler bodies would only restate the Rust
+    # source, and none of it can be exercised from Python: the guard needs a live WebView2
+    # session. What is worth pinning is that the call stays out of development builds, so
+    # F5 and the browser context menu keep working while developing.
+    source = TAURI_MAIN.read_text(encoding = "utf-8")
+
+    assert "fn setup_windows_browser_guards" in source
+    before_call = source.split("setup_windows_browser_guards(app)?;", 1)[0]
+    assert before_call.rstrip().endswith("#[cfg(all(windows, not(debug_assertions)))]")
+
+
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():
     source = APP_PROVIDER.read_text(encoding = "utf-8")
 
