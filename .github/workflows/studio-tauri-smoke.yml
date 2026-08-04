@@ -14,9 +14,9 @@
 #
 # A second, compile-only job type-checks the crate for Windows. `src/main.rs`
 # carries `#[cfg(windows)]` code that no Linux job compiles, and it cannot be
-# cross-checked from Linux either: `ring` and `webview2-com-sys` both invoke MSVC
-# `lib.exe` from their build scripts. Without this job the first compiler to see
-# that code is the manual release build.
+# cross-checked from Linux either: `ring` builds a static library through cc-rs,
+# which needs MSVC `lib.exe`. Without this job the first compiler to see that
+# code is the manual release build.
 
 name: Unsloth Tauri CI
 
