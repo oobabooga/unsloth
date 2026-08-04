@@ -108,20 +108,23 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
     use windows_core::Interface;
     use windows_core::BOOL;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_CONTROL, VK_F5, VK_MENU, VK_R,
+        GetKeyState, VK_CONTROL, VK_F5, VK_MENU, VK_R, VK_SHIFT,
     };
 
     let window = app.get_webview_window("main").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
     })?;
     window.with_webview(|webview| unsafe {
-        // Event handlers take effect immediately and avoid disabling unrelated browser features
-        // such as DevTools, keyboard zoom, spellcheck, and editing context menus.
+        // Handlers rather than the `AreBrowserAcceleratorKeysEnabled` and
+        // `AreDefaultContextMenusEnabled` settings: those are all-or-nothing, taking DevTools,
+        // keyboard zoom, spellcheck, and editing menus with them, and a setting changed after
+        // the first navigation only applies to the next one. Tauri exposes neither, so the COM
+        // route is the only one available from here anyway.
         //
         // The annotation is deliberate: Tauri does not re-export `webview2-com`, so this crate
         // depends on it directly. If a Tauri bump moves `controller()` to a different
-        // `webview2-com` major, this line fails with "perhaps two different versions of crate
-        // `webview2_com` are being used" instead of an opaque error inside the handler calls.
+        // `webview2-com` major, the mismatch fails on this line, naming the crate, instead of
+        // as an opaque error inside the handler calls.
         let controller: ICoreWebView2Controller = webview.controller();
         let accelerator_handler =
             AcceleratorKeyPressedEventHandler::create(Box::new(move |_, event_args| {
@@ -136,8 +139,14 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
                 // Windows treats left Ctrl plus left Alt as the same character-generating
                 // sequence, and Ctrl+Alt+R is not a refresh accelerator in the first place.
                 let alt_down = GetKeyState(i32::from(VK_MENU)) < 0;
+                // Ctrl+Shift+R stays live on purpose, as the one way back from a broken
+                // renderer. The frontend has no error boundary, so an unhandled render error
+                // leaves a blank window, and with every refresh path gone the only remaining
+                // action would be tray Quit, which stops a running job. Two modifiers are not
+                // hit by accident, which is the entire reason F5 and Ctrl+R are blocked.
+                let shift_down = GetKeyState(i32::from(VK_SHIFT)) < 0;
                 if virtual_key == u32::from(VK_F5)
-                    || (virtual_key == u32::from(VK_R) && control_down && !alt_down)
+                    || (virtual_key == u32::from(VK_R) && control_down && !alt_down && !shift_down)
                 {
                     event_args.SetHandled(true)?;
                 }

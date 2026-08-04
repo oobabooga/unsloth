@@ -181,6 +181,11 @@ jobs:
         # both directions: `setup_windows_browser_guards` is only called when it is off,
         # while deep-link registration and the dev backend lookup in `process.rs` only
         # compile when it is on. Checking one profile would leave the other uncompiled.
+        #
+        # `shell: bash` for `set -e`. windows-latest defaults to pwsh, which does not stop
+        # on a non-zero exit from a native command, so a debug-only compile error would be
+        # printed and then overwritten by the release check's status.
+        shell: bash
         run: |
           cargo check --all-targets
           cargo check --all-targets --release
