@@ -3,6 +3,7 @@
 
 import importlib.machinery
 import importlib.util
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -334,7 +335,28 @@ def test_gguf_export_fails_when_owned_output_has_no_gguf(tmp_path, monkeypatch):
     assert list(save_dir.glob("_tmp_model_*")) == []
 
 
-def test_gguf_export_ignores_owned_temp_cleanup_failure(tmp_path, monkeypatch):
+def _require_undeletable_dir_support(tmp_path):
+    """Skip when the platform lets us delete a file out of a read-only directory.
+
+    Running as root, and Windows, both ignore the mode bits this test relies on.
+    """
+    probe = tmp_path / "_perm_probe"
+    victim = probe / "victim"
+    probe.mkdir()
+    victim.write_bytes(b"x")
+    probe.chmod(0o500)
+    try:
+        victim.unlink()
+    except OSError:
+        return
+    finally:
+        probe.chmod(0o700)
+        shutil.rmtree(probe, ignore_errors = True)
+    pytest.skip("this platform allows deleting files from a read-only directory")
+
+
+def test_gguf_export_survives_real_owned_temp_cleanup_failure(tmp_path, monkeypatch):
+    _require_undeletable_dir_support(tmp_path)
     _install_export_backend_stubs(monkeypatch)
     export_mod = _load_module(
         "test_core_export_backend_cleanup_failure", "core/export/export.py", monkeypatch
@@ -342,34 +364,48 @@ def test_gguf_export_ignores_owned_temp_cleanup_failure(tmp_path, monkeypatch):
 
     save_dir = tmp_path / "export"
     monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
+    locked_dirs = []
 
     class _Model:
         def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
             (Path(f"{model_save_path}_gguf") / "converted.gguf").write_bytes(b"gguf")
+            # Make the real cleanup fail: this directory's contents cannot be unlinked,
+            # so rmtree cannot empty it and cannot remove the owned root above it.
+            merged = Path(model_save_path)
+            merged.mkdir()
+            (merged / "model.safetensors").write_bytes(b"weights")
+            merged.chmod(0o500)
+            locked_dirs.append(merged)
 
-    cleanup_calls = []
-
-    def _fail_unless_ignored(path, ignore_errors = False):
-        assert ignore_errors is True
-        cleanup_calls.append(Path(path))
-
-    monkeypatch.setattr(export_mod.shutil, "rmtree", _fail_unless_ignored)
     backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
     backend.current_model = _Model()
     backend.current_tokenizer = object()
     backend.current_checkpoint = None
 
-    success, message, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+    try:
+        success, message, output_path = backend.export_gguf(str(save_dir), "Q4_K_M")
+    finally:
+        for locked in locked_dirs:
+            locked.chmod(0o700)
 
     assert success is True, message
     assert output_path == str(save_dir.resolve())
     assert (save_dir / "converted.gguf").read_bytes() == b"gguf"
-    assert len(cleanup_calls) == 1
-    assert cleanup_calls[0].parent == save_dir
-    assert list(save_dir.glob("_tmp_model_*")) == cleanup_calls
+    # Cleanup really ran: the deletable half of the owned root is gone. It really failed:
+    # the undeletable half, and therefore the root itself, is still on disk. Deleting the
+    # cleanup call entirely would leave model_gguf behind and fail the first assertion.
+    assert len(locked_dirs) == 1
+    model_tmp_root = locked_dirs[0].parent
+    assert not (model_tmp_root / "model_gguf").exists()
+    assert (locked_dirs[0] / "model.safetensors").read_bytes() == b"weights"
+    assert list(save_dir.glob("_tmp_model_*")) == [model_tmp_root]
 
 
-def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
+# PEFT and non-PEFT differ only in whether save.py merges weights into the requested
+# model path or redirects the conversion input to the loaded checkpoint. Neither one
+# writes to <checkpoint>_gguf, so both must leave that sibling alone.
+@pytest.mark.parametrize("merges_into_model_dir", [False, True], ids = ["non_peft", "peft"])
+def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch, merges_into_model_dir):
     _install_export_backend_stubs(monkeypatch)
     export_mod = _load_module(
         "test_core_export_backend_owned_temp", "core/export/export.py", monkeypatch
@@ -385,16 +421,22 @@ def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
     notes = checkpoint_gguf / "notes.txt"
     imatrix = checkpoint_gguf / "imatrix.dat"
     old_gguf = checkpoint_gguf / "old.Q4_K_M.gguf"
+    old_modelfile = checkpoint_gguf / "Modelfile"
     concurrent_dir = save_dir / "user-created"
     concurrent_cwd_gguf = cwd / "unrelated.gguf"
     notes.write_text("keep", encoding = "utf-8")
     imatrix.write_bytes(b"imatrix")
     old_gguf.write_bytes(b"old")
+    old_modelfile.write_text("FROM old.Q4_K_M.gguf", encoding = "utf-8")
     monkeypatch.chdir(cwd)
     monkeypatch.setattr(export_mod, "resolve_export_write_dir", lambda _value: save_dir)
 
     class _Model:
         def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
+            if merges_into_model_dir:
+                merged = Path(model_save_path)
+                merged.mkdir()
+                (merged / "model.safetensors").write_bytes(b"merged")
             output_dir = Path(f"{model_save_path}_gguf")
             assert output_dir.is_dir()
             (output_dir / "new.Q4_K_M.gguf").write_bytes(b"new")
@@ -402,6 +444,7 @@ def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
             concurrent_dir.mkdir()
             (concurrent_dir / "notes.txt").write_text("keep", encoding = "utf-8")
             concurrent_cwd_gguf.write_bytes(b"unrelated")
+            return {"gguf_directory": str(output_dir)}
 
     backend = export_mod.ExportBackend.__new__(export_mod.ExportBackend)
     backend.current_model = _Model()
@@ -413,10 +456,12 @@ def test_gguf_export_preserves_unowned_paths(tmp_path, monkeypatch):
     assert success is True
     assert output_path == str(save_dir.resolve())
     assert (save_dir / "new.Q4_K_M.gguf").read_bytes() == b"new"
-    assert (save_dir / "Modelfile").is_file()
+    assert (save_dir / "Modelfile").read_text(encoding = "utf-8") == "FROM new.Q4_K_M.gguf"
+    assert not (save_dir / "old.Q4_K_M.gguf").exists()
     assert notes.read_text(encoding = "utf-8") == "keep"
     assert imatrix.read_bytes() == b"imatrix"
     assert old_gguf.read_bytes() == b"old"
+    assert old_modelfile.read_text(encoding = "utf-8") == "FROM old.Q4_K_M.gguf"
     assert (concurrent_dir / "notes.txt").read_text(encoding = "utf-8") == "keep"
     assert concurrent_cwd_gguf.read_bytes() == b"unrelated"
     assert list(save_dir.glob("_tmp_model_*")) == []
