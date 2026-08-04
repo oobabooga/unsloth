@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { Switch } from "@/components/ui/switch";
-import { useT } from "@/i18n";
-import type { TranslationKey } from "@/i18n";
-import { isTauri } from "@/lib/api-base";
 import {
   CloudIcon,
   CpuIcon,
@@ -21,8 +17,11 @@ import {
   UserIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import type { IconSvgElement } from "@hugeicons/react";
 import { Reorder, useDragControls } from "motion/react";
+import { Switch } from "@/components/ui/switch";
+import { useT } from "@/i18n";
+import type { TranslationKey } from "@/i18n";
+import type { IconSvgElement } from "@hugeicons/react";
 import type { SidebarMenuItemPref } from "../stores/appearance-custom-store";
 import { useAppearanceCustomStore } from "../stores/appearance-custom-store";
 
@@ -112,7 +111,8 @@ function MovableRow({ item }: { item: SidebarMenuItemPref }) {
 
 /**
  * Show/hide and reorder the optional sidebar profile menu items. The pinned
- * entries are rendered as static rows so the final menu layout is obvious.
+ * entries (Settings on top; Help, Log out, Shutdown below) are rendered as
+ * static rows so the final menu layout is obvious.
  */
 export function SidebarMenuCustomizer() {
   const t = useT();
@@ -141,13 +141,8 @@ export function SidebarMenuCustomizer() {
       </Reorder.Group>
       <div className="mx-2 my-1 border-t border-border/70" />
       <FixedRow icon={HelpCircleIcon} label={t("common.help")} />
-      {!isTauri && (
-        <FixedRow icon={Logout05Icon} label={t("shell.navigation.logOut")} />
-      )}
-      <FixedRow
-        icon={PowerIcon}
-        label={t(isTauri ? "common.quit" : "common.shutdown")}
-      />
+      <FixedRow icon={Logout05Icon} label={t("shell.navigation.logOut")} />
+      <FixedRow icon={PowerIcon} label={t("common.shutdown")} />
     </div>
   );
 }

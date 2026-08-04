@@ -2475,14 +2475,10 @@ export function AppSidebar() {
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuItem
-                  onSelect={
-                    isTauri ? quitDesktopApp : () => setShutdownOpen(true)
-                  }
+                  onSelect={isTauri ? quitDesktopApp : () => setShutdownOpen(true)}
                 >
                   <HugeiconsIcon icon={PowerIcon} strokeWidth={1.75} className="size-icon" />
-                  <span>
-                    {t(isTauri ? "common.quit" : "common.shutdown")}
-                  </span>
+                  <span>{t("common.shutdown")}</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
