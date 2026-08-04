@@ -14,6 +14,15 @@ export function registerBundlerResolver(): void {
   register("../bundler-resolver.mjs", import.meta.url);
 }
 
+/**
+ * registerBundlerResolver plus stubs for the auth/hub barrels and config/env, the
+ * modules that keep a feature store from loading outside vite. Call instead of
+ * registerBundlerResolver, before importing a store.
+ */
+export function registerStoreStubResolver(): void {
+  register("../store-stub-resolver.mjs", import.meta.url);
+}
+
 export type StorageFake = {
   getItem: (key: string) => string | null;
   setItem: (key: string, value: string) => void;

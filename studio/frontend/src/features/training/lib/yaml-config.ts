@@ -83,6 +83,7 @@ export function serializeConfigToYaml(
     max_seq_length: state.contextLength,
     num_epochs: state.epochs,
     learning_rate: state.learningRate,
+    embedding_learning_rate: state.embeddingLearningRate,
     batch_size: state.batchSize,
     gradient_accumulation_steps: state.gradientAccumulation,
     warmup_steps: state.warmupSteps,
@@ -105,6 +106,17 @@ export function serializeConfigToYaml(
   const config = {
     training,
     lora,
+    // parseYamlConfig reads this section back and every shipped model config
+    // ships one. Imports are sparse patches, so omitting it does not clear the
+    // current store; it makes the saved file an incomplete record, and a fresh
+    // store loads it with the wandb/tensorboard settings back at defaults.
+    logging: {
+      enable_wandb: state.enableWandb,
+      wandb_project: state.wandbProject,
+      enable_tensorboard: state.enableTensorboard,
+      tensorboard_dir: state.tensorboardDir,
+      log_frequency: state.logFrequency,
+    },
   };
 
   return yaml.dump(config, { lineWidth: -1, noRefs: true });

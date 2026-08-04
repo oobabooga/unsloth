@@ -18,6 +18,7 @@ interface BackendTrainingDefaults {
   max_seq_length?: number;
   num_epochs?: number;
   learning_rate?: number | string;
+  embedding_learning_rate?: number | string | null;
   optim?: string;
   lr_scheduler_type?: string;
   batch_size?: number;
@@ -31,7 +32,8 @@ interface BackendTrainingDefaults {
   vision_image_size?: number | string | null;
   packing?: boolean;
   train_on_completions?: boolean;
-  gradient_checkpointing?: "none" | "true" | "unsloth";
+  // Shipped model configs write this as a YAML boolean as often as a string.
+  gradient_checkpointing?: "none" | "true" | "unsloth" | boolean;
   trust_remote_code?: boolean;
 }
 
