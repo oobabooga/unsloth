@@ -1036,14 +1036,12 @@ class ExportBackend:
                 # On WSL, patch out sudo check before llama.cpp build
                 _apply_wsl_sudo_patch()
 
-                # Keep every intermediate below one directory created by this export. The model
-                # path and its derived _gguf sibling both stay inside this ownership boundary.
-                # Cleanup must not replace a successful export or the original conversion error.
+                # Keep every intermediate below one directory created by this export, so
+                # cleanup only ever removes paths this export owns.
                 model_tmp_root = tempfile.mkdtemp(prefix = "_tmp_model_", dir = abs_save_dir)
+                model_tmp_path = Path(model_tmp_root)
                 try:
                     _model_tmp = os.path.join(model_tmp_root, "model")
-                    _gguf_tmp = Path(f"{_model_tmp}_gguf")
-                    _gguf_tmp.mkdir()
                     result = self.current_model.save_pretrained_gguf(
                         _model_tmp,
                         self.current_tokenizer,
@@ -1051,18 +1049,28 @@ class ExportBackend:
                         **imatrix_kw,
                     )
 
-                    # save.py owns the output-directory convention and reports it back, so read
-                    # it instead of re-deriving the _gguf suffix here. Honor it only while it
-                    # stays inside the root this export created; anything outside is not ours to
-                    # move from, and falling back leaves the empty-output check to reject it.
-                    reported = result.get("gguf_directory") if isinstance(result, dict) else None
-                    if reported:
-                        reported_dir = Path(reported).resolve()
-                        if reported_dir.is_relative_to(Path(model_tmp_root).resolve()):
-                            _gguf_tmp = reported_dir
+                    # Savers place the output differently: save.py writes into a
+                    # "<save path>_gguf" sibling, while the MLX saver writes the .gguf into
+                    # the save path itself and returns nothing. Everything below the owned
+                    # root is this export's, so take all of it; a saver that wrote outside
+                    # that root is honored through the files it reports producing, which is
+                    # exact, instead of scanning a directory this export does not own.
+                    reported = result if isinstance(result, dict) else {}
+                    produced = {p.resolve() for p in model_tmp_path.rglob("*.gguf") if p.is_file()}
+                    produced.update(
+                        Path(f).resolve()
+                        for f in reported.get("gguf_files") or []
+                        if f and Path(f).is_file()
+                    )
+                    modelfiles = {
+                        p.resolve() for p in model_tmp_path.rglob("Modelfile") if p.is_file()
+                    }
+                    reported_modelfile = reported.get("modelfile_location")
+                    if reported_modelfile and Path(reported_modelfile).is_file():
+                        modelfiles.add(Path(reported_modelfile).resolve())
 
                     relocated_ggufs = []
-                    for src in sorted(_gguf_tmp.glob("*.gguf")):
+                    for src in sorted(produced):
                         dest = os.path.join(abs_save_dir, src.name)
                         shutil.move(str(src), dest)
                         relocated_ggufs.append(dest)
@@ -1072,12 +1080,24 @@ class ExportBackend:
                             "GGUF conversion produced no files in its output directory"
                         )
 
-                    modelfile = _gguf_tmp / "Modelfile"
-                    if modelfile.is_file():
+                    if modelfiles:
+                        modelfile = sorted(modelfiles)[0]
                         shutil.move(str(modelfile), os.path.join(abs_save_dir, "Modelfile"))
                         logger.info(f"Relocated Modelfile → {abs_save_dir}/")
                 finally:
-                    shutil.rmtree(model_tmp_root, ignore_errors = True)
+                    # Cleanup must not replace a successful export or the original conversion
+                    # error, and must never delete a converted GGUF that stayed behind because
+                    # its relocation failed.
+                    unrelocated = []
+                    if model_tmp_path.is_dir():
+                        unrelocated = sorted(str(p) for p in model_tmp_path.rglob("*.gguf"))
+                    if unrelocated:
+                        logger.error(
+                            "Kept GGUF files that could not be relocated: %s",
+                            ", ".join(unrelocated),
+                        )
+                    else:
+                        shutil.rmtree(model_tmp_root, ignore_errors = True)
 
                 # Write export metadata so the Chat page can identify the base model
                 self._write_export_metadata(abs_save_dir)
