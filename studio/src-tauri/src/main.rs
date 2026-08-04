@@ -107,7 +107,9 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
     use webview2_com::{AcceleratorKeyPressedEventHandler, ContextMenuRequestedEventHandler};
     use windows_core::Interface;
     use windows_core::BOOL;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_F5, VK_R};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_CONTROL, VK_F5, VK_MENU, VK_R,
+    };
 
     let window = app.get_webview_window("main").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "main window not found")
@@ -129,8 +131,13 @@ fn setup_windows_browser_guards(app: &tauri::App) -> Result<(), Box<dyn std::err
                 let mut virtual_key = 0;
                 event_args.VirtualKey(&mut virtual_key)?;
                 let control_down = GetKeyState(i32::from(VK_CONTROL)) < 0;
+                // AltGr reports as left Ctrl plus right Alt, so a bare Ctrl test would swallow
+                // printable AltGr combinations such as AltGr+R. Either Alt clears the arm:
+                // Windows treats left Ctrl plus left Alt as the same character-generating
+                // sequence, and Ctrl+Alt+R is not a refresh accelerator in the first place.
+                let alt_down = GetKeyState(i32::from(VK_MENU)) < 0;
                 if virtual_key == u32::from(VK_F5)
-                    || (virtual_key == u32::from(VK_R) && control_down)
+                    || (virtual_key == u32::from(VK_R) && control_down && !alt_down)
                 {
                     event_args.SetHandled(true)?;
                 }

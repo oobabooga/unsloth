@@ -146,7 +146,8 @@ jobs:
   windows-check:
     name: Tauri Windows type check (compile only)
     runs-on: windows-latest
-    timeout-minutes: 30
+    # Two profiles, so a cold cache checks the dependency tree twice.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -175,4 +176,11 @@ jobs:
         # `--all-targets` so the crate's unit tests are type-checked too. This does not
         # run them: the Linux job owns `cargo test`, and the Windows-only code paths
         # need a real WebView2 session that no runner provides.
-        run: cargo check --all-targets
+        #
+        # Both profiles run because `main.rs` gates Windows code on `debug_assertions` in
+        # both directions: `setup_windows_browser_guards` is only called when it is off,
+        # while deep-link registration and the dev backend lookup in `process.rs` only
+        # compile when it is on. Checking one profile would leave the other uncompiled.
+        run: |
+          cargo check --all-targets
+          cargo check --all-targets --release
