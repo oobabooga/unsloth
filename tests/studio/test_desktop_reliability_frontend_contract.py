@@ -317,6 +317,10 @@ def test_desktop_window_exposes_native_quit_with_tray_cleanup():
     assert "quit_app," in invoke_handler
     assert 'invoke("quit_app")' in sidebar
 
+    # Cleanup reaps the backend tree for up to ~15s. Hide first, or the window
+    # sits on screen looking hung for the whole wait.
+    assert quit_app.index("hide_main_window") < quit_app.index("cleanup_child_processes")
+
 
 def test_quit_refuses_spawns_that_cleanup_could_never_reap():
     # cleanup_child_processes takes each child handle out of its state before it

@@ -313,6 +313,12 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn hide_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     let Some(request) = QuitRequest::begin() else {
@@ -330,7 +336,21 @@ fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
             if !confirm_quit_during_training(&app) {
                 return;
             }
-            cleanup_child_processes(&app);
+
+            // Reaping the backend tree can take ~15s. Hide first so the quit reads as
+            // instant instead of leaving the window on screen looking hung. The tray
+            // path usually hides it already, and hiding twice is a no-op.
+            hide_main_window(&app);
+
+            // The window is gone, so a panicking cleanup must not leave the app alive
+            // and invisible. Exit anyway: `RunEvent::Exit` re-runs the poisoned
+            // `TERMINATION_CLEANUP`, giving the backend a second chance to be reaped.
+            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cleanup_child_processes(&app)
+            }));
+            if cleanup.is_err() {
+                warn!("Quit cleanup panicked, exiting anyway");
+            }
             request.commit();
             app.exit(0);
         })
