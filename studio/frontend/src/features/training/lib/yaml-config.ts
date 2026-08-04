@@ -83,6 +83,7 @@ export function serializeConfigToYaml(
     max_seq_length: state.contextLength,
     num_epochs: state.epochs,
     learning_rate: state.learningRate,
+    embedding_learning_rate: state.embeddingLearningRate,
     batch_size: state.batchSize,
     gradient_accumulation_steps: state.gradientAccumulation,
     warmup_steps: state.warmupSteps,

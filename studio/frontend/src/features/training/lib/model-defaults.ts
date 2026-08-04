@@ -11,6 +11,7 @@ type ModelDefaultsPatch = Partial<
     | "epochs"
     | "contextLength"
     | "learningRate"
+    | "embeddingLearningRate"
     | "optimizerType"
     | "lrSchedulerType"
     | "loraRank"
@@ -107,6 +108,13 @@ export function mapBackendModelConfigToTrainingPatch(
 
   const learningRate = toNumber(training?.learning_rate);
   if (learningRate !== undefined) patch.learningRate = learningRate;
+
+  // null is a real setting here ("let the backend derive it"), so distinguish an
+  // explicit null from an absent key the way vision_image_size does below.
+  if (Object.hasOwn(training ?? {}, "embedding_learning_rate")) {
+    const raw = training?.embedding_learning_rate;
+    patch.embeddingLearningRate = raw == null ? null : (toNumber(raw) ?? null);
+  }
 
   const optim = toStringValue(training?.optim);
   if (optim !== undefined) patch.optimizerType = optim;

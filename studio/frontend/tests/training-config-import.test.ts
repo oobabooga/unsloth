@@ -174,3 +174,33 @@ test("saving and reloading a config keeps the logging settings", () => {
   assert.equal(after.tensorboardDir, "my-runs");
   assert.equal(after.logFrequency, 25);
 });
+
+test("saving and reloading a config keeps the embedding learning rate", () => {
+  seedTunedModelDefaults();
+  useTrainingConfigStore.setState({ embeddingLearningRate: 3e-5 });
+
+  const saved = serializeConfigToYaml(useTrainingConfigStore.getState(), false);
+
+  useTrainingConfigStore.setState({ embeddingLearningRate: null });
+  importConfig(saved);
+  assert.equal(useTrainingConfigStore.getState().embeddingLearningRate, 3e-5);
+
+  // null means "let the backend derive it", so it has to round-trip too rather
+  // than leave the previous rate standing.
+  useTrainingConfigStore.setState({ embeddingLearningRate: null });
+  const clearedSave = serializeConfigToYaml(
+    useTrainingConfigStore.getState(),
+    false,
+  );
+  useTrainingConfigStore.setState({ embeddingLearningRate: 9e-5 });
+  importConfig(clearedSave);
+  assert.equal(useTrainingConfigStore.getState().embeddingLearningRate, null);
+});
+
+test("a file with no embedding learning rate leaves the current one alone", () => {
+  seedTunedModelDefaults();
+  useTrainingConfigStore.setState({ embeddingLearningRate: 4e-5 });
+
+  importConfig("training:\n  max_seq_length: 4096\n");
+  assert.equal(useTrainingConfigStore.getState().embeddingLearningRate, 4e-5);
+});

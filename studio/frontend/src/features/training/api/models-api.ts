@@ -18,6 +18,7 @@ interface BackendTrainingDefaults {
   max_seq_length?: number;
   num_epochs?: number;
   learning_rate?: number | string;
+  embedding_learning_rate?: number | string | null;
   optim?: string;
   lr_scheduler_type?: string;
   batch_size?: number;
