@@ -622,6 +622,11 @@ pub fn start_backend(
     // into the old window between generation reset and child storage.
     let (generation, backend_log, stdout, stderr) = {
         let mut proc = state.lock().map_err(|e| e.to_string())?;
+        // Checked under the same lock the child is stored under, so a quit that is
+        // already reaping cannot race a fresh backend past it.
+        if crate::quit_in_progress() {
+            return Err(crate::QUIT_IN_PROGRESS_ERROR.to_string());
+        }
         if proc.has_owned_backend() {
             return Err("Backend is already running.".to_string());
         }

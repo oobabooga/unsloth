@@ -607,6 +607,17 @@ export function AppSidebar() {
 
   const [shutdownOpen, setShutdownOpen] = useState(false);
 
+  const quitDesktopApp = async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("quit_app");
+    } catch (error) {
+      toast.error("Could not quit Unsloth", {
+        description: String(error),
+      });
+    }
+  };
+
   const isChatRoute = pathname.startsWith("/chat");
   const isStudioRoute = pathname === "/studio" || pathname.startsWith("/studio/");
   const [chatOpen, setChatOpen] = useState(true);
@@ -2463,12 +2474,12 @@ export function AppSidebar() {
                     <span>{t("shell.navigation.logOut")}</span>
                   </DropdownMenuItem>
                 )}
-                {!isTauri && (
-                  <DropdownMenuItem onSelect={() => setShutdownOpen(true)}>
-                    <HugeiconsIcon icon={PowerIcon} strokeWidth={1.75} className="size-icon" />
-                    <span>{t("common.shutdown")}</span>
-                  </DropdownMenuItem>
-                )}
+                <DropdownMenuItem
+                  onSelect={isTauri ? quitDesktopApp : () => setShutdownOpen(true)}
+                >
+                  <HugeiconsIcon icon={PowerIcon} strokeWidth={1.75} className="size-icon" />
+                  <span>{t("common.shutdown")}</span>
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
             {/* settings cog; sibling of the trigger (buttons cannot nest),

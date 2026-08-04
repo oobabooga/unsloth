@@ -298,6 +298,52 @@ def test_mac_dock_reopens_hidden_main_window():
     assert "show_main_window(app)" in reopen_handler
 
 
+def test_desktop_window_exposes_native_quit_with_tray_cleanup():
+    main = TAURI_MAIN.read_text(encoding = "utf-8")
+    sidebar = APP_SIDEBAR.read_text(encoding = "utf-8")
+
+    quit_app = main.split("fn quit_app", 1)[1].split("\n}\n", 1)[0]
+    tray_menu = main.split(".on_menu_event", 1)[1].split(".on_tray_icon_event", 1)[0]
+    tray_quit = tray_menu.split('"quit" =>', 1)[1].split("_ => {}", 1)[0]
+    invoke_handler = main.split("tauri::generate_handler![", 1)[1].split("])", 1)[0]
+
+    # The in-window action and the tray item must run one sequence, so they cannot drift.
+    assert "QuitRequest::begin()" in quit_app
+    assert "confirm_quit_during_install" in quit_app
+    assert "confirm_quit_during_training" in quit_app
+    assert "cleanup_child_processes" in quit_app
+    assert "app.exit(0)" in quit_app
+    assert "quit_app(app.clone())" in tray_quit
+    assert "quit_app," in invoke_handler
+    assert 'invoke("quit_app")' in sidebar
+
+    # Cleanup reaps the backend tree for up to ~15s. Hide first, or the window
+    # sits on screen looking hung for the whole wait.
+    assert quit_app.index("hide_main_window") < quit_app.index("cleanup_child_processes")
+
+
+def test_quit_refuses_spawns_that_cleanup_could_never_reap():
+    # cleanup_child_processes takes each child handle out of its state before it
+    # blocks on the kill, and TERMINATION_CLEANUP only runs once. A spawn landing in
+    # that window would outlive the app, so every owner refuses while a quit is live.
+    main = TAURI_MAIN.read_text(encoding = "utf-8")
+    assert "fn quit_in_progress()" in main
+
+    spawn_owners = {
+        REPO / "studio/src-tauri/src/process.rs": "pub fn start_backend(",
+        REPO / "studio/src-tauri/src/install.rs": "fn spawn_script(",
+        REPO / "studio/src-tauri/src/update.rs": "fn spawn_update(",
+    }
+    for path, signature in spawn_owners.items():
+        source = path.read_text(encoding = "utf-8")
+        body = source.split(signature, 1)[1]
+        gate = body.index("crate::quit_in_progress()")
+        # The gate is only airtight when it is read under the same lock that stores
+        # the child; outside it, a quit can start between the check and the spawn.
+        assert body.index(".lock()") < gate
+        assert gate < body.index(".spawn()")
+
+
 def test_desktop_startup_waits_for_auth_without_intermediate_handoff():
     source = APP_PROVIDER.read_text(encoding = "utf-8")
 
