@@ -35,14 +35,11 @@ export function formatFastApiDetail(detail: unknown): string | null {
   return parts.length > 0 ? parts.join("; ") : null;
 }
 
-/**
- * Render FastAPI and OpenAI-compatible error bodies into a message.
- *
- * Studio's `/api/*` routes use `{detail}` while its `/v1/*` routes use the
- * OpenAI-compatible `{error: {message}}` envelope. Keep both response shapes
- * readable for frontend callers that can reach either API surface.
- */
-export function formatApiErrorBody(body: unknown): string | null {
+// FastAPI nests at most one envelope inside `detail`, so the cap only exists to
+// keep a hostile or malformed body from recursing without bound.
+const MAX_ERROR_BODY_DEPTH = 4;
+
+function formatErrorBody(body: unknown, depth: number): string | null {
   if (!body || typeof body !== "object") return null;
 
   const payload = body as {
@@ -52,6 +49,19 @@ export function formatApiErrorBody(body: unknown): string | null {
   };
   const formatted = formatFastApiDetail(payload.detail);
   if (formatted) return formatted;
+  // A route that raises `HTTPException(detail = <OpenAI envelope>)` returns the
+  // envelope verbatim on the `/v1/*` mount but wrapped as
+  // `{detail: {error: {message}}}` on the `/api/*` mount of the same router,
+  // so the same rejection has to read the same either way.
+  if (
+    depth < MAX_ERROR_BODY_DEPTH &&
+    payload.detail &&
+    typeof payload.detail === "object" &&
+    !Array.isArray(payload.detail)
+  ) {
+    const nested = formatErrorBody(payload.detail, depth + 1);
+    if (nested) return nested;
+  }
   if (typeof payload.message === "string" && payload.message) {
     return payload.message;
   }
@@ -62,6 +72,17 @@ export function formatApiErrorBody(body: unknown): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Render FastAPI and OpenAI-compatible error bodies into a message.
+ *
+ * Studio's `/api/*` routes use `{detail}` while its `/v1/*` routes use the
+ * OpenAI-compatible `{error: {message}}` envelope. Keep both response shapes
+ * readable for frontend callers that can reach either API surface.
+ */
+export function formatApiErrorBody(body: unknown): string | null {
+  return formatErrorBody(body, 0);
 }
 
 /**

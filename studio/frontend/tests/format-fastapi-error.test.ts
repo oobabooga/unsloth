@@ -48,6 +48,64 @@ test("keeps FastAPI detail and top-level message support", () => {
   );
 });
 
+test("unwraps an envelope nested in FastAPI's detail", () => {
+  // `/api/inference/chat/completions` and `/v1/chat/completions` are the same
+  // router, but only the `/v1` mount returns the envelope unwrapped.
+  const flat = { error: { message: "Audio file is too large (max ~25 MB)." } };
+  assert.equal(
+    formatApiErrorBody({ detail: flat }),
+    "Audio file is too large (max ~25 MB).",
+  );
+  // Both mounts must render the same rejection identically.
+  assert.equal(formatApiErrorBody(flat), formatApiErrorBody({ detail: flat }));
+  assert.equal(
+    formatApiErrorBody({
+      detail: {
+        error: {
+          message: "n > 1 is not supported for GGUF tool chat completions.",
+          code: "unsupported_parameter",
+          param: "n",
+        },
+      },
+    }),
+    "n > 1 is not supported for GGUF tool chat completions.",
+  );
+  assert.equal(
+    formatApiErrorBody({ detail: { message: "Nested plain message" } }),
+    "Nested plain message",
+  );
+});
+
+test("prefers a string detail over anything nested under it", () => {
+  // A string detail still wins, so the flat `/api/*` shape is unchanged.
+  assert.equal(
+    formatApiErrorBody({ detail: "Audio is too large." }),
+    "Audio is too large.",
+  );
+  assert.equal(formatApiErrorBody({ detail: {} }), null);
+  assert.equal(formatApiErrorBody({ detail: { error: {} } }), null);
+  assert.equal(formatApiErrorBody({ detail: [] }), null);
+});
+
+test("reads an envelope nested in detail off a response", async () => {
+  const response = new Response(
+    JSON.stringify({
+      detail: { error: { message: "Audio file is too large (max ~25 MB)." } },
+    }),
+    { status: 413, headers: { "Content-Type": "application/json" } },
+  );
+  assert.equal(
+    await readFastApiError(response),
+    "Audio file is too large (max ~25 MB).",
+  );
+});
+
+test("does not recurse without bound on a deeply nested detail", () => {
+  let body: unknown = { error: { message: "too deep to reach" } };
+  for (let i = 0; i < 50; i++) body = { detail: body };
+  assert.equal(formatApiErrorBody(body), null);
+});
+
 test("reads an OpenAI-compatible error response", async () => {
   const response = new Response(
     JSON.stringify({ error: { message: "Context limit exceeded" } }),

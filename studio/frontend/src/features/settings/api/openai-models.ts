@@ -2,7 +2,6 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
-import { readFastApiError } from "@/lib/format-fastapi-error";
 
 export type OpenAIModel = {
   id: string;
@@ -23,7 +22,7 @@ type ApiOpenAIModelList = {
 export async function listOpenAIModels(): Promise<OpenAIModel[]> {
   const res = await authFetch("/v1/models");
   if (!res.ok) {
-    throw new Error(await readFastApiError(res, "Failed to list models"));
+    throw new Error(`Failed to list models (${res.status})`);
   }
   const body = (await res.json()) as ApiOpenAIModelList;
   if (!Array.isArray(body?.data)) {

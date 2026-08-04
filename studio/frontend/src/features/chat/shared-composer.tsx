@@ -897,10 +897,11 @@ export function SharedComposer({
       pasteClipboardFiles(
         event,
         async (files) => {
+          // Oversized audio counts as recognized so `addFiles` can name the
+          // limit; rejecting it here would fall back to the generic message.
           const supported = files.some(
             (file) =>
-              (file.type.match(/^audio\//i) &&
-                getAudioSizeError(file.size) === null) ||
+              file.type.match(/^audio\//i) ||
               (file.type.match(/^image\/(jpeg|png|webp|gif)$/i) &&
                 file.size <= MAX_IMAGE_SIZE),
           );
