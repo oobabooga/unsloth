@@ -25,12 +25,15 @@ def _steps(workflow, job):
     return workflow["jobs"][job]["steps"]
 
 
+def _step_index(workflow, job, name):
+    """Locate a step by name, and say so plainly when it has been renamed."""
+    names = [step.get("name") for step in _steps(workflow, job)]
+    assert name in names, f"{job} has no step named {name!r}; steps are {names}"
+    return names.index(name)
+
+
 def _step(workflow, job, name):
-    return next(step for step in _steps(workflow, job) if step.get("name") == name)
-
-
-def _step_names(workflow, job):
-    return [step.get("name") for step in _steps(workflow, job)]
+    return _steps(workflow, job)[_step_index(workflow, job, name)]
 
 
 def _write_fake_gh(path: Path):
@@ -47,15 +50,6 @@ if [ "$1" = "api" ]; then
 fi
 if [ "$1 $2" = "release view" ]; then
   exit "$RELEASE_EXISTS_STATUS"
-fi
-if [ "$1 $2" = "release create" ]; then
-  prev=""
-  for arg in "$@"; do
-    if [ "$prev" = "--notes-file" ]; then
-      cp "$arg" "$NOTES_CAPTURE"
-    fi
-    prev="$arg"
-  done
 fi
 exit 0
 """,
@@ -87,7 +81,6 @@ def _run_step(
             "DESKTOP_RELEASE_TAG": RELEASE_TAG,
             "GH_REPO": "unslothai/unsloth",
             "GH_TOKEN": "masked-token",
-            "NOTES_CAPTURE": str(tmp_path / "release-body.md"),
             "PATH": f"{fake_bin}:{env['PATH']}",
             "RELEASE_EXISTS_STATUS": "0" if release_exists else "1",
             "RUNNER_TEMP": str(tmp_path),
@@ -139,25 +132,25 @@ def _run_create_release(workflow, tmp_path: Path, **kwargs):
 def _upload_commands(workflow):
     commands = []
     for step in _steps(workflow, "publish-release"):
-        for line in step.get("run", "").splitlines():
+        # Join backslash continuations so a flag parked on the next line counts.
+        for line in step.get("run", "").replace("\\\n", " ").splitlines():
             stripped = line.strip()
             if stripped.startswith("gh release upload"):
                 commands.append(stripped)
     return commands
 
 
-def test_an_existing_tag_or_release_fails_before_any_build_work(tmp_path):
+def test_a_used_version_fails_the_guard_before_any_build_work(tmp_path):
     workflow = _workflow()
-    names = _step_names(workflow, "prepare-version")
     # The point of guarding here rather than only at publish time is that the
     # three platform builds and the notarization round trip never start.
-    assert names.index("Guard against republishing an existing version") < names.index(
-        "Verify PyPI package and Unsloth stamp"
-    )
+    assert _step_index(
+        workflow, "prepare-version", "Guard against republishing an existing version"
+    ) < _step_index(workflow, "prepare-version", "Verify PyPI package and Unsloth stamp")
     assert workflow["jobs"]["build"]["needs"] == "prepare-version"
 
-    for case in ({"tag_exists": True}, {"release_exists": True}):
-        case_dir = tmp_path / "-".join(case)
+    for case, expected in (({"tag_exists": True}, 1), ({"release_exists": True}, 1), ({}, 0)):
+        case_dir = tmp_path / ("-".join(case) or "unused-version")
         case_dir.mkdir()
         result, _ = _run_step(
             workflow,
@@ -166,18 +159,11 @@ def test_an_existing_tag_or_release_fails_before_any_build_work(tmp_path):
             case_dir,
             **case,
         )
-        assert result.returncode == 1, case
-        assert RELEASE_TAG in result.stderr
-
-
-def test_an_unused_version_passes_the_guard(tmp_path):
-    result, _ = _run_step(
-        _workflow(),
-        "prepare-version",
-        "Guard against republishing an existing version",
-        tmp_path,
-    )
-    assert result.returncode == 0, result.stderr
+        assert result.returncode == expected, (case, result.stderr)
+        if expected:
+            assert RELEASE_TAG in result.stderr
+            # Deleting the release alone leaves the tag, which fails here again.
+            assert f"gh release delete {RELEASE_TAG} --cleanup-tag" in result.stderr
 
 
 def test_publish_refuses_to_reuse_an_existing_release(tmp_path):
@@ -190,10 +176,11 @@ def test_publish_refuses_to_reuse_an_existing_release(tmp_path):
         result, commands = _run_create_release(workflow, case_dir, **case)
         assert result.returncode == 1, case
         assert "Refusing to republish" in result.stderr
+        assert f"gh release delete {RELEASE_TAG} --cleanup-tag" in result.stderr
         assert not [line for line in commands if line.startswith("gh release create")]
 
 
-def test_release_body_records_the_source_commit_and_asset_digests(tmp_path):
+def test_release_body_records_provenance_the_updater_notes_do_not_carry(tmp_path):
     workflow = _workflow()
     digests = _stage_assets(tmp_path)
     result, commands = _run_create_release(workflow, tmp_path)
@@ -203,23 +190,18 @@ def test_release_body_records_the_source_commit_and_asset_digests(tmp_path):
     assert RELEASE_TAG in create
     assert f"--target {SOURCE_SHA}" in create
 
-    body = (tmp_path / "release-body.md").read_text(encoding = "utf-8")
+    body_file = tmp_path / "desktop-release-body.md"
+    assert f"--notes-file {body_file}" in create
+    body = body_file.read_text(encoding = "utf-8")
     assert SOURCE_SHA in body
     for name, digest in digests.items():
         assert f"{digest}  {name}" in body
 
-
-def test_updater_notes_stay_free_of_the_provenance_block(tmp_path):
-    # latest.json feeds the in-app update popup from this file, so the digest
-    # dump belongs to the release body only.
-    workflow = _workflow()
-    result, _ = _run_create_release(workflow, tmp_path)
-    assert result.returncode == 0, result.stderr
-
+    # latest.json carries the notes file into the in-app update popup, so the
+    # digest dump belongs to the release body only.
     notes = (tmp_path / "desktop-release-notes.md").read_text(encoding = "utf-8")
     assert "Build provenance" not in notes
     assert "Desktop app for Unsloth." in notes
-
     metadata_step = _step(
         workflow, "publish-release", "Generate and publish versioned updater metadata"
     )
@@ -227,8 +209,7 @@ def test_updater_notes_stay_free_of_the_provenance_block(tmp_path):
 
 
 def test_versioned_uploads_never_clobber_but_the_channel_pointer_does():
-    workflow = _workflow()
-    uploads = _upload_commands(workflow)
+    uploads = _upload_commands(_workflow())
     versioned = [line for line in uploads if "$DESKTOP_RELEASE_TAG" in line]
     channel = [line for line in uploads if "desktop-latest" in line]
     assert len(versioned) == 2, uploads
