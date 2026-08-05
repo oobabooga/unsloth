@@ -384,6 +384,11 @@ fn main() {
             has_saved_window_state,
         ])
         .setup(|app| {
+            // Before the first preflight, so an install that never got a studio
+            // root id written for it can still recognize its own backend.
+            if let Err(error) = desktop_backend_owner::ensure_installed_studio_root_id() {
+                warn!("Desktop backend ownership id unavailable: {error}");
+            }
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
