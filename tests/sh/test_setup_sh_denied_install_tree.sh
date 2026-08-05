@@ -37,6 +37,27 @@ assert_contains "the ownership guard checks readability before blaming ownership
 assert_contains "an unverifiable tree is never described as not ours" \
     "$SETUP_SH" "Unsloth cannot confirm this folder is its own install while it is unreadable"
 
+# The ownership guard beside the prebuilt install only runs for a custom
+# UNSLOTH_STUDIO_HOME, so the default ~/.unsloth/llama.cpp -- where a root-owned
+# leftover lands -- went straight into install_llama_prebuilt.py, whose
+# is_file() raises on EACCES rather than returning false. Mirrors the
+# Get-LlamaCppInstallReadState guard in setup.ps1 PHASE 3.4.
+PREBUILT_BLOCK="$(awk '/substep "installing prebuilt llama.cpp\.\.\."/,/_PREBUILT_CMD=\(/' "$SETUP_SH")"
+if printf '%s' "$PREBUILT_BLOCK" | grep -qF '_studio_dir_unsearchable "$LLAMA_CPP_DIR"' &&
+   printf '%s' "$PREBUILT_BLOCK" | grep -qF '_path_access_denied "$LLAMA_CPP_DIR" "llama.cpp install"'; then
+    ok "the default-home prebuilt install stops on an unsearchable tree"
+else
+    bad "the default-home prebuilt install stops on an unsearchable tree"
+fi
+# After the ownership guard, which reports a custom home as owner-unverified:
+# that is the more careful of the two wordings and must win where it applies.
+if [ "$(printf '%s' "$PREBUILT_BLOCK" | grep -n '_assert_studio_owned_or_absent' | cut -d: -f1 | head -1)" -lt \
+     "$(printf '%s' "$PREBUILT_BLOCK" | grep -n '_studio_dir_unsearchable' | cut -d: -f1 | head -1)" ]; then
+    ok "the ownership guard still reports a custom home first"
+else
+    bad "the ownership guard still reports a custom home first"
+fi
+
 echo ""
 echo "=== setup.sh: neither destructive replace runs blind ==="
 
