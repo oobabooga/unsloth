@@ -21,6 +21,7 @@ import type {
 import type { MessageRecord } from "../types";
 import {
   ensureStoredChatThread,
+  syncStoredChatMessageDeletion,
   syncStoredChatMessages,
 } from "./chat-history-storage";
 
@@ -77,13 +78,10 @@ export function exportedItemToRecord(
   };
 }
 
-/**
- * Persist exported messages, pruning only for explicit delete flows.
- */
+/** Persist the repository without treating an incomplete snapshot as deletion. */
 export async function syncExportedRepositoryToBackend(
   remoteId: string,
   exp: ExportedMessageRepository,
-  options: { pruneMissing?: boolean } = {},
 ): Promise<void> {
   await ensureStoredChatThread(remoteId);
   await syncStoredChatMessages(
@@ -91,7 +89,6 @@ export async function syncExportedRepositoryToBackend(
     exp.messages.map(({ message, parentId }) =>
       exportedItemToRecord(remoteId, parentId, message),
     ),
-    { pruneMissing: options.pruneMissing },
   );
 }
 
@@ -134,9 +131,19 @@ export async function deleteThreadMessage(args: {
 
   const next = repo.export();
   if (remoteId) {
-    await syncExportedRepositoryToBackend(remoteId, next, {
-      pruneMissing: true,
-    });
+    const remainingIds = new Set(
+      next.messages.map(({ message }) => message.id),
+    );
+    const deletedIds = exported.messages
+      .map(({ message }) => message.id)
+      .filter((id) => !remainingIds.has(id));
+    await syncStoredChatMessageDeletion(
+      remoteId,
+      next.messages.map(({ message, parentId }) =>
+        exportedItemToRecord(remoteId, parentId, message),
+      ),
+      deletedIds,
+    );
   }
   thread.import(next);
 }
