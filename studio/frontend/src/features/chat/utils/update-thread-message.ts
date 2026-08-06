@@ -1,5 +1,5 @@
 import type { ExportedMessageRepository, ThreadMessage } from "@assistant-ui/react";
-import { saveChatMessage } from "../api/chat-api";
+import { saveStoredChatMessage } from "./chat-history-storage";
 
 type ThreadImportExport = {
   export: () => ExportedMessageRepository;
@@ -136,7 +136,7 @@ export async function updateThreadMessage(args: {
   // If it's NOT incognito, we attempt to save to the DB regardless of the ID.
   if (remoteId && !isIncognito) {
     try {
-      await saveChatMessage({
+      await saveStoredChatMessage({
         id: messageId,
         threadId: remoteId,
         parentId: originalParentId,

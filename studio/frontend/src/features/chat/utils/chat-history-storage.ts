@@ -2,34 +2,40 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import {
+  batchListChatMessages,
   buildBackendChatExport,
   clearBackendChats,
   deleteChatProject,
   deleteChatThreads,
-  getChatProject,
   getChatMessage,
+  getChatProject,
   getChatThread,
-  batchListChatMessages,
-  listChatProjects,
   listChatImportLedger,
   listChatMessages,
+  listChatProjects,
   listChatThreads,
   notifyChatHistoryUpdated,
   recordChatImportLedger,
-  saveChatProject,
   saveChatMessage,
+  saveChatProject,
   saveChatThread,
   syncChatMessages,
   updateChatProject,
   updateChatThread,
 } from "../api/chat-api";
-import { db, DEXIE_DB_NAME } from "../db";
+import { DEXIE_DB_NAME, db } from "../db";
 import type {
   MessageRecord,
   ModelType,
   ProjectRecord,
   ThreadRecord,
 } from "../types";
+import {
+  isChatMessageDeleted,
+  markChatMessagesDeleted,
+  removeChatMessageTombstones,
+  removeChatMessageTombstonesForThreads,
+} from "./chat-message-tombstones";
 import {
   isChatThreadDeleted,
   markChatThreadsDeleted,
@@ -132,6 +138,45 @@ async function listLegacyThreads(
   );
 }
 
+// The legacy Dexie database can be unreadable while studio.db is perfectly
+// healthy. The .deb links the system WebKit and the AppImage bundles an
+// older one, and the older engine refuses to open an IndexedDB file written
+// by the newer one, so switching between the two Linux artifacts on the same
+// profile makes every Dexie read throw. Dexie is only a supplement to the
+// backend here, so each read below degrades to "no legacy data" instead of
+// failing the whole lookup and emptying the chat history.
+let legacyStorageFailureReported = false;
+
+function reportLegacyStorageFailure(error: unknown): void {
+  if (legacyStorageFailureReported) return;
+  legacyStorageFailureReported = true;
+  console.warn(
+    "chat-history-storage: legacy chat storage is unreadable, continuing " +
+      "with backend chat history only",
+    error,
+  );
+}
+
+async function readLegacyRecord<T>(
+  read: () => Promise<T | undefined>,
+): Promise<T | undefined> {
+  try {
+    return await read();
+  } catch (error) {
+    reportLegacyStorageFailure(error);
+    return undefined;
+  }
+}
+
+async function readLegacyCollection<T>(read: () => Promise<T[]>): Promise<T[]> {
+  try {
+    return await read();
+  } catch (error) {
+    reportLegacyStorageFailure(error);
+    return [];
+  }
+}
+
 function sortMessages(messages: MessageRecord[]): MessageRecord[] {
   const roleOrder: Record<string, number> = {
     system: 0,
@@ -159,7 +204,13 @@ export function isExpectedBackgroundChatStorageError(error: unknown): boolean {
 
 function normalizeLegacyMessages(messages: MessageRecord[]): MessageRecord[] {
   let previousId: string | null = null;
-  return sortMessages(messages).map((message) => {
+  return sortMessages(
+    messages.filter(
+      (message) =>
+        !isChatThreadDeleted(message.threadId) &&
+        !isChatMessageDeleted(message.threadId, message.id),
+    ),
+  ).map((message) => {
     const parentId = hasOwn(message, "parentId")
       ? (message.parentId ?? null)
       : previousId;
@@ -209,7 +260,11 @@ function mergeMessages(
   const includeLegacyOnly = options.includeLegacyOnly ?? true;
   const backendIds = new Set(
     backendMessages
-      .filter((message) => !isChatThreadDeleted(message.threadId))
+      .filter(
+        (message) =>
+          !isChatThreadDeleted(message.threadId) &&
+          !isChatMessageDeleted(message.threadId, message.id),
+      )
       .map((message) => message.id),
   );
   let shouldSync = false;
@@ -222,7 +277,10 @@ function mergeMessages(
     }
   }
   for (const message of backendMessages) {
-    if (!isChatThreadDeleted(message.threadId)) {
+    if (
+      !isChatThreadDeleted(message.threadId) &&
+      !isChatMessageDeleted(message.threadId, message.id)
+    ) {
       const legacyMessage = byId.get(message.id);
       if (legacyMessage && messageNeedsBackfill(message, legacyMessage)) {
         byId.set(message.id, mergeLegacyMessageFields(message, legacyMessage));
@@ -340,11 +398,12 @@ async function importLegacyChatsIfNeeded(): Promise<void> {
 
     // Slow path: diff Dexie against the server-side ledger and import
     // any threads not already recorded.
-    const [legacyThreads, backendThreads, importedThreadIds] = await Promise.all([
-      db.threads.toArray(),
-      listChatThreads({ includeArchived: true }),
-      listChatImportLedger(),
-    ]);
+    const [legacyThreads, backendThreads, importedThreadIds] =
+      await Promise.all([
+        db.threads.toArray(),
+        listChatThreads({ includeArchived: true }),
+        listChatImportLedger(),
+      ]);
 
     const backendThreadsById = new Map(
       backendThreads.map((thread) => [thread.id, thread]),
@@ -372,7 +431,10 @@ async function importLegacyChatsIfNeeded(): Promise<void> {
       .where("threadId")
       .anyOf(unimportedIds)
       .toArray()
-      .catch(() => [] as MessageRecord[]);
+      .catch((error) => {
+        reportLegacyStorageFailure(error);
+        throw error;
+      });
     const legacyByThread = new Map<string, MessageRecord[]>();
     for (const message of allLegacyMessages) {
       const arr = legacyByThread.get(message.threadId);
@@ -447,7 +509,7 @@ export async function getStoredChatThread(
   // empty -- short-circuit it instead of doing a Dexie read + backend GET.
   if (isThreadIncognito(threadId)) return undefined;
   if (isChatThreadDeleted(threadId)) return undefined;
-  const legacyThread = await db.threads.get(threadId);
+  const legacyThread = await readLegacyRecord(() => db.threads.get(threadId));
   let backendThread: ThreadRecord | null;
   try {
     backendThread = await getChatThread(threadId);
@@ -473,7 +535,8 @@ export async function ensureStoredChatThread(
   // on every autosave (runStart/runEnd) and message append.
   if (isThreadIncognito(threadId)) return undefined;
   if (isChatThreadDeleted(threadId)) return undefined;
-  const legacyThread = fallback ?? (await db.threads.get(threadId));
+  const legacyThread =
+    fallback ?? (await readLegacyRecord(() => db.threads.get(threadId)));
   let backendThread: ThreadRecord | null;
   try {
     backendThread = await getChatThread(threadId);
@@ -495,10 +558,15 @@ export async function listStoredChatMessages(
 ): Promise<MessageRecord[]> {
   if (isThreadIncognito(threadId)) return [];
   if (isChatThreadDeleted(threadId)) return [];
-  const legacyMessages = await db.messages
-    .where("threadId")
-    .equals(threadId)
-    .toArray();
+  const legacyMessages = (
+    await readLegacyCollection(() =>
+      db.messages.where("threadId").equals(threadId).toArray(),
+    )
+  ).filter(
+    (message) =>
+      !isChatThreadDeleted(message.threadId) &&
+      !isChatMessageDeleted(message.threadId, message.id),
+  );
   const [backendThread, backendMessages] = await Promise.all([
     getChatThread(threadId).catch(() => undefined),
     listChatMessages(threadId).catch((error) => {
@@ -528,9 +596,7 @@ export async function listStoredChatMessages(
   ) {
     return [];
   }
-  return legacyMessages.filter(
-    (message) => !isChatThreadDeleted(message.threadId),
-  );
+  return legacyMessages;
 }
 
 export async function getStoredChatMessage(
@@ -539,7 +605,10 @@ export async function getStoredChatMessage(
 ): Promise<MessageRecord | undefined> {
   if (isThreadIncognito(threadId)) return undefined;
   if (isChatThreadDeleted(threadId)) return undefined;
-  const legacyMessage = await db.messages.get(messageId);
+  if (isChatMessageDeleted(threadId, messageId)) return undefined;
+  const legacyMessage = await readLegacyRecord(() =>
+    db.messages.get(messageId),
+  );
   const matchingLegacyMessage =
     legacyMessage?.threadId === threadId ? legacyMessage : undefined;
   let backendMessage: MessageRecord | null;
@@ -566,7 +635,9 @@ export async function getStoredChatMessage(
 export async function listStoredChatThreads(
   args: ThreadListArgs = {},
 ): Promise<ThreadRecord[]> {
-  const legacyThreads = await listLegacyThreads(args);
+  const legacyThreads = await readLegacyCollection(() =>
+    listLegacyThreads(args),
+  );
   let backendThreads = await listChatThreads(args).catch((error) => {
     if (legacyThreads.length > 0) {
       return undefined;
@@ -591,8 +662,7 @@ export async function listStoredChatThreads(
   return Array.from(byId.values())
     .filter((thread) => matchesThreadListArgs(thread, args))
     .sort(
-      (a, b) =>
-        (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt),
+      (a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt),
     );
 }
 
@@ -613,7 +683,11 @@ export async function listStoredChatThreadsWithMessages(
   const entries = await Promise.all(
     threads.map(async (thread) => {
       const backendMessages = backendByThread.get(thread.id) ?? [];
-      if (backendMessages.length > 0) {
+      if (
+        backendMessages.some(
+          (message) => !isChatMessageDeleted(thread.id, message.id),
+        )
+      ) {
         return { thread, hasContent: true };
       }
       const legacy = await listStoredChatMessages(thread.id).catch(() => null);
@@ -677,10 +751,12 @@ export async function moveStoredChatItemToProject(
   const threadIds =
     item.type === "single"
       ? [item.id]
-      : (await listStoredChatThreads({
-          pairId: item.id,
-          includeArchived: true,
-        })).map((thread) => thread.id);
+      : (
+          await listStoredChatThreads({
+            pairId: item.id,
+            includeArchived: true,
+          })
+        ).map((thread) => thread.id);
 
   await Promise.all(
     Array.from(new Set(threadIds)).map((threadId) =>
@@ -696,6 +772,7 @@ export async function saveStoredChatMessage(
   if (isChatThreadDeleted(message.threadId)) {
     throw new Error(`Thread ${message.threadId} was deleted`);
   }
+  if (isChatMessageDeleted(message.threadId, message.id)) return message;
   await ensureStoredChatThread(message.threadId);
   return saveChatMessage(message);
 }
@@ -708,7 +785,32 @@ export async function syncStoredChatMessages(
   if (isThreadIncognito(threadId)) return messages;
   if (isChatThreadDeleted(threadId)) return [];
   await ensureStoredChatThread(threadId);
-  return syncChatMessages(threadId, messages, options);
+  return syncChatMessages(
+    threadId,
+    messages.filter((message) => !isChatMessageDeleted(threadId, message.id)),
+    options,
+  );
+}
+
+export async function syncStoredChatMessageDeletion(
+  threadId: string,
+  messages: MessageRecord[],
+  deletedMessageIds: string[],
+): Promise<MessageRecord[]> {
+  if (isThreadIncognito(threadId)) return messages;
+  if (isChatThreadDeleted(threadId)) return [];
+  const newTombstoneIds = deletedMessageIds.filter(
+    (messageId) => !isChatMessageDeleted(threadId, messageId),
+  );
+  markChatMessagesDeleted(threadId, newTombstoneIds);
+  try {
+    return await syncStoredChatMessages(threadId, messages, {
+      pruneMissing: true,
+    });
+  } catch (error) {
+    removeChatMessageTombstones(threadId, newTombstoneIds);
+    throw error;
+  }
 }
 
 export async function saveStoredChatThread(
@@ -747,6 +849,7 @@ export async function deleteStoredChatThreads(
     })
     .catch(() => undefined);
   markChatThreadsDeleted(ids);
+  removeChatMessageTombstonesForThreads(ids);
 }
 
 export async function countStoredChats(): Promise<number> {
@@ -817,6 +920,7 @@ export async function clearStoredChats(): Promise<ClearStoredChatsResult> {
   result.failedThreadIds = allThreadIds.filter((id) => !deleted.has(id));
 
   markChatThreadsDeleted(result.deletedThreadIds);
+  removeChatMessageTombstonesForThreads(result.deletedThreadIds);
   notifyChatHistoryUpdated();
 
   if (result.backend === "failed" && result.legacy === "failed") {
@@ -828,12 +932,16 @@ export async function clearStoredChats(): Promise<ClearStoredChatsResult> {
 export async function buildStoredChatExport(): Promise<ExportedChat> {
   await importLegacyChatsIfNeeded().catch(() => undefined);
   const [legacyThreads, legacyMessages] = await Promise.all([
-    db.threads.toArray(),
-    db.messages.toArray(),
+    readLegacyCollection(() => db.threads.toArray()),
+    readLegacyCollection(() => db.messages.toArray()),
   ]);
   const hasLegacyData =
     legacyThreads.some((thread) => !isChatThreadDeleted(thread.id)) ||
-    legacyMessages.some((message) => !isChatThreadDeleted(message.threadId));
+    legacyMessages.some(
+      (message) =>
+        !isChatThreadDeleted(message.threadId) &&
+        !isChatMessageDeleted(message.threadId, message.id),
+    );
   const backend = await buildBackendChatExport().catch((error) => {
     if (hasLegacyData) {
       return null;
@@ -850,7 +958,12 @@ export async function buildStoredChatExport(): Promise<ExportedChat> {
     threadsById.set(thread.id, thread);
   }
   for (const message of backend?.messages ?? []) {
-    if (isChatThreadDeleted(message.threadId)) continue;
+    if (
+      isChatThreadDeleted(message.threadId) ||
+      isChatMessageDeleted(message.threadId, message.id)
+    ) {
+      continue;
+    }
     messagesById.set(message.id, message);
   }
   const includeLegacyOnly = backend === null || !isLegacyChatImportDone();
@@ -865,7 +978,10 @@ export async function buildStoredChatExport(): Promise<ExportedChat> {
     threadsById.set(thread.id, thread);
   }
   for (const message of legacyMessages as MessageRecord[]) {
-    if (isChatThreadDeleted(message.threadId)) {
+    if (
+      isChatThreadDeleted(message.threadId) ||
+      isChatMessageDeleted(message.threadId, message.id)
+    ) {
       continue;
     }
     if (!includeLegacyOnly) continue;

@@ -8,6 +8,7 @@ import {
   listStoredChatMessages,
   listStoredChatThreads,
 } from "../utils/chat-history-storage";
+import { isChatMessageDeleted } from "../utils/chat-message-tombstones";
 
 export interface ChatSearchItem {
   type: "single" | "compare";
@@ -109,7 +110,7 @@ function extractText(message: MessageRecord): string {
   return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-async function buildIndex(): Promise<ChatSearchItem[]> {
+export async function buildChatSearchIndex(): Promise<ChatSearchItem[]> {
   const active = (
     await listStoredChatThreads({ includeArchived: false })
   ).slice(0, THREAD_LIMIT);
@@ -160,6 +161,14 @@ async function buildIndex(): Promise<ChatSearchItem[]> {
   );
   let messagesByThread = await batchListChatMessages(allThreadIds).catch(
     () => new Map<string, MessageRecord[]>(),
+  );
+  messagesByThread = new Map(
+    Array.from(messagesByThread, ([threadId, messages]) => [
+      threadId,
+      messages.filter(
+        (message) => !isChatMessageDeleted(threadId, message.id),
+      ),
+    ]),
   );
 
   // Legacy-only chats can exist before server-side history import finishes.
@@ -233,7 +242,7 @@ export function useChatSearchIndex(enabled: boolean): {
     const run = () => {
       const seq = ++requestSeqRef.current;
       setLoading(true);
-      buildIndex()
+      buildChatSearchIndex()
         .then((result) => {
           // Drop out-of-order responses so a slower rebuild can't clobber a fresher one.
           if (cancelled || seq !== requestSeqRef.current) return;
