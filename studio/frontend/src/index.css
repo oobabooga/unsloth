@@ -2715,6 +2715,18 @@ html[data-chat-font] .aui-root {
 	scrollbar-gutter: stable;
 }
 
+/* Overlay scrollbars (WebKitGTK on Linux, WKWebView on macOS) take no layout
+   width, so nothing moves aside for them, but they still hit-test over a strip
+   of the scroller's inner right edge and swallow clicks aimed at whatever is
+   under it. `scrollbar-gutter: stable` above is defined as a no-op for them.
+   src/lib/overlay-scrollbar.ts measures that strip and publishes its width, so
+   scrollers that put controls on their right edge can hold them clear of it.
+   The variable is unset wherever scrollbars take layout width, which leaves
+   this at 0px and the layout untouched. */
+.overlay-scrollbar-gutter {
+	padding-right: var(--overlay-scrollbar-gutter, 0px);
+}
+
 /* Chat viewport: solid track matching sidebar so the scrollbar reads as a
    full-height rail flush to the right edge, without a separate decorative strip. */
 .aui-thread-viewport {

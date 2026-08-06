@@ -8,6 +8,7 @@ import "./index.css";
 import { App } from "./app/app";
 import { fetchDeviceType } from "./config/env";
 import { initializeLocale } from "./i18n";
+import { watchOverlayScrollbarGutter } from "./lib/overlay-scrollbar";
 
 const globalCrypto = globalThis.crypto as Crypto | undefined;
 
@@ -42,6 +43,10 @@ const uaLower = navigator.userAgent.toLowerCase();
 if (uaLower.includes("linux") && !uaLower.includes("android")) {
   document.documentElement.classList.add("render-linux");
 }
+
+// Publishes the width of the strip an overlay scrollbar hit-tests over, so
+// scrollers with controls on their right edge can keep them out of it.
+watchOverlayScrollbarGutter(window);
 
 createRoot(rootElement).render(
   <StrictMode>

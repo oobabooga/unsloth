@@ -3874,7 +3874,12 @@ export function HubModelPicker({
         >
           <div
             className={cn(
-              "pr-0",
+              // Holds the rows clear of the strip an overlay scrollbar hit-tests
+              // over, which otherwise eats the clicks meant for the per-row gear.
+              // Zero-width wherever scrollbars take layout space. Reserved even
+              // while the list is short enough not to scroll, so rows do not
+              // shift sideways as a search crosses the height cap.
+              "overlay-scrollbar-gutter",
               // On Device pulls the heading block tight to the controls; Recommended
               // keeps a little more top room above its first row.
               showDownloaded ? "pt-0" : "pt-[4px]",
