@@ -1,9 +1,9 @@
 use crate::diagnostics::{self, BackendLog, DiagnosticsState};
+use crate::output_lines::{lossy_line, read_bounded_line};
 use log::{error, info, warn};
 use process_wrap::std::*;
 use regex::Regex;
 use std::collections::VecDeque;
-use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -306,14 +306,6 @@ pub fn new_backend_state() -> BackendState {
 
 pub fn new_shutdown_flag() -> ShutdownFlag {
     Arc::new(AtomicBool::new(false))
-}
-
-pub(crate) fn trim_line_endings(bytes: &[u8]) -> &[u8] {
-    let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
-        end -= 1;
-    }
-    &bytes[..end]
 }
 
 /// Windows `CREATE_NO_WINDOW` flag — suppresses console windows for child processes.
@@ -1002,13 +994,13 @@ fn read_output_stream<R: std::io::Read>(
 
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => {
+        match read_bounded_line(&mut reader, &mut buf) {
+            Ok((0, _)) => {
                 saw_eof = true;
                 break;
             }
-            Ok(_) => {
-                let text = String::from_utf8_lossy(trim_line_endings(&buf)).into_owned();
+            Ok((_, truncated)) => {
+                let text = lossy_line(&buf, truncated).text;
                 let log_line = if is_stderr {
                     format!("[stderr] {}", text)
                 } else {
@@ -1021,7 +1013,7 @@ fn read_output_stream<R: std::io::Read>(
                     &text,
                 );
 
-                let detected_port = if !is_stderr {
+                let detected_port = if !is_stderr && !truncated {
                     port_re
                         .captures(&text)
                         .and_then(|caps| caps.get(1))

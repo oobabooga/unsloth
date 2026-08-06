@@ -4,6 +4,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { isTauri, setApiBase } from "@/lib/api-base";
 import {
+  createDiagnosticsLineRedactor,
   copySupportDiagnostics,
   type CopySupportDiagnosticsResult,
 } from "@/lib/tauri-diagnostics";
@@ -104,6 +105,9 @@ export function useTauriBackend() {
   const [status, setStatus] = useState<BackendStatus>("checking");
   const statusRef = useRef<BackendStatus>(status);
   const [logs, setLogs] = useState<string[]>([]);
+  const logsRef = useRef<string[]>([]);
+  const logRedactorRef = useRef(createDiagnosticsLineRedactor());
+  const progressRedactorRef = useRef(createDiagnosticsLineRedactor());
   const [error, setError] = useState<string | null>(null);
   // Guard against double startServer calls
   const startingRef = useRef(false);
@@ -132,6 +136,32 @@ export function useTauriBackend() {
   const authFailureRef = useRef<string | null>(getTauriAuthFailure());
   const elevationResumeRef = useRef<"install" | "repair" | null>(null);
   const [tauriEventsReady, setTauriEventsReady] = useState(!isTauri);
+
+  function clearLogs() {
+    logsRef.current = [];
+    logRedactorRef.current.reset();
+    setLogs([]);
+  }
+
+  function appendLog(rawLine: string) {
+    const line = logRedactorRef.current.redactLine(rawLine);
+    if (line === null) return;
+    setLogs((previous) => {
+      const next = [...previous.slice(-499), line];
+      logsRef.current = next;
+      return next;
+    });
+  }
+
+  function clearProgressDetail() {
+    progressRedactorRef.current.reset();
+    setProgressDetail(null);
+  }
+
+  function replaceProgressDetail(rawLine: string) {
+    const line = progressRedactorRef.current.redactLine(rawLine);
+    setProgressDetail(line);
+  }
 
   function setBackendStatus(nextStatus: BackendStatus) {
     if (authFailureRef.current) return;
@@ -325,13 +355,13 @@ export function useTauriBackend() {
   async function startRepair() {
     elevationResumeRef.current = null;
     setCurrentStepIndex(-1);
-    setProgressDetail(null);
+    clearProgressDetail();
     seenStepsRef.current.clear();
     startingRef.current = false;
     portRef.current = null;
     setIsExternalServer(false);
     stopExternalServerPoll();
-    setLogs([]);
+    clearLogs();
     clearBackendError();
     setBackendStatus("repairing");
 
@@ -372,10 +402,10 @@ export function useTauriBackend() {
   async function startInstall() {
     elevationResumeRef.current = null;
     setCurrentStepIndex(-1);
-    setProgressDetail(null);
+    clearProgressDetail();
     seenStepsRef.current.clear();
     setBackendStatus("installing");
-    setLogs([]);
+    clearLogs();
     clearBackendError();
     const { invoke } = await import("@tauri-apps/api/core");
     try {
@@ -400,12 +430,12 @@ export function useTauriBackend() {
   const retry = useCallback(() => {
     clearAuthFailure();
     setError(null);
-    setLogs([]);
+    clearLogs();
     startingRef.current = false;
     portRef.current = null;
     startTimedOutRef.current = false;
     setCurrentStepIndex(-1);
-    setProgressDetail(null);
+    clearProgressDetail();
     setElevationPackages([]);
     elevationResumeRef.current = null;
     setIsExternalServer(false);
@@ -426,7 +456,7 @@ export function useTauriBackend() {
     }
     elevationResumeRef.current = null;
     clearBackendError();
-    setLogs([]);
+    clearLogs();
     setElevationPackages([]);
     if (resume === "repair") {
       setBackendError("Repair canceled before system packages were installed.", "repair-error");
@@ -442,7 +472,7 @@ export function useTauriBackend() {
       await invoke("install_system_packages", { packages: elevationPackages });
       // Packages installed successfully, resume the flow that requested them.
       setCurrentStepIndex(-1);
-      setProgressDetail(null);
+      clearProgressDetail();
       elevationResumeRef.current = null;
       if (resume === "repair") {
         await startRepair();
@@ -515,7 +545,7 @@ export function useTauriBackend() {
       }
 
       register<string>("install-progress", (e) => {
-        setLogs((prev) => [...prev.slice(-499), e.payload]);
+        appendLog(e.payload);
       });
 
       // install-complete is informational only; does NOT trigger startServer. The
@@ -529,7 +559,7 @@ export function useTauriBackend() {
         if (seenStepsRef.current.has(stepName)) return; // deduplicate
         seenStepsRef.current.add(stepName);
         setCurrentStepIndex((prev) => prev + 1);
-        setProgressDetail(null);
+        clearProgressDetail();
       });
 
       register<string[]>("install-needs-elevation", (e) => {
@@ -539,7 +569,7 @@ export function useTauriBackend() {
       });
 
       register<string>("install-progress-detail", (e) => {
-        setProgressDetail(e.payload);
+        replaceProgressDetail(e.payload);
       });
 
       register<string>("install-failed", (e) => {
@@ -547,7 +577,7 @@ export function useTauriBackend() {
       });
 
       register<string>("repair-progress", (e) => {
-        setLogs((prev) => [...prev.slice(-499), e.payload]);
+        appendLog(e.payload);
       });
 
       register<string[]>("repair-needs-elevation", (e) => {
@@ -558,7 +588,7 @@ export function useTauriBackend() {
 
       register<void>("repair-complete", () => {
         if (statusRef.current !== "repairing") return;
-        setProgressDetail("Repair complete");
+        replaceProgressDetail("Repair complete");
       });
 
       register<string>("repair-failed", (e) => {
@@ -588,11 +618,17 @@ export function useTauriBackend() {
       register<string>("server-start-timeout", (e) => {
         startingRef.current = false;
         startTimedOutRef.current = true;
-        setBackendError(e.payload || "The Unsloth backend did not start in time");
+        const summary = e.payload.split("\n", 1)[0]?.trim();
+        const safeTail = logsRef.current.slice(-20).join("\n");
+        setBackendError(
+          safeTail
+            ? `${summary || "The Unsloth backend did not start in time"}\n${safeTail}`
+            : summary || "The Unsloth backend did not start in time",
+        );
       });
 
       register<string>("server-log", (e) => {
-        setLogs((prev) => [...prev.slice(-499), e.payload]);
+        appendLog(e.payload);
         setStartupMessage((current) => startupMessageFromLog(current, e.payload));
       });
 

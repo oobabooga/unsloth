@@ -1,8 +1,7 @@
 use crate::diagnostics::{self, AttemptLog, DiagnosticsState};
-use crate::process::trim_line_endings;
+use crate::output_lines::read_lossy_lines;
 use log::{error, info, warn};
 use process_wrap::std::*;
-use std::io::BufRead;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
@@ -121,21 +120,6 @@ fn spawn_update(
 
 // ── Stream ──
 
-fn read_lossy_lines<R: std::io::Read>(
-    stream: R,
-    mut on_line: impl FnMut(String),
-) -> std::io::Result<()> {
-    let mut reader = std::io::BufReader::new(stream);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        if reader.read_until(b'\n', &mut buf)? == 0 {
-            return Ok(());
-        }
-        on_line(String::from_utf8_lossy(trim_line_endings(&buf)).into_owned());
-    }
-}
-
 fn stream_output(
     app: &AppHandle,
     progress_event: &'static str,
@@ -151,14 +135,17 @@ fn stream_output(
         let diagnostics_clone = diagnostics.clone();
         let attempt_clone = attempt.clone();
         threads.push(std::thread::spawn(move || {
-            if let Err(e) = read_lossy_lines(out, |text| {
+            if let Err(e) = read_lossy_lines(out, |line| {
+                let text = line.text;
                 diagnostics::append_phase_line(&attempt_clone.handle, "stdout", &text);
-                if let Some(step) = text.strip_prefix("[TAURI:STEP] ") {
-                    diagnostics::record_step(&diagnostics_clone, &attempt_clone, step);
-                } else if let Some(progress) = text.strip_prefix("[TAURI:PROGRESS] ") {
-                    diagnostics::record_progress(&diagnostics_clone, &attempt_clone, progress);
-                } else if let Some(marker) = text.strip_prefix("[TAURI:DIAG] ") {
-                    diagnostics::record_diag_marker(&diagnostics_clone, &attempt_clone, marker);
+                if !line.truncated {
+                    if let Some(step) = text.strip_prefix("[TAURI:STEP] ") {
+                        diagnostics::record_step(&diagnostics_clone, &attempt_clone, step);
+                    } else if let Some(progress) = text.strip_prefix("[TAURI:PROGRESS] ") {
+                        diagnostics::record_progress(&diagnostics_clone, &attempt_clone, progress);
+                    } else if let Some(marker) = text.strip_prefix("[TAURI:DIAG] ") {
+                        diagnostics::record_diag_marker(&diagnostics_clone, &attempt_clone, marker);
+                    }
                 }
                 info!("[update][stdout] {}", text);
                 let _ = app_clone.emit(progress_event, &text);
@@ -172,7 +159,8 @@ fn stream_output(
         let app_clone = app.clone();
         let attempt_clone = attempt.clone();
         threads.push(std::thread::spawn(move || {
-            if let Err(e) = read_lossy_lines(err, |text| {
+            if let Err(e) = read_lossy_lines(err, |line| {
+                let text = line.text;
                 diagnostics::append_phase_line(&attempt_clone.handle, "stderr", &text);
                 warn!("[update][stderr] {}", text);
                 let _ = app_clone.emit(progress_event, &text);
@@ -451,17 +439,42 @@ pub fn stop_update(state: &UpdateState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_lines::{MAX_LINE_BYTES, TRUNCATION_MARKER};
     use std::io::Cursor;
 
     #[test]
     fn lossy_reader_keeps_invalid_utf8_and_later_lines() {
         let mut lines = Vec::new();
         read_lossy_lines(Cursor::new(b"bad\xff\r\n[TAURI:STEP] next\n"), |line| {
-            lines.push(line)
+            lines.push(line.text)
         })
         .unwrap();
 
         assert_eq!(lines, ["bad\u{fffd}", "[TAURI:STEP] next"]);
+    }
+
+    #[test]
+    fn update_reader_drains_oversized_line_before_next_protocol_line() {
+        let mut input = vec![b'a'; MAX_LINE_BYTES];
+        input.extend_from_slice(b"discarded remainder\n[TAURI:PROGRESS] repaired\n");
+        let mut emitted = Vec::new();
+        let mut progress = Vec::new();
+
+        read_lossy_lines(Cursor::new(input), |line| {
+            if !line.truncated {
+                if let Some(detail) = line.text.strip_prefix("[TAURI:PROGRESS] ") {
+                    progress.push(detail.to_string());
+                }
+            }
+            emitted.push(line.text);
+        })
+        .unwrap();
+
+        assert_eq!(progress, ["repaired"]);
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted[0].ends_with(TRUNCATION_MARKER));
+        assert!(!emitted[0].contains("discarded remainder"));
+        assert_eq!(emitted[1], "[TAURI:PROGRESS] repaired");
     }
 
     #[cfg(windows)]

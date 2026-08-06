@@ -3,9 +3,14 @@
 
 import { Spinner } from "@/components/ui/spinner";
 import type { UpdateStatus } from "@/hooks/use-tauri-update";
-import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
+import {
+  redactDiagnosticsLineStream,
+  redactDiagnosticsText,
+  type CopySupportDiagnosticsResult,
+  type DiagnosticsLineStreamState,
+} from "@/lib/tauri-diagnostics";
 import { AnimatePresence, motion } from "motion/react";
-import { useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 interface UpdateScreenProps {
   status: UpdateStatus;
@@ -69,6 +74,14 @@ function statusSubtext(status: UpdateStatus, progress: number): string {
 }
 
 function UpdateDetails({ logs }: { logs: string[] }) {
+  const redactionState = useRef<DiagnosticsLineStreamState | undefined>(
+    undefined,
+  );
+  const displayedLogs = useMemo(() => {
+    const next = redactDiagnosticsLineStream(logs, redactionState.current);
+    redactionState.current = next;
+    return next.displayedLines.join("\n");
+  }, [logs]);
   if (logs.length === 0) {
     return null;
   }
@@ -80,7 +93,7 @@ function UpdateDetails({ logs }: { logs: string[] }) {
         <span className="hidden group-open:inline">Hide update details</span>
       </summary>
       <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/50 bg-muted/30 p-3 font-mono text-ui-10 leading-relaxed text-muted-foreground">
-        {logs.join("\n")}
+        {displayedLogs}
       </pre>
     </details>
   );
@@ -96,6 +109,7 @@ export function UpdateScreen({
   onCopyDiagnostics,
 }: UpdateScreenProps) {
   const isError = status === "error";
+  const displayedError = error ? redactDiagnosticsText(error) : null;
   const [copying, setCopying] = useState(false);
   const [manualReport, setManualReport] = useState<string | null>(null);
   const [manualMessage, setManualMessage] = useState<string | null>(null);
@@ -162,14 +176,14 @@ export function UpdateScreen({
             )}
 
             <AnimatePresence>
-              {isError && error && (
+              {isError && displayedError && (
                 <motion.p
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: "auto" }}
                   exit={{ opacity: 0, height: 0 }}
                   className="max-w-md text-xs text-muted-foreground"
                 >
-                  {error}
+                  {displayedError}
                 </motion.p>
               )}
             </AnimatePresence>
