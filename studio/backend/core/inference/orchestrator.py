@@ -26,7 +26,7 @@ import time
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Generator, Optional, Tuple, Union
+from typing import Any, Generator, Optional, Sequence, Tuple, Union
 from utils.hardware import get_device, prepare_gpu_selection
 from utils.utils import hf_env_offline
 
@@ -44,6 +44,7 @@ def __getattr__(name: str):
 
 
 logger = get_logger(__name__)
+
 
 _CTX = mp.get_context("spawn")
 
@@ -1431,6 +1432,27 @@ class InferenceOrchestrator:
         self.models.clear()
         return True
 
+    # --- Dictation models -------------------------------------------------
+    # These run in the STT sidecars (whisper-server, llama-server, Transformers
+    # in process), not the chat worker. Their lifecycle goes through here all
+    # the same, so one object knows everything that is resident and Voice
+    # settings and Model Hub cannot report different things about one model.
+
+    def load_stt_model(self, model: Optional[str], engine: str) -> None:
+        """Make a dictation model resident on its sidecar."""
+        from core.inference import stt_registry
+        stt_registry.load(model, engine)
+
+    def unload_stt_model(self, engines: Optional[Sequence[str]] = None) -> list:
+        """Release dictation models (all engines by default); returns refusals."""
+        from core.inference import stt_registry
+        return stt_registry.unload(engines)
+
+    def resident_stt_model(self) -> dict:
+        """What dictation holds, alongside active_model_name for chat."""
+        from core.inference import stt_registry
+        return stt_registry.resident()
+
     def unload_model(self, model_name: str) -> bool:
         """Unload a model from the subprocess."""
         # active_model_name can differ in case from the client's raw /unload name (the
@@ -1685,7 +1707,29 @@ class InferenceOrchestrator:
         if system_prompt:
             initial = [{"role": "system", "content": system_prompt}] + initial
 
+        # Same profile the renderer uses, so the controller never drops a tool over a
+        # marker this model does not treat as structure. The controller is also given the
+        # catalog safe under every template this turn could select, because the
+        # native-template fallback renders with a different profile (#7066).
+        from core.inference.chat_template_helpers import (
+            mapped_chat_template,
+            markup_for_tokenizer,
+            renderable_tool_catalog,
+        )
+
+        _model_info = self.models.get(self.active_model_name) or {}
+        # Resolved BEFORE the profile: the mapper installs its template during the render.
+        _mapped_tpl = mapped_chat_template(_model_info, self.active_model_name)
+
         yield from run_safetensors_tool_loop(
+            markup = markup_for_tokenizer(_model_info.get("tokenizer"), tools, _mapped_tpl),
+            renderable_tools = renderable_tool_catalog(
+                tools,
+                _model_info.get("tokenizer"),
+                _model_info,
+                active_model_name = self.active_model_name,
+                template = _mapped_tpl,
+            ),
             single_turn = _single_turn,
             messages = initial,
             tools = tools,
