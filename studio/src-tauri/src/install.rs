@@ -1,8 +1,8 @@
 use crate::diagnostics::{self, AttemptLog, DiagnosticsState};
+use crate::output_lines::read_lossy_lines;
 use log::{error, info, warn};
 use process_wrap::std::*;
 use std::collections::VecDeque;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -37,8 +37,6 @@ pub fn new_install_state() -> InstallState {
     Arc::new(Mutex::new(InstallProcess::default()))
 }
 
-use crate::process::trim_line_endings;
-
 const FAILURE_CONTEXT_LINES: usize = 8;
 const FAILURE_CONTEXT_LINE_BYTES: usize = 1_000;
 
@@ -66,6 +64,8 @@ struct InstallFailureContext {
     explicit_error_stream: Option<InstallOutputStream>,
     default_error: Option<String>,
     output_tail: VecDeque<InstallOutputLine>,
+    stdout_inside_private_key: bool,
+    stderr_inside_private_key: bool,
 }
 
 impl InstallFailureContext {
@@ -81,8 +81,11 @@ impl InstallFailureContext {
         if let Some(message) = text.strip_prefix("[TAURI:ERROR] ") {
             let message = message.trim();
             if !message.is_empty() {
-                self.explicit_error = Some(Self::bounded_line(message));
-                self.explicit_error_stream = Some(InstallOutputStream::Stdout);
+                self.explicit_error =
+                    self.redacted_output_line(InstallOutputStream::Stdout, message);
+                if self.explicit_error.is_some() {
+                    self.explicit_error_stream = Some(InstallOutputStream::Stdout);
+                }
             }
             return false;
         }
@@ -93,7 +96,8 @@ impl InstallFailureContext {
         if let Some(message) = text.strip_prefix("[TAURI:ERROR_DEFAULT] ") {
             let message = message.trim();
             if !message.is_empty() {
-                self.default_error = Some(Self::bounded_line(message));
+                self.default_error =
+                    self.redacted_output_line(InstallOutputStream::Stdout, message);
             }
             return true;
         }
@@ -160,7 +164,9 @@ impl InstallFailureContext {
         if text.is_empty() {
             return;
         }
-        let text = Self::bounded_line(text);
+        let Some(text) = self.redacted_output_line(stream, text) else {
+            return;
+        };
         self.output_tail
             .push_back(InstallOutputLine { stream, text });
         while self.output_tail.len() > FAILURE_CONTEXT_LINES {
@@ -174,6 +180,34 @@ impl InstallFailureContext {
             diagnostics::valid_utf8_boundary(&text, text.len().min(FAILURE_CONTEXT_LINE_BYTES));
         text.truncate(boundary);
         text
+    }
+
+    fn inside_private_key_mut(&mut self, stream: InstallOutputStream) -> &mut bool {
+        match stream {
+            InstallOutputStream::Stdout => &mut self.stdout_inside_private_key,
+            InstallOutputStream::Stderr => &mut self.stderr_inside_private_key,
+        }
+    }
+
+    fn redacted_output_line(&mut self, stream: InstallOutputStream, text: &str) -> Option<String> {
+        let uppercase = text.to_ascii_uppercase();
+        let begins_private_key =
+            uppercase.contains("-----BEGIN ") && uppercase.contains("PRIVATE KEY-----");
+        let ends_private_key =
+            uppercase.contains("-----END ") && uppercase.contains("PRIVATE KEY-----");
+        let inside_private_key = self.inside_private_key_mut(stream);
+
+        if *inside_private_key {
+            if ends_private_key {
+                *inside_private_key = false;
+            }
+            return None;
+        }
+        if begins_private_key {
+            *inside_private_key = !ends_private_key;
+            return Some("<redacted private key>".to_string());
+        }
+        Some(Self::bounded_line(text))
     }
 
     fn message(&self, code: i32) -> String {
@@ -485,71 +519,64 @@ fn stream_output(
         let attempt_clone = attempt.clone();
         let failure_context_clone = Arc::clone(&failure_context);
         threads.push(std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(out);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let text = String::from_utf8_lossy(trim_line_endings(&buf)).into_owned();
-                        diagnostics::append_phase_line(&attempt_clone.handle, "stdout", &text);
-                        let is_failure_control = failure_context_clone
-                            .lock()
-                            .map(|mut context| context.observe_stdout(&text))
-                            .unwrap_or(false);
-                        if is_failure_control {
+            if let Err(e) = read_lossy_lines(out, |line| {
+                let text = line.text;
+                diagnostics::append_phase_line(&attempt_clone.handle, "stdout", &text);
+                let is_failure_control = failure_context_clone
+                    .lock()
+                    .map(|mut context| {
+                        if line.truncated {
+                            context.push_output(InstallOutputStream::Stdout, &text);
+                            false
+                        } else {
+                            context.observe_stdout(&text)
+                        }
+                    })
+                    .unwrap_or(false);
+                if is_failure_control {
+                    info!("[install][stdout] {}", text);
+                    return;
+                }
+                // A truncated protocol line is incomplete by definition. It is
+                // still logged and emitted below, but it must not mutate state.
+                if !line.truncated {
+                    if let Some(packages) = text.strip_prefix("[TAURI:NEED_SUDO] ") {
+                        let pkgs: Vec<String> =
+                            packages.split_whitespace().map(String::from).collect();
+                        if let Ok(mut install) = state_clone.lock() {
+                            install.needed_packages = pkgs.clone();
+                        }
+                        diagnostics::record_elevation_packages(
+                            &diagnostics_clone,
+                            &attempt_clone,
+                            &pkgs,
+                        );
+                    } else if let Some(step) = text.strip_prefix("[TAURI:STEP] ") {
+                        diagnostics::record_step(&diagnostics_clone, &attempt_clone, step);
+                        if !event_mode.emit_install_structured_events() {
                             info!("[install][stdout] {}", text);
-                            continue;
+                            let _ = app_clone.emit(event_mode.progress_event(), &text);
+                            return;
                         }
-                        // Parse structured Tauri protocol lines
-                        if let Some(packages) = text.strip_prefix("[TAURI:NEED_SUDO] ") {
-                            let pkgs: Vec<String> =
-                                packages.split_whitespace().map(String::from).collect();
-                            if let Ok(mut install) = state_clone.lock() {
-                                install.needed_packages = pkgs.clone();
-                            }
-                            diagnostics::record_elevation_packages(
-                                &diagnostics_clone,
-                                &attempt_clone,
-                                &pkgs,
-                            );
-                        } else if let Some(step) = text.strip_prefix("[TAURI:STEP] ") {
-                            diagnostics::record_step(&diagnostics_clone, &attempt_clone, step);
-                            if !event_mode.emit_install_structured_events() {
-                                info!("[install][stdout] {}", text);
-                                let _ = app_clone.emit(event_mode.progress_event(), &text);
-                                continue;
-                            }
-                            let _ = app_clone.emit("install-step", step);
-                        } else if let Some(detail) = text.strip_prefix("[TAURI:PROGRESS] ") {
-                            diagnostics::record_progress(
-                                &diagnostics_clone,
-                                &attempt_clone,
-                                detail,
-                            );
-                            if !event_mode.emit_install_structured_events() {
-                                info!("[install][stdout] {}", text);
-                                let _ = app_clone.emit(event_mode.progress_event(), detail);
-                                continue;
-                            }
-                            let _ = app_clone.emit("install-progress-detail", detail);
-                        } else if let Some(marker) = text.strip_prefix("[TAURI:DIAG] ") {
-                            diagnostics::record_diag_marker(
-                                &diagnostics_clone,
-                                &attempt_clone,
-                                marker,
-                            );
+                        let _ = app_clone.emit("install-step", step);
+                    } else if let Some(detail) = text.strip_prefix("[TAURI:PROGRESS] ") {
+                        diagnostics::record_progress(&diagnostics_clone, &attempt_clone, detail);
+                        if !event_mode.emit_install_structured_events() {
+                            info!("[install][stdout] {}", text);
+                            let _ = app_clone.emit(event_mode.progress_event(), detail);
+                            return;
                         }
-                        // Always forward the raw line
-                        info!("[install][stdout] {}", text);
-                        let _ = app_clone.emit(event_mode.progress_event(), &text);
-                    }
-                    Err(e) => {
-                        warn!("[install] Error reading stdout: {}", e);
-                        break;
+                        let _ = app_clone.emit("install-progress-detail", detail);
+                    } else if let Some(marker) = text.strip_prefix("[TAURI:DIAG] ") {
+                        diagnostics::record_diag_marker(&diagnostics_clone, &attempt_clone, marker);
                     }
                 }
+
+                // Always forward the raw line.
+                info!("[install][stdout] {}", text);
+                let _ = app_clone.emit(event_mode.progress_event(), &text);
+            }) {
+                warn!("[install] Error reading stdout: {}", e);
             }
         }));
     }
@@ -559,31 +586,28 @@ fn stream_output(
         let attempt_clone = attempt.clone();
         let failure_context_clone = Arc::clone(&failure_context);
         threads.push(std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(err);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let text = String::from_utf8_lossy(trim_line_endings(&buf)).into_owned();
-                        diagnostics::append_phase_line(&attempt_clone.handle, "stderr", &text);
-                        let is_failure_control = failure_context_clone
-                            .lock()
-                            .map(|mut context| context.observe_stderr(&text))
-                            .unwrap_or(false);
-                        if is_failure_control {
-                            info!("[install][stderr] {}", text);
-                            continue;
+            if let Err(e) = read_lossy_lines(err, |line| {
+                let text = line.text;
+                diagnostics::append_phase_line(&attempt_clone.handle, "stderr", &text);
+                let is_failure_control = failure_context_clone
+                    .lock()
+                    .map(|mut context| {
+                        if line.truncated {
+                            context.push_output(InstallOutputStream::Stderr, &text);
+                            false
+                        } else {
+                            context.observe_stderr(&text)
                         }
-                        warn!("[install][stderr] {}", text);
-                        let _ = app_clone.emit(event_mode.progress_event(), &text);
-                    }
-                    Err(e) => {
-                        warn!("[install] Error reading stderr: {}", e);
-                        break;
-                    }
+                    })
+                    .unwrap_or(false);
+                if is_failure_control {
+                    info!("[install][stderr] {}", text);
+                    return;
                 }
+                warn!("[install][stderr] {}", text);
+                let _ = app_clone.emit(event_mode.progress_event(), &text);
+            }) {
+                warn!("[install] Error reading stderr: {}", e);
             }
         }));
     }
@@ -1139,6 +1163,69 @@ fn capped_output_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_lines::{MAX_LINE_BYTES, TRUNCATION_MARKER};
+    use std::io::Cursor;
+
+    fn oversized_line_then(next: &[u8]) -> Vec<u8> {
+        let mut input = vec![b'a'; MAX_LINE_BYTES];
+        input.extend_from_slice(b"discarded remainder");
+        input.push(b'\n');
+        input.extend_from_slice(next);
+        input
+    }
+
+    #[test]
+    fn install_stdout_drains_oversized_line_before_next_protocol_line() {
+        let input = oversized_line_then(b"[TAURI:STEP] create environment\n");
+        let mut emitted = Vec::new();
+        let mut steps = Vec::new();
+
+        read_lossy_lines(Cursor::new(input), |line| {
+            if !line.truncated {
+                if let Some(step) = line.text.strip_prefix("[TAURI:STEP] ") {
+                    steps.push(step.to_string());
+                }
+            }
+            emitted.push(line.text);
+        })
+        .unwrap();
+
+        assert_eq!(steps, ["create environment"]);
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted[0].ends_with(TRUNCATION_MARKER));
+        assert!(!emitted[0].contains("discarded remainder"));
+        assert_eq!(emitted[1], "[TAURI:STEP] create environment");
+    }
+
+    #[test]
+    fn install_stderr_drains_oversized_line_before_next_control_line() {
+        let input = oversized_line_then(b"[TAURI:ERROR_OUTPUT] install failed\n");
+        let mut context = InstallFailureContext::default();
+        let mut emitted = Vec::new();
+        let mut controls = Vec::new();
+
+        read_lossy_lines(Cursor::new(input), |line| {
+            let is_control = if line.truncated {
+                context.push_output(InstallOutputStream::Stderr, &line.text);
+                false
+            } else {
+                context.observe_stderr(&line.text)
+            };
+            controls.push(is_control);
+            if !is_control {
+                emitted.push(line.text);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(controls, [false, true]);
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].ends_with(TRUNCATION_MARKER));
+        assert!(!emitted[0].contains("discarded remainder"));
+        let message = context.message(1);
+        assert!(message.starts_with("Installation failed: install failed: aaaa"));
+        assert!(!message.contains("discarded remainder"));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1493,6 +1580,25 @@ mod tests {
         assert!(message.contains("ERROR: download failed"));
         assert!(message.contains("https://<redacted>@example.com/package"));
         assert!(!message.contains("user:pass"));
+    }
+
+    #[test]
+    fn failure_context_keeps_private_key_state_after_marker_leaves_tail() {
+        let mut context = InstallFailureContext::default();
+        context.observe_stderr("-----BEGIN PRIVATE KEY-----");
+        context.observe_stderr("[TAURI:OUTPUT_CLEAR] private key marker left retained output");
+        for index in 0..FAILURE_CONTEXT_LINES + 2 {
+            context.observe_stdout(&format!("ordinary output {index}"));
+        }
+        context.observe_stderr("new-secret-key-material");
+
+        let message = context.message(1);
+        assert!(!message.contains("new-secret-key-material"));
+        assert!(context
+            .output_tail
+            .iter()
+            .all(|line| !line.text.contains("new-secret-key-material")));
+        assert!(context.stderr_inside_private_key);
     }
 
     #[test]

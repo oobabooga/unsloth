@@ -11,9 +11,15 @@ import {
 import { ShimmerButton } from "@/components/ui/shimmer-button";
 import { Spinner } from "@/components/ui/spinner";
 import type { BackendStatus } from "@/hooks/use-tauri-backend";
-import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
+import {
+  latestRedactedDiagnosticsLine,
+  redactDiagnosticsLineStream,
+  redactDiagnosticsText,
+  type CopySupportDiagnosticsResult,
+  type DiagnosticsLineStreamState,
+} from "@/lib/tauri-diagnostics";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 interface StartupScreenProps {
   status: BackendStatus;
@@ -138,6 +144,66 @@ function ActionButton({
   );
 }
 
+const STARTUP_LOG_PREVIEW_LIMIT = 1_000;
+
+// Caps a single progress line only. Error text is never truncated: the startup
+// timeout message carries the backend's last output, which is the whole point of it.
+function boundedLogPreview(line: string) {
+  if (line.length <= STARTUP_LOG_PREVIEW_LIMIT) return line;
+  return `${line.slice(0, STARTUP_LOG_PREVIEW_LIMIT)}…`;
+}
+
+function useLatestVisibleLog(logs: string[]) {
+  return useMemo(
+    () => boundedLogPreview(latestRedactedDiagnosticsLine(logs)),
+    [logs],
+  );
+}
+
+function useRedactedLogDetails(
+  logs: string[],
+  progressDetail: string | null,
+): string[] {
+  const redactionState = useRef<DiagnosticsLineStreamState | undefined>(
+    undefined,
+  );
+  const rawLines = useMemo(
+    () => (progressDetail ? [...logs, progressDetail] : logs),
+    [logs, progressDetail],
+  );
+  return useMemo(() => {
+    const next = redactDiagnosticsLineStream(
+      rawLines,
+      redactionState.current,
+    );
+    redactionState.current = next;
+    return next.displayedLines.map(boundedLogPreview);
+  }, [rawLines]);
+}
+
+function visibleLines(text: string) {
+  return text
+    .split("\n")
+    .filter((line) => line.trim())
+    .join("\n");
+}
+
+function usePeriodicValue<T>(value: T, intervalMs: number) {
+  const latestRef = useRef(value);
+  const [published, setPublished] = useState(value);
+
+  useEffect(() => {
+    latestRef.current = value;
+  }, [value]);
+
+  useEffect(() => {
+    const id = setInterval(() => setPublished(latestRef.current), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+
+  return published;
+}
+
 // ---------------------------------------------------------------------------
 // Per-status renderers
 // ---------------------------------------------------------------------------
@@ -192,9 +258,7 @@ function InstallingContent({
   progressDetail: string | null;
 }) {
   const message = installProgressMessage(currentStepIndex);
-  const detailLines = progressDetail
-    ? [...logs, progressDetail]
-    : logs;
+  const detailLines = useRedactedLogDetails(logs, progressDetail);
 
   return (
     <div className="flex h-full w-full flex-col items-center">
@@ -230,9 +294,9 @@ function RepairingContent({
   logs: string[];
   progressDetail: string | null;
 }) {
-  const detailLines = progressDetail
-    ? [...logs, progressDetail]
-    : logs;
+  // Repair logs are pip/uv output from the managed install and can carry index
+  // URLs with credentials, tokens and home paths, exactly like startup logs.
+  const detailLines = useRedactedLogDetails(logs, progressDetail);
 
   return (
     <div className="flex h-full w-full flex-col items-center">
@@ -268,13 +332,17 @@ function InstallErrorContent({
   onRetryInstall: () => void;
   onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
+  const displayedError = error ? redactDiagnosticsText(error) : null;
+
   return (
     <>
       <Logo />
       <div className="mt-8 flex flex-col items-center gap-2">
         <p className="text-sm font-medium text-destructive">Setup ran into a problem</p>
-        {error && (
-          <p className="max-w-xs text-center text-xs text-muted-foreground">{error}</p>
+        {displayedError && (
+          <p className="max-w-xs whitespace-pre-wrap break-words text-center text-xs text-muted-foreground">
+            {displayedError}
+          </p>
         )}
         <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetryInstall}>Try Again</ActionButton>
@@ -293,13 +361,17 @@ function RepairErrorContent({
   onRetry: () => void;
   onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
+  const displayedError = error ? redactDiagnosticsText(error) : null;
+
   return (
     <>
       <Logo />
       <div className="mt-8 flex flex-col items-center gap-2">
         <p className="text-sm font-medium text-destructive">Update failed</p>
-        {error && (
-          <p className="max-w-md text-center text-xs text-muted-foreground">{error}</p>
+        {displayedError && (
+          <p className="max-w-md whitespace-pre-wrap break-words text-center text-xs text-muted-foreground">
+            {displayedError}
+          </p>
         )}
         <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetry}>Retry</ActionButton>
@@ -318,6 +390,8 @@ function NeedsElevationContent({
   onApproveElevation: () => void;
   onRetryInstall: () => void;
 }) {
+  const displayedPackages = useRedactedLogDetails(elevationPackages, null);
+
   return (
     <>
       <Logo />
@@ -327,8 +401,8 @@ function NeedsElevationContent({
           The following system packages need to be installed:
         </p>
         <div className="mt-2 w-full max-w-xs rounded-lg bg-muted p-3 font-mono text-xs">
-          {elevationPackages.map((pkg) => (
-            <div key={pkg}>{pkg}</div>
+          {displayedPackages.map((pkg, index) => (
+            <div key={`${index}:${pkg}`}>{pkg}</div>
           ))}
         </div>
         <div className="mt-4 flex gap-3">
@@ -340,8 +414,16 @@ function NeedsElevationContent({
   );
 }
 
-function StartingContent({ message }: { message: StartupMessage }) {
+function StartingContent({
+  message,
+  logs,
+}: {
+  message: StartupMessage;
+  logs: string[];
+}) {
   const [showFallback, setShowFallback] = useState(false);
+  const latestLog = useLatestVisibleLog(logs);
+  const announcedLog = usePeriodicValue(latestLog, 2_000);
 
   useEffect(() => {
     if (message !== SERVER_STARTUP_MESSAGE) {
@@ -356,7 +438,6 @@ function StartingContent({ message }: { message: StartupMessage }) {
   }, [message]);
 
   const displayMessage = showFallback ? INITIAL_STARTUP_MESSAGE : message;
-
   return (
     <div className="flex h-full flex-col items-center">
       <div className="flex flex-1 items-center">
@@ -365,6 +446,17 @@ function StartingContent({ message }: { message: StartupMessage }) {
       <div className="mb-10 flex flex-col items-center gap-2">
         <Spinner className="size-6 text-primary" />
         <p className="text-sm text-muted-foreground">{displayMessage}</p>
+        {latestLog && (
+          <p
+            aria-hidden="true"
+            className="max-w-sm line-clamp-3 whitespace-pre-wrap break-all text-center font-mono text-xs text-foreground"
+          >
+            {latestLog}
+          </p>
+        )}
+        <output className="sr-only" aria-live="polite" aria-atomic="true">
+          {announcedLog}
+        </output>
       </div>
     </div>
   );
@@ -386,26 +478,61 @@ function StoppedContent({ onStartServer }: { onStartServer: () => void }) {
 
 function ErrorContent({
   error,
+  logs,
   onRetry,
   onCopyDiagnostics,
 }: {
   error: string | null;
+  logs: string[];
   onRetry: () => void;
   onCopyDiagnostics: () => Promise<CopySupportDiagnosticsResult>;
 }) {
+  // Rendered in full. The startup timeout message embeds the backend's last 20
+  // lines, so capping it here would drop the only actionable part of the screen.
+  const displayedError = useMemo(
+    () => (error ? redactDiagnosticsText(error) : null),
+    [error],
+  );
+  const serverOutput = useMemo(
+    () =>
+      visibleLines(redactDiagnosticsText(logs.join("\n")))
+        .split("\n")
+        .slice(-20)
+        .join("\n"),
+    [logs],
+  );
+  const comparableError = displayedError ? visibleLines(displayedError) : null;
+
   return (
-    <>
+    <div className="flex max-h-full w-full flex-col items-center overflow-y-auto py-4">
       <Logo />
-      <div className="mt-8 flex flex-col items-center gap-2">
-        <p className="text-sm font-medium text-destructive">Something went wrong</p>
-        {error && (
-          <p className="max-w-md text-center text-xs text-muted-foreground">{error}</p>
+      <div className="mt-8 flex w-full flex-col items-center gap-2">
+        <div
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+          className="flex flex-col items-center gap-2"
+        >
+          <p className="text-sm font-medium text-destructive">Something went wrong</p>
+          {displayedError && (
+            <p className="max-w-md whitespace-pre-wrap break-words text-center text-xs text-muted-foreground">
+              {displayedError}
+            </p>
+          )}
+        </div>
+        {serverOutput && !comparableError?.includes(serverOutput) && (
+          <details className="mt-2 w-full max-w-md text-left text-xs text-muted-foreground">
+            <summary className="cursor-pointer select-none text-center">Server output</summary>
+            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/40 bg-muted/30 p-3 font-mono text-ui-11 leading-relaxed">
+              {serverOutput}
+            </pre>
+          </details>
         )}
         <DiagnosticsCopyActions onCopyDiagnostics={onCopyDiagnostics}>
           <ActionButton onClick={onRetry}>Retry</ActionButton>
         </DiagnosticsCopyActions>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -469,7 +596,13 @@ export function StartupScreen({
           />
         );
       case "starting":
-        return <StartingContent key={startupMessage} message={startupMessage} />;
+        return (
+          <StartingContent
+            key={startupMessage}
+            message={startupMessage}
+            logs={logs}
+          />
+        );
       case "running":
         return null;
       case "stopped":
@@ -478,6 +611,7 @@ export function StartupScreen({
         return (
           <ErrorContent
             error={error}
+            logs={logs}
             onRetry={onRetry}
             onCopyDiagnostics={onCopyDiagnostics}
           />

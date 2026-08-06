@@ -14,6 +14,7 @@ mod native_clipboard;
 mod native_file_dialogs;
 mod native_intents;
 mod native_path_policy;
+mod output_lines;
 mod preflight;
 mod process;
 mod update;

@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@/lib/api-base";
 import {
+  createDiagnosticsLineRedactor,
   copySupportDiagnostics,
   type CopySupportDiagnosticsResult,
 } from "@/lib/tauri-diagnostics";
@@ -106,6 +107,7 @@ export function useTauriUpdate(isExternalServer = false) {
   const progressRef = useRef(0);
   const [logs, setLogs] = useState<string[]>([]);
   const logsRef = useRef<string[]>([]);
+  const logRedactorRef = useRef(createDiagnosticsLineRedactor());
   const [phase, setPhase] = useState<UpdatePhase | null>(null);
   const phaseRef = useRef<UpdatePhase | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -136,11 +138,14 @@ export function useTauriUpdate(isExternalServer = false) {
   }
 
   function replaceLogs(nextLogs: string[]) {
+    logRedactorRef.current.reset();
     logsRef.current = nextLogs;
     setLogs(nextLogs);
   }
 
-  function appendLog(line: string) {
+  function appendLog(rawLine: string) {
+    const line = logRedactorRef.current.redactLine(rawLine);
+    if (line === null) return;
     setLogs((prev) => {
       const next = [...prev.slice(-499), line];
       logsRef.current = next;

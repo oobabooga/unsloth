@@ -3,6 +3,15 @@
 
 import { isTauri } from "@/lib/api-base";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { redactDiagnosticsText } from "@/lib/diagnostics-redaction";
+
+export {
+  createDiagnosticsLineRedactor,
+  latestRedactedDiagnosticsLine,
+  redactDiagnosticsLineStream,
+  redactDiagnosticsText,
+  type DiagnosticsLineStreamState,
+} from "@/lib/diagnostics-redaction";
 
 export interface FrontendSupportSnapshot {
   status?: string | null;
@@ -24,62 +33,6 @@ export interface CopySupportDiagnosticsResult {
 }
 
 const FALLBACK_LOG_LINE_LIMIT = 200;
-
-const ANSI_ESCAPE_PATTERN = new RegExp(
-  `${String.fromCharCode(27)}(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])`,
-  "g",
-);
-
-function stripAnsi(text: string): string {
-  return text.replace(ANSI_ESCAPE_PATTERN, "");
-}
-
-export function redactDiagnosticsText(text: string): string {
-  let redacted = stripAnsi(text);
-
-  redacted = redacted.replace(
-    /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi,
-    "<redacted-private-key>",
-  );
-  redacted = redacted.replace(
-    /([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi,
-    "$1<redacted>@",
-  );
-  redacted = redacted.replace(
-    /\b(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+/gi,
-    "$1$2 <redacted>",
-  );
-  redacted = redacted.replace(/\bhf_[A-Za-z0-9]{20,}\b/g, "hf_<redacted>");
-  redacted = redacted.replace(/\bghp_[A-Za-z0-9_]{20,}\b/g, "ghp_<redacted>");
-  redacted = redacted.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "github_pat_<redacted>");
-  redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "sk-<redacted>");
-  redacted = redacted.replace(
-    /\b(cookie|set-cookie)\s*[:=]\s*[^\n\r]+/gi,
-    "$1=<redacted>",
-  );
-  redacted = redacted.replace(
-    /(^|[\s;])((?:[A-Z0-9]+_)*(?:TOKEN|KEY|SECRET|PASSWORD)(?:_[A-Z0-9]+)*\s*=\s*)[^\s]+/gi,
-    "$1$2<redacted>",
-  );
-
-  // Redact Unsloth paths before broader home-directory paths.
-  redacted = redacted.replace(
-    /(?:\/Users|\/home)\/[^\s/]+\/\.unsloth\/studio/gi,
-    "<studio_home>",
-  );
-  redacted = redacted.replace(
-    /[A-Z]:\\Users\\[^\s\\]+\\\.unsloth\\studio/gi,
-    "<studio_home>",
-  );
-  redacted = redacted.replace(/(?:\/Users|\/home)\/[^\s/]+/gi, "$HOME");
-  redacted = redacted.replace(/[A-Z]:\\Users\\[^\s\\]+/gi, "%USERPROFILE%");
-  redacted = redacted.replace(
-    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
-    "<redacted-email>",
-  );
-
-  return redacted;
-}
 
 function safeLines(lines: string[] | undefined): string[] {
   return (lines ?? [])

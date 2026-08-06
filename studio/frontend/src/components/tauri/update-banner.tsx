@@ -9,11 +9,14 @@ import type {
   UpdateInfo,
   UpdateStatus,
 } from "@/hooks/use-tauri-update";
-import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
+import {
+  redactDiagnosticsText,
+  type CopySupportDiagnosticsResult,
+} from "@/lib/tauri-diagnostics";
 import { cn } from "@/lib/utils";
 import { CircleAlert, Download } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 interface UpdateBannerProps {
   status: UpdateStatus;
@@ -74,6 +77,10 @@ export function UpdateBanner({
     (info?.pypiVersion ?? info?.version)?.replace(LEADING_V, "") ?? null;
   const notesOpen =
     notesTargetVersion !== null && notesVersion === notesTargetVersion;
+  const displayedFailure = useMemo(
+    () => lastFailure ? redactDiagnosticsText(lastFailure.error) : null,
+    [lastFailure],
+  );
 
   async function handleCopyDiagnostics() {
     setCopying(true);
@@ -167,9 +174,9 @@ export function UpdateBanner({
               </div>
             </div>
 
-            {showFailure && lastFailure && (
-              <p className="mt-3 line-clamp-2 text-xs text-destructive">
-                {lastFailure.error}
+            {showFailure && displayedFailure && (
+              <p className="mt-3 line-clamp-2 whitespace-pre-wrap break-words text-xs text-destructive">
+                {displayedFailure}
               </p>
             )}
 
