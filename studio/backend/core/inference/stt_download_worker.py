@@ -24,7 +24,12 @@ def backend_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def spawn_download(args: Sequence[str], hf_token: Optional[str] = None) -> subprocess.Popen:
+def spawn_download(
+    args: Sequence[str],
+    hf_token: Optional[str] = None,
+    *,
+    hub_cache: Optional[Path] = None,
+) -> subprocess.Popen:
     """Run this module as a child process performing ``args``' download.
 
     The token travels in the environment, never argv, so it stays out of ``ps``.
@@ -33,8 +38,13 @@ def spawn_download(args: Sequence[str], hf_token: Optional[str] = None) -> subpr
     from utils.hf_cache_settings import get_hf_cache_paths
 
     env = get_hf_cache_paths().child_env()
+    if hub_cache is not None:
+        env["HF_HUB_CACHE"] = str(hub_cache)
     env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    # Progress is based on the sequentially growing .incomplete file. Xet
+    # reconstructs chunks out of order and leaves that file nearly flat.
+    env["HF_HUB_DISABLE_XET"] = "1"
     # Parallel Range chunks leave sparse partials a resumed sequential writer
     # cannot reuse, which defeats the point of cancelling.
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
@@ -82,39 +92,31 @@ def reap_download(process: subprocess.Popen) -> bytes:
     try:
         _, stderr = process.communicate()
     finally:
-        forget_pid(process.pid)
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int):
+            forget_pid(pid)
     return stderr or b""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description = "Download one dictation model.")
     parser.add_argument("--repo-id", required = True)
-    # GGML is a single file; Transformers is a snapshot pinned to the revision
-    # the sidecar already validated.
-    parser.add_argument("--filename")
+    # Every path is explicit. Repository-controlled glob metacharacters must
+    # never widen a Transformers STT download beyond the files already sized.
+    parser.add_argument("--filename", action = "append", required = True)
     parser.add_argument("--revision")
-    parser.add_argument("--allow-pattern", action = "append", default = [])
     args = parser.parse_args(argv)
 
     token = os.environ.get("HF_TOKEN") or None
-    if args.filename:
-        from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download
+
+    for filename in args.filename:
         hf_hub_download(
             repo_id = args.repo_id,
-            filename = args.filename,
+            filename = filename,
             revision = args.revision,
             token = token,
         )
-        return 0
-
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(
-        repo_id = args.repo_id,
-        revision = args.revision,
-        allow_patterns = list(args.allow_pattern) or None,
-        token = token,
-    )
     return 0
 
 
