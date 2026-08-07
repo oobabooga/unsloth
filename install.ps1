@@ -536,6 +536,221 @@ function Install-UnslothStudio {
         }
     }
 
+    # ── Managed llama.cpp access check (shared verbatim with studio/setup.ps1) ──
+    # This script is fetched standalone (irm | iex) and bundled as a Tauri
+    # resource, so it cannot dot-source studio/setup.ps1. The nine functions
+    # below are therefore byte-identical copies of the definitions there, which
+    # is what the preflight further down needs to reach the same verdict setup
+    # reaches, only before anything has been downloaded.
+    #
+    # Copies, not paraphrases: they are compared function-by-function by
+    # tests/studio/install/test_denied_llama_cpp_preflight.py, so an edit to
+    # either file that is not applied to the other fails CI.
+    # ── BEGIN SHARED WITH studio/setup.ps1 ──
+
+    # ERROR_ACCESS_DENIED in any of its disguises. PowerShell wraps .NET exceptions
+    # in MethodInvocationException, so walk the chain instead of catching by type.
+    function Test-AccessDeniedError {
+        param($ErrorRecord)
+
+        $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        while ($ex) {
+            if ($ex -is [System.UnauthorizedAccessException]) { return $true }
+            # IOException carries ERROR_ACCESS_DENIED as an HRESULT; Win32Exception
+            # keeps E_FAIL there and puts the code in NativeErrorCode instead.
+            if ($ex.HResult -eq -2147024891) { return $true }
+            if ($ex -is [System.ComponentModel.Win32Exception] -and $ex.NativeErrorCode -eq 5) { return $true }
+            $ex = $ex.InnerException
+        }
+        if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+            return ($ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::PermissionDenied)
+        }
+        return $false
+    }
+
+    # Test-Path throws UnauthorizedAccessException (it does not return $false) when
+    # an ACL denies the probe, and this script runs under "Stop", so a denied path
+    # aborted setup with a raw error. "Denied" is kept distinct from "Absent"
+    # because a denial needs reporting, not a silent retry.
+    function Get-PathState {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+            [ValidateSet("Any", "Leaf", "Container")][string]$PathType = "Any"
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Path)) { return "Absent" }
+        try {
+            if (Test-Path -LiteralPath $Path -PathType $PathType -ErrorAction Stop) { return "Present" }
+            return "Absent"
+        } catch {
+            if (Test-AccessDeniedError $_) { return "Denied" }
+            # Malformed path, offline drive, dangling link: nothing usable there.
+            return "Absent"
+        }
+    }
+
+    # Whether the managed llama.cpp tree can be read at all. "Absent" | "Readable" |
+    # "Denied". No single probe answers this on Windows, which is why it is a
+    # function rather than an expression at each call site:
+    #   - the directory itself only reads Denied when its PARENT is unreadable; an
+    #     admin-owned llama.cpp under a readable .unsloth still probes Present
+    #   - UNSLOTH_PREBUILT_INFO.json inside it is what such a tree actually denies
+    #   - but Windows reports a MISSING child of a denied directory as absent, so
+    #     that probe alone cannot tell "no metadata here" from "cannot look"; the
+    #     listing can, and is the same fallback Get-StudioAdoptableState uses
+    function Get-LlamaCppInstallReadState {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+
+        $dirState = Get-PathState -Path $Path -PathType Container
+        if ($dirState -eq "Denied") { return "Denied" }
+        if ($dirState -ne "Present") { return "Absent" }
+        switch (Get-PathState -Path (Join-Path $Path "UNSLOTH_PREBUILT_INFO.json") -PathType Leaf) {
+            "Present" { return "Readable" }
+            "Denied"  { return "Denied" }
+        }
+        try { $null = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Select-Object -First 1) }
+        catch {
+            if (Test-AccessDeniedError $_) { return "Denied" }
+            # Anything else (offline drive, dangling link) was not usable before
+            # either, and this must not throw: it runs before anything is installed.
+        }
+        return "Readable"
+    }
+
+    # Names the link target of a denied dir, since that is where the user must look.
+    # Empty/null tolerated: this runs while reporting a failure and must not add one.
+    function Get-PathDenialDetail {
+        param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
+
+        if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $item) { return "" }
+        # Non-filesystem providers expose an unrelated .Attributes with no -band
+        # overload, and throwing here would replace the failure we are reporting.
+        if ($item -isnot [System.IO.FileSystemInfo]) { return "" }
+        if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return "" }
+        $target = $null
+        try { $target = $item.Target } catch { $target = $null }
+        # PS 5.1 exposes .Target as a collection; PS 7 as a string.
+        if ($target) { return " (it is a link to $(@($target) -join ', '))" }
+        return " (it is a link)"
+    }
+
+    # Prints the denial and returns the one-line reason the caller fails with, so
+    # the two scripts that have to report this share one wording. It only writes
+    # through step / substep (Write-Host), so the reason is the sole pipeline output.
+    function Write-PathAccessDenied {
+        param(
+            [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path,
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Label,
+            # "delete it, we reinstall it" is true of the managed cache and wrong for
+            # a tree the user pointed us at. Never tell them to delete their build.
+            [switch]$UserSupplied,
+            # Same rule, one step weaker: the ownership guard stops because it could
+            # not read the marker, so it cannot claim the tree is ours either. It
+            # already says "move it aside" when it CAN prove the tree is not ours.
+            [switch]$OwnershipUnverified
+        )
+
+        step "permissions" "$Label at $Path cannot be read: access is denied$(Get-PathDenialDetail -Path $Path)" "Red"
+        if ($UserSupplied) {
+            substep "Unsloth will not touch a directory you pointed it at, so this has to be fixed at the source" "Yellow"
+            substep "Restore access with these two in an elevated PowerShell, or point UNSLOTH_LOCAL_LLAMA_CPP_DIR at a readable build:" "Yellow"
+        } elseif ($OwnershipUnverified) {
+            substep "Unsloth cannot confirm this folder is its own install while it is unreadable, so it will not tell you to remove it" "Yellow"
+            substep "Restore access with these two in an elevated PowerShell, or move the folder aside and re-run setup:" "Yellow"
+        } else {
+            substep "This folder lives outside the app, so reinstalling Unsloth Studio, to any drive, reuses it and fails the same way" "Yellow"
+            substep "Simplest fix: close Unsloth, delete or rename $Path, then re-run setup (it is a managed cache and gets reinstalled)" "Yellow"
+            substep "If deleting is also denied, run these two in an elevated PowerShell, then re-run setup:" "Yellow"
+        }
+        substep "takeown /F `"$Path`" /R /D Y" "Yellow"
+        substep "icacls `"$Path`" /reset /T" "Yellow"
+        substep "Antivirus or Controlled folder access can deny this path too; allow or exclude it, then retry" "Yellow"
+        if ($UserSupplied) {
+            return "Access denied reading $Label at $Path. Restore access with takeown/icacls, or point UNSLOTH_LOCAL_LLAMA_CPP_DIR at a readable build, then re-run setup."
+        }
+        if ($OwnershipUnverified) {
+            return "Access denied reading $Label at $Path. Unsloth cannot confirm that folder is its own install while it is unreadable: restore access with takeown/icacls, or move it aside, then re-run setup."
+        }
+        return "Access denied reading the existing $Label at $Path. Delete or rename that folder (Unsloth reinstalls it) or restore access with takeown/icacls, then re-run setup. Reinstalling the app does not reset it."
+    }
+
+    # Canonical spelling of a directory that exists, so two spellings of the same
+    # folder compare equal. Anything that cannot be resolved (absent, denied,
+    # malformed) comes back as given: this only ever feeds a comparison.
+    function Get-CanonicalDir {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+
+        if ((Get-PathState -Path $Path -PathType Container) -ne "Present") { return $Path }
+        try { return (Resolve-Path -LiteralPath $Path).Path } catch { return $Path }
+    }
+
+    # Whether UNSLOTH_STUDIO_HOME points somewhere other than the legacy default,
+    # which is setup.ps1's $StudioHomeIsCustom. Both sides are canonicalized first,
+    # or an override spelled differently from the default reads as custom. Only
+    # this function answers the question: where the runtime goes and whether the
+    # tree there can be called a cache we own are the same decision, and inferring
+    # the second from the first re-derives it with a rule that can drift.
+    function Test-StudioHomeIsCustom {
+        return ((Get-CanonicalDir -Path $StudioHome) -ne
+            (Get-CanonicalDir -Path (Join-Path $env:USERPROFILE ".unsloth\studio")))
+    }
+
+    # Where setup.ps1 will put the managed llama.cpp runtime: $USERPROFILE\.unsloth\
+    # llama.cpp normally, or <home>\llama.cpp when UNSLOTH_STUDIO_HOME points
+    # somewhere other than the legacy default. Both entrypoints call this resolver
+    # before phase 1 and reuse its answer in the llama.cpp install phase.
+    function Get-ManagedLlamaCppDir {
+        if (-not (Test-StudioHomeIsCustom)) {
+            return (Join-Path $env:USERPROFILE ".unsloth\llama.cpp")
+        }
+        return (Join-Path (Get-CanonicalDir -Path $StudioHome) "llama.cpp")
+    }
+
+    # Returns $null when the install may continue, or the one-line reason to fail
+    # with. The caller owns the failure, this owns the decision, so the tests can
+    # run the real thing against a real denied tree. Only step / substep write,
+    # and both go to Write-Host, so the reason is the sole pipeline output.
+    #
+    # An unreadable managed cache stops the run, which is what setup.ps1 does with
+    # the same tree; the installer must not promise more than setup will honour.
+    # It never runs takeown or grants ACLs either: repairing permissions the user
+    # did not ask us to repair is not something an installer should do silently,
+    # and it would need elevation this process deliberately does not have.
+    function Invoke-ManagedLlamaCppPreflight {
+        # USERPROFILE is where the managed cache lives, so without it there is
+        # nothing to check. Failing a profile-less environment is the job of the
+        # code that actually needs one, further down; a preflight that throws
+        # would replace that failure with a worse one.
+        if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) { return $null }
+        $dir = Get-ManagedLlamaCppDir
+        if ((Get-LlamaCppInstallReadState -Path $dir) -ne "Denied") { return $null }
+        Write-Host ""
+        # A custom UNSLOTH_STUDIO_HOME is the user's own directory, so an
+        # unreadable tree there cannot be proven ours and must not be described
+        # as a cache we own. Same rule setup.ps1 applies, off the same predicate
+        # that chose $dir rather than a re-derivation.
+        $homeIsCustom = Test-StudioHomeIsCustom
+        # --with-llama-cpp-dir, or UNSLOTH_LOCAL_LLAMA_CPP_DIR which setup.ps1
+        # reads from the environment we hand it, can name this very tree: setup
+        # supports pointing either at the managed location to reuse the build
+        # already there, and reports that tree -UserSupplied ($LocalIsCanonical)
+        # rather than telling the user to delete their own build. Resolve both
+        # sides the way setup.ps1 does.
+        $suppliedDir = if ($WithLlamaCppDir) { $WithLlamaCppDir } else { $env:UNSLOTH_LOCAL_LLAMA_CPP_DIR }
+        $userSupplied = (-not [string]::IsNullOrWhiteSpace($suppliedDir)) -and
+            ((Get-CanonicalDir -Path $suppliedDir) -eq (Get-CanonicalDir -Path $dir))
+        $reason = Write-PathAccessDenied -Path $dir -Label "llama.cpp install" `
+            -UserSupplied:$userSupplied -OwnershipUnverified:$homeIsCustom
+        substep "Stopping here, before phase 1: nothing has been downloaded or installed" "Yellow"
+        substep "Fix access, then run the same install, setup, or update command again" "Yellow"
+        Write-Host ""
+        return "$reason Nothing was installed."
+    }
+
+    # ── END SHARED WITH studio/setup.ps1 ──
+
     # Redact index-URL credentials (userinfo + ?query= + #fragment) from captured installer
     # output before printing on failure; uv/pip errors echo the failing --index-url verbatim.
     # Mirrors the other installers. Verbose mode streams uncaptured, so it isn't redacted.
@@ -728,17 +943,10 @@ function Install-UnslothStudio {
             # empty prefix to match pre-PR behavior.
             $studioHomeExport = if ($StudioRedirectMode -eq 'env') {
                 # When override == legacy default, llama.cpp stays at
-                # ~/.unsloth/llama.cpp (one shared build). Canonicalize the
-                # legacy side so the comparison survives path normalization.
-                $_legacyStudio = Join-Path $env:USERPROFILE ".unsloth\studio"
-                if (Test-Path -LiteralPath $_legacyStudio -PathType Container) {
-                    $_legacyStudio = (Resolve-Path -LiteralPath $_legacyStudio).Path
-                }
-                $_llamaPath = if ($StudioHome -eq $_legacyStudio) {
-                    Join-Path $env:USERPROFILE ".unsloth\llama.cpp"
-                } else {
-                    Join-Path $StudioHome "llama.cpp"
-                }
+                # ~/.unsloth/llama.cpp (one shared build). Get-ManagedLlamaCppDir
+                # owns that rule, and the preflight above resolves the path it
+                # checks the same way.
+                $_llamaPath = Get-ManagedLlamaCppDir
                 $_sq = $StudioHome -replace "'", "''"
                 $_llama = $_llamaPath -replace "'", "''"
                 $_appDirSq = $appDir -replace "'", "''"
@@ -1242,6 +1450,29 @@ exit 0
             Write-Host ""
             return (Exit-InstallFailure "Refusing to install from the Windows system directory $CurrentDir, and no folder outside $SystemRootDir was usable. Run the installer from a normal user account.")
         }
+    }
+
+    # ── Preflight: the managed llama.cpp cache has to be readable ──
+    # %USERPROFILE%\.unsloth\llama.cpp outlives an uninstall, and an elevated
+    # PowerShell installs into the SAME profile, so a run started with "Run as
+    # administrator" can leave a tree behind that the ordinary account cannot
+    # open afterwards. Setup cannot get past that: install_llama_prebuilt.py
+    # probes UNSLOTH_PREBUILT_INFO.json inside it and pathlib raises on EACCES
+    # rather than returning false, so the guard cannot simply be relaxed.
+    #
+    # setup.ps1 already reports this properly, but it only reaches PHASE 3.4
+    # after PyTorch has downloaded and the whole dependency install has run, so
+    # the user paid several GB and a rolled-back install for a condition that was
+    # knowable before the first byte. Ask the same question here, where the
+    # answer is still free.
+    #
+    # This is the last cheap point in the run: winget, Python, uv, the venv and
+    # the downloads all start below. It is also after the System32 relocation
+    # above, which decides whether this install belongs to a real user profile
+    # at all, and therefore which .unsloth the answer is about.
+    $llamaPreflightFailure = Invoke-ManagedLlamaCppPreflight
+    if ($llamaPreflightFailure) {
+        return (Exit-InstallFailure $llamaPreflightFailure)
     }
 
     # ── Check winget ──

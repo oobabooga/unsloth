@@ -1652,6 +1652,15 @@ else
     if [ "$_STUDIO_HOME_IS_CUSTOM" = true ]; then
         _assert_studio_owned_or_absent "$LLAMA_CPP_DIR" "llama.cpp install"
     fi
+    # install_llama_prebuilt.py probes UNSLOTH_PREBUILT_INFO.json inside this
+    # tree and pathlib raises on EACCES rather than returning false, so an
+    # unsearchable install reaches Python as a traceback. The guard above only
+    # covers a custom UNSLOTH_STUDIO_HOME; the default ~/.unsloth/llama.cpp,
+    # which is where a root-owned leftover lands, needs its own. Mirrors the
+    # Get-LlamaCppInstallReadState check in setup.ps1 PHASE 3.4.
+    if _studio_dir_unsearchable "$LLAMA_CPP_DIR"; then
+        _path_access_denied "$LLAMA_CPP_DIR" "llama.cpp install"
+    fi
     _PREBUILT_CMD=(
         python "$SCRIPT_DIR/install_llama_prebuilt.py"
         --install-dir "$LLAMA_CPP_DIR"
