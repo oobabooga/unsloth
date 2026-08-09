@@ -76,16 +76,21 @@ class VideoFamily:
     gguf_repo: Optional[str] = None
     # Hosted PRE-CAST text-encoder checkpoints as (scheme, component, repo_id); same semantics as DiffusionFamily.te_prequant_repos.
     te_prequant_repos: tuple[tuple[str, str, str], ...] = field(default_factory = tuple)
-    # Modular Diffusers workflow to load instead of a conventional DiffusionPipeline.
+    # Modular workflow whose components are loaded without pruning its routing blocks.
     modular_workflow: Optional[str] = None
+    # Released video and audio sigma shifts, when configurable.
+    default_flow_shift: Optional[float] = None
+    default_audio_flow_shift: Optional[float] = None
+    # First/last-frame conditioning: the request may carry keyframe images.
+    supports_keyframes: bool = False
+    # Omni-reference conditioning. MiniMax-H3 loads this in a separate denoiser partition.
+    supports_references: bool = False
     # Guidance-distilled families expose neither CFG nor a negative prompt.
     supports_cfg: bool = True
 
 
 _FAMILIES: tuple[VideoFamily, ...] = (
-    # MiniMax-H3: a joint video/audio model integrated through Modular Diffusers. The released
-    # FL2VA transformer serves both text-only and first/last-frame generation; Studio initially
-    # loads the text-only workflow so the 61.7 GB Ref2VA transformer is not downloaded too.
+    # FL2VA covers text-only and keyframe generation. Ref2VA is a separate partition.
     VideoFamily(
         name = "minimax-h3",
         pipeline_class = "ModularPipeline",
@@ -103,13 +108,28 @@ _FAMILIES: tuple[VideoFamily, ...] = (
         max_num_frames = 345,
         snap_frames_up = True,
         resolution_multiple = 32,
-        resolution_presets = ((1344, 768), (768, 1344), (1024, 1024), (960, 544), (544, 960)),
+        # Model-card ratios use H3's canvas rule. Keep the legacy 1024 square and cheaper
+        # 16:9 tiers for compatibility.
+        resolution_presets = (
+            (1344, 768),   # 16:9
+            (1536, 672),   # 21:9
+            (1024, 768),   # 4:3
+            (1024, 1024),  # 1:1
+            (768, 1024),   # 3:4
+            (768, 1344),   # 9:16
+            (960, 544),    # 16:9, faster
+            (544, 960),    # 9:16, faster
+        ),
         duration_presets = (5.0, 10.0, 14.4),
         # Decimal GB resident estimates: transformer, Qwen3-VL conditioner, video+audio VAEs.
         bf16_components_gb = (66.3, 66.8, 11.1),
         supports_torch_compile = False,
         gguf_repo = "unsloth/MiniMax-H3-GGUF",
-        modular_workflow = "t2va",
+        modular_workflow = "fl2va",
+        default_flow_shift = 12.0,
+        default_audio_flow_shift = 3.0,
+        supports_keyframes = True,
+        supports_references = True,
         supports_cfg = False,
     ),
     # LTX-2 (diffusers >= 0.39): ~19B single-stream video DiT generating synchronized audio + video in one pass. The Gemma3-12B

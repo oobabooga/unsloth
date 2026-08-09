@@ -96,6 +96,21 @@ from .video_families import (
     snap_video_size,
     supported_video_family_names,
 )
+from .video_minimax_h3 import (
+    H3_ANCHOR_FIRST,
+    H3_ANCHOR_LAST,
+    H3_CANVAS_MAX_PIXELS,
+    H3_CANVAS_SHORT_EDGE,
+    H3_REF_SIZE_MATCH,
+    H3_REF_SIZE_MAX,
+    H3_TASK_KEYFRAMES,
+    H3_TASK_REFERENCES,
+    fit_h3_keyframe,
+    fit_h3_reference_image,
+    h3_canvas_for_aspect,
+    h3_conditioning_mode,
+    h3_transformer_task,
+)
 from utils.hardware import clear_gpu_cache
 
 # Shared with the image backend so both pin every loader call to the same live cache root.
@@ -186,6 +201,34 @@ def _picked_gguf_arch(repo_id: str, gguf_filename: str) -> Optional[str]:
         return None
 
 
+# Enough for a 15-second reference video after base64 decoding.
+_MAX_REFERENCE_MEDIA_BYTES = 96 * 1024 * 1024
+
+
+def _decode_b64_media(data: Optional[str]) -> bytes:
+    """Decode a base64 media payload, optionally wrapped in a data URL."""
+    import base64
+    import binascii
+
+    raw = (data or "").strip()
+    if not raw:
+        raise ValueError("A reference was sent empty.")
+    if raw.startswith("data:"):
+        _, _, raw = raw.partition(",")
+    try:
+        blob = base64.b64decode(raw, validate = False)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid base64 media data: {exc}") from exc
+    if not blob:
+        raise ValueError("A reference decoded to no data.")
+    if len(blob) > _MAX_REFERENCE_MEDIA_BYTES:
+        raise ValueError(
+            f"A reference is too large ({len(blob) / 1e6:.0f} MB); the limit is "
+            f"{_MAX_REFERENCE_MEDIA_BYTES / 1e6:.0f} MB."
+        )
+    return blob
+
+
 class _VideoGenerationCancelled(Exception):
     """Unwinds a denoise loop that has no cooperative interrupt (no step callback);
     generate() maps it to the VIDEO_CANCELLED_MSG sentinel the routes 409 on."""
@@ -262,6 +305,8 @@ class _VideoLoadState:
     kind: str
     engine: str = "diffusers"
     gguf_filename: Optional[str] = None
+    # Resident MiniMax-H3 denoiser partition, if any.
+    h3_task: Optional[str] = None
     offload_policy: str = "none"
     vae_tiling: bool = True
     memory_mode: str = "auto"
@@ -380,6 +425,7 @@ class VideoBackend:
         model_kind: Optional[str] = None,
         transformer_quant: Optional[str] = None,
         text_encoder_quant: Optional[str] = None,
+        h3_task: Optional[str] = None,
     ) -> VideoFamily:
         """Cheap, network-free validation shared by the route and the load path."""
         kind = resolve_video_model_kind(gguf_filename, model_kind)
@@ -400,6 +446,13 @@ class VideoBackend:
 
         if is_h3_native(fam, kind):
             validate_h3_transformer_filename(gguf_filename or "")
+            # The GGUF filename and explicit task must name the same partition.
+            picked = h3_transformer_task(gguf_filename or "")
+            if h3_task and h3_task != picked:
+                raise ValueError(
+                    f"'{Path(gguf_filename or '').name}' is the {picked} partition, but the "
+                    f"load asked for {h3_task}. Pick the matching checkpoint."
+                )
         else:
             # Refuse a too-old diffusers here rather than deep in the load.
             from .diffusion_families import assert_pipeline_class_available
@@ -515,6 +568,7 @@ class VideoBackend:
         transformer_quant: Optional[str] = None,
         text_encoder_quant: Optional[str] = None,
         model_kind: Optional[str] = None,
+        h3_task: Optional[str] = None,
     ) -> dict[str, Any]:
         """Validate, then run the (slow) load on a daemon thread. Returns at once."""
         hf_token = (hf_token.strip() if isinstance(hf_token, str) else hf_token) or None
@@ -526,6 +580,7 @@ class VideoBackend:
             model_kind = model_kind,
             transformer_quant = transformer_quant,
             text_encoder_quant = text_encoder_quant,
+            h3_task = h3_task,
         )
         with self._lock:
             if self._loading is not None and self._loading.error is None:
@@ -554,6 +609,7 @@ class VideoBackend:
                 transformer_quant = transformer_quant,
                 text_encoder_quant = text_encoder_quant,
                 model_kind = model_kind,
+                h3_task = h3_task,
                 _load_token = token,
                 _cancel_event = cancel_event,
             ),
@@ -859,6 +915,7 @@ class VideoBackend:
                         dtype = Path(filename).stem.split("-")[-1],
                         kind = "gguf",
                         engine = "sd_cpp",
+                        h3_task = h3_transformer_task(filename),
                         gguf_filename = filename,
                         offload_policy = policy,
                         vae_tiling = False,
@@ -1423,6 +1480,7 @@ class VideoBackend:
         transformer_quant: Optional[str] = None,
         text_encoder_quant: Optional[str] = None,
         model_kind: Optional[str] = None,
+        h3_task: Optional[str] = None,
         _load_token: Optional[int] = None,
         _base_local_dir: Optional[str] = None,
         _te_prequant_skipped: tuple[str, ...] = (),
@@ -1435,6 +1493,7 @@ class VideoBackend:
             model_kind = model_kind,
             transformer_quant = transformer_quant,
             text_encoder_quant = text_encoder_quant,
+            h3_task = h3_task,
         )
         kind = resolve_video_model_kind(gguf_filename, model_kind)
         from .video_minimax_h3 import is_h3_native
@@ -1498,6 +1557,7 @@ class VideoBackend:
                 device = device,
                 hf_token = hf_token,
                 memory_mode = memory_mode,
+                h3_task = h3_task,
                 _load_token = _load_token,
                 _base_local_dir = _base_local_dir,
             )
@@ -1948,15 +2008,17 @@ class VideoBackend:
         device: str,
         hf_token: Optional[str],
         memory_mode: Optional[str],
-        _load_token: Optional[int],
-        _base_local_dir: Optional[str],
+        h3_task: Optional[str] = None,
+        _load_token: Optional[int] = None,
+        _base_local_dir: Optional[str] = None,
     ) -> dict[str, Any]:
         """Load MiniMax-H3 through its official Modular Diffusers workflow."""
         if kind != "pipeline":
             raise ValueError("MiniMax-H3 Diffusers loading requires the pipeline artifact.")
+        # Load one denoiser partition. fl2va also covers text-only generation.
+        workflow = h3_task or fam.modular_workflow
         manager = diffusers.ComponentsManager()
         load_kwargs: dict[str, Any] = {
-            "workflow": fam.modular_workflow,
             "components_manager": manager,
             "cache_dir": hub_cache_dir(),
         }
@@ -1966,14 +2028,18 @@ class VideoBackend:
         # The token above only opens the modular index. Every component's own from_pretrained runs
         # here, against the repos that index names, so it has to be passed again or a gated/private
         # component load goes out anonymously (load_components only WARNS on a failed component).
-        pipe.load_components(dtype = dtype, **({"token": hf_token} if hf_token else {}))
-        # The video VAE loads at float32 and the decode runs under float16 autocast, so both
-        # copies are resident for the whole decode. Pre-casting removes the pair without
-        # changing a single output value, and t2va never uses the encoder half at all.
+        # Restrict component loading without pruning the blocks that route each request.
+        pipe.load_components(
+            workflow = workflow,
+            dtype = dtype,
+            **({"token": hf_token} if hf_token else {}),
+        )
+        # Pre-cast the decoder to avoid simultaneous float32 and float16 copies. Both workflows
+        # still need the encoder, so keep it resident.
         from .video_minimax_h3 import trim_h3_video_vae
 
         try:
-            trimmed = trim_h3_video_vae(getattr(pipe, "vae", None), workflow = fam.modular_workflow)
+            trimmed = trim_h3_video_vae(getattr(pipe, "vae", None), workflow = workflow)
         except Exception as exc:  # noqa: BLE001 -- a saving is not worth failing a load over
             logger.warning("video.h3_vae_trim failed, keeping the full VAE: %s", exc)
         else:
@@ -2024,6 +2090,7 @@ class VideoBackend:
                 dtype = str(dtype).replace("torch.", ""),
                 kind = kind,
                 engine = "diffusers",
+                h3_task = workflow,
                 offload_policy = offload_policy,
                 vae_tiling = True,
                 memory_mode = normalize_memory_mode(memory_mode),
@@ -2085,6 +2152,14 @@ class VideoBackend:
         guidance: Optional[float] = None,
         guidance_2: Optional[float] = None,
         seed: Optional[int] = None,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
+        reference_videos: Optional[list[dict]] = None,
+        reference_audios: Optional[list[str]] = None,
+        reference_image_size: Optional[str] = None,
+        flow_shift: Optional[float] = None,
+        audio_flow_shift: Optional[float] = None,
     ) -> None:
         """Validate cheaply, then run generate + gallery persist on a daemon thread.
 
@@ -2098,6 +2173,31 @@ class VideoBackend:
         sentinels the route maps to 409.
         """
         cancel = threading.Event()
+        # Snapshot load state before decoding outside the backend lock.
+        with self._lock:
+            if self._state is None:
+                raise RuntimeError(VIDEO_NOT_LOADED_MSG)
+            if self._generate_job_active:
+                raise RuntimeError(VIDEO_GENERATION_BUSY_MSG)
+            family = self._state.family
+            task = self._state.h3_task
+            engine = self._state.engine
+        # Validate conditioning before creating the asynchronous job so request errors return 400.
+        _, _, canvas_w, canvas_h, _ = self._resolve_keyframes(
+            family, task, first_frame, last_frame, width, height
+        )
+        self._resolve_references(
+            family,
+            task,
+            engine,
+            reference_images,
+            reference_videos,
+            reference_audios,
+            reference_image_size,
+            canvas_w,
+            canvas_h,
+        )
+        self._resolve_flow_shifts(family, engine, flow_shift, audio_flow_shift)
         with self._lock:
             if self._state is None:
                 raise RuntimeError(VIDEO_NOT_LOADED_MSG)
@@ -2126,6 +2226,14 @@ class VideoBackend:
                 guidance = guidance,
                 guidance_2 = guidance_2,
                 seed = seed,
+                first_frame = first_frame,
+                last_frame = last_frame,
+                reference_images = reference_images,
+                reference_videos = reference_videos,
+                reference_audios = reference_audios,
+                reference_image_size = reference_image_size,
+                flow_shift = flow_shift,
+                audio_flow_shift = audio_flow_shift,
                 cancel_event = cancel,
             ),
             daemon = True,
@@ -2175,6 +2283,9 @@ class VideoBackend:
                     "guidance_2": gen_kwargs.get("guidance_2"),
                     "seed": result["seed"],
                     "has_audio": result["has_audio"],
+                    "conditioning": result["conditioning"],
+                    "flow_shift": result.get("flow_shift"),
+                    "audio_flow_shift": result.get("audio_flow_shift"),
                     "model": result["repo_id"],
                     "created_at": created_at,
                 },
@@ -2236,6 +2347,14 @@ class VideoBackend:
         guidance: Optional[float] = None,
         guidance_2: Optional[float] = None,
         seed: Optional[int] = None,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
+        reference_videos: Optional[list[dict]] = None,
+        reference_audios: Optional[list[str]] = None,
+        reference_image_size: Optional[str] = None,
+        flow_shift: Optional[float] = None,
+        audio_flow_shift: Optional[float] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> dict[str, Any]:
         # begin_generate passes its already-registered event; a direct call makes its own.
@@ -2251,11 +2370,22 @@ class VideoBackend:
                 self._active_generate_cancel = cancel
             try:
                 fam = state.family
-                width, height = snap_video_size(
-                    fam,
-                    width or fam.resolution_presets[0][0],
-                    height or fam.resolution_presets[0][1],
+                first_pil, last_pil, width, height, conditioning = self._resolve_keyframes(
+                    fam, state.h3_task, first_frame, last_frame, width, height
                 )
+                references = self._resolve_references(
+                    fam,
+                    state.h3_task,
+                    state.engine,
+                    reference_images,
+                    reference_videos,
+                    reference_audios,
+                    reference_image_size,
+                    width,
+                    height,
+                )
+                if references:
+                    conditioning = h3_conditioning_mode(has_references = True)
                 frames = snap_num_frames(fam, num_frames or fam.default_num_frames)
                 out_fps = (
                     fam.default_fps if fam.name == "minimax-h3" else int(fps or fam.default_fps)
@@ -2268,6 +2398,9 @@ class VideoBackend:
                 )
                 steps = int(steps or default_steps)
                 guidance = float(default_guidance if guidance is None else guidance)
+                shift, audio_shift = self._resolve_flow_shifts(
+                    fam, state.engine, flow_shift, audio_flow_shift
+                )
 
                 if state.engine == "sd_cpp":
                     return self._generate_h3_native(
@@ -2280,6 +2413,11 @@ class VideoBackend:
                         steps = steps,
                         guidance = guidance,
                         seed = seed,
+                        first_frame = first_pil,
+                        last_frame = last_pil,
+                        references = references,
+                        conditioning = conditioning,
+                        flow_shift = shift,
                         cancel = cancel,
                     )
 
@@ -2370,6 +2508,23 @@ class VideoBackend:
                     kwargs[fam.cfg2_kwarg] = float(guidance_2)
                 if fam.modular_workflow:
                     kwargs["output"] = ["videos", "audio", "sampling_rate"]
+                # Auto-blocks distinguish omitted conditioning from empty conditioning.
+                if first_pil is not None:
+                    kwargs["image"] = first_pil
+                if last_pil is not None:
+                    kwargs["last_image"] = last_pil
+                if references:
+                    from .video_minimax_h3 import h3_diffusers_references
+
+                    kwargs["references"] = h3_diffusers_references(references)
+                # Set scheduler shifts every run so prior requests cannot leak state.
+                for component, value in (
+                    ("scheduler", shift),
+                    ("audio_scheduler", audio_shift),
+                ):
+                    setter = getattr(getattr(pipe, component, None), "set_shift", None)
+                    if callable(setter) and value is not None:
+                        setter(float(value))
 
                 started = time.monotonic()
                 self._gen = {
@@ -2489,8 +2644,11 @@ class VideoBackend:
                     "fps": out_fps,
                     "duration_s": duration_s,
                     "has_audio": bool(audio_track is not None),
+                    "conditioning": conditioning,
                     "steps": steps,
                     "guidance": guidance,
+                    "flow_shift": shift,
+                    "audio_flow_shift": audio_shift,
                 }
             except Exception:
                 self._gen = {"active": False}
@@ -2499,6 +2657,183 @@ class VideoBackend:
                 with self._lock:
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+
+    @staticmethod
+    def _resolve_keyframes(
+        fam: VideoFamily,
+        h3_task: Optional[str],
+        first_frame: Optional[str],
+        last_frame: Optional[str],
+        width: Optional[int],
+        height: Optional[int],
+    ) -> tuple[Any, Any, int, int, str]:
+        """Decode keyframes and resolve their shared generation canvas.
+
+        Unsupported keyframes are rejected. Omitting both dimensions matches the source aspect.
+        """
+        if first_frame or last_frame:
+            if not fam.supports_keyframes:
+                raise ValueError(
+                    f"{fam.name} generates from the prompt alone; it takes no first or last frame."
+                )
+            if h3_task == H3_TASK_REFERENCES:
+                raise ValueError(
+                    "The loaded MiniMax-H3 checkpoint is the Ref2VA partition, which conditions "
+                    "on references rather than keyframes. Load a minimax_h3_fl2va checkpoint to "
+                    "generate from a first or last frame."
+                )
+        first = last = None
+        if first_frame or last_frame:
+            from .diffusion import decode_b64_image
+
+            first = decode_b64_image(first_frame, mode = "RGB") if first_frame else None
+            last = decode_b64_image(last_frame, mode = "RGB") if last_frame else None
+
+        if (width is None or height is None) and (first is not None or last is not None):
+            width, height = h3_canvas_for_aspect(*(first if first is not None else last).size)
+        else:
+            width, height = snap_video_size(
+                fam,
+                width or fam.resolution_presets[0][0],
+                height or fam.resolution_presets[0][1],
+            )
+        # Fit once so both engines condition on identical pixels.
+        if first is not None:
+            first = fit_h3_keyframe(first, width, height, anchor = H3_ANCHOR_FIRST)
+        if last is not None:
+            last = fit_h3_keyframe(last, width, height, anchor = H3_ANCHOR_LAST)
+        conditioning = h3_conditioning_mode(
+            has_first = first is not None, has_last = last is not None
+        )
+        return first, last, width, height, conditioning
+
+    @staticmethod
+    def _resolve_flow_shifts(
+        fam: VideoFamily,
+        engine: str,
+        flow_shift: Optional[float],
+        audio_flow_shift: Optional[float],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Resolve requested or released sigma shifts.
+
+        sd.cpp rejects non-default audio shifts because it cannot apply them.
+        """
+        if flow_shift is not None and fam.default_flow_shift is None:
+            raise ValueError(f"{fam.name} does not expose a video flow_shift control.")
+        if audio_flow_shift is not None and fam.default_audio_flow_shift is None:
+            raise ValueError(f"{fam.name} does not expose an audio_flow_shift control.")
+        shift = flow_shift if flow_shift is not None else fam.default_flow_shift
+        audio_shift = (
+            audio_flow_shift if audio_flow_shift is not None else fam.default_audio_flow_shift
+        )
+        if (
+            audio_flow_shift is not None
+            and engine == "sd_cpp"
+            and audio_flow_shift != fam.default_audio_flow_shift
+        ):
+            raise ValueError(
+                "stable-diffusion.cpp derives the audio schedule against a fixed "
+                f"{fam.default_audio_flow_shift:g} shift, so audio_flow_shift needs the "
+                "Diffusers engine."
+            )
+        return shift, audio_shift
+
+    @staticmethod
+    def _resolve_references(
+        fam: VideoFamily,
+        h3_task: Optional[str],
+        engine: str,
+        reference_images: Optional[list[str]],
+        reference_videos: Optional[list[dict]],
+        reference_audios: Optional[list[str]],
+        reference_image_size: Optional[str],
+        width: int,
+        height: int,
+    ) -> Any:
+        """Decode the request's omni references into the one object both engines consume.
+
+        Sizing is settled here for the same reason keyframes are: sd.cpp scales every reference
+        to the generation's pixel area and the Diffusers blocks scale to their own 2048px short
+        edge, and both are min(1, ...) scales, so pre-fitting to the requested policy makes each
+        engine's own rule a no-op and the two agree. That is also why ``max`` is refused on the
+        native engine rather than accepted and quietly undone.
+        """
+        from .video_minimax_h3 import (
+            MiniMaxH3References,
+            decode_h3_reference_audio,
+            decode_h3_reference_video,
+        )
+
+        images = list(reference_images or [])
+        videos = list(reference_videos or [])
+        audios = list(reference_audios or [])
+        if not (images or videos or audios):
+            if h3_task == H3_TASK_REFERENCES:
+                # Ref2VA has no text-only denoiser, so every request needs an image or video.
+                raise ValueError(
+                    "The loaded MiniMax-H3 checkpoint is the Ref2VA partition, which generates "
+                    "from references. Add at least one reference image or video, or load a "
+                    "minimax_h3_fl2va checkpoint for text-to-video."
+                )
+            return MiniMaxH3References()
+        if not fam.supports_references:
+            raise ValueError(f"{fam.name} takes no reference images, videos or audio.")
+        if h3_task != H3_TASK_REFERENCES:
+            raise ValueError(
+                "The loaded MiniMax-H3 checkpoint is the FL2VA partition, which conditions on "
+                "keyframes rather than references. Load a minimax_h3_ref2va checkpoint to "
+                "generate from references."
+            )
+        policy = (reference_image_size or H3_REF_SIZE_MATCH).strip().lower()
+        if policy not in (H3_REF_SIZE_MATCH, H3_REF_SIZE_MAX):
+            raise ValueError(
+                f"reference_image_size must be '{H3_REF_SIZE_MATCH}' or '{H3_REF_SIZE_MAX}'."
+            )
+        if policy == H3_REF_SIZE_MAX and engine == "sd_cpp":
+            raise ValueError(
+                "stable-diffusion.cpp scales every reference to the generation's pixel area, so "
+                f"'{H3_REF_SIZE_MAX}' reference sizing needs the Diffusers engine. Use "
+                f"'{H3_REF_SIZE_MATCH}' with this checkpoint."
+            )
+
+        from .diffusion import decode_b64_image
+
+        fitted_images = tuple(
+            fit_h3_reference_image(
+                decode_b64_image(item, mode = "RGB"), width = width, height = height,
+                policy = policy,
+            )
+            for item in images
+        )
+        decoded_videos = []
+        for item in videos:
+            blob = _decode_b64_media(item.get("video") if isinstance(item, dict) else item)
+            frames, waveform, sample_rate = decode_h3_reference_video(blob)
+            override = item.get("audio") if isinstance(item, dict) else None
+            if override:
+                waveform, sample_rate = decode_h3_reference_audio(_decode_b64_media(override))
+            decoded_videos.append((frames, waveform, sample_rate))
+        if engine == "sd_cpp":
+            soundtrack_gap = False
+            for index, (_, waveform, _) in enumerate(decoded_videos, start = 1):
+                if waveform is None:
+                    soundtrack_gap = True
+                elif soundtrack_gap:
+                    # sd-cli pairs soundtrack flags by position, so gaps would misattach audio.
+                    raise ValueError(
+                        "stable-diffusion.cpp can pair reference-video soundtracks only from "
+                        f"Video 1 onward without gaps, but Video {index} has audio after a "
+                        "silent earlier video. Reorder the videos so ones with soundtracks "
+                        "come first, or add a replacement soundtrack to each earlier video."
+                    )
+        decoded_audios = tuple(
+            decode_h3_reference_audio(_decode_b64_media(item)) for item in audios
+        )
+        return MiniMaxH3References(
+            images = fitted_images,
+            videos = tuple(decoded_videos),
+            audios = decoded_audios,
+        )
 
     def _generate_h3_native(
         self,
@@ -2512,6 +2847,12 @@ class VideoBackend:
         steps: int,
         guidance: float,
         seed: Optional[int],
+        # Canvas-fitted keyframes, and the task name they add up to (see _resolve_keyframes).
+        first_frame: Any,
+        last_frame: Any,
+        references: Any,
+        conditioning: str,
+        flow_shift: Optional[float],
         cancel: threading.Event,
     ) -> dict[str, Any]:
         import random
@@ -2519,7 +2860,11 @@ class VideoBackend:
 
         from .sd_cpp_args import SdCppVideoGenParams
         from .sd_cpp_engine import SdCppCancelled
-        from .video_minimax_h3 import inspect_video, transcode_video_to_mp4
+        from .video_minimax_h3 import (
+            inspect_video,
+            stage_h3_references,
+            transcode_video_to_mp4,
+        )
 
         runtime = state.pipe
         if seed is None:
@@ -2534,10 +2879,22 @@ class VideoBackend:
             "eta_seconds": None,
             "error": None,
         }
-        step_pattern = re.compile(r"(?:step|sampling)\D+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+        # sd.cpp reuses an unlabeled bar for loading, denoising, and VAE work. Count only
+        # iteration-rated bars inside its denoise window.
+        denoise_open = re.compile(r"generate_video\s+\d+x\d+x\d+")
+        denoise_close = re.compile(r"sampling completed", re.IGNORECASE)
+        step_bar = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)\s*-\s*[\d.]+\s*(?:it/s|s/it)")
+        denoising = False
 
         def on_log(line: str) -> None:
-            match = step_pattern.search(line)
+            nonlocal denoising
+            if denoise_open.search(line):
+                denoising = True
+                return
+            if denoise_close.search(line):
+                denoising = False
+                return
+            match = step_bar.search(line) if denoising else None
             if match is None:
                 return
             done, total = int(match.group(1)), int(match.group(2))
@@ -2551,50 +2908,73 @@ class VideoBackend:
         tmp = tempfile.NamedTemporaryFile(suffix = ".webm", delete = False)
         tmp.close()
         output_path = Path(tmp.name)
-        try:
+        # Stage in-memory conditioning in sd-cli's temporary disk format.
+        with tempfile.TemporaryDirectory(prefix = "unsloth-h3-keyframes-") as scratch:
+            def stage(image: Any, name: str) -> Optional[str]:
+                if image is None:
+                    return None
+                path = Path(scratch) / f"{name}.png"
+                image.save(path, format = "PNG")
+                return str(path)
+
+            init_img = stage(first_frame, "first")
+            end_img = stage(last_frame, "last")
+            staged = stage_h3_references(references, Path(scratch))
             try:
-                generated = runtime.engine.generate_video(
-                    runtime.files,
-                    SdCppVideoGenParams(
-                        prompt = prompt,
-                        width = width,
-                        height = height,
-                        num_frames = frames,
-                        fps = fps,
-                        steps = steps,
-                        cfg_scale = 1.0,
-                        seed = int(seed),
-                    ),
-                    output_path = str(output_path),
-                    offload = list(runtime.offload_flags),
-                    on_log = on_log,
-                    cancel_event = cancel,
-                )
-            except SdCppCancelled:
-                raise RuntimeError(VIDEO_CANCELLED_MSG) from None
-            if cancel.is_set():
-                raise RuntimeError(VIDEO_CANCELLED_MSG)
-            self._gen.update(phase = "export", eta_seconds = None)
-            actual_width, actual_height, actual_frames, has_audio = inspect_video(generated)
-            mp4_bytes = transcode_video_to_mp4(generated, fps = fps)
-            if cancel.is_set():
-                raise RuntimeError(VIDEO_CANCELLED_MSG)
-            self._gen = {"active": False}
-            return {
-                "mp4_bytes": mp4_bytes,
-                "seed": int(seed),
-                "repo_id": state.repo_id,
-                "width": actual_width,
-                "height": actual_height,
-                "num_frames": actual_frames,
-                "fps": fps,
-                "duration_s": actual_frames / float(fps),
-                "has_audio": has_audio,
-                "steps": steps,
-                "guidance": guidance,
-            }
-        finally:
-            output_path.unlink(missing_ok = True)
+                try:
+                    generated = runtime.engine.generate_video(
+                        runtime.files,
+                        SdCppVideoGenParams(
+                            prompt = prompt,
+                            width = width,
+                            height = height,
+                            num_frames = frames,
+                            fps = fps,
+                            steps = steps,
+                            cfg_scale = 1.0,
+                            seed = int(seed),
+                            init_img = init_img,
+                            end_img = end_img,
+                            ref_images = staged.images,
+                            ref_videos = staged.videos,
+                            ref_video_audios = staged.video_audios,
+                            ref_audios = staged.audios,
+                            flow_shift = flow_shift,
+                        ),
+                        output_path = str(output_path),
+                        offload = list(runtime.offload_flags),
+                        on_log = on_log,
+                        cancel_event = cancel,
+                    )
+                except SdCppCancelled:
+                    raise RuntimeError(VIDEO_CANCELLED_MSG) from None
+                if cancel.is_set():
+                    raise RuntimeError(VIDEO_CANCELLED_MSG)
+                self._gen.update(phase = "export", eta_seconds = None)
+                actual_width, actual_height, actual_frames, has_audio = inspect_video(generated)
+                mp4_bytes = transcode_video_to_mp4(generated, fps = fps)
+                if cancel.is_set():
+                    raise RuntimeError(VIDEO_CANCELLED_MSG)
+                self._gen = {"active": False}
+                return {
+                    "mp4_bytes": mp4_bytes,
+                    "seed": int(seed),
+                    "repo_id": state.repo_id,
+                    "width": actual_width,
+                    "height": actual_height,
+                    "num_frames": actual_frames,
+                    "fps": fps,
+                    "duration_s": actual_frames / float(fps),
+                    "has_audio": has_audio,
+                    "conditioning": conditioning,
+                    "steps": steps,
+                    "guidance": guidance,
+                    "flow_shift": flow_shift,
+                    # sd.cpp pins the audio schedule, so the recipe records what it actually ran.
+                    "audio_flow_shift": state.family.default_audio_flow_shift,
+                }
+            finally:
+                output_path.unlink(missing_ok = True)
 
     @staticmethod
     def _encode_mp4(
@@ -2735,6 +3115,9 @@ class VideoBackend:
                 "text_encoder_quant": None,
                 "has_audio": False,
                 "supports_cfg": True,
+                "supports_keyframes": False,
+                "supports_references": False,
+                "h3_task": None,
                 "defaults": None,
                 "resolved": None,
             }
@@ -2765,6 +3148,12 @@ class VideoBackend:
             "text_encoder_quant": state.text_encoder_quant,
             "has_audio": fam.has_audio,
             "supports_cfg": fam.supports_cfg,
+            # Expose only conditioning supported by the resident partition.
+            "supports_keyframes": fam.supports_keyframes
+            and state.h3_task != H3_TASK_REFERENCES,
+            "supports_references": fam.supports_references
+            and state.h3_task == H3_TASK_REFERENCES,
+            "h3_task": state.h3_task,
             "defaults": {
                 "steps": default_steps,
                 "guidance": default_guidance,
@@ -2775,6 +3164,14 @@ class VideoBackend:
                 "duration_presets": list(fam.duration_presets),
                 "resolution_multiple": fam.resolution_multiple,
                 "resolution_presets": [list(p) for p in fam.resolution_presets],
+                # Let the frontend preview the backend-owned "match source" rule.
+                "canvas_short_edge": H3_CANVAS_SHORT_EDGE if fam.supports_keyframes else None,
+                "canvas_max_pixels": H3_CANVAS_MAX_PIXELS if fam.supports_keyframes else None,
+                "flow_shift": fam.default_flow_shift,
+                "audio_flow_shift": fam.default_audio_flow_shift,
+                # sd.cpp has no flag for the audio shift, so the control is only real on Diffusers.
+                "supports_audio_flow_shift": fam.default_audio_flow_shift is not None
+                and state.engine != "sd_cpp",
             },
             "resolved": state.resolved,
         }
