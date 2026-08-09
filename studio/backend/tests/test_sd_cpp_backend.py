@@ -1257,8 +1257,8 @@ def test_a_repack_left_in_the_pre_change_cache_root_still_wins_over_the_mirror(
 def test_the_delete_guard_names_the_repack_as_well_as_the_mirror(monkeypatch):
     """The bytes land in whichever of the three the load chose, and that is re-decided per load, so
     a guard naming only one of them can delete a repo the next load needs."""
-    from core.inference.sd_cpp_backend import _with_mirrors
+    from core.inference.diffusion_families import with_repo_mirrors
 
-    protected = _with_mirrors(["unsloth/Z-Image-Turbo-ComfyUI"])
+    protected = with_repo_mirrors(["unsloth/Z-Image-Turbo-ComfyUI"])
     assert "unsloth/Z-Image-Turbo-ComfyUI" in protected
     assert "Comfy-Org/z_image_turbo" in protected

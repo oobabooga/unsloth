@@ -18,7 +18,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 
 # Runtime->route contract: the /images/generate route matches these messages EXACTLY for a 409 (vs a 500), so both engines raise them verbatim.
@@ -874,6 +874,43 @@ def sd_cpp_text_encoders_for(
         if _token_in_needle("9b", identity) or "klein9b" in identity:
             return _FLUX2_KLEIN_9B_SD_CPP_TEXT_ENCODERS
     return fam.sd_cpp_text_encoders
+
+
+def sd_cpp_asset_specs(
+    fam: DiffusionFamily, repo_id: str, gguf_filename: str
+) -> tuple[tuple[str, str, str], ...]:
+    """(repo, filename, kind) for every file sd-cli needs. ``kind`` is the
+    SdCppModelFiles field; the transformer reuses the diffusers GGUF.
+
+    The single enumerator behind the download plan, the preflight access check, the load, and
+    the cached-inventory dependency map, so a family gaining an asset reaches all four.
+    """
+    specs: list[tuple[str, str, str]] = [(repo_id, gguf_filename, "diffusion_model")]
+    if fam.sd_cpp_vae:
+        specs.append((fam.sd_cpp_vae[0], fam.sd_cpp_vae[1], "vae"))
+    # Pick the encoder per variant from the load identity so a 9B GGUF fetches the right one.
+    specs.extend(sd_cpp_text_encoders_for(fam, repo_id, gguf_filename))
+    return tuple(specs)
+
+
+def with_repo_mirrors(repo_ids: Iterable[Optional[str]]) -> tuple[str, ...]:
+    """``repo_ids`` plus the ungated mirror and the community repack of each, de-duplicated,
+    order preserved.
+
+    Both the live delete guard and the cached dependency map must name whichever of the set the
+    bytes landed in, and that decision is re-taken per load; naming all of them is cheap and
+    cannot under-protect. A mirror's own repack is included because ``prefer_cached_legacy_source``
+    can hand the load back to it after the id has already been swapped to the mirror.
+    """
+    out: list[str] = []
+    for rid in repo_ids:
+        if not rid:
+            continue
+        out.append(rid)
+        mirror = mirror_repo(rid)
+        aliases = (mirror, legacy_source_repo(rid), legacy_source_repo(mirror) if mirror else None)
+        out.extend(alias for alias in aliases if alias)
+    return tuple(dict.fromkeys(out))
 
 
 # FLUX.2 sizes the adaLN modulation projection as (6 * inner_dim, inner_dim), and inner_dim is the

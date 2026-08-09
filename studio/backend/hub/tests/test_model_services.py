@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from core.inference import video_families
 from hub.dependencies import get_hf_token
 from hub.storage import scan_folders
 from hub.services import download_lifecycle
@@ -1760,11 +1761,11 @@ def _diffusion_scan(monkeypatch, tmp_path, repo_id: str, files: list, *, task: s
     return rows[0]
 
 
-def test_cached_models_scan_marks_a_companion_only_pipeline_partial(monkeypatch, tmp_path):
+def test_cached_models_scan_surfaces_a_complete_companion_pipeline(monkeypatch, tmp_path):
     """A GGUF image load prefetches the base repo's manifest + VAE + text encoder and skips the
-    multi-GB transformer. Every file its manifest expected arrived, so the download-partial check
-    passes it, but from_pretrained cannot load it -- the picker must not advertise it as on-device
-    (same rule /api/models/cached applies)."""
+    multi-GB transformer. Every file its manifest expected arrived, so this is a complete required-
+    asset cache rather than a partial model download. The companion flag keeps it out of pickers
+    while leaving a clean On Device row as the supported cleanup path."""
     row = _diffusion_scan(
         monkeypatch,
         tmp_path,
@@ -1777,9 +1778,13 @@ def test_cached_models_scan_marks_a_companion_only_pipeline_partial(monkeypatch,
         task = "text-to-image",
     )
 
-    assert row["partial"] is True
-    # A companion-only snapshot arrived intact, so it has no Resume / Redownload story.
+    assert row["partial"] is False
+    assert row["companion"] is True
+    assert row["capabilities"]["can_chat"] is False
+    # A companion-only snapshot arrived intact, so it has no Resume / Redownload story and no
+    # installed checkpoint in this isolated scan holds it in use.
     assert row["partial_transport"] is None
+    assert row["required_by"] == []
 
 
 def test_cached_models_scan_keeps_a_complete_pipeline_loadable(monkeypatch, tmp_path):
@@ -1858,35 +1863,274 @@ def test_an_ordinary_repo_is_not_flagged_as_a_companion(monkeypatch, tmp_path):
     assert row["capabilities"]["can_chat"] is True
 
 
-def test_the_real_companion_shape_never_reaches_a_row_at_all(monkeypatch, tmp_path):
-    """Why the flag above is a latch, not a live fix.
+def test_the_real_comfyui_companion_shape_gets_a_cleanup_row(monkeypatch, tmp_path):
+    """The published native mirrors have split_files weights and no root config. They are not
+    runnable models, but their multi-GB caches must remain visible and deletable."""
+    row = _diffusion_scan(
+        monkeypatch,
+        tmp_path,
+        "unsloth/Z-Image-Turbo-ComfyUI",
+        [
+            _file("split_files/vae/ae.safetensors", 300_000_000),
+            _file("README.md", 100),
+        ],
+        task = None,
+    )
 
-    The published mirrors are ComfyUI-style: weights under split_files/ and no config.json or
-    model_index.json. _repo_non_gguf_model_payload classifies that as ``unknown``, so
-    has_runnable_weights is False and _scan_cached_models drops the repo before any row exists.
-    Pinned because the flag's whole value is covering the day that classifier learns to admit
-    these -- if this test starts failing, the flag is what stops a denoiser-less repo becoming a
-    chat pick.
-    """
-    from types import SimpleNamespace
+    assert row["model_format"] == "unknown"
+    assert row["size_bytes"] == 300_000_000
+    assert row["companion"] is True
+    assert row["partial"] is False
+    assert row["capabilities"]["can_chat"] is False
 
+
+def test_asset_dependents_cover_diffusers_and_native_assets(tmp_path):
+    """One installed image GGUF claims the diffusers base, the native VAE and text encoders, and
+    the mirror / community-repack ids that name the same bytes under a different repo key."""
+    checkpoint = _repo(
+        "unsloth/FLUX.2-klein-4B-GGUF",
+        [_file("FLUX.2-klein-4B-Q4_K_M.gguf", 2_600_000_000)],
+        tmp_path / "hub" / "models--unsloth--FLUX.2-klein-4B-GGUF",
+    )
+    vae = _repo(
+        "unsloth/FLUX.2-VAE",
+        [_file("split_files/vae/flux2-vae.safetensors", 300_000_000)],
+        tmp_path / "hub" / "models--unsloth--FLUX.2-VAE",
+    )
+    encoder = _repo(
+        "unsloth/Z-Image-Turbo-ComfyUI",
+        [_file("split_files/text_encoders/qwen_3_4b.safetensors", 8_000_000_000)],
+        tmp_path / "hub" / "models--unsloth--Z-Image-Turbo-ComfyUI",
+    )
+    diffusers_base = _repo(
+        "black-forest-labs/FLUX.2-klein-4B",
+        [_file("model_index.json", 500)],
+        tmp_path / "hub" / "models--black-forest-labs--FLUX.2-klein-4B",
+    )
+
+    dependents = cache_inventory.cached_asset_dependents_by_repo(
+        cache_scans = [SimpleNamespace(repos = [checkpoint, vae, encoder, diffusers_base])]
+    )
+
+    user = ["unsloth/FLUX.2-klein-4B-GGUF"]
+    assert dependents["black-forest-labs/flux.2-klein-4b"] == user
+    assert dependents["unsloth/flux.2-vae"] == user
+    assert dependents["unsloth/z-image-turbo-comfyui"] == user
+    # Its own transformer GGUF is not an asset of itself, or the row could never be deleted.
+    assert "unsloth/flux.2-klein-4b-gguf" not in dependents
+
+
+
+def test_asset_dependents_cover_a_video_gguf_base(tmp_path):
+    """Video GGUFs borrow their VAE and text encoder from the family base just as image ones do,
+    and they are not in the image family table, so they need their own resolution."""
+    repo_path = tmp_path / "hub" / "models--unsloth--Wan2.2-TI2V-5B-GGUF"
+    checkpoint = _repo(
+        "unsloth/Wan2.2-TI2V-5B-GGUF",
+        [_file("Wan2.2-TI2V-5B-Q4_K_M.gguf", 3_000_000_000)],
+        repo_path,
+    )
+
+    dependents = cache_inventory.cached_asset_dependents_by_repo(
+        cache_scans = [SimpleNamespace(repos = [checkpoint])]
+    )
+
+    base = video_families.resolve_video_base_repo(
+        video_families.detect_video_family("unsloth/Wan2.2-TI2V-5B-GGUF"), None
+    )
+    assert dependents[base.lower()] == ["unsloth/Wan2.2-TI2V-5B-GGUF"]
+
+
+def test_asset_dependents_use_only_the_loaders_first_card_base(tmp_path):
+    """The loader treats a ``base_model`` list as ordered and reads only its first entry. Inventory
+    must do the same or another trusted entry can make an unrelated cache undeletable."""
     snapshot = tmp_path / "snapshots" / _SNAPSHOT_SHA
     snapshot.mkdir(parents = True)
-    files = [_file("split_files/vae/ae.safetensors", 300_000_000), _file("README.md", 100)]
-    for f in files:
-        target = snapshot / f.file_name
-        target.parent.mkdir(parents = True, exist_ok = True)
-        target.write_bytes(b"\0" * 16)
-    repo = SimpleNamespace(
-        repo_id = "unsloth/Z-Image-Turbo-ComfyUI",
+    (snapshot / "README.md").write_text(
+        "---\nbase_model:\n  - black-forest-labs/FLUX.2-klein-9B\n"
+        "  - black-forest-labs/FLUX.1-dev\n---\n",
+        encoding = "utf-8",
+    )
+    checkpoint = SimpleNamespace(
+        repo_id = "unsloth/FLUX.2-klein-9B-GGUF",
         repo_type = "model",
         repo_path = tmp_path,
-        revisions = [SimpleNamespace(files = files, snapshot_path = snapshot, commit_hash = _SNAPSHOT_SHA)],
+        revisions = [
+            SimpleNamespace(
+                files = [_file("FLUX.2-klein-9B-Q4_K_M.gguf", 4_000_000_000)],
+                snapshot_path = snapshot,
+            )
+        ],
     )
-    payload = cache_inventory._repo_non_gguf_model_payload(repo)
 
-    assert payload.model_format == "unknown"
-    assert payload.has_runnable_weights is False
+    dependents = cache_inventory.cached_asset_dependents_by_repo(
+        cache_scans = [SimpleNamespace(repos = [checkpoint])]
+    )
+
+    assert "black-forest-labs/flux.2-klein-9b" in dependents
+    assert "black-forest-labs/flux.1-dev" not in dependents
+
+
+def test_asset_dependents_ignore_an_untrusted_card_base(tmp_path):
+    """A remote GGUF card cannot pin an arbitrary repo that the loader refuses to open."""
+    snapshot = tmp_path / "snapshots" / _SNAPSHOT_SHA
+    snapshot.mkdir(parents = True)
+    (snapshot / "README.md").write_text(
+        "---\nbase_model: Attacker/Untrusted-Pipeline\n---\n",
+        encoding = "utf-8",
+    )
+    checkpoint = SimpleNamespace(
+        repo_id = "unsloth/FLUX.2-klein-9B-GGUF",
+        repo_type = "model",
+        repo_path = tmp_path,
+        revisions = [
+            SimpleNamespace(
+                files = [_file("FLUX.2-klein-9B-Q4_K_M.gguf", 4_000_000_000)],
+                snapshot_path = snapshot,
+            )
+        ],
+    )
+
+    dependents = cache_inventory.cached_asset_dependents_by_repo(
+        cache_scans = [SimpleNamespace(repos = [checkpoint])]
+    )
+
+    assert "attacker/untrusted-pipeline" not in dependents
+
+
+def test_asset_dependents_claim_only_the_borrowed_quant_and_only_once_it_is_cached(tmp_path):
+    """Qwen-Image borrows exactly one Qwen2.5-VL text-encoder quant. Everything else in that repo
+    is the user's own chat download, and until the borrowed quant is actually on disk nothing in
+    the repo is held at all."""
+    checkpoint = _repo(
+        "unsloth/Qwen-Image-GGUF",
+        [_file("Qwen-Image-Q4_K_M.gguf", 2_600_000_000)],
+        tmp_path / "hub" / "models--unsloth--Qwen-Image-GGUF",
+    )
+    encoder_path = tmp_path / "hub" / "models--unsloth--Qwen2.5-VL-7B-Instruct-GGUF"
+    chat_quant = _file("Qwen2.5-VL-7B-Instruct-Q8_0.gguf", 8_000_000_000)
+    borrowed_quant = _file("Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", 5_000_000_000)
+
+    chat_only = [
+        SimpleNamespace(
+            repos = [
+                checkpoint,
+                _repo("unsloth/Qwen2.5-VL-7B-Instruct-GGUF", [chat_quant], encoder_path),
+            ]
+        )
+    ]
+    assert cache_inventory.cached_asset_dependents(
+        "unsloth/Qwen2.5-VL-7B-Instruct-GGUF", cache_scans = chat_only
+    ) == []
+
+    both = [
+        SimpleNamespace(
+            repos = [
+                checkpoint,
+                _repo(
+                    "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+                    [chat_quant, borrowed_quant],
+                    encoder_path,
+                ),
+            ]
+        )
+    ]
+    assert cache_inventory.cached_asset_dependents(
+        "unsloth/Qwen2.5-VL-7B-Instruct-GGUF", "Q4_K_M", cache_scans = both
+    ) == ["unsloth/Qwen-Image-GGUF"]
+    assert cache_inventory.cached_asset_dependents(
+        "unsloth/Qwen2.5-VL-7B-Instruct-GGUF", "Q8_0", cache_scans = both
+    ) == []
+    # Without a variant the whole repo is claimed, because deleting it takes the quant with it.
+    assert cache_inventory.cached_asset_dependents(
+        "unsloth/Qwen2.5-VL-7B-Instruct-GGUF", cache_scans = both
+    ) == ["unsloth/Qwen-Image-GGUF"]
+
+
+def _delete_scans(monkeypatch, tmp_path, repos: list) -> Path:
+    """Point the delete path at ``repos`` in one cache root and return that root."""
+    scans = [SimpleNamespace(repos = repos)]
+    monkeypatch.setattr(deletion.cache_inventory, "all_hf_cache_scans", lambda: scans)
+    root = (tmp_path / "hub").resolve()
+    monkeypatch.setattr(
+        deletion, "resolve_delete_target_root", lambda *_args, **_kwargs: root
+    )
+    return root
+
+
+def test_whole_repo_delete_refuses_assets_used_by_an_installed_gguf(monkeypatch, tmp_path):
+    """End to end through the real dependency map: the VAE repo an installed FLUX.2 GGUF reads
+    from survives a whole-repo delete."""
+    vae_path = tmp_path / "hub" / "models--unsloth--FLUX.2-VAE"
+    vae_path.mkdir(parents = True)
+    checkpoint_path = tmp_path / "hub" / "models--unsloth--FLUX.2-klein-4B-GGUF"
+    checkpoint_path.mkdir(parents = True)
+    _delete_scans(
+        monkeypatch,
+        tmp_path,
+        [
+            _repo(
+                    "unsloth/FLUX.2-VAE",
+                    [_file("split_files/vae/flux2-vae.safetensors", 300_000_000)],
+                    vae_path,
+                ),
+            _repo(
+                "unsloth/FLUX.2-klein-4B-GGUF",
+                [_file("FLUX.2-klein-4B-Q4_K_M.gguf", 2_600_000_000)],
+                checkpoint_path,
+            ),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        deletion._delete_cached_model_blocking("unsloth/FLUX.2-VAE", None, None)
+
+    assert exc_info.value.status_code == 409
+    assert "unsloth/FLUX.2-klein-4B-GGUF" in exc_info.value.detail
+    assert vae_path.exists()
+
+
+def test_variant_delete_refuses_a_quant_used_as_a_diffusion_asset(monkeypatch, tmp_path):
+    """Qwen-Image borrows exactly the Q4_K_M Qwen2.5-VL text encoder, so that quant is refused
+    while a sibling quant of the same repo still deletes."""
+    encoder_path = tmp_path / "hub" / "models--unsloth--Qwen2.5-VL-7B-Instruct-GGUF"
+    encoder_path.mkdir(parents = True)
+    checkpoint_path = tmp_path / "hub" / "models--unsloth--Qwen-Image-GGUF"
+    checkpoint_path.mkdir(parents = True)
+    _delete_scans(
+        monkeypatch,
+        tmp_path,
+        [
+            _repo(
+                "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+                [
+                    _file("Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", 5_000_000_000),
+                    _file("Qwen2.5-VL-7B-Instruct-Q8_0.gguf", 8_000_000_000),
+                ],
+                encoder_path,
+            ),
+            _repo(
+                "unsloth/Qwen-Image-GGUF",
+                [_file("Qwen-Image-Q4_K_M.gguf", 2_600_000_000)],
+                checkpoint_path,
+            ),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        deletion._delete_cached_model_blocking(
+            "unsloth/Qwen2.5-VL-7B-Instruct-GGUF", "Q4_K_M", None
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "unsloth/Qwen-Image-GGUF" in exc_info.value.detail
+    assert encoder_path.exists()
+    # The sibling quant is the user's own chat download; it is not borrowed and must not be held.
+    assert cache_inventory.cached_asset_dependents(
+        "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+        "Q8_0",
+        cache_scans = deletion.cache_inventory.all_hf_cache_scans(),
+    ) == []
 
 
 def test_cached_models_scan_leaves_chat_repos_unflagged(monkeypatch, tmp_path):

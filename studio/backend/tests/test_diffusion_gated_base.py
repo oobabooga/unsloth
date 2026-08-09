@@ -305,12 +305,11 @@ def test_the_native_pre_eviction_preflight_refuses_a_gated_companion(monkeypatch
         info = _FakeInfo("auto", [_FakeSibling("ae.safetensors", 1000)]),
         download_error = _gated_error(),
     )
+    # No text encoders, so the gated VAE is the only companion the preflight can refuse on.
     fam = types.SimpleNamespace(
         name = "flux.1",
         sd_cpp_vae = (GATED_REPO, "ae.safetensors"),
-    )
-    monkeypatch.setattr(
-        "core.inference.sd_cpp_backend.sd_cpp_text_encoders_for", lambda *a, **k: ()
+        sd_cpp_text_encoders = (),
     )
 
     with pytest.raises(ValueError) as excinfo:

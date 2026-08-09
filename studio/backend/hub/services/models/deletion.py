@@ -773,6 +773,24 @@ def _delete_cached_model_blocking(
             if str(repo_info.repo_id) in matched_repo_ids
         ]
 
+        # Refuse before anything is unlinked: these bytes are a shared VAE / text encoder that an
+        # installed image or video GGUF re-reads on every load, so removing them breaks that model
+        # with no signal until its next generation fails.
+        required_by = cache_inventory.cached_asset_dependents(
+            repo_id, variant, cache_scans = cache_scans
+        )
+        if required_by:
+            preview = ", ".join(required_by[:3])
+            if len(required_by) > 3:
+                preview += f" and {len(required_by) - 3} more"
+            raise HTTPException(
+                status_code = 409,
+                detail = (
+                    f"These cached files are required by {preview}. Delete those model "
+                    "files first, then remove these required assets."
+                ),
+            )
+
         if not target_entries:
             if variant is None:
                 cache_purged = purge_repo_cache_dirs(

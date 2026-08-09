@@ -236,6 +236,14 @@ class CachedModelRepo(CachedRepoBase):
     # never a pick on ANY page. It still gets a row, because these run to tens of GB and the row
     # is how they are seen and deleted; the pickers filter on this instead.
     companion: bool = False
+    required_by: List[str] = Field(
+        default_factory = list,
+        description = (
+            "Cached GGUF repositories whose image or video loads use files from this repo. "
+            "A non-empty list blocks deletion so a shared companion cache cannot be removed "
+            "out from under an installed model."
+        ),
+    )
 
 
 class CachedModelsResponse(BaseModel):

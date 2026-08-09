@@ -64,6 +64,7 @@ interface ModelRowMenuDelete {
   description: ReactNode;
   successMessage: string;
   disabled?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => Promise<void> | void;
   onDeleted?: () => void;
 }
@@ -290,6 +291,7 @@ export function ModelRowMenu({
           title={del.title}
           description={del.description}
           deleting={deleting}
+          confirmDisabled={del.confirmDisabled}
           onConfirm={() => void handleDeleteConfirm()}
         />
       )}

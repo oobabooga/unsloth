@@ -299,6 +299,7 @@ export function DeleteConfirmDialog({
   title,
   description,
   deleting,
+  confirmDisabled = false,
   onConfirm,
 }: {
   open: boolean;
@@ -306,6 +307,7 @@ export function DeleteConfirmDialog({
   title: string;
   description: ReactNode;
   deleting: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
 }) {
   return (
@@ -319,13 +321,13 @@ export function DeleteConfirmDialog({
           <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
-            disabled={deleting}
+            disabled={deleting || confirmDisabled}
             onClick={(e) => {
               e.preventDefault();
               onConfirm();
             }}
           >
-            {deleting ? "Deleting…" : "Delete"}
+            {deleting ? "Deleting…" : confirmDisabled ? "Still in use" : "Delete"}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

@@ -75,6 +75,10 @@ export interface CachedModelRepo {
   tags?: string[];
   library_name?: string | null;
   quant_method?: string | null;
+  /** Required-asset cache rather than a standalone model. */
+  companion?: boolean;
+  /** Installed GGUF repos that currently depend on this cache. */
+  required_by?: string[];
 }
 
 export interface LocalModelInfo {

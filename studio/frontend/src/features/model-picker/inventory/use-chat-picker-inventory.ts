@@ -103,7 +103,7 @@ export function useChatPickerInventory(
           (row) =>
             row.modelFormat !== "gguf" &&
             isCompleteCachedRow(row) &&
-            // An sd.cpp companion mirror holds a VAE / text encoders and no denoiser. It has no
+            // A required-asset cache holds a VAE / text encoders and no denoiser. It has no
             // task, and a task of null is what every unclassified CHAT repo carries, so without
             // this it lands in the chat On Device list as a load that cannot succeed.
             !row.companion &&

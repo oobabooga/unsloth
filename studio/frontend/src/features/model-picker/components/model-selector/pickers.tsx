@@ -40,6 +40,9 @@ import {
   TrainIcon,
   TransportConflictDialog,
   deleteCachedModel,
+  // The local formatBytes drops the space so a size reads as one token beside a quant chip;
+  // this dialog is prose, so it takes the Hub's own "2.6 GB" spelling.
+  formatBytes as formatProseBytes,
   invalidateGgufVariantsCache,
   listGgufVariants as listGgufVariantsCached,
   useGgufVariantsCacheVersions,
@@ -550,6 +553,41 @@ function SizeText({ value }: { value: string }) {
         </>
       )}
       <span className="ml-[0.14em]">{unit}</span>
+    </>
+  );
+}
+
+function GgufDeleteDescription({
+  repoId,
+  quant,
+  sizeBytes,
+  retainsRequiredAssets,
+}: {
+  repoId: string;
+  quant: string;
+  sizeBytes?: number;
+  retainsRequiredAssets: boolean;
+}) {
+  return (
+    <>
+      This will remove{" "}
+      <span className="font-medium text-foreground">
+        {repoId} ({quant})
+      </span>
+      {typeof sizeBytes === "number" && sizeBytes > 0
+        ? ` (${formatProseBytes(sizeBytes)})`
+        : ""}{" "}
+      from disk.
+      {retainsRequiredAssets ? (
+        <>
+          {" "}
+          Shared text encoders, VAE, tokenizer, and configuration files stay
+          cached. Remove them separately from Model Hub, On Device after no
+          installed model needs them.
+        </>
+      ) : (
+        <> You can re-download it later.</>
+      )}
     </>
   );
 }
@@ -1103,6 +1141,7 @@ function GgufVariantExpander({
   variantActions,
   onDevice = false,
   allowPin = false,
+  retainsRequiredAssets = false,
   onHasVision,
 }: {
   repoId: string;
@@ -1142,6 +1181,8 @@ function GgufVariantExpander({
   /** Only managed cached-Hub rows can surface quant pins in the Pinned
    *  section. Local-path expanders deliberately leave this false. */
   allowPin?: boolean;
+  /** Image/video GGUF deletion keeps separately cached pipeline components. */
+  retainsRequiredAssets?: boolean;
   /** Report GGUF vision support up so the parent row can badge it. */
   onHasVision?: (hasVision: boolean) => void;
 }) {
@@ -1541,13 +1582,12 @@ function GgufVariantExpander({
                           description: renderDeleteVariantDescription?.(
                             v.quant,
                           ) ?? (
-                            <>
-                              This will remove{" "}
-                              <span className="font-medium text-foreground">
-                                {repoId} ({v.quant})
-                              </span>{" "}
-                              from disk. You can re-download it later.
-                            </>
+                            <GgufDeleteDescription
+                              repoId={repoId}
+                              quant={v.quant}
+                              sizeBytes={v.size_bytes}
+                              retainsRequiredAssets={retainsRequiredAssets}
+                            />
                           ),
                           successMessage:
                             getDeleteVariantSuccessMessage?.(v.quant) ??
@@ -2660,6 +2700,15 @@ export function HubModelPicker({
     return byId;
   }, [cachedGguf, cachedModels, lmStudioModels, localDirModels, customFolderModels]);
 
+  // Deleting an image/video GGUF leaves its shared VAE / text encoders behind, so the dialog has
+  // to say so. The page filter cannot answer this: the unfiltered chat picker lists diffusion
+  // rows too (passesTaskGate routes them to their page), so ask per repo, not per page.
+  const retainsRequiredAssets = useCallback(
+    (repoId: string) =>
+      diffusionPageForTask(diffusionTaskById.get(repoId.toLowerCase())) !== null,
+    [diffusionTaskById],
+  );
+
   const onSelect = useCallback(
     (id: string, meta: ModelSelectorChangeMeta) => {
       if (!task) {
@@ -2763,14 +2812,14 @@ export function HubModelPicker({
   }, [pinnedIds, sortedCachedGguf, formatFilter]);
   const [pinnedQuantValidation, setPinnedQuantValidation] = useState<{
     validated: boolean;
-    downloaded: ReadonlySet<string>;
-  }>({ validated: false, downloaded: new Set() });
+    downloaded: ReadonlyMap<string, number>;
+  }>({ validated: false, downloaded: new Map() });
   const prunePinnedQuantValidation = useCallback(
     (repoId: string, quant: string) => {
       const key = pinKey(repoId, quant);
       setPinnedQuantValidation((prev) => {
         if (!prev.downloaded.has(key)) return prev;
-        const downloaded = new Set(prev.downloaded);
+        const downloaded = new Map(prev.downloaded);
         downloaded.delete(key);
         return { ...prev, downloaded };
       });
@@ -2795,7 +2844,12 @@ export function HubModelPicker({
           );
           return normalizeGgufVariantsResponse(response)
             .variants.filter((variant) => variant.downloaded === true)
-            .map((variant) => pinKey(repoId, variant.quant));
+            .map(
+              (variant): readonly [string, number] => [
+                pinKey(repoId, variant.quant),
+                variant.size_bytes,
+              ],
+            );
         } catch {
           // If the backend cannot verify a quant, hiding the direct-load row
           // is safer than claiming a missing file is downloaded.
@@ -2806,7 +2860,7 @@ export function HubModelPicker({
       if (!cancelled) {
         setPinnedQuantValidation({
           validated: true,
-          downloaded: new Set(groups.flat()),
+          downloaded: new Map(groups.flat()),
         });
       }
     });
@@ -2815,24 +2869,31 @@ export function HubModelPicker({
       cancelled = true;
     };
   }, [hfToken, pinnedQuantCandidates]);
-  const downloadedPinnedQuantKeys = useMemo<ReadonlySet<string>>(
+  const downloadedPinnedQuantSizes = useMemo<ReadonlyMap<string, number>>(
     () =>
       pinnedQuantValidation.validated
         ? pinnedQuantValidation.downloaded
-        : new Set(),
+        : new Map(),
     [pinnedQuantValidation],
   );
 
   // Verified downloaded quants, in pin order and filtered by repo id or quant.
   const pinnedQuants = useMemo(() => {
     const q = normalizeForSearch(debouncedQuery.trim());
-    return pinnedQuantCandidates.filter(
-      (entry) =>
-        downloadedPinnedQuantKeys.has(pinKey(entry.repoId, entry.quant)) &&
-        (!q ||
-          normalizeForSearch(`${entry.repoId} ${entry.quant}`).includes(q)),
-    );
-  }, [debouncedQuery, downloadedPinnedQuantKeys, pinnedQuantCandidates]);
+    return pinnedQuantCandidates.flatMap((entry) => {
+      const sizeBytes = downloadedPinnedQuantSizes.get(
+        pinKey(entry.repoId, entry.quant),
+      );
+      if (
+        sizeBytes === undefined ||
+        (q &&
+          !normalizeForSearch(`${entry.repoId} ${entry.quant}`).includes(q))
+      ) {
+        return [];
+      }
+      return [{ ...entry, sizeBytes }];
+    });
+  }, [debouncedQuery, downloadedPinnedQuantSizes, pinnedQuantCandidates]);
 
   const pinnedCachedModelRows = useMemo(
     () =>
@@ -3448,7 +3509,11 @@ export function HubModelPicker({
 
   // A pinned quant: repo name with the quant as a grey chip. One click loads
   // that quant directly, no expansion needed.
-  const renderPinnedQuantRow = (entry: { repoId: string; quant: string }) => {
+  const renderPinnedQuantRow = (entry: {
+    repoId: string;
+    quant: string;
+    sizeBytes: number;
+  }) => {
     const optionKey = makeModelOptionKey(
       "pinned-quant",
       pinKey(entry.repoId, entry.quant),
@@ -3515,13 +3580,12 @@ export function HubModelPicker({
             del={{
               title: "Delete cached model?",
               description: (
-                <>
-                  This will remove{" "}
-                  <span className="font-medium text-foreground">
-                    {entry.repoId} ({entry.quant})
-                  </span>{" "}
-                  from disk. You can re-download it later.
-                </>
+                <GgufDeleteDescription
+                  repoId={entry.repoId}
+                  quant={entry.quant}
+                  sizeBytes={entry.sizeBytes}
+                  retainsRequiredAssets={retainsRequiredAssets(entry.repoId)}
+                />
               ),
               successMessage: `Deleted ${entry.repoId} ${entry.quant}`,
               disabled: deleteDisabled,
@@ -3609,13 +3673,12 @@ export function HubModelPicker({
             del={{
               title: "Delete cached model?",
               description: (
-                <>
-                  This will remove{" "}
-                  <span className="font-medium text-foreground">
-                    {c.repo_id} ({variant.quant})
-                  </span>{" "}
-                  from disk. You can re-download it later.
-                </>
+                <GgufDeleteDescription
+                  repoId={c.repo_id}
+                  quant={variant.quant}
+                  sizeBytes={variant.size_bytes}
+                  retainsRequiredAssets={retainsRequiredAssets(c.repo_id)}
+                />
               ),
               successMessage: `Deleted ${c.repo_id} ${variant.quant}`,
               disabled: deleteDisabled,
@@ -3685,6 +3748,7 @@ export function HubModelPicker({
         {expanderOpen && (
           <GgufVariantExpander
             repoId={c.repo_id}
+            retainsRequiredAssets={retainsRequiredAssets(c.repo_id)}
             loadId={c.load_id}
             cachePath={c.cache_path}
             onDevice={true}
@@ -4484,6 +4548,7 @@ export function HubModelPicker({
                               isGgufExpanded(m.id) && (
                                 <GgufVariantExpander
                                   repoId={m.id}
+                                  retainsRequiredAssets={retainsRequiredAssets(m.id)}
                                   onDevice={true}
                                   onSelect={onSelect}
                                   onConfigure={onConfigure}
@@ -4613,6 +4678,7 @@ export function HubModelPicker({
                             {isGguf && !isGgufFile && isGgufExpanded(m.id) && (
                               <GgufVariantExpander
                                 repoId={m.id}
+                                retainsRequiredAssets={retainsRequiredAssets(m.id)}
                                 onDevice={true}
                                 onSelect={onSelect}
                                 onConfigure={onConfigure}
@@ -4728,6 +4794,7 @@ export function HubModelPicker({
                             {isGguf && !isGgufFile && isGgufExpanded(m.id) && (
                               <GgufVariantExpander
                                 repoId={m.id}
+                                retainsRequiredAssets={retainsRequiredAssets(m.id)}
                                 onDevice={true}
                                 onSelect={onSelect}
                                 onConfigure={onConfigure}
@@ -4819,6 +4886,7 @@ export function HubModelPicker({
                             {expandedGguf === id && (
                               <GgufVariantExpander
                                 repoId={id}
+                                retainsRequiredAssets={retainsRequiredAssets(id)}
                                 onSelect={onSelect}
                                 onConfigure={onConfigure}
                                 hfToken={hfToken || undefined}
@@ -4932,6 +5000,7 @@ export function HubModelPicker({
                           {expandedGguf === id && (
                             <GgufVariantExpander
                               repoId={id}
+                              retainsRequiredAssets={retainsRequiredAssets(id)}
                               onSelect={onSelect}
                               onConfigure={onConfigure}
                               hfToken={hfToken || undefined}
@@ -5038,6 +5107,7 @@ export function HubModelPicker({
                             {expandedGguf === id && (
                               <GgufVariantExpander
                                 repoId={id}
+                                retainsRequiredAssets={retainsRequiredAssets(id)}
                                 onSelect={onSelect}
                                 onConfigure={onConfigure}
                                 hfToken={hfToken || undefined}

@@ -24,6 +24,7 @@ from hub.utils.snapshot_filters import (
     snapshot_download_blob_hashes,
     snapshot_download_size,
 )
+from hub.utils.gguf_plan import is_main_gguf_variant_path
 from hub.services.models.common import (
     _capabilities_for_format,
     _classify_non_gguf_model_format,
@@ -441,6 +442,178 @@ def _cached_row_companion(repo_id: str) -> bool:
         return (repo_id or "").strip().lower() in sd_cpp_companion_only_repo_ids()
     except Exception:  # noqa: BLE001 -- a classification failure never hides a row
         return False
+
+
+def _cached_card_base_models(repo_info) -> set[str]:
+    """Hub base-model ids recorded by cached revisions of a GGUF repo.
+
+    The live loader prefers a trusted ``base_model`` card tag over the family fallback. Reading
+    every cached revision keeps dependency protection offline and conservative when the tag changed:
+    either base may still hold assets downloaded for an installed quant.
+    """
+    bases: set[str] = set()
+    for revision in getattr(repo_info, "revisions", ()):
+        snapshot = getattr(revision, "snapshot_path", None)
+        if snapshot is None:
+            continue
+        card = _read_model_card_frontmatter(Path(snapshot) / "README.md")
+        base = card.get("base_model")
+        if isinstance(base, list):
+            base = base[0] if base else None
+        if isinstance(base, str) and "/" in base and base.strip():
+            bases.add(base.strip())
+    return bases
+
+
+def _diffusion_companion_assets(repo_info) -> set[tuple[str, Optional[str]]]:
+    """Every Hub repo an installed diffusion or video GGUF can read required assets from.
+
+    Intentionally a superset of any single load. Diffusers reads the card/family base, the native
+    engine reads the single-file VAE and text encoders ``sd_cpp_asset_specs`` enumerates, and the
+    Video backend reads its own family base. Each of those is named alongside its mirror and
+    community repack, because they are byte-identical caches under different HF repo keys and
+    either can win after a cache-folder change.
+    """
+    try:
+        from core.inference.diffusion_families import (
+            canonical_base,
+            detect_family_for_pick,
+            sd_cpp_asset_specs,
+            with_repo_mirrors,
+        )
+        from core.inference.video_families import detect_video_family, resolve_video_base_repo
+    except Exception as e:  # noqa: BLE001
+        # Fails open, and a fail-open dependency map lets a delete take assets an installed model
+        # still needs, so say so rather than silently dropping every protection.
+        logger.warning(f"Diffusion support unavailable; cached assets are unprotected: {e}")
+        return set()
+    try:
+        from core.inference.diffusion import _is_trusted_diffusion_repo
+    except Exception as e:  # noqa: BLE001 -- family defaults and native assets remain protectable
+        logger.debug(f"Diffusion trust check unavailable; card bases are unprotected: {e}")
+        _is_trusted_diffusion_repo = None
+
+    dependencies: set[tuple[str, Optional[str]]] = set()
+
+    def add_repo(repo_id: Optional[str], filename: Optional[str] = None) -> None:
+        for alias in with_repo_mirrors([(repo_id or "").strip()]):
+            dependencies.add((alias, filename))
+
+    repo_id = str(getattr(repo_info, "repo_id", ""))
+    main_ggufs = [
+        name
+        for revision in getattr(repo_info, "revisions", ())
+        for name in map(_cached_repo_file_name, getattr(revision, "files", ()))
+        if _is_main_gguf_filename(name)
+    ]
+    if not main_ggufs:
+        return set()
+
+    video_family = detect_video_family(repo_id)
+    if video_family is not None:
+        add_repo(resolve_video_base_repo(video_family, None))
+
+    card_bases_read = False
+    for filename in main_ggufs:
+        family = detect_family_for_pick(repo_id, filename)
+        if family is None:
+            continue
+        add_repo(family.base_repo)
+        if not card_bases_read:
+            # Read the cards only once a family has matched, and only once per repo: every chat
+            # GGUF in the cache would otherwise pay a README read and a YAML parse for nothing.
+            card_bases_read = True
+            for cached_base in _cached_card_base_models(repo_info):
+                if _is_trusted_diffusion_repo and _is_trusted_diffusion_repo(cached_base):
+                    # The loader maps a mirror tag back to the upstream it copies before
+                    # fetching, so protect what the fetch will actually reach for.
+                    add_repo(canonical_base(cached_base))
+        for asset_repo, asset_file, kind in sd_cpp_asset_specs(family, repo_id, filename):
+            if kind != "diffusion_model":  # the transformer is this repo's own GGUF
+                add_repo(asset_repo, asset_file)
+
+    repo_key = repo_id.lower()
+    return {
+        (dependency, filename)
+        for dependency, filename in dependencies
+        if dependency.lower() != repo_key
+    }
+
+
+def _cached_file_names_by_repo(cache_scans: list) -> dict[str, set[str]]:
+    """Lowercased repo id to the snapshot-relative file names that repo currently holds."""
+    names: dict[str, set[str]] = {}
+    for hf_cache in cache_scans:
+        for repo_info in getattr(hf_cache, "repos", ()):
+            if str(getattr(repo_info, "repo_type", "")) != "model":
+                continue
+            held = names.setdefault(str(getattr(repo_info, "repo_id", "")).lower(), set())
+            for revision in getattr(repo_info, "revisions", ()):
+                held.update(map(_cached_repo_file_name, getattr(revision, "files", ())))
+    return names
+
+
+def _cached_asset_claims(cache_scans: Optional[list]):
+    """(user repo id, dependency repo id, dependency filename) for every asset that is CACHED.
+
+    A dependency naming one file only claims the repo that actually holds it. Without that, a
+    Qwen-Image install would pin the whole Qwen2.5-VL GGUF repo -- a popular chat model -- on the
+    strength of a text-encoder quant nobody has downloaded, and the delete would fail with a
+    message about files that are not there.
+    """
+    scans = cache_scans if cache_scans is not None else all_hf_cache_scans()
+    held = _cached_file_names_by_repo(scans)
+    for hf_cache in scans:
+        for repo_info in getattr(hf_cache, "repos", ()):
+            if str(getattr(repo_info, "repo_type", "")) != "model":
+                continue
+            if not _repo_has_gguf_files(repo_info):
+                continue
+            user = str(getattr(repo_info, "repo_id", ""))
+            for dependency, filename in _diffusion_companion_assets(repo_info):
+                if filename and filename not in held.get(dependency.lower(), ()):
+                    continue
+                yield user, dependency, filename
+
+
+def cached_asset_dependents_by_repo(
+    *, cache_scans: Optional[list] = None
+) -> dict[str, list[str]]:
+    """Lowercased asset repo id to the installed GGUF repos that require it.
+
+    Dependents span remembered cache roots because the diffusion fetchers deliberately reuse the
+    other root after a cache-folder change. Scoping this map to one root would allow deleting the
+    only usable asset copy merely because its checkpoint row lives in the other root.
+    """
+    dependents: dict[str, set[str]] = {}
+    for user, dependency, _filename in _cached_asset_claims(cache_scans):
+        dependents.setdefault(dependency.lower(), set()).add(user)
+    return {repo_id: sorted(users, key = str.lower) for repo_id, users in dependents.items()}
+
+
+def cached_asset_dependents(
+    repo_id: str,
+    variant: Optional[str] = None,
+    *,
+    cache_scans: Optional[list] = None,
+) -> list[str]:
+    """Installed GGUF repos that require *repo_id* -- or exactly its *variant* quant -- as an asset.
+
+    The single-repo query the delete guard wants, so it does not build the whole map to read one key.
+    """
+    repo_key = repo_id.lower()
+    return sorted(
+        {
+            user
+            for user, dependency, filename in _cached_asset_claims(cache_scans)
+            if dependency.lower() == repo_key
+            and (
+                variant is None
+                or (bool(filename) and is_main_gguf_variant_path(filename, variant))
+            )
+        },
+        key = str.lower,
+    )
 
 
 def _cached_row_task(repo_info, *, gguf: bool) -> Optional[str]:
@@ -951,6 +1124,7 @@ def _scan_cached_models(
     skipped_gguf = 0
     skipped_no_weights = 0
     skipped_stt = 0
+    asset_dependents = cached_asset_dependents_by_repo(cache_scans = cache_scans)
     for hf_cache in cache_scans:
         for repo_info in hf_cache.repos:
             inspected += 1
@@ -969,11 +1143,12 @@ def _scan_cached_models(
                     continue
                 has_main_gguf = _repo_has_gguf_files(repo_info)
                 payload = _repo_non_gguf_model_payload(repo_info)
+                known_companion = _cached_row_companion(repo_id)
                 if payload.size_bytes == 0:
                     if has_main_gguf:
                         skipped_gguf += 1
                     continue
-                if not payload.has_runnable_weights:
+                if not payload.has_runnable_weights and not known_companion:
                     skipped_no_weights += 1
                     continue
                 key = repo_id.lower()
@@ -1008,14 +1183,19 @@ def _scan_cached_models(
                     ),
                 )
                 # A companion-only prefetch (pipeline manifest + VAE / text-encoder but no transformer shards, left by a GGUF load) passes
-                # the download check yet cannot from_pretrained, so mark it partial and the pickers stop advertising it as on-device.
+                # the download check yet cannot from_pretrained, so flag it and the pickers stop advertising it as on-device.
                 # Scoped to the row's own snapshot, like the download check above it: the repo-wide twin picks the newest revision for
-                # itself, so a newer companion-only snapshot beside the complete one refs/main resolves to marked this row partial.
+                # itself, so a newer companion-only snapshot beside the complete one cannot
+                # misclassify the row selected for loading.
                 companion_only = hf_cache_scan.snapshot_pipeline_missing_denoiser(load_snapshot)
-                snapshot_partial = download_partial or companion_only
+                companion = known_companion or companion_only
+                # A companion snapshot is complete for the role Studio downloaded it for. Calling
+                # it partial hid the only cleanup path and offered Retry even though every required
+                # file had arrived. The companion flag keeps it out of model pickers.
+                snapshot_partial = download_partial
                 # Flags are OR-ed over revisions, so no payload snapshot means no directory
                 # serves the row and it would reach for the Hub.
-                if not payload.payload_snapshots:
+                if not payload.payload_snapshots and not companion:
                     snapshot_partial = True
                 row_task = _cached_row_task(repo_info, gguf = False)
                 row = {
@@ -1043,7 +1223,8 @@ def _scan_cached_models(
                     ),
                     # Listed so tens of GB of companion weights stay visible and deletable, but
                     # flagged so no picker offers a denoiser-less repo as a load.
-                    "companion": _cached_row_companion(repo_id),
+                    "companion": companion,
+                    "required_by": asset_dependents.get(repo_id.lower(), []),
                     **local_metadata,
                 }
                 last_modified = max(

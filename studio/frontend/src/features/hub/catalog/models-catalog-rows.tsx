@@ -634,6 +634,9 @@ export const InventoryRow = memo(function InventoryRow({
         ? row.repoId
         : null;
   const canDelete = cacheDeletableRepoId !== null;
+  // Required assets (a shared VAE / text-encoder cache) only ever arrive as a cache row.
+  const companion = row.kind === "cache" && row.companion === true;
+  const requiredBy = row.kind === "cache" ? (row.requiredBy ?? []) : [];
   const partialRepoId = row.partial
     ? row.kind === "cache"
       ? row.repoId
@@ -649,15 +652,19 @@ export const InventoryRow = memo(function InventoryRow({
   });
   // Always-derivable stats so on-device rows don't show empty placeholder cells:
   // format badge, parameter count from the repo name, and GGUF quant variant.
-  const formatLabel =
-    row.modelFormat === "gguf"
+  const formatLabel = companion
+    ? "Required assets"
+    : row.modelFormat === "gguf"
       ? "GGUF"
       : row.modelFormat === "adapter"
         ? "Adapter"
         : row.modelFormat === "safetensors" || row.modelFormat === "checkpoint"
           ? "Safetensors"
           : null;
-  const paramLabel = useMemo(() => paramLabelFromId(title), [title]);
+  const paramLabel = useMemo(
+    () => (companion ? null : paramLabelFromId(title)),
+    [companion, title],
+  );
   const quantLabel = row.formatVariant?.trim() || null;
 
   const metaChips =
@@ -678,6 +685,14 @@ export const InventoryRow = memo(function InventoryRow({
 
   // On-disk size for cached repos, else local source or last-modified date.
   const sourceLabel = row.kind === "local" ? row.sourceLabel : null;
+
+  const requiredByMarker =
+    requiredBy.length > 0 ? (
+      <StatusDot
+        tone="warning"
+        label={`Required by ${requiredBy.length} installed ${requiredBy.length === 1 ? "model" : "models"}`}
+      />
+    ) : null;
 
   const statusMarkers = (
     <>
@@ -703,18 +718,20 @@ export const InventoryRow = memo(function InventoryRow({
       {unsupported && (
         <StatusDot tone="danger" label="May not be supported yet" />
       )}
+      {requiredByMarker}
     </>
   );
 
   // Compact rows are all on-device, so the format dots are noise: surface only
   // exceptional states; format + params move to the meta line.
   const compactMarkers =
-    partialRepoId || unsupported ? (
+    partialRepoId || unsupported || requiredBy.length > 0 ? (
       <span className="flex shrink-0 items-center gap-1">
         {partialRepoId && <StatusDot tone="warning" label="Partial download" />}
         {unsupported && (
           <StatusDot tone="danger" label="May not be supported yet" />
         )}
+        {requiredByMarker}
       </span>
     ) : null;
 
@@ -740,6 +757,50 @@ export const InventoryRow = memo(function InventoryRow({
   const settingsAction =
     !isDataset && onOpenSettings ? { onOpen: () => onOpenSettings(row) } : undefined;
   const deletableRepoId = canDelete ? cacheDeletableRepoId : null;
+
+  const deleteSize = row.kind === "cache" ? ` (${formatBytes(row.bytes)})` : "";
+  const deleteTitle = isDataset
+    ? "Delete cached dataset?"
+    : companion
+      ? "Delete required assets?"
+      : "Delete cached model?";
+  // Three outcomes, in decreasing severity: held by an installed model, an orphaned asset cache
+  // that will simply be re-fetched, or an ordinary repo the user chose to install.
+  let deleteDescription: ReactNode;
+  if (requiredBy.length > 0) {
+    deleteDescription = (
+      <>
+        These cached files are required by{" "}
+        <span className="font-medium text-foreground">
+          {requiredBy.join(", ")}
+        </span>
+        . Delete those model files first. Studio keeps shared assets while any
+        installed model needs them.
+      </>
+    );
+  } else if (companion) {
+    deleteDescription = (
+      <>
+        This will remove the unused required assets in{" "}
+        <span className="font-medium text-foreground">{deletableRepoId}</span>
+        {deleteSize} from disk. A model that needs them later will download them
+        again.
+      </>
+    );
+  } else {
+    deleteDescription = (
+      <>
+        This will remove{" "}
+        <span className="font-medium text-foreground">{deletableRepoId}</span>{" "}
+        {isDataset
+          ? "and its downloaded files"
+          : row.isGguf
+            ? "and all of its downloaded quantizations"
+            : "and all of its downloaded files"}
+        {deleteSize} from disk. You can re-download it later.
+      </>
+    );
+  }
   const deleteAction =
     deletableRepoId || settingsAction ? (
       <ModelRowMenu
@@ -761,23 +822,10 @@ export const InventoryRow = memo(function InventoryRow({
           isDataset || !deletableRepoId ? undefined : { repoId: deletableRepoId }
         }
         del={deletableRepoId ? {
-          title: isDataset ? "Delete cached dataset?" : "Delete cached model?",
-          description: (
-            <>
-              This will remove{" "}
-              <span className="font-medium text-foreground">
-                {deletableRepoId}
-              </span>{" "}
-              {isDataset
-                ? "and its downloaded files"
-                : row.isGguf
-                  ? "and all of its downloaded quantizations"
-                  : "and all of its downloaded files"}
-              {row.kind === "cache" ? ` (${formatBytes(row.bytes)})` : ""} from
-              disk. You can re-download it later.
-            </>
-          ),
+          title: deleteTitle,
+          description: deleteDescription,
           successMessage: `Deleted ${deletableRepoId}`,
+          confirmDisabled: requiredBy.length > 0,
           onConfirm: async () => {
             // Delete only the copy this row shows: cache rows carry the owning
             // cache path, so pass it through and leave other caches untouched.

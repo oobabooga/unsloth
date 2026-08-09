@@ -40,14 +40,14 @@ from core.inference.diffusion_families import (
     DiffusionFamily,
     detect_family_for_pick,
     family_sd_cpp_supported,
-    mirror_repo,
-    legacy_source_repo,
     prefer_cached_legacy_source,
     prefer_ungated_mirror,
     resolve_base_repo,
     resolve_local_gguf_child,
+    sd_cpp_asset_specs,
     sd_cpp_text_encoders_for,
     supported_family_names,
+    with_repo_mirrors,
 )
 from core.inference.diffusion_memory import (
     OFFLOAD_GROUP,
@@ -341,26 +341,6 @@ def _fetch_repo_map(assets: list[tuple[str, str, str]], hf_token: Optional[str])
         repo: prefer_cached_legacy_source(prefer_ungated_mirror(repo, hf_token, files = names), names)
         for repo, names in by_repo.items()
     }
-
-
-def _with_mirrors(repo_ids) -> tuple[str, ...]:
-    """``repo_ids`` plus the ungated mirror and the community repack of each, de-duplicated, order
-    preserved.
-
-    The delete-cached guard must protect whichever of the set the bytes landed in, and that
-    decision is re-taken per load; naming all of them is cheap and cannot under-protect."""
-    out: list[str] = []
-    for rid in repo_ids:
-        if not rid:
-            continue
-        out.append(rid)
-        mirror = mirror_repo(rid)
-        if mirror:
-            out.append(mirror)
-        legacy = legacy_source_repo(rid)
-        if legacy:
-            out.append(legacy)
-    return tuple(dict.fromkeys(out))
 
 
 class SdCppDiffusionBackend:
@@ -831,15 +811,7 @@ class SdCppDiffusionBackend:
     def _asset_specs(
         self, repo_id: str, gguf_filename: str, fam: DiffusionFamily
     ) -> list[tuple[str, str, str]]:
-        """(repo, filename, kind) for every file sd-cli needs. ``kind`` is the
-        SdCppModelFiles field; the transformer reuses the diffusers GGUF."""
-        specs: list[tuple[str, str, str]] = [(repo_id, gguf_filename, "diffusion_model")]
-        if fam.sd_cpp_vae:
-            specs.append((fam.sd_cpp_vae[0], fam.sd_cpp_vae[1], "vae"))
-        # Pick the encoder per variant from the load identity so a 9B GGUF fetches the right one.
-        for terepo, tefile, kind in sd_cpp_text_encoders_for(fam, repo_id, gguf_filename):
-            specs.append((terepo, tefile, kind))
-        return specs
+        return list(sd_cpp_asset_specs(fam, repo_id, gguf_filename))
 
     def _set_expected_bytes(
         self, assets: list[tuple[str, str, str]], hf_token: Optional[str]
@@ -930,7 +902,7 @@ class SdCppDiffusionBackend:
             if loading is None or loading.error is not None:
                 return ()
             ids = (loading.repo_id, loading.base_repo, *loading.asset_repos)
-            return _with_mirrors(ids)
+            return with_repo_mirrors(ids)
 
     def loaded_repo_ids(self) -> tuple[str, ...]:
         """Repo ids the COMMITTED native model reads from disk (empty when unloaded).
@@ -956,7 +928,7 @@ class SdCppDiffusionBackend:
                     fam, state.repo_id, state.gguf_filename
                 )
             )
-            return _with_mirrors(repos)
+            return with_repo_mirrors(repos)
 
     # ── Generate ───────────────────────────────────────────────────────────
 

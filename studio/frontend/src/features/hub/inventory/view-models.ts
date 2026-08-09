@@ -172,6 +172,7 @@ export function buildCachedInventoryRow(
     task?: string | null;
     single_file?: boolean;
     companion?: boolean;
+    required_by?: string[];
     tags?: string[];
     library_name?: string | null;
     quant_method?: string | null;
@@ -235,6 +236,7 @@ export function buildCachedInventoryRow(
     task: row.task ?? null,
     singleFile: row.single_file ?? false,
     companion: row.companion ?? false,
+    requiredBy: row.required_by ?? [],
     tags: row.tags,
     libraryName: row.library_name ?? null,
     quantMethod: row.quant_method ?? null,
