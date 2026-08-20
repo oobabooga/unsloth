@@ -110,3 +110,28 @@ jobs:
             code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -I "$h" 2>/dev/null || echo FAIL)"
             printf '%-28s %s\n' "$h" "$code"
           done
+
+  # The halo job above got no runner in 11 minutes and none ever registered, so
+  # these ask the other label sets the DevLab pools are known to route on. Any
+  # of them going green means the repo is served but `halo` is the wrong token;
+  # all of them sitting queued means the repo is not being served at all.
+  label-sweep:
+    name: Label sweep - ${{ matrix.label }}
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.label }}"]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: stx,                     os: Linux}
+          - {label: r9700,                   os: Linux}
+          - {label: devlab-x2-la01-s01-d03,  os: Linux}
+          - {label: strix-halo,              os: Linux}
+    steps:
+      - name: Who answered
+        run: |
+          echo "label:  ${{ matrix.label }}"
+          echo "runner: ${{ runner.name }}"
+          echo "host:   $(hostname)"
+          uname -a
+          lspci -nn 2>/dev/null | grep -iE 'vga|display|processing accelerator' || true
