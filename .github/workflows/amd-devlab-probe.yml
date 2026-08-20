@@ -1,137 +1,68 @@
 name: AMD DevLab probe
 
-# Throwaway. Lives on an orphan branch that contains this file and nothing else,
-# so no other workflow in the repo can be triggered by the push that starts it.
-# Asserts nothing -- it reports what the machine on the other end actually is.
-
 on:
-  push:
-    branches: [amd-devlab-probe]
   workflow_dispatch:
 
-# The job runs on third-party hardware. Hand it a token with nothing on it, and
-# do not check the repository out onto their disk.
 permissions: {}
 
 jobs:
   probe:
-    name: Strix Halo (Linux)
-    runs-on: [self-hosted, Linux, halo]
-    timeout-minutes: 15
+    name: Strix Halo probe and CI smoke
+    runs-on: [self-hosted, Linux, devlab-ephemeral, halo]
+    timeout-minutes: 20
     steps:
-      - name: Runner identity
+      - name: Runner and operating system
         run: |
-          echo "runner:    ${{ runner.name }}"
-          echo "host:      $(hostname)"
-          echo "user:      $(whoami)  (uid $(id -u), groups: $(id -Gn))"
-          echo "workdir:   $(pwd)"
-          echo "uptime:    $(uptime -p 2>/dev/null || uptime)"
-          echo "arch:      $(uname -m)"
-
-      - name: OS and kernel
-        run: |
+          echo "runner=${{ runner.name }}"
+          echo "host=$(hostname)"
+          echo "user=$(whoami)"
+          echo "arch=$(uname -m)"
           uname -a
-          echo "---"
-          cat /etc/os-release 2>/dev/null || echo "no /etc/os-release"
-          echo "---"
-          echo "container? $( [ -f /.dockerenv ] && echo yes || echo 'no /.dockerenv' )"
-          systemd-detect-virt 2>/dev/null || echo "systemd-detect-virt unavailable"
+          cat /etc/os-release
 
-      - name: CPU
-        run: lscpu 2>/dev/null || cat /proc/cpuinfo
-
-      - name: Memory
+      - name: CPU and memory
         run: |
-          free -h 2>/dev/null || true
-          echo "---"
-          grep -E 'MemTotal|MemAvailable|SwapTotal' /proc/meminfo 2>/dev/null || true
+          lscpu
+          free -h
 
-      - name: Accelerators on the PCI bus
+      - name: AMD devices
         run: |
-          lspci -nn 2>/dev/null | grep -iE 'vga|display|processing accelerator|signal processing' \
-            || echo "lspci unavailable or nothing matched"
-
-      - name: GPU via DRM
-        run: |
-          for c in /sys/class/drm/card[0-9]*; do
-            [ -e "$c/device/vendor" ] || continue
-            echo "== $c"
-            echo "  vendor/device: $(cat $c/device/vendor 2>/dev/null) $(cat $c/device/device 2>/dev/null)"
-            echo "  vram total:    $(cat $c/device/mem_info_vram_total 2>/dev/null || echo n/a)"
-            echo "  gtt total:     $(cat $c/device/mem_info_gtt_total 2>/dev/null || echo n/a)"
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          for card in /sys/class/drm/card[0-9]*; do
+            [ -e "$card/device/vendor" ] || continue
+            echo "card=$card"
+            echo "vendor=$(cat "$card/device/vendor")"
+            echo "device=$(cat "$card/device/device")"
+            echo "vram=$(cat "$card/device/mem_info_vram_total" 2>/dev/null || echo unavailable)"
+            echo "gtt=$(cat "$card/device/mem_info_gtt_total" 2>/dev/null || echo unavailable)"
           done
-          echo "--- amdgpu module"
-          modinfo amdgpu 2>/dev/null | grep -E '^(version|srcversion|filename):' || echo "modinfo amdgpu unavailable"
 
-      - name: ROCm
+      - name: ROCm and NPU
         run: |
-          ls -d /opt/rocm* 2>/dev/null || echo "no /opt/rocm*"
-          cat /opt/rocm/.info/version 2>/dev/null || echo "no rocm version file"
-          echo "--- rocm-smi"
-          rocm-smi 2>/dev/null || echo "rocm-smi not on PATH"
-          echo "--- rocminfo (agents only)"
-          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || echo "rocminfo not on PATH"
-          echo "--- amd-smi"
-          amd-smi static 2>/dev/null | head -60 || amd-smi 2>/dev/null || echo "amd-smi not on PATH"
-          echo "--- hip"
-          hipconfig --version 2>/dev/null || echo "hipconfig not on PATH"
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+          ls -l /dev/accel* 2>/dev/null || true
+          xrt-smi examine 2>/dev/null || true
 
-      - name: NPU / XRT
+      - name: Disk and toolchain
         run: |
-          ls -l /dev/accel* 2>/dev/null || echo "no /dev/accel*"
-          xrt-smi examine 2>/dev/null || echo "xrt-smi not on PATH"
-          xbutil examine 2>/dev/null || echo "xbutil not on PATH"
-          modinfo amdxdna 2>/dev/null | grep -E '^(version|filename):' || echo "no amdxdna module"
-
-      - name: Disk
-        run: |
-          df -hT . | tail -n +1
-          echo "---"
-          df -hT "${TMPDIR:-/tmp}" | tail -1
-          echo "TMPDIR=${TMPDIR:-<unset>}"
-          echo "--- all mounts"
-          df -hT 2>/dev/null | grep -vE 'tmpfs|udev' || true
-
-      - name: Toolchain
-        run: |
-          for t in gcc g++ clang cmake ninja make git python3 pip3 docker podman uv; do
-            p="$(command -v $t 2>/dev/null)"
-            if [ -n "$p" ]; then
-              printf '%-8s %s\n' "$t" "$($t --version 2>&1 | head -1)"
+          df -hT . /tmp
+          for tool in gcc g++ clang cmake ninja make git python3 pip3 docker podman uv; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              printf '%-8s %s\n' "$tool" "$($tool --version 2>&1 | head -1)"
             else
-              printf '%-8s %s\n' "$t" "NOT INSTALLED"
+              printf '%-8s NOT INSTALLED\n' "$tool"
             fi
           done
-          echo "--- nproc: $(nproc 2>/dev/null || echo n/a)"
 
       - name: Network egress
         run: |
-          for h in https://github.com https://huggingface.co https://pypi.org; do
-            code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -I "$h" 2>/dev/null || echo FAIL)"
-            printf '%-28s %s\n' "$h" "$code"
+          for url in https://github.com https://huggingface.co https://pypi.org; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -m 15 -I "$url")
+            printf '%-28s %s\n' "$url" "$code"
           done
 
-  # The halo job above got no runner in 11 minutes and none ever registered, so
-  # these ask the other label sets the DevLab pools are known to route on. Any
-  # of them going green means the repo is served but `halo` is the wrong token;
-  # all of them sitting queued means the repo is not being served at all.
-  label-sweep:
-    name: Label sweep - ${{ matrix.label }}
-    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.label }}"]
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {label: stx,                     os: Linux}
-          - {label: r9700,                   os: Linux}
-          - {label: devlab-x2-la01-s01-d03,  os: Linux}
-          - {label: strix-halo,              os: Linux}
-    steps:
-      - name: Who answered
+      - name: Unsloth CI smoke
         run: |
-          echo "label:  ${{ matrix.label }}"
-          echo "runner: ${{ runner.name }}"
-          echo "host:   $(hostname)"
-          uname -a
-          lspci -nn 2>/dev/null | grep -iE 'vga|display|processing accelerator' || true
+          git clone --depth 1 --branch main https://github.com/oobabooga/unsloth.git source
+          python3 -m compileall -q source/unsloth
