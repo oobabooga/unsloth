@@ -8,7 +8,7 @@ permissions: {}
 jobs:
   probe:
     name: Strix Halo probe and CI smoke
-    runs-on: [self-hosted, Linux, devlab-ephemeral, halo]
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
     timeout-minutes: 20
     steps:
       - name: Runner and operating system
