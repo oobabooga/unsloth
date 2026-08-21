@@ -1,0 +1,27 @@
+name: AMD DevLab direct push test
+
+on:
+  push:
+    branches: [amd-devlab-direct-push-test]
+
+permissions: {}
+
+jobs:
+  prove-direct-push:
+    name: Prove branch-only AMD workflow
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 10
+    steps:
+      - name: Assert trigger and hardware
+        run: |
+          set -euxo pipefail
+          test "${{ github.event_name }}" = push
+          test "${{ github.ref }}" = refs/heads/amd-devlab-direct-push-test
+          case "${{ runner.name }}" in
+            ephemeral-devlab-*) ;;
+            *) exit 1 ;;
+          esac
+          lscpu | grep -F 'AMD RYZEN AI MAX+ 395'
+          rocminfo | grep -F gfx1151
+          test -c /dev/accel/accel0
+          echo "Direct branch push reached the AMD DevLab runner."
