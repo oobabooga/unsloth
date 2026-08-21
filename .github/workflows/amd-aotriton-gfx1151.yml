@@ -1,0 +1,99 @@
+name: AOTriton gate on gfx1151
+
+on:
+  push:
+    branches: [amd-aotriton-gfx1151]
+
+permissions: {}
+
+jobs:
+  gfx1151:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          free -h
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -20 || true
+          rocm-smi 2>/dev/null || true
+
+      - name: Fetch the probe
+        run: |
+          set -eux
+          url="https://raw.githubusercontent.com/oobabooga/unsloth/${GITHUB_SHA}/probe_gfx1151_aotriton.py"
+          for attempt in 1 2 3 4 5; do
+            curl -fsSL -o probe.py "$url" && break
+            sleep $((attempt * 5))
+          done
+          wc -l probe.py
+
+      - name: Install stable multi-arch ROCm torch for gfx1151
+        run: |
+          set -eux
+          WORK_ROOT="$RUNNER_TEMP/aotriton-work"
+          mkdir -p "$WORK_ROOT/tmp" "$WORK_ROOT/cache"
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export PIP_CACHE_DIR="$WORK_ROOT/cache"
+          python -m pip install -q --upgrade pip
+          # The index and extra sstamenk names in unslothai/unsloth#8821: the AOTriton images
+          # for gfx1151 ship in the amd-torch-device-gfx115x family wheel, which the
+          # device-gfx1151 extra pulls in. A gfx1200 install carries only amd-gfx120x, which
+          # is what the earlier "stable does not ship gfx1151 kernels" reading was based on.
+          python -m pip install \
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "torch[device-gfx1151]==2.11.0+rocm7.14.0"
+          echo "$WORK_ROOT" > "$RUNNER_TEMP/work_root"
+
+      - name: What the wheels actually installed
+        run: |
+          set -eux
+          . "$(cat "$RUNNER_TEMP/work_root")/venv/bin/activate"
+          python -c "import torch, os; print(torch.__version__, torch.version.hip)"
+          TORCH_LIB="$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")"
+          ls -1 "$TORCH_LIB" | grep -i aotriton || echo "no aotriton runtime in torch/lib"
+          echo "--- aotriton.images families ---"
+          ls -1 "$TORCH_LIB/aotriton.images" || echo "no aotriton.images directory"
+          echo "--- image entry counts ---"
+          find "$TORCH_LIB/aotriton.images" -maxdepth 1 -mindepth 1 -type d \
+            -exec sh -c 'echo "$(basename "$1") $(find "$1" -type f | wc -l)"' _ {} \; || true
+          echo "--- installed amd-torch-device packages ---"
+          python -m pip list 2>/dev/null | grep -i "^amd-torch" || true
+
+      - name: Gate unset
+        run: |
+          set -eux
+          . "$(cat "$RUNNER_TEMP/work_root")/venv/bin/activate"
+          unset TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL
+          PROBE_OUT="$RUNNER_TEMP/unset.json" python probe.py
+
+      - name: Gate set to 0
+        run: |
+          set -eux
+          . "$(cat "$RUNNER_TEMP/work_root")/venv/bin/activate"
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=0
+          PROBE_OUT="$RUNNER_TEMP/zero.json" python probe.py
+
+      - name: Gate set to 1
+        run: |
+          set -eux
+          . "$(cat "$RUNNER_TEMP/work_root")/venv/bin/activate"
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          PROBE_OUT="$RUNNER_TEMP/one.json" python probe.py
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p results
+          cp "$RUNNER_TEMP"/unset.json "$RUNNER_TEMP"/zero.json "$RUNNER_TEMP"/one.json results/ 2>/dev/null || true
+          ls -l results || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gfx1151-aotriton-results
+          path: results
+          if-no-files-found: warn
