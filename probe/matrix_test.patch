@@ -1,0 +1,34 @@
+diff --git a/studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py b/studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py
+index 68f9ec9028..7248f98b37 100644
+--- a/studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py
++++ b/studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py
+@@ -287,10 +287,12 @@ def _install_cell(monkeypatch, tmp_path, os_key, vendor):
+                 ],
+                 vendor = "amd",
+             )
+-            # Plenty of system RAM, so the iGPU's shared-pool cap never binds
+-            # and the only thing that can change its figure is the host reserve.
++            # Below the iGPU's driver figure, so the shared-pool cap binds on every
++            # cell and the figure does not depend on which of the two sources answered
++            # it: Windows does not consult the driver for a shared pool at all, since
++            # there free == total says nothing about what is left (#7072).
+             monkeypatch.setattr(
+-                LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 60000)
++                LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 11000)
+             )
+             expected = [(0, 12049)]
+     else:
+@@ -331,9 +333,10 @@ class TestOsVendorMatrix:
+         every device on every cell, the AMD one whose iGPU the gate drops too."""
+         expected = _install_cell(monkeypatch, tmp_path, os_key, vendor)
+         if vendor == "amd" and os_key != "macos":
+-            # The iGPU is kept, still with its unified-memory host reserve: the
+-            # gate is what must not apply here, not the APU accounting.
+-            expected = [(0, 12049), (1, 12176 - _IGPU_HOST_RESERVE_MIB)]
++            # The iGPU is kept, still capped by system RAM and still paying its
++            # unified-memory host reserve: the gate is what must not apply here, not
++            # the APU accounting.
++            expected = [(0, 12049), (1, 11000 - _IGPU_HOST_RESERVE_MIB)]
+         assert LlamaCppBackend._get_gpu_free_memory() == expected
+         assert marker_spy == [], f"{os_key}/{vendor} read the install marker unasked"
+         assert arch_map_spy == [], f"{os_key}/{vendor} enumerated device archs unasked"

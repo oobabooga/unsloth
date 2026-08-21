@@ -1,0 +1,29 @@
+name: AMD Strix dropdown crash
+
+on:
+  push:
+    branches: [amd-strix-dropdown-crash]
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: Reproduce Strix Halo telemetry crash
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hardware
+        run: bash probe/01_hardware.sh
+      - name: Install Unsloth Studio
+        run: bash probe/05_install_studio.sh
+      - name: HIP context cost on gfx1151
+        run: bash probe/03b_context_cost.sh
+      - name: Studio llama.cpp GPU probe (before the fix)
+        run: bash probe/05b_studio_probe.sh
+      - name: Verify the fix on real gfx1151
+        run: bash probe/09_verify_fix.sh
+      - name: Dump logs
+        if: always()
+        run: bash probe/07_dump.sh

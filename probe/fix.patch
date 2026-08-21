@@ -1,0 +1,90 @@
+diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
+index 0b99c7381e..7201f034af 100644
+--- a/studio/backend/core/inference/llama_cpp.py
++++ b/studio/backend/core/inference/llama_cpp.py
+@@ -7615,6 +7615,41 @@ class LlamaCppBackend:
+             or os.environ.get("CUDA_VISIBLE_DEVICES") is not None
+         )
+ 
++    @staticmethod
++    def _windows_apu_ceiling_is_host_ram(shared: bool, available_mib: Optional[int]) -> bool:
++        """Whether available system RAM alone already decides this device's budget, so
++        the driver does not have to be asked.
++
++        True only for a unified-memory APU on Windows, with system RAM readable.
++        ``mem_get_info`` is the last call on this path that initializes HIP on the device;
++        everything else the ROCm branch touches -- ``is_available``, ``device_count``,
++        ``get_device_properties`` -- has already run during hardware detection, so on a
++        backend that has been serving for minutes it is the one native call still being
++        made for the first time. On a Strix Halo (gfx1151) with AMD's Windows ROCm wheels
++        it has ended the backend with exit status 3, the MSVC ``abort()`` status: no
++        exception for the handler below to catch, the process simply gone, and the desktop
++        app reporting "Server stopped unexpectedly" the moment the model dropdown asked
++        what would fit.
++
++        Here it is also the one reading that decides nothing. Windows HIP reports
++        free == total on a shared pool (#7072, and ``rocm_windows_free_is_untrusted``
++        records AMD's own note that free "only accounts for memory allocated by this
++        process"), so it describes the pool rather than what is left of it, and the caller
++        takes the smaller of it and available system RAM. System RAM is what a
++        unified-memory APU actually loads into -- llama.cpp runs it with
++        GGML_CUDA_ENABLE_UNIFIED_MEMORY, which is why the total published for these
++        devices is 0 -- so it is the honest ceiling, and the only one of the two that
++        moves when something else on the host takes memory.
++
++        Everything else keeps the driver reading. Off Windows free tracks real residency,
++        so a genuinely smaller one is a floor this must not raise; a discrete card needs
++        the driver's total, which system RAM says nothing about; and an unreadable
++        MemAvailable leaves no ceiling to publish at all.
++        """
++        from utils.hardware import rocm_windows_free_is_untrusted
++
++        return shared and available_mib is not None and rocm_windows_free_is_untrusted()
++
+     @staticmethod
+     def _rocm_total_memory_mib_by_physical_id() -> dict[int, int]:
+         """Total memory HIP reports per PHYSICAL device id, honoring the active ROCm
+@@ -7971,7 +8006,6 @@ class LlamaCppBackend:
+             from utils.hardware import trusted_mem_get_info
+ 
+             for ordinal in range(torch.cuda.device_count()):
+-                free_bytes, total_bytes = trusted_mem_get_info(ordinal)
+                 idx = (
+                     physical_ids[ordinal]
+                     if physical_ids is not None and ordinal < len(physical_ids)
+@@ -7980,13 +8014,19 @@ class LlamaCppBackend:
+                 if not arch_keeps(idx):
+                     continue
+                 shared = idx in unified_ids
+-                raw_mib = free_bytes // (1024 * 1024)
+-                if shared:
+-                    # ROCm's free is unreliable on a shared pool (Windows HIP
+-                    # reports free==total, #7072), and system RAM is the real
+-                    # ceiling there, so cap before taking the reserve.
+-                    avail = LlamaCppBackend._available_system_memory_mib()
+-                    if avail is not None:
++                # ROCm's free is unreliable on a shared pool (Windows HIP
++                # reports free==total, #7072), and system RAM is the real
++                # ceiling there, so cap before taking the reserve.
++                avail = LlamaCppBackend._available_system_memory_mib() if shared else None
++                if LlamaCppBackend._windows_apu_ceiling_is_host_ram(shared, avail):
++                    raw_mib, total_mib = avail, 0
++                else:
++                    # Asked after the arch gate, so a device this binary has no kernels
++                    # for costs no driver context either.
++                    free_bytes, total_bytes = trusted_mem_get_info(ordinal)
++                    raw_mib = free_bytes // (1024 * 1024)
++                    total_mib = 0 if shared else total_bytes // (1024 * 1024)
++                    if shared and avail is not None:
+                         raw_mib = min(raw_mib, avail)
+                 free_mib = _apply_igpu_host_reserve_mib(raw_mib, shared)
+                 if free_mib < raw_mib:
+@@ -7995,7 +8035,7 @@ class LlamaCppBackend:
+                         f"RAM; reserving {raw_mib - free_mib}MiB host headroom "
+                         f"({raw_mib}->{free_mib}MiB usable)"
+                     )
+-                gpus.append((idx, free_mib, 0 if shared else total_bytes // (1024 * 1024)))
++                gpus.append((idx, free_mib, total_mib))
+             # Match the nvidia-smi path's docstring guarantee of sorted-by-id.
+             return sorted(gpus, key = lambda g: g[0])
+         except Exception as e:
