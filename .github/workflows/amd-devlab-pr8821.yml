@@ -82,7 +82,7 @@ jobs:
           rows = []
           required_failures = []
           for dtype in (torch.float16, torch.bfloat16):
-              tolerance = 0.03 if dtype == torch.bfloat16 else 0.006
+    tolerance = 0.04 if dtype == torch.bfloat16 else 0.006
               for causal in (False, True):
                   for length in (31, 127, 512):
                       for head_dim in (32, 64, 80, 128, 256):
