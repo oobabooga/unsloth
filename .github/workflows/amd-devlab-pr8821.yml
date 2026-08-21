@@ -1,0 +1,193 @@
+name: AMD DevLab PR 8821
+
+on:
+  push:
+    branches: [amd-devlab-ci-pr8821]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 45
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu
+          free -h
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+          ls -l /dev/accel* 2>/dev/null || true
+
+      - name: Install isolated ROCm stack
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{models,tmp,cache/huggingface,cache/torch,cache/uv}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export HF_HOME="$WORK_ROOT/cache/huggingface"
+          export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+          export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "torch[device-gfx1151]==2.11.0+rocm7.14.0"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/LeoBorcherding/unsloth.git "$WORK_ROOT/src"
+          git -C "$WORK_ROOT/src" fetch --depth=1 origin fix/amd-aotriton-library-gate
+          git -C "$WORK_ROOT/src" checkout --detach FETCH_HEAD
+
+      - name: Gate states and SDPA matrix
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          cat > "$WORK_ROOT/probe.py" <<'PY'
+          import json
+          import os
+          import time
+
+          import torch
+          from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+          def run_backend(backend, q0, k0, v0, causal):
+              q = q0.detach().clone().requires_grad_(True)
+              k = k0.detach().clone().requires_grad_(True)
+              v = v0.detach().clone().requires_grad_(True)
+              torch.cuda.reset_peak_memory_stats()
+              start = time.perf_counter()
+              with sdpa_kernel(backend):
+                  out = torch.nn.functional.scaled_dot_product_attention(
+                      q, k, v, dropout_p=0.0, is_causal=causal
+                  )
+              out.float().sum().backward()
+              torch.cuda.synchronize()
+              return {
+                  "out": out.detach().float().cpu(),
+                  "qgrad": q.grad.detach().float().cpu(),
+                  "kgrad": k.grad.detach().float().cpu(),
+                  "vgrad": v.grad.detach().float().cpu(),
+                  "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+                  "peak_bytes": torch.cuda.max_memory_allocated(),
+              }
+
+
+          rows = []
+          required_failures = []
+          for dtype in (torch.float16, torch.bfloat16):
+              tolerance = 0.03 if dtype == torch.bfloat16 else 0.006
+              for causal in (False, True):
+                  for length in (31, 127, 512):
+                      for head_dim in (32, 64, 80, 128, 256):
+                          torch.manual_seed(8821)
+                          shape = (1, 4, length, head_dim)
+                          q0 = torch.randn(shape, device="cuda", dtype=dtype)
+                          k0 = torch.randn_like(q0)
+                          v0 = torch.randn_like(q0)
+                          reference = run_backend(SDPBackend.MATH, q0, k0, v0, causal)
+                          for label, backend in (
+                              ("flash", SDPBackend.FLASH_ATTENTION),
+                              ("efficient", SDPBackend.EFFICIENT_ATTENTION),
+                          ):
+                              record = {
+                                  "dtype": str(dtype),
+                                  "causal": causal,
+                                  "length": length,
+                                  "head_dim": head_dim,
+                                  "backend": label,
+                              }
+                              try:
+                                  actual = run_backend(backend, q0, k0, v0, causal)
+                                  deltas = {
+                                      name: float((actual[name] - reference[name]).abs().max())
+                                      for name in ("out", "qgrad", "kgrad", "vgrad")
+                                  }
+                                  record.update(
+                                      status="pass",
+                                      max_delta=max(deltas.values()),
+                                      elapsed_ms=actual["elapsed_ms"],
+                                      peak_bytes=actual["peak_bytes"],
+                                  )
+                                  assert torch.isfinite(actual["out"]).all()
+                                  assert all(value <= tolerance for value in deltas.values()), deltas
+                              except Exception as exc:
+                                  record.update(status="error", error=f"{type(exc).__name__}: {exc}")
+                                  if head_dim in (64, 128):
+                                      required_failures.append(record)
+                              rows.append(record)
+
+          assert not required_failures, required_failures
+
+          torch.manual_seed(8821)
+          q0 = torch.randn((1, 32, 4096, 128), device="cuda", dtype=torch.bfloat16)
+          k0 = torch.randn_like(q0)
+          v0 = torch.randn_like(q0)
+          long_rows = {}
+          for label, backend in (
+              ("math", SDPBackend.MATH),
+              ("flash", SDPBackend.FLASH_ATTENTION),
+              ("efficient", SDPBackend.EFFICIENT_ATTENTION),
+          ):
+              result = run_backend(backend, q0, k0, v0, True)
+              long_rows[label] = {
+                  "elapsed_ms": result["elapsed_ms"],
+                  "peak_bytes": result["peak_bytes"],
+              }
+
+          payload = {
+              "gate": os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "<unset>"),
+              "torch": torch.__version__,
+              "hip": torch.version.hip,
+              "device": torch.cuda.get_device_name(0),
+              "capability": torch.cuda.get_device_capability(0),
+              "passes": sum(row["status"] == "pass" for row in rows),
+              "errors": [row for row in rows if row["status"] == "error"],
+              "long": long_rows,
+          }
+          print(json.dumps(payload, sort_keys=True))
+          PY
+
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL \
+            python "$WORK_ROOT/probe.py" > "$WORK_ROOT/unset.json"
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=0 \
+            python "$WORK_ROOT/probe.py" > "$WORK_ROOT/zero.json"
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
+            python "$WORK_ROOT/probe.py" > "$WORK_ROOT/one.json"
+          python - "$WORK_ROOT/unset.json" "$WORK_ROOT/zero.json" "$WORK_ROOT/one.json" <<'PY'
+          import json
+          import sys
+
+          rows = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
+          for row in rows:
+              print(json.dumps(row, indent=2, sort_keys=True))
+              assert row["passes"] >= 100, row
+          assert [row["passes"] for row in rows] == [rows[0]["passes"]] * 3
+          assert [len(row["errors"]) for row in rows] == [len(rows[0]["errors"])] * 3
+          PY
+
+      - name: PR helper import boundary
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          . "$WORK_ROOT/venv/bin/activate"
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL \
+            python - "$WORK_ROOT/src/unsloth/_rocm_attention.py" <<'PY'
+          import importlib.util
+          import os
+          import sys
+
+          path = sys.argv[1]
+          spec = importlib.util.spec_from_file_location("pr8821_rocm_attention", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert module.enable_rocm_aotriton_attention() is True
+          assert os.environ[module.AOTRITON_ENV] == "1"
+          assert module.enable_rocm_aotriton_attention() is False
+          print("helper gate:", os.environ[module.AOTRITON_ENV])
+          PY
