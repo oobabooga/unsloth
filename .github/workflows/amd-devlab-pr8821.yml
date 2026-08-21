@@ -2,7 +2,7 @@ name: AMD DevLab PR 8821
 
 on:
   push:
-    branches: [amd-devlab-ci-pr8821]
+    branches: [amd-devlab-ci-pr8821-rerun]
 
 permissions: {}
 
