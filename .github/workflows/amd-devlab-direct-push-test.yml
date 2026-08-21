@@ -1,4 +1,4 @@
-name: AMD DevLab writable paths test
+name: Strix Halo unified memory probe
 
 on:
   push:
@@ -7,54 +7,173 @@ on:
 permissions: {}
 
 jobs:
-  writable-paths:
-    name: Probe writable work and cache paths
+  unified-memory:
+    name: Measure RAM and VRAM accounting
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
     timeout-minutes: 10
     steps:
-      - name: Inspect paths and mounts
+      - name: Report static memory views
         run: |
           set -euxo pipefail
-          env | sort | grep -E '^(HOME|RUNNER_|GITHUB_WORKSPACE|TMPDIR|XDG_|HF_|HUGGINGFACE_|TRANSFORMERS_|TORCH_HOME|UV_CACHE_DIR)=' || true
-          printf 'pwd=%s\n' "$PWD"
-          RUNNER_WORKSPACE=${RUNNER_WORKSPACE:-$(dirname "$GITHUB_WORKSPACE")}
-          for path in "$GITHUB_WORKSPACE" "$RUNNER_WORKSPACE" "$RUNNER_TEMP" "$HOME" /mnt/scratch /tmp /opt /usr/local; do
-            printf '\nPATH=%s\n' "$path"
-            stat -c 'owner=%U group=%G mode=%A' "$path" 2>/dev/null || true
-            df -hT "$path" 2>/dev/null || true
-            findmnt -T "$path" 2>/dev/null || true
-            if probe=$(mktemp -p "$path" amd-write-probe.XXXXXX 2>/dev/null); then
-              echo "writable=yes probe=$probe"
-              rm -f "$probe"
-            else
-              echo 'writable=no'
-            fi
+          free -b
+          grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SReclaimable|Shmem):' /proc/meminfo
+          for card in /sys/class/drm/card[0-9]*; do
+            echo "card=$card"
+            for field in mem_info_vram_total mem_info_vram_used mem_info_gtt_total mem_info_gtt_used mem_info_vis_vram_total mem_info_vis_vram_used; do
+              if test -r "$card/device/$field"; then
+                printf '%s=%s\n' "$field" "$(cat "$card/device/$field")"
+              fi
+            done
           done
+          command -v rocm-smi && rocm-smi --showmeminfo all || true
+          command -v amd-smi && amd-smi metric --mem-usage || true
+          rocminfo | grep -E 'Name:|Marketing Name:|Segment:|Size:|Allocatable:' | head -120 || true
 
-      - name: Create work tree and virtual environment
+      - name: Allocate and touch 4 GiB through HIP
         run: |
-          set -euxo pipefail
-          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
-          mkdir -p "$WORK_ROOT"/{models,tmp,cache/huggingface,cache/torch,cache/uv}
-          python3 -m venv "$WORK_ROOT/venv"
-          "$WORK_ROOT/venv/bin/python" --version
-          "$WORK_ROOT/venv/bin/pip" --version
-          test -w "$WORK_ROOT/models"
-          test -w "$WORK_ROOT/cache/huggingface"
-          echo "WORK_ROOT=$WORK_ROOT"
+          python3 - <<'PY'
+          import ctypes
+          import ctypes.util
+          import glob
+          import json
+          import os
+          import time
 
-      - name: Test redirected model download
+          GIB = 1024 ** 3
+          ALLOCATION_BYTES = 4 * GIB
+
+          def read_int(path):
+              try:
+                  with open(path, encoding="ascii") as handle:
+                      return int(handle.read().strip())
+              except (FileNotFoundError, PermissionError, ValueError):
+                  return None
+
+          def meminfo():
+              values = {}
+              with open("/proc/meminfo", encoding="ascii") as handle:
+                  for line in handle:
+                      key, raw = line.split(":", 1)
+                      parts = raw.split()
+                      if parts:
+                          values[key] = int(parts[0]) * 1024
+              return values
+
+          drm_cards = sorted(glob.glob("/sys/class/drm/card[0-9]*"))
+          if not drm_cards:
+              raise RuntimeError("No DRM card found")
+          drm_device = os.path.join(drm_cards[0], "device")
+
+          candidates = [
+              ctypes.util.find_library("amdhip64"),
+              "/opt/rocm/lib/libamdhip64.so",
+              "/opt/rocm/lib64/libamdhip64.so",
+              "libamdhip64.so",
+          ]
+          hip = None
+          errors = []
+          for candidate in candidates:
+              if not candidate:
+                  continue
+              try:
+                  hip = ctypes.CDLL(candidate)
+                  print(f"HIP_LIBRARY={candidate}")
+                  break
+              except OSError as exc:
+                  errors.append(f"{candidate}: {exc}")
+          if hip is None:
+              raise RuntimeError("Cannot load HIP runtime: " + "; ".join(errors))
+
+          hip.hipGetErrorString.argtypes = [ctypes.c_int]
+          hip.hipGetErrorString.restype = ctypes.c_char_p
+          hip.hipSetDevice.argtypes = [ctypes.c_int]
+          hip.hipMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+          hip.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+          hip.hipDeviceSynchronize.argtypes = []
+          hip.hipFree.argtypes = [ctypes.c_void_p]
+          hip.hipMemGetInfo.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+
+          def check(code, operation):
+              if code:
+                  detail = hip.hipGetErrorString(code)
+                  message = detail.decode() if detail else "unknown HIP error"
+                  raise RuntimeError(f"{operation} failed: {code} ({message})")
+
+          check(hip.hipSetDevice(0), "hipSetDevice")
+
+          def snapshot(label):
+              memory = meminfo()
+              hip_free = ctypes.c_size_t()
+              hip_total = ctypes.c_size_t()
+              check(hip.hipMemGetInfo(ctypes.byref(hip_free), ctypes.byref(hip_total)), "hipMemGetInfo")
+              result = {
+                  "label": label,
+                  "mem_total": memory.get("MemTotal"),
+                  "mem_available": memory.get("MemAvailable"),
+                  "mem_free": memory.get("MemFree"),
+                  "cached": memory.get("Cached"),
+                  "hip_total": hip_total.value,
+                  "hip_free": hip_free.value,
+                  "vram_total": read_int(os.path.join(drm_device, "mem_info_vram_total")),
+                  "vram_used": read_int(os.path.join(drm_device, "mem_info_vram_used")),
+                  "gtt_total": read_int(os.path.join(drm_device, "mem_info_gtt_total")),
+                  "gtt_used": read_int(os.path.join(drm_device, "mem_info_gtt_used")),
+              }
+              print("SNAPSHOT " + json.dumps(result, sort_keys=True), flush=True)
+              return result
+
+          before = snapshot("before")
+          pointer = ctypes.c_void_p()
+          check(hip.hipMalloc(ctypes.byref(pointer), ALLOCATION_BYTES), "hipMalloc")
+          check(hip.hipMemset(pointer, 0xA5, ALLOCATION_BYTES), "hipMemset")
+          check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
+          time.sleep(2)
+          during = snapshot("during")
+          check(hip.hipFree(pointer), "hipFree")
+          check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize after free")
+          time.sleep(2)
+          after = snapshot("after")
+
+          def delta(current, baseline, key):
+              if current[key] is None or baseline[key] is None:
+                  return None
+              return current[key] - baseline[key]
+
+          results = {
+              "allocation_bytes": ALLOCATION_BYTES,
+              "during_minus_before": {
+                  "mem_available": delta(during, before, "mem_available"),
+                  "mem_free": delta(during, before, "mem_free"),
+                  "hip_free": delta(during, before, "hip_free"),
+                  "vram_used": delta(during, before, "vram_used"),
+                  "gtt_used": delta(during, before, "gtt_used"),
+              },
+              "after_minus_before": {
+                  "mem_available": delta(after, before, "mem_available"),
+                  "hip_free": delta(after, before, "hip_free"),
+                  "vram_used": delta(after, before, "vram_used"),
+              },
+          }
+          print("RESULTS " + json.dumps(results, sort_keys=True), flush=True)
+          print("RESULTS_GIB")
+          for phase, values in results.items():
+              if not isinstance(values, dict):
+                  print(f"{phase}={values / GIB:.3f} GiB")
+                  continue
+              for key, value in values.items():
+                  shown = "unavailable" if value is None else f"{value / GIB:+.3f} GiB"
+                  print(f"{phase}.{key}={shown}")
+
+          vram_rise = results["during_minus_before"]["vram_used"]
+          hip_drop = results["during_minus_before"]["hip_free"]
+          if vram_rise is None or vram_rise < 3 * GIB:
+              raise RuntimeError(f"VRAM used did not rise by at least 3 GiB: {vram_rise}")
+          if hip_drop is None or hip_drop > -3 * GIB:
+              raise RuntimeError(f"HIP free did not fall by at least 3 GiB: {hip_drop}")
+          PY
+
+      - name: Report memory after release
+        if: always()
         run: |
-          set -euxo pipefail
-          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
-          export TMPDIR="$WORK_ROOT/tmp"
-          export HF_HOME="$WORK_ROOT/cache/huggingface"
-          export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
-          export TRANSFORMERS_CACHE="$HF_HOME/transformers"
-          export TORCH_HOME="$WORK_ROOT/cache/torch"
-          export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
-          curl --fail --location --retry 3 \
-            https://huggingface.co/bert-base-uncased/resolve/main/config.json \
-            --output "$WORK_ROOT/models/bert-base-uncased-config.json"
-          test -s "$WORK_ROOT/models/bert-base-uncased-config.json"
-          du -ah "$WORK_ROOT" | sort -h | tail -30
+          free -b
+          rocm-smi --showmeminfo all || true
