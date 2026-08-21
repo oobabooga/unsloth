@@ -18,12 +18,8 @@ jobs:
         run: bash probe/01_hardware.sh
       - name: Install Unsloth Studio
         run: bash probe/05_install_studio.sh
-      - name: HIP context cost on gfx1151
-        run: bash probe/03b_context_cost.sh
-      - name: Studio llama.cpp GPU probe (before the fix)
-        run: bash probe/05b_studio_probe.sh
-      - name: Verify the fix on real gfx1151
-        run: bash probe/09_verify_fix.sh
+      - name: Which request reaches the native GPU probes
+        run: bash probe/10_trace_dropdown_local_model.sh
       - name: Dump logs
         if: always()
         run: bash probe/07_dump.sh

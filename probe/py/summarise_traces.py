@@ -2,6 +2,7 @@
 import sys
 
 req = "(startup / background warm)"
+kind = "?"
 stacks = []
 cur = None
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
@@ -11,18 +12,19 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     if line.startswith("@@@BASELINE_AFTER_WARM@@@"):
         req = "(idle, after warm)"
         continue
-    if line.startswith("@@@MEM_GET_INFO@@@"):
+    if line.startswith("@@@MEM_GET_INFO@@@") or line.startswith("@@@AMD_SMI@@@"):
         cur = []
+        kind = line.strip().strip("@")
         continue
     if line.startswith("@@@END@@@"):
         if cur is not None:
-            stacks.append((req, cur))
+            stacks.append((req + "  [" + kind + "]", cur))
         cur = None
         continue
     if cur is not None:
         cur.append(line.rstrip("\n"))
 
-print("total mem_get_info calls:", len(stacks))
+print("total traced native calls:", len(stacks))
 seen = {}
 for req, frames in stacks:
     interesting = [f for f in frames if "site-packages/torch" not in f and 'File "<' not in f]
