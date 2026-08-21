@@ -1,4 +1,4 @@
-name: AMD DevLab direct push test
+name: AMD DevLab writable paths test
 
 on:
   push:
@@ -7,21 +7,54 @@ on:
 permissions: {}
 
 jobs:
-  prove-direct-push:
-    name: Prove branch-only AMD workflow
+  writable-paths:
+    name: Probe writable work and cache paths
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
     timeout-minutes: 10
     steps:
-      - name: Assert trigger and hardware
+      - name: Inspect paths and mounts
         run: |
           set -euxo pipefail
-          test "${{ github.event_name }}" = push
-          test "${{ github.ref }}" = refs/heads/amd-devlab-direct-push-test
-          case "${{ runner.name }}" in
-            ephemeral-devlab-*) ;;
-            *) exit 1 ;;
-          esac
-          lscpu | grep -F 'AMD RYZEN AI MAX+ 395'
-          rocminfo | grep -F gfx1151
-          test -c /dev/accel/accel0
-          echo "Direct branch push reached the AMD DevLab runner."
+          env | sort | grep -E '^(HOME|RUNNER_|GITHUB_WORKSPACE|TMPDIR|XDG_|HF_|HUGGINGFACE_|TRANSFORMERS_|TORCH_HOME|UV_CACHE_DIR)=' || true
+          printf 'pwd=%s\n' "$PWD"
+          RUNNER_WORKSPACE=${RUNNER_WORKSPACE:-$(dirname "$GITHUB_WORKSPACE")}
+          for path in "$GITHUB_WORKSPACE" "$RUNNER_WORKSPACE" "$RUNNER_TEMP" "$HOME" /mnt/scratch /tmp /opt /usr/local; do
+            printf '\nPATH=%s\n' "$path"
+            stat -c 'owner=%U group=%G mode=%A' "$path" 2>/dev/null || true
+            df -hT "$path" 2>/dev/null || true
+            findmnt -T "$path" 2>/dev/null || true
+            if probe=$(mktemp -p "$path" amd-write-probe.XXXXXX 2>/dev/null); then
+              echo "writable=yes probe=$probe"
+              rm -f "$probe"
+            else
+              echo 'writable=no'
+            fi
+          done
+
+      - name: Create work tree and virtual environment
+        run: |
+          set -euxo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{models,tmp,cache/huggingface,cache/torch,cache/uv}
+          python3 -m venv "$WORK_ROOT/venv"
+          "$WORK_ROOT/venv/bin/python" --version
+          "$WORK_ROOT/venv/bin/pip" --version
+          test -w "$WORK_ROOT/models"
+          test -w "$WORK_ROOT/cache/huggingface"
+          echo "WORK_ROOT=$WORK_ROOT"
+
+      - name: Test redirected model download
+        run: |
+          set -euxo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export HF_HOME="$WORK_ROOT/cache/huggingface"
+          export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+          export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
+          curl --fail --location --retry 3 \
+            https://huggingface.co/bert-base-uncased/resolve/main/config.json \
+            --output "$WORK_ROOT/models/bert-base-uncased-config.json"
+          test -s "$WORK_ROOT/models/bert-base-uncased-config.json"
+          du -ah "$WORK_ROOT" | sort -h | tail -30
