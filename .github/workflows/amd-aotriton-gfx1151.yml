@@ -28,7 +28,17 @@ jobs:
       - name: Install stable torch with the gfx1151 device extra
         run: |
           set -euo pipefail
-          ROOT=/mnt/scratch/aotriton-probe
+          # /mnt/scratch is the big volume but is not writable by the runner user on
+          # every host, so take the first base that actually accepts a mkdir.
+          ROOT=""
+          for base in /mnt/scratch "${RUNNER_TEMP:-}" "$HOME" /tmp; do
+            [ -n "$base" ] || continue
+            if mkdir -p "$base/aotriton-probe" 2>/dev/null; then
+              ROOT="$base/aotriton-probe"; break
+            fi
+          done
+          [ -n "$ROOT" ] || { echo "no writable base directory"; exit 1; }
+          echo "using $ROOT"; df -h "$ROOT"
           rm -rf "$ROOT"; mkdir -p "$ROOT"
           export TMPDIR="$ROOT/tmp"; mkdir -p "$TMPDIR"
           export PIP_CACHE_DIR="$ROOT/pipcache"
@@ -39,12 +49,13 @@ jobs:
             --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
             --extra-index-url https://pypi.org/simple \
             "torch[device-gfx1151]==2.11.0+rocm7.14.0"
-          echo "$ROOT/venv/bin/python" > /mnt/scratch/probe_python
+          echo "$ROOT/venv/bin/python" > "$HOME/probe_python"
+          echo "$ROOT" > "$HOME/probe_root"
 
       - name: What landed on disk
         run: |
           set -euo pipefail
-          PY=$(cat /mnt/scratch/probe_python)
+          PY=$(cat "$HOME/probe_python")
           "$PY" -m pip list 2>/dev/null | grep -iE 'torch|amd-|rocm' || true
           LIB=$("$PY" -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"lib"))')
           echo "--- torch/lib/aotriton.images ---"
@@ -63,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           unset TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL || true
-          "$(cat /mnt/scratch/probe_python)" - <<'PY'
+          "$(cat "$HOME/probe_python")" - <<'PY'
           import os, torch
           print("label:", os.environ.get("PROBE_LABEL"))
           print("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL =",
@@ -103,7 +114,7 @@ jobs:
           PROBE_LABEL: "flag = 1"
         run: |
           set -euo pipefail
-          "$(cat /mnt/scratch/probe_python)" - <<'PY'
+          "$(cat "$HOME/probe_python")" - <<'PY'
           import os, torch
           print("label:", os.environ.get("PROBE_LABEL"))
           print("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL =",
@@ -132,4 +143,5 @@ jobs:
 
       - name: Clean up the scratch install
         if: always()
-        run: rm -rf /mnt/scratch/aotriton-probe /mnt/scratch/probe_python || true
+        run: |
+          rm -rf "$(cat "$HOME/probe_root" 2>/dev/null)" "$HOME/probe_python" "$HOME/probe_root" || true
