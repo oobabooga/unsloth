@@ -9,7 +9,7 @@ permissions: {}
 jobs:
   amd:
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Hardware
         run: |
@@ -27,12 +27,16 @@ jobs:
           export HF_HOME="$WORK_ROOT/cache/huggingface"
           export TORCH_HOME="$WORK_ROOT/cache/torch"
           export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
-          python -m pip install --upgrade pip
-          python -m pip install \
-            --index-url https://repo.amd.com/rocm/whl/gfx1151/ \
-            'torch==2.11.0+rocm7.13.0'
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
           git clone --depth 1 --branch amd-devlab-pr8821-safe-code \
             https://github.com/oobabooga/unsloth.git "$WORK_ROOT/source"
+          timeout 900s python -m pip install \
+            --no-cache-dir \
+            --progress-bar off \
+            --timeout 60 \
+            --retries 2 \
+            --index-url https://repo.amd.com/rocm/whl/gfx1151/ \
+            'torch==2.11.0+rocm7.13.0'
 
       - name: Verify allowlist and attention
         run: |
