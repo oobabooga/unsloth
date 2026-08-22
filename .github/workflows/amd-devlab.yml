@@ -1,0 +1,92 @@
+name: AMD DevLab PR 8821 Safe Gate
+
+on:
+  push:
+    branches: [amd-devlab-ci-pr8821-safe]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+
+      - name: Install exact validated stack
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-pr8821-safe"
+          mkdir -p "$WORK_ROOT"/{tmp,cache/huggingface,cache/torch,cache/uv}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export HF_HOME="$WORK_ROOT/cache/huggingface"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --index-url https://repo.amd.com/rocm/whl/gfx1151/ \
+            'torch==2.11.0+rocm7.13.0'
+          git clone --depth 1 --branch amd-devlab-pr8821-safe-code \
+            https://github.com/oobabooga/unsloth.git "$WORK_ROOT/source"
+
+      - name: Verify allowlist and attention
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-pr8821-safe"
+          . "$WORK_ROOT/venv/bin/activate"
+          export PYTHONPATH="$WORK_ROOT/source"
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import torch
+
+          from unsloth_runtime.rocm_attention import enable_rocm_aotriton_attention
+
+          props = torch.cuda.get_device_properties(0)
+          print("torch", torch.__version__)
+          print("hip", torch.version.hip)
+          print("arch", getattr(props, "gcnArchName", None))
+          assert enable_rocm_aotriton_attention(torch_module = torch) is True
+          assert os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] == "1"
+
+          inherited = subprocess.check_output(
+              [
+                  sys.executable,
+                  "-c",
+                  "import os; print(os.environ.get('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'))",
+              ],
+              text = True,
+          ).strip()
+          assert inherited == "1", inherited
+
+          torch.manual_seed(7)
+          q = torch.randn(1, 8, 1024, 64, device = "cuda", dtype = torch.float16, requires_grad = True)
+          k = torch.randn_like(q, requires_grad = True)
+          v = torch.randn_like(q, requires_grad = True)
+          out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal = True)
+          loss = out.float().square().mean()
+          loss.backward()
+          torch.cuda.synchronize()
+          assert torch.isfinite(out).all()
+          assert torch.isfinite(q.grad).all()
+          assert torch.isfinite(k.grad).all()
+          assert torch.isfinite(v.grad).all()
+          print("gate", os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"])
+          print("attention", tuple(out.shape), float(loss))
+          print("child", inherited)
+          PY
+
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=0 python - <<'PY'
+          import os
+          import torch
+          from unsloth_runtime.rocm_attention import enable_rocm_aotriton_attention
+
+          assert enable_rocm_aotriton_attention(torch_module = torch) is False
+          assert os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] == "0"
+          print("optout", os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"])
+          PY
