@@ -1,0 +1,130 @@
+name: AMD DevLab PR 8821 live validation
+
+on:
+  push:
+    branches: [amd-devlab-ci-pr8821-live]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu
+          free -h
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+
+      - name: Install ROCm PyTorch
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-pr8821"
+          mkdir -p "$WORK_ROOT"/{tmp,cache/huggingface,cache/torch,cache/uv}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export HF_HOME="$WORK_ROOT/cache/huggingface"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --index-url https://repo.amd.com/rocm/whl/gfx1151/ \
+            'torch==2.11.0+rocm7.13.0'
+
+      - name: Compare gate states
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-pr8821"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          cat > "$WORK_ROOT/attention_probe.py" <<'PY'
+          import argparse
+          import contextlib
+          import os
+          import statistics
+          import time
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--late-enable", action="store_true")
+          args = parser.parse_args()
+
+          import torch
+          import torch.nn.functional as F
+          from torch.nn.attention import SDPBackend, sdpa_kernel
+
+          if args.late_enable:
+              os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
+          assert torch.cuda.is_available()
+          assert torch.version.hip is not None
+          device = torch.device("cuda")
+          dtype = torch.float16
+          shape = (1, 16, 4096, 64)
+          torch.manual_seed(8821)
+          q0 = torch.randn(shape, device=device, dtype=dtype)
+          k0 = torch.randn(shape, device=device, dtype=dtype)
+          v0 = torch.randn(shape, device=device, dtype=dtype)
+          grad_out = torch.randn(shape, device=device, dtype=dtype)
+
+          def context_for(backend):
+              return contextlib.nullcontext() if backend is None else sdpa_kernel(backend)
+
+          def once(backend):
+              q = q0.detach().clone().requires_grad_(True)
+              k = k0.detach().clone().requires_grad_(True)
+              v = v0.detach().clone().requires_grad_(True)
+              torch.cuda.synchronize()
+              base = torch.cuda.memory_allocated()
+              torch.cuda.reset_peak_memory_stats()
+              started = time.perf_counter()
+              with context_for(backend):
+                  out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+              grads = torch.autograd.grad(out, (q, k, v), grad_outputs=grad_out)
+              torch.cuda.synchronize()
+              elapsed_ms = (time.perf_counter() - started) * 1000
+              peak_mib = (torch.cuda.max_memory_allocated() - base) / 1024**2
+              return out.detach(), tuple(g.detach() for g in grads), elapsed_ms, peak_mib
+
+          ref_out, ref_grads, ref_ms, ref_peak = once(SDPBackend.MATH)
+          print(
+              "STATE",
+              repr(os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL")),
+              "torch", torch.__version__, "hip", torch.version.hip,
+              "device", torch.cuda.get_device_name(0),
+          )
+          print(f"RESULT math ok time_ms={ref_ms:.3f} peak_mib={ref_peak:.1f}")
+
+          for name, backend in (
+              ("default", None),
+              ("flash", SDPBackend.FLASH_ATTENTION),
+              ("mem_efficient", SDPBackend.EFFICIENT_ATTENTION),
+          ):
+              try:
+                  out, grads, first_ms, peak = once(backend)
+                  timings = [first_ms]
+                  for _ in range(2):
+                      _, _, elapsed, _ = once(backend)
+                      timings.append(elapsed)
+                  out_diff = (out.float() - ref_out.float()).abs().max().item()
+                  grad_diff = max(
+                      (got.float() - expected.float()).abs().max().item()
+                      for got, expected in zip(grads, ref_grads)
+                  )
+                  print(
+                      f"RESULT {name} ok median_ms={statistics.median(timings):.3f} "
+                      f"peak_mib={peak:.1f} max_out_diff={out_diff:.8f} "
+                      f"max_grad_diff={grad_diff:.8f}"
+                  )
+              except Exception as exc:
+                  print(f"RESULT {name} unavailable {type(exc).__name__}: {exc}")
+          PY
+
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL \
+            python "$WORK_ROOT/attention_probe.py"
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=0 \
+            python "$WORK_ROOT/attention_probe.py"
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
+            python "$WORK_ROOT/attention_probe.py"
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL \
+            python "$WORK_ROOT/attention_probe.py" --late-enable
