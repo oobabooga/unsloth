@@ -9,7 +9,7 @@ permissions: {}
 jobs:
   amd:
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Hardware
         run: |
@@ -28,9 +28,13 @@ jobs:
           export TORCH_HOME="$WORK_ROOT/cache/torch"
           export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
           export PIP_DISABLE_PIP_VERSION_CHECK=1
-          git clone --depth 1 --branch amd-devlab-pr8821-safe-code \
-            https://github.com/oobabooga/unsloth.git "$WORK_ROOT/source"
-          timeout 900s python -m pip install \
+          mkdir -p "$WORK_ROOT/source/unsloth_runtime"
+          curl --fail --location --max-time 30 \
+            https://raw.githubusercontent.com/oobabooga/unsloth/amd-devlab-pr8821-safe-code/unsloth_runtime/rocm_attention.py \
+            --output "$WORK_ROOT/source/unsloth_runtime/rocm_attention.py"
+          echo "772eb621a5fb2238500dcb3e1e3caad4edf0bd34b4443cd0abafc9b92ecdfb4d  $WORK_ROOT/source/unsloth_runtime/rocm_attention.py" \
+            | sha256sum --check
+          timeout --kill-after=30s 300s python -m pip install \
             --no-cache-dir \
             --progress-bar off \
             --timeout 60 \
