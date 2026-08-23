@@ -4,9 +4,10 @@ name: "DevLab concurrency probe"
 # suggest four, but only two have ever been observed overlapping, and capacity
 # planning off an inference is how you end up queueing behind yourself.
 #
-# Six jobs, each recording when it started and stopped, then holding a slot for
-# 45s so any overlap is unambiguous in the timestamps. Nothing is downloaded,
-# nothing is installed, no GPU work: the cost is a few slot-seconds.
+# Four jobs holding a slot for five minutes each, with a heartbeat, so all four
+# are provably resident at the same time rather than merely overlapping briefly.
+# Nothing is downloaded, nothing is installed, no GPU work. Note this does
+# occupy the entire pool for the duration.
 
 on:
   push:
@@ -22,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [1, 2, 3, 4, 5, 6]
+        n: [1, 2, 3, 4]
     steps:
       - name: Identify and hold
         run: |
@@ -33,6 +34,10 @@ jobs:
           echo "runner_temp=$RUNNER_TEMP"
           echo "started=$(date -u +%H:%M:%S)"
           nproc; free -g | head -2
-          # Long enough that genuinely parallel jobs must overlap.
-          sleep 45
+          # Five minutes, with a heartbeat so the overlap is visible in the
+          # log itself and not only in the API timestamps.
+          for i in $(seq 1 10); do
+            sleep 30
+            echo "job ${{ matrix.n }} alive at $(date -u +%H:%M:%S) (${i}/10)"
+          done
           echo "ended=$(date -u +%H:%M:%S)"
