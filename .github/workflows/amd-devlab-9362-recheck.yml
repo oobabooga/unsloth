@@ -1,0 +1,103 @@
+name: "9362 recheck: is the failure the PR or my GPU mask?"
+
+# One test in PR 9362's new suite failed on the AMD runner and passes on an
+# unmasked host. The suites job sets HIP_VISIBLE_DEVICES="" so it cannot disturb
+# the GPU job beside it, and the test does not mock _cuda_order_matches_smi,
+# which reads real host state. So the mask is the prime suspect for the failure
+# and it would be wrong to report a regression without separating the two.
+#
+# Same host, same commit, mask as the ONLY variable.
+
+on:
+  push:
+    branches: [amd-devlab-9362-recheck]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recheck:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - name: Gate
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/recheck"; mkdir -p "$WORK"/{bin,out,src,tmp}
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "refused privilege escalation: $*" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          { echo "WORK=$WORK"; echo "TMPDIR=$WORK/tmp"; echo "PATH=$WORK/bin:$PATH"
+            echo "UNSLOTH_STUDIO_HOME=$WORK/studio"; } >> "$GITHUB_ENV"
+          rocm-smi || true
+
+      - name: Clone 9362 head
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$WORK/src/u"
+          cd "$WORK/src/u"
+          git fetch -q origin 'refs/pull/9362/head:h'
+          git checkout -q h
+          git log --oneline -1
+
+      - name: Install Studio (ROCm torch)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/u"
+          set +e
+          bash install.sh --local 2>&1 | tail -12
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo FATAL no venv; exit 1; }
+          echo "STUDIO_VENV=$V" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      - name: Same test, masked and unmasked
+        timeout-minutes: 20
+        run: |
+          set +e
+          set -uo pipefail
+          cd "$WORK/src/u/studio/backend"
+          T=tests/test_system_poll_no_cuda_context.py
+          ONE="$T::test_context_free_rocm_smi_translates_hip_ordinals"
+
+          echo "== UNMASKED (no HIP_VISIBLE_DEVICES set)"
+          "$STUDIO_VENV/bin/python" -m pytest -q "$ONE" > "$WORK/out/unmasked_one.log" 2>&1
+          echo "unmasked single rc=$? :: $(tail -1 "$WORK/out/unmasked_one.log")" | tee -a "$WORK/out/recheck.txt"
+          "$STUDIO_VENV/bin/python" -m pytest -q "$T" > "$WORK/out/unmasked_all.log" 2>&1
+          echo "unmasked suite  rc=$? :: $(tail -1 "$WORK/out/unmasked_all.log")" | tee -a "$WORK/out/recheck.txt"
+
+          echo "== MASKED (HIP_VISIBLE_DEVICES=\"\", as the suites job ran it)"
+          HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+            "$STUDIO_VENV/bin/python" -m pytest -q "$ONE" > "$WORK/out/masked_one.log" 2>&1
+          echo "masked   single rc=$? :: $(tail -1 "$WORK/out/masked_one.log")" | tee -a "$WORK/out/recheck.txt"
+          HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" \
+            "$STUDIO_VENV/bin/python" -m pytest -q "$T" > "$WORK/out/masked_all.log" 2>&1
+          echo "masked   suite  rc=$? :: $(tail -1 "$WORK/out/masked_all.log")" | tee -a "$WORK/out/recheck.txt"
+
+          echo; cat "$WORK/out/recheck.txt"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "## 9362 recheck, mask as the only variable"; echo '```'
+            cat "$WORK/out/recheck.txt" 2>/dev/null || echo none; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recheck9362
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
