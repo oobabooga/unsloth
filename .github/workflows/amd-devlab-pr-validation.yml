@@ -1,0 +1,463 @@
+name: "Validate PRs 9487 / 9362 / 9315 / 9314 on gfx1151"
+
+# Four Studio PRs, checked on the hardware their defects actually concern.
+#
+# Each PR is run at BOTH its merge base and its head in the same job on the same
+# host. A green head leg alone proves nothing: if the base leg does not exhibit
+# the defect, the harness is broken and the run is void, not a pass. That is the
+# one rule the whole workflow is built around.
+#
+# Layout follows what this pool actually is: four ephemeral slots on ONE machine
+# sharing ONE gfx1151. So only the job that measures GPU memory may touch the
+# GPU; the other three mask it, or they would contaminate the measurement they
+# are running beside.
+#
+# No system packages: install.sh builds a venv under $RUNNER_TEMP, the sd.cpp
+# installer is pure stdlib, and a sudo shim on PATH refuses any escalation.
+
+on:
+  push:
+    branches: [amd-devlab-pr-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  SD_TAG: "master-813-bfbef5b"
+  SD_ASSET: "sd-master-bfbef5b-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip"
+  SD_REPO: "leejet/stable-diffusion.cpp"
+
+jobs:
+
+  # ---------------------------------------------------------------- PR 9487
+  sdcpp:
+    name: "9487 sd.cpp symlinks (real ROCm asset)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 60
+    env:
+      # This job never needs the GPU: the installer is stdlib and sd-cli --help
+      # parses args. Masked so it cannot perturb the memory job beside it.
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Isolation gate
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/v9487"; mkdir -p "$WORK"/{bin,out,src,inst}
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "refused privilege escalation: $*" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          { echo "WORK=$WORK"; echo "TMPDIR=$WORK/tmp"; echo "PATH=$WORK/bin:$PATH"; } >> "$GITHUB_ENV"
+          mkdir -p "$WORK/tmp"
+          uname -a; df -h "$RUNNER_TEMP" | tail -1; python3 -VV
+
+      - name: Clone and resolve the three states
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$WORK/src/unsloth"
+          cd "$WORK/src/unsloth"
+          git fetch -q origin 'refs/pull/9487/head:pr9487-head' 'refs/pull/9487/merge:pr9487-merge' || \
+            git fetch -q origin 'refs/pull/9487/head:pr9487-head'
+          BASE=$(git merge-base origin/main pr9487-head)
+          echo "BASE_9487=$BASE" >> "$GITHUB_ENV"
+          { echo "base   $BASE"; echo "head   $(git rev-parse pr9487-head)"
+            echo "merge  $(git rev-parse pr9487-merge 2>/dev/null || echo none)"; } \
+            | tee "$WORK/out/commits.txt"
+          for st in base head merge; do
+            case $st in
+              base)  ref=$BASE ;;
+              head)  ref=pr9487-head ;;
+              merge) ref=$(git rev-parse pr9487-merge 2>/dev/null || echo "") ;;
+            esac
+            [ -n "$ref" ] && git worktree add -q --detach "$WORK/src/$st" "$ref" && echo "$st -> $ref"
+          done
+
+      - name: Fetch the exact asset and prove it can exhibit the bug
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          curl -fL --retry 5 --retry-delay 10 -o asset.zip \
+            "https://github.com/$SD_REPO/releases/download/$SD_TAG/$SD_ASSET"
+          ls -l asset.zip; sha256sum asset.zip | tee out/asset.sha256
+          # A zip with no symlink members cannot show this defect either way, so
+          # a zero count is a broken input, not a passing test.
+          python3 - <<'PY'
+          import os, stat, sys, zipfile
+          n = links = 0
+          with zipfile.ZipFile(os.environ["WORK"] + "/asset.zip") as zf:
+              for i in zf.infolist():
+                  n += 1
+                  if i.create_system == 3 and stat.S_ISLNK(i.external_attr >> 16):
+                      links += 1
+                      print("symlink member:", i.filename, "->", zf.read(i).decode())
+          print(f"members={n} symlinks={links}")
+          if links == 0:
+              sys.exit("FATAL: asset carries no symlink members; the A/B would be vacuous")
+          PY
+
+      - name: Install three times at each state
+        timeout-minutes: 25
+        run: |
+          set +e
+          set -uo pipefail
+          for st in base head merge; do
+            [ -d "$WORK/src/$st" ] || { echo "== $st absent, skipped"; continue; }
+            echo "::group::$st"
+            python3 "$GITHUB_WORKSPACE/scripts/probe_9487.py" \
+              --repo-root "$WORK/src/$st" \
+              --asset "$WORK/asset.zip" --asset-name "$SD_ASSET" --tag "$SD_TAG" \
+              --install-root "$WORK/inst/$st" --installs 3 \
+              --label "$st" --out "$WORK/out/9487_$st.json" > "$WORK/out/9487_$st.log" 2>&1
+            echo "probe rc=$? ($st)"
+            tail -5 "$WORK/out/9487_$st.log"
+            echo "::endgroup::"
+          done
+          exit 0
+
+      - name: Verdict
+        if: always()
+        run: |
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/verdict_9487.py" "$WORK/out" \
+            | tee "$WORK/out/VERDICT_9487.md" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9487
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- PR 9362
+  gpu:
+    name: "9362 driver free VRAM + 9314 evidence (GPU exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    # The only job allowed to allocate VRAM. Serialised against any other run of
+    # this group so a co-tenant cannot move the number being measured.
+    concurrency:
+      group: amd-devlab-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Isolation and hardware gate
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/v9362"; mkdir -p "$WORK"/{bin,out,src,tmp}
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "refused privilege escalation: $*" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          { echo "WORK=$WORK"; echo "TMPDIR=$WORK/tmp"; echo "PATH=$WORK/bin:$PATH"
+            echo "UNSLOTH_STUDIO_HOME=$WORK/studio"; } >> "$GITHUB_ENV"
+          rocminfo | grep -E 'Marketing Name:|^ *Name: *gfx' | head -6 || true
+          rocm-smi || true
+
+      - name: Clone and resolve states for 9362 and 9314
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$WORK/src/unsloth"
+          cd "$WORK/src/unsloth"
+          for pr in 9362 9314; do
+            git fetch -q origin "refs/pull/$pr/head:pr$pr-head" || true
+            git fetch -q origin "refs/pull/$pr/merge:pr$pr-merge" || true
+          done
+          B62=$(git merge-base origin/main pr9362-head)
+          { echo "9362 base  $B62"
+            echo "9362 head  $(git rev-parse pr9362-head)"
+            echo "9314 head  $(git rev-parse pr9314-head 2>/dev/null || echo none)"; } \
+            | tee "$WORK/out/commits.txt"
+          git worktree add -q --detach "$WORK/src/base62" "$B62"
+          git worktree add -q --detach "$WORK/src/head62" pr9362-head
+          git rev-parse pr9362-merge >/dev/null 2>&1 && \
+            git worktree add -q --detach "$WORK/src/merge62" pr9362-merge || true
+
+      - name: Install Unsloth Studio (ROCm torch)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/head62"
+          set +e
+          bash install.sh --local 2>&1 | tee "$WORK/out/install.log" | tail -25
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "install.sh exit=$rc"; [ "$rc" -eq 0 ] || exit "$rc"
+          VENV=""
+          for cand in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$cand/bin/python" ] && { VENV="$cand"; break; }
+          done
+          [ -n "$VENV" ] || { echo "FATAL: no Studio venv"; ls -la "$UNSLOTH_STUDIO_HOME"; exit 1; }
+          echo "STUDIO_VENV=$VENV" >> "$GITHUB_ENV"
+          "$VENV/bin/python" - <<'PY'
+          import sys, torch
+          print("torch", torch.__version__, "hip", torch.version.hip)
+          if not torch.version.hip: sys.exit("FATAL: torch is not a ROCm build")
+          if not torch.cuda.is_available(): sys.exit("FATAL: torch cannot see the GPU")
+          p = torch.cuda.get_device_properties(0)
+          print("device", p.name, getattr(p, "gcnArchName", "?"),
+                "integrated", getattr(p, "is_integrated", None), "total", p.total_memory)
+          if getattr(p, "gcnArchName", "") and "gfx1151" not in p.gcnArchName:
+              sys.exit(f"FATAL: expected gfx1151, got {p.gcnArchName}")
+          PY
+
+      - name: 9314 evidence, is the widening inert on Linux
+        timeout-minutes: 10
+        run: |
+          set +e
+          "$STUDIO_VENV/bin/python" - > "$WORK/out/9314_linux.txt" 2>&1 <<'PY'
+          import json, platform, torch
+          p = torch.cuda.get_device_properties(0)
+          free, total = torch.cuda.mem_get_info(0)
+          out = {
+            "platform": platform.system(),
+            "props_total_gib": p.total_memory / 1024**3,
+            "driver_total_gib": total / 1024**3,
+            "driver_free_gib": free / 1024**3,
+            "is_integrated": getattr(p, "is_integrated", None),
+            "widens": total > p.total_memory,
+            # 9314 only edits a function that early-returns off Windows, so on
+            # Linux it cannot change anything. This records that rather than
+            # claiming the PR was exercised.
+            "note": "9314 edits a Windows-only path; on Linux it is a no-op",
+          }
+          print(json.dumps(out, indent = 2))
+          PY
+          cat "$WORK/out/9314_linux.txt"
+          exit 0
+
+      - name: 9362 differential, another process holding VRAM
+        timeout-minutes: 30
+        run: |
+          set +e
+          set -uo pipefail
+          PY="$STUDIO_VENV/bin/python"
+          P="$GITHUB_WORKSPACE/scripts/probe_9362.py"
+
+          # Idle control: three samples, so drift can be distinguished from the
+          # holder's effect. A noisy baseline invalidates the comparison.
+          for i in 1 2 3; do
+            "$PY" "$P" observe --repo-root "$WORK/src/head62" \
+              --label "idle-$i" --out "$WORK/out/idle_$i.json" > /dev/null 2>&1
+          done
+
+          "$PY" "$P" holder --gib 4 --max-seconds 900 > "$WORK/out/holder.log" 2>&1 &
+          HPID=$!
+          for i in $(seq 1 90); do grep -q READY "$WORK/out/holder.log" 2>/dev/null && break; sleep 2; done
+          cat "$WORK/out/holder.log"
+          if ! grep -q READY "$WORK/out/holder.log"; then
+            echo "FATAL: holder never became ready; the differential cannot be measured"
+            kill $HPID 2>/dev/null; exit 1
+          fi
+
+          for st in base62 head62 merge62; do
+            [ -d "$WORK/src/$st" ] || continue
+            "$PY" "$P" observe --repo-root "$WORK/src/$st" \
+              --label "$st" --out "$WORK/out/busy_$st.json" > /dev/null 2>&1
+            echo "observed $st rc=$?"
+          done
+
+          kill $HPID 2>/dev/null; sleep 8
+          "$PY" "$P" observe --repo-root "$WORK/src/head62" \
+            --label "recovered" --out "$WORK/out/recovered.json" > /dev/null 2>&1
+          exit 0
+
+      - name: Verdict
+        if: always()
+        run: |
+          set +e
+          "$STUDIO_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verdict_9362.py" "$WORK/out" \
+            | tee "$WORK/out/VERDICT_9362.md" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9362
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ------------------------------------------------------- backend suites
+  suites:
+    name: "Backend suites, base vs head (GPU masked)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Isolation gate
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/vsuites"; mkdir -p "$WORK"/{bin,out,src,tmp}
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "refused privilege escalation: $*" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          { echo "WORK=$WORK"; echo "TMPDIR=$WORK/tmp"; echo "PATH=$WORK/bin:$PATH"
+            echo "UNSLOTH_STUDIO_HOME=$WORK/studio"; } >> "$GITHUB_ENV"
+
+      - name: Clone and resolve every state
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$WORK/src/unsloth"
+          cd "$WORK/src/unsloth"
+          for pr in 9487 9362 9314; do
+            git fetch -q origin "refs/pull/$pr/head:pr$pr-head" || true
+          done
+          for pr in 9487 9362 9314; do
+            b=$(git merge-base origin/main "pr$pr-head" 2>/dev/null) || continue
+            git worktree add -q --detach "$WORK/src/${pr}_base" "$b"
+            git worktree add -q --detach "$WORK/src/${pr}_head" "pr$pr-head"
+            echo "$pr base=$b head=$(git rev-parse pr$pr-head)"
+          done | tee "$WORK/out/commits.txt"
+
+      - name: Install Unsloth Studio (ROCm torch)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/9362_head"
+          set +e
+          bash install.sh --local 2>&1 | tee "$WORK/out/install.log" | tail -20
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          VENV=""
+          for cand in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$cand/bin/python" ] && { VENV="$cand"; break; }
+          done
+          [ -n "$VENV" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "STUDIO_VENV=$VENV" >> "$GITHUB_ENV"
+          "$VENV/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      - name: Run each PR's suites at base and head
+        timeout-minutes: 45
+        run: |
+          set +e
+          set -uo pipefail
+          PY="$STUDIO_VENV/bin/python"
+          run_set() {
+            pr="$1"; state="$2"; shift 2
+            d="$WORK/src/${pr}_${state}/studio/backend"
+            [ -d "$d" ] || { echo "$pr $state: absent"; return; }
+            ( cd "$d" && "$PY" -m pytest -q --timeout=600 "$@" ) \
+              > "$WORK/out/pytest_${pr}_${state}.log" 2>&1
+            echo "$pr $state rc=$? :: $(tail -1 "$WORK/out/pytest_${pr}_${state}.log")" \
+              | tee -a "$WORK/out/suites.txt"
+          }
+          for st in base head; do
+            run_set 9487 $st tests/test_sd_cpp_install.py
+            run_set 9362 $st tests/test_utils.py tests/test_system_poll_no_cuda_context.py \
+              tests/test_amd_apu_unified_memory.py tests/test_rocm_vram_probe_no_hip_context.py \
+              tests/test_amd_smi_hip_index_and_coverage.py tests/test_gpu_selection.py
+            run_set 9314 $st tests/test_rocm_windows_vram_7072.py \
+              tests/test_rocm_windows_vram_7452.py tests/test_rocm_windows_mem_guards_8403.py
+          done
+          echo; cat "$WORK/out/suites.txt"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "## Backend suites, base vs head"; echo '```'
+            cat "$WORK/out/suites.txt" 2>/dev/null || echo "(none)"; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suites
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- PR 9315
+  frontend:
+    name: "9315 frontend, merge commit vs parent"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 60
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Isolation gate and clone
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/vfe"; mkdir -p "$WORK"/{bin,out,src,tmp}
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "refused privilege escalation: $*" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          { echo "WORK=$WORK"; echo "TMPDIR=$WORK/tmp"; echo "PATH=$WORK/bin:$PATH"; } >> "$GITHUB_ENV"
+          node -v; npm -v
+          git clone -q --filter=blob:none "$UPSTREAM" "$WORK/src/unsloth"
+          cd "$WORK/src/unsloth"
+          # 9315 is already merged, so its "head" is the merge commit in main and
+          # the pre state is that commit's first parent. This is a post-merge
+          # regression check, not a pre-merge review.
+          M=$(git log origin/main --format=%H --grep='(#9315)' -1)
+          [ -n "$M" ] || { echo "FATAL: cannot find the 9315 merge commit in main"; exit 1; }
+          P=$(git rev-parse "$M^")
+          { echo "9315 merge  $M"; echo "9315 parent $P"; } | tee "$WORK/out/commits.txt"
+          git worktree add -q --detach "$WORK/src/post" "$M"
+          git worktree add -q --detach "$WORK/src/pre" "$P"
+
+      - name: Frontend CI set at both states
+        timeout-minutes: 45
+        run: |
+          set +e
+          set -uo pipefail
+          for st in pre post; do
+            d="$WORK/src/$st/studio/frontend"
+            echo "::group::$st"
+            ( cd "$d" && npm ci ) > "$WORK/out/npmci_$st.log" 2>&1
+            echo "npm ci rc=$?"
+            for t in "i18n:check:strict" "typecheck" "test" "biome:check"; do
+              ( cd "$d" && npm run "$t" ) > "$WORK/out/${st}_${t//:/_}.log" 2>&1
+              echo "$st $t rc=$? :: $(tail -2 "$WORK/out/${st}_${t//:/_}.log" | tr '\n' ' ')" \
+                | tee -a "$WORK/out/frontend.txt"
+            done
+            echo "::endgroup::"
+          done
+          echo; cat "$WORK/out/frontend.txt"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "## 9315 frontend, parent vs merge commit"; echo '```'
+            cat "$WORK/out/frontend.txt" 2>/dev/null || echo "(none)"; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9315
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
