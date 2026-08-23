@@ -31,7 +31,7 @@ concurrency:
 jobs:
   quants:
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 150
+    timeout-minutes: 240
     env:
       LLAMA_BUILD: "b10590"
       HF_REPO: "unsloth/Qwen3.8-27B-GGUF"
@@ -172,9 +172,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK/models"
-          for pair in "v2:$V2_REV" "v3:$V3_REV"; do
-            label="${pair%%:*}"; rev="${pair##*:}"
-            url="https://huggingface.co/$HF_REPO/resolve/$rev/$QUANT"
+          for pair in "v2:$V2_REV:$QUANT" "v3:$V3_REV:$QUANT" "udq4km:$V3_REV:Qwen3.8-27B-UD-Q4_K_M.gguf"; do
+            label="${pair%%:*}"; rest="${pair#*:}"; rev="${rest%%:*}"; file="${rest##*:}"
+            url="https://huggingface.co/$HF_REPO/resolve/$rev/$file"
             echo "== $label from $rev"
             curl -fL --retry 5 --retry-delay 10 -o "$label.gguf" "$url"
             ls -l "$label.gguf"
@@ -191,7 +191,7 @@ jobs:
             2>&1 | tee "$WORK/out/header_diff.txt" | tail -40
 
       - name: Generate on every backend and revision
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           # GitHub runs step shells with -e, so a crashing cell would abort the
           # step before its exit code could be recorded. A crash is the result
@@ -200,6 +200,15 @@ jobs:
           set -uo pipefail
           cd "$WORK"
           : > out/matrix.txt
+          # llama.cpp#27431 reports the crash landing at ~99.8% of prompt
+          # processing, with short prompts working. A 7-token prompt therefore
+          # tests the one regime that reporter says does not fail.
+          python3 -c 'para = ("The sea has been described by sailors, poets and cartographers "
+            "for as long as records exist, and every account differs in the details it keeps. "
+            "Consider the tides, the salinity gradients, the migration of cold water masses, "
+            "and the way a storm reorganises the surface for days afterwards. "); print((para * 260).strip())' \
+            > long_prompt.txt
+          wc -w long_prompt.txt
           for flavour in vulkan-x64 rocm-7.14-x64; do
             # llama-completion is the non-interactive binary. llama-cli was
             # rewritten into a chat UI whose args differ (it rejects -no-cnv and
@@ -216,21 +225,28 @@ jobs:
             fi
             libdir=$(dirname "$cli")
             echo "$flavour: using $(basename "$cli") with $oneshot"
-            for rev in v2 v3; do
-              log="out/${flavour}_${rev}.log"
-              echo "===== $flavour $rev"
-              # Greedy and seeded so the two revisions are comparable, short so a
-              # crash on the first token is the thing being measured rather than
-              # a long run being waited on.
+            for rev in v2 v3 udq4km; do
+             for mode in short long; do
+              log="out/${flavour}_${rev}_${mode}.log"
+              echo "===== $flavour $rev $mode"
+              # The long cell mirrors the reporter's configuration: quantised KV
+              # cache, flash attention and a large context, since those change
+              # the kernels prompt processing actually dispatches.
+              if [ "$mode" = short ]; then
+                flags=(-p "Write one sentence about the sea." -c 4096)
+              else
+                flags=(-f long_prompt.txt -c 32768 -fa auto
+                       --cache-type-k q8_0 --cache-type-v q8_0)
+              fi
+              # Greedy and seeded so the revisions are comparable.
               # -no-cnv is load-bearing: without it llama-cli opens a chat
               # session for a template model, ignores -n and waits on stdin, and
               # the run is killed by its own timeout instead of generating.
               LD_LIBRARY_PATH="$libdir:$WORK/vk/usr/lib/x86_64-linux-gnu" \
               timeout 420 "$cli" \
                 -m "models/$rev.gguf" \
-                -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup -v \
-                $oneshot \
-                -p "Write one sentence about the sea." \
+                -ngl 999 --temp 0 --seed 1234 -n 64 --no-warmup -v \
+                $oneshot "${flags[@]}" \
                 < /dev/null > "$log" 2>&1
               rc=$?
               # Which device actually holds the weights. system_info is the
@@ -241,10 +257,12 @@ jobs:
               backend=$(grep -aoE "load_tensors: *[A-Za-z]+[0-9]* model buffer size" "$log" \
                 | awk '{print $2}' | sort -u | tr '\n' '+' | sed 's/+$//')
               backend="${backend:-unknown}"
-              printf '%-16s %-3s backend=%-9s exit=%-4s %s\n' "$flavour" "$rev" "$backend" "$rc" \
-                "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV' "$log" | sort -u | tr '\n' ',' )" \
+              printf '%-16s %-7s %-6s backend=%-9s exit=%-4s %s\n' \
+                "$flavour" "$rev" "$mode" "$backend" "$rc" \
+                "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV|Channel Error' "$log" | sort -u | tr '\n' ',' )" \
                 | tee -a out/matrix.txt
-              tail -25 "$log"
+              tail -15 "$log"
+             done
             done
           done
           echo; cat out/matrix.txt
