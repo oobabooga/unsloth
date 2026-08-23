@@ -128,16 +128,29 @@ jobs:
       - name: Generate on every backend and revision
         timeout-minutes: 60
         run: |
+          # GitHub runs step shells with -e, so a crashing cell would abort the
+          # step before its exit code could be recorded. A crash is the result
+          # here, so errexit is explicitly off.
+          set +e
           set -uo pipefail
           cd "$WORK"
           : > out/matrix.txt
           for flavour in vulkan-x64 rocm-7.14-x64; do
-            cli=$(find "build-$flavour" -name llama-cli -type f 2>/dev/null | head -1)
+            # llama-completion is the non-interactive binary. llama-cli was
+            # rewritten into a chat UI whose args differ (it rejects -no-cnv and
+            # takes -st instead), and left to itself it waits on stdin.
+            cli=$(find "build-$flavour" -name llama-completion -type f 2>/dev/null | head -1)
+            oneshot="-no-cnv"
+            if [ -z "$cli" ]; then
+              cli=$(find "build-$flavour" -name llama-cli -type f 2>/dev/null | head -1)
+              oneshot="-st"
+            fi
             if [ -z "$cli" ]; then
               echo "$flavour: build missing, skipped" | tee -a out/matrix.txt
               continue
             fi
             libdir=$(dirname "$cli")
+            echo "$flavour: using $(basename "$cli") with $oneshot"
             for rev in v2 v3; do
               log="out/${flavour}_${rev}.log"
               echo "===== $flavour $rev"
@@ -150,7 +163,7 @@ jobs:
               LD_LIBRARY_PATH="$libdir" timeout 420 "$cli" \
                 -m "models/$rev.gguf" \
                 -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup \
-                -no-cnv --no-display-prompt \
+                $oneshot \
                 -p "Write one sentence about the sea." \
                 < /dev/null > "$log" 2>&1
               rc=$?
