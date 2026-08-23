@@ -228,20 +228,19 @@ jobs:
               LD_LIBRARY_PATH="$libdir:$WORK/vk/usr/lib/x86_64-linux-gnu" \
               timeout 420 "$cli" \
                 -m "models/$rev.gguf" \
-                -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup \
+                -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup -v \
                 $oneshot \
                 -p "Write one sentence about the sea." \
                 < /dev/null > "$log" 2>&1
               rc=$?
-              # Which backend actually registered. A cell that fell back to CPU
-              # is not a Vulkan result and must not be reported as one.
-              sysinfo=$(grep -a "system_info:" "$log" | head -1)
-              echo "$sysinfo" | tr '|' '\n' | grep -aE "ROCm|Vulkan|BLAS" | head -3
-              backend="cpu-only"
-              case "$sysinfo" in
-                *Vulkan*) backend="vulkan" ;;
-                *ROCm*)   backend="rocm" ;;
-              esac
+              # Which device actually holds the weights. system_info is the
+              # wrong place to look: it advertises ROCm but says nothing about
+              # Vulkan, so reading it labelled working Vulkan runs "cpu-only".
+              # The tensor buffer line names the device that was really used.
+              grep -aE "load_backend: loaded|model buffer size" "$log" | head -8
+              backend=$(grep -aoE "load_tensors: *[A-Za-z]+[0-9]* model buffer size" "$log" \
+                | awk '{print $2}' | sort -u | tr '\n' '+' | sed 's/+$//')
+              backend="${backend:-unknown}"
               printf '%-16s %-3s backend=%-9s exit=%-4s %s\n' "$flavour" "$rev" "$backend" "$rc" \
                 "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV' "$log" | sort -u | tr '\n' ',' )" \
                 | tee -a out/matrix.txt
