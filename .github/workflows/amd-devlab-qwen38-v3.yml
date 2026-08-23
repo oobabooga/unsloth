@@ -145,6 +145,28 @@ jobs:
           ls "$(dirname "$(find "$WORK/build-vulkan-x64" -name llama-completion | head -1)")" | head -30
           echo "::endgroup::"
 
+      - name: Probe the Vulkan device list
+        timeout-minutes: 5
+        run: |
+          set +e
+          set -uo pipefail
+          # The library loads and its deps resolve, so the fallback happens
+          # later: either RADV enumerates no device, or the runner cannot open
+          # a render node. --list-devices makes ggml say which, and -v exposes
+          # the backend registration it otherwise swallows.
+          echo "::group::render nodes and identity"
+          id; ls -l /dev/dri 2>&1 | head; ls -l /dev/kfd 2>&1 | head -3
+          echo "::endgroup::"
+
+          echo "::group::llama device list, vulkan build"
+          cli=$(find "$WORK/build-vulkan-x64" -name llama-completion -type f | head -1)
+          libdir=$(dirname "$cli")
+          LD_LIBRARY_PATH="$libdir" "$cli" --list-devices 2>&1 | head -20
+          echo "-- with verbose backend registration:"
+          LD_LIBRARY_PATH="$libdir" GGML_VK_VISIBLE_DEVICES=0 \
+            "$cli" -v --list-devices 2>&1 | grep -aiE "vulkan|device|backend|error|fail" | head -20
+          echo "::endgroup::"
+
       - name: Download the V2 and V3 quant
         timeout-minutes: 60
         run: |
