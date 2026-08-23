@@ -85,6 +85,38 @@ jobs:
             "$STUDIO_VENV/bin/python" -m pytest -q "$T" > "$WORK/out/masked_all.log" 2>&1
           echo "masked   suite  rc=$? :: $(tail -1 "$WORK/out/masked_all.log")" | tee -a "$WORK/out/recheck.txt"
 
+          echo "== the partition guard, standalone and unmasked"
+          PART="$T::test_context_free_rocm_smi_declines_whole_gpu_metrics_for_a_partition"
+          "$STUDIO_VENV/bin/python" -m pytest -q "$PART" > "$WORK/out/partition_one.log" 2>&1
+          echo "partition standalone rc=$? :: $(tail -1 "$WORK/out/partition_one.log")" | tee -a "$WORK/out/recheck.txt"
+
+          # Why: the amd-smi branch breaks on the total mismatch, then the Linux
+          # DRM sysfs fallback answers with real host data, so the decline the
+          # test asserts never happens on a machine where sysfs works.
+          "$STUDIO_VENV/bin/python" - > "$WORK/out/partition_why.txt" 2>&1 <<'PY2'
+          import sys
+          sys.path.insert(0, ".")
+          import utils.hardware.hardware as hw
+          from utils.hardware import amd
+          gib = 1 << 30
+          hw.IS_ROCM = True
+          hw._get_parent_visible_gpu_spec = lambda: {
+              "raw": None, "numeric_ids": [0], "supports_explicit_gpu_ids": True}
+          amd.get_hip_id_by_gpu_index = lambda: {0: 0}
+          hw._torch_get_physical_gpu_count = lambda: 1
+          hw._smi_query = lambda *a, **k: {
+              "available": True,
+              "devices": [{"visible_ordinal": 0, "vram_used_gb": 70.0, "vram_total_gb": 80.0}]}
+          got = hw._context_free_cuda_memory_info(0, 10 * gib)
+          print("with sysfs reachable ->", got)
+          probe = hw._rocm_system_wide_vram_by_index([{"index": 0, "vram_total_gb": 10.0}])
+          print("sysfs resolver returned ->", probe)
+          # Neutralise only the sysfs fallback; the smi guard should still decline.
+          hw._rocm_system_wide_vram_by_index = lambda *a, **k: {}
+          print("with sysfs neutralised ->", hw._context_free_cuda_memory_info(0, 10 * gib))
+          PY2
+          cat "$WORK/out/partition_why.txt"
+
           echo; cat "$WORK/out/recheck.txt"
           exit 0
 
