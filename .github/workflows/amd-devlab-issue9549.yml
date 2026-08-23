@@ -152,8 +152,16 @@ jobs:
             ls -R "$UNSLOTH_STUDIO_HOME/llama.cpp" | head -40 || true
           fi
 
-          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
+          # The installer's venv name is not stable across versions: current
+          # builds use <home>/unsloth_studio, older ones <home>/.venv_t5_NNN.
+          # Pick the first that actually has an interpreter.
+          VENV=""
+          for cand in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$cand/bin/python" ] && { VENV="$cand"; break; }
+          done
+          [ -n "$VENV" ] || { echo "FATAL: no Studio venv under $UNSLOTH_STUDIO_HOME"; ls -la "$UNSLOTH_STUDIO_HOME"; exit 1; }
           echo "venv=$VENV"
+          echo "STUDIO_VENV=$VENV" >> "$GITHUB_ENV"
           "$VENV/bin/python" - <<'PY'
           import sys
           import torch
@@ -173,7 +181,8 @@ jobs:
         run: |
           set -euo pipefail
           BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
-          [ -x "$BIN" ] || BIN=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_*/bin/unsloth | head -1)
+          [ -x "$BIN" ] || BIN="$STUDIO_VENV/bin/unsloth"
+          [ -x "$BIN" ] || { echo "FATAL: no unsloth CLI"; ls -la "$UNSLOTH_STUDIO_HOME/bin" "$STUDIO_VENV/bin" || true; exit 1; }
           echo "unsloth bin: $BIN"
           LOG="$WORK_ROOT/results/studio.log"
           # Detached with setsid, output to a FILE: a piped stdout whose reader
@@ -195,8 +204,7 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
-          PY="$VENV/bin/python"; [ -x "$PY" ] || PY=python3
+          PY="$STUDIO_VENV/bin/python"
           "$PY" "$GITHUB_WORKSPACE/scripts/probe_9549.py" \
             --base-url "http://127.0.0.1:$STUDIO_PORT" \
             --password "$STUDIO_PASSWORD" \
@@ -209,9 +217,9 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          cp -v "$GITHUB_WORKSPACE"/tests/*.py "$UNSLOTH_REPO/studio/backend/tests/" 2>/dev/null || true
-          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
-          PY="$VENV/bin/python"; [ -x "$PY" ] || PY=python3
+          cp -v "$GITHUB_WORKSPACE"/tests/*.py "$UNSLOTH_REPO/studio/backend/tests/"
+          PY="${STUDIO_VENV:-}/bin/python"
+          [ -x "$PY" ] || { echo "no Studio venv; skipping the mocked leg"; exit 0; }
           "$PY" -m pip install pytest pytest-asyncio pytest-timeout > /dev/null
           cd "$UNSLOTH_REPO/studio/backend"
           "$PY" -m pytest -q --timeout=300 \
@@ -219,6 +227,7 @@ jobs:
             tests/test_rocm_windows_vram_7452.py \
             tests/test_model_memory_settings.py \
             tests/test_rocm_windows_model_memory_9549.py \
+            tests/test_mtp_context_refit_9550.py \
             2>&1 | tee "$WORK_ROOT/results/pytest_windows_leg.log"
 
       - name: Summary
