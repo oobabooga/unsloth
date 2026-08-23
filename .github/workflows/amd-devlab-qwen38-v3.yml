@@ -80,6 +80,36 @@ jobs:
           # answered the question.
           ls /usr/share/vulkan/icd.d/ 2>/dev/null || echo "(no icd.d)"
           command -v vulkaninfo && vulkaninfo --summary 2>&1 | head -30 || echo "(no vulkaninfo)"
+          # An ICD json is the driver, not the loader. ggml-vulkan dlopens
+          # libvulkan.so.1, and without it the whole Vulkan backend fails to
+          # register and llama silently runs on CPU instead, which looks like a
+          # clean pass and answers nothing.
+          ldconfig -p | grep -i vulkan || echo "(no vulkan libs in ldconfig)"
+          echo "::endgroup::"
+
+          echo "::group::vulkan loader"
+          if ldconfig -p | grep -q 'libvulkan\.so\.1'; then
+            echo "loader present system-wide"
+          else
+            # Unpacked into the job's own tree, never installed: no apt, no
+            # system package is touched, and it dies with the runner.
+            echo "loader missing, unpacking libvulkan1 locally"
+            mkdir -p "$WORK/vk"
+            ( cd "$WORK/vk"
+              for pkg in libvulkan1 mesa-vulkan-drivers; do
+                url=$(curl -s "https://packages.ubuntu.com/noble/amd64/$pkg/download" \
+                  | grep -oE 'https?://[^"]*'"$pkg"'[^"]*_amd64\.deb' | head -1)
+                echo "$pkg -> ${url:-none}"
+                [ -n "$url" ] && curl -fLs -o "$pkg.deb" "$url" && dpkg-deb -x "$pkg.deb" . || true
+              done )
+            find "$WORK/vk" -name 'libvulkan*' -o -name 'libvulkan_radeon*' | head
+          fi
+          # The RADV ICD, by glob: the filename is radeon_icd.json on some
+          # images and radeon_icd.x86_64.json on others, and naming the wrong
+          # one is another way to land silently on CPU.
+          icd=$(ls /usr/share/vulkan/icd.d/radeon_icd*.json "$WORK"/vk/usr/share/vulkan/icd.d/radeon_icd*.json 2>/dev/null | head -1)
+          echo "ICD: ${icd:-none found}"
+          [ -n "$icd" ] && echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
           echo "::endgroup::"
 
       - name: Fetch llama.cpp release builds
@@ -160,15 +190,24 @@ jobs:
               # -no-cnv is load-bearing: without it llama-cli opens a chat
               # session for a template model, ignores -n and waits on stdin, and
               # the run is killed by its own timeout instead of generating.
-              LD_LIBRARY_PATH="$libdir" timeout 420 "$cli" \
+              LD_LIBRARY_PATH="$libdir:$WORK/vk/usr/lib/x86_64-linux-gnu" \
+              timeout 420 "$cli" \
                 -m "models/$rev.gguf" \
                 -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup \
                 $oneshot \
                 -p "Write one sentence about the sea." \
                 < /dev/null > "$log" 2>&1
               rc=$?
-              grep -aE "ggml_vulkan|ROCm[0-9]|using device|load_tensors:.*(buffer size|offload)" "$log" | head -6 || true
-              printf '%-16s %-3s exit=%-4s %s\n' "$flavour" "$rev" "$rc" \
+              # Which backend actually registered. A cell that fell back to CPU
+              # is not a Vulkan result and must not be reported as one.
+              sysinfo=$(grep -a "system_info:" "$log" | head -1)
+              echo "$sysinfo" | tr '|' '\n' | grep -aE "ROCm|Vulkan|BLAS" | head -3
+              backend="cpu-only"
+              case "$sysinfo" in
+                *Vulkan*) backend="vulkan" ;;
+                *ROCm*)   backend="rocm" ;;
+              esac
+              printf '%-16s %-3s backend=%-9s exit=%-4s %s\n' "$flavour" "$rev" "$backend" "$rc" \
                 "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV' "$log" | sort -u | tr '\n' ',' )" \
                 | tee -a out/matrix.txt
               tail -25 "$log"
