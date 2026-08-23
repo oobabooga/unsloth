@@ -84,7 +84,19 @@ jobs:
           # $HOME and /tmp share a ~32 GiB root overlay; a ROCm torch wheel set
           # plus the model copies will not fit there.
           WORK_ROOT="$RUNNER_TEMP/unsloth-work"
-          mkdir -p "$WORK_ROOT"/{models,tmp,results,cache/{huggingface,torch,uv,pip,xdg}}
+          mkdir -p "$WORK_ROOT"/{models,tmp,results,bin,cache/{huggingface,torch,uv,pip,xdg}}
+
+          # setup.sh reaches for apt to add optional build tools. Nothing here
+          # needs them (the run asserts it took the prebuilt llama.cpp anyway),
+          # and the job should not be able to change the machine even where the
+          # runner would let it. A shim on PATH makes that checkable rather than
+          # assumed, and logs every attempt.
+          cat > "$WORK_ROOT/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "REFUSED privilege escalation: $*" | tee -a "$WORK_ROOT/results/escalation-attempts.log" >&2
+          exit 1
+          SH
+          chmod +x "$WORK_ROOT/bin/sudo"
           {
             echo "WORK_ROOT=$WORK_ROOT"
             echo "TMPDIR=$WORK_ROOT/tmp"
@@ -96,6 +108,7 @@ jobs:
             echo "XDG_CACHE_HOME=$WORK_ROOT/cache/xdg"
             echo "UNSLOTH_STUDIO_HOME=$WORK_ROOT/studio"
             echo "UNSLOTH_REPO=$WORK_ROOT/unsloth"
+            echo "PATH=$WORK_ROOT/bin:$PATH"
           } >> "$GITHUB_ENV"
 
       - name: Clone the code under test
@@ -226,7 +239,10 @@ jobs:
           PY="${STUDIO_VENV:-}/bin/python"
           [ -x "$PY" ] || { echo "no Studio venv; skipping"; exit 0; }
           cd "$UNSLOTH_REPO/studio/backend"
-          "$PY" - 2>&1 | tee "$WORK_ROOT/results/gpu_probe_diagnostics.log" <<'PY'
+          # Heredoc on the python, not on the tee: bound to the last command in
+          # the pipeline it feeds tee the script text and hands python nothing,
+          # which is how the first run logged its own source.
+          { "$PY" - <<'PY'
           import torch
 
           # PR #9314 widens the Windows APU total from props.total_memory (the
@@ -264,6 +280,7 @@ jobs:
           except Exception as exc:
               print(f"placement probe raised: {exc!r}")
           PY
+          } 2>&1 | tee "$WORK_ROOT/results/gpu_probe_diagnostics.log"
 
       - name: Mocked Windows dual-dGPU leg
         if: always()
