@@ -24,6 +24,8 @@ jobs:
       STUDIO_PASSWORD: "Issue9549Probe!"
       GGUF_URL: "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
       UNSLOTH_SKIP_WHISPER_INSTALL: "1"
+      FIX_REPO: "https://github.com/oobabooga/unsloth"
+      FIX_BRANCH: "fix-9549-9550-9551-validation"
 
     steps:
       - name: Checkout probe scripts
@@ -96,11 +98,13 @@ jobs:
             echo "UNSLOTH_REPO=$WORK_ROOT/unsloth"
           } >> "$GITHUB_ENV"
 
-      - name: Clone unsloth
+      - name: Clone the code under test
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/unslothai/unsloth "$UNSLOTH_REPO"
+          # The branch with the fixes, NOT upstream main: cloning main would
+          # install unmodified code and report a green run that gated nothing.
+          git clone --depth 1 --branch "$FIX_BRANCH" "$FIX_REPO" "$UNSLOTH_REPO"
           cd "$UNSLOTH_REPO"
           git log -1 --format='%H %ad %s'
           git log -1 --format='%H' > "$WORK_ROOT/results/unsloth_commit.txt"
@@ -212,12 +216,63 @@ jobs:
             --out "$WORK_ROOT/results/matrix" \
             --model-copies $WORK_ROOT/models/copy*.gguf
 
+      # Two readings this host is the only one that can give. Neither gates the
+      # run; both answer questions raised against code that ships on it.
+      - name: GPU probe diagnostics
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set -uo pipefail
+          PY="${STUDIO_VENV:-}/bin/python"
+          [ -x "$PY" ] || { echo "no Studio venv; skipping"; exit 0; }
+          cd "$UNSLOTH_REPO/studio/backend"
+          "$PY" - 2>&1 | tee "$WORK_ROOT/results/gpu_probe_diagnostics.log" <<'PY'
+          import torch
+
+          # PR #9314 widens the Windows APU total from props.total_memory (the
+          # dedicated carve-out) to mem_get_info's pool, and its author says it
+          # "needs an APU to validate against rather than a guess". This is that
+          # APU, on Linux rather than Windows, so it shows what the two readings
+          # actually are on gfx1151.
+          props = torch.cuda.get_device_properties(0)
+          free, total = torch.cuda.mem_get_info(0)
+          gib = 1024 ** 3
+          print(f"name                  {props.name}")
+          print(f"gcnArchName           {getattr(props, 'gcnArchName', '?')}")
+          print(f"is_integrated         {getattr(props, 'is_integrated', '?')}")
+          print(f"props.total_memory    {props.total_memory / gib:.2f} GiB")
+          print(f"mem_get_info total    {total / gib:.2f} GiB")
+          print(f"mem_get_info free     {free / gib:.2f} GiB")
+          print(f"widens?               {total > props.total_memory}")
+          try:
+              from utils.hardware.hardware import _rocm_props_total_is_carve_out
+              print(f"classified carve-out  {_rocm_props_total_is_carve_out(props)}")
+          except Exception as exc:
+              print(f"classifier unavailable: {exc}")
+
+          # The previous run logged "GPUs free: [], selected: None" on this host
+          # while /api/system reported the device correctly. Record what the
+          # placement probe actually returns; the matrix pins -ngl by hand, so
+          # this is an observation rather than something the run depends on.
+          try:
+              from core.inference.llama_cpp import LlamaCppBackend
+              backend = LlamaCppBackend()
+              binary = backend._find_llama_server_binary()
+              print(f"llama-server          {binary}")
+              print(f"_get_gpu_memory()     {backend._get_gpu_memory(binary)}")
+              print(f"  for_llama_server    {backend._get_gpu_memory(binary, for_llama_server = True)}")
+          except Exception as exc:
+              print(f"placement probe raised: {exc!r}")
+          PY
+
       - name: Mocked Windows dual-dGPU leg
         if: always()
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          cp -v "$GITHUB_WORKSPACE"/tests/*.py "$UNSLOTH_REPO/studio/backend/tests/"
+          # Both test files ship on the fix branch now, so nothing is copied in:
+          # the staging copies are the pre-fix versions and would silently
+          # replace the ones under test.
           PY="${STUDIO_VENV:-}/bin/python"
           [ -x "$PY" ] || { echo "no Studio venv; skipping the mocked leg"; exit 0; }
           "$PY" -m pip install pytest pytest-asyncio pytest-timeout > /dev/null
@@ -229,6 +284,47 @@ jobs:
             tests/test_rocm_windows_model_memory_9549.py \
             tests/test_mtp_context_refit_9550.py \
             2>&1 | tee "$WORK_ROOT/results/pytest_windows_leg.log"
+
+      - name: Backend suites the fixes could break
+        if: always()
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          PY="${STUDIO_VENV:-}/bin/python"
+          [ -x "$PY" ] || { echo "no Studio venv; skipping"; exit 0; }
+          cd "$UNSLOTH_REPO/studio/backend"
+          # Everything that pins an explicit context being honored verbatim, plus
+          # the arch gate, whose tests assert on the source text of the files the
+          # Model Memory change edits.
+          "$PY" -m pytest -q --timeout=600 \
+            tests/test_llama_cpp_placement.py \
+            tests/test_llama_cpp_context_fit.py \
+            tests/test_mmproj_placement_policy.py \
+            tests/test_tensor_parallel.py \
+            tests/test_gpu_arch_gate_os_matrix_7624.py \
+            tests/test_gpu_memory_mode.py \
+            tests/test_native_context_length.py \
+            2>&1 | tee "$WORK_ROOT/results/pytest_regression.log"
+
+      - name: Frontend CI set
+        if: always()
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cd "$UNSLOTH_REPO/studio/frontend"
+          # Node comes from the Studio install. Parity and the unit tests need no
+          # node_modules; typecheck and biome do, so they are left to the normal
+          # frontend CI rather than installed here.
+          node --experimental-strip-types --no-warnings src/i18n/check-parity.ts --strict \
+            2>&1 | tail -5 | tee "$WORK_ROOT/results/i18n_parity.log"
+          # Counts only: ~142 suites need node_modules and fail on this box
+          # whatever the branch, so the number to compare is against a baseline
+          # run, not zero. Never fails the step on its own.
+          set +e
+          node --experimental-strip-types --test "tests/**/*.test.ts" 2>&1 \
+            | grep -E "^. (tests|pass|fail) " \
+            | tee "$WORK_ROOT/results/frontend_tests.log"
+          set -e
 
       - name: Summary
         if: always()

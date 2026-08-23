@@ -245,6 +245,37 @@ def backend_log_argv(studio_home: Path, since: float) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # One cell
 # --------------------------------------------------------------------------- #
+# Per-launch values that differ for reasons the toggles have nothing to do with.
+# Left in, every cell hashes unique and the comparison says nothing.
+_PER_LAUNCH_FLAGS = ("--port", "-m", "--alias", "--slot-save-path")
+
+# Which cells must produce the same launch, and which must differ. Derived from
+# the policy, not from a previous run: no_ram_reserve only STRIPS, so with no
+# user extras to strip it cannot change anything, and the cells that share a
+# class here are the ones the reporter is toggling between.
+_EXPECTED_CLASSES = [
+    {0, 1, 3, 5, 7},  # nothing emitted (5 of 8, which is the whole complaint)
+    {2, 6},           # keep_resident on, no_ram_reserve off: the lock
+    {4},              # the user's own --mlock, nothing to strip it
+]
+
+
+def _scrub_argv(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg in _PER_LAUNCH_FLAGS:
+            skip = True
+            continue
+        if arg.endswith(".gguf"):
+            continue
+        out.append(arg)
+    return out
+
+
 def run_cell(
     client: Client,
     cell: dict,
@@ -331,9 +362,8 @@ def run_cell(
         ).hexdigest()[:16]
         # The model path differs per cell (distinct copies defeat the page cache),
         # so hash the argv with it removed or every cell looks unique.
-        scrubbed = [a for a in record["argv"] if not a.endswith(".gguf")]
         record["argv_hash_no_model"] = hashlib.sha256(
-            "\0".join(scrubbed).encode()
+            "\0".join(_scrub_argv(record["argv"])).encode()
         ).hexdigest()[:16]
         record["has_mlock"] = "--mlock" in record["argv"]
         record["has_no_mmap"] = "--no-mmap" in record["argv"]
@@ -369,8 +399,9 @@ def render_table(records: list[dict]) -> str:
     header = (
         "| # | keep_resident | no_ram_reserve | user extras | --mlock in argv | "
         "--load-mode | VmLck MB | VmRSS MB | RssFile MB | RssAnon MB | "
-        "mlock_active | reload_required | vram_used MB | gtt_used MB | offloaded |\n"
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "mlock_active | mlock_applicable | reload_required | vram_used MB | "
+        "gtt_used MB | offloaded |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
     )
     rows = []
     for rec in records:
@@ -385,7 +416,7 @@ def render_table(records: list[dict]) -> str:
         offload = (rec.get("child_log") or {}).get("offloaded")
         rows.append(
             "| {i} | {kr} | {nrr} | {ex} | {ml} | {lm} | {lck} | {rss} | {rf} | {ra} | "
-            "{ma} | {rr} | {vram} | {gtt} | {off} |".format(
+            "{ma} | {mapp} | {rr} | {vram} | {gtt} | {off} |".format(
                 i=rec["index"],
                 kr=rec["keep_resident"],
                 nrr=rec["no_ram_reserve"],
@@ -397,6 +428,7 @@ def render_table(records: list[dict]) -> str:
                 rf=mb(status.get("RssFile")),
                 ra=mb(status.get("RssAnon")),
                 ma=settings.get("mlock_active"),
+                mapp=settings.get("mlock_applicable"),
                 rr=settings.get("reload_required"),
                 vram=mb(first.get("mem_info_vram_used"), 1024 * 1024),
                 gtt=mb(first.get("mem_info_gtt_used"), 1024 * 1024),
@@ -459,12 +491,25 @@ def main() -> int:
         if offload and offload[0] != offload[1]:
             problems.append(f"cell {rec['index']} was not fully offloaded: {offload}")
 
-    bare = [rec for rec in records if not rec["extras"]]
-    with_mlock = [rec for rec in records if rec["extras"]]
+    # The launch behaviour itself: which cells emit the same command. This is
+    # what a UI-only change to the Model Memory panel must leave alone.
+    by_hash: dict[str, set[int]] = {}
+    for rec in records:
+        digest = rec.get("argv_hash_no_model")
+        if digest:
+            by_hash.setdefault(digest, set()).add(rec["index"])
+    observed = sorted((sorted(idxs) for idxs in by_hash.values()))
+    expected = sorted(sorted(cls) for cls in _EXPECTED_CLASSES)
+    if observed != expected:
+        problems.append(f"argv classes changed: expected {expected}, got {observed}")
+
     summary = {
-        "bare_argv_hashes": {rec["index"]: rec.get("argv_hash_no_model") for rec in bare},
-        "mlock_extra_argv_hashes": {
-            rec["index"]: rec.get("argv_hash_no_model") for rec in with_mlock
+        "argv_classes": observed,
+        "argv_classes_expected": expected,
+        "argv_hashes": {rec["index"]: rec.get("argv_hash_no_model") for rec in records},
+        "mlock_applicable": {
+            rec["index"]: (rec.get("settings_after_load") or {}).get("mlock_applicable")
+            for rec in records
         },
         "problems": problems,
     }
