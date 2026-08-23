@@ -1,0 +1,258 @@
+name: "issue-9549 model-memory toggles on AMD ROCm"
+
+on:
+  push:
+    branches: [amd-devlab-issue9549]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    env:
+      STUDIO_PORT: "8901"
+      # Not a credential to anything: it only unlocks this throwaway Studio on
+      # loopback, and setting it at launch clears must_change_password, without
+      # which every authenticated route answers 403.
+      STUDIO_PASSWORD: "Issue9549Probe!"
+      GGUF_URL: "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+      UNSLOTH_SKIP_WHISPER_INSTALL: "1"
+
+    steps:
+      - name: Checkout probe scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # --------------------------------------------------------------- #
+      # A1. Hard gate. Every check here is fatal on purpose: without ROCm
+      # userspace the installer silently picks the CPU llama.cpp bundle and
+      # exits 0, and the whole matrix then comes out identical for a reason
+      # that has nothing to do with the toggles.
+      # --------------------------------------------------------------- #
+      - name: Hardware and ROCm gate
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          echo "::group::host"
+          uname -a; lscpu | head -20; free -h; df -h "$RUNNER_TEMP" /
+          lspci -nn | grep -iE 'vga|display|processing accelerator' || true
+          echo "::endgroup::"
+
+          echo "::group::rocm"
+          command -v rocminfo || { echo "FATAL: rocminfo missing"; exit 1; }
+          rocminfo | grep -E 'Name:|Marketing Name:|gfx' | head -40
+          rocminfo | grep -q gfx1151 || { echo "FATAL: no gfx1151 agent"; exit 1; }
+          rocm-smi || true
+          ls -l /dev/kfd || { echo "FATAL: /dev/kfd missing, HIP cannot run"; exit 1; }
+          ls -l /dev/dri/renderD* || { echo "FATAL: no render node"; exit 1; }
+          id -nG
+          echo "::endgroup::"
+
+          echo "::group::limits"
+          echo "ulimit -l (soft): $(ulimit -S -l)"
+          echo "ulimit -l (hard): $(ulimit -H -l)"
+          echo "::endgroup::"
+
+          echo "::group::inherited env that would confound the result"
+          env | grep -E '^(GGML_|HSA_|HIP_|ROCR_|LLAMA_ARG_|UNSLOTH_|CUDA_)' || echo "(none)"
+          echo "::endgroup::"
+
+          echo "::group::amdgpu sysfs"
+          for d in /sys/class/drm/card*/device; do
+            [ -e "$d/mem_info_vram_total" ] || continue
+            echo "$d"
+            for f in mem_info_vram_total mem_info_vram_used mem_info_gtt_total mem_info_gtt_used; do
+              printf '  %s = %s\n' "$f" "$(cat "$d/$f" 2>/dev/null || echo n/a)"
+            done
+          done
+          echo "::endgroup::"
+
+      - name: Prepare workspace roots
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          # $HOME and /tmp share a ~32 GiB root overlay; a ROCm torch wheel set
+          # plus the model copies will not fit there.
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{models,tmp,results,cache/{huggingface,torch,uv,pip,xdg}}
+          {
+            echo "WORK_ROOT=$WORK_ROOT"
+            echo "TMPDIR=$WORK_ROOT/tmp"
+            echo "HF_HOME=$WORK_ROOT/cache/huggingface"
+            echo "HUGGINGFACE_HUB_CACHE=$WORK_ROOT/cache/huggingface/hub"
+            echo "TORCH_HOME=$WORK_ROOT/cache/torch"
+            echo "UV_CACHE_DIR=$WORK_ROOT/cache/uv"
+            echo "PIP_CACHE_DIR=$WORK_ROOT/cache/pip"
+            echo "XDG_CACHE_HOME=$WORK_ROOT/cache/xdg"
+            echo "UNSLOTH_STUDIO_HOME=$WORK_ROOT/studio"
+            echo "UNSLOTH_REPO=$WORK_ROOT/unsloth"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone unsloth
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/unslothai/unsloth "$UNSLOTH_REPO"
+          cd "$UNSLOTH_REPO"
+          git log -1 --format='%H %ad %s'
+          git log -1 --format='%H' > "$WORK_ROOT/results/unsloth_commit.txt"
+
+      - name: Fetch the GGUF and make one cold copy per cell
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          cd "$WORK_ROOT/models"
+          curl -fL --retry 5 --retry-delay 10 -o base.gguf "$GGUF_URL"
+          ls -l base.gguf
+          # Eight distinct files so every cell faults from a cold page cache.
+          # drop_caches needs root, which we do not have.
+          for i in $(seq 0 7); do cp base.gguf "copy$i.gguf"; done
+          rm -f base.gguf
+          ls -l
+          df -h "$RUNNER_TEMP"
+
+      - name: Install Unsloth Studio (with ROCm torch)
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cd "$UNSLOTH_REPO"
+          mkdir -p "$WORK_ROOT/results"
+          # NOT --no-torch: without ROCm torch, IS_ROCM is never set, the APU
+          # unified-memory predicate returns empty, weights_in_host_memory is
+          # False in every cell, and all eight rows come out identical.
+          set +e
+          bash install.sh --local 2>&1 | tee "$WORK_ROOT/results/install.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "install.sh exit=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      - name: Assert we got a real gfx1151 ROCm stack
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if grep -q 'skipped (cmake not found)' "$WORK_ROOT/results/install.log"; then
+            echo "FATAL: llama.cpp fell through to a source build with no cmake"; exit 1
+          fi
+          INFO="$UNSLOTH_STUDIO_HOME/llama.cpp/UNSLOTH_PREBUILT_INFO.json"
+          if [ -f "$INFO" ]; then
+            cat "$INFO"
+            grep -q 'rocm' "$INFO" || { echo "FATAL: llama.cpp bundle is not ROCm"; exit 1; }
+            grep -q 'gfx1151' "$INFO" || echo "WARN: bundle does not name gfx1151"
+          else
+            echo "WARN: no UNSLOTH_PREBUILT_INFO.json at $INFO"
+            ls -R "$UNSLOTH_STUDIO_HOME/llama.cpp" | head -40 || true
+          fi
+
+          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
+          echo "venv=$VENV"
+          "$VENV/bin/python" - <<'PY'
+          import sys
+          import torch
+          print("torch", torch.__version__, "hip", torch.version.hip, "cuda", torch.version.cuda)
+          print("is_available", torch.cuda.is_available(), "count", torch.cuda.device_count())
+          if not torch.version.hip:
+              sys.exit("FATAL: torch is not a ROCm build; every cell would be identical")
+          if not torch.cuda.is_available():
+              sys.exit("FATAL: torch cannot see the GPU")
+          for i in range(torch.cuda.device_count()):
+              p = torch.cuda.get_device_properties(i)
+              print(i, p.name, getattr(p, "gcnArchName", "?"), p.total_memory)
+          PY
+
+      - name: Launch Studio
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          [ -x "$BIN" ] || BIN=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_*/bin/unsloth | head -1)
+          echo "unsloth bin: $BIN"
+          LOG="$WORK_ROOT/results/studio.log"
+          # Detached with setsid, output to a FILE: a piped stdout whose reader
+          # dies leaves the server 500ing on logging-heavy endpoints.
+          # Password via the environment, not --password: a literal value would
+          # show in the process list, and setting it at all is what clears
+          # must_change_password (without which every route answers 403).
+          setsid bash -c "UNSLOTH_STUDIO_PASSWORD='$STUDIO_PASSWORD' '$BIN' studio -H 127.0.0.1 -p $STUDIO_PORT >> '$LOG' 2>&1" < /dev/null > /dev/null 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:$STUDIO_PORT/healthz" > /dev/null 2>&1; then
+              echo "healthy after ${i}0s"; break
+            fi
+            sleep 10
+          done
+          curl -fsS "http://127.0.0.1:$STUDIO_PORT/healthz" || { tail -100 "$LOG"; exit 1; }
+          tail -30 "$LOG"
+
+      - name: Run the 8-cell toggle matrix
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
+          PY="$VENV/bin/python"; [ -x "$PY" ] || PY=python3
+          "$PY" "$GITHUB_WORKSPACE/scripts/probe_9549.py" \
+            --base-url "http://127.0.0.1:$STUDIO_PORT" \
+            --password "$STUDIO_PASSWORD" \
+            --studio-home "$UNSLOTH_STUDIO_HOME" \
+            --out "$WORK_ROOT/results/matrix" \
+            --model-copies $WORK_ROOT/models/copy*.gguf
+
+      - name: Mocked Windows dual-dGPU leg
+        if: always()
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cp -v "$GITHUB_WORKSPACE"/tests/*.py "$UNSLOTH_REPO/studio/backend/tests/" 2>/dev/null || true
+          VENV=$(ls -d "$UNSLOTH_STUDIO_HOME"/.venv_t5_* 2>/dev/null | head -1)
+          PY="$VENV/bin/python"; [ -x "$PY" ] || PY=python3
+          "$PY" -m pip install pytest pytest-asyncio pytest-timeout > /dev/null
+          cd "$UNSLOTH_REPO/studio/backend"
+          "$PY" -m pytest -q --timeout=300 \
+            tests/test_rocm_windows_vram_7072.py \
+            tests/test_rocm_windows_vram_7452.py \
+            tests/test_model_memory_settings.py \
+            tests/test_rocm_windows_model_memory_9549.py \
+            2>&1 | tee "$WORK_ROOT/results/pytest_windows_leg.log"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## issue 9549 - model memory toggles on gfx1151"
+            echo
+            echo "unsloth commit: $(cat "$WORK_ROOT/results/unsloth_commit.txt" 2>/dev/null || echo unknown)"
+            echo
+            cat "$WORK_ROOT/results/matrix/table.md" 2>/dev/null || echo "(no table produced)"
+            echo
+            echo '```json'
+            cat "$WORK_ROOT/results/matrix/summary.json" 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect logs
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set -uo pipefail
+          DEST="$WORK_ROOT/results/studio-logs"
+          mkdir -p "$DEST"
+          cp -r "$UNSLOTH_STUDIO_HOME/logs" "$DEST/" 2>/dev/null || true
+          # Anything under studio_home that names a path is local scratch only.
+          du -sh "$WORK_ROOT/results" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-9549-results
+          path: ${{ env.WORK_ROOT }}/results
+          retention-days: 7
+          if-no-files-found: warn
