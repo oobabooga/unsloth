@@ -361,3 +361,74 @@ jobs:
           path: ${{ env.WORK_ROOT }}/results
           retention-days: 7
           if-no-files-found: warn
+
+  # Same suites, same hardware, upstream main. A ROCm host resolves GPU
+  # visibility differently from the GPU-less runners upstream CI uses, so a
+  # failure here has to be shown to pre-date the fixes rather than argued to.
+  baseline:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 60
+    steps:
+      - name: Prepare workspace roots
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-baseline"
+          mkdir -p "$WORK_ROOT"/{tmp,results,cache/{huggingface,torch,uv,pip,xdg}}
+          {
+            echo "WORK_ROOT=$WORK_ROOT"
+            echo "TMPDIR=$WORK_ROOT/tmp"
+            echo "HF_HOME=$WORK_ROOT/cache/huggingface"
+            echo "TORCH_HOME=$WORK_ROOT/cache/torch"
+            echo "UV_CACHE_DIR=$WORK_ROOT/cache/uv"
+            echo "PIP_CACHE_DIR=$WORK_ROOT/cache/pip"
+            echo "XDG_CACHE_HOME=$WORK_ROOT/cache/xdg"
+            echo "UNSLOTH_STUDIO_HOME=$WORK_ROOT/studio"
+            echo "UNSLOTH_REPO=$WORK_ROOT/unsloth"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone upstream main
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/unslothai/unsloth "$UNSLOTH_REPO"
+          cd "$UNSLOTH_REPO" && git log -1 --format='%H %ad %s'
+
+      - name: Install Unsloth Studio
+        timeout-minutes: 45
+        env:
+          UNSLOTH_SKIP_WHISPER_INSTALL: "1"
+        run: |
+          set -euo pipefail
+          cd "$UNSLOTH_REPO"
+          bash install.sh --local 2>&1 | tail -40
+
+      - name: Same suites on unmodified code
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          VENV=""
+          for cand in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$cand/bin/python" ] && { VENV="$cand"; break; }
+          done
+          [ -n "$VENV" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          cd "$UNSLOTH_REPO/studio/backend"
+          "$VENV/bin/python" -m pip install pytest pytest-asyncio pytest-timeout > /dev/null
+          "$VENV/bin/python" -m pytest -q --timeout=600 \
+            tests/test_llama_cpp_placement.py \
+            tests/test_llama_cpp_context_fit.py \
+            tests/test_mmproj_placement_policy.py \
+            tests/test_tensor_parallel.py \
+            tests/test_gpu_arch_gate_os_matrix_7624.py \
+            tests/test_gpu_memory_mode.py \
+            tests/test_native_context_length.py \
+            2>&1 | tee "$WORK_ROOT/results/pytest_baseline.log" | tail -20
+
+      - name: Upload baseline log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-9549-baseline
+          path: ${{ env.WORK_ROOT }}/results
+          retention-days: 7
+          if-no-files-found: warn
