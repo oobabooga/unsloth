@@ -144,12 +144,17 @@ jobs:
               # Greedy and seeded so the two revisions are comparable, short so a
               # crash on the first token is the thing being measured rather than
               # a long run being waited on.
-              LD_LIBRARY_PATH="$libdir" timeout 900 "$cli" \
+              # -no-cnv is load-bearing: without it llama-cli opens a chat
+              # session for a template model, ignores -n and waits on stdin, and
+              # the run is killed by its own timeout instead of generating.
+              LD_LIBRARY_PATH="$libdir" timeout 420 "$cli" \
                 -m "models/$rev.gguf" \
                 -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup \
+                -no-cnv --no-display-prompt \
                 -p "Write one sentence about the sea." \
-                > "$log" 2>&1
+                < /dev/null > "$log" 2>&1
               rc=$?
+              grep -aE "ggml_vulkan|ROCm[0-9]|using device|load_tensors:.*(buffer size|offload)" "$log" | head -6 || true
               printf '%-16s %-3s exit=%-4s %s\n' "$flavour" "$rev" "$rc" \
                 "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV' "$log" | sort -u | tr '\n' ',' )" \
                 | tee -a out/matrix.txt
@@ -157,6 +162,9 @@ jobs:
             done
           done
           echo; cat out/matrix.txt
+          # A crashing cell is the result, not a broken job: the table and the
+          # logs are the deliverable and the summary step reads them.
+          exit 0
 
       - name: Summary
         if: always()
