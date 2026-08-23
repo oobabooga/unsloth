@@ -107,7 +107,7 @@ jobs:
           # The RADV ICD, by glob: the filename is radeon_icd.json on some
           # images and radeon_icd.x86_64.json on others, and naming the wrong
           # one is another way to land silently on CPU.
-          icd=$(ls /usr/share/vulkan/icd.d/radeon_icd*.json "$WORK"/vk/usr/share/vulkan/icd.d/radeon_icd*.json 2>/dev/null | head -1)
+          icd=$(ls /usr/share/vulkan/icd.d/radeon_icd*.json "$WORK"/vk/usr/share/vulkan/icd.d/radeon_icd*.json 2>/dev/null | head -1 || true)
           echo "ICD: ${icd:-none found}"
           [ -n "$icd" ] && echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
           echo "::endgroup::"
@@ -131,6 +131,19 @@ jobs:
             fi
           done
           du -sh "$WORK"/build-* 2>/dev/null || true
+
+          echo "::group::vulkan backend library"
+          # libvulkan.so.1 is present on this image, so the CPU fallback in the
+          # previous run was not a missing loader. ggml dlopens its backends and
+          # swallows the failure, so resolve the library by hand and let ldd
+          # name whatever it cannot find.
+          vklib=$(find "$WORK/build-vulkan-x64" -name '*ggml-vulkan*' 2>/dev/null | head -1)
+          echo "backend lib: ${vklib:-none}"
+          if [ -n "$vklib" ]; then
+            ldd "$vklib" 2>&1 | grep -iE "not found|vulkan" || echo "(all deps resolve)"
+          fi
+          ls "$(dirname "$(find "$WORK/build-vulkan-x64" -name llama-completion | head -1)")" | head -30
+          echo "::endgroup::"
 
       - name: Download the V2 and V3 quant
         timeout-minutes: 60
