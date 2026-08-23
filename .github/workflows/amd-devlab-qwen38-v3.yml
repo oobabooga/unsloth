@@ -1,0 +1,185 @@
+name: "Qwen3.8-27B V2 vs V3 on AMD"
+
+# A Reddit thread reports the V3 Qwen3.8-27B quants crashing on the first
+# generated token on dual-AMD Vulkan setups (RX 9070 XT + RX 7800 XT, and other
+# RDNA4 + RDNA3 pairs) on Windows, with the V2 revision working. Rolling back
+# the revision fixes it, so the question is whether V3 is a bad quant or whether
+# it exposes something in the backend.
+#
+# This runner cannot answer the dual-GPU Windows half: it is one gfx1151 APU on
+# Linux. What it CAN answer is whether V3 runs clean on AMD at all, on both
+# backends, with everything else held equal. A clean V3 here points at the
+# multi-GPU split rather than the file; a broken V3 here is a much larger
+# finding and is reproducible without the reporter's hardware.
+#
+# No system packages are installed and nothing outside $RUNNER_TEMP is written:
+# the two llama.cpp builds are release tarballs, a sudo shim on PATH refuses any
+# escalation, and there is no pip or apt anywhere in the job.
+
+on:
+  push:
+    branches: [amd-devlab-qwen38-v3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quants:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 150
+    env:
+      LLAMA_BUILD: "b10590"
+      HF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+      # The quant the thread names, and one of the few present under the same
+      # filename in both revisions, so V2 and V3 are the only variable.
+      QUANT: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+      V2_REV: "408fcc1807ab"
+      V3_REV: "main"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Isolation and hardware gate
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/qwen38"
+          mkdir -p "$WORK"/{bin,models,out,tmp}
+
+          # Nothing in this job may touch the system. install.sh is not used
+          # here, but a shim makes that a property of the job rather than a
+          # claim about it: anything reaching for sudo fails loudly.
+          cat > "$WORK/bin/sudo" <<'SH'
+          #!/bin/sh
+          echo "sudo refused: this job installs no system packages ($*)" >&2
+          exit 1
+          SH
+          chmod +x "$WORK/bin/sudo"
+          {
+            echo "WORK=$WORK"
+            echo "TMPDIR=$WORK/tmp"
+            echo "PATH=$WORK/bin:$PATH"
+          } >> "$GITHUB_ENV"
+
+          echo "::group::hardware"
+          uname -a; free -h; df -h "$RUNNER_TEMP"
+          rocminfo | grep -E 'Marketing Name:|gfx' | head -10 || true
+          rocm-smi || true
+          echo "::endgroup::"
+
+          echo "::group::vulkan"
+          # The reporter's backend. If the image has no ICD the Vulkan half of
+          # the matrix cannot run, and saying so beats reporting ROCm as if it
+          # answered the question.
+          ls /usr/share/vulkan/icd.d/ 2>/dev/null || echo "(no icd.d)"
+          command -v vulkaninfo && vulkaninfo --summary 2>&1 | head -30 || echo "(no vulkaninfo)"
+          echo "::endgroup::"
+
+      - name: Fetch llama.cpp release builds
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          base="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_BUILD"
+          for flavour in vulkan-x64 rocm-7.14-x64; do
+            name="llama-$LLAMA_BUILD-bin-ubuntu-$flavour.tar.gz"
+            echo "== $name"
+            if curl -fL --retry 3 -o "$name" "$base/$name"; then
+              mkdir -p "build-$flavour"
+              tar xzf "$name" -C "build-$flavour"
+              rm -f "$name"
+              find "build-$flavour" -name 'llama-cli' -printf '%p\n'
+            else
+              echo "WARN: $name unavailable"
+            fi
+          done
+          du -sh "$WORK"/build-* 2>/dev/null || true
+
+      - name: Download the V2 and V3 quant
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$WORK/models"
+          for pair in "v2:$V2_REV" "v3:$V3_REV"; do
+            label="${pair%%:*}"; rev="${pair##*:}"
+            url="https://huggingface.co/$HF_REPO/resolve/$rev/$QUANT"
+            echo "== $label from $rev"
+            curl -fL --retry 5 --retry-delay 10 -o "$label.gguf" "$url"
+            ls -l "$label.gguf"
+            sha256sum "$label.gguf" | tee -a "$WORK/out/checksums.txt"
+          done
+          df -h "$RUNNER_TEMP"
+
+      - name: Header diff, V2 against V3
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/gguf_local_diff.py" \
+            "$WORK/models/v2.gguf" "$WORK/models/v3.gguf" \
+            2>&1 | tee "$WORK/out/header_diff.txt" | tail -40
+
+      - name: Generate on every backend and revision
+        timeout-minutes: 60
+        run: |
+          set -uo pipefail
+          cd "$WORK"
+          : > out/matrix.txt
+          for flavour in vulkan-x64 rocm-7.14-x64; do
+            cli=$(find "build-$flavour" -name llama-cli -type f 2>/dev/null | head -1)
+            if [ -z "$cli" ]; then
+              echo "$flavour: build missing, skipped" | tee -a out/matrix.txt
+              continue
+            fi
+            libdir=$(dirname "$cli")
+            for rev in v2 v3; do
+              log="out/${flavour}_${rev}.log"
+              echo "===== $flavour $rev"
+              # Greedy and seeded so the two revisions are comparable, short so a
+              # crash on the first token is the thing being measured rather than
+              # a long run being waited on.
+              LD_LIBRARY_PATH="$libdir" timeout 900 "$cli" \
+                -m "models/$rev.gguf" \
+                -ngl 999 --temp 0 --seed 1234 -n 64 -c 4096 --no-warmup \
+                -p "Write one sentence about the sea." \
+                > "$log" 2>&1
+              rc=$?
+              printf '%-16s %-3s exit=%-4s %s\n' "$flavour" "$rev" "$rc" \
+                "$(grep -aoE 'error|assert|Aborted|out of memory|device lost|SIGSEGV' "$log" | sort -u | tr '\n' ',' )" \
+                | tee -a out/matrix.txt
+              tail -25 "$log"
+            done
+          done
+          echo; cat out/matrix.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## Qwen3.8-27B $QUANT, V2 ($V2_REV) against V3 ($V3_REV)"
+            echo
+            echo '```'
+            cat "$WORK/out/matrix.txt" 2>/dev/null || echo "(no matrix)"
+            echo '```'
+            echo
+            echo "### Header diff"
+            echo '```'
+            sed -n '/type moves/,$p' "$WORK/out/header_diff.txt" 2>/dev/null | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen38-v2-v3
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
