@@ -3,6 +3,22 @@
 
 Judges only. The observations come from probes/webkit_paint_probe.py.
 
+The first version of this file asked the page for its renderer through
+`WEBGL_debug_renderer_info` and treated any string that was not a known software
+rasteriser as hardware. On the runner that returned **"Apple GPU" / "Apple Inc."**
+from WebKitGTK on Linux: every WebKit port masks that extension for
+fingerprinting reasons, and there is no runtime switch to unmask it. The reading
+was therefore not a reading at all, and "not llvmpipe" quietly passed it. That is
+the exact failure mode this toolkit exists to prevent, so the string is now
+recognised as MASKED and cannot support a verdict on its own.
+
+What replaced it is evidence the engine does not author:
+
+  * amdgpu's per-fd counters (`drm-engine-gfx`, `drm-memory-vram`) for the render
+    node held open by WebKit's own process, read from /proc by the kernel driver;
+  * which mesa driver that process mapped into its address space
+    (`radeonsi_dri.so` against `swrast_dri.so`).
+
 Three things this deliberately does NOT do:
 
   * It does not treat the frame rate as evidence. An X server with no vblank
@@ -30,9 +46,20 @@ NEEDS = [
 SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "mesa offscreen",
                       "lavapipe", "swiftshader")
 
+# What WebKit reports instead of the device. On a Linux/AMD host this is a mask,
+# not a Mac.
+MASKED_RENDERERS = ("apple gpu", "apple inc")
+
+SOFTWARE_DRIVER_LIBS = ("swrast_dri.so", "llvmpipe", "softpipe")
+AMD_DRIVER_LIBS = ("radeonsi_dri.so", "radeonsi")
+
 
 def _is_software(r: str | None) -> bool:
     return bool(r) and any(s in r.lower() for s in SOFTWARE_RENDERERS)
+
+
+def _is_masked(r: str | None) -> bool:
+    return bool(r) and any(s in r.lower() for s in MASKED_RENDERERS)
 
 
 def _page(obs: dict) -> dict:
@@ -46,6 +73,48 @@ def _renderer(obs: dict) -> str | None:
 def _dri_holders(obs: dict) -> list[dict]:
     return [p for p in ((obs.get("webkit") or {}).get("webkit_processes") or [])
             if p.get("dri_fds")]
+
+
+def _procs(obs: dict) -> list[dict]:
+    return ((obs.get("webkit") or {}).get("webkit_processes") or [])
+
+
+def _gfx_engine_ns(obs: dict) -> int:
+    """GPU engine time the kernel attributes to WebKit's own process."""
+    best = 0
+    for p in _procs(obs):
+        for fi in p.get("fdinfo") or []:
+            v = (fi or {}).get("drm-engine-gfx") or ""
+            digits = "".join(ch for ch in v if ch.isdigit())
+            if digits:
+                best = max(best, int(digits))
+    return best
+
+
+def _vram_kib(obs: dict) -> int:
+    best = 0
+    for p in _procs(obs):
+        for fi in p.get("fdinfo") or []:
+            v = (fi or {}).get("drm-memory-vram") or ""
+            digits = "".join(ch for ch in v if ch.isdigit())
+            if digits:
+                best = max(best, int(digits))
+    return best
+
+
+def _mapped(obs: dict) -> set[str]:
+    out: set[str] = set()
+    for p in _procs(obs):
+        out |= set(p.get("mapped_drivers") or [])
+    return out
+
+
+def _amd_driver_mapped(obs: dict) -> bool:
+    return any(any(t in m for t in AMD_DRIVER_LIBS) for m in _mapped(obs))
+
+
+def _software_driver_mapped(obs: dict) -> bool:
+    return any(any(t in m for t in SOFTWARE_DRIVER_LIBS) for m in _mapped(obs))
 
 
 def _painted(obs: dict) -> bool:
@@ -88,9 +157,15 @@ def table(obs: dict) -> str:
     rows = ["| reading | value |", "|---|---|"]
     rows.append(f"| WebKitGTK version | {w.get('webkit_version')} |")
     rows.append(f"| hardware acceleration policy | {w.get('hardware_acceleration_policy')} |")
-    rows.append(f"| **renderer inside the page** (WEBGL_debug_renderer_info) | **{r}** |")
+    rows.append(f"| renderer inside the page (WEBGL_debug_renderer_info) | {r}"
+                f"{' - MASKED by WebKit, carries no device information' if _is_masked(r) else ''} |")
     rows.append(f"| vendor inside the page | {p.get('webgl_vendor')} |")
     rows.append(f"| same host, standalone EGL probe | {ref} |")
+    rows.append(f"| **mesa driver mapped into WebKit's process** | "
+                f"**{', '.join(sorted(_mapped(obs))) or 'none'}** |")
+    rows.append(f"| **amdgpu GFX engine time attributed to WebKit** | "
+                f"**{_gfx_engine_ns(obs):,} ns** over {p.get('ms')} ms of animation |")
+    rows.append(f"| amdgpu VRAM attributed to WebKit | {_vram_kib(obs):,} KiB |")
     rows.append(f"| WebKit processes holding /dev/dri | "
                 f"{', '.join(h['pid'] + ' ' + ','.join(h['dri_fds']) for h in holders) or 'none'} |")
     rows.append(f"| snapshot | {w.get('snapshot_bytes')} bytes, "
@@ -111,36 +186,51 @@ def table(obs: dict) -> str:
     return "\n".join(rows)
 
 
+def _gpu_composited(obs: dict) -> bool:
+    """All three, from sources the engine does not author."""
+    return (_amd_driver_mapped(obs) and not _software_driver_mapped(obs)
+            and _gfx_engine_ns(obs) > 0 and bool(_dri_holders(obs)))
+
+
 def verdict(obs: dict) -> tuple[str, str]:
     r = _renderer(obs)
     holders = _dri_holders(obs)
-    ref = obs.get("reference_gl_renderer")
+    ns, mapped = _gfx_engine_ns(obs), _mapped(obs)
 
-    if r is None:
-        return "NOT_CAPABLE", (
-            "the page painted but could not report a renderer, so what drew it is unknown "
-            f"(webgl={_page(obs).get('webgl')}, error={_page(obs).get('webgl_error')!r})")
+    # An in-page string that names a software rasteriser is still decisive
+    # against, because nothing masks its way INTO llvmpipe.
     if _is_software(r):
         return "NOT_CAPABLE", (
-            f"WebKit rendered through {r!r}, which is the CPU, on a host whose standalone EGL "
-            f"context reports {ref!r}. The engine is not reaching the GPU here, so a perf "
-            f"number taken in it would describe a software rasteriser")
+            f"WebKit rendered through {r!r}, which is the CPU, so a perf number taken in it "
+            f"would describe a software rasteriser")
+    if _software_driver_mapped(obs) and not _amd_driver_mapped(obs):
+        return "NOT_CAPABLE", (
+            f"WebKit's process mapped {sorted(mapped)}, a software rasteriser, and no AMD "
+            f"driver, so the engine is not reaching the GPU here")
     if not holders:
+        return "NOT_CAPABLE", (
+            "no WebKit process held a /dev/dri node open while an animating page was "
+            "compositing, so nothing it drew went through the GPU")
+    if not _amd_driver_mapped(obs):
         return "PARTIAL", (
-            f"WebKit reports {r!r}, which is not a software rasteriser, but no WebKit process "
-            f"was seen holding a /dev/dri node, so the corroboration is missing and the "
-            f"reading rests on one source")
+            f"a WebKit process held the render node, but no AMD driver was found mapped into "
+            f"it (mapped: {sorted(mapped) or 'nothing recognised'}), so what did the drawing "
+            f"is not established")
+    if ns <= 0:
+        return "PARTIAL", (
+            f"WebKit mapped the AMD driver and held the render node, but amdgpu attributed no "
+            f"GFX engine time to it, so the GPU path was opened and possibly never used")
     return "CAPABLE", (
-        f"WebKit rendered through {r!r} from inside the page, matching the standalone EGL "
-        f"reading of {ref!r}, and {len(holders)} WebKit process(es) held the render node open. "
-        f"This host composites WebKitGTK on the GPU")
+        f"amdgpu attributed {ns:,} ns of GFX engine time and {_vram_kib(obs):,} KiB of VRAM to "
+        f"WebKit's own process, which mapped {sorted(m for m in mapped if 'radeonsi' in m)} and "
+        f"held {holders[0]['dri_fds'][0]} open while an animating page painted. The in-page "
+        f"renderer string is {r!r}, which WebKit masks on every port and which is therefore "
+        f"not part of this finding. This host composites WebKitGTK on the GPU")
 
 
 def observed_capabilities(obs: dict) -> dict[str, bool]:
-    r = _renderer(obs)
-    hw = bool(r) and not _is_software(r)
     return {
         "webkitgtk": bool((obs.get("webkit") or {}).get("gi")),
         "headless_display_server": bool((obs.get("xserver") or {}).get("display")),
-        "gpu_browser_compositing": hw and bool(_dri_holders(obs)) and _painted(obs),
+        "gpu_browser_compositing": _gpu_composited(obs) and _painted(obs),
     }

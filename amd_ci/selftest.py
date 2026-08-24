@@ -380,6 +380,72 @@ def test_capability_mode_is_not_a_disguised_differential() -> None:
         check(f"{good} keeps the job green", good not in ann.NO_RESULT, "")
 
 
+def _fake_webkit_obs(*, renderer = "Apple GPU", mapped = ("radeonsi_dri.so", "libEGL.so.1"),
+                     gfx_ns = "91379468 ns", dri = True, painted = True) -> dict:
+    return {
+        "_probe_rc": 0,
+        "xserver": {"display": ":99", "binary": "/tmp/xroot/usr/bin/Xvfb"},
+        "reference_gl_renderer": "AMD Radeon Graphics (radeonsi, gfx1151, LLVM 20.1.2)",
+        "webkit": {
+            "gi": True, "webkit_version": "2.52.3",
+            "hardware_acceleration_policy": "ALWAYS",
+            "page": {"frames": 304, "ms": 5005, "fps": 60.7, "p95_frame_ms": 17,
+                     "webgl": True, "webgl_renderer": renderer, "webgl_vendor": "Apple Inc."},
+            "snapshot_bytes": 198324 if painted else 900,
+            "snapshot_distinct_bytes": 256 if painted else 8,
+            "webkit_processes": [{
+                "pid": "255976", "cmdline": ".../WebKitWebProcess 4 18",
+                "dri_fds": ["/dev/dri/renderD128"] if dri else [],
+                "fdinfo": [{"drm-driver": "amdgpu", "drm-engine-gfx": gfx_ns,
+                            "drm-memory-vram": "56000 KiB"}] if dri else [],
+                "mapped_drivers": list(mapped)}]},
+    }
+
+
+def test_a_masked_renderer_string_cannot_carry_a_verdict() -> None:
+    print("\nWebKit masks its renderer string; the verdict must not lean on it")
+    crit = _load(ROOT / "criteria" / "webkit_gpu_compositing.py")
+
+    # Observed on the runner: WebKitGTK on Linux/AMD reports "Apple GPU".
+    v, why = crit.verdict(_fake_webkit_obs())
+    check("a masked string plus kernel evidence -> CAPABLE", v == "CAPABLE", f"{v}: {why}")
+    check("and the reason cites amdgpu engine time, not the string",
+          "GFX engine time" in why and "masks" in why, why)
+
+    # The hole this test exists to keep shut: "not llvmpipe" is not "hardware".
+    v, why = crit.verdict(_fake_webkit_obs(mapped = ("swrast_dri.so", "libEGL.so.1"),
+                                           gfx_ns = "0 ns", dri = False))
+    check("the same masked string with software evidence -> NOT_CAPABLE",
+          v == "NOT_CAPABLE", f"{v}: {why}")
+
+    v, why = crit.verdict(_fake_webkit_obs(renderer = "llvmpipe (LLVM 20.1.2, 256 bits)"))
+    check("an in-page software name is decisive against", v == "NOT_CAPABLE", f"{v}: {why}")
+
+    v, why = crit.verdict(_fake_webkit_obs(gfx_ns = "0 ns"))
+    check("render node opened but never used -> PARTIAL", v == "PARTIAL", f"{v}: {why}")
+
+    v, why = crit.verdict(_fake_webkit_obs(mapped = ("libEGL.so.1",)))
+    check("no AMD driver mapped -> PARTIAL", v == "PARTIAL", f"{v}: {why}")
+
+    check("gpu_browser_compositing is only claimed on the full chain",
+          crit.observed_capabilities(_fake_webkit_obs())["gpu_browser_compositing"] is True, "")
+    check("and not when the page never painted",
+          crit.observed_capabilities(_fake_webkit_obs(painted = False))
+          ["gpu_browser_compositing"] is False, "")
+
+    g = dict((n, ok) for n, ok, _ in crit.gates(_fake_webkit_obs()))
+    check("a blank snapshot fails the painted gate",
+          dict((n, ok) for n, ok, _ in crit.gates(_fake_webkit_obs(painted = False)))
+          ["the view really painted, not a blank surface"] is False, "")
+    check("and a real one passes it", all(g.values()), str(g))
+
+    no_display = _fake_webkit_obs()
+    no_display["xserver"] = {"display": None, "attempts": []}
+    g = dict((n, ok) for n, ok, _ in crit.gates(no_display))
+    check("no display -> a failed gate, not a NO",
+          g["a display server was obtained"] is False, str(g))
+
+
 def main() -> int:
     print("AMD CI selftest")
     test_void_rule()
@@ -395,6 +461,7 @@ def main() -> int:
     test_gates_fail_rather_than_answer()
     test_probe_established_capabilities_are_not_defaulted_true()
     test_capability_mode_is_not_a_disguised_differential()
+    test_a_masked_renderer_string_cannot_carry_a_verdict()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} failure(s):")

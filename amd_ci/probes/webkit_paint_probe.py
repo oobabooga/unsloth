@@ -269,7 +269,26 @@ def webkit_child(out: Path, ms: int, snapshot: Path) -> int:
             if "WebKit" not in cmd and "webkit" not in cmd:
                 continue
             pid = os.path.basename(p)
-            entry = {"pid": pid, "cmdline": cmd[:200], "dri_fds": [], "fdinfo": []}
+            entry = {"pid": pid, "cmdline": cmd[:200], "dri_fds": [], "fdinfo": [],
+                     "mapped_drivers": []}
+            # Which mesa driver the engine's own process loaded. WebKitGTK
+            # returns a masked "Apple GPU" from WEBGL_debug_renderer_info on
+            # every port, so the in-page string cannot name the device; a
+            # mapped radeonsi_dri.so or swrast_dri.so can, and the engine does
+            # not choose what its own address space says.
+            try:
+                maps = Path(p, "maps").read_text(errors = "replace")
+                names = set()
+                for ln in maps.splitlines():
+                    path = ln.split(" ", 5)[-1].strip() if " " in ln else ""
+                    base = os.path.basename(path)
+                    if base.endswith("_dri.so") or any(
+                            t in base for t in ("radeonsi", "llvmpipe", "swrast", "libEGL",
+                                                "libgbm", "libvulkan", "libGLX", "libGLESv2")):
+                        names.add(base)
+                entry["mapped_drivers"] = sorted(names)
+            except Exception:  # noqa: BLE001
+                pass
             for fd in glob.glob(f"{p}/fd/*"):
                 try:
                     tgt = os.readlink(fd)
