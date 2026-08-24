@@ -1,0 +1,123 @@
+name: AMD DevLab PR 9629
+
+on:
+  push:
+    branches: [amd-devlab-ci-9629]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 40
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu
+          free -h
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+          ls -l /dev/accel* 2>/dev/null || true
+
+      - name: Clone PR branch
+        run: |
+          git clone --depth 1 --branch diffusion-preflight-9130-ci \
+            https://github.com/oobabooga/unsloth.git "$GITHUB_WORKSPACE/pr"
+          git -C "$GITHUB_WORKSPACE/pr" rev-parse HEAD
+
+      - name: Install test environment
+        working-directory: pr
+        run: |
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{models,tmp,cache/huggingface,cache/torch,cache/uv}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export HF_HOME="$WORK_ROOT/cache/huggingface"
+          export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+          export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          export UV_CACHE_DIR="$WORK_ROOT/cache/uv"
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/rocm7.1 \
+            --extra-index-url https://pypi.org/simple 'torch>=2.10,<2.12'
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx 'transformers>=4.51,<5.5'
+          echo "VIRTUAL_ENV=$WORK_ROOT/venv" >> "$GITHUB_ENV"
+          echo "$WORK_ROOT/venv/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$WORK_ROOT/tmp" >> "$GITHUB_ENV"
+          echo "HF_HOME=$WORK_ROOT/cache/huggingface" >> "$GITHUB_ENV"
+          echo "HUGGINGFACE_HUB_CACHE=$WORK_ROOT/cache/huggingface/hub" >> "$GITHUB_ENV"
+          echo "TRANSFORMERS_CACHE=$WORK_ROOT/cache/huggingface/transformers" >> "$GITHUB_ENV"
+          echo "TORCH_HOME=$WORK_ROOT/cache/torch" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$WORK_ROOT/cache/uv" >> "$GITHUB_ENV"
+
+      - name: Focused regression suites
+        working-directory: pr
+        env:
+          PYTHONPATH: studio/backend
+        run: |
+          python -m pytest -q \
+            studio/backend/tests/test_diffusion_predownload_memory_guard.py \
+            studio/backend/tests/test_media_auto_switch.py \
+            studio/backend/tests/test_diffusion_te_prequant.py \
+            studio/backend/tests/test_diffusion_offline_load.py \
+            studio/backend/tests/test_diffusion_routes.py \
+            studio/backend/tests/test_diffusion_auto_policy.py \
+            studio/backend/tests/test_diffusion_memory.py \
+            studio/backend/tests/test_diffusion_backend.py
+
+      - name: Live unified-memory preflight
+        working-directory: pr
+        env:
+          PYTHONPATH: studio/backend
+        run: |
+          python - <<'PY'
+          import torch
+
+          assert torch.cuda.is_available(), "PyTorch did not detect the AMD GPU"
+          print("torch", torch.__version__)
+          print("hip", torch.version.hip)
+          print("device", torch.cuda.get_device_name(0))
+
+          from core.inference.diffusion import DiffusionBackend
+          from core.inference.diffusion_device import resolve_diffusion_device_target
+          from core.inference.diffusion_families import detect_family_for_pick
+          from core.inference.diffusion_memory import snapshot_device_memory
+
+          target = resolve_diffusion_device_target(ordinal=0)
+          snapshot = snapshot_device_memory(target)
+          print("target", target)
+          print("memory", snapshot)
+          assert snapshot.memory_kind == "unified_memory"
+          assert snapshot.total_mib is not None and snapshot.total_mib >= 60 * 1024
+
+          mib = 1024 * 1024
+          family = detect_family_for_pick("unsloth/FLUX.2-dev", None, None)
+          backend = DiffusionBackend()
+          small = [("transformer/model.safetensors", 32 * 1024 * mib)]
+          large = [("transformer/model.safetensors", 64 * 1024 * mib)]
+          assert backend.declared_footprint_shortfall(
+              family,
+              "unsloth/FLUX.2-dev",
+              "black-forest-labs/FLUX.2-dev",
+              kind="pipeline",
+              declared_files=small,
+              gpu_ordinal=0,
+          ) is None
+          refusal = backend.declared_footprint_shortfall(
+              family,
+              "unsloth/FLUX.2-dev",
+              "black-forest-labs/FLUX.2-dev",
+              kind="pipeline",
+              declared_files=large,
+              gpu_ordinal=0,
+          )
+          print("refusal", refusal)
+          assert refusal is not None
+          PY
