@@ -71,6 +71,19 @@ jobs:
           cat "$AMD_CI_WORK/out/display/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/display"
 
+      - name: WebKitGTK paint probe
+        run: |
+          set +e
+          # Same job, so this does not take a second place in the GPU
+          # concurrency group: the group holds one runner plus one waiter, and a
+          # third arrival evicts the waiter.
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/webkit_paint_probe.py \
+            --criteria amd_ci/criteria/webkit_gpu_compositing.py \
+            --out-dir "$AMD_CI_WORK/out/webkit"
+          cat "$AMD_CI_WORK/out/webkit/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/webkit"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
