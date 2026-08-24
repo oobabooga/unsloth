@@ -1,0 +1,80 @@
+name: "AMD CI: can this host render a browser venue?"
+
+# A CAPABILITY question, not a differential one. There is no defect and no
+# base/head pair, so lib/differential.py is not used and its VOID rule is not
+# simulated by pointing two states at the same tree. lib/capability_run.py runs
+# one probe once and lets the criteria judge; a NO is a finding and stays green,
+# only a failed gate (we could not tell) fails the job.
+#
+# Why it asks anything at all: the only browser perf venue we have is headless
+# Chromium on a server, where both arms and the null all sit at 60 fps with a
+# 1-2% busy main thread, so every rung is VOID against the measured floor. The
+# reported symptom is 60 fps collapsing to 5 fps in Unsloth Studio / Desktop,
+# which render with WebKitGTK, not Chromium. This run establishes whether this
+# runner could host that engine on real GPU compositing.
+
+on:
+  push:
+    branches: [amd-ci-display-capability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  display:
+    name: "Display / render stack capability (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 45
+    # Opening a render node and making a GL context allocates on the one gfx1151
+    # the four ephemeral slots share, so this takes the GPU group like any other
+    # measuring job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "display-capability"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. Only `linux` is checkable here: every other
+          # capability in gate.py is read out of torch, and installing Studio to
+          # import torch would cost 30+ minutes for a question that does not
+          # need it. That the host is really the gfx1151 APU is a non-vacuity
+          # gate in the criteria, where a miss lands on INCONCLUSIVE instead of
+          # a confident wrong answer.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -30
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      - name: Capability probe
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/display_stack_probe.py \
+            --criteria amd_ci/criteria/display_stack_capability.py \
+            --out-dir "$AMD_CI_WORK/out/display"
+          cat "$AMD_CI_WORK/out/display/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/display"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: display-capability
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
