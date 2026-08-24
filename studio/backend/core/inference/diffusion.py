@@ -77,7 +77,12 @@ from .diffusion_device import (
     resolve_selected_cuda_ordinal,
 )
 from .diffusion_ideogram4 import ideogram4_repo_is_fp8, load_ideogram4_pipeline
-from .diffusion_hidream import HIDREAM_FAMILY_NAME, hidream_te4_kwargs
+from .diffusion_hidream import (
+    HIDREAM_FAMILY_NAME,
+    HIDREAM_LLAMA_BF16_BYTES,
+    HIDREAM_LLAMA_REPO,
+    hidream_te4_kwargs,
+)
 from .diffusion_krea2 import KREA2_FAMILY_NAME, load_krea2_pipeline
 from .diffusion_memory import (
     MEMORY_MODE_BALANCED,
@@ -97,6 +102,7 @@ from .diffusion_memory import (
     reclaimable_snapshot_device_memory,
     refine_memory_plan_for_components,
     settled_snapshot_device_memory,
+    snapshot_device_memory,
     unified_memory_shortfall_message,
 )
 from .diffusion_speed import (
@@ -161,6 +167,7 @@ from .diffusion_auto_policy import (
     family_bf16_components_gb,
     precision_fallback_allowed,
     precision_refusal_message,
+    resident_bytes_from_declared,
     resolve_dense_quant_candidate,
 )
 from .diffusion_transformer_quant import (
@@ -461,6 +468,38 @@ def _fit_within(img: Any, max_w: int, max_h: int) -> Any:
     nw = max(1, int(round(w * scale)))
     nh = max(1, int(round(h * scale)))
     return img.resize((nw, nh), Image.LANCZOS)
+
+
+def _flatten_declared_sizes(per_repo: Any) -> list:
+    """Flatten per-repo file sizes without collapsing duplicate paths."""
+    flat: list = []
+    for files in (per_repo or {}).values():
+        flat.extend((name, size) for name, size in (files or {}).items())
+    return flat
+
+
+def _prequant_plan_bytes(te_files: Any) -> int:
+    """Return the hosted pre-cast encoder bytes in a download plan."""
+    return sum(
+        int(size or 0) for entry in (te_files or {}).values() for _name, size in (entry[1] or ())
+    )
+
+
+def _predownload_encoder_bytes(
+    fam: Any,
+    te_files: Any,
+    *,
+    pipeline_declared: bool = True,
+) -> int:
+    """Return encoder bytes that are absent from the selected pipeline declaration."""
+    total = _prequant_plan_bytes(te_files)
+    if (
+        getattr(fam, "name", None) == HIDREAM_FAMILY_NAME
+        and "text_encoder_4" not in (te_files or {})
+        and pipeline_declared
+    ):
+        total += HIDREAM_LLAMA_BF16_BYTES
+    return total
 
 
 def _image_variant_hint(
@@ -2094,7 +2133,9 @@ class DiffusionBackend:
                 kwargs.get("hf_token"),
                 kwargs.get("gpu_ordinal"),
                 local_files_only = local_files_only,
+                base_repo = base,
             )
+            declared_sizes: dict[str, dict[str, int]] = {}
             expected, base_files = self._estimate_download_bytes(
                 kwargs["repo_id"],
                 kwargs.get("gguf_filename"),
@@ -2120,6 +2161,7 @@ class DiffusionBackend:
                 ),
                 skip_te_components = tuple(te_prequant_files),
                 local_files_only = local_files_only,
+                file_sizes_out = declared_sizes,
             )
             # Only shards this prefetch staged may be materialised by the dense fallback, so read it
             # off the staged list: a failed size estimate drops every base file too. A LOCAL base
@@ -2154,6 +2196,26 @@ class DiffusionBackend:
                 kwargs.get("hf_token"),
                 allow_network = not local_files_only,
             )
+            shortfall = self.declared_footprint_shortfall(
+                fam,
+                kwargs["repo_id"],
+                base,
+                kind = kind,
+                declared_files = _flatten_declared_sizes(declared_sizes),
+                prequant_bytes = _predownload_encoder_bytes(
+                    fam, te_prequant_files, pipeline_declared = bool(declared_sizes)
+                ),
+                gguf_filename = kwargs.get("gguf_filename"),
+                gpu_ordinal = kwargs.get("gpu_ordinal"),
+                memory_mode = kwargs.get("memory_mode"),
+                cpu_offload = bool(kwargs.get("cpu_offload")),
+            )
+            if shortfall is not None:
+                logger.error(
+                    "diffusion.memory: refusing oversized unified-memory load before download: %s",
+                    shortfall,
+                )
+                raise RuntimeError(shortfall)
             with self._lock:
                 # Stamp progress only if this load is still current (a superseder has its own token).
                 if self._load_token == token and self._loading is not None:
@@ -2258,6 +2320,7 @@ class DiffusionBackend:
         hf_token: Optional[str],
         gpu_ordinal: Optional[int] = None,
         local_files_only: bool = False,
+        base_repo: Optional[str] = None,
     ) -> dict[str, tuple[str, list[tuple[str, int]]]]:
         """``{component: (repo_id, [(rfilename, size)])}`` for the text encoders this pick will
         take PRE-CAST from a hosted checkpoint instead of the base repo's dense weights.
@@ -2274,18 +2337,41 @@ class DiffusionBackend:
         try:
             from huggingface_hub import HfApi
 
-            from .diffusion_te_prequant import te_prequant_hub_files, te_prequant_sources
+            from .diffusion_te_prequant import (
+                TE_PREQUANT_COMPONENTS,
+                te_base_equivalent,
+                te_prequant_hub_files,
+                te_prequant_sources,
+            )
 
-            sources = te_prequant_sources(
-                fam,
-                te_quant_mode = text_encoder_quant,
+            source_kwargs = {
+                "te_quant_mode": text_encoder_quant,
                 # The selected card, for the same reason the dense-quant probe uses it.
-                target = (
+                "target": (
                     resolve_diffusion_device_target()
                     if gpu_ordinal is None
                     else resolve_diffusion_device_target(ordinal = gpu_ordinal)
                 ),
-            )
+            }
+            if getattr(fam, "name", None) == HIDREAM_FAMILY_NAME:
+                source_kwargs["components"] = (*TE_PREQUANT_COMPONENTS, "text_encoder_4")
+            sources = te_prequant_sources(fam, **source_kwargs)
+            if base_repo:
+                compatible = {}
+                for component, source in sources.items():
+                    external_te4 = (
+                        getattr(fam, "name", None) == HIDREAM_FAMILY_NAME
+                        and component == "text_encoder_4"
+                    )
+                    checkpoint_base = (
+                        HIDREAM_LLAMA_REPO
+                        if external_te4
+                        else str(getattr(fam, "base_repo", "") or "")
+                    )
+                    selected_base = HIDREAM_LLAMA_REPO if external_te4 else base_repo
+                    if checkpoint_base and te_base_equivalent(checkpoint_base, selected_base):
+                        compatible[component] = source
+                sources = compatible
             if not sources:
                 return {}
             files = te_prequant_hub_files(sources, HfApi(token = hf_token or None), logger)
@@ -2575,6 +2661,7 @@ class DiffusionBackend:
         model_kind: Optional[str] = None,
         hf_token: Optional[str] = None,
         text_encoder_quant: Optional[str] = None,
+        allow_device_probe: bool = True,
         **load_kwargs: Any,
     ) -> dict[str, Any]:
         """The repos + exact files this pick needs, so the Hub download manager can fetch
@@ -2589,7 +2676,9 @@ class DiffusionBackend:
         loads a hosted PRE-CAST encoder, so the base repo's dense encoder shards must not be
         staged and the pre-cast checkpoint must be. Without it the manager stages the dense
         encoder (tens of GB the load never opens) and the load then pulls the pre-cast file
-        inline, outside the manager's progress and disk preflight."""
+        inline, outside the manager's progress and disk preflight.
+
+        ``allow_device_probe=False`` skips the memory verdict while training owns the GPU."""
         fam = detect_family_for_pick(repo_id, gguf_filename, family_override)
         kind = resolve_model_kind(gguf_filename, model_kind)
         if kind == "pipeline":
@@ -2613,7 +2702,11 @@ class DiffusionBackend:
         ) or speech_pick_refusal(repo_id, gguf_filename, hf_token)
         # Only a checkpoint that really resolves on the Hub earns the right to drop dense shards.
         te_files = self._te_prequant_plan_files(
-            fam, text_encoder_quant, hf_token, load_kwargs.get("gpu_ordinal")
+            fam,
+            text_encoder_quant,
+            hf_token,
+            load_kwargs.get("gpu_ordinal"),
+            base_repo = base,
         )
         sizes: dict[str, int] = {}
         file_sizes: dict[str, dict[str, int]] = {}
@@ -2812,6 +2905,21 @@ class DiffusionBackend:
             # A companion of the checkpoint, never the selected model itself.
             prequant_repo, prequant_file, prequant_size = dit_prequant
             add_missing_entry(prequant_repo, [prequant_file], {prequant_file: prequant_size})
+        if incompatible is None and allow_device_probe:
+            incompatible = self.declared_footprint_shortfall(
+                fam,
+                repo_id,
+                base,
+                kind = kind,
+                declared_files = _flatten_declared_sizes(file_sizes),
+                prequant_bytes = _predownload_encoder_bytes(
+                    fam, te_files, pipeline_declared = bool(file_sizes)
+                ),
+                gguf_filename = gguf_filename,
+                gpu_ordinal = load_kwargs.get("gpu_ordinal"),
+                memory_mode = load_kwargs.get("memory_mode"),
+                cpu_offload = bool(load_kwargs.get("cpu_offload")),
+            )
         return {
             "entries": entries,
             "total_bytes": sum(entry["bytes"] for entry in entries),
@@ -4938,6 +5046,58 @@ class DiffusionBackend:
             )
         except Exception:  # noqa: BLE001 — sizing aid only; refuse on the plan as built
             return plan
+
+    def declared_footprint_shortfall(
+        self,
+        fam: Optional[DiffusionFamily],
+        repo_id: str,
+        base: str,
+        *,
+        kind: str,
+        declared_files: Any,
+        prequant_bytes: int = 0,
+        gguf_filename: Optional[str] = None,
+        gpu_ordinal: Optional[int] = None,
+        memory_mode: Optional[str] = None,
+        cpu_offload: bool = False,
+    ) -> Optional[str]:
+        """Return a pre-download unified-memory refusal for a pipeline, if any.
+
+        The estimate comes from Hub metadata because a cold cache has no local size to inspect.
+        It uses total capacity so a currently loaded model does not make a valid swap look too
+        large. GGUF and single-file loads retain the existing in-load guard.
+        """
+        if fam is None or kind != "pipeline":
+            return None
+        resident_bytes = resident_bytes_from_declared(
+            fam, base, declared_files, prequant_bytes = prequant_bytes
+        )
+        if not resident_bytes:
+            return None
+        try:
+            target = self._target_for_ordinal(fam, gpu_ordinal)
+            with diffusion_device_scope(target.ordinal if target.is_cuda_torch_device else None):
+                device_memory = snapshot_device_memory(target)
+            if device_memory.total_mib is None:
+                return None
+            capacity = replace(device_memory, free_mib = device_memory.total_mib)
+            resident_mib = int(resident_bytes) // (1024 * 1024)
+            variant_hint = _image_variant_hint(fam.name, gguf_filename, repo_id, base)
+            plan = plan_diffusion_memory(
+                target = target,
+                device_memory = capacity,
+                model_dense_mib = resident_mib,
+                runtime_headroom_mib = estimate_image_runtime_mib(
+                    width = None, height = None, family = variant_hint
+                ),
+                requested_mode = memory_mode,
+                explicit_offload = bool(cpu_offload),
+            )
+            # The estimate uses capacity, not current free memory.
+            plan = replace(plan, device_memory = replace(capacity, free_mib = None))
+        except Exception:  # noqa: BLE001 -- failed sizing must not refuse a load
+            return None
+        return unified_memory_shortfall_message(plan, family = fam.name)
 
     def _plan_memory(
         self,

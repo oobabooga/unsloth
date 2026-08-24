@@ -506,6 +506,7 @@ def missing_download_bytes(
                 model_kind = target.model_kind,
                 gpu_ordinal = ordinal,
                 hf_token = hf_token,
+                allow_device_probe = False,
             )
             or {}
             for planner in planners_for(owner, target)

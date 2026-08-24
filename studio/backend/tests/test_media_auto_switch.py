@@ -751,20 +751,20 @@ def test_a_replacement_load_is_not_reported_as_the_requested_model(
 
 
 def test_the_download_plan_asks_the_engine_that_will_load_the_pick(cached_gguf, monkeypatch):
-    # The resident engine can be native sd.cpp while the target loads through diffusers; its
-    # planner refuses the pick, and that refusal would read as nothing missing.
+    # The target may use a different engine than the resident model.
     pick = mas.resolve_local_media_model("city96/FLUX.1-dev-gguf", task = mas.IMAGE_TASK)
     asked: list = []
 
     class _Planner:
         def download_plan(self, model_path, **kwargs):
-            asked.append(model_path)
+            asked.append((model_path, kwargs))
             return {"total_bytes": 7}
 
     monkeypatch.setattr(locality, "planners_for", lambda owner, p: [_Planner()])
 
     assert mas.missing_download_bytes(arb.DIFFUSION, pick) == 7
-    assert asked == [pick.model_path]
+    assert [model_path for model_path, _kwargs in asked] == [pick.model_path]
+    assert asked[0][1]["allow_device_probe"] is False
 
 
 def test_two_bpw_builds_of_one_quant_are_not_confused(two_bpw, enabled, backend, loads):
