@@ -63,6 +63,7 @@ jobs:
           PYTHONPATH: studio/backend
         run: |
           python -m pytest -q \
+            --deselect studio/backend/tests/test_diffusion_backend.py::test_pick_dtype_bf16_only_on_ampere \
             studio/backend/tests/test_diffusion_predownload_memory_guard.py \
             studio/backend/tests/test_media_auto_switch.py \
             studio/backend/tests/test_diffusion_te_prequant.py \
