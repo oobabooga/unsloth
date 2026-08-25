@@ -373,8 +373,12 @@ def table(obs: dict) -> str:
 
     rows += [
         "",
-        "**fps is the rAF inter-frame interval (1000 / p50). The after-paint column is printed "
-        "only so that it is not quoted later: it is an artefact.** The driver calls "
+        "**fps is the EFFECTIVE rate: rAF callbacks delivered over the window's wall time, "
+        "which is what studiobench's scoring/frames.py reports as `effective_fps`. It is not "
+        "1000/p50; a bursty block leaves the median untouched and the jammed control proved it, "
+        "reporting a p50 of 16.0 ms both jammed and unjammed while its effective rate went "
+        "61.2 -> 17.2 fps. The after-paint column is printed only so that it is not quoted "
+        "later: it is an artefact.** The driver calls "
         "`GdkFrameClock.begin_updating()`, which ticks the clock at the display rate whether or "
         "not anything asked for a frame. Measured with the main thread blocked 200 ms out of "
         "every 250 ms, that column read 60.0 fps in every phase while the same gesture took 2.5x "
