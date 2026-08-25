@@ -58,12 +58,27 @@ PARK = {"500K": 153387, "100K": 30119, "10K": 4102, "0K": 0}
 # ── synthetic payload builders ────────────────────────────────────────────────────────────────
 
 def window(name, arm, bmpf, fps, *, fired = None, took = None, sh = 0.0, ok = True, frames = 80,
-           travel = 1.0, mode = "pixel", mutations = 0, park = PARK["500K"]):
+           travel = 1.0, mode = "pixel", mutations = 0, park = PARK["500K"], selector = "none",
+           robust_bmpf = None, stalls = 0, worst_gap = 900):
+    """One measured window.
+
+    `robust_bmpf` defaults to the mean, which is the healthy case: dropping the single worst frame
+    changes nothing when no frame dominated. A window that caught one of this venue's 8.6 s stalls
+    is built by passing a robust figure far below the mean, which is what run 32876363634 looked
+    like on the arm that read 112.9 ms/frame at a p50 of 17 ms.
+    """
+    if robust_bmpf is None and bmpf is not None:
+        robust_bmpf = round(bmpf * 0.98, 1)
     return {
         "name": name, "arm": arm, "ok": ok,
         "blocked_ms_per_frame": bmpf, "eff_fps": fps, "frames": frames,
         "busy": {"busy_pct": 90.0, "blocked_ms": (bmpf or 0) * frames},
-        "raf": {"max_ms": 900, "n": frames},
+        "raf": {"max_ms": worst_gap, "n": frames},
+        "robust": {"blocked_ms": None if robust_bmpf is None else round(robust_bmpf * (frames - 1)),
+                   "frames": frames - 1, "blocked_ms_per_frame": robust_bmpf,
+                   "stall_frames_over_1s": stalls, "worst_tick_ms": worst_gap,
+                   "worst_gap_ms": worst_gap},
+        "selector": selector, "apply_detail": selector,
         "fired": fired, "took_effect": took, "scroll_height_delta": sh,
         "census_before": {"scroller_scroll_height": 316829},
         "census_applied": {"scroller_scroll_height": 316829, "elements": 164136},
@@ -179,17 +194,29 @@ def common(cen, *, jam_clean, jam_jammed, idle_fps, warm, park):
     }
 
 
+SEL_VH = ".katex{visibility:hidden}"
+SEL_CVD = ".katex-display{content-visibility:auto;contain-intrinsic-size:auto 3.5rem}"
+SEL_CVA = ".katex,.katex-display{content-visibility:auto;contain-intrinsic-size:auto 3.5rem}"
+SEL_CVM = ".cvk-mathblock{content-visibility:auto;contain-intrinsic-size:auto 24px} over 402 blocks"
+
+
 def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm = 60.0, vh = 10.0,
-                 neg = 285.0, floor = 1.5, pos = 2.0, repeat = None,
+                 vh_late = None, neg = 285.0, floor = 1.5, pos = 2.0, repeat = None,
                  cvd_fired = None, cvd_took = None, cva_took = None, cvd_sh = 0.0,
                  jam_clean = 61.0, jam_jammed = 17.0, idle_fps = 61.0, warm = None,
-                 base_mutations = 0):
+                 base_mutations = 0, stalled = None):
     """One repetition of a scored rung, in the scene's SEQUENCE order.
 
     fps is derived from blocked-ms-per-frame so the two channels stay consistent: the campaign's
     own arithmetic trap was reading busy%, a share of WALL time, as if it were work per event.
+
+    `stalled` is {window name: robust blocked-ms-per-frame}, which builds a window that caught one
+    of this venue's 8.6 s main-thread stalls: the mean is what it is, and the same window with its
+    single worst frame dropped is far cheaper.
     """
     repeat = base if repeat is None else repeat
+    vh_late = vh if vh_late is None else vh_late
+    stalled = stalled or {}
     park = PARK.get(rung, 153387)
     cen = census_long()
 
@@ -197,33 +224,47 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
         return round(1000.0 / (16.0 + b), 1)
 
     def w(name, arm, b, **kw):
+        if name in stalled:
+            kw.setdefault("robust_bmpf", stalled[name])
+            kw.setdefault("stalls", 1)
+            kw.setdefault("worst_gap", 8600)
         return window(name, arm, b, f(b), park = park, **kw)
 
+    # The scene's SEQUENCE, with the reference upper bound run TWICE: fourth, and again twelfth
+    # after the three arms that skip and unskip large subtrees. Run 32876363634 read 55% from it
+    # at r500K where run 32869180652 published 97%, and arm order was the only visible difference.
     arms = [
         w("baseline", "baseline", base, mutations = base_mutations),
-        w("noop_touch", "noop_touch", neg),
+        w("noop_touch", "noop_touch", neg, selector = "touched 30 messages"),
         w("baseline_2", "baseline", base),
+        w("katex_root_visibility_hidden", "katex_root_visibility_hidden", vh, selector = SEL_VH,
+          fired = fired_ok(".katex", "visibility", "hidden")),
+        w("baseline_3", "baseline", base),
         w("content_visibility_katex_display", "content_visibility_katex_display", cvd,
+          selector = SEL_CVD,
           fired = cvd_fired or fired_ok(".katex-display", "contentVisibility", "auto"),
           took = took(".katex-display", 90, 96) if cvd_took is None else cvd_took,
           sh = cvd_sh),
-        w("baseline_3", "baseline", base),
+        w("baseline_4", "baseline", base),
         # Probed on the INLINE roots on purpose: those are the ones the claim is about, and on the
         # spec reading nothing there can change height at all.
-        w("content_visibility_katex_all", "content_visibility_katex_all", cva,
+        w("content_visibility_katex_all", "content_visibility_katex_all", cva, selector = SEL_CVA,
           fired = fired_ok(".katex", "contentVisibility", "auto"),
           took = took(".katex:not(.katex-display *)", 2, 300, before = 18.2, after = 18.2)
           if cva_took is None else cva_took),
-        w("baseline_4", "baseline", base),
+        w("baseline_5", "baseline", base),
         w("content_visibility_math_blocks", "content_visibility_math_blocks", cvm,
+          selector = SEL_CVM,
           fired = fired_ok(".cvk-mathblock", "contentVisibility", "auto"),
           took = took(".cvk-mathblock", 180, 200, before = 61.0, after = 24.0)),
-        w("baseline_5", "baseline", base),
-        w("visibility_hidden_offscreen", "visibility_hidden_offscreen", vh,
-          fired = fired_ok(".katex", "visibility", "hidden")),
+        w("baseline_6", "baseline", base),
+        w("katex_root_visibility_hidden_late", "katex_root_visibility_hidden", vh_late,
+          selector = SEL_VH, fired = fired_ok(".katex", "visibility", "hidden")),
         w("baseline_repeat", "baseline", repeat),
-        w("still_no_scroll", "still_no_scroll", floor, mode = "still"),
-        w("detach_messages", "detach_messages", pos, sh = -0.98, mutations = 120000),
+        w("still_no_scroll", "still_no_scroll", floor, mode = "still",
+          selector = "gesture mode: still"),
+        w("detach_messages", "detach_messages", pos, sh = -0.98, mutations = 120000,
+          selector = "removed 28 of 30 messages"),
     ]
     p = {"ok": True, "rung": rung, "arms": arms, "no_scroll_range": False,
          "scrollable_px": 315749}
@@ -316,7 +357,8 @@ check("the upper bound is labelled as a reference bound that cannot ship",
 check("the table carries a per-repetition section", "Per repetition" in tbl)
 check("the table prints the measured scrollHeight for EVERY arm, not only failures",
       "scrollHeight, measured on every arm" in tbl
-      and "- `content_visibility_katex_display` **[SHIPPABLE]**: +0.00%, +0.00%" in tbl, tbl)
+      and "- `content_visibility_katex_display` **[SHIPPABLE]** (`.katex-display{content-"
+          "visibility:auto;cont...`): +0.00%, +0.00%" in tbl, tbl)
 check("the table carries the headline comparison with both height probes side by side",
       "Does adding `.katex` to the selector buy anything?" in tbl
       and "90/96" in tbl and "2/300" in tbl, tbl)
@@ -364,9 +406,9 @@ check("and that the gate is about magnitude, with the 300,000 px document named"
 v, why = C.verdict(o)
 check("and it cannot carry the headline", v == "NO_BENEFIT", f"{v}: {why}")
 tbl = C.table(o)
-check("a 0.00% arm is still printed in the scrollHeight list, labelled",
-      "- `visibility_hidden_offscreen` **[REFERENCE UPPER BOUND, NOT SHIPPABLE]**: +0.00%" in tbl,
-      tbl)
+check("a 0.00% arm is still printed in the scrollHeight list, labelled and with its selector",
+      "- `katex_root_visibility_hidden` **[REFERENCE UPPER BOUND, NOT SHIPPABLE]** "
+      "(`.katex{visibility:hidden}`): +0.00%" in tbl, tbl)
 check("the disqualifying delta is printed as a number too, not only as a disqualification",
       "+7.00%  <- over the gate" in tbl, tbl)
 check("the positive control is over the gate but marked exempt rather than as a fault",
@@ -494,6 +536,87 @@ check("the verdict still rests on the shippable arm", v == "HELPS"
       and why.split("For scale")[0].count("content_visibility_math_blocks") == 0, why)
 check("and the exploratory arm is reported as a bound on a renderer-side hoist, labelled",
       "EXPLORATORY, NOT SHIPPABLE AS WRITTEN" in why and "+93%" in why, why)
+
+print("case 17: a window whose mean is 6x its robust figure, which is one 8.6 s stall")
+# 112.9 ms/frame against 18.8 with the single worst frame dropped is the shape run 32876363634
+# actually produced on the upper-bound arm, at an unchanged p50 of 17 ms.
+o = obs(vh = 112.9, stalled = {"katex_root_visibility_hidden": 18.8})
+ok, ev = gate(o, "dominated by a single frame")
+check("the stall gate fails", ok is False, ev)
+check("and it names the rung, the window and both numbers",
+      "500K:" in ev and "katex_root_visibility_hidden" in ev and "112.9" in ev and "18.8" in ev,
+      ev)
+check("and it prints the ratio, the stall count and the worst gap",
+      "6.0x" in ev and "1 frame over 1 s" in ev and "8600 ms" in ev, ev)
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE, not a reading of the stalled window",
+      v == "INCONCLUSIVE" and "dominated by a single frame" in why, f"{v}: {why}")
+
+print("case 17b: a BASELINE caught the stall, which is worse and is exempt from nothing")
+o = obs(stalled = {"baseline_3": 40.0})
+ok, ev = gate(o, "dominated by a single frame")
+check("the stall gate fails on a baseline too", ok is False, ev)
+check("and it names the baseline window", "baseline_3" in ev, ev)
+
+print("case 17c: a clean run, where the mean survives dropping its worst frame")
+o = obs()
+ok, ev = gate(o, "dominated by a single frame")
+check("the stall gate passes", ok is True, ev)
+check("and it says so rather than staying silent",
+      "survives dropping its worst frame" in ev, ev)
+check("the 0K rung is excused, having no windows", "0K: no scrollable range" in ev, ev)
+
+print("case 18: the early and late readings of the reference upper bound disagree by 10x")
+o = obs(vh = 10.0, vh_late = 100.0)
+tbl = C.table(o)
+check("the report carries the early/late comparison", "run TWICE at 500K" in tbl, tbl)
+check("and it prints both readings and the factor between them",
+      "early **10.0**" in tbl and "late **100.0**" in tbl and "10.0x between them" in tbl, tbl)
+check("and it says they DISAGREE and that this is about the session, not the arm",
+      "They DISAGREE" in tbl and "statement about this SESSION" in tbl, tbl)
+check("and it tells the reader not to use the arm as a bound until they agree",
+      "do not use this arm as a bound" in tbl, tbl)
+v, why = C.verdict(o)
+check("a disagreement is reported, not gated: the verdict still rests on the shippable arm",
+      v == "HELPS", f"{v}: {why}")
+
+print("case 18b: the early and late readings agree, killing the arm-order hypothesis")
+o = obs()
+tbl = C.table(o)
+check("the report says they AGREE", "They AGREE" in tbl, tbl)
+check("and names the two sessions the question came from",
+      "32869180652" in tbl and "32876363634" in tbl, tbl)
+
+print("case 19: the late upper-bound window is printed and is not treated as a candidate")
+o = obs()
+tbl = C.table(o)
+check("the late window appears in the arm table",
+      "`katex_root_visibility_hidden_late` **[REFERENCE UPPER BOUND, RE-RUN LATE, NOT SHIPPABLE]**"
+      in tbl, tbl)
+check("it is not in CANDIDATES", "katex_root_visibility_hidden_late" not in C.CANDIDATES,
+      str(C.CANDIDATES))
+v, why = C.verdict(o)
+check("and it never carries the verdict", "katex_root_visibility_hidden_late" not in why, why)
+
+print("case 20: the table quotes what each arm APPLIED, not only what it is called")
+o = obs()
+tbl = C.table(o)
+check("the arm table has a selector column", "| window | selector | blocked ms/frame (MEAN, "
+      "primary) |" in tbl, tbl.splitlines()[:20])
+check("and it says the mean is primary and the robust figure sits alongside it",
+      "stays the primary metric" in tbl and "never instead of it" in tbl, tbl)
+check("the shipped rule's own declaration is quoted",
+      "`.katex-display{content-visibility:auto;cont...`" in tbl, tbl)
+check("the upper bound's declaration is quoted in full", "`.katex{visibility:hidden}`" in tbl, tbl)
+check("the robust column and the stall count are rendered, per rep rather than averaged",
+      "| **172.0** | 168.6, 168.6 | 0, 0 |" in tbl, tbl)
+check("the per-rep table carries them too, since a stall lands in ONE repetition",
+      "| window | selector | blocked ms/frame per rep | robust per rep | stalls > 1 s per rep |"
+      in tbl, tbl)
+v, why = C.verdict(o)
+check("and the verdict quotes the selector beside the arm name",
+      "`content_visibility_katex_display` (`.katex-display{content-visibility:auto;cont...`)"
+      in why, why)
 
 print("\n" + (f"{FAIL} FAILED" if FAIL else "all cvkatex criteria self-tests passed"))
 sys.exit(1 if FAIL else 0)

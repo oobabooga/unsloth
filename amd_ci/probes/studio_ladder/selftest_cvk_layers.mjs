@@ -413,10 +413,12 @@ async function runScene(opts) {
 
 // The sequence the criteria module indexes by name. `position_static_all` and `katex_static` are
 // gone: both were disqualified on scrollHeight in run 32869180652 and neither could ever ship.
-const SEQUENCE = ["baseline", "noop_touch", "baseline_2", "content_visibility_katex_display",
-                  "baseline_3", "content_visibility_katex_all", "baseline_4",
-                  "content_visibility_math_blocks", "baseline_5", "visibility_hidden_offscreen",
-                  "baseline_repeat", "still_no_scroll", "detach_messages"];
+const SEQUENCE = ["baseline", "noop_touch", "baseline_2", "katex_root_visibility_hidden",
+                  "baseline_3", "content_visibility_katex_display", "baseline_4",
+                  "content_visibility_katex_all", "baseline_5",
+                  "content_visibility_math_blocks", "baseline_6",
+                  "katex_root_visibility_hidden_late", "baseline_repeat", "still_no_scroll",
+                  "detach_messages"];
 
 console.log("scenario 1: every declaration takes AND acts");
 {
@@ -427,11 +429,11 @@ console.log("scenario 1: every declaration takes AND acts");
   check("the scene completed and posted ok", payload && payload.ok === true,
         payload && JSON.stringify(payload.error_detail || payload.error));
   const names = (payload.arms || []).map((a) => a.name);
-  check("all thirteen windows ran, in order, baseline interleaved",
+  check("all fifteen windows ran, in order, baseline interleaved, the upper bound twice",
         names.join(",") === SEQUENCE.join(","), names.join(","));
   const by = Object.fromEntries((payload.arms || []).map((a) => [a.name, a]));
   for (const n of ["content_visibility_katex_display", "content_visibility_katex_all",
-                   "content_visibility_math_blocks", "visibility_hidden_offscreen"]) {
+                   "content_visibility_math_blocks", "katex_root_visibility_hidden"]) {
     check(`${n} reports its declaration took`, by[n] && by[n].fired && by[n].fired.fired === true,
           JSON.stringify(by[n] && by[n].fired));
   }
@@ -519,12 +521,24 @@ console.log("scenario 1: every declaration takes AND acts");
   check("and the class actually landed on exactly those blocks",
         payload.baseline_census.math_blocks === M.count,
         JSON.stringify([payload.baseline_census.math_blocks, M.count]));
-  check("the placeholder height comes from the measured median of those blocks",
-        typeof M.median_height === "number" && M.median_height > 0
-        && M.heights.p50 !== null && M.heights.min <= M.median_height
-        && M.median_height <= M.heights.max, JSON.stringify(M.heights));
+  // THE MEAN, NOT THE MEDIAN. The scrollHeight error a placeholder introduces is the SUM of
+  // (placeholder - actual) over the blocks that were never rendered, so the statistic that
+  // zeroes it is the arithmetic mean. Run 32876363634 used the median and moved scrollHeight by
+  // +3.3% at r500K, which disqualified the arm, while the same arm moved it by -0.01% at r100K
+  // where the two statistics happened to coincide. Both are still recorded, because the gap
+  // between them is what says the distribution is skewed.
+  check("the placeholder height comes from the measured MEAN of those blocks",
+        typeof M.mean_height === "number" && M.mean_height > 0
+        && M.heights.min <= M.mean_height && M.mean_height <= M.heights.max,
+        JSON.stringify({ mean: M.mean_height, median: M.median_height, heights: M.heights }));
+  check("the median is recorded too, so a skewed distribution is visible",
+        typeof M.median_height === "number" && M.median_height > 0,
+        JSON.stringify([M.mean_height, M.median_height]));
+  check("what those blocks ARE is counted, so the follow-up knows whether a CSS selector exists",
+        M.kinds && typeof M.kinds === "object" && Object.keys(M.kinds).length > 0,
+        JSON.stringify(M.kinds));
   check("the exploratory arm names that measured height in its own applied detail",
-        by.content_visibility_math_blocks.apply_detail.indexOf(`${M.median_height}px`) >= 0,
+        by.content_visibility_math_blocks.apply_detail.indexOf(`${M.mean_height}px`) >= 0,
         by.content_visibility_math_blocks.apply_detail);
 }
 

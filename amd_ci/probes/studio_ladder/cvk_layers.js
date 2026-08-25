@@ -1,9 +1,19 @@
 // ONE-PIXEL scroll ablation: what does `content-visibility: auto` on KaTeX actually buy?
 //
 // This is `amdv_layers.js`, the scene that produced run 32869180652 (baseline 287.6 ms blocked
-// per scroll event = 3.2 fps, `.katex{visibility:hidden}` 10.0 ms = 61.0 fps, +97%), with three
-// arms added and NOTHING ELSE CHANGED. Same one-pixel gesture, same fixed park, same drained
-// fence reservoir, same discarded warm-up, same interleaved baselines, same thresholds.
+// per scroll event = 3.2 fps, `.katex{visibility:hidden}` 10.0 ms = 61.0 fps, +97%), with arms
+// added and NOTHING ELSE CHANGED about the instrument. Same one-pixel gesture, same fixed park,
+// same drained fence reservoir, same discarded warm-up, same interleaved baselines, same
+// thresholds.
+//
+// SECOND ATTEMPT, after run 32876363634. That run passed every instrument gate at every rung and
+// failed exactly one: the reference upper bound. `.katex{visibility:hidden}` removed 90% at
+// r100K, as published, but only 55% at r500K against the published 97%. Two things changed here
+// and nothing else: the upper bound now runs TWICE, early and late, so order-dependence is
+// measured rather than argued; and the exploratory arm's placeholder height is now the
+// arithmetic MEAN of the blocks it covers rather than the median, because the scrollHeight error
+// a placeholder introduces is the SUM of (placeholder - actual) and the mean is the value that
+// zeroes it.
 //
 // WHAT IS BEING ASKED. `.katex{visibility:hidden}` is a MECHANISM PROBE, not a shippable fix: it
 // works by making the maths invisible. Its 97% is an UPPER BOUND on what a real fix could
@@ -210,6 +220,35 @@
     }
     return { clamp_ms: med, samples: s.length, p50: med };
   };
+  // THE PRIMARY METRIC IS A MEAN, AND A MEAN OVER ONE OUTLIER IS A REPORT OF WHERE THE OUTLIER
+  // LANDED. This is not hypothetical: on this venue at r500K the app blocks the main thread for
+  // about 8.6 SECONDS every 30 SECONDS. Re-scored from the untouched rAF series of runs
+  // 32869180652 and 32876363634, every window longer than about 3 s catches exactly one of
+  // those, and every window shorter than that catches none. `.katex{visibility:hidden}` runs in
+  // 1.8 s when it works, so in the published run it missed the stall and read 10.0 ms per frame,
+  // and in the next session it caught one and read 112.9 -- an 11x difference produced entirely
+  // by one frame, with both sessions reporting an identical p50 of 17 ms and p95 of 18 ms.
+  //
+  // So every window now also reports what it costs with its single worst frame removed, and how
+  // many frames over one second it contained. Neither replaces the mean; a window whose two
+  // numbers disagree is a window that caught a stall, and that is a fact about the window rather
+  // than about the arm.
+  const robustOver = (t, g, el) => {
+    if (clamp.clamp_ms === null || !(el > 0) || !t.length || !g.length) {
+      return { blocked_ms: null, frames: null, blocked_ms_per_frame: null,
+               stall_frames_over_1s: null, worst_tick_ms: null, worst_gap_ms: null };
+    }
+    const ts = t.slice().sort((a, b) => b - a);
+    const gs = g.slice().sort((a, b) => b - a);
+    let b = 0;
+    for (let i = 1; i < ts.length; i++) { const x = ts[i] - clamp.clamp_ms; if (x > 0) b += x; }
+    const frames = Math.max(1, g.length - 1);
+    return { blocked_ms: Math.round(b), frames,
+             blocked_ms_per_frame: Math.round((b / frames) * 10) / 10,
+             stall_frames_over_1s: g.filter((x) => x > 1000).length,
+             worst_tick_ms: Math.round(ts[0]), worst_gap_ms: Math.round(gs[0]) };
+  };
+
   const busyOver = (t, el) => {
     if (clamp.clamp_ms === null || !(el > 0)) {
       return { busy_pct: null, blocked_ms: null,
@@ -497,7 +536,16 @@
       revert: async () => unstyle("lay-ks"),
       fired: () => firedCheck(".katex *", "position", "static", 400) },
 
-    visibility_hidden_offscreen: {
+    // NAMED AFTER ITS SELECTOR, deliberately. The old name for this arm was
+    // `visibility_hidden_offscreen`, and `wq_final.js` has a DIFFERENT arm of that exact name
+    // which hides off-screen MESSAGES (`.f-vh` on `[data-role]`) rather than KaTeX roots. Two
+    // arms, adjacent names, different selectors: that is instrument defect #40, and it cost a
+    // round of investigation when this arm read 55% here against a published 97%. It was not the
+    // collision -- both sessions recorded `.katex{visibility:hidden}` and both fired 514/514 --
+    // but the only reason that could be established is that the payload records the SELECTOR
+    // independently of the label. The name now carries the selector so the question cannot be
+    // asked again.
+    katex_root_visibility_hidden: {
       why: "`recursiveUpdateLayerPositionsAfterScroll` has exactly ONE early-out: "
          + "`!m_hasVisibleDescendant && !m_hasVisibleContent`. `visibility: hidden` on the KaTeX "
          + "roots is the only cheap way to reach it, and it does NOT change layout, so "
@@ -558,7 +606,7 @@
          + "other, and the placeholder height is the measured median of those very blocks. It "
          + "bounds what that work would be worth before anyone does it.",
       apply: async () => {
-        const h = W.mathBlocks && W.mathBlocks.median_height ? W.mathBlocks.median_height : 24;
+        const h = W.mathBlocks && W.mathBlocks.mean_height ? W.mathBlocks.mean_height : 24;
         style("cvk-m", `.cvk-mathblock{content-visibility:auto;contain-intrinsic-size:auto ${h}px}`);
         return `.cvk-mathblock{content-visibility:auto;contain-intrinsic-size:auto ${h}px} `
              + `over ${(W.mathBlocks || {}).count} blocks`;
@@ -597,17 +645,29 @@
   // `visibility_hidden_offscreen` is kept because it is the UPPER BOUND the shippable arms are
   // being read against, and re-measuring it in the same session is the only way to know that
   // this session is the same experiment as the one that produced the 97%.
+  // THE REFERENCE UPPER BOUND RUNS TWICE, EARLY AND LATE, and that is the point of this
+  // sequence. In run 32876363634 `.katex{visibility:hidden}` removed 90% at r100K but only 55%
+  // at r500K, against the 97% run 32869180652 published for the same arm on the same corpus and
+  // the same venue. Every other control in that session behaved -- the floor was 6.0 ms, the
+  // positive control 2.0 ms, both reps agreed to within a few percent, and one arm in the same
+  // wave removed 92% -- so the session was not blind. What differed from the published run is
+  // the arm's POSITION: it ran tenth, after three arms that skip and unskip large subtrees,
+  // rather than eighth after two that force `position: static`. Running it in both places in one
+  // session is the only way to settle whether that history is what moved it, and if the two
+  // readings agree then the position hypothesis is dead and the difference is between sessions.
   const SEQUENCE = [
     ["baseline", "baseline"],
     ["noop_touch", "noop_touch"],
     ["baseline", "baseline_2"],
-    ["content_visibility_katex_display", "content_visibility_katex_display"],
+    ["katex_root_visibility_hidden", "katex_root_visibility_hidden"],
     ["baseline", "baseline_3"],
-    ["content_visibility_katex_all", "content_visibility_katex_all"],
+    ["content_visibility_katex_display", "content_visibility_katex_display"],
     ["baseline", "baseline_4"],
-    ["content_visibility_math_blocks", "content_visibility_math_blocks"],
+    ["content_visibility_katex_all", "content_visibility_katex_all"],
     ["baseline", "baseline_5"],
-    ["visibility_hidden_offscreen", "visibility_hidden_offscreen"],
+    ["content_visibility_math_blocks", "content_visibility_math_blocks"],
+    ["baseline", "baseline_6"],
+    ["katex_root_visibility_hidden", "katex_root_visibility_hidden_late"],
     ["baseline", "baseline_repeat"],
     ["still_no_scroll", "still_no_scroll"],
     ["detach_messages", "detach_messages"],
@@ -737,15 +797,35 @@
           }
         }
         const hs = [];
+        const kinds = {};
         for (const b of blocks) {
           b.classList.add("cvk-mathblock");
           hs.push(b.getBoundingClientRect().height);
+          // What these blocks ARE, because if they turn out to be one identifiable kind of
+          // element then the follow-up is a CSS rule and not a renderer change, and if they are
+          // a grab-bag then it is a renderer change. Guessing either way would be guessing.
+          const cls = String(b.className || "");
+          const k = b.tagName + (cls.indexOf("katex-display") >= 0 ? ".katex-display" : "")
+                  + (b.getAttribute && b.getAttribute("data-streamdown")
+                     ? "[data-streamdown=" + b.getAttribute("data-streamdown") + "]" : "");
+          kinds[k] = (kinds[k] || 0) + 1;
         }
+        const sum = hs.reduce((a, b) => a + b, 0);
         hs.sort((a, b) => a - b);
         const at = (p) => hs.length
           ? hs[Math.min(hs.length - 1, Math.max(0, Math.round(p * (hs.length - 1))))] : null;
+        // THE MEAN, NOT THE MEDIAN, and this is a correction rather than a preference. The
+        // scrollHeight error a placeholder introduces is the SUM of (placeholder - actual) over
+        // the blocks that have not been rendered, so the value that makes that sum zero is the
+        // arithmetic mean. Run 32876363634 used the median, 138 px against a mean of about
+        // 133, and moved scrollHeight by +3.3% at r500K -- which disqualified the arm under the
+        // 2% rule even though the same arm moved scrollHeight by -0.01% at r100K, where the two
+        // statistics happened to coincide.
+        const mean = hs.length ? Math.round(sum / hs.length) : null;
         return { count: blocks.size, roots: roots.length,
+                 mean_height: mean,
                  median_height: at(0.5) === null ? null : Math.round(at(0.5)),
+                 kinds,
                  heights: { min: at(0), p25: at(0.25), p50: at(0.5), p75: at(0.75),
                             p90: at(0.9), max: at(1) } };
       };
@@ -936,9 +1016,14 @@
           // separate "less work per frame" from "more frames in the same second".
           blocked_ms_per_frame: (b.blocked_ms !== null && s.g.length)
             ? Math.round((b.blocked_ms / s.g.length) * 10) / 10 : null,
+          // Reported ALONGSIDE the mean, never instead of it. See `robustOver`.
+          robust: robustOver(s.t, s.g, elapsed),
           raf: summarise(s.g),
           raf_gaps_ms: s.g.map((x) => Math.round(x * 10) / 10),
           busy: b,
+          // THE SELECTOR, on every window, so a report can quote the thing rather than the
+          // label. Three times in this campaign a label has been trusted over what it names.
+          selector: detail,
           census_before: before, census_applied: applied, census_after: census(el),
           // Per window, so a window that paid for someone else's deferred mounting is visible as
           // a number instead of being averaged into the arm it landed on.

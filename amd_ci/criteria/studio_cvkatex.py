@@ -42,11 +42,32 @@ are inline and the declaration is silently inert on them. That is measured here 
 asserted: if the all-selector arm reads MATERIALLY BETTER, the reading is wrong and the shipped
 rule is leaving something on the table, and this file says so.
 
-THE REFERENCE UPPER BOUND IS NOT A CANDIDATE. `visibility_hidden_offscreen` is re-measured in the
+THE REFERENCE UPPER BOUND IS NOT A CANDIDATE. `katex_root_visibility_hidden` is re-measured in the
 same session for one reason: to say whether this session reproduces the 97% that run 32869180652
 measured. If it does not, the candidates cannot be read against that published number, because the
 session is not the same experiment. It is gated as such, and it is never allowed to carry a
-verdict, because it is not shippable.
+verdict, because it is not shippable. It now runs TWICE, early and late in the sequence
+(`katex_root_visibility_hidden` and `katex_root_visibility_hidden_late`), because run 32876363634
+read 55% from it at r500K where the published run read 97% and the only thing that visibly differed
+was where in the sequence it ran. The two readings are compared per rung and reported: a
+disagreement between them is a statement about the SESSION, not about the arm.
+
+THE MEAN IS PRIMARY AND THE MEAN IS FRAGILE, AND BOTH OF THOSE ARE TRUE AT ONCE. On this venue at
+r500K the app blocks the main thread for about 8.6 SECONDS every 30 SECONDS. Re-scored from the
+untouched rAF gap series of runs 32869180652 and 32876363634, every window longer than about 3 s
+catches exactly one of those stalls and every window shorter than that catches none. Because
+`blocked_ms_per_frame` is a MEAN, one 8.6 s frame spread over ~90 frames adds about 90 ms per
+frame on its own. `.katex{visibility:hidden}` completes in 1.8 s when it works, so the published
+run missed the stall and read 10.0 ms per frame while the next session caught one and read 112.9 --
+an 11x difference produced by a SINGLE FRAME, with both sessions reporting an identical p50 of
+17 ms and p95 of 18 ms. Drop the single worst frame from each window and the two sessions agree to
+within 2% on every window. The stall does not occur at r100K (0 frames over 1 s in 1,392 frames in
+the same session) and does not occur on the local llvmpipe rig at all. So the scene now records a
+`robust` figure per window with its single worst tick and worst rAF gap removed, this file reports
+it ALONGSIDE the mean rather than instead of it, and a window whose mean is more than
+MEAN_OVER_ROBUST_MAX times its robust figure FAILS THE RUN. Recording that quantity and never
+gating on it would be defect #48 (a measured quantity nobody checks) on top of defect #8 (a metric
+unstable by construction), and a window that caught a stall is not measuring its arm.
 
 MULTI-RUNG. The probe measures several rungs in one observation file and every per-window
 computation is grouped BY RUNG. An arm at 100K scored against a baseline at 500K would be a ratio
@@ -99,8 +120,15 @@ FLOOR = "still_no_scroll"
 CANDIDATES = ["content_visibility_katex_display", "content_visibility_katex_all",
               "content_visibility_math_blocks"]
 # NOT a candidate. `.katex{visibility:hidden}` makes the maths invisible, so it can never ship; it
-# is kept in the sequence only to say whether this session reproduces the published 97%.
-UPPER_BOUND = "visibility_hidden_offscreen"
+# is kept in the sequence only to say whether this session reproduces the published 97%. Renamed
+# from `visibility_hidden_offscreen`, which in `wq_final.js` names a DIFFERENT arm that hides
+# off-screen MESSAGES: two arms sharing one label is defect #40, and the label is what a report
+# quotes.
+UPPER_BOUND = "katex_root_visibility_hidden"
+# The same arm, run a second time late in the sequence. Not a candidate either. It exists to
+# separate "the arm reads differently depending on what ran before it" from "this session differs
+# from the published one", which run 32876363634 could not do.
+UPPER_BOUND_LATE = "katex_root_visibility_hidden_late"
 # The one arm a verdict may be built on: it is the rule the PR adds.
 SHIPPABLE = "content_visibility_katex_display"
 # The same rule with `.katex` added, which exists to prove the inline-maths claim rather than
@@ -144,11 +172,24 @@ KATEX_ALL_MAX_EXCESS = 0.05
 # Idle frame rate at the short rung, against the long rung. The short rung has fewer elements and
 # no maths, so it cannot legitimately be slower.
 SHORT_RUNG_IDLE_TOLERANCE = 0.05
+# How far a window's MEAN may sit above the same window with its single worst frame removed. Two
+# times is already enormous: it means one frame out of ninety is worth as much as the other
+# eighty-nine put together, which on this venue means the window caught one of the app's 8.6 s
+# stalls and is reporting where that landed rather than what the arm did.
+MEAN_OVER_ROBUST_MAX = 2.0
+# REPORTING ONLY, gates nothing: how far the early and late readings of the reference upper bound
+# may diverge before the report calls them a disagreement about the session.
+EARLY_LATE_MAX_RATIO = 2.0
+# How much of a selector to quote in a table cell.
+SELECTOR_CHARS = 46
 
 # Run 32869180652, this venue, 500K, same scene minus the three new arms.
 PUBLISHED_RUN = "32869180652"
 PUBLISHED_BASE_MS, PUBLISHED_BASE_FPS = 287.6, 3.2
 PUBLISHED_UPPER_MS, PUBLISHED_UPPER_FPS, PUBLISHED_UPPER_SAVING = 10.0, 61.0, 0.97
+# Run 32876363634, the session that caught the stalls: the same upper-bound arm read 55% at r500K
+# and 90% at r100K, with a floor of 6.0 ms and a positive control of 2.0 ms.
+STALL_RUN = "32876363634"
 
 
 # ── payload access, GROUPED BY RUNG ───────────────────────────────────────────────────────────
@@ -251,6 +292,11 @@ def _scored(obs: dict, rung: str) -> dict[str, list[dict]]:
                 "work_ratio": (base_b / b) if (b and base_b) else None,
                 "fps_ratio": (f / base_f) if (f and base_f) else None,
                 "fired": a.get("fired"),
+                # What the arm actually applied, quoted rather than summarised by its label.
+                "selector": a.get("selector") or a.get("apply_detail"),
+                # The same window with its single worst frame removed. Reported ALONGSIDE the
+                # mean, never instead of it.
+                "robust": a.get("robust") or {},
                 # The engine ACTED on it, as opposed to having accepted it.
                 "took_effect": a.get("took_effect"),
                 "probe_before": a.get("probe_before"), "probe_after": a.get("probe_after"),
@@ -268,6 +314,32 @@ def _entries(obs: dict, rung: str | None, name: str) -> list[dict]:
 
 def _saving(obs: dict, rung: str | None, name: str):
     return _mean([e["saving"] for e in _entries(obs, rung, name) if e.get("saving") is not None])
+
+
+def _selector_of(window_or_entry: dict) -> str | None:
+    return window_or_entry.get("selector") or window_or_entry.get("apply_detail")
+
+
+def _sel_txt(x, chars: int = SELECTOR_CHARS) -> str:
+    """Quote what the arm applied. A label is a claim about a selector; the selector is the fact."""
+    s = str(x or "").strip().replace("|", "/").replace("\n", " ")
+    if not s:
+        return "-"
+    return "`" + (s if len(s) <= chars else s[:chars - 3] + "...") + "`"
+
+
+def _arm_selector(entries: list[dict]) -> str | None:
+    for e in entries:
+        s = _selector_of(e)
+        if s:
+            return s
+    return None
+
+
+def _rb(window_or_entry: dict) -> dict:
+    """The window with its single worst tick and worst rAF gap removed."""
+    r = window_or_entry.get("robust")
+    return r if isinstance(r, dict) else {}
 
 
 def _took_effect(entries: list[dict]) -> dict | None:
@@ -305,6 +377,8 @@ def _label(name: str) -> str:
         return " **[SHIPPABLE]**"
     if name == UPPER_BOUND:
         return " **[REFERENCE UPPER BOUND, NOT SHIPPABLE]**"
+    if name == UPPER_BOUND_LATE:
+        return " **[REFERENCE UPPER BOUND, RE-RUN LATE, NOT SHIPPABLE]**"
     if name == EXPLORATORY:
         return " **[EXPLORATORY, NOT SHIPPABLE AS WRITTEN]**"
     if name == ALL_SELECTOR:
@@ -550,6 +624,37 @@ def _gate_records(obs: dict) -> list[dict]:
     g(f"no scored window mounted more than {MAX_SCORED_WINDOW_MUTATIONS} elements",
       *_per_rung(obs, _quiet, scored_only = True))
 
+    # THE MEAN MUST NOT BE ONE FRAME. On this venue at r500K the app blocks the main thread for
+    # about 8.6 s every 30 s, and `blocked_ms_per_frame` is a MEAN, so a single such frame spread
+    # over ~90 frames adds ~90 ms per frame by itself. That is how run 32869180652 read 10.0 ms
+    # for the upper-bound arm and run 32876363634 read 112.9 for the same arm on the same corpus,
+    # while both reported a p50 of 17 ms and a p95 of 18 ms. A window that caught a stall is not
+    # measuring its arm, so it fails the RUN rather than being annotated: recording `robust` and
+    # never checking it would be defect #48 laid on top of defect #8. NOTHING is exempt -- a
+    # baseline that catches one contaminates every arm scored against it, which is worse.
+    def _stall(rung, rs):
+        bad = []
+        for rep_i, seq in _windows(obs, rung):
+            for a in seq:
+                rb = _rb(a)
+                m, r = a.get("blocked_ms_per_frame"), rb.get("blocked_ms_per_frame")
+                if m is None or r is None:
+                    continue
+                if m > MEAN_OVER_ROBUST_MAX * r:
+                    ratio = (m / r) if r else float("inf")
+                    n_stall = rb.get("stall_frames_over_1s")
+                    bad.append(f"rep {rep_i} {a.get('name')}: mean {m} ms/frame against a robust "
+                               f"{r} ms/frame with the worst frame dropped ("
+                               + ("infinitely more" if r == 0 else f"{ratio:.1f}x")
+                               + f"), {n_stall} frame{'' if n_stall == 1 else 's'} over 1 s, "
+                                 f"worst gap {rb.get('worst_gap_ms')} ms")
+        return (not bad), ("; ".join(bad) if bad
+                           else "every window's mean survives dropping its worst frame")
+
+    g(f"no scored window's mean is dominated by a single frame (mean <= "
+      f"{MEAN_OVER_ROBUST_MAX:.0f}x the same window with its worst frame dropped)",
+      *_per_rung(obs, _stall, scored_only = True))
+
     # Every window of a rung must have looked at the SAME content, which is what a fixed park
     # pixel buys. The park differs BETWEEN rungs by construction, which is why this is per rung.
     def _park(rung, rs):
@@ -700,23 +805,38 @@ def _rung_table(obs: dict, rung: str) -> list[str]:
             if a.get("name") not in order:
                 order.append(a.get("name"))
 
+    def raw(name: str) -> list[dict]:
+        return [a for _, seq in _windows(obs, rung) for a in seq if a.get("name") == name]
+
     rows = [f"### Rung {rung}", "",
-            "| window | blocked ms/frame | vs its two neighbouring baselines | cost removed | "
-            "fps | busy | worst frame | scrollHeight | elements mounted | declaration accepted | "
-            "engine acted |",
-            "|---|---|---|---|---|---|---|---|---|---|---|"]
+            f"**blocked ms/frame is the MEAN and stays the primary metric.** The column beside it "
+            f"is the SAME window with its single worst tick and worst rAF gap removed, reported "
+            f"ALONGSIDE the mean and never instead of it, because on this venue at r500K the app "
+            f"blocks the main thread for about 8.6 s every 30 s and one such frame spread over "
+            f"~90 frames is worth ~90 ms/frame on its own. Where the two disagree by more than "
+            f"{MEAN_OVER_ROBUST_MAX:.0f}x the window caught a stall and the run fails its own "
+            f"gate rather than reporting the mean as if it were the arm. `stalls > 1 s` is the "
+            f"count of frames over one second in the window.", "",
+            "| window | selector | blocked ms/frame (MEAN, primary) | robust, worst frame dropped "
+            "| stalls > 1 s | vs its two neighbouring baselines | cost removed | fps | busy | "
+            "worst frame | scrollHeight | elements mounted | declaration accepted | engine acted |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name in order:
         es = scored.get(name)
+        ws = raw(name)
+        sel = _sel_txt(next((_selector_of(a) for a in ws if _selector_of(a)), None))
+        rb_vals = [_rb(a).get("blocked_ms_per_frame") for a in ws]
+        rb_txt = ", ".join(f"{v:.1f}" for v in rb_vals if v is not None) or "-"
+        st_vals = [_rb(a).get("stall_frames_over_1s") for a in ws]
+        st_txt = ", ".join(str(v) for v in st_vals if v is not None) or "-"
         if es is None:
-            vals = [_bmpf(a) for _, seq in _windows(obs, rung) for a in seq
-                    if a.get("name") == name]
-            fps = [a.get("eff_fps") for _, seq in _windows(obs, rung) for a in seq
-                   if a.get("name") == name]
-            mut = [(a.get("mutations") or {}).get("added_elements") or 0
-                   for _, seq in _windows(obs, rung) for a in seq if a.get("name") == name]
-            rows.append(f"| `{name}` (baseline) | "
-                        + ", ".join(f"{v:.1f}" for v in vals if v is not None)
-                        + " | - | - | " + ", ".join(f"{v:.1f}" for v in fps if v is not None)
+            vals = [_bmpf(a) for a in ws]
+            fps = [a.get("eff_fps") for a in ws]
+            mut = [(a.get("mutations") or {}).get("added_elements") or 0 for a in ws]
+            rows.append(f"| `{name}` (baseline) | {sel} | "
+                        + (", ".join(f"{v:.1f}" for v in vals if v is not None) or "-")
+                        + f" | {rb_txt} | {st_txt} | - | - | "
+                        + (", ".join(f"{v:.1f}" for v in fps if v is not None) or "-")
                         + f" | - | - | - | {max(mut) if mut else 0} | - | - |")
             continue
         b = _mean([e["bmpf"] for e in es])
@@ -731,7 +851,10 @@ def _rung_table(obs: dict, rung: str) -> list[str]:
         te = _took_effect(es)
         rows.append("| " + " | ".join([
             f"`{name}`{_label(name)}" + ("  **[DISQUALIFIED]**" if dq else ""),
+            sel,
             "-" if b is None else f"**{b:.1f}**",
+            rb_txt,
+            st_txt,
             "-" if wr is None else f"{wr:.2f}x less work",
             "-" if sv is None else f"{sv:+.0%}",
             "-" if f is None else f"{f:.1f}",
@@ -753,17 +876,19 @@ def _rung_table(obs: dict, rung: str) -> list[str]:
                  f"block's real height with a placeholder is EXPECTED to move it a little):", ""]
     for name in order:
         es = scored.get(name)
-        vals = ([e["scroll_height_delta"] for e in es] if es else
-                [a.get("scroll_height_delta") for _, seq in _windows(obs, rung) for a in seq
-                 if a.get("name") == name])
+        ws = raw(name)
+        sel = _sel_txt(next((_selector_of(a) for a in ws if _selector_of(a)), None))
+        vals = ([e["scroll_height_delta"] for e in es] if es
+                else [a.get("scroll_height_delta") for a in ws])
         vals = [v for v in vals if v is not None]
         if not vals:
-            rows.append(f"- `{name}`: not recorded")
+            rows.append(f"- `{name}` ({sel}): not recorded")
             continue
         worst = max(vals, key = abs)
         over = abs(worst) > MAX_SCROLL_HEIGHT_DELTA
         exempt = name in (POSITIVE, NEGATIVE, FLOOR, BASELINE_REPEAT)
-        rows.append(f"- `{name}`{_label(name)}: " + ", ".join(f"{v:+.2%}" for v in vals)
+        rows.append(f"- `{name}`{_label(name)} ({sel}): "
+                    + ", ".join(f"{v:+.2%}" for v in vals)
                     + ("" if not over else
                        ("  <- over the gate, and exempt from it: this arm changes the thread on "
                         "purpose" if exempt else "  <- over the gate")))
@@ -771,25 +896,77 @@ def _rung_table(obs: dict, rung: str) -> list[str]:
     dqs = [(n, _disqualified(n, es)) for n, es in scored.items() if _disqualified(n, es)]
     if dqs:
         rows += ["", "Disqualified arms, and why (the other arms are unaffected):", ""]
-        rows += [f"- `{n}`{_label(n)}: {why}" for n, why in dqs]
+        rows += [f"- `{n}`{_label(n)} ({_sel_txt(_arm_selector(scored[n]))}): {why}"
+                 for n, why in dqs]
+
+    rows += _early_late_lines(obs, rung)
 
     # Per repetition, because a mean over a bimodal draw is a report of how many slow draws
-    # happened to land in that arm.
+    # happened to land in that arm. The robust column is repeated here per rep because a stall
+    # lands in ONE repetition, and a mean over two reps is exactly where that disappears.
     rows += ["", "Per repetition, so a mean cannot hide a disagreement:", "",
-             "| window | blocked ms/frame per rep | fps per rep | frames per rep |",
-             "|---|---|---|---|"]
+             "| window | selector | blocked ms/frame per rep | robust per rep | stalls > 1 s per "
+             "rep | fps per rep | frames per rep |", "|---|---|---|---|---|---|---|"]
     for name in order:
-        vals, fps, fr = [], [], []
-        for _, seq in _windows(obs, rung):
-            for a in seq:
-                if a.get("name") == name:
-                    vals.append(_bmpf(a))
-                    fps.append(a.get("eff_fps"))
-                    fr.append(a.get("frames"))
-        rows.append(f"| `{name}` | " + ", ".join(str(v) for v in vals) + " | "
-                    + ", ".join(str(v) for v in fps) + " | "
-                    + ", ".join(str(v) for v in fr) + " |")
+        ws = raw(name)
+        sel = _sel_txt(next((_selector_of(a) for a in ws if _selector_of(a)), None))
+        rows.append(f"| `{name}` | {sel} | "
+                    + ", ".join(str(_bmpf(a)) for a in ws) + " | "
+                    + ", ".join(str(_rb(a).get("blocked_ms_per_frame")) for a in ws) + " | "
+                    + ", ".join(str(_rb(a).get("stall_frames_over_1s")) for a in ws) + " | "
+                    + ", ".join(str(a.get("eff_fps")) for a in ws) + " | "
+                    + ", ".join(str(a.get("frames")) for a in ws) + " |")
     return rows
+
+
+def _early_late_lines(obs: dict, rung: str, brief: bool = False) -> list[str]:
+    """The reference upper bound ran twice. Whether the two agree is a fact about the SESSION.
+
+    Run 32876363634 read 55% from this arm at r500K where run 32869180652 published 97% for the
+    same arm on the same corpus and the same venue, with every control behaving in both. The only
+    visible difference was WHERE IN THE SEQUENCE it ran: tenth, after three arms that skip and
+    unskip large subtrees, rather than eighth after two that force `position: static`. Running it
+    in both positions in one session is the only way to settle that, and if the two readings agree
+    the position hypothesis is dead and the difference lives between sessions.
+    """
+    scored = _scored(obs, rung)
+    early, late = scored.get(UPPER_BOUND) or [], scored.get(UPPER_BOUND_LATE) or []
+    if not early or not late:
+        return []
+    eb, lb = _mean([e["bmpf"] for e in early]), _mean([e["bmpf"] for e in late])
+    es_, ls_ = _saving(obs, rung, UPPER_BOUND), _saving(obs, rung, UPPER_BOUND_LATE)
+    sel = _sel_txt(_arm_selector(early) or _arm_selector(late))
+    if eb is None or lb is None or not eb or not lb:
+        return ["", f"The reference upper bound ran twice at {rung} ({sel}) but one of the two "
+                    f"windows produced no reading, so the order-dependence question is open."]
+    ratio = max(eb, lb) / min(eb, lb)
+    if brief:
+        # The full paragraph lives in the rung's own section; repeating it here would be noise,
+        # but a reader who came for the bound has to be told whether it is stable.
+        return ["", f"It ran twice in this session: early **{eb:.1f}**, late **{lb:.1f}** ms "
+                    f"blocked/frame, {ratio:.1f}x apart -- they "
+                    + ("DISAGREE, so read the rung section above before using this number as a "
+                       "bound" if ratio > EARLY_LATE_MAX_RATIO
+                       else "agree, so the bound is stable within this session") + "."]
+    head = (f"The reference upper bound, run TWICE at {rung} ({sel}): early "
+            f"**{eb:.1f}** ms blocked/frame"
+            + ("" if es_ is None else f" ({es_:+.0%})")
+            + f", late **{lb:.1f}** ms blocked/frame"
+            + ("" if ls_ is None else f" ({ls_:+.0%})")
+            + f", a factor of {ratio:.1f}x between them.")
+    if ratio > EARLY_LATE_MAX_RATIO:
+        tail = (f" **They DISAGREE.** The same declaration, on the same page, in the same session, "
+                f"read {ratio:.1f}x differently depending on where in the sequence it ran. That is "
+                f"a statement about this SESSION and not about the arm: either the arms that ran "
+                f"between them left the page in a different state, or a window caught one of this "
+                f"venue's 8.6 s stalls. Read the robust column above before reading either number, "
+                f"and do not use this arm as a bound until they agree.")
+    else:
+        tail = (f" They AGREE to within {EARLY_LATE_MAX_RATIO:.0f}x, so this arm's reading does "
+                f"not depend on what ran before it, and the gap between run {PUBLISHED_RUN} "
+                f"({PUBLISHED_UPPER_SAVING:.0%}) and run {STALL_RUN} (55% at r500K) is a "
+                f"difference between SESSIONS rather than an artefact of arm order.")
+    return ["", head + tail]
 
 
 def _short_section(obs: dict, rung: str) -> list[str]:
@@ -857,11 +1034,12 @@ def table(obs: dict) -> str:
                  "probes are the evidence, and they are probed on DIFFERENT populations on "
                  "purpose -- the display arm on `.katex-display`, the all arm on the INLINE roots, "
                  "because those are the ones the claim is about.", "",
-                 "| arm | cost removed | height probe | off-screen boxes whose height changed | "
-                 "mean height before -> after |", "|---|---|---|---|---|"]
+                 "| arm | selector | cost removed | height probe | off-screen boxes whose height "
+                 "changed | mean height before -> after |", "|---|---|---|---|---|---|"]
         for nm, sv, te in ((SHIPPABLE, d_sv, te_d), (ALL_SELECTOR, a_sv, te_a)):
             rows.append("| " + " | ".join([
                 f"`{nm}`{_label(nm)}",
+                _sel_txt(_arm_selector(_entries(obs, long_rung, nm))),
                 "-" if sv is None else f"**{sv:+.0%}**",
                 "-" if not te else f"`{te.get('selector')}`",
                 "-" if not te else (f"{te.get('changed')}/{te.get('compared')} "
@@ -887,14 +1065,18 @@ def table(obs: dict) -> str:
         ub = _saving(obs, long_rung, UPPER_BOUND)
         if ub is not None:
             rows += [f"### The reference upper bound ({long_rung})", "",
-                     f"`{UPPER_BOUND}` removes **{ub:+.0%}** here, against +"
+                     f"`{UPPER_BOUND}` "
+                     f"({_sel_txt(_arm_selector(_entries(obs, long_rung, UPPER_BOUND)))}) removes "
+                     f"**{ub:+.0%}** here, against +"
                      f"{PUBLISHED_UPPER_SAVING:.0%} in run {PUBLISHED_RUN} ({PUBLISHED_BASE_MS} ms "
                      f"blocked per scroll event at {PUBLISHED_BASE_FPS} fps -> "
                      f"{PUBLISHED_UPPER_MS} ms at {PUBLISHED_UPPER_FPS} fps). It is NOT a "
                      f"candidate and cannot ship: it removes the cost by making the maths "
                      f"invisible. Its only job is to say whether this session is the same "
                      f"experiment as the published one, so that the candidate numbers above can "
-                     f"be read against that 97%.", ""]
+                     f"be read against that 97%."]
+            rows += _early_late_lines(obs, long_rung, brief = True)
+            rows.append("")
 
     # THE DISCARDED WARM-UP, reported per rung. The whole point of it is the first-visit work it
     # absorbs, so throwing the window away without saying what was in it would repeat the mistake
@@ -1029,17 +1211,23 @@ def verdict(obs: dict) -> tuple[str, str]:
                  f"roots -- so the rule cannot cost anything there"
                  if shorts else "No short rung was measured, so the cost at short context is not "
                                 "established by this run")
+    # Quote what each arm APPLIED, not only what it is called. Three times in this campaign a
+    # label has been trusted over the selector it names, most recently when two different arms in
+    # two scenes shared the name `visibility_hidden_offscreen`.
+    ship_sel = _sel_txt(_arm_selector(ship))
+    expl_sel = _sel_txt(_arm_selector(_entries(obs, rung, EXPLORATORY)))
     exploratory_txt = (
-        f"`{EXPLORATORY}` (EXPLORATORY, NOT SHIPPABLE AS WRITTEN: it hoists the declaration to a "
-        f"block ancestor, which is what a renderer-side change would have to do) reads "
+        f"`{EXPLORATORY}` ({expl_sel}, EXPLORATORY, NOT SHIPPABLE AS WRITTEN: it hoists the "
+        f"declaration to a block ancestor, which is what a renderer-side change would have to do) "
+        f"reads "
         + ("no window" if expl is None else f"{expl:+.0%}")
         + (f", but it is DISQUALIFIED ({expl_dq})" if expl_dq else "")
         + ", which is what reaching inline maths would be worth")
 
     if ship and not dq and sv is not None and sv >= ARM_MIN_SAVING:
         return "HELPS", (
-            f"the shippable rule WORKS at {rung}. `{SHIPPABLE}` removes {sv:.0%} of the "
-            f"per-scroll-event cost"
+            f"the shippable rule WORKS at {rung}. `{SHIPPABLE}` ({ship_sel}) removes {sv:.0%} of "
+            f"the per-scroll-event cost"
             + (f" ({wr:.2f}x less blocked time per 1 px scroll)" if wr else "")
             + f", scored against its own two neighbouring baselines, with the negative control "
               f"flat and the positive control recovering. Per rep: {_per_rep(ship)}. "
@@ -1054,8 +1242,8 @@ def verdict(obs: dict) -> tuple[str, str]:
     why = dq or (f"it removes only {sv:+.0%}, under the {ARM_MIN_SAVING:.0%} bar"
                  if sv is not None else "it produced no scored window")
     return "NO_BENEFIT", (
-        f"the shippable rule DOES NOT WORK at {rung}: `{SHIPPABLE}` cannot carry a claim because "
-        f"{why}. Per rep: {_per_rep(ship)}. " + bound + ", and " + structural
+        f"the shippable rule DOES NOT WORK at {rung}: `{SHIPPABLE}` ({ship_sel}) cannot carry a "
+        f"claim because {why}. Per rep: {_per_rep(ship)}. " + bound + ", and " + structural
         + ". Adding `.katex` to the selector "
         + ("produced no window" if (alls is None or sv is None)
            else f"changed the reading by {alls - sv:+.1%}")
