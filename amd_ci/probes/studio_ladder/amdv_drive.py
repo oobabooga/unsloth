@@ -46,6 +46,10 @@ def main():
     # decides whether every composite goes through that software GL stack is the hardware
     # acceleration policy, so it has to be settable rather than left at whatever the headless
     # X server negotiates.
+    ap.add_argument("--console-log", default="",
+                    help="append every console message, page error and failed load here. "
+                         "A silently 404ing asset is the classic way a page looks fine and is "
+                         "not, and WebKit swallows it unless something listens.")
     ap.add_argument("--frame-clock", default="passive", choices=["updating", "passive"],
                     help="updating: GdkFrameClock.begin_updating(), a free-running display-rate "
                          "clock. passive: emissions only when a frame is actually requested.")
@@ -87,6 +91,34 @@ def main():
         if pol is not None:
             settings.set_hardware_acceleration_policy(pol)
     settings.set_enable_developer_extras(True)
+
+    # Console, page errors and unhandled rejections, to a FILE. `set_enable_write_console_
+    # messages_to_stdout` alone interleaves them with the driver's own JSON on stdout, where
+    # they are lost the moment stdout is parsed.
+    con = open(args.console_log, "a", buffering = 1) if args.console_log else None
+    if con is not None:
+        def on_console(_v, msg):
+            try:
+                con.write(json.dumps({
+                    "t": time.time(), "level": int(msg.get_level()),
+                    "source": int(msg.get_source()), "line": msg.get_line(),
+                    "text": msg.get_text(), "uri": msg.get_source_id()}) + "\n")
+            except Exception as e:  # noqa: BLE001
+                con.write(json.dumps({"t": time.time(), "console_error": repr(e)}) + "\n")
+            return False
+        try:
+            view.connect("console-message-sent", on_console)
+        except Exception as e:  # noqa: BLE001
+            con.write(json.dumps({"t": time.time(),
+                                  "note": f"console-message-sent unavailable: {e!r}"}) + "\n")
+        try:
+            view.connect("resource-load-started", lambda v, res, req: res.connect(
+                "failed", lambda r, err: con.write(json.dumps({
+                    "t": time.time(), "resource_failed": req.get_uri(),
+                    "err": str(err)}) + "\n")))
+        except Exception as e:  # noqa: BLE001
+            con.write(json.dumps({"t": time.time(),
+                                  "note": f"resource-load-started unavailable: {e!r}"}) + "\n")
     settings.set_enable_write_console_messages_to_stdout(True)
     settings.set_javascript_can_access_clipboard(True)
 
@@ -191,6 +223,8 @@ def main():
     GLib.timeout_add(200, wire_frame_clock)
 
     def on_fail(_v, _ev, uri, err):
+        if con is not None:
+            con.write(json.dumps({"t": time.time(), "load_failed": uri, "err": str(err)}) + "\n")
         emit("load_failed", {"uri": uri, "err": str(err)})
         return False
 

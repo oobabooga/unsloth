@@ -240,7 +240,9 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 f"install rc={inst.get('rc')} in {inst.get('seconds')}s; "
                 f"dist={d.get('path')} assets={d.get('asset_files')}"))
 
-    runs, ok = _runs(obs), _ok_runs(obs)
+    # LADDER runs only. The jammed control has its own gate below; counting its failure here
+    # once cost a run its verdict even though all six ladder legs had completed.
+    runs, ok = [r for r in _runs(obs) if not _is_control(r)], _ok_runs(obs)
     out.append(("every ladder run completed", bool(runs) and len(ok) == len(runs),
                 f"{len(ok)}/{len(runs)} ok" + ("" if len(ok) == len(runs) else
                 "; " + "; ".join(
@@ -288,6 +290,34 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                  f"{c.get('rung')} with a {c.get('hog_ms')} ms jam every "
                  f"{(c.get('payload') or {}).get('run_meta', {}).get('hog_period_ms', '?')} ms: "
                  f"{jam:.1f} fps against {unjam:.1f} fps unjammed, {phase} phase")))
+
+    # STUDIO ACTUALLY FUNCTIONS. Not "the process started and healthz returned 200": the
+    # thread has to have rendered, the reply has to have streamed, the reasoning pane has to
+    # open and close, and a selection has to be copyable. A Studio that boots and serves a
+    # half-rendered page produces clean-looking numbers that mean nothing.
+    acts: dict[str, list[bool]] = {}
+    streamed = 0
+    for r in ok:
+        pl = r["payload"]
+        for a in pl.get("actions") or []:
+            acts.setdefault(a.get("name", "?"), []).append(bool(a.get("ok")))
+        if (pl.get("first_token_ms") is not None
+                and not pl.get("still_running_at_deadline")
+                and any(ph.get("phase") == "stream" and (ph.get("elapsed_ms") or 0) > 0
+                        for ph in pl.get("phases") or [])):
+            streamed += 1
+    toggles = acts.get("reasoning_toggle") or []
+    copies = acts.get("select_all_copy") or []
+    works = bool(ok) and streamed == len(ok) and toggles and all(toggles) \
+        and copies and all(copies)
+    out.append(("Studio really functions here: thread rendered, reply streamed, reasoning pane "
+                "opened and closed, selection copied", works,
+                f"streamed {streamed}/{len(ok)}; reasoning_toggle "
+                f"{sum(toggles)}/{len(toggles)}; select_all_copy {sum(copies)}/{len(copies)}"
+                + ("" if works else "; " + "; ".join(
+                    f"{a.get('name')}: {str(a.get('detail'))[:90]}"
+                    for r in ok for a in (r["payload"].get("actions") or [])
+                    if not a.get("ok")))))
 
     have_repeat = any(len(rs) >= 2 for rs in _by_rung(obs).values())
     out.append(("at least one rung was measured twice, so a difference has a floor",
@@ -348,6 +378,26 @@ def table(obs: dict) -> str:
                 continue
             reads = ", ".join(f"{v:.1f}" for v in a["fps"])
             rows.append(f"| {rung} | {phase} | {reads} | {a['spread']:.1f} fps |")
+
+    rows += ["", "Action windows, which is where PR 9477 piece 2 has to be judged. "
+             "`app_sync_ms` is the time spent INSIDE the click handler, i.e. app code with "
+             "nothing else in the way; the window around it includes this scene's own waiting. "
+             "Quoting the window as though it were app cost is how a traced 153 ms call turned "
+             "out to be ~26 ms of real listener elsewhere in this campaign.", "",
+             "| rung | action | ok | app_sync_ms | window ms | fps (rAF) | worst frame | busy |",
+             "|---|---|---|---|---|---|---|---|"]
+    for rung in _rungs_sorted(obs):
+        for r in by[rung]:
+            for a in r["payload"].get("actions") or []:
+                raf = a.get("raf") or {}
+                b = a.get("busy") or {}
+                p50 = raf.get("p50_ms")
+                rows.append("| " + " | ".join([
+                    rung, str(a.get("name")), "yes" if a.get("ok") else "NO",
+                    _fmt(a.get("app_sync_ms"), " ms", 1), _fmt(a.get("elapsed_ms"), " ms"),
+                    "-" if not p50 else f"{1000.0 / p50:.1f}",
+                    _fmt(raf.get("max_ms"), " ms"),
+                    "null" if b.get("busy_pct") is None else f"{b['busy_pct']:.0f}%"]) + " |")
 
     jam, unjam, cphase = _control_fps(obs)
     if jam is not None:

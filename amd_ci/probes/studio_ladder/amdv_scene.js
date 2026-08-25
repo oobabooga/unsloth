@@ -241,6 +241,115 @@
       const scrollEl = performance.now() - scrollT0;
       const scrollS = slice();
 
+      // ── functional proof + the 9477 window ─────────────────────────────────────────────────
+      // reasoning_toggle is the window PR 9477 piece 2 has to be judged on, and it is also the
+      // clearest proof that the app is really working: the pane cannot open and close unless
+      // the thread rendered, the message mounted and React is committing.
+      //
+      // app_sync_ms is recorded separately from the window: it is the time spent INSIDE the
+      // click handler, which is app code and nothing else. The window around it includes this
+      // scene's own waiting. Reporting only the window would repeat the mistake of attributing
+      // harness cost to the app, which turned a "153 ms" traced call into ~26 ms of real
+      // listener elsewhere in this campaign.
+      const actions = [];
+      const runAction = async (name, fn) => {
+        const i0 = W.gaps.length, t0 = performance.now();
+        const before = census();
+        let detail = "", ok = true, appSync = null;
+        try { const r = await fn(); detail = r && r.detail || String(r || ""); appSync = r && r.app_sync_ms; }
+        catch (e) { ok = false; detail = String((e && e.message) || e); }
+        const dur = performance.now() - t0;
+        const g = W.gaps.slice(i0), t = W.ticks.slice(cut.ticks);
+        cut.gaps = W.gaps.length; cut.ticks = W.ticks.length;
+        actions.push({ name, ok, detail, app_sync_ms: appSync,
+                       elapsed_ms: Math.round(dur), raf: summarise(g),
+                       raf_gaps_ms: g.map((x) => Math.round(x * 10) / 10),
+                       busy: busyOver(t, dur, clamp),
+                       census_before: before, census_after: census(),
+                       wall_start_ms: Date.now() - Math.round(dur), wall_end_ms: Date.now() });
+        return ok;
+      };
+
+      mark("action:reasoning_toggle");
+      await runAction("reasoning_toggle", async () => {
+        const root = document.querySelector('[data-slot="reasoning-root"]');
+        if (!root) throw new Error("no reasoning root on the page");
+        const trigger = root.querySelector("button");
+        if (!trigger) throw new Error("no reasoning trigger button");
+        const s0 = root.getAttribute("data-state");
+        // The synchronous cost of the click handler: app code, measured with nothing else in
+        // the way. React commits inside this call.
+        const c0 = performance.now();
+        trigger.click();
+        const sync1 = performance.now() - c0;
+        await sleep(1500);
+        const r2 = document.querySelector('[data-slot="reasoning-root"]') || root;
+        const s1 = r2.getAttribute("data-state");
+        const t2 = r2.querySelector("button");
+        let sync2 = null;
+        if (t2) { const c1 = performance.now(); t2.click(); sync2 = performance.now() - c1; }
+        await sleep(1500);
+        const s2 = (document.querySelector('[data-slot="reasoning-root"]') || r2)
+          .getAttribute("data-state");
+        if (s0 === s1 && s1 === s2) throw new Error("the pane never changed state: " + s0);
+        return { detail: `state ${s0} -> ${s1} -> ${s2}`,
+                 app_sync_ms: Math.round(Math.max(sync1, sync2 || 0) * 10) / 10 };
+      });
+
+      mark("action:select_all_copy");
+      await runAction("select_all_copy", async () => {
+        const root = document.querySelector('[data-slot="reasoning-root"]')
+          || document.querySelector('[data-role="assistant"]');
+        if (!root) throw new Error("nothing to select");
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        const rng = document.createRange();
+        rng.selectNodeContents(root);
+        sel.addRange(rng);
+        await sleep(150);
+        const c0 = performance.now();
+        let copied = false;
+        try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+        const sync = performance.now() - c0;
+        const n = (sel.toString() || "").length;
+        sel.removeAllRanges();
+        if (!n) throw new Error("the selection was empty, so nothing rendered to copy");
+        return { detail: `selected ${n} chars, execCommand(copy)=${copied}`,
+                 app_sync_ms: Math.round(sync * 10) / 10 };
+      });
+
+      if (o.skipSend) {
+        // The jammed control does not need a reply: its job is to show that the frame channel
+        // moves when the main thread cannot keep up, and idle/scroll already show that. Asking
+        // it to stream as well only gives the jam a chance to starve the model chip restore,
+        // which is what made the control fail and cost the whole run its verdict.
+        const ph = (name, sl, el, extra) => Object.assign({
+          phase: name, elapsed_ms: Math.round(el), raf: summarise(sl.g),
+          raf_gaps_ms: sl.g.map((x) => Math.round(x * 10) / 10),
+          busy: busyOver(sl.t, el, clamp), census: census() }, extra || {});
+        post({
+          __done: true, ok: true, ua: navigator.userAgent, rung: o.rung, skipped_send: true,
+          engine_probe: {
+            is_webkit_gtk_ua: /AppleWebKit/.test(navigator.userAgent) && /X11/.test(navigator.userAgent),
+            vendor: navigator.vendor,
+            has_chrome: typeof window.chrome !== "undefined",
+            has_webkit_message_handlers:
+              typeof (window.webkit && window.webkit.messageHandlers) !== "undefined",
+            hardwareConcurrency: navigator.hardwareConcurrency, dpr: window.devicePixelRatio },
+          build: {
+            scripts: Array.from(document.querySelectorAll("script[src]")).map((x) => x.getAttribute("src")),
+            css: Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((x) => x.getAttribute("href")) },
+          url: location.href,
+          mount: { ms: Math.round(mountMs), by: mountedBy, census: censusMounted,
+                   last_marker: o.lastMarker },
+          clamp, scroll_detail: scrollDetail, marks: W.marks, actions,
+          phases: [ph("idle", idleS, idleEl), ph("scroll", scrollS, scrollEl,
+                                                 { detail: scrollDetail })],
+          final: census(),
+        });
+        return;
+      }
+
       mark("send");
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype, "value").set;
@@ -384,7 +493,7 @@
         send_attempts: attempts,
         still_running_at_deadline: stillRunning,
         scroll_detail: scrollDetail,
-        marks: W.marks,
+        marks: W.marks, actions,
         phases: [
           phase("idle", idleS, idleEl),
           phase("scroll", scrollS, scrollEl, { detail: scrollDetail }),

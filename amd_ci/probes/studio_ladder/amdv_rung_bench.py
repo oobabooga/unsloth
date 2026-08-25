@@ -87,6 +87,11 @@ def main():
     ap.add_argument("--hog-ms", type=int, default=0)
     ap.add_argument("--hog-period-ms", type=int, default=250)
     ap.add_argument("--frame-clock", default="passive", choices=["updating", "passive"])
+    ap.add_argument("--skip-send", action="store_true",
+                    help="stop after the action phases. The jammed control uses this: it does "
+                         "not need a reply, and starving the model chip restore under the jam "
+                         "is what made the control fail and cost a whole run its verdict.")
+    ap.add_argument("--studio-verbose", action="store_true", default=True)
     args = ap.parse_args()
 
     def P(v, default_parent=WS):
@@ -167,7 +172,8 @@ def main():
 
     binp = args.unsloth_bin or str(WS / "bin" / "unsloth")
     cmd = ["setsid", "bash", "-c",
-           f'"{binp}" studio -H 127.0.0.1 -p {args.port} -f "{dist}" >> "{logp}" 2>&1']
+           f'"{binp}" studio -H 127.0.0.1 -p {args.port} -f "{dist}"'
+           f'{" --verbose" if args.studio_verbose else ""} >> "{logp}" 2>&1']
     proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
@@ -249,8 +255,10 @@ def main():
             "maxMs": int(exp_ms * 4 + 240000), "rung": args.rung,
             "lastMarker": seeded["last_marker"],
             "mountTimeoutMs": 420000,
+            "skipSend": bool(args.skip_send),
         }))
 
+        conlog = outp.parent / f"console_{tag}.jsonl"
         resultp = work / f"result_{tag}.json"
         if resultp.exists():
             resultp.unlink()
@@ -264,7 +272,8 @@ def main():
         drive = [args.python_gi, str(driver_path),
                  "--url", url, "--init-script", str(initp), "--script", str(runp),
                  "--out", str(resultp), "--timeout", str(total_timeout),
-                 "--accel", args.accel, "--frame-clock", args.frame_clock]
+                 "--accel", args.accel, "--frame-clock", args.frame_clock,
+                 "--console-log", str(conlog)]
         denv = dict(os.environ)
         denv["DISPLAY"] = args.display
         print(f"[{tag}] driving {url}, timeout {total_timeout:.0f}s", flush=True)
@@ -291,7 +300,8 @@ def main():
             "streamed_reasoning_chars": len(reasoning), "streamed_content_chars": len(content),
             "expected_stream_ms": exp_ms, "pacer": pacer.base_url,
             "pacer_stats": stats if isinstance(stats, dict) else str(stats),
-            "studio_log": str(logp), "studio_port": args.port, "url": url,
+            "studio_log": str(logp), "console_log": str(conlog),
+            "skip_send": bool(args.skip_send), "studio_verbose": bool(args.studio_verbose), "studio_port": args.port, "url": url,
             "renderer": "REAL WebKitGTK via libwebkit2gtk-4.1 (PyGObject), NOT Playwright WebKit",
             "accel_policy": args.accel, "driver_exit": r.returncode,
             "scene": str(scene_path), "driver": str(driver_path),

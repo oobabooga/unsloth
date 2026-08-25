@@ -202,6 +202,8 @@ def main() -> int:
                    "--driver", str(LADDER / "amdv_drive.py"),
                    "--frame-clock", "updating",
                    "--out", str(outp)]
+            if hog_ms:
+                cmd.append("--skip-send")
             t0 = time.time()
             r = sh(cmd, timeout = args.rung_timeout,
                    env = {"UNSLOTH_WORKSPACE": str(work)})
@@ -218,6 +220,23 @@ def main() -> int:
             obs["runs"].append(entry)
             port += 1
             time.sleep(10)
+        # EVERY log, into the artifact. A Studio that boots and serves a half-rendered page
+        # produces clean-looking numbers, so the evidence that it worked has to be visible and
+        # not merely asserted.
+        logs = work / "out" / "logs"
+        logs.mkdir(parents = True, exist_ok = True)
+        collected = []
+        for pat in ("*.log", "*.jsonl"):
+            for f in list((work / "out").glob(pat)) + list(work.rglob("logs/" + pat)):
+                try:
+                    if f.parent == logs:
+                        continue
+                    dest = logs / (f.parent.name + "__" + f.name)
+                    shutil.copy2(f, dest)
+                    collected.append({"src": str(f), "bytes": dest.stat().st_size})
+                except Exception as e:  # noqa: BLE001
+                    collected.append({"src": str(f), "error": f"{type(e).__name__}: {e}"})
+        obs["logs_collected"] = collected
         return 0
     finally:
         if xproc is not None and xproc.poll() is None:

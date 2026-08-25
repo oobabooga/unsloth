@@ -101,6 +101,20 @@ jobs:
           sleep 3
           exit 0
 
+      # The logs, separately from the verdict, because the ask is to SEE that Studio functions
+      # rather than be told it does: Studio's own --verbose log per run, the browser console and
+      # page-error stream, and every failed resource load.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-ladder-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/ladder/out/logs
+            ${{ env.AMD_CI_WORK }}/ladder/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/ladder/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
