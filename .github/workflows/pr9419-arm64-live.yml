@@ -1,0 +1,272 @@
+name: PR 9419 ARM64 live validation
+
+on:
+  push:
+    branches: [pr9419-arm64-ci]
+
+permissions: {}
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          uname -m
+          lscpu
+          free -h
+          test "$(uname -m)" = aarch64
+
+      - name: Fetch the current PR merge
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git source
+          cd source
+          git fetch origin refs/pull/9419/merge
+          git checkout --detach FETCH_HEAD
+          git rev-parse HEAD
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal probe dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install structlog
+
+      - name: Exercise the real ARM64 wheel install heartbeat
+        env:
+          PYTHONPATH: ${{ github.workspace }}/source/studio/backend
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          import time
+          import types
+
+          offline = types.ModuleType("utils.utils")
+          offline.hf_env_offline = lambda: False
+          sys.modules["utils.utils"] = offline
+
+          from utils import ssm_runtime
+          from utils.wheel_utils import direct_wheel_url, wheel_platform_tag
+
+          assert wheel_platform_tag() == "linux_aarch64"
+          wheel_env = {
+              "python_tag": "cp312",
+              "torch_mm": "2.10",
+              "torch_version": "2.10.0+cu130",
+              "cuda_version": "13.0",
+              "cuda_major": "13",
+              "hip_version": "",
+              "cxx11abi": "TRUE",
+              "platform_tag": "linux_aarch64",
+          }
+          wheel_url = direct_wheel_url(
+              filename_prefix = "causal_conv1d",
+              package_version = "1.6.1",
+              release_tag = "v1.6.1.post4",
+              release_base_url = "https://github.com/Dao-AILab/causal-conv1d/releases/download",
+              env = wheel_env,
+          )
+          assert wheel_url and ssm_runtime.url_exists(wheel_url), wheel_url
+
+          importable = iter((False, True))
+          ssm_runtime._is_importable = lambda name: next(importable)
+          ssm_runtime.probe_torch_wheel_env = lambda timeout = 30: wheel_env
+
+          real_install_wheel = ssm_runtime.install_wheel
+
+          def quiet_real_install(url, **kwargs):
+              time.sleep(65)
+              return real_install_wheel(url, **kwargs)
+
+          ssm_runtime.install_wheel = quiet_real_install
+          started = time.monotonic()
+          statuses = []
+
+          def status(message):
+              elapsed = time.monotonic() - started
+              statuses.append((elapsed, message))
+              print(f"status at {elapsed:.1f}s: {message}", flush = True)
+
+          installed = ssm_runtime._install_kernel(
+              import_name = "causal_conv1d",
+              display_name = "causal-conv1d",
+              pypi_name = "causal-conv1d",
+              package_version = "1.6.1",
+              release_tag = "v1.6.1.post4",
+              release_base_url = "https://github.com/Dao-AILab/causal-conv1d/releases/download",
+              status_cb = status,
+              run = subprocess.run,
+          )
+          beats = [entry for entry in statuses if entry[1].startswith("Still installing")]
+          assert installed is True
+          assert beats, statuses
+          assert 58 <= beats[0][0] <= 65, beats
+          print({"wheel_url": wheel_url, "heartbeats": len(beats), "first_heartbeat_s": beats[0][0]})
+          PY
+
+      - name: Exercise failed-load cancellation and process-tree cleanup
+        env:
+          PYTHONPATH: ${{ github.workspace }}/source/studio/backend
+          UNSLOTH_STUDIO_CHILD_RECORD: ${{ runner.temp }}/pr9419-child-records
+        run: |
+          python - <<'PY'
+          import multiprocessing as mp
+          import os
+          import subprocess
+          import sys
+          import threading
+          import time
+          import types
+
+          hardware = types.ModuleType("utils.hardware")
+
+          class Device:
+              value = "cpu"
+
+          hardware.get_device = lambda: Device()
+          hardware.prepare_gpu_selection = lambda *args, **kwargs: ([0], "arm64-ci")
+          sys.modules["utils.hardware"] = hardware
+
+          utility = types.ModuleType("utils.utils")
+          utility.hf_env_offline = lambda: False
+          sys.modules["utils.utils"] = utility
+
+          transformers_version = types.ModuleType("utils.transformers_version")
+
+          class SidecarSwapInProgress(RuntimeError):
+              pass
+
+          transformers_version.SidecarSwapInProgress = SidecarSwapInProgress
+          transformers_version.needs_transformers_5 = lambda name: False
+          transformers_version.sidecar_swap_kind = lambda: None
+          sys.modules["utils.transformers_version"] = transformers_version
+
+          xet = types.ModuleType("utils.hf_xet_fallback")
+
+          class DownloadStallError(RuntimeError):
+              pass
+
+          xet.DownloadStallError = DownloadStallError
+          sys.modules["utils.hf_xet_fallback"] = xet
+
+          from core.inference import orchestrator as orchestrator_module
+          from core.inference.orchestrator import InferenceOrchestrator
+          from utils.process_lifetime import adopt_pid
+
+          orchestrator_module.prepare_gpu_selection = hardware.prepare_gpu_selection
+          orchestrator_module.get_device = hardware.get_device
+
+          def worker(pid_queue):
+              child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+              pid_queue.put(child.pid)
+              time.sleep(120)
+
+          def running(pid):
+              try:
+                  with open(f"/proc/{pid}/stat", encoding = "utf-8") as handle:
+                      return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+              except OSError:
+                  return False
+
+          context = mp.get_context("fork")
+          orchestrator = InferenceOrchestrator.__new__(InferenceOrchestrator)
+          orchestrator._proc = None
+          orchestrator._cmd_queue = None
+          orchestrator._resp_queue = None
+          orchestrator._cancel_event = None
+          orchestrator._drain_event = None
+          orchestrator._subprocess_shutdown_lock = threading.Lock()
+          orchestrator._stop_dispatcher = lambda: None
+          orchestrator._drain_queue = lambda: []
+          orchestrator._reset_worker_scoped_state = lambda: None
+          orchestrator.active_model_name = None
+          orchestrator.models = {}
+          orchestrator.loading_models = set()
+
+          spawned = {}
+          parked = threading.Event()
+          release_timeout = threading.Event()
+
+          def spawn(config):
+              pid_queue = context.Queue()
+              process = context.Process(target = worker, args = (pid_queue,), daemon = True)
+              process.start()
+              child_pid = pid_queue.get(timeout = 5)
+              orchestrator._proc = process
+              orchestrator._cmd_queue = context.Queue()
+              orchestrator._resp_queue = context.Queue()
+              orchestrator._cancel_event = context.Event()
+              orchestrator._drain_event = context.Event()
+              adopt_pid(process.pid)
+              spawned.update(process = process, child_pid = child_pid)
+
+          def wait_for_loaded(expected, timeout = 300.0):
+              parked.set()
+              assert release_timeout.wait(timeout = 10)
+              raise RuntimeError("Timeout waiting for 'loaded' response (no activity for 300.0s)")
+
+          orchestrator._spawn_subprocess = spawn
+          orchestrator._wait_response = wait_for_loaded
+          load_result = {}
+          cancel_result = {}
+
+          def run_load():
+              try:
+                  orchestrator.load_model(types.SimpleNamespace(identifier = "m", gguf_variant = None))
+              except Exception as exc:
+                  load_result["exception"] = exc
+
+          def run_cancel():
+              try:
+                  cancel_result["value"] = orchestrator.cancel_load("m")
+              except Exception as exc:
+                  cancel_result["exception"] = exc
+
+          loader = threading.Thread(target = run_load)
+          canceller = threading.Thread(target = run_cancel)
+          try:
+              loader.start()
+              assert parked.wait(timeout = 10)
+              canceller.start()
+              deadline = time.monotonic() + 10
+              while not orchestrator._subprocess_shutdown_lock.locked() and time.monotonic() < deadline:
+                  time.sleep(0.01)
+              assert orchestrator._subprocess_shutdown_lock.locked()
+              release_timeout.set()
+              loader.join(timeout = 20)
+              canceller.join(timeout = 20)
+              assert not loader.is_alive() and not canceller.is_alive()
+              assert cancel_result == {"value": True}, cancel_result
+              error = load_result.get("exception")
+              assert isinstance(error, RuntimeError), load_result
+              assert "Timeout waiting for 'loaded'" in str(error)
+
+              process = spawned["process"]
+              child_pid = spawned["child_pid"]
+              deadline = time.monotonic() + 5
+              while running(child_pid) and time.monotonic() < deadline:
+                  time.sleep(0.05)
+              observed = {
+                  "timeout_preserved": str(error),
+                  "worker_alive": process.is_alive(),
+                  "descendant_alive": running(child_pid),
+              }
+              print(observed)
+              assert observed["worker_alive"] is False
+              assert observed["descendant_alive"] is False
+          finally:
+              release_timeout.set()
+              process = spawned.get("process")
+              if process is not None and process.is_alive():
+                  process.kill()
+                  process.join(timeout = 5)
+              child_pid = spawned.get("child_pid")
+              if child_pid is not None and running(child_pid):
+                  os.kill(child_pid, 9)
+          PY
