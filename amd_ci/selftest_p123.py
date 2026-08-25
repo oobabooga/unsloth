@@ -300,6 +300,33 @@ def test_never_quotes_p50() -> None:
     del code, uses
 
 
+def test_every_referenced_patch_exists() -> None:
+    """The first run of this workflow died in preflight because `p3m_off.patch` was generated but
+    never copied into the branch. It cost 30 seconds rather than a GPU hold, which is the
+    preflight working, but it is a file-existence question and belongs in a self-test that runs
+    before anything is cloned."""
+    print("\n[10] every patch every arm references is actually in the branch")
+    spec = importlib.util.spec_from_file_location(
+        "p123probe", HERE / "probes" / "studio_p123_probe.py")
+    P = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(P)
+    ladder = HERE / "probes" / "studio_ladder"
+    missing = sorted({p for _, patches in P.ARMS.values() for p in patches
+                      if not (ladder / p).is_file()})
+    check("no arm references a patch file that is not present", not missing, str(missing))
+    check("every arm in ARM_ORDER has a definition", set(P.ARM_ORDER) == set(P.ARMS),
+          str(set(P.ARM_ORDER) ^ set(P.ARMS)))
+    check("the criteria and the probe agree on the arm set", set(P.ARM_ORDER) == set(C.ARMS),
+          str(set(P.ARM_ORDER) ^ set(C.ARMS)))
+    check("the criteria and the probe agree on the mechanism names",
+          tuple(P.PIECES) == tuple(C.PIECES), f"{P.PIECES} vs {C.PIECES}")
+    # every sentinel the criteria expects to be greppable is planted by some patch
+    texts = "\n".join((ladder / f).read_text(errors="replace") for f in
+                       [p for _, ps in P.ARMS.values() for p in ps])
+    unplanted = [s for s in list(P.SENTINEL.values()) + [P.DEFER_SENTINEL] if s not in texts]
+    check("every sentinel is planted by one of the patches", not unplanted, str(unplanted))
+
+
 def test_table_renders() -> None:
     print("\n[8] the report renders without exploding on a partial run")
     fps = {C.REFERENCE: 5.1, C.CLOSURE: 5.2, "A01": 25.0, "A11": 25.3}
@@ -317,7 +344,8 @@ def main() -> int:
     for fn in (test_r500k_control_is_per_rung, test_floor_downgrades_rather_than_scores,
                test_attributes_to_the_owning_mechanism, test_redundancy_is_visible_not_hidden,
                test_closure_failure_is_reported, test_unsettled_fidelity_census_is_refused,
-               test_served_bundle_fallback_is_caught, test_never_quotes_p50, test_table_renders):
+               test_served_bundle_fallback_is_caught, test_never_quotes_p50,
+               test_every_referenced_patch_exists, test_table_renders):
         fn()
     print()
     if FAILURES:

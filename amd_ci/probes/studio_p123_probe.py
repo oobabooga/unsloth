@@ -475,6 +475,15 @@ def do_build(args, obs: dict, work: Path) -> int:
                 r = sh(["git", "apply", str(LADDER / p)], cwd=str(pre), timeout=300)
             steps.append({"patch": p, "rc": r.get("rc"), "stderr": (r.get("stderr") or "")[:300]})
         ok = all(s["rc"] == 0 for s in steps)
+        if not ok:
+            # NAME THE CAUSE IN THE STEP LOG. The first run of this probe reported only
+            # "these arms' patch stacks do not apply: ['M']", and the actual cause was a patch
+            # file that had never been copied into the branch at all. A gate that fails must say
+            # what it saw.
+            for s in steps:
+                if s["rc"] != 0:
+                    print(f"== preflight {name}: {s['patch']} rc={s['rc']}: {s['stderr']}",
+                          flush=True)
         sent = read_sentinels(pre) if ok else {}
         # THE PREMISE, CHECKED. Nothing may differ outside the frontend, or one dist cannot stand
         # for one arm and the measuring job's single backend install would silently erase a
