@@ -53,7 +53,7 @@ MODE = "capability"
 
 NEEDS = ["webkitgtk", "headless_display_server", "studio_production_bundle", "studiobench_ladder"]
 
-ACTION = "action:reasoning_toggle_all"
+ACTION = "reasoning_toggle_all"
 RUNG = "100K"
 
 #: The eleven points, in commit order. p0/p0g are the anchor, p1..p9 are the span.
