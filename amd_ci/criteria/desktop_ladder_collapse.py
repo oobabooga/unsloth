@@ -324,22 +324,45 @@ def _agg(rs, phase):
             "elements": (sum(els) / len(els)) if els else None}
 
 
-def _control_at(obs, c):
-    """One jam leg against the SAME rung unjammed: (jam fps, unjam fps, phase)."""
+def _control_phases(obs, c):
+    """Every phase this jam leg can be read on, against the SAME rung unjammed."""
+    out = []
     if not c or not _bench(c).get("ok"):
-        return None, None, "scroll"
+        return out
     peers = [r for r in _ok_runs(obs) if r.get("rung") == c.get("rung")]
-    best = (None, None, "scroll")
-    for phase in ("scroll", "idle", "stream"):
+    for phase in ("idle", "scroll", "stream"):
         j = _raf_fps(_scene(c), phase)
         if j is None:
             continue
         u = [x for x in (_raf_fps(_scene(r), phase) for r in peers) if x is not None]
         if not u:
             continue
-        if best[0] is None or j < best[0]:
-            best = (j, sum(u) / len(u), phase)
-    return best
+        unjam = sum(u) / len(u)
+        out.append({"phase": phase, "jam": j, "unjam": unjam,
+                    "drop_pct": (100.0 * (unjam - j) / unjam) if unjam else None,
+                    "busy_unjammed": next((v for v in (_busy(_scene(r), phase) for r in peers)
+                                           if v is not None), None)})
+    return out
+
+
+def _control_at(obs, c):
+    """One jam leg against the SAME rung unjammed: (jam fps, unjam fps, phase).
+
+    THE PHASE IS CHOSEN BY LARGEST RELATIVE DROP, not by lowest jammed frame rate, and that
+    distinction decided a whole run. Picking the lowest jammed reading always lands on the
+    phase where the page is ALREADY saturated, which is precisely where a jam has no headroom
+    left to take. Measured on this runner in run 32819187840, at 500K: the scroll phase read
+    1.8 fps jammed against 2.5 fps unjammed, a 28% drop that only just missed the 25% bar with
+    the main thread already 97% busy unjammed -- while the IDLE phase of the same two legs read
+    17.8 fps against 61.5 fps, a 71% drop, the same figure the control produces at 100K (17.2
+    against 61.0). The channel resolves a jammed main thread perfectly well; the old selection
+    rule was reading it in the one window where nothing could show.
+    """
+    rows = _control_phases(obs, c)
+    if not rows:
+        return None, None, "scroll"
+    best = max(rows, key = lambda x: x["drop_pct"] if x["drop_pct"] is not None else -1e9)
+    return best["jam"], best["unjam"], best["phase"]
 
 
 def _control_rows(obs):
@@ -365,7 +388,7 @@ def _control_rows(obs):
         rows.append({
             "rung": c.get("rung", "?"), "jam": jam, "unjam": unjam, "phase": phase,
             "hog_ms": c.get("hog"), "period_ms": _bench(c).get("hog_period_ms", 250),
-            "completed": done, "why": why,
+            "completed": done, "why": why, "phases": _control_phases(obs, c),
             "resolves": bool(jam is not None and unjam is not None
                              and jam < unjam * (1.0 - CONTROL_MIN_DROP_PCT / 100.0)),
         })
@@ -702,7 +725,27 @@ def table(obs):
                 "-" if x["unjam"] is None else f"{x['unjam']:.1f}",
                 x["phase"], "yes" if x["resolves"] else
                 ("-" if x["jam"] is None else "NO")]) + " |")
+        rows += ["", "Every phase the control can be read on, so the phase choice above is "
+                 "auditable rather than asserted:", "",
+                 "| rung | phase | jammed fps | unjammed fps | drop | unjammed busy |",
+                 "|---|---|---|---|---|---|"]
+        for x in crows:
+            for ph in x["phases"]:
+                rows.append("| " + " | ".join([
+                    x["rung"], ph["phase"], f"{ph['jam']:.1f}", f"{ph['unjam']:.1f}",
+                    "-" if ph["drop_pct"] is None else f"{ph['drop_pct']:.0f}%",
+                    "-" if ph["busy_unjammed"] is None else f"{ph['busy_unjammed']:.0f}%"])
+                    + " |")
         rows += ["",
+                 "The headline phase is the one with the LARGEST RELATIVE DROP, not the one "
+                 "with the lowest jammed frame rate. The lowest jammed reading always lands on "
+                 "the phase where the page is already saturated, which is exactly where a jam "
+                 "has no headroom left to take: at 500K the scroll phase is 97% busy before "
+                 "the jam is installed, so the jam can only move it from 2.5 fps to 1.8 fps, "
+                 "while the idle phase of the same two legs moves 61.5 -> 17.8 fps. Reading "
+                 "the control in the saturated window would report that the channel cannot see "
+                 "a blocked main thread, which is false.",
+                 "",
                  "One per rung, and that is a repair rather than thoroughness. In run "
                  "32808701910 the only jam leg was scheduled at 0K, 0K was the rung that could "
                  "not complete, and the gate failed with *control did not complete* -- so six "

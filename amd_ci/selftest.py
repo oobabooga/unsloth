@@ -621,6 +621,32 @@ def test_an_empty_rung_and_a_single_point_control() -> None:
     g3 = dict((n, o) for n, o, _ in crit.gates(limp))
     check("a jam the channel cannot see is still a failure", g3[control_gate] is False)
 
+    # A SATURATED PHASE IS NOT A BROKEN CHANNEL. These are the readings measured at 500K in
+    # run 32819187840: the scroll window is 97% busy before the jam is installed, so the jam
+    # can only take it from 2.5 to 1.8 fps, while the idle window of the SAME two legs moves
+    # 61.5 -> 17.8. Reading the control in the saturated window says the channel cannot see a
+    # blocked main thread, which is false.
+    def _phased(rung, rep, per_phase, **kw):
+        r = _desktop_run(rung, rep, elements = 274733, mount_elements = 110322,
+                         messages = 30, seeded_messages = 30, fps = 1.0, **kw)
+        for ph in r["payload"]["payload"]["phases"]:
+            f = per_phase.get(ph["phase"])
+            if f is None:
+                r["payload"]["payload"]["phases"] = [
+                    p for p in r["payload"]["payload"]["phases"] if p["phase"] != ph["phase"]]
+                continue
+            ph["raf"]["n"] = int(f * 10)
+        return r
+
+    sat = _desktop_obs([
+        _phased("500K", "1", {"idle": 61.5, "scroll": 2.5, "stream": 1.5}),
+        _phased("500K", "2", {"idle": 61.5, "scroll": 2.5, "stream": 1.3}),
+        _phased("500K", "hog", {"idle": 17.8, "scroll": 1.8}, hog = 200),
+    ])
+    jam, unjam, ph = crit._control_at(sat, [r for r in sat["runs"] if r["rep"] == "hog"][0])
+    check("the control is read where it can discriminate, not where the page is saturated",
+          ph == "idle" and jam < unjam * 0.75, f"{ph} {jam} vs {unjam}")
+
     # DEFECT 1. The page-side post-condition an empty thread could never satisfy.
     boot = (ROOT / "probes" / "desktop_ladder" / "amdv_desktop_boot.js").read_text()
     check("the navigation post-condition has an empty-thread branch",

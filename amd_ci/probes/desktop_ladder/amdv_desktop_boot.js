@@ -291,6 +291,10 @@
       }
       var ran = false, err = null;
       if (name === "assign") markAssignUsed(stamp);
+      // Cleared per attempt. The latch is set by the app's FIRST app-shell-ready, which fires
+      // for the shell's own startup navigation long before ours, so an un-cleared latch made
+      // the bounded wait below return in 0 ms and wait for nothing.
+      shellReady = false;
       try { ran = S[name](); } catch (e) { err = String(e); }
       note("nav_attempt", { name: name, ran: ran, err: err });
       if (!ran) { tried.push({ name: name, ran: false, err: err }); continue; }

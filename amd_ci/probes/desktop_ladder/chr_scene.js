@@ -1,8 +1,14 @@
-// A COPY of scripts/amdv_scene.js with ONE block changed: the scroll phase.
+// A COPY of scripts/amdv_scene.js with TWO blocks changed, and neither of them is a
+// measured window:
+//   * the scroll phase, which in the original does not scroll in Chromium at all. See the
+//     block comment at `mark("scroll")`;
+//   * the SEND phase, which held the composer element captured at mount and typed into it
+//     even after the app had remounted and detached it. That is not a phase the ladder
+//     scores; it is the step that gets a reply started, and holding a stale node there cost
+//     run 32819187840 all three of its 0K legs. See the block comment at `mark("send")`.
 // Everything else -- the rAF channel, the calibrated clamp, the phase marks, the
 // action windows -- is byte-identical, so a number from this scene and a number from
-// that one differ in the gesture and in nothing else. See the block comment at
-// `mark("scroll")` for why the original does not scroll in Chromium.
+// that one differ in the gesture and in nothing else.
 // Injected at document-start into REAL WebKitGTK, before app code.
 //
 // scripts/wk_scene9477.js measures ONE streamed reply into a FRESH thread: it varies reply
@@ -195,7 +201,8 @@
       // The composer appearing is NOT the thread being mounted. At 500K the app paints a shell
       // and then spends a long time putting messages in, and an idle baseline taken there is a
       // reading of the mount, not of the mounted thread.
-      const ta = await waitFor(W.dom.composer, 120000, "composer textarea");
+      let ta = await waitFor(W.dom.composer, 120000, "composer textarea");
+      W.__ta = ta;
       let mountedBy = "composer";
       if (o.lastMarker) {
         // The seeder's own marker string for the LAST seeded turn. If it is on the page, every
@@ -422,6 +429,28 @@
       }
 
       mark("send");
+      // ── THE COMPOSER CAPTURED AT MOUNT CAN HAVE BEEN REPLACED BY NOW ──────────────────────
+      //
+      // `ta` is grabbed the moment a composer first exists, which at a big rung is many
+      // seconds after the app settled on the requested thread and at 0K is essentially the
+      // instant the navigation is issued. React then remounts the composer as the thread's
+      // history resolves, and the captured node is left detached from the document. Setting
+      // `.value` on a detached textarea updates nothing the app can see: the visible composer
+      // stays empty, the Send button CORRECTLY stays disabled, and the run dies 120 s later in
+      // `waitFor(enabledSend)` blaming the model chip. That is how run 32819187840 lost all
+      // three of its 0K legs -- reps 1 and 2 and the software control -- while the DOM it
+      // reported at the failure had a live composer, a live Send button and the pacer chip
+      // present. Re-resolving costs nothing, changes no measured window (the send phase is not
+      // one of the four scored phases), and is applied identically at every rung.
+      let composerRefreshes = 0;
+      const liveComposer = () => {
+        if (!document.contains(ta)) {
+          const live = W.dom.composer();
+          if (live && live !== ta) { ta = live; W.__ta = ta; composerRefreshes += 1; }
+        }
+        return ta;
+      };
+      liveComposer();
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype, "value").set;
       // FOCUS FIRST. studiobench's own driver clicks the composer before filling it
@@ -429,6 +458,7 @@
       // 500K cell. Setting .value on an unfocused textarea left the app's composer state
       // untouched here: the button existed, the click landed, and no request was ever made.
       const focusComposer = async () => {
+        liveComposer();
         try {
           const r = ta.getBoundingClientRect();
           const x = r.left + r.width / 2, y = r.top + r.height / 2;
@@ -448,6 +478,7 @@
       // exactly like a send that was ignored.
       const fill = async (text) => {
         await focusComposer();
+        liveComposer();
         setter.call(ta, text);
         ta.dispatchEvent(new Event("input", { bubbles: true }));
         const dl = performance.now() + 10000;
@@ -458,6 +489,7 @@
       // Some composers commit on Enter and not on the button, and a busy main thread makes the
       // difference visible. Both are tried before an attempt is called a failure.
       const pressEnter = async () => {
+        liveComposer();
         for (const type of ["keydown", "keypress", "keyup"]) {
           ta.dispatchEvent(new KeyboardEvent(type, {
             key: "Enter", code: "Enter", keyCode: 13, which: 13,
@@ -483,8 +515,38 @@
         const off = b.disabled || b.getAttribute("aria-disabled") === "true";
         return off ? null : b;
       };
-      const send = await waitFor(enabledSend, 120000, "an ENABLED send button (the model chip " +
-                                 "restores from localStorage asynchronously)");
+      // ... but a disabled Send is NOT always the model chip, and assuming it was is what made
+      // this a silent 120 s death. It is also disabled when the composer is EMPTY, and the
+      // composer goes empty on its own if the app remounts it after the fill -- which is what
+      // liveComposer above exists for. So the wait re-checks the composer it is actually
+      // looking at, and re-fills it if the app has emptied it, rather than waiting out the
+      // whole budget on a node the app threw away. What is waited for is unchanged; what is
+      // fixed is waiting for it while holding the wrong element.
+      const refills = [];
+      const waitEnabledSend = async (timeoutMs) => {
+        const dl = performance.now() + timeoutMs;
+        let nextRefill = performance.now() + 15000;
+        while (performance.now() < dl) {
+          const b = enabledSend();
+          if (b) return b;
+          if (performance.now() > nextRefill) {
+            nextRefill = performance.now() + 15000;
+            const before = ta;
+            liveComposer();
+            if ((ta.value || "") !== o.prompt) {
+              const ok = await fill(o.prompt);
+              refills.push({ at_ms: Math.round(performance.now() - composerT0),
+                             node_changed: before !== ta, filled: ok,
+                             value_len: (ta.value || "").length });
+            }
+          }
+          await sleep(100);
+        }
+        throw new Error("timeout waiting for an ENABLED send button. composer_attached=" +
+                        document.contains(ta) + " value_len=" + (ta.value || "").length +
+                        " refills=" + JSON.stringify(refills));
+      };
+      const send = await waitEnabledSend(120000);
       const sendT = performance.now();
       let started = false;
       const attempts = [];
@@ -561,7 +623,8 @@
                  last_marker: o.lastMarker },
         clamp,
         first_token_ms: firstTokenMs, composer_fill_ms: Math.round(composerMs),
-        send_attempts: attempts,
+        send_attempts: attempts, composer_refreshes: composerRefreshes,
+        composer_refills: refills,
         still_running_at_deadline: stillRunning,
         scroll_detail: scrollDetail, scroll_trace: scrollTrace,
         marks: W.marks, actions,
@@ -578,6 +641,11 @@
              error: String((e && e.message) || e),
              error_stack: String((e && e.stack) || ""),
              send_attempts: W.sendAttempts || null,
+             // Whether the composer the scene was holding is still IN the document. A
+             // detached one is silently unfillable and is the difference between "the app
+             // would not send" and "the harness typed into a node the app had thrown away".
+             composer_attached: (() => { try { return W.__ta ? document.contains(W.__ta) : null; }
+                                         catch (e) { return null; } })(),
              marks: W.marks, url: location.href,
              dom: { composer: !!W.dom.composer(), send: !!W.dom.sendButton(),
                     running: W.dom.isRunning(), elements: W.dom.elements(),
