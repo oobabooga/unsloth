@@ -90,9 +90,19 @@
     throw new Error("timeout waiting for " + label);
   };
 
+  // THE TEXT INSIDE THE REASONING PANES, on its own. `assistant_chars` is the whole thread, so a
+  // pane that pagination cut from 12,149 characters to 7,721 moves it by 2% at r100K and by 0.4%
+  // at r500K, and a gate scored on it cannot tell "the mechanism did not engage" from "the
+  // mechanism engaged and is small relative to the document". Those are different findings.
+  const reasoningChars = () => Array.from(
+    document.querySelectorAll('[data-slot="reasoning-root"]'))
+    .reduce((a, e) => a + (e.textContent || "").length, 0);
+
   const census = () => ({
     elements: W.dom.elements(), messages: W.dom.messages(),
     assistant_chars: W.dom.assistantChars(),
+    reasoning_chars: reasoningChars(),
+    show_more_buttons: document.querySelectorAll('[data-slot="reasoning-show-earlier"]').length,
     reasoning_roots: W.dom.reasoningRoots(), reasoning_open: W.dom.reasoningOpen(),
     code_blocks: W.dom.codeBlocks(), highlight_spans: W.dom.highlightSpans(),
     scroll_height: (document.scrollingElement || document.body).scrollHeight,
@@ -316,6 +326,39 @@
         return { detail: `state ${s0} -> ${s1} -> ${s2}`,
                  census_open: censusOpen,
                  app_sync_ms: Math.round(Math.max(sync1, sync2 || 0) * 10) / 10 };
+      });
+
+      // EVERY PANE, which is a DIFFERENT GESTURE from the one above and is the one the campaign's
+      // r100K figures (26.4 fps, 80.4% busy, 942 ms blocked) were measured on: studiobench's
+      // `reasoning_toggle` clicks every trigger in the thread, this scene's clicks the first.
+      // Same name, different work. Pagination can only ever act on panes that are OPEN, so the
+      // one-pane gesture caps its possible effect at one pane's trace no matter how large the
+      // thread is; this is the gesture where the mechanism has room to matter.
+      mark("action:reasoning_toggle_all");
+      await runAction("reasoning_toggle_all", async () => {
+        const triggers = Array.from(
+          document.querySelectorAll('[data-slot="reasoning-trigger"]'));
+        if (triggers.length === 0) {
+          return { detail: "no reasoning pane at this rung", not_applicable: true };
+        }
+        const open = () => document.querySelectorAll(
+          '[data-slot="reasoning-root"][data-state="open"]').length;
+        const before = open();
+        const c0 = performance.now();
+        for (const t of triggers) t.click();
+        const sync1 = performance.now() - c0;
+        await sleep(2500);
+        const opened = open();
+        const censusOpen = census();
+        const c1 = performance.now();
+        for (const t of Array.from(
+          document.querySelectorAll('[data-slot="reasoning-trigger"]'))) t.click();
+        const sync2 = performance.now() - c1;
+        await sleep(2500);
+        if (opened === before) throw new Error("no pane opened: " + before + " -> " + opened);
+        return { detail: `open ${before} -> ${opened} of ${triggers.length}, then closed`,
+                 census_open: censusOpen,
+                 app_sync_ms: Math.round(Math.max(sync1, sync2) * 10) / 10 };
       });
 
       mark("action:select_all_copy");

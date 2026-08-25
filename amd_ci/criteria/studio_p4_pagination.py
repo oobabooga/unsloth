@@ -45,7 +45,14 @@ NEEDS = [
     "discrete_gpu", "nvidia", "windows", "mlx",
 ]
 
-ACTION = "reasoning_toggle"
+#: TWO GESTURES, and they are not the same work under one name.
+#:   reasoning_toggle      opens the FIRST pane only. That caps pagination's possible effect at one
+#:                         trace, ~12,149 characters, however large the thread is.
+#:   reasoning_toggle_all  opens EVERY pane, which is what studiobench's `reasoning_toggle` does
+#:                         and what the campaign's r100K figures were measured on. This is the
+#:                         gesture where the mechanism has room to matter, so it is the primary.
+ACTIONS = ("reasoning_toggle_all", "reasoning_toggle")
+ACTION = ACTIONS[0]
 EXPECTED_CORPUS = "23cd2464"
 
 #: A rung counts as exhibiting the defect only if the BASE arm's reasoning toggle is this loaded.
@@ -77,52 +84,61 @@ def _sel(obs: dict, arm: str, rung: str) -> list[dict]:
     return [r for r in _runs(obs) if r.get("arm") == arm and r.get("rung") == rung]
 
 
-def _action(payload: dict) -> dict:
+def _action(payload: dict, name: str | None = None) -> dict:
+    want = name or ACTION
     for a in payload.get("actions") or []:
-        if a.get("name") == ACTION and not a.get("not_applicable"):
+        if a.get("name") == want and not a.get("not_applicable"):
             return a
     return {}
 
 
-def _eff_fps(payload: dict):
-    a = _action(payload)
+def _eff_fps(payload: dict, name: str | None = None):
+    a = _action(payload, name)
     n = (a.get("raf") or {}).get("n")
     el = a.get("elapsed_ms")
     return (1000.0 * n / el) if (n and el) else None
 
 
-def _busy(payload: dict):
-    return ((_action(payload).get("busy")) or {}).get("busy_pct")
+def _busy(payload: dict, name: str | None = None):
+    return ((_action(payload, name).get("busy")) or {}).get("busy_pct")
 
 
-def _blocked(payload: dict):
-    return ((_action(payload).get("busy")) or {}).get("blocked_ms")
+def _blocked(payload: dict, name: str | None = None):
+    return ((_action(payload, name).get("busy")) or {}).get("blocked_ms")
 
 
-def _worst(payload: dict):
-    return (_action(payload).get("raf") or {}).get("max_ms")
+def _worst(payload: dict, name: str | None = None):
+    return (_action(payload, name).get("raf") or {}).get("max_ms")
 
 
-def _sync(payload: dict):
-    return _action(payload).get("app_sync_ms")
+def _sync(payload: dict, name: str | None = None):
+    return _action(payload, name).get("app_sync_ms")
 
 
-def _mounted_reasoning(payload: dict):
-    """How much text was in the DOM WHILE THE PANE WAS OPEN.
+def _mounted_reasoning(payload: dict, name: str | None = None):
+    """How much REASONING text was in the DOM while the panes were open.
 
-    `census_open`, not `census_after`: the gesture opens the pane and closes it again, so both
-    the before and after snapshots are taken with the reasoning content unmounted on every arm.
-    Scored on those, a paginated arm and an unpaginated one are identical and the "did the
-    treatment do anything" gate would pass vacuously on a build where the flag never reached the
-    DOM at all.
+    Two corrections live here, both learned the hard way.
+
+    `census_open`, not `census_after`: the gesture opens and closes again, so both the before and
+    after snapshots are taken with the reasoning unmounted on every arm. Scored on those, a
+    paginated arm and an unpaginated one are identical and the engagement gate passes vacuously.
+
+    `reasoning_chars`, not `assistant_chars`: the thread-wide count moves by 2% at r100K and 0.4%
+    at r500K for a pane that pagination cut by 36%, because the pane is a small part of the
+    document. A gate on the thread-wide number cannot tell "the mechanism did not engage" from
+    "the mechanism engaged and is small relative to the document", and those are entirely
+    different findings -- only the second is about this PR.
     """
-    c = _action(payload).get("census_open") or {}
-    v = c.get("assistant_chars")
+    c = _action(payload, name).get("census_open") or {}
+    v = c.get("reasoning_chars")
+    if not isinstance(v, (int, float)):
+        v = c.get("assistant_chars")
     return v if isinstance(v, (int, float)) else None
 
 
-def _vals(obs: dict, arm: str, rung: str, fn):
-    return [v for v in (fn(r["payload"]) for r in _sel(obs, arm, rung)) if v is not None]
+def _vals(obs: dict, arm: str, rung: str, fn, name: str | None = None):
+    return [v for v in (fn(r["payload"], name) for r in _sel(obs, arm, rung)) if v is not None]
 
 
 def _mean(xs):
@@ -223,6 +239,18 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append((f"every arm loaded the same corpus ({EXPECTED_CORPUS})",
                 corpora == {EXPECTED_CORPUS}, f"corpus hashes seen: {sorted(corpora)}"))
 
+    # ONE INSTRUMENT FOR EVERY ARM. `amdv_rung_bench.py` imports the pacer, seeder and corpus from
+    # `--sb-root`. Pointed at each arm's own checkout, an August arm would be measured with August
+    # instruments and a today arm with today's, and the difference reported as the effect of the
+    # change: the measuring device co-varying with the subject. This asserts they did not.
+    pacers = {str((r["payload"].get("run_meta") or {}).get("instrument_pacer_file")) for r in ok}
+    roots = {str((r["payload"].get("run_meta") or {}).get("instrument_sb_root")) for r in ok}
+    one = len(pacers) == 1 and len(roots) == 1 and "None" not in pacers
+    inside = all("/instrument/" in x for x in pacers) if one else False
+    out.append(("every arm was driven by ONE instrument, outside every arm's own tree",
+                one and inside,
+                f"pacer resolved to {sorted(pacers)}; sb-root {sorted(roots)}"))
+
     # THE JAMMED POSITIVE CONTROL. Without it a flat result is indistinguishable from a blind
     # channel, and this campaign has published that mistake before.
     notes, ctrl_ok = [], False
@@ -244,8 +272,12 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
             a = _mean(_vals(obs, off, rung, _mounted_reasoning))
             b = _mean(_vals(obs, on, rung, _mounted_reasoning))
             if a and b:
+                # `drop` is a REDUCTION: positive means less was mounted. Printed with the word,
+                # not with a bare sign, because the previous version rendered a 4,428-character
+                # reduction as "+2%" and a reader could only take that as a regression.
                 drop = (1.0 - b / a) * 100.0
-                fnotes.append(f"{rung} {off}->{on}: {a:,.0f} -> {b:,.0f} ({drop:+.0f}%)")
+                fnotes.append(f"{rung} {off}->{on}: {a:,.0f} -> {b:,.0f} reasoning chars "
+                              f"({abs(drop):.0f}% {'less' if drop > 0 else 'MORE'} mounted)")
                 fired = fired or drop >= PAGINATION_MIN_DROP_PCT
     out.append((f"pagination actually reduced what is mounted by >= {PAGINATION_MIN_DROP_PCT:.0f}%",
                 fired, "; ".join(fnotes) or "no census pair available"))
@@ -269,24 +301,43 @@ def table(obs: dict) -> str:
     for rung in _rungs(obs):
         jam, clean = _control(obs, rung)
         mark = "SCORED" if rung in qual else "VOID at this rung: the base arm does not exhibit the defect"
-        rows += [f"### r{rung} -- {mark}", "",
-                 "| arm | pagination | eff fps | busy | worst frame | blocked | click handler |",
-                 "|---|---|---|---|---|---|---|"]
-        for arm in ARMS:
-            f = _mean(_vals(obs, arm, rung, _eff_fps))
-            bu = _mean(_vals(obs, arm, rung, _busy))
-            wo = _vals(obs, arm, rung, _worst)
-            bl = _mean(_vals(obs, arm, rung, _blocked))
-            sy = _mean(_vals(obs, arm, rung, _sync))
-            lit = ((obs.get("states") or {}).get(arm) or {}).get("pagination_literal")
-            rows.append("| " + " | ".join([
-                arm, str(lit),
-                "-" if f is None else f"**{f:.1f}**",
-                "-" if bu is None else f"{bu:.0f}%",
-                "-" if not wo else f"{max(wo):,.0f} ms",
-                "-" if bl is None else f"{bl:,.0f} ms",
-                "-" if sy is None else f"{sy:.1f} ms",
-            ]) + " |")
+        rows += [f"### r{rung} -- {mark}", ""]
+
+        # HOW MUCH REASONING EACH GESTURE ACTUALLY MOUNTS, per arm. Without this the frame numbers
+        # cannot be read: a gesture that mounts 12,149 characters of a 1,148,084-character document
+        # gives pagination nothing to remove, and a flat result there says nothing about the
+        # mechanism.
+        rows += ["Reasoning text in the DOM while open, which is what pagination can act on:", "",
+                 "| gesture | " + " | ".join(ARMS) + " |",
+                 "|---|" + "---|" * len(ARMS)]
+        for act in ACTIONS:
+            cells = []
+            for arm in ARMS:
+                v = _mean(_vals(obs, arm, rung, _mounted_reasoning, act))
+                cells.append("-" if v is None else f"{v:,.0f}")
+            rows.append(f"| {act} | " + " | ".join(cells) + " |")
+        rows.append("")
+
+        rows += ["| gesture | arm | pagination | eff fps | busy | worst frame | blocked | click |",
+                 "|---|---|---|---|---|---|---|---|"]
+        for act in ACTIONS:
+            for arm in ARMS:
+                f = _mean(_vals(obs, arm, rung, _eff_fps, act))
+                bu = _mean(_vals(obs, arm, rung, _busy, act))
+                wo = _vals(obs, arm, rung, _worst, act)
+                bl = _mean(_vals(obs, arm, rung, _blocked, act))
+                sy = _mean(_vals(obs, arm, rung, _sync, act))
+                lit = ((obs.get("states") or {}).get(arm) or {}).get("pagination_literal")
+                if f is None:
+                    continue
+                rows.append("| " + " | ".join([
+                    act, arm, str(lit),
+                    f"**{f:.1f}**",
+                    "-" if bu is None else f"{bu:.0f}%",
+                    "-" if not wo else f"{max(wo):,.0f} ms",
+                    "-" if bl is None else f"{bl:,.0f} ms",
+                    "-" if sy is None else f"{sy:.1f} ms",
+                ]) + " |")
         if jam and clean:
             rows.append(f"| JAM (control) | n/a | **{jam:.1f}** | - | - | - | - |")
         rows += ["", "The one-line isolations at this rung, which are the measurement:", "",

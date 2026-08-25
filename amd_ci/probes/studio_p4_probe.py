@@ -94,6 +94,14 @@ ARMS: dict[str, tuple[str, tuple[str, ...]]] = {
     "Aoff": ("33d65ce99b40de93361366447a3e34949480008a", ("A_pagination_off.patch",)),
 }
 
+#: THE INSTRUMENT. One checkout of today's main, used to drive EVERY arm, and deliberately not any
+#: arm's own tree. `amdv_rung_bench.py` imports the pacer, seeder and frozen corpus from
+#: `--sb-root`; handing it the arm's own repo would measure an August arm with August instruments
+#: and a today arm with today's, then report the difference as the effect of pagination. The
+#: measuring device would co-vary with the subject. It is a separate clone so that it is also not
+#: silently the same directory as an arm that a later edit might patch.
+INSTRUMENT_REF = "90f85fdbf8fd6f9df1b99aff44f1e45da4c808d0"
+
 #: Every key a state dict must carry, whatever went wrong. The previous run aborted the whole probe
 #: on `KeyError: 'dist'` because a failed checkout returned early with a short dict, so three arms
 #: that HAD built were never measured. A build failure must fail its own gate, not the run.
@@ -241,7 +249,7 @@ def build_state(work: Path, name: str, repo_url: str, ref: str, patches: tuple[s
 
 
 def measure(work: Path, st: dict, arm: str, rung: str, rep: str, port: int, display: str,
-            py_gi: str, timeout: int, hog_ms: int = 0) -> dict:
+            py_gi: str, timeout: int, instrument: Path, hog_ms: int = 0) -> dict:
     rhome = work / f"run_{arm}_{rung}_{rep}"
     shutil.rmtree(rhome, ignore_errors=True)
     rhome.mkdir(parents=True, exist_ok=True)
@@ -260,7 +268,8 @@ def measure(work: Path, st: dict, arm: str, rung: str, rep: str, port: int, disp
            "--rung", rung, "--rep", f"{arm}_{rung}_{rep}",
            "--dist", st["dist"]["path"], "--home", str(rhome),
            "--port", str(port), "--display", display,
-           "--sb-root", st["repo_root"], "--unsloth-bin", st["unsloth_bin"],
+           # ONE instrument for every arm, never the arm's own checkout.
+           "--sb-root", str(instrument), "--unsloth-bin", st["unsloth_bin"],
            "--python-gi", py_gi,
            # A scene of this probe's own, so no other probe on this branch changes behaviour. It
            # is `amdv_scene.js` plus one thing: a census taken while the reasoning pane is OPEN.
@@ -342,6 +351,22 @@ def main() -> int:
             print(f"== {obs['fatal']}", flush=True)
             return 0
 
+        # THE INSTRUMENT, cloned once, before any arm.
+        instrument = work / "instrument"
+        obs["instrument"] = clone_at(args.repo, INSTRUMENT_REF, instrument)
+        obs["instrument"]["path"] = str(instrument)
+        if not obs["instrument"].get("checkout_ok"):
+            obs["fatal"] = (f"the instrument checkout asked for {INSTRUMENT_REF[:9]} and landed "
+                            f"on {str(obs['instrument'].get('commit'))[:9]}; refusing to measure "
+                            f"any arm with an instrument that is not the one declared")
+            return 0
+        sb = instrument / "tests" / "studio" / "studiobench"
+        obs["instrument"]["studiobench_present"] = sb.is_dir()
+        if not sb.is_dir():
+            obs["fatal"] = f"the pinned instrument has no studiobench package at {sb}"
+            return 0
+        print(f"== instrument: {instrument} at {obs['instrument']['commit'][:9]}", flush=True)
+
         obs["states"] = {}
         for name in ARM_ORDER:
             ref, patches = ARMS[name]
@@ -371,7 +396,7 @@ def main() -> int:
         for rung in rungs:
             obs["runs"].append(measure(work, obs["states"][control_arm], "JAM", rung, "jam", port,
                                        xinfo["display"], py_gi, args.rung_timeout,
-                                       hog_ms=args.hog_ms))
+                                       instrument, hog_ms=args.hog_ms))
             port += 1
 
         # ── the arms, interleaved within each rep, never blocked ─────────────────────────────
@@ -379,7 +404,8 @@ def main() -> int:
             for rung in rungs:
                 for arm in usable:
                     obs["runs"].append(measure(work, obs["states"][arm], arm, rung, str(rep),
-                                               port, xinfo["display"], py_gi, args.rung_timeout))
+                                               port, xinfo["display"], py_gi, args.rung_timeout,
+                                               instrument))
                     port += 1
                     time.sleep(5)
 

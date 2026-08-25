@@ -107,12 +107,27 @@ def main():
     tag = f"r{args.rung}_rep{args.rep}"
 
     sb_root = P(args.sb_root) if args.sb_root else (WS / "wt_mainchk")
+    # THE INSTRUMENT MUST NOT CO-VARY WITH THE SUBJECT.
+    #
+    # This used to be handed the arm's OWN checkout, so a five-arm comparison would have measured
+    # each arm with the pacer, seeder, corpus and scene that shipped alongside it. Two arms four
+    # days apart would then differ by the change under test AND by the measuring device, and the
+    # difference would be reported as the change. It did not silently happen only because an
+    # August checkout has no `tests/studio/studiobench` at all and the import raised.
+    #
+    # `--sb-root` is now ONE pinned tree for every arm, chosen by the caller and never the arm's
+    # own repo. `sys.path.insert(0, ...)` puts it ahead of anything the arm could shadow it with,
+    # and the resolved file of the module that was actually imported is printed and recorded, so
+    # "all arms used one instrument" is a checkable fact rather than an intention.
     sys.path.insert(0, str(sb_root))
     from tests.studio.studiobench import pacer as pacer_mod
     from tests.studio.studiobench.runtime import lifecycle
     from tests.studio.studiobench.runtime.seeder import Seeder
     from tests.studio.studiobench.fixture import corpus as corpus_mod
     from tests.studio.studiobench.fixture.corpus import plan_rung, RUNGS
+
+    instrument_file = getattr(pacer_mod, "__file__", None)
+    print(f"[{tag}] INSTRUMENT pacer={instrument_file}", flush=True)
 
     bh = bundle_hash(dist)
     print(f"[{tag}] sb_root={sb_root}", flush=True)
@@ -293,6 +308,8 @@ def main():
             "rung": args.rung, "rep": args.rep, "synthetic_rung": args.rung in SYNTHETIC_RUNGS,
             "dist": str(dist), "bundle_hash": bh, "sb_root": str(sb_root),
             "corpus_hash": corpus.corpus_hash,
+            "instrument_pacer_file": instrument_file,
+            "instrument_sb_root": str(sb_root),
             "plan": None if plan is None else {
                 "target_tokens": plan.target_tokens, "target_chars": plan.target_chars,
                 "seeded_chars": plan.seeded_chars, "seeded_units": len(plan.seeded_units),
