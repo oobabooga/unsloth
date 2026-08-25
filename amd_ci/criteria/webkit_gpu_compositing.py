@@ -69,9 +69,24 @@ SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "mesa offscreen",
 MASKED_RENDERERS = ("apple gpu", "apple inc")
 
 SOFTWARE_DRIVER_LIBS = ("swrast_dri.so", "llvmpipe", "softpipe", "kms_swrast")
-# Names that identify the DEVICE. `libgallium-*.so` is deliberately absent: it
-# is a megadriver that also contains llvmpipe, so it names nothing.
-AMD_DRIVER_LIBS = ("radeonsi", "libvulkan_radeon", "libdrm_amdgpu", "amdgpu")
+# Names that identify the DEVICE.
+#
+# Three names are deliberately NOT here, and each was a candidate:
+#   libgallium-<version>.so   Mesa 24.2 merged every gallium driver into one
+#                             megadriver. It contains radeonsi AND llvmpipe, so
+#                             it names nothing. (It is also why the previous
+#                             revision's whitelist found no AMD driver at all:
+#                             radeonsi_dri.so is now a stub symlink an EGL+GBM
+#                             app never opens.)
+#   libdrm_amdgpu.so.1        a hard DT_NEEDED of that megadriver, so it is
+#                             mapped under llvmpipe too, and on hosts with no
+#                             AMD GPU at all. Observed here: the forced-software
+#                             control leg mapped it while billing 0 ns.
+#   libLLVM.so.*              llvmpipe is the primary LLVM consumer; if anything
+#                             it points the other way.
+# On Mesa >= 24.2 no GL/EGL library name discriminates. That is the whole reason
+# the negative control exists, and why it, not a name, carries the verdict.
+AMD_DRIVER_LIBS = ("radeonsi_dri.so", "libvulkan_radeon")
 
 # Below this share of the real leg's engine time, the control leg counts as
 # having collapsed. Not zero: an X server handshake can bill a few microseconds.
@@ -242,7 +257,8 @@ def table(obs: dict) -> str:
     rows.append(f"| WebKit processes holding /dev/dri | "
                 f"{', '.join(h['pid'] + ' ' + ','.join(sorted(set(h['dri_fds']))) for h in holders) or 'none'} |")
     rows.append(f"| device-naming libraries mapped into WebKit | "
-                f"{', '.join(amd_names) or 'none recognised (corroboration only)'} |")
+                f"{', '.join(amd_names) or 'none - on Mesa >= 24.2 no GL library name names a '
+                                          'device, see the note under the control table'} |")
     rows.append(f"| software rasteriser mapped into WebKit | "
                 f"{'yes' if _software_driver_mapped(obs) else 'no'} |")
     rows.append(f"| snapshot | {w.get('snapshot_bytes')} bytes, "
@@ -268,6 +284,18 @@ def table(obs: dict) -> str:
                 f"{_software_driver_mapped(obs, 'control')} |")
     rows.append(f"| in-page renderer string | {r} | {cp.get('webgl_renderer')} |")
     rows.append(f"| painted | {_painted(obs)} | {_painted(obs, 'control')} |")
+    for name in ("libgallium", "libdrm_amdgpu", "libLLVM"):
+        rows.append(f"| `{name}*` mapped | "
+                    f"{any(name in m for m in _mapped_all(obs))} | "
+                    f"{any(name in m for m in _mapped_all(obs, 'control'))} |")
+
+    rows.append("")
+    rows.append("The last three rows are the reason the verdict rests on the control and not on "
+                "a library name. Since Mesa 24.2 every gallium driver lives in one "
+                "`libgallium-<version>.so` that contains radeonsi and llvmpipe alike, and "
+                "`libdrm_amdgpu.so.1` is a hard DT_NEEDED of it, so both are mapped in the "
+                "software leg too. `radeonsi_dri.so` is now a stub symlink an EGL+GBM app never "
+                "opens. Only the kernel's per-fd counters separate the two legs.")
 
     rows.append("")
     for h in holders:

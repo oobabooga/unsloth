@@ -450,6 +450,16 @@ def test_a_masked_renderer_string_cannot_carry_a_verdict() -> None:
     check("and libgallium alone is not accepted as an AMD driver",
           crit._amd_driver_mapped(only_kernel) is False, str(crit._mapped(only_kernel)))
 
+    # libdrm_amdgpu.so.1 is a DT_NEEDED of the mesa megadriver, so it is mapped
+    # under llvmpipe and on hosts with no AMD GPU. Observed on the runner: the
+    # forced-software control leg mapped it while billing 0 ns of engine time.
+    decoy = _fake_webkit_obs(mapped = ("libEGL.so.1", "libdrm_amdgpu.so.1.125.0",
+                                       "libLLVM.so.20.1"))
+    check("libdrm_amdgpu / libLLVM are not accepted as device names either",
+          crit._amd_driver_mapped(decoy) is False, str(crit._mapped(decoy)))
+    v, why = crit.verdict(decoy)
+    check("so they cannot carry CAPABLE on their own", v == "PARTIAL", f"{v}: {why}")
+
     with_control = dict(only_kernel)
     with_control["control"] = {
         "gi": True, "page": {"frames": 300, "ms": 5000, "webgl_renderer": "Apple GPU"},
