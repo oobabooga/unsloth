@@ -131,6 +131,36 @@ blocked per scroll event against a 162.6 / 193.9 / 197.5 / 184.5 cluster while t
 11,205 elements. The cause was a park position recomputed per window; the fix is a FIXED park pixel
 plus a DISCARDED warm-up run to quiescence, both gated below. The threshold is unchanged.
 
+THE PRODUCT ARM IS THE ONE ARM THAT APPLIES NOTHING OF ITS OWN, AND THAT IS WHY IT NEEDS A
+PRECONDITION. `product_math_block_containment` measures the branch's own implementation of the
+hoist that `content_visibility_math_blocks` explores: the renderer emits `.aui-math-block` on the
+nearest block-level ancestor of every inline maths root ALWAYS, whether the feature is on or off,
+and the product bundle carries the declaration gated on `html[data-math-block-containment="on"]`.
+The arm therefore sets ONE ATTRIBUTE and injects no CSS. On a bundle built without the fix that
+toggle is INERT, and an inert arm reads as a clean null -- which, from the numbers alone, looks
+exactly like "the product implementation does not reproduce the harness arm" when what happened is
+that the wrong build was measured. That is the single most dangerous failure mode in this file:
+defect #35/#13 (a vacuous arm) arriving through defect #50 (an arm's identity is the selector it
+applied and the fired check that proves it applied, never its label).
+
+So the scene records `product_rule` in every payload, per rung and per repetition, and this module
+VOIDS the arm -- not the run -- when it does not hold up:
+  * `present` false: no rule mentioning `data-math-block-containment` was found in any readable
+    stylesheet, with the count of sheets that could not be read printed beside it, because "the
+    rule is absent" and "the rule may be in a sheet I could not open" are different answers;
+  * `toggle_check` flat at a rung that HAS maths: setting the attribute did not move the computed
+    `content-visibility` of the product's own blocks, so the rule is in the bundle but is not
+    reaching them.
+Either way the arm's number means nothing and the verdict says so IN WORDS, because a reader who
+sees a null next to the harness arm's win will otherwise conclude the product implementation
+failed. At the 0K rung there is no maths at all, so ZERO BLOCKS IS THE CORRECT ANSWER and is not a
+failure -- but the RULE must still be found there, since it is the same bundle at every rung, and a
+precondition that disagrees between rungs is an instrument fault that DOES fail the run.
+
+WHAT WAS MEASURED IS PART OF THE MEASUREMENT. The probe clones a repository at a ref, and the
+product arm is a claim about THAT BUILD. A run that cannot name its repository, its resolved ref
+and the commit SHA it built cannot attribute anything it found, so that is gated and printed.
+
 GATES THAT ARE ABOUT THE INSTRUMENT FAIL THE RUN. Conditions that are about ONE ARM disqualify that
 arm and are printed, because a single bad arm should not throw away the others:
   * an arm whose declaration was DROPPED by the engine (`fired`);
@@ -160,7 +190,7 @@ NEGATIVE = "noop_touch"
 FLOOR = "still_no_scroll"
 
 CANDIDATES = ["content_visibility_katex_display", "content_visibility_katex_all",
-              "content_visibility_math_blocks"]
+              "content_visibility_math_blocks", "product_math_block_containment"]
 # NOT a candidate. `.katex{visibility:hidden}` makes the maths invisible, so it can never ship; it
 # is kept in the sequence only to say whether this session reproduces the published 97%. Renamed
 # from `visibility_hidden_offscreen`, which in `wq_final.js` names a DIFFERENT arm that hides
@@ -179,6 +209,17 @@ ALL_SELECTOR = "content_visibility_katex_all"
 # NOT SHIPPABLE AS WRITTEN: it hoists the declaration to a block ancestor, which is what a
 # renderer-side change would have to do. Labelled EXPLORATORY everywhere it is printed.
 EXPLORATORY = "content_visibility_math_blocks"
+# THE PRODUCT IMPLEMENTATION of that same hoist, and a SHIPPABLE CANDIDATE: it is real code on a
+# real branch rather than a rule this harness wrote. Scored on BOTH the mean and p50, against the
+# same neighbouring baselines, the same reference upper bound and the same thresholds as every
+# other candidate. It is reported next to EXPLORATORY so the product-versus-harness comparison is
+# one table rather than two numbers a reader has to line up by hand.
+PRODUCT = "product_math_block_containment"
+# The names the branch froze. This module never re-derives them and never accepts a near miss:
+# an arm that toggled a DIFFERENT attribute would be a different experiment wearing this one's
+# label, which is defect #50.
+PRODUCT_ATTR = "data-math-block-containment"
+PRODUCT_BLOCK_CLASS = "aui-math-block"
 
 # Low to high. An unknown rung sorts last rather than crashing the report.
 RUNG_ORDER = ["0K", "1K", "10K", "50K", "100K", "500K"]
@@ -209,6 +250,12 @@ TOOK_EFFECT_MIN_FRACTION = 0.5
 # The reference upper bound has to reproduce, or this session is not the experiment that produced
 # the published 97% and no candidate can be read against it.
 UPPER_BOUND_MIN_SAVING = 0.80
+# Share of the sampled `.aui-math-block` elements whose COMPUTED `content-visibility` must move
+# when the product attribute is set, before the product arm is readable at a rung that has maths.
+# The same 50% as TOOK_EFFECT_MIN_FRACTION and for the same reason: a handful of blocks that
+# happen to be on screen, or a sample that straddles a lazily mounted subtree, should not decide
+# whether a rule shipped, but a rule that shipped moves the whole population.
+PRODUCT_TOGGLE_MIN_FRACTION = 0.5
 # How much better the all-selector arm may read before the spec reading is wrong.
 KATEX_ALL_MAX_EXCESS = 0.05
 # Idle frame rate at the short rung, against the long rung. The short rung has fewer elements and
@@ -297,6 +344,79 @@ def _rung_runs(obs: dict, rung: str) -> list[dict]:
     return _by_rung(obs).get(rung) or []
 
 
+def _subject(obs: dict) -> dict:
+    """What was built and measured: repository, resolved ref, commit SHA.
+
+    The product arm is a claim about ONE BUILD of one branch, so a run that cannot name the build
+    cannot attribute what it found. Read from the probe's own clone record, with the flattened
+    `subject` block preferred when the probe wrote one.
+    """
+    c = obs.get("clone") or {}
+    s = obs.get("subject") or {}
+    return {"repo": s.get("repo") or c.get("url"),
+            "ref": s.get("ref") or c.get("ref"),
+            "resolved_ref": s.get("resolved_ref") or c.get("resolved_ref"),
+            "commit": s.get("commit") or c.get("commit")}
+
+
+def _subject_txt(obs: dict) -> str:
+    s = _subject(obs)
+    commit = str(s.get("commit") or "")
+    ref, res = s.get("ref"), s.get("resolved_ref")
+    ref_txt = str(ref or "?") + ("" if (not res or res == ref) else f" (resolved to `{res}`)")
+    return (f"`{s.get('repo') or '?'}` at ref `{ref_txt}`, commit "
+            f"`{commit or 'NOT RECORDED'}`")
+
+
+def _product_rule(run: dict) -> dict:
+    """The product arm's precondition, as recorded by the scene for ONE rung and ONE repetition."""
+    pr = (run.get("payload") or {}).get("product_rule")
+    return pr if isinstance(pr, dict) else {}
+
+
+def _product_rules(obs: dict, rung: str) -> list[tuple[int, dict]]:
+    return [(r.get("rep"), _product_rule(r)) for r in _rung_runs(obs, rung)]
+
+
+def _product_void(pr: dict | None) -> str | None:
+    """Why the product arm's number means nothing. VOIDS THE ARM, never the run.
+
+    This arm applies no stylesheet of its own, so the two ways it can be vacuous are both facts
+    about the BUILD rather than about the measurement, and both of them produce a clean null that
+    a reader would otherwise read as a result.
+    """
+    if not isinstance(pr, dict) or not pr:
+        return (f"NO `product_rule` PRECONDITION WAS RECORDED, so nothing in this run establishes "
+                f"that the bundle under test contains the product rule at all. `{PRODUCT}` sets "
+                f"the attribute `{PRODUCT_ATTR}` and injects no CSS of its own, so without that "
+                f"record its window cannot be told apart from a build that never had the fix, and "
+                f"its number is not readable in either direction")
+    if not pr.get("present"):
+        return (f"THE BUNDLE UNDER TEST WAS BUILT WITHOUT THE PRODUCT RULE: no rule mentioning "
+                f"`{PRODUCT_ATTR}` was found in any of the {pr.get('sheets_readable')} readable "
+                f"stylesheets ({pr.get('sheets_unreadable')} could not be read, "
+                f"{pr.get('rules_scanned')} rules scanned). This arm applies NOTHING of its own -- "
+                f"it sets one attribute on the document element -- so with no such rule in the "
+                f"bundle the toggle is INERT and this window is a clean null. That null is a "
+                f"statement about the BUILD, not about the product implementation, and reporting "
+                f"it as a measurement would be reporting a vacuous arm as a result")
+    tc = pr.get("toggle_check") or {}
+    blocks = pr.get("blocks")
+    if blocks:
+        moved = tc.get("moved_fraction")
+        if moved is None or moved < PRODUCT_TOGGLE_MIN_FRACTION:
+            return (f"THE PRODUCT RULE IS IN THE BUNDLE BUT DOES NOT REACH THE BLOCKS: with "
+                    f"{blocks} `.{PRODUCT_BLOCK_CLASS}` elements on the page, setting "
+                    f"`{PRODUCT_ATTR}=\"on\"` moved the computed `content-visibility` of "
+                    f"{tc.get('moved')}/{tc.get('sampled')} sampled blocks "
+                    f"({'-' if moved is None else format(moved, '.0%')}, under the "
+                    f"{PRODUCT_TOGGLE_MIN_FRACTION:.0%} bar): off {tc.get('off_values')}, on "
+                    f"{tc.get('on_values')}. The rule was found -- `{pr.get('selector_text')}` -- "
+                    f"so this is not a missing build but a rule whose selector does not select "
+                    f"these elements, and the arm's window measures nothing either way")
+    return None
+
+
 def _windows(obs: dict, rung: str) -> list[tuple[int, list[dict]]]:
     """Per repetition of ONE rung, the arm windows IN ORDER. Order makes neighbours meaningful."""
     return [(r.get("rep"), list((r["payload"].get("arms") or []))) for r in _rung_runs(obs, rung)]
@@ -333,7 +453,13 @@ def _neighbour_baseline(seq: list[dict], i: int, key):
 def _scored(obs: dict, rung: str) -> dict[str, list[dict]]:
     """For every non-baseline window OF ONE RUNG, its own local comparison, one per repetition."""
     out: dict[str, list[dict]] = {}
-    for rep, seq in _windows(obs, rung):
+    for run in _rung_runs(obs, rung):
+        rep = run.get("rep")
+        seq = list((run["payload"].get("arms") or []))
+        # The product arm's precondition belongs to the REPETITION, not to the window, so it is
+        # attached to every entry of that repetition and the per-arm disqualifier can reach it
+        # without being handed the whole observation.
+        prod = _product_rule(run)
         for i, a in enumerate(seq):
             if a.get("arm") == BASELINE_ARM and a.get("name") != BASELINE_REPEAT:
                 continue
@@ -367,6 +493,9 @@ def _scored(obs: dict, rung: str) -> dict[str, list[dict]]:
                 "scroll_height_delta": a.get("scroll_height_delta"),
                 "mutations": a.get("mutations") or {},
                 "gesture": a.get("gesture") or {},
+                # The product arm applies no CSS, so this record is what says its window measured
+                # anything at all. Carried on every entry so the disqualifier can read it.
+                "product_rule": prod,
             }
             out.setdefault(a.get("name"), []).append(entry)
     return out
@@ -543,6 +672,8 @@ def _label(name: str) -> str:
         return " **[REFERENCE UPPER BOUND, RE-RUN LATE, NOT SHIPPABLE]**"
     if name == EXPLORATORY:
         return " **[EXPLORATORY, NOT SHIPPABLE AS WRITTEN]**"
+    if name == PRODUCT:
+        return " **[PRODUCT IMPLEMENTATION, SHIPPABLE CANDIDATE]**"
     if name == ALL_SELECTOR:
         return " **[SELECTOR PROBE, NOT A FIX]**"
     return {POSITIVE: " **[POSITIVE CONTROL]**", NEGATIVE: " **[NEGATIVE CONTROL]**",
@@ -567,6 +698,16 @@ def _disqualified(name: str, entries: list[dict]) -> str | None:
                        f"run" if name in CONTROL_WINDOWS else ""))
     if name in (POSITIVE, NEGATIVE, FLOOR, BASELINE_REPEAT):
         return None
+    # THE PRODUCT ARM'S PRECONDITION IS CHECKED BEFORE ITS FIRED CHECK, and the order is the whole
+    # point. A bundle without the product rule fails BOTH: the toggle changes no computed style,
+    # so `fired` is false as well. Reported through the generic fired disqualifier that would read
+    # "the declaration did not take", which names the wrong fault -- there was no declaration to
+    # take, because this arm never wrote one. The precondition names the build.
+    if name == PRODUCT:
+        for e in entries:
+            why = _product_void(e.get("product_rule"))
+            if why:
+                return why
     for e in entries:
         fired = e.get("fired")
         if isinstance(fired, dict) and fired.get("fired") is False:
@@ -654,6 +795,18 @@ def _gate_records(obs: dict) -> list[dict]:
     g("Studio installed and built a PRODUCTION bundle",
       bool(d.get("index_html")) and (d.get("asset_files") or 0) > 0,
       f"install rc={(obs.get('install') or {}).get('rc')}; assets={d.get('asset_files')}")
+
+    # WHAT WAS MEASURED IS PART OF THE MEASUREMENT. `product_math_block_containment` is a claim
+    # about one build of one branch, so a run that cannot name the repository, the ref it resolved
+    # and the commit it built cannot attribute anything it found to anything. Printed in the gate
+    # table, which is the one part of VERDICT.md that renders even when the run is INCONCLUSIVE.
+    subj = _subject(obs)
+    g("the build under test is identified: repository, resolved ref and cloned commit SHA",
+      bool(subj.get("repo")) and bool(subj.get("ref")) and len(str(subj.get("commit") or "")) >= 7,
+      _subject_txt(obs)
+      + ("" if len(str(subj.get("commit") or "")) >= 7 else
+         ". Without a commit SHA nothing measured here can be attributed to a build, and the "
+         "product arm in particular is a claim about a specific branch"))
 
     # A rung with no scrollable range still COMPLETED. Failing it here would report the
     # short-context leg as a broken run instead of as the flat leg it is asked for.
@@ -797,6 +950,61 @@ def _gate_records(obs: dict) -> list[dict]:
 
     g(f"no scored window mounted more than {MAX_SCORED_WINDOW_MUTATIONS} elements",
       *_per_rung(obs, _quiet, scored_only = True))
+
+    # THE PRODUCT ARM'S PRECONDITION, GATED ON BEING RECORDED AND ON AGREEING WITH ITSELF -- never
+    # on the answer it gives. Those are three different things and conflating them would either
+    # void good runs or hide bad builds:
+    #   * MISSING at any rung or repetition: the scene did not assert it, so the arm cannot be
+    #     read anywhere and this is an instrument fault. Fails the run.
+    #   * DISAGREEING between rungs: the same bundle serves every rung, so a rule that is present
+    #     at 500K and absent at 0K is not a fact about the bundle, it is a fault in the census.
+    #     Fails the run. This is what gates 0K, where there is nothing else to gate: no maths, no
+    #     blocks and no windows, but the same stylesheet.
+    #   * PRESENT: FALSE everywhere: the bundle was built without the fix. That is a fact about
+    #     the BUILD and it voids the ARM (see `_product_void`), which is printed in the arm table
+    #     and said in words in the verdict. It does not throw away the other arms' windows, which
+    #     are measurements of rules this harness applied itself and are unaffected by it.
+    # ZERO BLOCKS AT A RUNG WITH NO MATHS IS THE CORRECT ANSWER and is never a failure here.
+    def _product_pre(obs_: dict) -> tuple[bool, str]:
+        rungs = _rungs(obs_)
+        if not rungs:
+            return False, "no repetition produced a payload"
+        parts, okp, presence = [], True, set()
+        for rung in rungs:
+            for rep, pr in _product_rules(obs_, rung):
+                if not pr:
+                    okp = False
+                    parts.append(f"{rung} rep {rep}: NO `product_rule` record was posted  <- "
+                                 f"FAILS AT THIS RUNG")
+                    continue
+                presence.add(bool(pr.get("present")))
+                tc = pr.get("toggle_check") or {}
+                blocks = pr.get("blocks")
+                moved = tc.get("moved_fraction")
+                parts.append(
+                    f"{rung} rep {rep}: rule "
+                    + ("FOUND `" + str(pr.get("selector_text")) + "`" if pr.get("present")
+                       else f"NOT FOUND (this bundle was built without the fix, so `{PRODUCT}` is "
+                            f"VOID and its number means nothing)")
+                    + f", {pr.get('sheets_readable')} sheets read, "
+                      f"{pr.get('sheets_unreadable')} unreadable, {blocks} "
+                      f"`.{PRODUCT_BLOCK_CLASS}` and {pr.get('katex_display')} `.katex-display`, "
+                    + ("toggle moved "
+                       + f"{tc.get('moved')}/{tc.get('sampled')} sampled blocks"
+                       + ("" if moved is None else f" ({moved:.0%})") if blocks else
+                       "no blocks at this rung, which is the CORRECT answer for a thread with no "
+                       "maths"))
+        if len(presence) > 1:
+            okp = False
+            parts.append(f"the census DISAGREES BETWEEN RUNGS about whether `{PRODUCT_ATTR}` is in "
+                         f"the bundle, and one bundle serves every rung, so this is a fault in the "
+                         f"census rather than a fact about the build  <- FAILS")
+        return okp, "; ".join(parts)
+
+    g(f"the `product_rule` precondition was recorded at every rung and every repetition and says "
+      f"the same thing at each (a bundle built WITHOUT the rule voids `{PRODUCT}` alone, not the "
+      f"run; zero `.{PRODUCT_BLOCK_CLASS}` blocks at a rung with no maths is the correct answer)",
+      *_product_pre(obs))
 
     # THE MEAN MUST NOT BE ONE FRAME -- WHERE A CONCLUSION DEPENDS ON IT. On this venue at r500K
     # the app blocks the main thread for about 8.6 s every 30 s, and `blocked_ms_per_frame` is a
@@ -1132,6 +1340,7 @@ def _rung_table(obs: dict, rung: str) -> list[str]:
         rows += [f"- `{n}`{_label(n)} ({_sel_txt(_arm_selector(scored[n]))}): {why}"
                  for n, why in dqs]
 
+    rows += _product_lines(obs, rung)
     rows += _p50_lines(obs, rung)
     rows += _early_late_lines(obs, rung)
 
@@ -1185,6 +1394,100 @@ def _p50_lines(obs: dict, rung: str) -> list[str]:
                 "baselines, same as everything else here:", "",
             "| window | selector | p50 rAF gap | neighbouring baselines' p50 | cost removed on "
             "p50 |", "|---|---|---|---|---|"] + rows_
+
+
+def _product_lines(obs: dict, rung: str) -> list[str]:
+    """The product implementation against the harness arm that bounds it, in ONE table.
+
+    These two arms are the same idea twice: `content_visibility_math_blocks` hoists the
+    declaration to the nearest block-level ancestor from a stylesheet this harness injects, and
+    `product_math_block_containment` toggles the branch's own rule, which the renderer targets with
+    a class it emits at render time. Printing them apart would leave the reader to line up two
+    numbers by hand, and the only interesting question is whether they agree.
+
+    THE PRODUCT ARM'S PRECONDITION IS PRINTED WHETHER IT PASSED OR FAILED, verbatim, because this
+    arm applies nothing of its own and a null from an inert toggle looks exactly like a null from
+    an implementation that does not work.
+    """
+    scored = _scored(obs, rung)
+    prod, expl = scored.get(PRODUCT) or [], scored.get(EXPLORATORY) or []
+    prs = [pr for _, pr in _product_rules(obs, rung) if pr]
+    if not prod and not prs:
+        return []
+    pr = prs[0] if prs else {}
+    tc = (pr.get("toggle_check") or {}) if pr else {}
+    void = _product_void(pr) if prs else _product_void(None)
+    rows = ["", f"### The product implementation against the harness arm that bounds it ({rung})",
+            "",
+            f"`{EXPLORATORY}` applies a stylesheet THIS HARNESS wrote, to a class THIS HARNESS "
+            f"added, and is not shippable as written. `{PRODUCT}` sets ONE ATTRIBUTE, "
+            f"`{PRODUCT_ATTR}`, on the document element and injects no CSS at all: the "
+            f"declaration and the `.{PRODUCT_BLOCK_CLASS}` class both come from the build under "
+            f"test, and the class is emitted whether the feature is on or off, so every window in "
+            f"this session including every baseline saw the identical DOM. The two are read "
+            f"against the same neighbouring baselines, on the same two statistics, at the same "
+            f"{ARM_MIN_SAVING:.0%} bar.", "",
+            "| arm | selector it applied | cost removed on the MEAN | cost removed on p50 | "
+            "blocked ms/frame | p50 rAF gap | declaration accepted | engine acted | status |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for nm, es in ((EXPLORATORY, expl), (PRODUCT, prod)):
+        if not es:
+            rows.append(f"| `{nm}`{_label(nm)} | - | - | - | - | - | - | - | **no window at this "
+                        f"rung** |")
+            continue
+        dq = _disqualified(nm, es)
+        sv = _mean([e["saving"] for e in es if e.get("saving") is not None])
+        p50sv = _mean([e["p50_saving"] for e in es if e.get("p50_saving") is not None])
+        b = _mean([e["bmpf"] for e in es if e.get("bmpf") is not None])
+        p = _mean([e["p50"] for e in es if e.get("p50") is not None])
+        fired = next((e.get("fired") for e in es if isinstance(e.get("fired"), dict)), None)
+        te = _took_effect(es)
+        rows.append("| " + " | ".join([
+            f"`{nm}`{_label(nm)}",
+            _sel_txt(_arm_selector(es), 60),
+            "-" if sv is None else f"**{sv:+.0%}**",
+            "-" if p50sv is None else f"**{p50sv:+.0%}**",
+            "-" if b is None else f"{b:.1f}",
+            "-" if p is None else f"{p:.0f} ms",
+            "-" if not fired else ("yes" if fired.get("fired") else
+                                   f"NO ({fired.get('matching')}/{fired.get('sampled')})"),
+            "-" if not te else (f"{te.get('changed')}/{te.get('compared')} boxes "
+                                f"({(te.get('fraction_changed') or 0):.0%})"),
+            "**VOID**" if (nm == PRODUCT and void) else ("**DISQUALIFIED**" if dq else "scored"),
+        ]) + " |")
+
+    rows += ["", f"**The product arm's precondition at {rung}, which is what says its number is a "
+                 f"measurement at all.** It is asserted once per repetition before any window is "
+                 f"measured, and it does not depend on measuring anything:", ""]
+    if not prs:
+        rows.append(f"- **NOT RECORDED.** No `product_rule` block was posted at {rung}, so nothing "
+                    f"establishes that the bundle under test carries the rule this arm toggles.")
+    else:
+        rows += [
+            f"- rule found in the loaded stylesheets: **{'YES' if pr.get('present') else 'NO'}** "
+            f"({pr.get('sheets_readable')} sheets readable, {pr.get('sheets_unreadable')} "
+            f"unreadable, {pr.get('rules_scanned')} rules scanned)",
+            f"- matched selectorText, verbatim: `{pr.get('selector_text')}`",
+            f"- matched cssText, verbatim: `{pr.get('css_text')}`",
+            f"- covered by it on this page: **{pr.get('blocks')}** `.{PRODUCT_BLOCK_CLASS}` and "
+            f"**{pr.get('katex_display')}** `.katex-display`",
+            f"- toggle check, computed `content-visibility` on {tc.get('sampled')} sampled blocks: "
+            f"attribute off -> {tc.get('off_values')}, attribute on -> {tc.get('on_values')}, "
+            f"moved {tc.get('moved')}/{tc.get('sampled')}"
+            + ("" if tc.get("moved_fraction") is None else f" ({tc['moved_fraction']:.0%})")
+            + (f" -- {tc.get('note')}" if tc.get("note") else ""),
+            f"- attribute on `<html>` before the check: `{tc.get('attribute_before')}`, after it: "
+            f"`{tc.get('attribute_after')}` (it is put back exactly as it was found, so no other "
+            f"window can see it)",
+        ]
+        if len(prs) > 1:
+            rows.append("- per repetition, presence: "
+                        + ", ".join(f"rep {rep}: {'yes' if (p_ or {}).get('present') else 'NO'}"
+                                    for rep, p_ in _product_rules(obs, rung)))
+    if void:
+        rows += ["", f"**`{PRODUCT}` IS VOID AT {rung}, AND ITS NUMBER MUST NOT BE READ AS A "
+                     f"RESULT.** {void}."]
+    return rows
 
 
 def _early_late_lines(obs: dict, rung: str, brief: bool = False) -> list[str]:
@@ -1245,6 +1548,7 @@ def _short_section(obs: dict, rung: str) -> list[str]:
     fps = _mean([_idle(r["payload"])[0] for r in rs])
     blocked = _mean([_idle(r["payload"])[1] for r in rs])
     px = next((r["payload"].get("scrollable_px") for r in rs), None)
+    pr = next((p for _, p in _product_rules(obs, rung) if p), {})
     long_rung = _long_rung(obs)
     long_fps = _mean([_idle(r["payload"])[0] for r in _rung_runs(obs, long_rung)]) \
         if long_rung else None
@@ -1260,6 +1564,20 @@ def _short_section(obs: dict, rung: str) -> list[str]:
         f"- maths-bearing blocks (`.cvk-mathblock`, the exploratory arm's selector): "
         f"**{cen.get('math_blocks')}**" + (f" (scene counted {mb.get('count')})"
                                            if mb.get("count") is not None else ""),
+        f"- the PRODUCT's own marker class (`.{PRODUCT_BLOCK_CLASS}`, emitted by the renderer "
+        f"whether the feature is on or off): **{pr.get('blocks')}**"
+        + (f" (census {cen.get('product_math_blocks')})"
+           if cen.get("product_math_blocks") is not None else ""),
+        # ZERO BLOCKS HERE IS THE CORRECT ANSWER. The rule is a property of the BUNDLE, not of the
+        # thread, so it must still be found at a rung with no maths -- and if it is not, that is
+        # the same bundle failing everywhere, which is why the precondition gate compares rungs.
+        f"- the product rule, which is the same bundle at every rung, was "
+        + ("**FOUND** here: `" + str(pr.get("selector_text")) + "`" if pr.get("present")
+           else "**NOT FOUND** here, so this bundle was built without the fix and "
+                f"`{PRODUCT}` is VOID at every rung")
+        + f" ({pr.get('sheets_readable')} sheets readable, {pr.get('sheets_unreadable')} "
+          f"unreadable). Zero blocks at this rung is the CORRECT answer for an empty thread and is "
+          f"not a failure; a missing RULE here would be the bundle, not the thread",
         f"- elements in the page: **{(cen.get('elements') or 0):,}**",
         f"- idle frame rate: **{fps if fps is None else round(fps, 1)} fps** at "
         f"**{blocked if blocked is None else round(blocked, 2)} ms blocked per frame**"
@@ -1283,7 +1601,13 @@ def table(obs: dict) -> str:
             f"probe of the spec reading rather than a fix: it exists to show whether the inline "
             f"roots can be reached at all. `{EXPLORATORY}` is EXPLORATORY and is not shippable as "
             f"written: it hoists the declaration to a block ancestor, which is what a "
-            f"renderer-side change would have to do.", ""]
+            f"renderer-side change would have to do. `{PRODUCT}` is THE PRODUCT IMPLEMENTATION of "
+            f"that hoist and a SHIPPABLE CANDIDATE: it injects no CSS and only sets "
+            f"`{PRODUCT_ATTR}` on the document element, so it measures the build rather than a "
+            f"rule this harness wrote, and it is reported next to `{EXPLORATORY}` in one table.",
+            "",
+            f"**The build under test: {_subject_txt(obs)}.** Every number below is a statement "
+            f"about that commit and about no other.", ""]
 
     short = set(_short_rungs(obs))
     for rung in _rungs(obs):
@@ -1503,6 +1827,44 @@ def verdict(obs: dict) -> tuple[str, str]:
     # two scenes shared the name `visibility_hidden_offscreen`.
     ship_sel = _sel_txt(_arm_selector(ship))
     expl_sel = _sel_txt(_arm_selector(_entries(obs, rung, EXPLORATORY)))
+    # THE PRODUCT ARM, said in words, because its failure mode is a NUMBER THAT LOOKS FINE. It
+    # applies no CSS of its own, so on a bundle built without the fix its window is a clean null
+    # sitting next to the harness arm's win, and a reader will conclude the product implementation
+    # does not work unless this paragraph tells them what actually happened.
+    prod_e = _entries(obs, rung, PRODUCT)
+    prod_pr = next((p for _, p in _product_rules(obs, rung) if p), None)
+    prod_void = _product_void(prod_pr)
+    prod_dq = _disqualified(PRODUCT, prod_e) if prod_e else None
+    prod_sv, prod_p50 = _saving(obs, rung, PRODUCT), _p50_saving(obs, rung, PRODUCT)
+    prod_sel = _sel_txt(_arm_selector(prod_e))
+    if prod_void:
+        product_txt = (f"`{PRODUCT}` (THE PRODUCT IMPLEMENTATION, a pure `{PRODUCT_ATTR}` "
+                       f"attribute toggle that injects no CSS of its own) IS VOID and carries no "
+                       f"number at all: {prod_void}")
+    elif not prod_e:
+        product_txt = (f"`{PRODUCT}` (THE PRODUCT IMPLEMENTATION) produced no scored window at "
+                       f"{rung}, so this run says nothing about it")
+    elif prod_dq:
+        product_txt = (f"`{PRODUCT}` ({prod_sel}, THE PRODUCT IMPLEMENTATION) is DISQUALIFIED: "
+                       f"{prod_dq}")
+    elif (prod_sv is not None and prod_sv >= ARM_MIN_SAVING
+          and prod_p50 is not None and prod_p50 >= ARM_MIN_SAVING):
+        product_txt = (f"`{PRODUCT}` ({prod_sel}, THE PRODUCT IMPLEMENTATION, a pure attribute "
+                       f"toggle over the build's own rule) removes {prod_sv:+.0%} on the mean and "
+                       f"{prod_p50:+.0%} on p50 against its own two neighbouring baselines, so the "
+                       f"shipped code reproduces what the exploratory arm bounds. Its precondition "
+                       f"holds: the rule was found in the bundle and setting the attribute moved "
+                       f"the computed style of the blocks it names")
+    else:
+        product_txt = (f"`{PRODUCT}` ({prod_sel}, THE PRODUCT IMPLEMENTATION) READS A NULL: "
+                       + ("no saving was recorded" if prod_sv is None
+                          else f"{prod_sv:+.0%} on the mean")
+                       + ("" if prod_p50 is None else f" and {prod_p50:+.0%} on p50")
+                       + f", under the {ARM_MIN_SAVING:.0%} bar, so it is NOT a win and must not "
+                         f"be reported as one. Its precondition HOLDS -- the rule is in the bundle "
+                         f"and setting `{PRODUCT_ATTR}` moved the computed style of the blocks it "
+                         f"names -- so this null is a measurement of the product implementation "
+                         f"and not a bundle built without the fix")
     exploratory_txt = (
         f"`{EXPLORATORY}` ({expl_sel}, EXPLORATORY, NOT SHIPPABLE AS WRITTEN: it hoists the "
         f"declaration to a block ancestor, which is what a renderer-side change would have to do) "
@@ -1524,7 +1886,8 @@ def verdict(obs: dict) -> tuple[str, str]:
             + ("no recorded amount" if sh is None else f"{sh:+.2%}")
             + f", which is `contain-intrinsic-size` standing in for the height of blocks the "
               f"engine skipped and is inside the {MAX_SCROLL_HEIGHT_DELTA:.0%} gate that says the "
-              f"gesture was not pinned. " + short_txt + ". For scale, " + exploratory_txt)
+              f"gesture was not pinned. " + short_txt + ". For scale, " + exploratory_txt
+            + ", and " + product_txt + ". Measured on " + _subject_txt(obs))
 
     why = dq or (f"it removes only {sv:+.0%}, under the {ARM_MIN_SAVING:.0%} bar"
                  if sv is not None else "it produced no scored window")
@@ -1535,8 +1898,10 @@ def verdict(obs: dict) -> tuple[str, str]:
         + ". The rule moves scrollHeight by "
         + ("no recorded amount" if sh is None else f"{sh:+.2%}")
         + ". " + short_txt + ". Instead, " + exploratory_txt
+        + ", and " + product_txt
         + ". This is a measured absence of benefit at the rung where the defect lives, not an "
-          "absence of measurement: the controls behave and the reference upper bound reproduced")
+          "absence of measurement: the controls behave and the reference upper bound reproduced. "
+          "Measured on " + _subject_txt(obs))
 
 
 def observed_capabilities(obs: dict) -> dict[str, bool]:

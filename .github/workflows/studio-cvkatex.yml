@@ -45,6 +45,20 @@ on:
   push:
     branches: [amd-ci-cvkatex]
   workflow_dispatch:
+    inputs:
+      subject_ref:
+        description: >-
+          Branch, tag or commit of unslothai/unsloth to BUILD AND MEASURE. This is the subject,
+          not this harness: the workflow itself always runs from the branch it was dispatched on.
+          `product_math_block_containment` toggles a rule that only exists on the product branch,
+          so dispatching at `main` measures a bundle without it, and the criteria module VOIDS
+          that arm and says the bundle lacked the rule rather than reporting its null.
+        required: false
+        default: studio-math-block-containment
+      subject_repo:
+        description: "Repository to clone for the subject under test."
+        required: false
+        default: https://github.com/unslothai/unsloth
 
 permissions:
   contents: read
@@ -157,15 +171,26 @@ jobs:
       # far larger than the effects being separated. The second repetition exists so a per-rep
       # disagreement is visible: a mean over a bimodal draw is a report of how many slow draws
       # landed in an arm, not an estimate of anything.
+      # THE SUBJECT IS PASSED THROUGH, and it is not the same thing as the branch this workflow
+      # runs from. `product_math_block_containment` toggles an attribute that only does anything
+      # on a build carrying the product rule, so the ref decides whether that arm measures the
+      # product implementation or is VOIDED for a bundle that never had it. Both values arrive
+      # through `env` rather than being interpolated into the shell line, so a dispatch input
+      # cannot become part of the command.
       - name: One-pixel ablation at 0K, 100K and 500K
         timeout-minutes: 300
+        env:
+          SUBJECT_REPO: ${{ inputs.subject_repo || 'https://github.com/unslothai/unsloth' }}
+          SUBJECT_REF: ${{ inputs.subject_ref || 'studio-math-block-containment' }}
         run: |
           set +e
+          echo "subject under test: $SUBJECT_REPO at ref $SUBJECT_REF"
           python3 amd_ci/lib/capability_run.py \
             --probe amd_ci/probes/studio_cvkatex_probe.py \
             --criteria amd_ci/criteria/studio_cvkatex.py \
             --out-dir "$AMD_CI_WORK/out/cvkatex" \
-            -- --rungs 0K,100K,500K --reps 2
+            -- --rungs 0K,100K,500K --reps 2 \
+               --repo "$SUBJECT_REPO" --ref "$SUBJECT_REF"
           cat "$AMD_CI_WORK/out/cvkatex/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not. A drifted
           # page is a NON-result and must not tick.

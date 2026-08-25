@@ -37,7 +37,48 @@ HERE = Path(__file__).resolve().parent
 LADDER = HERE / "studio_ladder"
 sys.path.insert(0, str(HERE))
 from webkit_paint_probe import fetch_xvfb, inventory, start_xserver  # noqa: E402
-from studio_ladder_probe import clone, gi_python, sh  # noqa: E402
+from studio_ladder_probe import gi_python, sh  # noqa: E402
+
+
+def clone_ref(repo_url: str, ref: str, dest) -> dict:
+    """Clone the subject AT A REF, and record which ref and which commit that turned out to be.
+
+    `studio_ladder_probe.clone` shallow-clones and then `git checkout <ref>`s, and `git clone
+    --depth N` implies `--single-branch`: the ref was never fetched, so the checkout of anything
+    other than the default branch fails and the job goes on to install whatever the default branch
+    happened to be. That does not matter for an ablation whose arms are stylesheets this harness
+    writes; it matters completely for `product_math_block_containment`, which measures a rule that
+    only exists on one branch, because the failure mode is a green run that measured `main` and
+    reported the product implementation as inert.
+
+    So the branch is asked for at clone time, with a fallback that fetches a raw SHA, and the
+    RESOLVED ref and the commit are recorded either way. The criteria module gates on their being
+    present, because a number that cannot be attributed to a build is not a measurement of one.
+    """
+    out: dict = {"url": repo_url, "ref": ref, "dest": str(dest)}
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors = True)
+    out["clone"] = sh(["git", "clone", "--depth", "50", "--branch", ref or "main",
+                       repo_url, str(dest)], timeout = 1800)
+    if out["clone"].get("rc"):
+        # `--branch` takes a branch or a tag and refuses a raw commit SHA, which is a legitimate
+        # thing to dispatch against.
+        out["branch_clone_failed"] = (out["clone"].get("stderr") or "")[-500:]
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors = True)
+        out["clone_fallback"] = sh(["git", "clone", "--depth", "50", repo_url, str(dest)],
+                                   timeout = 1800)
+        out["fetch"] = sh(["git", "fetch", "--depth", "50", "origin", ref], cwd = str(dest),
+                          timeout = 900)
+        out["checkout"] = sh(["git", "checkout", "--detach", "FETCH_HEAD"], cwd = str(dest),
+                             timeout = 300)
+    r = sh(["git", "rev-parse", "HEAD"], cwd = str(dest), timeout = 60)
+    out["commit"] = (r.get("stdout") or "").strip()
+    r = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd = str(dest), timeout = 60)
+    out["resolved_ref"] = (r.get("stdout") or "").strip() or None
+    r = sh(["git", "log", "-1", "--pretty=%s"], cwd = str(dest), timeout = 60)
+    out["subject_line"] = (r.get("stdout") or "").strip()[:200]
+    return out
 
 
 def main() -> int:
@@ -47,7 +88,13 @@ def main() -> int:
     ap.add_argument("--checkout", default = "")
     ap.add_argument("--work", default = os.environ.get("AMD_CI_WORK", "/tmp/studio_layers"))
     ap.add_argument("--repo", default = "https://github.com/unslothai/unsloth")
-    ap.add_argument("--ref", default = "main")
+    ap.add_argument("--ref", default = "main",
+                    help = "branch, tag or commit of --repo to build and measure. The product arm "
+                           "`product_math_block_containment` only has anything to toggle on a "
+                           "build that carries the product rule, so dispatching this workflow at "
+                           "`main` measures a bundle without it and the arm is VOIDED rather than "
+                           "reported. The resolved ref and the cloned commit SHA are recorded in "
+                           "the observations and printed in VERDICT.md.")
     ap.add_argument("--rungs", default = "500K",
                     help = "comma separated, measured in the order given. The short rungs are "
                            "not optional: a change that wins at 500K and costs anything at 0K is "
@@ -83,7 +130,13 @@ def main() -> int:
             return 0
 
         repo = work / "repo"
-        obs["clone"] = clone(args.repo, args.ref, repo)
+        obs["clone"] = clone_ref(args.repo, args.ref, repo)
+        # Flattened next to the clone record, because this is the one fact every table in
+        # VERDICT.md is a statement about and it should not have to be dug out of a nested blob.
+        obs["subject"] = {"repo": args.repo, "ref": args.ref,
+                          "resolved_ref": obs["clone"].get("resolved_ref"),
+                          "commit": obs["clone"].get("commit"),
+                          "subject_line": obs["clone"].get("subject_line")}
         home = work / "studio_home"
         home.mkdir(parents = True, exist_ok = True)
         t0 = time.time()

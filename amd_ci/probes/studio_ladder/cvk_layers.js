@@ -39,6 +39,28 @@
 //                                         every maths root, which is what a renderer-side change
 //                                         would have to do to reach inline maths. It bounds what
 //                                         that work would be worth before anyone does it.
+//   * `product_math_block_containment`    THE PRODUCT IMPLEMENTATION of that same hoist, measured
+//                                         instead of imitated. The branch adds the class
+//                                         `.aui-math-block` to the nearest block-level ancestor of
+//                                         every INLINE maths root at render time, ALWAYS, whether
+//                                         the feature is on or off, and ships the declaration in
+//                                         the product bundle gated on
+//                                         `html[data-math-block-containment="on"]`. So this arm
+//                                         applies NO STYLESHEET OF ITS OWN: it sets one attribute
+//                                         on the document element and takes it off again.
+//
+// THE DANGEROUS FAILURE OF THE PRODUCT ARM, and it is dangerous precisely because it is quiet.
+// An arm that applies nothing of its own is INERT when the bundle under test does not contain the
+// rule it is toggling, and an inert arm reads as a clean null -- which looks exactly like "the
+// product implementation does not reproduce the harness arm" when what actually happened is that
+// the wrong build was measured. That is defect #35/#13 (a vacuous arm) arriving through defect #50
+// (an arm's identity is the selector it applied, never its label). So before any window is
+// measured this scene walks `document.styleSheets` and records, VERBATIM, the selectorText and
+// cssText of the product rule it found, how many sheets it could not read, and a BEHAVIOURAL
+// toggle check: the computed `content-visibility` of a sample of `.aui-math-block` elements with
+// the attribute off, then with it on, then off again. Those two facts together say "the rule
+// shipped" without depending on measuring anything, and the criteria module VOIDS the arm rather
+// than reporting its null when they do not hold.
 //
 // The class those blocks carry is added BEFORE the warm-up, so every window including every
 // baseline sees the same DOM and the arm only ever toggles a stylesheet. An arm that mutates the
@@ -296,6 +318,11 @@
     // decides how much this fix can be worth.
     katex_display_descendants: document.querySelectorAll(".katex-display *").length,
     math_blocks: document.querySelectorAll(".cvk-mathblock").length,
+    // The PRODUCT's own marker class, counted separately from the harness's. The branch emits it
+    // at render time whether the feature is on or off, so this count must be the SAME in every
+    // window of the session including every baseline; if it moves, the DOM is not identical
+    // across windows and defect #48 is back.
+    product_math_blocks: document.querySelectorAll(".aui-math-block").length,
     code_blocks: document.querySelectorAll("pre").length,
     // Run 32865232787 grew the DOM by 11,205 elements across one session while `.katex`,
     // `.katex *` and `pre` all stayed pinned, so the growth was none of those. These buckets
@@ -404,6 +431,121 @@
              mean_height_after: n ? Math.round((sumAfter / n) * 100) / 100 : null,
              selector: before.selector, total: before.total,
              offscreen_before: before.offscreen, offscreen_after: after.offscreen };
+  };
+
+  // ── THE PRODUCT IMPLEMENTATION'S OWN NAMES, frozen, and never re-derived from a label ──────
+  //
+  // These three strings are the contract with the branch under test. The class is emitted at
+  // render time on the nearest block-level ancestor of every INLINE maths root, ALWAYS, so the DOM
+  // is identical whether the feature is on or off (defect #48). Display maths needs no marker: its
+  // own `span.katex-display` root is already block-level, and the product rule names it directly.
+  // The attribute is the only thing the feature flag moves, and it lives on the document element.
+  const PRODUCT_ATTR = "data-math-block-containment";
+  const PRODUCT_BLOCK = "aui-math-block";
+  const PRODUCT_SEL = "." + PRODUCT_BLOCK;
+
+  // DOES THE RULE THE ARM TOGGLES ACTUALLY EXIST IN THIS BUILD?
+  //
+  // This is the precondition the product arm cannot be read without. The arm applies no stylesheet
+  // of its own, so if the bundle was built without the fix the attribute toggle is INERT and the
+  // window reads as a clean null -- indistinguishable, from the numbers alone, from a product
+  // implementation that does not work. Walking the loaded stylesheets and quoting the matched rule
+  // VERBATIM is the only way to tell those two apart, and it does not depend on measuring
+  // anything.
+  //
+  // Cross-origin stylesheets throw on `.cssRules` (CSSOM, and WebKit enforces it), so every sheet
+  // is read inside its own try and the number that could not be read is REPORTED rather than
+  // silently folded into "not found": "the rule is absent" and "the rule may be in a sheet I could
+  // not open" are different answers and must not be printed as the same one.
+  const findProductRule = () => {
+    const sheets = document.styleSheets || [];
+    const out = { attribute: PRODUCT_ATTR, block_class: PRODUCT_BLOCK, block_selector: PRODUCT_SEL,
+                  sheets_total: sheets.length, sheets_readable: 0, sheets_unreadable: 0,
+                  unreadable: [], rules_scanned: 0, matches: [] };
+    const visit = (rules, href, depth) => {
+      if (!rules || depth > 6) return;
+      for (let i = 0; i < rules.length; i++) {
+        const r = rules[i];
+        out.rules_scanned++;
+        let sel = null;
+        try { sel = r.selectorText; } catch (e) { sel = null; }
+        if (typeof sel === "string" && sel.indexOf(PRODUCT_ATTR) >= 0) {
+          let css = "";
+          try { css = String(r.cssText || ""); }
+          catch (e) { css = "(cssText threw: " + err(e).message + ")"; }
+          out.matches.push({ selector_text: String(sel), css_text: css.slice(0, 800), sheet: href });
+        }
+        // Grouping rules (`@media`, `@supports`, `@layer`) carry their own `cssRules`, and a
+        // bundler is free to put the product rule inside one.
+        let kids = null;
+        try { kids = r.cssRules; } catch (e) { kids = null; }
+        if (kids && kids.length) visit(kids, href, depth + 1);
+      }
+    };
+    for (let i = 0; i < sheets.length; i++) {
+      const s = sheets[i];
+      const href = String((s && s.href) || "(inline <style>)");
+      let rules = null;
+      try { rules = s.cssRules; }
+      catch (e) {
+        out.sheets_unreadable++;
+        if (out.unreadable.length < 8) out.unreadable.push({ sheet: href, why: err(e).message });
+        continue;
+      }
+      if (rules === null || rules === undefined) {
+        out.sheets_unreadable++;
+        if (out.unreadable.length < 8) out.unreadable.push({ sheet: href, why: "cssRules was null" });
+        continue;
+      }
+      out.sheets_readable++;
+      visit(rules, href, 0);
+    }
+    out.present = out.matches.length > 0;
+    // VERBATIM, both of them, and taken from the MATCH LIST rather than from the `present` flag,
+    // so the quoted rule and the claim that there is one cannot disagree. A census that answers
+    // YES and quotes nothing is exactly the shape this record exists to prevent, and deriving the
+    // quotes from the flag would also let a wrong flag throw in here and lose the whole payload.
+    out.selector_text = out.matches.length ? out.matches[0].selector_text : null;
+    out.css_text = out.matches.length ? out.matches[0].css_text : null;
+    return out;
+  };
+
+  // THE BEHAVIOURAL HALF OF THE SAME PRECONDITION. Finding the rule's text says the bundle carries
+  // it; this says the engine ACTS on it. Sample the computed `content-visibility` of the product's
+  // own blocks with the attribute OFF (expected `visible`, or `normal` on an engine that reports
+  // the initial value that way), set the attribute, sample the SAME elements again (expected
+  // `auto`), then put the attribute back exactly as it was found. Nothing else in the session may
+  // observe a difference, so the restore is unconditional and is itself recorded.
+  const productToggleCheck = (cap) => {
+    const all = document.querySelectorAll(PRODUCT_SEL);
+    const n = all.length;
+    const was = document.documentElement.getAttribute(PRODUCT_ATTR);
+    const res = { selector: PRODUCT_SEL, total: n, sampled: 0, attribute_before: was,
+                  off_values: [], on_values: [], moved: 0, moved_fraction: null,
+                  auto_when_on: 0, note: null };
+    if (!n) {
+      res.note = "no `" + PRODUCT_SEL + "` element exists at this rung, so there is nothing to "
+               + "toggle. At an empty thread that is the CORRECT answer and not a failure, but "
+               + "the RULE must still be present in the bundle here";
+      res.attribute_after = document.documentElement.getAttribute(PRODUCT_ATTR);
+      return res;
+    }
+    const stride = Math.max(1, Math.floor(n / cap));
+    const sample = [];
+    for (let i = 0; i < n; i += stride) sample.push(all[i]);
+    for (const e of sample) res.off_values.push(getComputedStyle(e).contentVisibility);
+    document.documentElement.setAttribute(PRODUCT_ATTR, "on");
+    for (const e of sample) res.on_values.push(getComputedStyle(e).contentVisibility);
+    if (was === null || was === undefined) document.documentElement.removeAttribute(PRODUCT_ATTR);
+    else document.documentElement.setAttribute(PRODUCT_ATTR, was);
+    res.attribute_after = document.documentElement.getAttribute(PRODUCT_ATTR);
+    res.sampled = sample.length;
+    for (let i = 0; i < sample.length; i++) {
+      if (res.on_values[i] === "auto") res.auto_when_on++;
+      if (res.on_values[i] === "auto" && res.off_values[i] !== "auto") res.moved++;
+    }
+    res.moved_fraction = Math.round((res.moved / res.sampled) * 1000) / 1000;
+    return res;
   };
 
   const cut = { g: 0, t: 0 };
@@ -615,6 +757,52 @@
       fired: () => firedCheck(".cvk-mathblock", "contentVisibility", "auto", 400),
       probe: () => heightProbe(".cvk-mathblock", 400) },
 
+    // ── the PRODUCT implementation of the arm above, measured rather than imitated ────────────
+    //
+    // A PURE ATTRIBUTE TOGGLE. It injects no stylesheet: the declaration is already in the product
+    // bundle, gated on `html[data-math-block-containment="on"]`, and the class the rule selects is
+    // emitted at render time whether the feature is on or off. So this arm changes exactly one
+    // attribute on the document element, which is the smallest possible difference between the
+    // measured window and its neighbouring baselines.
+    //
+    // BECAUSE IT APPLIES NOTHING OF ITS OWN, IT CANNOT BE READ WITHOUT ITS PRECONDITION. On a
+    // bundle built without the fix this toggle is inert and the window is a clean null. The
+    // `product_rule` record posted with every payload -- the matched selectorText and cssText
+    // verbatim, the count of unreadable sheets, and the off/on computed-style toggle check -- is
+    // what separates "the product implementation did not reproduce the harness arm" from "the
+    // wrong build was measured", and the criteria module VOIDS this arm rather than reporting its
+    // number when that record does not hold up.
+    //
+    // The apply detail quotes the SELECTOR THE PRODUCT STYLESHEET ITSELF CARRIES, read back out of
+    // the page, not a selector this file believes the product uses. Defect #50: an arm's identity
+    // is the selector it applied and the fired check that proves it applied, never its label.
+    product_math_block_containment: {
+      why: "THE PRODUCT IMPLEMENTATION. The chat markdown renderer adds `.aui-math-block` to the "
+         + "nearest block-level ancestor of every INLINE maths root, always, and the product "
+         + "stylesheet carries `content-visibility: auto` for that class and `.katex-display` "
+         + "gated on `html[data-math-block-containment=\"on\"]`. This arm therefore injects NO CSS "
+         + "of its own and only sets the attribute, which is what makes it a measurement of the "
+         + "shipped code rather than of a rule this harness wrote. It is scored against the same "
+         + "neighbouring baselines and the same reference upper bound as every other candidate, "
+         + "and it sits next to `content_visibility_math_blocks` so that the product-versus-"
+         + "harness comparison is a single table.",
+      apply: async () => {
+        const pr = W.productRule || {};
+        document.documentElement.setAttribute(PRODUCT_ATTR, "on");
+        const blocks = document.querySelectorAll(PRODUCT_SEL).length;
+        const disp = document.querySelectorAll(".katex-display").length;
+        const sel = (pr.present && pr.selector_text)
+          ? pr.selector_text
+          : `NO RULE MENTIONING [${PRODUCT_ATTR}] WAS FOUND IN ANY READABLE STYLESHEET `
+            + `(${pr.sheets_readable} readable, ${pr.sheets_unreadable} unreadable), so this `
+            + `attribute toggle applies NOTHING`;
+        return `${sel} <- set [${PRODUCT_ATTR}="on"] on <html>, covering ${blocks} `
+             + `${PRODUCT_SEL} and ${disp} .katex-display`;
+      },
+      revert: async () => { document.documentElement.removeAttribute(PRODUCT_ATTR); },
+      fired: () => firedCheck(PRODUCT_SEL, "contentVisibility", "auto", 400),
+      probe: () => heightProbe(PRODUCT_SEL, 400) },
+
     still_no_scroll: {
       why: "FLOOR. Assign the SAME scrollTop every frame. The position never changes, so "
          + "`RenderLayerScrollableArea::scrollTo` early-outs and no descendant walk happens. "
@@ -667,6 +855,12 @@
     ["baseline", "baseline_5"],
     ["content_visibility_math_blocks", "content_visibility_math_blocks"],
     ["baseline", "baseline_6"],
+    // IMMEDIATELY AFTER the harness's own hoist, so the product implementation and the arm that
+    // bounds it are separated by one baseline and nothing else. The two are read against each
+    // other in one table, and putting eight windows between them would make that comparison a
+    // comparison between two different parts of the session.
+    ["product_math_block_containment", "product_math_block_containment"],
+    ["baseline", "baseline_7"],
     ["katex_root_visibility_hidden", "katex_root_visibility_hidden_late"],
     ["baseline", "baseline_repeat"],
     ["still_no_scroll", "still_no_scroll"],
@@ -830,6 +1024,36 @@
                             p90: at(0.9), max: at(1) } };
       };
       W.mathBlocks = markMathBlocks();
+
+      // ── THE PRODUCT ARM'S PRECONDITION, ASSERTED ONCE, BEFORE ANY WINDOW ────────────────
+      //
+      // Alongside `markMathBlocks()` and for the same reason: it is a fact about the page that
+      // every window shares, so it is established once rather than inside a measured window. Two
+      // independent halves, both recorded whatever they say:
+      //
+      //   * the RULE EXISTS: `document.styleSheets` is walked and the matched selectorText and
+      //     cssText are quoted verbatim. This arm applies no CSS of its own, so if the bundle
+      //     lacks the product rule the attribute toggle is inert and the window reads as a clean
+      //     null. Without this record that null is indistinguishable from a product
+      //     implementation that does not work, and the wrong conclusion is the plausible one.
+      //   * the RULE ACTS: computed `content-visibility` on a sample of `.aui-math-block` with
+      //     the attribute off, then on, then off again.
+      //
+      // At the 0K rung there is no maths, so ZERO BLOCKS IS THE CORRECT ANSWER and the toggle
+      // check says so rather than failing; the rule must still be found in the bundle there,
+      // because it is the same bundle at every rung.
+      const productRule = findProductRule();
+      productRule.blocks = document.querySelectorAll(PRODUCT_SEL).length;
+      productRule.katex_display = document.querySelectorAll(".katex-display").length;
+      productRule.toggle_check = productToggleCheck(24);
+      W.productRule = productRule;
+      if (!productRule.present) {
+        W.notes.push(`no rule mentioning \`${PRODUCT_ATTR}\` was found in any of the `
+                   + `${productRule.sheets_readable} readable stylesheets `
+                   + `(${productRule.sheets_unreadable} unreadable), so this bundle was built `
+                   + `without the product fix and \`product_math_block_containment\` toggles `
+                   + `nothing`);
+      }
       await sleep(1000);
 
       // ── A DISCARDED WARM-UP, run to QUIESCENCE ─────────────────────────────────────────
@@ -1054,6 +1278,10 @@
              warmup: warm, park, fence_latch: warm.fence_latch,
              no_scroll_range: noScrollRange, scrollable_px: scrollable,
              math_blocks: W.mathBlocks,
+             // PER RUNG AND PER REP, because this payload is one repetition of one rung. The
+             // product arm cannot be scored without it, and at 0K -- where there are no windows
+             // at all -- it is the only thing this rung has to say about the product build.
+             product_rule: W.productRule,
              mutations_total: mutDelta(warm.mut_before, mutSnapshot()),
              baseline_census: baselineCensus, positioned,
              gesture_frames: o.gestureFrames, gesture_cap_ms: o.gestureCapMs, idle_ms: o.idleMs,

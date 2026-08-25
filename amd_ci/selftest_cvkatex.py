@@ -27,6 +27,18 @@ a synthetic observation whose right answer is known, and the ones that matter ar
   * A 0K RUNG WITH NO ARMS: an empty thread has nothing to scroll and no maths. That is a RESULT,
     and it must not crash the report, must not fail the window gates, and must not be turned into
     a win.
+  * THE PRODUCT ARM MEASURED ON A BUNDLE THAT NEVER HAD THE FIX. `product_math_block_containment`
+    sets ONE ATTRIBUTE and injects no CSS, so on the wrong build the toggle is inert and the arm
+    reads as a clean null sitting next to the harness arm's win. That is the most dangerous shape
+    in this file, because the plausible reading of it -- "the product implementation does not
+    reproduce the harness arm" -- is the wrong one. The module must VOID the arm, say the bundle
+    lacked the rule in words, and NOT void the run; and it must keep that answer distinct from a
+    genuine null measured on a build where the precondition holds.
+
+EVERY CASE ASSERTS ITS OWN FIXTURE FIRST (defect #51). A synthetic payload that drifts into no
+longer exercising the property under test turns a passing case into a decoration, and the only
+defence is for the case to fail loudly, naming itself, when its own inputs stop being what it
+says they are.
 """
 
 from __future__ import annotations
@@ -49,6 +61,24 @@ def check(label: str, cond: bool, detail: str = "") -> None:
         print(f"  ok   {label}")
     else:
         print(f"  FAIL {label}" + (f" -- {detail}" if detail else ""))
+        FAIL += 1
+
+
+def precondition(case: str, cond: bool, detail: str = "") -> None:
+    """DEFECT #51: a case must first prove its own fixture still exercises what it claims.
+
+    A fixture that drifts -- a builder default changed, a window renamed, a field dropped -- turns
+    a green case into a decoration that asserts something about a payload nobody meant to build.
+    This fails loudly and names the case rather than the assertion, because the fault is in the
+    setup and looking at the assertion would waste the reader's time.
+    """
+    global FAIL
+    if cond:
+        print(f"  ok   [precondition] {case}")
+    else:
+        print(f"  FAIL [precondition] {case}: THE FIXTURE NO LONGER EXERCISES WHAT THIS CASE "
+              f"TESTS, so its assertions below prove nothing"
+              + (f" -- {detail}" if detail else ""))
         FAIL += 1
 
 
@@ -123,6 +153,59 @@ def fired_dropped(sel, prop, want, saw):
             "matching": 0, "fraction": 0.0, "fired": False, "non_matching_examples": [saw]}
 
 
+# The product branch's rule, frozen, exactly as `studio-math-block-containment` ships it. The
+# scene quotes what it FOUND in the loaded stylesheets, so these two strings stand in for a real
+# `CSSStyleRule.selectorText` and `.cssText` and are compared verbatim.
+PRODUCT_SELECTOR_TEXT = ('html[data-math-block-containment="on"] .aui-thread-root '
+                         ':is(.aui-math-block, .katex-display)')
+PRODUCT_CSS_TEXT = (PRODUCT_SELECTOR_TEXT
+                    + " { content-visibility: auto; contain-intrinsic-size: auto 7.5rem; }")
+
+
+def product_rule(*, present = True, blocks = 402, katex_display = 117, moved = None,
+                 sampled = 24, sheets_readable = 6, sheets_unreadable = 1):
+    """The precondition the product arm cannot be read without, as the scene records it.
+
+    Two independent halves, and the cases below need each of them to be able to say NO on its own:
+    whether the RULE EXISTS in the bundle (`present`, from walking `document.styleSheets`), and
+    whether it ACTS (`toggle_check`, from computed `content-visibility` off then on). A bundle
+    built without the fix says no to both; a rule that shipped but does not reach the class says
+    no only to the second, and those are different faults with different words.
+
+    `blocks = 0` is the 0K rung: an empty thread has no maths, so there is nothing to toggle and
+    that is the CORRECT answer there. The RULE must still be found, because one bundle serves
+    every rung.
+    """
+    if blocks == 0:
+        sampled, moved = 0, 0
+    elif moved is None:
+        moved = sampled if present else 0
+    shown = min(sampled, 6)
+    tc = {"selector": ".aui-math-block", "total": blocks, "sampled": sampled,
+          "attribute_before": None, "attribute_after": None,
+          "off_values": ["visible"] * shown,
+          "on_values": [("auto" if i < min(moved, shown) else "visible") for i in range(shown)],
+          "moved": moved, "auto_when_on": moved,
+          "moved_fraction": (round(moved / sampled, 3) if sampled else None),
+          "note": None if sampled else
+                  ("no `.aui-math-block` element exists at this rung, so there is nothing to "
+                   "toggle. At an empty thread that is the CORRECT answer and not a failure, but "
+                   "the RULE must still be present in the bundle here")}
+    return {"attribute": "data-math-block-containment", "block_class": "aui-math-block",
+            "block_selector": ".aui-math-block",
+            "sheets_total": sheets_readable + sheets_unreadable,
+            "sheets_readable": sheets_readable, "sheets_unreadable": sheets_unreadable,
+            "unreadable": ([{"sheet": "https://fonts.googleapis.com/css2", "why": "SecurityError"}]
+                           if sheets_unreadable else []),
+            "rules_scanned": 4821,
+            "matches": ([{"selector_text": PRODUCT_SELECTOR_TEXT, "css_text": PRODUCT_CSS_TEXT,
+                          "sheet": "(inline <style>)"}] if present else []),
+            "present": present,
+            "selector_text": PRODUCT_SELECTOR_TEXT if present else None,
+            "css_text": PRODUCT_CSS_TEXT if present else None,
+            "blocks": blocks, "katex_display": katex_display, "toggle_check": tc}
+
+
 def took(sel, changed, compared, *, before = 53.9, after = 56.0):
     """The height-delta probe: what the ENGINE did, as opposed to what it accepted."""
     return {"selector": sel, "total": 117, "compared": compared, "changed": changed,
@@ -137,7 +220,8 @@ def took(sel, changed, compared, *, before = 53.9, after = 56.0):
 def census_long(elements = 164136, *, deferred = 0, spans = 49857):
     return {"elements": elements, "messages": 30, "message_descendants": 118000,
             "katex_roots": 1027, "katex_descendants": 101306, "katex_display": 117,
-            "katex_display_descendants": 23591, "math_blocks": 402, "code_blocks": 330,
+            "katex_display_descendants": 23591, "math_blocks": 402,
+            "product_math_blocks": 402, "code_blocks": 330,
             "highlight_spans": spans, "all_spans": 104000 + spans, "buttons": 90,
             "data_slots": 300, "fences_deferred": deferred, "code_block_bodies": 330,
             "scroller_scroll_height": 316829, "scroller_client_height": 1080}
@@ -147,7 +231,8 @@ def census_short(*, deferred = 0):
     """An empty thread: no maths, nothing to scroll, and the selector matches nothing."""
     return {"elements": 1204, "messages": 0, "message_descendants": 0,
             "katex_roots": 0, "katex_descendants": 0, "katex_display": 0,
-            "katex_display_descendants": 0, "math_blocks": 0, "code_blocks": 0,
+            "katex_display_descendants": 0, "math_blocks": 0,
+            "product_math_blocks": 0, "code_blocks": 0,
             "highlight_spans": 0, "all_spans": 140, "buttons": 22, "data_slots": 30,
             "fences_deferred": deferred, "code_block_bodies": 0,
             "scroller_scroll_height": 1080, "scroller_client_height": 1080}
@@ -193,8 +278,13 @@ def positioned_long():
                                          "estimate": 15291}}
 
 
-def common(cen, *, jam_clean, jam_jammed, idle_fps, warm, park):
+def common(cen, *, jam_clean, jam_jammed, idle_fps, warm, park, prod = None):
     return {
+        # PER RUNG AND PER REP, because a payload is one repetition of one rung. At 0K this is the
+        # only thing the rung has to say about the product build.
+        "product_rule": product_rule(blocks = cen["product_math_blocks"],
+                                     katex_display = cen["katex_display"])
+        if prod is None else prod,
         "warmup": warm,
         "fence_latch": warm["fence_latch"],
         "clamp": {"clamp_ms": 1.2, "samples": 400},
@@ -218,13 +308,20 @@ SEL_VH = ".katex{visibility:hidden}"
 SEL_CVD = ".katex-display{content-visibility:auto;contain-intrinsic-size:auto 3.5rem}"
 SEL_CVA = ".katex,.katex-display{content-visibility:auto;contain-intrinsic-size:auto 3.5rem}"
 SEL_CVM = ".cvk-mathblock{content-visibility:auto;contain-intrinsic-size:auto 24px} over 402 blocks"
+# What the PRODUCT arm applied, in the shape the scene records it: the selector the PRODUCT
+# stylesheet carries, read back out of the page, followed by the attribute this arm set and the
+# populations it covers. The arm injects no CSS of its own, so this string is the only place a
+# report can see what its window was actually about (defect #50).
+SEL_PROD = (PRODUCT_SELECTOR_TEXT + ' <- set [data-math-block-containment="on"] on <html>, '
+            "covering 402 .aui-math-block and 117 .katex-display")
 
 
 def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm = 60.0, vh = 10.0,
                  vh_late = None, neg = 285.0, floor = 1.5, pos = 2.0, repeat = None,
                  cvd_fired = None, cvd_took = None, cva_took = None, cvd_sh = 0.0,
                  jam_clean = 61.0, jam_jammed = 17.0, idle_fps = 61.0, warm = None,
-                 base_mutations = 0, stalled = None, p50s = None):
+                 base_mutations = 0, stalled = None, p50s = None,
+                 prodv = 62.0, prod = None, prod_fired = None, prod_took = None, prod_sh = 0.0):
     """One repetition of a scored rung, in the scene's SEQUENCE order.
 
     fps is derived from blocked-ms-per-frame so the two channels stay consistent: the campaign's
@@ -284,6 +381,15 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
           fired = fired_ok(".cvk-mathblock", "contentVisibility", "auto"),
           took = took(".cvk-mathblock", 180, 200, before = 61.0, after = 24.0)),
         w("baseline_6", "baseline", base),
+        # THE PRODUCT IMPLEMENTATION, one baseline after the harness arm it is compared with, so
+        # the two are separated by a single window and nothing else.
+        w("product_math_block_containment", "product_math_block_containment", prodv,
+          selector = SEL_PROD,
+          fired = prod_fired or fired_ok(".aui-math-block", "contentVisibility", "auto"),
+          took = took(".aui-math-block", 180, 200, before = 61.0, after = 24.0)
+          if prod_took is None else prod_took,
+          sh = prod_sh),
+        w("baseline_7", "baseline", base),
         w("katex_root_visibility_hidden_late", "katex_root_visibility_hidden", vh_late,
           selector = SEL_VH, fired = fired_ok(".katex", "visibility", "hidden")),
         w("baseline_repeat", "baseline", repeat),
@@ -295,37 +401,63 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
     p = {"ok": True, "rung": rung, "arms": arms, "no_scroll_range": False,
          "scrollable_px": 315749}
     p.update(common(cen, jam_clean = jam_clean, jam_jammed = jam_jammed, idle_fps = idle_fps,
-                    warm = warm if warm is not None else warmup(cen, park = park), park = park))
+                    warm = warm if warm is not None else warmup(cen, park = park), park = park,
+                    prod = prod))
     return p
 
 
 def payload_short(*, rung = "0K", jam_clean = 61.2, jam_jammed = 17.2, idle_fps = 61.2,
-                  warm = None):
+                  warm = None, prod = None):
     """The 0K rung: an empty thread. No arms, no scrollable range, and no maths to skip."""
     cen = census_short()
     p = {"ok": True, "rung": rung, "arms": [], "no_scroll_range": True, "scrollable_px": 0}
     p.update(common(cen, jam_clean = jam_clean, jam_jammed = jam_jammed, idle_fps = idle_fps,
                     warm = warm if warm is not None else warmup(
                         cen, deltas = (4, 0), left_deferred = 0, latched_from = 0, park = 0),
-                    park = 0))
+                    park = 0, prod = prod))
     return p
 
 
-def obs(reps = 2, rungs = ("0K", "500K"), short_kw = None, per_rung = None, **kw):
-    """rung OUTER, repetition INNER, exactly as the probe writes it."""
+# WHAT WAS BUILT. The product arm is a claim about one branch at one commit, so the observation
+# has to name it or nothing measured can be attributed. The probe writes both of these.
+SUBJECT = {"repo": "https://github.com/unslothai/unsloth",
+           "ref": "studio-math-block-containment",
+           "resolved_ref": "studio-math-block-containment",
+           "commit": "3f9c1a2b7d4e5f60718293a4b5c6d7e8f9012345"}
+
+
+def obs(reps = 2, rungs = ("0K", "500K"), short_kw = None, per_rung = None, prod_kw = None,
+        subject = SUBJECT, **kw):
+    """rung OUTER, repetition INNER, exactly as the probe writes it.
+
+    `prod_kw` is applied to EVERY rung, because one bundle serves them all: a fixture that made
+    the product rule present at 500K and absent at 0K would be describing something that cannot
+    happen, and the precondition gate exists to catch exactly that shape.
+    """
     runs = []
     for rung in rungs:
         for rep in range(1, reps + 1):
             if rung == "0K":
-                pl = payload_short(rung = rung, **(short_kw or {}))
+                sk = dict(short_kw or {})
+                if prod_kw is not None:
+                    sk.setdefault("prod", product_rule(
+                        **{**{"blocks": 0, "katex_display": 0}, **prod_kw}))
+                pl = payload_short(rung = rung, **sk)
             else:
                 over = dict(kw)
                 over.update((per_rung or {}).get(rung, {}))
+                if prod_kw is not None:
+                    over.setdefault("prod", product_rule(**prod_kw))
                 pl = payload_long(rung = rung, **over)
             runs.append({"rung": rung, "rep": rep, "rc": 0, "payload": pl})
+    s = dict(subject or {})
     return {"xserver": {"display": ":99"},
             "dist": {"index_html": True, "asset_files": 528},
-            "install": {"rc": 0}, "rungs": list(rungs), "reps": reps, "runs": runs}
+            "install": {"rc": 0}, "rungs": list(rungs), "reps": reps, "runs": runs,
+            "subject": s,
+            "clone": {"url": s.get("repo"), "ref": s.get("ref"),
+                      "resolved_ref": s.get("resolved_ref"), "commit": s.get("commit"),
+                      "dest": "/tmp/studio_layers/cvkatex/repo"}}
 
 
 def gate(o, needle):
@@ -757,6 +889,210 @@ v, why = C.verdict(o)
 check("and the verdict quotes the selector beside the arm name",
       "`content_visibility_katex_display` (`.katex-display{content-visibility:auto;cont...`)"
       in why, why)
+
+print("case 23: THE PRODUCT ARM WINS BIG and is reported as a shippable candidate")
+o = obs()
+pw = [a for a in o["runs"][2]["payload"]["arms"] if a["name"] == "product_math_block_containment"]
+pr0 = o["runs"][2]["payload"]["product_rule"]
+precondition("case 23",
+             len(pw) == 1 and pw[0]["selector"] == SEL_PROD and pr0["present"] is True
+             and pr0["toggle_check"]["moved_fraction"] == 1.0
+             and pw[0]["blocked_ms_per_frame"] < 0.5 * 287.6,
+             f"window={[a['name'] for a in o['runs'][2]['payload']['arms']]}")
+bad = [n for n, ok, ev in C.gates(o) if not ok]
+check("every gate passes with the product arm present", not bad, str(bad))
+check("the product arm is a CANDIDATE, so it is scored like every other candidate",
+      "product_math_block_containment" in C.CANDIDATES, str(C.CANDIDATES))
+check("and it is not disqualified", not dq_of(o, "product_math_block_containment"),
+      str(dq_of(o, "product_math_block_containment")))
+tbl = C.table(o)
+check("the table labels it as the product implementation and a shippable candidate",
+      "**[PRODUCT IMPLEMENTATION, SHIPPABLE CANDIDATE]**" in tbl, tbl[:200])
+check("the product-versus-harness comparison is ONE table, next to the exploratory arm",
+      "### The product implementation against the harness arm that bounds it (500K)" in tbl
+      and tbl.split("### The product implementation")[1].split("###")[0]
+          .count("content_visibility_math_blocks") >= 1, tbl)
+check("and that table carries both the mean and p50 columns, since it is scored on both",
+      "cost removed on the MEAN | cost removed on p50" in tbl, tbl)
+check("the matched selectorText and cssText are quoted VERBATIM, not paraphrased",
+      PRODUCT_SELECTOR_TEXT in tbl and PRODUCT_CSS_TEXT in tbl, tbl)
+check("the precondition prints the toggle check's off and on samples",
+      "attribute off -> ['visible'" in tbl and "attribute on -> ['auto'" in tbl, tbl)
+check("and how many stylesheets could not be read, so 'absent' is not confused with 'unreadable'",
+      "6 sheets readable, 1 unreadable" in tbl, tbl)
+check("the arm is marked scored rather than void", "| scored |" in tbl, tbl)
+v, why = C.verdict(o)
+check("the verdict reports the product arm's saving on BOTH statistics",
+      v == "HELPS" and "product_math_block_containment" in why
+      and "on the mean and" in why and "on p50" in why, f"{v}: {why}")
+check("and says its precondition holds", "precondition holds" in why, why)
+check("and names the build it was measured on",
+      "studio-math-block-containment" in why and "3f9c1a2b" in why, why)
+
+print("case 24: product_rule.present FALSE -- the bundle was built without the fix")
+o = obs(prod_kw = {"present": False}, prodv = 286.0,
+        prod_fired = fired_dropped(".aui-math-block", "contentVisibility", "auto", "visible"),
+        prod_took = took(".aui-math-block", 0, 200, before = 61.0, after = 61.0))
+pr0 = o["runs"][2]["payload"]["product_rule"]
+precondition("case 24",
+             pr0["present"] is False and pr0["selector_text"] is None and pr0["matches"] == []
+             and pr0["blocks"] > 0
+             and o["runs"][0]["payload"]["product_rule"]["present"] is False,
+             f"present={pr0['present']} blocks={pr0['blocks']}")
+dq = dq_of(o, "product_math_block_containment")
+check("the product arm is VOIDED", bool(dq), str(dq))
+check("and the words say the BUNDLE was built without the rule",
+      "BUILT WITHOUT THE PRODUCT RULE" in (dq or ""), str(dq))
+check("and name the attribute it looked for and how many sheets it read",
+      "data-math-block-containment" in (dq or "") and "readable" in (dq or "")
+      and "could not be read" in (dq or ""), str(dq))
+check("and say the toggle was INERT and the null is about the build, not the implementation",
+      "INERT" in (dq or "") and "statement about the BUILD" in (dq or ""), str(dq))
+check("the fault is named as the missing rule, NOT as a declaration the engine dropped",
+      "did not take" not in (dq or ""), str(dq))
+bad = [n for n, ok, ev in C.gates(o) if not ok]
+check("the RUN is not voided: one wrongly built arm must not throw away the others", not bad,
+      str(bad))
+v, why = C.verdict(o)
+check("the run still produces an answer from the arms that applied their own CSS", v == "HELPS",
+      f"{v}: {why}")
+check("and the verdict says IN WORDS that the product arm is void and why",
+      "IS VOID" in why and "BUILT WITHOUT THE PRODUCT RULE" in why, why)
+check("and does not report its null as a measurement", "READS A NULL" not in why, why)
+tbl = C.table(o)
+check("the table marks the arm VOID and repeats the reason under the comparison",
+      "**VOID**" in tbl and "IS VOID AT 500K, AND ITS NUMBER MUST NOT BE READ AS A RESULT" in tbl,
+      tbl)
+ok, ev = gate(o, "`product_rule` precondition was recorded")
+check("the precondition gate PASSES: it gates recording and agreement, never the answer",
+      ok is True, ev)
+check("and it still says the bundle was built without the fix",
+      "NOT FOUND" in ev and "VOID" in ev, ev)
+
+print("case 25: the rule shipped but the toggle moves no computed style at a maths-bearing rung")
+o = obs(prod_kw = {"present": True, "moved": 0}, prodv = 285.0)
+pr0 = o["runs"][2]["payload"]["product_rule"]
+precondition("case 25",
+             pr0["present"] is True and pr0["blocks"] > 0
+             and pr0["toggle_check"]["moved"] == 0
+             and pr0["toggle_check"]["moved_fraction"] == 0.0
+             and o["runs"][0]["payload"]["product_rule"]["blocks"] == 0,
+             f"present={pr0['present']} toggle={pr0['toggle_check']}")
+dq = dq_of(o, "product_math_block_containment")
+check("the product arm is VOIDED the same way", bool(dq), str(dq))
+check("and the words say the rule is in the bundle but does not reach the blocks",
+      "IS IN THE BUNDLE BUT DOES NOT REACH THE BLOCKS" in (dq or ""), str(dq))
+check("and they print the off and on samples that prove it",
+      "off ['visible'" in (dq or "") and "on ['visible'" in (dq or ""), str(dq))
+check("and say this is NOT a missing build, so the two faults are never confused",
+      "not a missing build" in (dq or "") and PRODUCT_SELECTOR_TEXT in (dq or ""), str(dq))
+bad = [n for n, ok, ev in C.gates(o) if not ok]
+check("the RUN is not voided by it", not bad, str(bad))
+v, why = C.verdict(o)
+check("and the verdict says the arm is void rather than reporting its number",
+      "IS VOID" in why and "DOES NOT REACH THE BLOCKS" in why, why)
+
+print("case 26: 0K, zero blocks and the rule PRESENT -- the correct answer, not a failure")
+o = obs()
+pr_short = o["runs"][0]["payload"]["product_rule"]
+precondition("case 26",
+             pr_short["blocks"] == 0 and pr_short["present"] is True
+             and pr_short["toggle_check"]["sampled"] == 0
+             and o["runs"][0]["payload"]["no_scroll_range"] is True,
+             f"0K product_rule={pr_short}")
+check("zero blocks at a rung with no maths does NOT void anything",
+      C._product_void(pr_short) is None, str(C._product_void(pr_short)))
+ok, ev = gate(o, "`product_rule` precondition was recorded")
+check("the precondition gate passes at 0K", ok is True, ev)
+check("and it says zero blocks there is the CORRECT answer rather than staying silent",
+      "0K rep 1" in ev and "which is the CORRECT answer for a thread with no maths" in ev, ev)
+check("while still reporting that the rule was found at 0K, since one bundle serves every rung",
+      ev.split("500K")[0].count("FOUND") >= 1, ev)
+bad = [n for n, ok_, ev_ in C.gates(o) if not ok_]
+check("and no gate fails because of the empty rung", not bad, str(bad))
+tbl = C.table(o)
+check("the 0K section reports the product marker count and that the rule is still there",
+      "the PRODUCT's own marker class" in tbl
+      and "the product rule, which is the same bundle at every rung, was **FOUND** here" in tbl,
+      tbl)
+check("and says a missing rule there would be the bundle rather than the thread",
+      "a missing RULE here would be the bundle, not the thread" in tbl, tbl)
+
+print("case 27: the product arm reads a NULL on a build whose precondition holds")
+o = obs(prodv = 280.0)
+pr0 = o["runs"][2]["payload"]["product_rule"]
+pnull = [a for a in o["runs"][2]["payload"]["arms"]
+         if a["name"] == "product_math_block_containment"][0]
+precondition("case 27",
+             pr0["present"] is True and pr0["toggle_check"]["moved_fraction"] == 1.0
+             and pnull["blocked_ms_per_frame"] > 0.9 * 287.6,
+             f"present={pr0['present']} bmpf={pnull['blocked_ms_per_frame']}")
+check("the arm is NOT disqualified: its precondition holds, so the null is a measurement",
+      not dq_of(o, "product_math_block_containment"),
+      str(dq_of(o, "product_math_block_containment")))
+v, why = C.verdict(o)
+check("the verdict reports it as a NULL", "READS A NULL" in why, why)
+check("and says explicitly that it is not a win", "NOT a win" in why, why)
+check("and distinguishes it from a bundle built without the fix",
+      "not a bundle built without the fix" in why, why)
+check("and does not call it void", "IS VOID" not in why, why)
+check("the headline still rests on the shippable arm", v == "HELPS", f"{v}: {why}")
+sv = C._saving(o, "500K", "product_math_block_containment")
+check("its measured saving really is under the bar", sv is not None and sv < C.ARM_MIN_SAVING,
+      str(sv))
+
+print("case 28: the precondition was never recorded at one rung and repetition")
+o = obs()
+del o["runs"][2]["payload"]["product_rule"]
+precondition("case 28",
+             "product_rule" not in o["runs"][2]["payload"]
+             and o["runs"][2]["rung"] == "500K" and o["runs"][2]["rep"] == 1
+             and "product_rule" in o["runs"][3]["payload"],
+             "the 500K rep 1 payload must be the only one missing the record")
+ok, ev = gate(o, "`product_rule` precondition was recorded")
+check("the gate FAILS, because an unasserted precondition is an instrument fault", ok is False, ev)
+check("and it names the rung and the repetition", "500K rep 1: NO `product_rule` record" in ev, ev)
+dq = dq_of(o, "product_math_block_containment")
+check("and the arm itself is voided, naming the missing record",
+      "NO `product_rule` PRECONDITION WAS RECORDED" in (dq or ""), str(dq))
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE", v == "INCONCLUSIVE", f"{v}: {why}")
+
+print("case 29: the presence census DISAGREES between rungs, which cannot be a fact")
+o = obs()
+for i in (0, 1):
+    o["runs"][i]["payload"]["product_rule"] = product_rule(present = False, blocks = 0,
+                                                           katex_display = 0)
+precondition("case 29",
+             o["runs"][0]["payload"]["product_rule"]["present"] is False
+             and o["runs"][2]["payload"]["product_rule"]["present"] is True,
+             "0K must say absent while 500K says present")
+ok, ev = gate(o, "`product_rule` precondition was recorded")
+check("the gate fails", ok is False, ev)
+check("and it says one bundle serves every rung, so this is a census fault",
+      "DISAGREES BETWEEN RUNGS" in ev and "fault in the census" in ev, ev)
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE", v == "INCONCLUSIVE", f"{v}: {why}")
+
+print("case 30: the run cannot say which build it measured")
+o = obs()
+ok, ev = gate(o, "the build under test is identified")
+precondition("case 30", ok is True and "3f9c1a2b" in ev,
+             "the clean fixture must identify its build before the missing case means anything")
+check("a clean run names the repository, the ref and the commit",
+      "studio-math-block-containment" in ev and "3f9c1a2b7d4e5f60718293a4b5c6d7e8f9012345" in ev,
+      ev)
+check("and the report prints the build at the top of the table",
+      "**The build under test:" in C.table(o) and "studio-math-block-containment" in C.table(o),
+      C.table(o)[:600])
+o = obs(subject = {})
+ok, ev = gate(o, "the build under test is identified")
+check("a run with no clone record fails the gate", ok is False, ev)
+check("and says why an unattributable number is not a measurement",
+      "nothing measured here can be attributed to a build" in ev
+      and "claim about a specific branch" in ev, ev)
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE", v == "INCONCLUSIVE", f"{v}: {why}")
 
 print("\n" + (f"{FAIL} FAILED" if FAIL else "all cvkatex criteria self-tests passed"))
 sys.exit(1 if FAIL else 0)

@@ -10,10 +10,11 @@
 // any box and ACTS only on a box that can take size containment, so "the engine took the
 // declaration" (`fired`) and "the engine did something with it" (`took_effect`) come apart, and
 // the arm that reads auto while skipping nothing is not a bug in the instrument -- it is the
-// measurement. Six scenarios, and the second is the one the whole run turns on:
+// measurement. Seven scenarios, and two of them are the ones the whole run turns on:
 //
-//   1. every declaration takes AND acts     -> 13 windows in order, fired true on all three
-//                                              content-visibility arms, heights change under each
+//   1. every declaration takes AND acts     -> 17 windows in order, fired true on all three
+//                                              content-visibility arms and on the product arm,
+//                                              heights change under each
 //   2. THE VACUOUS ARM: `content_visibility_katex_all` is accepted on the inline roots and skips
 //      nothing there, because size containment does not apply to a non-atomic inline-level box.
 //      The payload must carry fired:true WITH changed:0 -- if the scene cannot record that pair,
@@ -24,6 +25,16 @@
 //   5. NO SCROLLABLE RANGE (the 0K rung)    -> no_scroll_range, an empty arm table, ok still true,
 //                                              and the idle windows still reported
 //   6. markMathBlocks found the block ancestors, classed them, and measured their heights
+//   7. THE PRODUCT ARM, which applies no stylesheet at all: it sets `data-math-block-containment`
+//      on the document element and the declaration comes from the build under test. So the run
+//      has to prove the census FOUND the product rule (verbatim selectorText and cssText), that
+//      the attribute moved computed style, that the arm reverted the attribute, and that it
+//      injected no `<style>` of its own. 7b is the dangerous half: a bundle built WITHOUT the
+//      rule, where the class is still on the page, the arm still runs, and the window is a clean
+//      null -- the stub has to be able to say `present: false` and `fired: false` there, or the
+//      campaign cannot tell a wrong build from a product implementation that does not work.
+//      7c puts the rule inside a grouping rule, because a census that does not recurse reports a
+//      correct build as a missing one.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -80,6 +91,12 @@ class El {
   matches(sel) { return matchOne(this, sel); }
   hasAttribute(k) { return k in this.attrs; }
   getAttribute(k) { return (k in this.attrs) ? this.attrs[k] : null; }
+  // The product arm is a PURE ATTRIBUTE TOGGLE on the document element, so these two are the
+  // entire mechanism under test in scenario 7 and the stub has to implement them for real. A
+  // `removeAttribute` that left the key behind would make the revert look like it worked while
+  // every later window still carried the feature.
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  removeAttribute(k) { delete this.attrs[k]; }
   // `closest` is how the scene splits inline maths from display maths
   // (`.katex` that is not inside a `.katex-display`), which is the split the fix's ceiling is
   // computed from, so it has to include self and walk the whole way up.
@@ -176,6 +193,21 @@ function makeMO(hook) {
 // Shipped katex.css gives `.katex-display` `display: block` and gives `.katex` no `display` at
 // all, so inline maths is an inline box. That one line is the entire reason one of these two arms
 // can act and the other cannot, so the stub models display rather than hard-coding the answer.
+// ── the product branch's frozen names, and the rule it ships ─────────────────────────────────
+//
+// The renderer adds `.aui-math-block` to the nearest block-level ancestor of every INLINE maths
+// root at render time, ALWAYS, whether the feature is on or off, so the DOM is identical in every
+// measured window. Display maths needs no marker: `span.katex-display` is already block-level and
+// the rule names it directly. The only thing the flag moves is the attribute on `<html>`.
+const PRODUCT_ATTR = "data-math-block-containment";
+const PRODUCT_SELECTOR_TEXT = 'html[data-math-block-containment="on"] .aui-thread-root '
+                            + ":is(.aui-math-block, .katex-display)";
+const PRODUCT_CSS_TEXT = PRODUCT_SELECTOR_TEXT
+                       + " { content-visibility: auto; contain-intrinsic-size: auto 7.5rem; }";
+// A rule that mentions the CLASS but not the ATTRIBUTE. The census keys on the attribute, and this
+// is here so that "found the product rule" cannot pass by matching the class instead.
+const DECOY_CSS_TEXT = ".aui-math-block { margin-block: 0.5rem; }";
+
 const BLOCK_TAGS = new Set(["BODY", "DIV", "P", "PRE", "SECTION", "ARTICLE"]);
 const displayOf = (el) => {
   if (classesOf(el).includes("katex-display")) return "block";
@@ -216,7 +248,11 @@ function buildWorld(opts) {
     const msg = place(world, new El("div", "msg", { "data-role": "assistant" }), y, MSG_STRIDE - 40);
     scroller.appendChild(msg);
 
-    const para = place(world, new El("p"), y + 20, P_H);
+    // `.aui-math-block` is emitted by the PRODUCT RENDERER, so it is here in every scenario,
+    // including the ones where the stylesheet rule is missing. That is the shape the product ships
+    // (defect #48: the DOM must be identical in every measured window whether the feature is on or
+    // off), and it is also what makes "the class is there but the rule is not" expressible at all.
+    const para = place(world, new El("p", "aui-math-block"), y + 20, P_H);
     msg.appendChild(para);
     for (let k = 0; k < 2; k++) {
       const kx = place(world, new El("span", "katex"), y + 30, INLINE_H, 120);
@@ -243,8 +279,56 @@ function buildWorld(opts) {
   const head = new El("head");
   const styles = new Map();
 
+  // ── the CSSOM the product-rule census walks ────────────────────────────────────────────────
+  //
+  // `findProductRule` reads `document.styleSheets` and every sheet's `cssRules`, which is the only
+  // way to answer "does this BUILD contain the fix" without measuring anything. Three things have
+  // to be modelled or the census cannot be trusted:
+  //   * a cross-origin sheet THROWS on `.cssRules` (CSSOM security, enforced by WebKit), and the
+  //     census must count it rather than fold it into "not found";
+  //   * grouping rules (`@media`, `@supports`, `@layer`) nest their own `cssRules`, and a bundler
+  //     is free to put the product rule inside one;
+  //   * the arm stylesheets this harness injects are sheets too, and none of them mention the
+  //     attribute, so they must not be mistaken for the product's rule.
+  const rule = (selectorText, cssText) => ({ selectorText, cssText });
+  const group = (cssText, rules) => ({ selectorText: undefined, cssText, cssRules: rules });
+  const sheetOf = (href, cssRules) => ({ href, cssRules });
+  const crossOriginSheet = (href) => ({
+    href,
+    get cssRules() {
+      throw new Error("SecurityError: Not allowed to access cross-origin stylesheet");
+    },
+  });
+  const bundleSheet = () => {
+    const rules = [rule(".katex", ".katex { text-rendering: auto; }"),
+                   rule(".aui-math-block", DECOY_CSS_TEXT)];
+    if (!opts.productRuleMissing) {
+      const product = rule(PRODUCT_SELECTOR_TEXT, PRODUCT_CSS_TEXT);
+      // The same rule, reached only through a grouping rule's own `cssRules`. A census that does
+      // not recurse reports a build that HAS the fix as one that does not, which is the exact
+      // wrong answer this whole precondition exists to prevent.
+      rules.push(opts.productRuleNested
+        ? group("@media screen { " + PRODUCT_CSS_TEXT + " }", [product])
+        : product);
+    }
+    return sheetOf("/assets/index-4f21ab.css", rules);
+  };
+
   const doc = {
     documentElement: root,
+    get styleSheets() {
+      const out = [bundleSheet()];
+      for (let i = 0; i < (opts.crossOriginSheets === undefined ? 1 : opts.crossOriginSheets); i++) {
+        out.push(crossOriginSheet("https://fonts.googleapis.com/css2?family=Inter"));
+      }
+      for (const [id, el] of styles) {
+        if (!el.parentElement || !el.textContent) continue;
+        const txt = String(el.textContent);
+        out.push(sheetOf("(inline <style>)#" + id,
+                         [rule(txt.split("{")[0].trim(), txt)]));
+      }
+      return out;
+    },
     head: { appendChild: (e) => { styles.set(e.id, e); head.appendChild(e); return e; } },
     body: { innerText: "SEEDED_MARKER_END" },
     scrollingElement: scroller,
@@ -275,6 +359,13 @@ function buildWorld(opts) {
     if (live("cvk-d", a) && cls.includes("katex-display")) return "auto";
     if (live("cvk-a", a) && (cls.includes("katex") || cls.includes("katex-display"))) return "auto";
     if (live("cvk-m", a) && cls.includes("cvk-mathblock")) return "auto";
+    // THE PRODUCT PATH. Two independent conditions, and separating them is the point: the RULE has
+    // to be in the bundle (`productRuleMissing` is a build that never had the fix) AND the
+    // ATTRIBUTE has to be set on the document element (the feature flag, which defaults to OFF).
+    // A build without the rule therefore reports `visible` no matter what the arm does, which is
+    // what makes the arm's toggle inert and its window a clean null.
+    if (!opts.productRuleMissing && root.getAttribute(PRODUCT_ATTR) === "on"
+        && (cls.includes("aui-math-block") || cls.includes("katex-display"))) return "auto";
     return "visible";
   };
 
@@ -417,6 +508,7 @@ const SEQUENCE = ["baseline", "noop_touch", "baseline_2", "katex_root_visibility
                   "baseline_3", "content_visibility_katex_display", "baseline_4",
                   "content_visibility_katex_all", "baseline_5",
                   "content_visibility_math_blocks", "baseline_6",
+                  "product_math_block_containment", "baseline_7",
                   "katex_root_visibility_hidden_late", "baseline_repeat", "still_no_scroll",
                   "detach_messages"];
 
@@ -429,16 +521,17 @@ console.log("scenario 1: every declaration takes AND acts");
   check("the scene completed and posted ok", payload && payload.ok === true,
         payload && JSON.stringify(payload.error_detail || payload.error));
   const names = (payload.arms || []).map((a) => a.name);
-  check("all fifteen windows ran, in order, baseline interleaved, the upper bound twice",
+  check("all seventeen windows ran, in order, baseline interleaved, the upper bound twice",
         names.join(",") === SEQUENCE.join(","), names.join(","));
   const by = Object.fromEntries((payload.arms || []).map((a) => [a.name, a]));
   for (const n of ["content_visibility_katex_display", "content_visibility_katex_all",
-                   "content_visibility_math_blocks", "katex_root_visibility_hidden"]) {
+                   "content_visibility_math_blocks", "product_math_block_containment",
+                   "katex_root_visibility_hidden"]) {
     check(`${n} reports its declaration took`, by[n] && by[n].fired && by[n].fired.fired === true,
           JSON.stringify(by[n] && by[n].fired));
   }
   for (const n of ["content_visibility_katex_display", "content_visibility_katex_all",
-                   "content_visibility_math_blocks"]) {
+                   "content_visibility_math_blocks", "product_math_block_containment"]) {
     const t = by[n] && by[n].took_effect;
     check(`${n} reports the engine ACTED on it, not merely accepted it`,
           t && t.compared > 0 && t.fraction_changed >= 0.9 && t.shrank === t.changed
@@ -643,6 +736,166 @@ console.log("scenario 5: no scrollable range, which is a result and not an error
   check("and so is the census, so the rung is still describable",
         payload.final && payload.final.elements > 0 && payload.baseline_census.katex_roots > 0,
         JSON.stringify(payload.baseline_census && payload.baseline_census.elements));
+}
+
+console.log("scenario 7: THE PRODUCT ARM -- a pure attribute toggle over the build's own rule");
+{
+  // The product arm applies NO STYLESHEET. Everything it depends on -- the class on the block
+  // ancestor and the declaration gated on the attribute -- comes from the build under test, so the
+  // only things this arm can be checked on are: did the rule turn out to be there, did setting the
+  // attribute move computed style, and did the attribute come back off afterwards.
+  const { payload, world } = await runScene({ only: ["content_visibility_math_blocks",
+                                                     "product_math_block_containment"] });
+  const by = Object.fromEntries((payload.arms || []).map((a) => [a.name, a]));
+  const arm = by.product_math_block_containment;
+  const P = payload.product_rule;
+  // NAMED, NOT THROWN. If the scene died before posting, every assertion below would read a
+  // property of undefined and this file would report a TypeError with a line number instead of
+  // saying what went wrong. A test that fails by crashing is a test whose failure has to be
+  // debugged before it can be read.
+  check("the scene completed and posted its product-rule precondition",
+        Boolean(payload && payload.ok === true && P && arm),
+        JSON.stringify((payload && (payload.error_detail || payload.error))
+                       || Object.keys(payload || {})));
+  if (!P || !arm) {
+    check("scenario 7 cannot continue without a posted precondition", false,
+          "the scene did not reach the end of its run");
+  } else {
+  check("it found the product rule in the loaded stylesheets", P.present === true,
+        JSON.stringify(P.matches));
+  check("and recorded the matched selectorText VERBATIM", P.selector_text === PRODUCT_SELECTOR_TEXT,
+        String(P.selector_text));
+  check("and the matched cssText VERBATIM", P.css_text === PRODUCT_CSS_TEXT, String(P.css_text));
+  check("it keyed on the ATTRIBUTE, not on the class: the decoy rule did not match",
+        P.matches.length === 1 && P.matches[0].css_text.indexOf("content-visibility") >= 0,
+        JSON.stringify(P.matches.map((m) => m.selector_text)));
+  check("a cross-origin sheet that throws on .cssRules is COUNTED, not folded into 'not found'",
+        P.sheets_unreadable === 1 && P.sheets_readable >= 1
+        && (P.unreadable[0].why || "").indexOf("SecurityError") >= 0,
+        JSON.stringify([P.sheets_readable, P.sheets_unreadable, P.unreadable]));
+  check("the census counted the populations the rule covers",
+        P.blocks > 0 && P.katex_display > 0 && P.blocks === payload.baseline_census.product_math_blocks,
+        JSON.stringify([P.blocks, P.katex_display, payload.baseline_census.product_math_blocks]));
+  const T = P.toggle_check;
+  check("the BEHAVIOURAL half ran: computed style sampled with the attribute off, then on",
+        T.sampled > 0 && T.off_values.length > 0 && T.on_values.length === T.off_values.length,
+        JSON.stringify(T));
+  check("off it reads visible, on it reads auto, and the whole sample moved",
+        T.off_values.every((v) => v === "visible") && T.on_values.every((v) => v === "auto")
+        && T.moved === T.sampled && T.moved_fraction === 1, JSON.stringify(T));
+  check("and the attribute was put back exactly as it was found, so no other window saw it",
+        T.attribute_before === null && T.attribute_after === null, JSON.stringify(T));
+  check("the arm's fired check is the same one the other arms use, over `.aui-math-block`",
+        arm.fired.fired === true && arm.fired.selector === ".aui-math-block"
+        && arm.fired.prop === "contentVisibility" && arm.fired.want === "auto",
+        JSON.stringify(arm.fired));
+  check("its height probe is the same one the other arms use, and the engine ACTED",
+        arm.took_effect.selector === ".aui-math-block" && arm.took_effect.compared > 0
+        && arm.took_effect.fraction_changed >= 0.9
+        && arm.took_effect.mean_height_after < arm.took_effect.mean_height_before,
+        JSON.stringify(arm.took_effect));
+  // DEFECT #50: the arm's identity is the selector it applied, and this arm applied someone
+  // else's, so it has to quote the one it found rather than one this file believes in.
+  check("the apply detail quotes the PRODUCT stylesheet's own selector, read back from the page",
+        arm.apply_detail.indexOf(PRODUCT_SELECTOR_TEXT) === 0, arm.apply_detail);
+  check("and names the attribute it set and the populations it covers",
+        arm.apply_detail.indexOf(`set [${PRODUCT_ATTR}="on"] on <html>`) > 0
+        && arm.apply_detail.indexOf(`${P.blocks} .aui-math-block`) > 0
+        && arm.apply_detail.indexOf(`${P.katex_display} .katex-display`) > 0, arm.apply_detail);
+  check("REVERT: the attribute is gone from <html> after the run, not merely set to something else",
+        !(PRODUCT_ATTR in world.root.attrs), JSON.stringify(world.root.attrs));
+  check("the arm injected NO stylesheet of its own: the only ids ever created are the guard's "
+        + "and the exploratory arm's",
+        [...world.styles.keys()].sort().join(",") === "cvk-m,lay-guard",
+        JSON.stringify([...world.styles.keys()]));
+  check("every window saw the identical DOM, because the class is emitted whether the flag is on "
+        + "or off",
+        arm.census_before.product_math_blocks === arm.census_applied.product_math_blocks
+        && arm.census_before.product_math_blocks
+           === by.content_visibility_math_blocks.census_before.product_math_blocks
+        && arm.census_before.product_math_blocks > 0,
+        JSON.stringify([arm.census_before.product_math_blocks,
+                        arm.census_applied.product_math_blocks]));
+  }
+}
+
+console.log("scenario 7b: THE BUNDLE WAS BUILT WITHOUT THE RULE -- the toggle is inert");
+{
+  // The dangerous case. Nothing about the DOM changes: the renderer still emits the class, the
+  // arm still sets the attribute, the window still produces a number. Only the rule is missing,
+  // and the number is a clean null that looks exactly like a product implementation that does not
+  // work. Both of the stub's answers are exercised here: `present` false AND `fired` false.
+  const { payload, world } = await runScene({ productRuleMissing: true,
+                                              only: ["product_math_block_containment"] });
+  const by = Object.fromEntries((payload.arms || []).map((a) => [a.name, a]));
+  const arm = by.product_math_block_containment;
+  const P = payload.product_rule;
+  check("the scene completed and posted its product-rule precondition even on the wrong build",
+        Boolean(payload && payload.ok === true && P && arm),
+        JSON.stringify((payload && (payload.error_detail || payload.error))
+                       || Object.keys(payload || {})));
+  if (!P || !arm) {
+    check("scenario 7b cannot continue without a posted precondition", false,
+          "the scene did not reach the end of its run, so the wrong-build case proved nothing");
+  } else {
+  check("the census says the rule is NOT present, and says it with an empty match list",
+        P.present === false && P.matches.length === 0 && P.selector_text === null
+        && P.css_text === null, JSON.stringify(P.matches));
+  check("it still read the sheets rather than failing to look",
+        P.sheets_readable >= 1 && P.rules_scanned > 0,
+        JSON.stringify([P.sheets_readable, P.rules_scanned]));
+  check("the class is STILL on the page, so the DOM is identical to the working build",
+        P.blocks > 0 && payload.baseline_census.product_math_blocks === P.blocks,
+        JSON.stringify([P.blocks, payload.baseline_census.product_math_blocks]));
+  check("the toggle check moved NOTHING, which is the other answer the stub can give",
+        P.toggle_check.sampled > 0 && P.toggle_check.moved === 0
+        && P.toggle_check.moved_fraction === 0
+        && P.toggle_check.on_values.every((v) => v === "visible"),
+        JSON.stringify(P.toggle_check));
+  check("the arm reports fired:false rather than a clean null",
+        arm.fired.fired === false && (arm.fired.non_matching_examples || []).includes("visible"),
+        JSON.stringify(arm.fired));
+  check("and its height probe moved nothing either, so both channels agree",
+        arm.took_effect.compared > 0 && arm.took_effect.changed === 0,
+        JSON.stringify(arm.took_effect));
+  check("the apply detail SAYS the rule was not found instead of quoting a selector it never saw",
+        arm.apply_detail.indexOf("NO RULE MENTIONING [" + PRODUCT_ATTR + "]") === 0
+        && arm.apply_detail.indexOf("applies NOTHING") > 0, arm.apply_detail);
+  check("and the scene notes it once, naming the build rather than the arm",
+        (payload.notes || []).some((n) => n.indexOf("built without the product fix") >= 0),
+        JSON.stringify(payload.notes));
+  check("the attribute is still reverted, even though it bought nothing",
+        !(PRODUCT_ATTR in world.root.attrs), JSON.stringify(world.root.attrs));
+  }
+}
+
+console.log("scenario 7c: the product rule inside a grouping rule is still found");
+{
+  // A bundler is free to emit the rule inside `@media`, `@supports` or `@layer`. A census that
+  // does not recurse would report a build that HAS the fix as one that does not, and the arm would
+  // be voided for a fault that is in the census.
+  const { payload } = await runScene({ productRuleNested: true, crossOriginSheets: 0,
+                                       only: ["product_math_block_containment"] });
+  const P = payload.product_rule;
+  const arm = (payload.arms || [])[0];
+  check("the scene completed and posted its product-rule precondition",
+        Boolean(payload && payload.ok === true && P),
+        JSON.stringify((payload && (payload.error_detail || payload.error))
+                       || Object.keys(payload || {})));
+  if (!P) {
+    check("scenario 7c cannot continue without a posted precondition", false,
+          "the scene did not reach the end of its run");
+  } else {
+  check("the nested rule was found, with its selectorText verbatim",
+        P.present === true && P.selector_text === PRODUCT_SELECTOR_TEXT, JSON.stringify(P.matches));
+  check("and the toggle still moves computed style",
+        P.toggle_check.moved === P.toggle_check.sampled && P.toggle_check.sampled > 0,
+        JSON.stringify(P.toggle_check));
+  check("and with no cross-origin sheet the unreadable count is zero, not a constant",
+        P.sheets_unreadable === 0, JSON.stringify([P.sheets_readable, P.sheets_unreadable]));
+  check("the arm fired", arm && arm.fired && arm.fired.fired === true,
+        JSON.stringify(arm && arm.fired));
+  }
 }
 
 console.log(failures ? `\n${failures} FAILED` : "\nall scene self-tests passed");
