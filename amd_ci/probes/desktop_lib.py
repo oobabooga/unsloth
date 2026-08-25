@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 # The roots of the Tauri v2 Linux build closure. Everything else arrives as a dependency.
@@ -196,6 +197,65 @@ def compile_link_proof(work: Path, env=None) -> dict:
     run = sh([str(binp)], timeout = 120, env = env)
     return {"stage": "ok" if run.get("rc") == 0 else "run",
             "output": (run.get("stdout") or "").strip(), "detail": run}
+
+
+def start_xserver_exclusive(work: Path, xvfb_root: Path, width=1440, height=900) -> tuple:
+    """An X server this job OWNS, on a display number nothing else is using.
+
+    webkit_paint_probe.start_xserver hard-codes `:99`, which is safe for one job and is not
+    safe here. Four ephemeral slots share ONE machine and /tmp/.X11-unix is not namespaced, so
+    two jobs both asking for :99 is not a conflict that fails loudly: the second Xvfb exits
+    because the display is taken, and the poll loop then finds the socket -- the FIRST job's
+    socket -- still there and reports success. The screenshot that follows would be a picture
+    of somebody else's window, and it would look like proof.
+
+    So: choose a display whose socket does not exist, start the server, and require that OUR
+    process is still alive when the socket appears. A socket that appears while our process is
+    dead is somebody else's and is refused rather than adopted.
+    """
+    info: dict = {"attempts": []}
+    candidates = [shutil.which("Xvfb"), str(xvfb_root / "usr/bin/Xvfb")]
+    binary = next((c for c in candidates if c and os.path.exists(c)), None)
+    if binary is None:
+        info["error"] = "no Xvfb binary"
+        return None, info
+    log = work / "xvfb.log"
+    # High numbers, and a per-pid stride, so two jobs starting at the same instant do not both
+    # begin their scan at the same place.
+    start = 120 + (os.getpid() % 40)
+    for n in list(range(start, 200)) + list(range(120, start)):
+        display = f":{n}"
+        sock = f"/tmp/.X11-unix/X{n}"
+        if os.path.exists(sock):
+            continue
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = (f"{xvfb_root}/usr/lib/x86_64-linux-gnu:{xvfb_root}/usr/lib:"
+                                  f"{os.environ.get('LD_LIBRARY_PATH', '')}")
+        xkb = (f"{xvfb_root}/usr/share/X11/xkb"
+               if (xvfb_root / "usr/share/X11/xkb").is_dir() else "/usr/share/X11/xkb")
+        cmd = [binary, display, "-screen", "0", f"{width}x{height}x24", "-nolisten", "tcp",
+               "-xkbdir", xkb]
+        with open(log, "a") as fh:
+            fh.write(f"\n== {cmd}\n")
+            fh.flush()
+            proc = subprocess.Popen(cmd, stdout = fh, stderr = subprocess.STDOUT, env = env)
+        ok = False
+        for _ in range(60):
+            if proc.poll() is not None:
+                break
+            if os.path.exists(sock):
+                ok = True
+                break
+            time.sleep(0.5)
+        if ok and proc.poll() is None:
+            info.update({"display": display, "binary": binary, "screen": f"{width}x{height}",
+                         "pid": proc.pid, "owned": True})
+            return proc, info
+        info["attempts"].append({"display": display, "exit": proc.poll()})
+        if proc.poll() is None:
+            proc.kill()
+    info["error"] = "no display number could be claimed"
+    return None, info
 
 
 def install_rust(work: Path, toolchain: str = "stable") -> dict:

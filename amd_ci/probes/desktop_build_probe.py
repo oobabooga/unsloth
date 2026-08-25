@@ -56,9 +56,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from desktop_lib import (  # noqa: E402
-    compile_link_proof, fetch_devroot, install_rust, sh,
+    compile_link_proof, fetch_devroot, install_rust, sh, start_xserver_exclusive,
 )
-from webkit_paint_probe import fetch_xvfb, inventory, start_xserver  # noqa: E402
+from webkit_paint_probe import fetch_xvfb, inventory  # noqa: E402
 
 # The variables linux_webkit.rs may set on the process, and the marker it uses to remember that
 # it set them. Read back out of /proc/<pid>/environ, which is the state the app actually ran
@@ -258,7 +258,9 @@ def main() -> int:
         obs["inventory"] = inventory()
         if not obs["inventory"].get("Xvfb"):
             obs["fetch_xvfb"] = fetch_xvfb(work)
-        xproc, xinfo = start_xserver(work, obs)
+        # Not webkit_paint_probe.start_xserver: it hard-codes :99, and four ephemeral slots
+        # share one /tmp/.X11-unix. See the docstring on start_xserver_exclusive.
+        xproc, xinfo = start_xserver_exclusive(work, work / "xroot")
         obs["xserver"] = xinfo
         if not xinfo.get("display"):
             obs["fatal"] = "no display server could be started"
