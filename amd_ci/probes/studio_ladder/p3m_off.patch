@@ -1,0 +1,40 @@
+diff --git a/studio/frontend/src/components/assistant-ui/markdown-text.tsx b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+index 6bd0e1b..124080b 100644
+--- a/studio/frontend/src/components/assistant-ui/markdown-text.tsx
++++ b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+@@ -844,11 +844,32 @@ function FenceBlock({
+     [source, languageToken],
+   );
+ 
+-  // A streaming fence is the one the reader is watching, so it never defers, and the hook latches
+-  // it so that finishing the stream cannot hand it back the plain shell.
++  // AMDCI_FENCEDEFER_DISABLED
++  // MEASUREMENT ARM. This arm exists to separate two costs that `codeHighlighting="plain"`
++  // removes together, and which the campaign has so far been unable to tell apart.
++  //
++  // `code-fence-defer.tsx` is BYTE-IDENTICAL between main and this branch: the deferral
++  // machinery is main's own code and 9477 does not touch a line of it. What 9477 does is pass
++  // `codeHighlighting="plain"` from `reasoning.tsx`, which makes `renderPlainBody` non-null,
++  // which passes `enabled = false` here, which turns that machinery off as a SIDE EFFECT while
++  // also removing every syntax colour.
++  //
++  // Turning the machinery off is therefore not a change to 9477's code at all. Passing `false`
++  // directly leaves `codeHighlighting` alone, so this arm keeps every colour and pays none of
++  // the per-fence observer, layout and scroll-listener work: an IntersectionObserver per fence,
++  // a ResizeObserver per nested-scroller fence, a pre-paint `useLayoutEffect` doing ancestor
++  // `getComputedStyle` walks and a `getBoundingClientRect` inside the commit that just inserted
++  // the whole trace, registration into a module-global `unreached` set, a document-wide
++  // capturing scroll listener, and a jump path that walks `unreached` and issues two `flushSync`
++  // renders.
++  //
++  // `reached` becomes true for every fence, so nothing defers and every fence highlights
++  // eagerly. That is the honest shape of the question: if this arm is fast, the cost was the
++  // machinery and the colours can stay. If it is slow, the cost is really the tokenizer and the
++  // fidelity trade is a real one.
+   const reached = useFenceReached(
+     host,
+-    mode !== "off" && renderPlainBody === null,
++    false && mode !== "off" && renderPlainBody === null,
+     Boolean(isIncomplete),
+     languageToken,
+     warm,

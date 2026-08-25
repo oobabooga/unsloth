@@ -1,0 +1,23 @@
+diff --git a/studio/frontend/src/components/assistant-ui/reasoning.tsx b/studio/frontend/src/components/assistant-ui/reasoning.tsx
+index 2cc13c6..faf0dd1 100644
+--- a/studio/frontend/src/components/assistant-ui/reasoning.tsx
++++ b/studio/frontend/src/components/assistant-ui/reasoning.tsx
+@@ -338,10 +338,17 @@ function ReasoningText({
+   );
+ }
+ 
++// AMDCI_PIECE3A_NEUTRALISED
++// Piece 3a is the ONE LITERAL below. On main, `ReasoningImpl` renders a bare `<MarkdownText />`
++// and `MarkdownCodeHighlightingContext` defaults to "syntax", so every fence inside a reasoning
++// pane is syntax highlighted at any size. 9477 passes `codeHighlighting="plain"`, which makes
++// every reasoning fence permanently plain whatever its length. Flipping this literal back to the
++// context default restores main's rendering and changes nothing else: the prop is read in exactly
++// three places, all of them `=== "syntax"` or `=== "plain"` tests on this same context.
+ const ReasoningImpl: ReasoningMessagePartComponent = () => (
+   <SearchImagesEnabledContext.Provider value={false}>
+     <MarkdownText
+-      codeHighlighting="plain"
++      codeHighlighting="syntax"
+       paginateReasoning={REASONING_PAGINATION_ENABLED}
+     />
+   </SearchImagesEnabledContext.Provider>

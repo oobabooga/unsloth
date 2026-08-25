@@ -1,0 +1,90 @@
+diff --git a/studio/frontend/src/components/assistant-ui/markdown-text.tsx b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+index 6bd0e1b..439fddd 100644
+--- a/studio/frontend/src/components/assistant-ui/markdown-text.tsx
++++ b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+@@ -1219,6 +1219,27 @@ function PartitionedMarkdownText({
+     return sources;
+   }, [incrementalRender, reasoningPage.canonicalCodeSources]);
+ 
++  // AMDCI_PIECE2_NEUTRALISED
++  // Ablation arm: give Streamdown back ownership of the block list, which is
++  // how main renders. `IncrementalMarkdownCache` still decides WHICH blocks
++  // exist (that class is on main too), but the render-partitioning layer piece
++  // 2 added on top of it -- the one-block provider shell, `StableCommittedChunk`
++  // /`StableCommittedChunks`, `StableTerminalPrefix`, `TerminalCodeTail` and
++  // `PartitionedStreamdownShell` -- is bypassed entirely, so every block is a
++  // direct `StreamdownBlock` child of one Streamdown, exactly as on main.
++  //
++  // The committed prefix is flattened back into the block list rather than
++  // re-lexed, so this arm neither pays a second parse nor keeps the chunk memo.
++  const unpartitionedBlocks = useCallback(
++    (): string[] => [
++      ...incrementalRender.chunks.flatMap((chunk) =>
++        chunk.blocks.map((block) => block.content),
++      ),
++      ...incrementalRender.tail.map((block) => block.content),
++    ],
++    [incrementalRender],
++  );
++
+   return (
+     <div data-status={statusType} className="min-w-0 max-w-full">
+       {reasoningPage.hasEarlier && (
+@@ -1237,8 +1258,8 @@ function PartitionedMarkdownText({
+             <Streamdown
+               key={messageId}
+               mode="streaming"
+-              parseIncompleteMarkdown={false}
+-              parseMarkdownIntoBlocksFn={parseProviderShellBlock}
++              parseIncompleteMarkdown={!pageIsStreaming}
++              parseMarkdownIntoBlocksFn={unpartitionedBlocks}
+               isAnimating={pageIsStreaming}
+               animated={STREAMDOWN_IMMEDIATE_UPDATES}
+               plugins={
+@@ -1251,9 +1272,9 @@ function PartitionedMarkdownText({
+               urlTransform={safeMarkdownUrl}
+               controls={STREAMDOWN_CONTROLS}
+               shikiTheme={STREAMDOWN_SHIKI_THEME}
+-              BlockComponent={PartitionedStreamdownShell}
++              BlockComponent={StreamdownBlock}
+             >
+-              {incrementalRender.shellMarkdown}
++              {incrementalRender.markdown}
+             </Streamdown>
+           </StreamingMarkdownPlanContext.Provider>
+         </MarkdownCodeHighlightingContext.Provider>
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts b/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
+index c64fa2a..f6eccfc 100644
+--- a/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
++++ b/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
+@@ -19,7 +19,12 @@ import {
+ // Retain blocks only after they are outside the rollback window.
+ const ROLLBACK_BLOCKS = 8;
+ // Group retained blocks so token updates touch only the final partial chunk.
+-const COMMITTED_CHUNK_BLOCKS = 8;
++// AMDCI_PIECE2_NEUTRALISED
++// Ablation arm: 1 block per chunk, so the chunk grouping piece 2 introduced
++// does no grouping at all and `syncCommittedChunks` produces one chunk per
++// committed block. Retention itself (ROLLBACK_BLOCKS, the commit boundary) is
++// untouched, because that machinery is on main too and is not piece 2.
++const COMMITTED_CHUNK_BLOCKS = 1;
+ // Bound stalled-tail scans; 8,192 characters preserves enough context for late closures.
+ const STALLED_TAIL_CHARACTERS = 8_192;
+ // remend repairs the trailing incomplete construct, but it reaches that
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts b/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts
+index 98ab24f..dc99b02 100644
+--- a/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts
++++ b/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts
+@@ -5,7 +5,11 @@
+ // already contains enough rich content that 60 publication attempts per second
+ // create more mutation/reconciliation work than visible progress. 75 ms lands
+ // at 12.5 Hz on a 60 Hz display, inside the requested smooth 12-15 Hz band.
+-export const LONG_STREAM_PRESENTATION_CHARS = 24 * 1024;
++// AMDCI_PIECE2_NEUTRALISED
++// Ablation arm: unreachable threshold, so `schedule` never takes the long-tail
++// branch and every publication is one requestAnimationFrame after the token,
++// which is exactly main's `useCoalescedStreamingText` coalescing.
++export const LONG_STREAM_PRESENTATION_CHARS = Number.MAX_SAFE_INTEGER;
+ export const LONG_STREAM_PRESENTATION_MS = 75;
+ 
+ type FrameHandle = number;
