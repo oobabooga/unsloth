@@ -312,7 +312,16 @@ def compile_link_proof(work: Path, env=None) -> dict:
     src = work / "wkprobe.c"
     binp = work / "wkprobe"
     src.write_text(C_PROBE)
-    flags = sh(["pkg-config", "--cflags", "--libs", "webkit2gtk-4.1"], timeout = 120, env = env)
+    # --define-prefix: the fetched .pc files carry `prefix=/usr`, so without it the -I flags
+    # point at the SYSTEM include tree, which has no webkit2 headers, and this probe reports a
+    # failure on a host where cargo links the real thing perfectly well. Observed exactly that:
+    # `cargo build --release` produced a 71 MB binary in the same job where this said
+    # `fatal error: webkit2/webkit2.h: No such file or directory`.
+    flags = sh(["pkg-config", "--define-prefix", "--cflags", "--libs", "webkit2gtk-4.1"],
+               timeout = 120, env = env)
+    if flags.get("rc") != 0:
+        flags = sh(["pkg-config", "--cflags", "--libs", "webkit2gtk-4.1"], timeout = 120,
+                   env = env)
     if flags.get("rc") != 0:
         return {"stage": "pkg-config", "detail": flags}
     cc = shutil.which("cc") or shutil.which("gcc") or ""

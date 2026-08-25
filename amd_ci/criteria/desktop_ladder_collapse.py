@@ -61,6 +61,10 @@ REPORTED_FLOOR_FPS = 5.0
 MIN_DOM_GROWTH = 5.0
 MIN_TOP_BUSY_PCT = 15.0
 CONTROL_MIN_DROP_PCT = 25.0
+# How much of the commanded scroll distance has to be actually travelled before the scroll
+# phase counts as a traversal rather than a jiggle. The unrepaired gesture measured 12% in
+# Chromium (6,610 px of 54,000) and read a comfortable frame rate for it.
+MIN_SCROLL_TRAVEL_FRACTION = 0.80
 # How far below the real leg the SOFTWARE leg's GFX engine time has to fall before the real
 # leg's counters are accepted as caused by the browser's rendering. A software rasteriser that
 # still books GFX time means something else in the process tree is using the device.
@@ -93,8 +97,19 @@ def _is_pristine(r):
     return bool(r.get("no_scene")) or str(r.get("rep")) == "pristine"
 
 
+def _is_ablation(r):
+    """The fence-deferral OFF arm. Same rung as a ladder run and NOT a ladder run.
+
+    Kept out of `_by_rung` deliberately. Pooling it with the default arm at the same rung would
+    average an ablated reading into the ladder and, worse, inflate that rung's repeat spread --
+    which is the floor every rung-to-rung difference is judged against. An arm that changes the
+    app's behaviour is a second experiment, not a second repetition.
+    """
+    return (r.get("defer_fence") in ("off", "on")) or str(r.get("rep", "")).startswith("abl")
+
+
 def _is_control(r):
-    return _is_hog(r) or _is_software(r) or _is_pristine(r)
+    return _is_hog(r) or _is_software(r) or _is_pristine(r) or _is_ablation(r)
 
 
 def _ok_runs(obs):
@@ -150,6 +165,16 @@ def _blocked(scene, phase):
 
 def _elements(scene):
     return (scene.get("final") or {}).get("elements")
+
+
+def _scroll_trace(scene):
+    return scene.get("scroll_trace") or {}
+
+
+def _fence_arm(r):
+    """The arm the PAGE reports it ran under, not the one the harness asked for."""
+    return ((_scene(r).get("__desktop") or {}).get("fence_arm")
+            or _bench(r).get("defer_fence_arm") or "default")
 
 
 def _by_rung(obs):
@@ -270,6 +295,23 @@ def gates(obs):
     out.append((f"the seeded thread really mounted (DOM grew >= {MIN_DOM_GROWTH:.0f}x)",
                 grew, detail))
 
+    # THE SCROLL GESTURE ACTUALLY TRAVELLED. This is a gate and not a footnote, because the
+    # failure it guards against reads as a comfortable frame rate rather than as an error: the
+    # unrepaired gesture assigns `scrollTop` into a `scroll-smooth` viewport, so it commands
+    # tens of thousands of pixels and travels a few thousand, and `scroll_detail` shows the
+    # bottom of the thread either way. A scroll phase that did not move is not a scroll phase.
+    travels = []
+    for r in ok:
+        st = _scroll_trace(_scene(r))
+        c, t = st.get("commanded_px"), st.get("travelled_px")
+        if c:
+            travels.append((r.get("rung"), c, t or 0, (t or 0) / c))
+    moved = bool(travels) and all(frac >= MIN_SCROLL_TRAVEL_FRACTION for *_, frac in travels)
+    out.append((f"the scroll gesture travelled (>= {MIN_SCROLL_TRAVEL_FRACTION:.0%} of the "
+                f"pixels it commanded)", moved,
+                "; ".join(f"{rung}: {t:,.0f}/{c:,.0f} px ({frac:.0%})"
+                          for rung, c, t, frac in travels) or "no scroll trace recorded"))
+
     # THE POSITIVE CONTROL. Without it a flat frame rate cannot be told from a channel that
     # cannot read anything else, which is precisely how the web UI's first table came to be an
     # artefact.
@@ -375,6 +417,74 @@ def table(obs):
                 continue
             rows.append(f"| {rung} | {phase} | {', '.join(f'{v:.1f}' for v in a['fps'])} | "
                         f"{a['spread']:.1f} fps |")
+
+    # ── THE ABLATION ──
+    #
+    # Printed as its own table and never folded into the ladder. The comparison is the SAME
+    # rung in two arms, so the ladder's rung-to-rung floor does not apply to it and its own
+    # arm-to-arm repeat spread does.
+    abl = [r for r in _runs(obs) if _is_ablation(r) and _bench(r).get("ok")]
+    default_at = [r for r in _ok_runs(obs) if r.get("rung") == (abl[0].get("rung") if abl else None)]
+    if abl and default_at:
+        rung = abl[0].get("rung")
+        rows += ["", f"### Fence-deferral ablation at {rung}", "",
+                 "| arm | n | scroll fps | stream fps | idle fps | busy (scroll) | elements | "
+                 "highlight spans |", "|---|---|---|---|---|---|---|---|"]
+        for label, rs in (("deferral ON (SHIP_DEFAULT)", default_at),
+                          ("deferral OFF (ablated)", abl)):
+            sc, stm, idl = _agg(rs, "scroll"), _agg(rs, "stream"), _agg(rs, "idle")
+            spans = [((_scene(r).get("final") or {}).get("highlightSpans")) for r in rs]
+            spans = [x for x in spans if x is not None]
+            def rng(a):
+                if not a["fps"]:
+                    return "-"
+                return (f"{a['fps_min']:.1f}" if a["n"] == 1
+                        else f"{a['fps_min']:.1f}-{a['fps_max']:.1f}")
+            rows.append("| " + " | ".join([
+                label, str(len(rs)), f"**{rng(sc)}**", f"**{rng(stm)}**", rng(idl),
+                "null" if sc["busy"] is None else f"{sc['busy']:.0f}%",
+                _fmt(sc["elements"]),
+                _fmt(sum(spans) / len(spans) if spans else None)]) + " |")
+        arms = sorted({_fence_arm(r) for r in abl})
+        rows += ["",
+                 f"The ablated arm reports `fence_arm={arms}`, read back from the page's own "
+                 f"global rather than from the flag the harness asked for: an arm that failed to "
+                 f"apply is the single failure that would make this table read as *the flag does "
+                 f"nothing*. `resolveFenceMode` maps the BOOLEAN `false` to `off` and an ABSENT "
+                 f"value to `SHIP_DEFAULT`, which is `defer`, so the two arms here are "
+                 f"`false` and unset, never a string.",
+                 "",
+                 "**What this is testing.** The mechanism attributed in both engines is the "
+                 "one-way upgrade of deferred code fences: roughly 335 fences, two commits per "
+                 "latch, each forcing a style recalc over the whole document. It is EXCESS and "
+                 "not BURST -- both arms end with an identical DOM, so the deferred delivery buys "
+                 "nothing and costs the extra traversals. If Desktop moves the way Chromium and "
+                 "WebKitGTK already do, the mechanism is shell-independent and Desktop is the "
+                 "same defect in a different wrapper."]
+
+    # Scroll travel, so the gesture is auditable rather than assumed.
+    rows += ["", "### Did the scroll phase actually scroll", "",
+             "| leg | commanded px | travelled px | steps | reached top | deadline hit |",
+             "|---|---|---|---|---|---|"]
+    for r in _runs(obs):
+        st = _scroll_trace(_scene(r))
+        if not st:
+            continue
+        rows.append("| " + " | ".join([
+            f"{r.get('rung')} rep {r.get('rep')}", _fmt(st.get("commanded_px")),
+            _fmt(st.get("travelled_px")), str(st.get("steps")),
+            str(st.get("reached_top")), str(st.get("deadline_hit"))]) + " |")
+    rows += ["",
+             "Recorded because the unrepaired gesture in `amdv_scene.js` does not scroll: it "
+             "assigns `scrollTop` into a viewport carrying `scroll-smooth`, so each write "
+             "animates and the next is computed from a stalled position. Measured in Chromium at "
+             "r500K it commanded 54,000 px and travelled 6,610, never further than 1,107 px from "
+             "the bottom of a 316,829 px thread, and read a comfortable frame rate for it. "
+             "`scroll_detail` cannot show that, because it records the first and last position "
+             "only and both are the bottom. This ladder uses the repaired gesture "
+             "(`scrollTo` with `behavior: instant`, a real `WheelEvent`, one step per painted "
+             "frame), so its idle and stream phases stay directly comparable to the web UI "
+             "ladder and its scroll phase is comparable only with the gesture named."]
 
     # The rendering path, which is the other half of the question.
     rows += ["", "### What actually rendered", "",

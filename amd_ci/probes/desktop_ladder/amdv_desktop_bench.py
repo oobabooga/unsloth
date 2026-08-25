@@ -194,6 +194,13 @@ def main() -> int:
     ap.add_argument("--hog-ms", type = int, default = 0)
     ap.add_argument("--hog-period-ms", type = int, default = 250)
     ap.add_argument("--skip-send", action = "store_true")
+    ap.add_argument("--defer-fence", default = "default", choices = ["default", "on", "off"],
+                    help = "the fence-deferral ablation arm. `default` sets nothing, so the app "
+                           "takes SHIP_DEFAULT = defer; `off` sets the runtime global to the "
+                           "BOOLEAN false, which resolveFenceMode maps to \"off\". The "
+                           "mechanism attributed in both engines is the one-way upgrade of "
+                           "deferred fences: ~335 fences x two commits per latch, each forcing a "
+                           "style recalc over the whole document.")
     ap.add_argument("--no-scene", action = "store_true",
                     help = "launch the PRISTINE binary and observe it, with no control channel "
                            "and no scene. This leg exists so that 'Unsloth Desktop functions on "
@@ -405,11 +412,17 @@ def main() -> int:
             "unsloth_chat_connections_enabled": "true",
             "unsloth_chat_last_external_checkpoint": ckpt,
         }
+        # Read synchronously by the boot script during parse, before the app module runs. It
+        # cannot travel in the config payload: that arrives by fetch, long after the app has
+        # already resolved the flag.
+        if args.defer_fence != "default":
+            seed_ls["__amdv_defer_fence"] = args.defer_fence
+        out["defer_fence_arm"] = args.defer_fence
         if control is not None:
             control.store.set_config({
             "ready": True,
             "localStorage": seed_ls,
-            "lsStamp": f"{seeded['thread_id']}:{ckpt}",
+            "lsStamp": f"{seeded['thread_id']}:{ckpt}:{args.defer_fence}",
             "threadId": seeded["thread_id"],
             "lastMarker": seeded["last_marker"],
             "settleMs": args.settle_ms,

@@ -14,10 +14,22 @@
 // The pristine binary is built and launched in the same job precisely so that "Desktop
 // functions" is a claim about an unmodified app, and only the ladder numbers come from this one.
 //
-// The scene itself (amdv_scene.js) is included VERBATIM from the web UI ladder, and is loaded
-// before this file. Byte-identical phases, byte-identical busy calibration and byte-identical
-// census are the whole point: a Desktop number is only comparable to the web UI number if the
-// thing being counted is the same thing.
+// The scene itself (chr_scene.js) is included VERBATIM and is loaded before this file.
+// Byte-identical phases, busy calibration and census are the whole point: a Desktop number is
+// only comparable to a web UI number if the thing being counted is the same thing.
+//
+// It is the REPAIRED scene rather than amdv_scene.js, and the difference is confined to the
+// scroll gesture. The original assigns `el.scrollTop` while the thread viewport carries
+// `scroll-smooth`, so each assignment animates and the next is computed from a position that
+// has barely moved; measured in Chromium at r500K it commanded 54,000 px and travelled 6,610,
+// never getting further than 1,107 px from the bottom of a 316,829 px thread. That is a jiggle
+// reported as a traversal, and `scroll_detail` cannot reveal it because it records only the
+// first and last position and both are the bottom either way. The repaired gesture scrolls
+// instantly, dispatches a real WheelEvent so the app's autoscroll sees a user scroll, takes one
+// step per painted frame, and RECORDS COMMANDED AND TRAVELLED PIXELS so the question is
+// answered by the payload instead of assumed. Consequence for comparability, stated rather than
+// buried: the idle and stream phases remain directly comparable to the web UI ladder, and the
+// scroll phase is comparable only with the gesture named.
 
 (function () {
   "use strict";
@@ -30,6 +42,32 @@
   var log = [];
   var sentResult = false;
   var started = false;
+
+  // ── THE FENCE-DEFERRAL FLAG, READ SYNCHRONOUSLY, BEFORE ANY APP CODE RUNS ────────────────
+  //
+  // `fenceMode()` reads `globalThis.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__`
+  // (components/assistant-ui/code-fence-defer.tsx:78) and `resolveFenceMode` maps the BOOLEAN
+  // `false` to "off" while ABSENT takes SHIP_DEFAULT, which is "defer"
+  // (code-fence-mode.ts:26-56). So the ablation arm sets the boolean and the default arm sets
+  // nothing at all; an unrecognised string would degrade to "off" and quietly measure the wrong
+  // thing, which is why the value is written as a real boolean and never as a string.
+  //
+  // It cannot come from the control server: that is a fetch, and by the time it resolves the
+  // app has already booted and read the flag. It comes from localStorage, which is readable
+  // synchronously here in a classic script during parse, i.e. before the deferred module entry.
+  // The harness seeds it and then reloads once, which is the same reload the provider seeding
+  // already requires, so the ablation costs no extra page load.
+  try {
+    var fenceFlag = window.localStorage.getItem("__amdv_defer_fence");
+    if (fenceFlag === "off") {
+      window.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__ = false;
+    } else if (fenceFlag === "on") {
+      window.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__ = true;
+    }
+    window.__amdvFenceArm = fenceFlag || "default";
+  } catch (e) {
+    window.__amdvFenceArm = "unreadable";
+  }
 
   function post(path, obj) {
     try {
@@ -314,6 +352,13 @@
     // constant.
     window.__av.__desktop = {
       nav: nav, app_shell: shell, control: CONTROL, shell_ready_event: shellReady,
+      // The arm actually in force, read back from the global rather than from the config that
+      // asked for it. An arm that failed to apply is the one failure that would make an
+      // ablation table read as "the flag does nothing".
+      fence_arm: window.__amdvFenceArm,
+      fence_global: typeof window.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__,
+      fence_value: window.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__ === undefined
+        ? null : window.__UNSLOTH_DEFER_FENCE_HIGHLIGHT__,
       viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
       href: location.href, ua: navigator.userAgent,
     };

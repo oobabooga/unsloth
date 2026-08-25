@@ -72,7 +72,17 @@ RENDERER_VARS = [
 
 
 LADDER = HERE / "desktop_ladder"
-SCENE = HERE / "studio_ladder" / "amdv_scene.js"
+# The REPAIRED scene, not studio_ladder/amdv_scene.js. Its own header says it is a copy of
+# that file "with ONE block changed: the scroll phase", and the change is not cosmetic: the
+# original assigns `el.scrollTop` while the thread viewport carries `scroll-smooth`, so each
+# assignment ANIMATES and the next is computed from a stalled position. Measured in Chromium at
+# r500K: 54,000 px commanded, 6,610 px travelled, never further than 1,107 px from the bottom of
+# a 316,829 px thread. That window is a jiggle that reads a comfortable frame rate because
+# almost nothing happens in it, and `scroll_detail` cannot show it because it records only the
+# first and last position and both are the bottom either way. The defect is engine-specific --
+# WebKitGTK still collapses on the inert gesture -- which makes it exactly the kind of thing to
+# fix rather than rely on.
+SCENE = HERE / "desktop_ladder" / "chr_scene.js"
 
 # The control server's port has to be a compile-time constant, because the page is served from
 # the binary at `tauri://localhost` under a CSP of `default-src 'self'` with no `unsafe-eval`:

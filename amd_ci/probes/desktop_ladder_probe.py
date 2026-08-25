@@ -77,6 +77,9 @@ def main() -> int:
     ap.add_argument("--hog-ms", type = int, default = 200)
     ap.add_argument("--hog-period-ms", type = int, default = 250)
     ap.add_argument("--control-rung", default = "0K")
+    ap.add_argument("--ablate-rung", default = "500K",
+                    help = "the rung the fence-deferral ablation is run at, in BOTH arms")
+    ap.add_argument("--ablate-reps", type = int, default = 2)
     args = ap.parse_args()
     args.out.parent.mkdir(parents = True, exist_ok = True)
 
@@ -172,6 +175,23 @@ def main() -> int:
             plan.append({"rung": "100K", "rep": "pristine", "hog": 0, "software": False,
                          "no_scene": True, "binary": args.pristine})
 
+        # THE ABLATION, at the top rung, in the arm the ladder does not already cover.
+        #
+        # The mechanism has been attributed in both engines: the one-way upgrade of deferred code
+        # fences, ~335 fences x two commits per latch, each forcing a style recalc over the whole
+        # document. Chromium counters at r500K read RecalcStyleCount 718 vs 37 and
+        # RecalcStyleDuration 7.53 s vs 0.47 s with the flag on versus off, and it replicates on
+        # WebKitGTK 2.50.4. It is EXCESS and not BURST: both arms end with an identical DOM, so
+        # deferred delivery buys nothing and costs the extra traversals.
+        #
+        # The ladder rungs run in the DEFAULT arm, which is `defer` (SHIP_DEFAULT), so only the
+        # `off` arm has to be added. If Desktop shows the same ablation response, the mechanism
+        # is shell-independent and Desktop is the same defect in a different wrapper. If it does
+        # not, that is a Desktop-specific finding and a much more interesting one.
+        for rep in range(1, args.ablate_reps + 1):
+            plan.append({"rung": args.ablate_rung, "rep": f"abl{rep}", "hog": 0,
+                         "software": False, "defer_fence": "off"})
+
         obs["plan"] = plan
         obs["runs"] = []
         port = args.first_port
@@ -198,6 +218,8 @@ def main() -> int:
                 cmd.append("--software")
             if item.get("no_scene"):
                 cmd.append("--no-scene")
+            if item.get("defer_fence"):
+                cmd += ["--defer-fence", item["defer_fence"]]
             t0 = time.time()
             r = sh(cmd, timeout = args.rung_timeout)
             entry = {**item, "port": port, "seconds": round(time.time() - t0, 1),
