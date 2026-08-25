@@ -25,7 +25,7 @@ jobs:
   ladder:
     name: "Studio ladder in WebKitGTK (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 240
+    timeout-minutes: 330
     # Compositing a browser and seeding a 2 MB thread both allocate on the one gfx1151 that the
     # four ephemeral slots share, so this takes the GPU group like any other measuring job. The
     # group holds one runner plus one waiter and a third arrival evicts the waiter.
@@ -103,20 +103,28 @@ jobs:
           cat "$AMD_CI_WORK/out/ablate/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/ablate"
 
-      # PR 9477 piece 2, base vs head, at r500K. One job, one hold on the shared GPU group.
-      # r500K and not r100K on purpose: at r100K the BASE arm does not exhibit the defect on this
-      # host, so a differential there is VOID by construction rather than by measurement.
-      - name: PR 9477 piece 2 differential (r500K)
-        timeout-minutes: 200
+      # PR 9477 PIECE 4, REASONING PAGINATION. Five arms, two of which are one-line isolations,
+      # measured on `action:reasoning_toggle`. Replaces the piece 2 step rather than running
+      # beside it: piece 2 is already answered (1.069x at r500K, run 32807566159), and the GPU
+      # concurrency group holds one runner plus ONE waiter, so a second measuring job here would
+      # evict somebody silently.
+      #
+      # BOTH rungs, and the criteria reports per rung. r100K is where the window is worst in
+      # Chromium (80% busy) but this host is not Chromium: here the reasoning toggle is known to
+      # sit around 25% busy at r100K, which is the VOID condition. Running both is what turns
+      # that from an assertion into a measurement, and the criteria says which rung carried the
+      # verdict instead of averaging a loaded rung with an unloaded one.
+      - name: PR 9477 piece 4 (reasoning pagination) on action:reasoning_toggle
+        timeout-minutes: 210
         run: |
           set +e
           python3 amd_ci/lib/capability_run.py \
-            --probe amd_ci/probes/studio_9477_probe.py \
-            --criteria amd_ci/criteria/studio_9477_piece2.py \
-            --out-dir "$AMD_CI_WORK/out/p9477" \
-            -- --rung 500K --reps 2
-          cat "$AMD_CI_WORK/out/p9477/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/p9477"
+            --probe amd_ci/probes/studio_p4_probe.py \
+            --criteria amd_ci/criteria/studio_p4_pagination.py \
+            --out-dir "$AMD_CI_WORK/out/p4" \
+            -- --rungs 100K,500K --reps 2 --hog-ms 200
+          cat "$AMD_CI_WORK/out/p4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/p4"
 
       - name: Stop anything left holding the GPU
         if: always()
