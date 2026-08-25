@@ -56,6 +56,24 @@ jobs:
           echo "selftest rc=$rc"
           [ "$rc" -eq 0 ] || exit "$rc"
 
+      # The eleven commits exist ONLY on the pull request, on unslothai/unsloth, and never on this
+      # fork or on any branch. `actions/checkout` clones this branch at depth 1, so without this
+      # the self-test below cannot see a single arm -- which is exactly what it refused to pass
+      # over on the first run of this workflow. Fetched from the upstream repo unauthenticated,
+      # with real depth, and the tip is resolved here so a silent partial fetch fails HERE rather
+      # than as eleven mysteriously missing arms later.
+      - name: Fetch PR 9477's commits
+        run: |
+          set -euo pipefail
+          git -C "$GITHUB_WORKSPACE" fetch --depth 400 \
+            https://github.com/unslothai/unsloth refs/pull/9477/head:pr9477
+          for c in 33d65ce99b40de93361366447a3e34949480008a \
+                   e48dab1386ad16d2f56a086a798e78caf376b66c; do
+            git -C "$GITHUB_WORKSPACE" rev-parse --verify "$c^{commit}" >/dev/null \
+              || { echo "::error::$c is not present after fetching refs/pull/9477/head"; exit 1; }
+          done
+          echo "PR 9477 head: $(git -C "$GITHUB_WORKSPACE" rev-parse pr9477)"
+
       # SEPARATE AND EARLY, because it is the gate that protects the expensive job from the two
       # mistakes this design is most likely to make. It resolves all eleven commits and, for each,
       # forces the flags and reads the EFFECTIVE pagination state back out of the real source --
