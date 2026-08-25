@@ -84,7 +84,7 @@ def run(arm: str, rung: str, rep: str, *, n: int, elapsed: int, busy, worst: flo
 def base_obs(runs: list[dict], rungs: list[str]) -> dict:
     states = {}
     for arm in C.ARMS:
-        if arm == C.REFERENCE:
+        if arm in (C.REFERENCE, C.SHIP):
             mask = None
         elif arm == C.CLOSURE:
             mask = [False, False, False, False]

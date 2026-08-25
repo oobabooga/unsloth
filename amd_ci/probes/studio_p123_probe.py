@@ -158,6 +158,12 @@ BASELINE_ARM = "A00"
 #: the two single-mechanism null checks, each one piece away from `A11`
 NULL_P1 = "N1"
 NULL_P3B = "N3b"
+#: THE SHIP CANDIDATE, and the only arm that is not built from `C_tip.patch`. It is MAIN plus a
+#: 42-line change that does one thing: render fenced code inside reasoning panes plain, through
+#: the SAME `DeferredFenceShell` an unreached fence already shows, and skip that fence's deferral
+#: bookkeeping since it has nothing to wait for. If `main -> S` reproduces `main -> A11`, the
+#: whole of 9477's benefit on this window is available from 42 lines and none of the rest.
+SHIP = "S"
 
 
 def arm_of(mask) -> str:
@@ -180,6 +186,7 @@ def _arms() -> "dict[str, tuple[str, tuple[str, ...]]]":
     # that mechanism rather than about the arm
     out[NULL_P1] = (BASE_REF, ("C_tip.patch", "p1_off.patch"))
     out[NULL_P3B] = (BASE_REF, ("C_tip.patch", "p3b_off.patch"))
+    out[SHIP] = (BASE_REF, ("ship.patch",))
     return out
 
 
@@ -195,7 +202,7 @@ ARMS = _arms()
 #:
 #: `Z`, `A10`, `N1` and `N3b` are the closure control, the p2-in-context edge and the two
 #: predicted nulls. All four are worth having and none of them changes what we would ship.
-ARM_ORDER = (REFERENCE, BASELINE_ARM, DECOUPLE, arm_of((0, 1)), arm_of((1, 1)),
+ARM_ORDER = (REFERENCE, SHIP, arm_of((1, 1)), BASELINE_ARM, arm_of((0, 1)), DECOUPLE,
              arm_of((1, 0)), CLOSURE, NULL_P1, NULL_P3B)
 
 #: PREDICTIONS, RECORDED BEFORE THE RUN so that a null reads as CONFIRMED INERT rather than as a
@@ -207,6 +214,10 @@ PREDICTED_NULLS = {
               "finished parts, so that loop never runs. A NON-null here does not mean piece 1 "
               "helps; it means the harness is streaming when it believes it is not, and it "
               "falsifies the harness rather than the piece."),
+    SHIP: ("S is MAIN plus 42 lines, so it carries no neutralisation sentinel and its mask reads "
+           "like main's. What it must do is reproduce `main -> A11` while touching nothing but "
+           "reasoning code rendering: if it does not, the benefit depends on something else in "
+           "9477 and this candidate is not the fix."),
     NULL_P3B: ("p3b must read the same as A11. The largest fenced code block anywhere in this "
                "thread is 2,781 characters, against OVERSIZED_OPEN_CODE_CHARS = 4,096 and "
                "MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS = 16,384, so both predicates already sit at "

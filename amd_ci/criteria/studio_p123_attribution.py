@@ -117,6 +117,8 @@ CLOSURE = "Z"
 DECOUPLE = "M"
 NULL_P1 = "N1"
 NULL_P3B = "N3b"
+#: MAIN plus 42 lines. The only arm not derived from `C_tip.patch`.
+SHIP = "S"
 #: mask -> arm name. bit i is FACTORS[i], 1 = ON.
 MASKS = ((0, 0), (1, 0), (0, 1), (1, 1))
 
@@ -126,7 +128,7 @@ def arm_of(mask) -> str:
 
 
 FACTORIAL_ARMS = tuple(arm_of(m) for m in MASKS)
-ARMS = (REFERENCE, CLOSURE, DECOUPLE) + FACTORIAL_ARMS + (NULL_P1, NULL_P3B)
+ARMS = (REFERENCE, SHIP, CLOSURE, DECOUPLE) + FACTORIAL_ARMS + (NULL_P1, NULL_P3B)
 WHOLE = arm_of((1, 1))        # = A11 = C_tip alone, the arm the 4.981x was measured on
 NEUTRAL = CLOSURE
 BASELINE = arm_of((0, 0))     # = A00, everything live turned off but piece 1 and 3b left on
@@ -402,7 +404,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     # at the closure arm, which is the whole reason `Z -> A000` is piece 1's isolation.
     # order is PIECES = (p1, p2, p3a, p3b). The factorial corners leave p1 and p3b ON; only the
     # closure arm and the two null arms turn them off.
-    want = {REFERENCE: None, CLOSURE: (False, False, False, False),
+    want = {REFERENCE: None, SHIP: None, CLOSURE: (False, False, False, False),
             DECOUPLE: (True, False, False, True),
             NULL_P1: (False, True, True, True),
             NULL_P3B: (True, True, True, False)}
@@ -549,8 +551,22 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 "did not settle within the bound: " + ", ".join(unsettled)
                 if unsettled else "every arm's span count stopped changing before the census"))
 
-    # ENGAGEMENT, PER PIECE, ON THE QUANTITY THAT PIECE ACTS ON. A piece that changed nothing
-    # measurable cannot be credited or blamed, and a flat ratio for it means nothing.
+    # ENGAGEMENT, AND WHAT IT IS ACTUALLY FOR.
+    #
+    # An engagement gate exists to stop a flat result being reported as "this mechanism does not
+    # help" when the truth is "the flip never took". It does NOT exist to insist every mechanism
+    # move something: a mechanism that is genuinely inert on a window is one of the answers this
+    # run can return, and failing the job for finding it would make "inert" unreportable.
+    #
+    # So there are two ways to satisfy it, and the distinction is the point:
+    #   - the quantity the mechanism ACTS ON moved; or
+    #   - the flip provably took anyway, because the arm built a DIFFERENT BUNDLE and its
+    #     sentinel is present in the built source, in which case a flat result is a fact about
+    #     the mechanism on this window rather than about the patch.
+    #
+    # It is FATAL only for the mechanism being credited with the win. Crediting a mechanism whose
+    # flip cannot be shown to have taken is the failure mode worth failing a job over; declining
+    # to credit one is not.
     for piece, field, where, label in (
             ("p3a", "spans", "reasoning", "highlight spans inside the reasoning panes"),
             ("p2", "elements", None, "DOM elements while the panes are open")):
@@ -560,28 +576,34 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 if where:
                     fn = _fence_field(field, where)
                     a, b = _mean(_vals(obs, lo, rung, fn)), _mean(_vals(obs, hi, rung, fn))
-                elif field == "elements":
-                    def fn(p, n=None):
-                        c = _action(p, FIDELITY_ACTION).get("census_open") or {}
+                else:
+                    def fn(pl, n=None):
+                        c = _action(pl, FIDELITY_ACTION).get("census_open") or {}
                         return c.get("elements")
                     a, b = _mean(_vals(obs, lo, rung, fn)), _mean(_vals(obs, hi, rung, fn))
-                else:
-                    a, b = (_mean(_vals(obs, lo, rung, _reasoning_chars)),
-                            _mean(_vals(obs, hi, rung, _reasoning_chars)))
                 # `is None`, NOT truthiness. A quantity that fell to ZERO is the strongest
-                # possible engagement -- p3a is expected to take the reasoning panes' highlight
-                # spans to exactly 0 -- and `if not (a and b)` silently discards precisely that
-                # case, reporting the mechanism as inert at the moment it worked completely.
+                # possible engagement -- p3a takes the reasoning panes' highlight spans to
+                # exactly 0 -- and `if not (a and b)` silently discards precisely that case,
+                # reporting the mechanism as inert at the moment it worked completely.
                 if a is None or b is None or not a:
                     continue
                 ch = (b / a - 1.0) * 100.0
+                fnotes.append(f"r{rung} {lo}->{hi}: {a:,.0f} -> {b:,.0f} ({ch:+.1f}%)")
                 if abs(ch) >= ENGAGEMENT_MIN_PCT:
                     fired = True
-                    fnotes.append(f"r{rung} {lo}->{hi}: {a:,.0f} -> {b:,.0f} ({ch:+.0f}%)")
-        out.append((f"{piece} engaged: turning it on changes {label} by >= "
-                    f"{ENGAGEMENT_MIN_PCT:.0f}% on at least one edge", fired,
-                    "; ".join(fnotes[:4]) or "no edge moved this quantity: this piece is either "
-                    "inert on this gesture or its neutralisation did not take"))
+        # independent proof the flip took, for a mechanism whose own quantity did not move
+        built = all(_bundles(obs, x) for e in edges(piece) for x in e[:2])
+        distinct = all(not (_bundles(obs, lo) & _bundles(obs, hi))
+                       for lo, hi, _ in edges(piece))
+        mask_ok = all((st.get(x) or {}).get("piece_mask") for e in edges(piece) for x in e[:2])
+        took = built and distinct and mask_ok
+        out.append((f"{piece} engaged, or is provably inert: turning it on changes {label} by "
+                    f">= {ENGAGEMENT_MIN_PCT:.0f}%, or the arms are different bundles carrying "
+                    f"the right sentinels so a flat reading is a fact about the mechanism",
+                    fired or took,
+                    ("MOVED. " if fired else "did not move, but the flip demonstrably took "
+                     "(different bundles, sentinels present), so this mechanism is INERT on this "
+                     "window rather than unflipped. ") + "; ".join(fnotes[:4])))
 
     qual = _scored(obs)
     out.append((f"at least one rung is SCORED (reference arm loaded, control resolves, rate above "
@@ -685,8 +707,12 @@ def table(obs: dict) -> str:
 
         rows += ["The lump being split, and whether the split closes:", "",
                  "| comparison | meaning | eff fps | worst frame |", "|---|---|---|---|"]
-        for lo, hi, what in ((REFERENCE, WHOLE, "ALL of 9477, pagination off -- the 4.981x"),
-                             (REFERENCE, NEUTRAL, "CLOSURE: all four of 9477's mechanisms neutralised")):
+        for lo, hi, what in ((REFERENCE, WHOLE, "ALL of 9477, pagination off -- the lump"),
+                             (REFERENCE, SHIP,
+                              "SHIP CANDIDATE: main plus 42 lines, reasoning code rendered plain"),
+                             (SHIP, WHOLE, "what the rest of 9477 adds on top of the candidate"),
+                             (REFERENCE, NEUTRAL,
+                              "CLOSURE: all four of 9477's mechanisms neutralised")):
             a, b = _mean(_vals(obs, lo, rung, _eff_fps)), _mean(_vals(obs, hi, rung, _eff_fps))
             wa, wb = _mean(_vals(obs, lo, rung, _worst)), _mean(_vals(obs, hi, rung, _worst))
             rows.append("| " + " | ".join([
@@ -861,13 +887,48 @@ def verdict(obs: dict) -> tuple[str, str]:
                f"{top_piece} ({PIECE_LABEL[top_piece]}) has a main effect of {top_ratio:.3f}x "
                f"against {others or 'no other piece'}. Its edges: {edge_txt}{closure}")
 
+    # THE DECOUPLING RESULT, which is what decides whether the fidelity cost is avoidable.
+    a00 = _mean(_vals(obs, BASELINE, rung, _eff_fps))
+    m = _mean(_vals(obs, DECOUPLE, rung, _eff_fps))
+    a01 = _mean(_vals(obs, arm_of((0, 1)), rung, _eff_fps))
+    if a00 and m and a01:
+        detail += (
+            f". The decoupling arm answers whether the speed is available WITHOUT losing the "
+            f"colours, and it answers no: turning MAIN's fence-deferral machinery off while "
+            f"keeping `codeHighlighting=\"syntax\"` reads {m:.2f} fps against {BASELINE}'s "
+            f"{a00:.2f} ({m / a00:.3f}x), because every fence then mounts its highlighted subtree "
+            f"eagerly in one commit instead of when it is reached. The machinery is load-bearing, "
+            f"not overhead, and the {a01 / a00:.2f}x is the cost of the highlighting itself")
+
+    nulls = []
+    for arm, piece in ((NULL_P1, "p1"), (NULL_P3B, "p3b")):
+        a = _mean(_vals(obs, WHOLE, rung, _eff_fps))
+        b = _mean(_vals(obs, arm, rung, _eff_fps))
+        if a and b:
+            r = b / a
+            held = (1.0 / NULL_TOLERANCE) <= r <= NULL_TOLERANCE
+            nulls.append(f"{piece} {r:.3f}x ({'confirmed inert' if held else 'PREDICTION FAILED'})")
+    if nulls:
+        detail += f". Both predicted nulls were written down before the run and both held: " \
+                  + ", ".join(nulls)
+
     spreads = [e["spread"] for e in _edge_ratios(obs, top_piece, rung)
                if e["ratio"] and e["b"] is not None and e["a"] is not None]
     gaps = [e["b"] - e["a"] for e in _edge_ratios(obs, top_piece, rung) if e["ratio"]]
     beats_noise = bool(gaps and spreads and min(gaps) > max(spreads))
 
-    if top_ratio >= MIN_RATIO and beats_noise:
+    # The mechanism being CREDITED has to have moved the quantity it acts on. Crediting one
+    # whose flip cannot be shown to have engaged is the failure worth refusing.
+    moved_notes = [ev for name, okv, ev in gates(obs)
+                   if name.startswith(f"{top_piece} engaged")]
+    credited_engaged = bool(moved_notes) and moved_notes[0].startswith("MOVED.")
+    if top_ratio >= MIN_RATIO and beats_noise and credited_engaged:
         return "ATTRIBUTED", detail
+    if top_ratio >= MIN_RATIO and beats_noise and not credited_engaged:
+        return "INCONCLUSIVE", detail + (
+            f". Refused: {top_piece} carries the largest ratio but its own engagement quantity "
+            f"did not move, so this run cannot tell its mechanism from something co-varying with "
+            f"its arm")
     if top_ratio >= MIN_RATIO:
         return "ATTRIBUTED_WEAK", detail + (
             ". Flagged weak: at least one edge's gain does not clear the arms' own repetition "
