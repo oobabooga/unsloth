@@ -1,0 +1,70 @@
+name: PR 5695 cross-platform validation
+
+on:
+  push:
+    branches: [pr5695-cross-platform-ci]
+
+permissions: {}
+
+jobs:
+  audit-test-install:
+    name: ${{ matrix.os }} audit, tests, and installs
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - windows-latest
+          - macos-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Fetch the exact PR head
+        env:
+          PR_HEAD: 0e98598fb38cb51717b2b05749aa1ec82166d1f1
+        run: |
+          set -euo pipefail
+          git init pr
+          cd pr
+          git remote add upstream https://github.com/unslothai/unsloth.git
+          git fetch --depth=1 upstream "$PR_HEAD"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+
+      - name: Setup Node.js exactly as the affected workflows do
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Run the native release-path audit before any npm install
+        working-directory: pr
+        run: |
+          python3 --version
+          python3 scripts/lockfile_supply_chain_audit.py
+
+      - name: Pin Python for the regression suite
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run focused security regression tests
+        working-directory: pr
+        run: |
+          python -m pip install --disable-pip-version-check pytest PyYAML
+          python -m pytest tests/security/test_lockfile_supply_chain_audit.py -q
+
+      - name: Install the pinned Tauri CLI after the audit
+        working-directory: pr
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+      - name: Install and build the frontend after the audit
+        working-directory: pr/studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+          test -f dist/index.html
