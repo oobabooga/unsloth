@@ -129,7 +129,10 @@ the earlier ablation failed on precisely that: baseline 17.5 fps against baselin
 THE DRIFT GATE HAS ALREADY FIRED ONCE HERE, on run 32865232787, which read baseline 261.4 ms
 blocked per scroll event against a 162.6 / 193.9 / 197.5 / 184.5 cluster while the DOM grew by
 11,205 elements. The cause was a park position recomputed per window; the fix is a FIXED park pixel
-plus a DISCARDED warm-up run to quiescence, both gated below. The threshold is unchanged.
+plus a DISCARDED warm-up run to quiescence, both gated below. The threshold
+is unchanged. What HAS changed is the statistic: it fired a second time, on run 32902943628, against
+baselines that had not drifted, because it was reading the raw mean on a host that blocks its main
+thread for about 8.6 s once every 30 s. See the comment on the gate itself.
 
 THE PRODUCT ARM IS THE ONE ARM THAT APPLIES NOTHING OF ITS OWN, AND THAT IS WHY IT NEEDS A
 PRECONDITION. `product_math_block_containment` measures the branch's own implementation of the
@@ -429,6 +432,12 @@ def _bmpf(a: dict):
 def _p50(a: dict):
     """The window's median rAF gap. One stalled frame cannot move a median."""
     return (a.get("raf") or {}).get("p50_ms")
+
+
+def _robust_bmpf(a: dict):
+    """Blocked ms per frame with the window's stalled frames dropped. Same units as `_bmpf`, so a
+    real change in per-frame cost still shows, but a host stall the page did not cause does not."""
+    return (a.get("robust") or {}).get("blocked_ms_per_frame")
 
 
 def _mean(xs):
@@ -882,24 +891,49 @@ def _gate_records(obs: dict) -> list[dict]:
     # DRIFT, per rung, because baseline_repeat at 100K says nothing about 500K. Reported first in
     # the summary because a drift-corrected number is the only honest one: if this fails the
     # correct output is "it drifted", not a ratio against a contaminated baseline.
+    # JUDGED ON p50, REPORTED ON BOTH. This gate previously read the mean, and on run 32902943628
+    # it failed at 500K on baselines that had not drifted at all: the eight baseline means came out
+    # [285.4, 253, 246.6, 174.5, 252.9, 184.3, 286.7, 172.2] while their p50 rAF gaps sat at
+    # [249, 248, 247, 248, 250, 249, 249, 248], stable to within 1 ms. This host blocks its main
+    # thread for about 8.6 s once every 30 s, and a ~29 s window holds about 94 frames, so catching
+    # one such stall adds 8600/94 = 91 ms to a window's MEAN and nothing whatever to its median.
+    # That is the entire spread. Judging drift on a statistic the venue can move by 40% on its own
+    # makes this gate a coin toss, so it judges the median, which a single stalled frame cannot
+    # move, and prints the mean beside it so a real drift is still legible in the evidence.
     def _drift(rung, rs):
         txt, okd = [], True
         for rep, seq in _windows(obs, rung):
             first = next((x for x in seq if x.get("name") == FIRST_BASELINE), None)
             rep_w = next((x for x in seq if x.get("name") == BASELINE_REPEAT), None)
-            if not first or not rep_w or not _bmpf(first) or _bmpf(rep_w) is None:
+            if not first or not rep_w or not _p50(first) or _p50(rep_w) is None:
                 okd = False
                 txt.append(f"rep {rep}: missing a baseline window")
                 continue
-            rel = _bmpf(rep_w) / _bmpf(first) - 1
-            allb = [_bmpf(x) for x in seq if x.get("arm") == BASELINE_ARM and _bmpf(x) is not None]
-            txt.append(f"rep {rep}: baseline {_bmpf(first)} -> baseline_repeat {_bmpf(rep_w)} ms "
-                       f"blocked/frame ({rel:+.0%}); all baselines {[round(x, 1) for x in allb]}")
-            if abs(rel) > DRIFT_MAX:
+            rel = _p50(rep_w) / _p50(first) - 1
+            basel = [x for x in seq if x.get("arm") == BASELINE_ARM]
+            allp = [_p50(x) for x in basel if _p50(x) is not None]
+            allb = [_bmpf(x) for x in basel if _bmpf(x) is not None]
+            # Second leg, in the units the arms are scored in. A median is immune to a stall but it
+            # is also coarse: rAF gaps land on whole milliseconds, so at a cheap rung a real change
+            # can hide inside one bucket. The stall-stripped mean is not coarse and is not movable
+            # by a stall either, so both must hold for the run to be called undrifted.
+            rb_first, rb_rep = _robust_bmpf(first), _robust_bmpf(rep_w)
+            rel_rb = (rb_rep / rb_first - 1) if (rb_first and rb_rep is not None) else None
+            allrb = [_robust_bmpf(x) for x in basel if _robust_bmpf(x) is not None]
+            txt.append(f"rep {rep}: baseline p50 {_p50(first)} -> baseline_repeat {_p50(rep_w)} ms "
+                       f"({rel:+.0%}), stall-stripped mean {rb_first} -> {rb_rep} ms/frame "
+                       f"({rel_rb:+.0%})" if rel_rb is not None else
+                       f"rep {rep}: baseline p50 {_p50(first)} -> baseline_repeat {_p50(rep_w)} ms "
+                       f"({rel:+.0%}), stall-stripped mean unavailable")
+            txt[-1] += (f"; all baseline p50 {[round(x, 1) for x in allp]}; "
+                        f"stall-stripped {[round(x, 1) for x in allrb]}; "
+                        f"raw means, not judged {[round(x, 1) for x in allb]}")
+            if abs(rel) > DRIFT_MAX or (rel_rb is not None and abs(rel_rb) > DRIFT_MAX):
                 okd = False
         return (okd and bool(txt)), ("; ".join(txt) or "no baseline windows")
 
-    g(f"DRIFT: baseline_repeat within {DRIFT_MAX:.0%} of the first baseline of the same rung",
+    g(f"DRIFT: baseline_repeat within {DRIFT_MAX:.0%} of the first baseline of the same rung, on "
+      f"both the median and the stall-stripped mean",
       *_per_rung(obs, _drift, scored_only = True))
 
     # THE DEFERRED-FENCE RESERVOIR. `code-fence-defer.tsx` ships `SHIP_DEFAULT = "defer"` and

@@ -577,12 +577,44 @@ o = obs(repeat = 287.6 * 1.4)
 ok, ev = gate(o, "DRIFT")
 check("the drift gate fails", ok is False, ev)
 check("and it prints both baselines and every baseline in the run",
-      "baseline_repeat" in ev and "all baselines" in ev, ev)
+      "baseline_repeat" in ev and "all baseline p50" in ev, ev)
+check("and it prints the raw means too, marked as not judged",
+      "raw means, not judged" in ev, ev)
 v, why = C.verdict(o)
 check("the verdict is INCONCLUSIVE and names the failing gate",
       v == "INCONCLUSIVE" and "DRIFT" in why, f"{v}: {why}")
 check("and it says that is not the same as the fix not working",
       "not the same as the fix not working" in why, why)
+
+print("case 5a: the MEANS swing 40% but only because one baseline caught a host stall")
+# Run 32902943628, at 500K. The eight baseline means came out
+# [285.4, 253, 246.6, 174.5, 252.9, 184.3, 286.7, 172.2] while their p50 rAF gaps sat within one
+# millisecond of each other at [249, 248, 247, 248, 250, 249, 249, 248]. The page had not drifted:
+# this venue blocks its main thread for about 8.6 s once every 30 s, and one such frame spread
+# over the ~94 frames of a window is worth ~91 ms/frame on the MEAN and nothing at all on the
+# median. Judging drift on the mean made this gate a coin toss on the venue's own stall schedule.
+o = obs(per_rung = {"500K": dict(
+    base = 285.4, repeat = 172.2,
+    stalled = {"baseline": stall(285.4, 196.3), "baseline_repeat": stall(172.2, 167.7, stalls = 0,
+                                                                        gap = 331)},
+    p50s = {"baseline": 249, "baseline_repeat": 248})})
+ok, ev = gate(o, "DRIFT")
+check("the drift gate PASSES, because the medians agree to within a millisecond", ok is True, ev)
+check("and it shows the stall-stripped means agreeing too", "stall-stripped mean" in ev, ev)
+check("and the raw 40% swing is still printed, so a reader can see what was discarded",
+      "285.4" in ev and "172.2" in ev, ev)
+
+print("case 5a2: a drift the median cannot see is still caught by the stall-stripped mean")
+# The median is coarse: rAF gaps land on whole milliseconds, so at a cheap rung a real change can
+# hide inside one bucket. That is why the gate judges two statistics rather than one.
+o = obs(per_rung = {"500K": dict(
+    base = 285.4, repeat = 400.0,
+    stalled = {"baseline": stall(285.4, 280.0, stalls = 0, gap = 331),
+               "baseline_repeat": stall(400.0, 395.0, stalls = 0, gap = 331)},
+    p50s = {"baseline": 249, "baseline_repeat": 249})})
+ok, ev = gate(o, "DRIFT")
+check("the drift gate fails on the stall-stripped mean alone", ok is False, ev)
+check("and the median it could not use is printed at +0%", "+0%" in ev, ev)
 
 print("case 5b: only ONE rung drifted, and the gate has to name which")
 o = obs(rungs = ("0K", "100K", "500K"), per_rung = {"100K": {"repeat": 287.6 * 1.4}})
