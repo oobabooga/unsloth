@@ -89,6 +89,11 @@ def main():
     ap.add_argument("--hog-ms", type=int, default=0)
     ap.add_argument("--hog-period-ms", type=int, default=250)
     ap.add_argument("--frame-clock", default="passive", choices=["updating", "passive"])
+    # A CONTENT hash of the pinned instrument, supplied by the probe that cloned it once. The
+    # resolved `__file__` already proves the import landed outside the arm's own tree; this
+    # proves the tree behind that path was the same one for the first arm and the ninth. A path
+    # assertion cannot see a directory that changed under it mid-run.
+    ap.add_argument("--instrument-hash", default="")
     ap.add_argument("--skip-send", action="store_true",
                     help="stop after the action phases. The jammed control uses this: it does "
                          "not need a reply, and starving the model chip restore under the jam "
@@ -310,6 +315,7 @@ def main():
             "corpus_hash": corpus.corpus_hash,
             "instrument_pacer_file": instrument_file,
             "instrument_sb_root": str(sb_root),
+            "instrument_hash": args.instrument_hash or None,
             "plan": None if plan is None else {
                 "target_tokens": plan.target_tokens, "target_chars": plan.target_chars,
                 "seeded_chars": plan.seeded_chars, "seeded_units": len(plan.seeded_units),

@@ -1,0 +1,232 @@
+name: "AMD CI: is there a peak in the middle of PR 9477?"
+
+# A CAPABILITY question about a CURVE, not a differential, so lib/differential.py and its base/head
+# pair are not used. The independent variable is which commit of the branch is compiled into the
+# bundle, and the control for "the commit caused this" is a pair of commits that CANNOT have caused
+# anything.
+#
+# Why it exists: run 32819830754 measured the two ENDPOINTS of `33d65ce99..e48dab138` on this host
+# and the tip won on every metric at both rungs, so there is no NET regression across the span. A
+# two-point measurement cannot see a PEAK IN THE MIDDLE -- a commit that introduced a regression
+# which a later commit then partially repaired would leave BOTH endpoints below some intermediate
+# point, and the endpoint comparison would report "no regression" while concealing exactly that.
+# This sweeps every commit on the branch's own first-parent path and asks whether any of them beats
+# the tip.
+#
+# NOT `git bisect`. Bisection finds one transition on a boolean predicate. This is a continuous
+# metric that may be non-monotonic and may have no transition at all, so every point is measured.
+#
+# TWO JOBS, ON PURPOSE. Building eleven frontends needs no GPU, and holding the exclusive gfx1151
+# group for ~12 minutes of `npm` costs the other three ephemeral slots for nothing. It also removes
+# a confound: installing ONE backend rather than eleven means an install flake can no longer land
+# on one commit and be read as that commit's effect.
+
+on:
+  push:
+    branches: [amd-ci-9477-sweep]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "Build eleven commits' frontends (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 150
+    # NOT in the gfx1151 group, and explicitly blind to the device, so this cannot allocate on the
+    # one GPU the four ephemeral slots share while somebody else's measurement is in flight.
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-sweep-build"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # SEPARATE AND EARLY, because it is the gate that protects the expensive job from the two
+      # mistakes this design is most likely to make. It resolves all eleven commits and, for each,
+      # forces the flags and reads the EFFECTIVE pagination state back out of the real source --
+      # eleven trees carrying two flag declarations at three different line numbers in two
+      # different shapes. Then it exercises every branch of the verdict on synthetic curves,
+      # including the one-arm-disagreeing-with-itself case that would otherwise draw a false peak.
+      - name: Criteria and flag self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest_sweep.py --repo "$GITHUB_WORKSPACE" 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          echo "sweep selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The integrity checks live HERE, with the build, not with the measurement: asked-versus-
+      # landed per checkout, the effective pagination literal read back out of the built source,
+      # the grid-collapse column, a source tree hash so the two free nulls are provable at build
+      # time, and a distinct bundle hash per point. A point that fails fails its OWN gate and the
+      # loop continues; aborting on the first bad arm is what threw away three good arms earlier
+      # in this campaign.
+      - name: Build the eleven points
+        timeout-minutes: 130
+        run: |
+          set +e
+          python3 amd_ci/probes/studio_sweep_probe.py \
+            --mode build \
+            --dist-out "$AMD_CI_WORK/dists" \
+            --out "$AMD_CI_WORK/out/build_obs.json"
+          echo "build probe rc=$?"
+          ls -la "$AMD_CI_WORK/dists" 2>/dev/null | head -20
+          python3 - <<'PY'
+          import json, os, pathlib
+          w = pathlib.Path(os.environ["AMD_CI_WORK"])
+          m = w / "dists" / "build_manifest.json"
+          if not m.is_file():
+              print("::error::no build manifest was produced")
+              raise SystemExit(1)
+          d = json.loads(m.read_text())
+          bundles = {}
+          for n in d["arm_order"]:
+              s = d["states"].get(n, {})
+              print(f"{n:4s} landed={str(s.get('commit'))[:9]} ok={s.get('prepared_ok')} "
+                    f"pagination={s.get('pagination_effective')} grid={s.get('grid_collapse')} "
+                    f"bundle={s.get('exported_bundle_hash')}")
+              if s.get("exported_bundle_hash"):
+                  bundles.setdefault(s["exported_bundle_hash"], []).append(n)
+          # Two points sharing a bundle cannot differ in the browser. That is EXPECTED for the two
+          # free nulls and a finding for anything else, so it is printed either way.
+          for h, v in bundles.items():
+              if len(v) > 1:
+                  print(f"::notice::points {v} share bundle {h} and cannot differ in the browser")
+          missing = [n for n in d["arm_order"] if not d["states"].get(n, {}).get("exported_bundle_hash")]
+          if missing:
+              print(f"::warning::these points did not build and will not be measured: {missing}")
+          print(f"built {len(bundles)} distinct bundles across {len(d['arm_order'])} points")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweep-dists
+          path: ${{ env.AMD_CI_WORK }}/dists
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep-build-observations
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  measure:
+    name: "Measure eleven points in WebKitGTK (exclusive)"
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 300
+    # Compositing a browser and seeding a 400 KB thread both allocate on the one gfx1151 the four
+    # ephemeral slots share, so this takes the GPU group. The group holds one runner plus ONE
+    # waiter and a third arrival cancels the waiter silently.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-sweep"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. A skip would misreport missing hardware as nothing to see.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sweep-dists
+          path: ${{ env.AMD_CI_WORK }}/dists
+
+      - name: Engine inventory
+        run: |
+          set +e
+          for p in /usr/bin/python3 /usr/bin/python3.12; do
+            [ -x "$p" ] || continue
+            echo "== $p"
+            "$p" -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('  WebKit', WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version())" 2>&1 | tail -2
+          done
+          echo "== points that arrived"
+          ls "$AMD_CI_WORK/dists" 2>&1 | head -20
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      # r100K ONLY, and the time that buys goes into REPETITIONS.
+      #
+      # r500K is roughly three times the measurement time per run and it is the rung whose ratios
+      # were already agreed to be direction-only: the reference arm and the jammed control both sit
+      # at ~0.1 fps there, so the channel cannot resolve anything. Five repetitions at r100K, where
+      # the control resolves cleanly, is what an eleven-point curve actually needs: the endpoint
+      # run had one arm swing 44.9 to 26.4 fps between two reps, and at two reps a mean alone would
+      # have drawn a peak out of that single arm disagreeing with itself.
+      - name: The sweep, on action:reasoning_toggle_all at r100K
+        timeout-minutes: 240
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_sweep_probe.py \
+            --criteria amd_ci/criteria/studio_sweep_peak.py \
+            --out-dir "$AMD_CI_WORK/out/sweep" \
+            -- --mode measure --dist-in "$AMD_CI_WORK/dists" \
+               --rungs 100K --reps 100K:5 --hog-ms 200
+          cat "$AMD_CI_WORK/out/sweep/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/sweep"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By PORT, then by PID. A pattern-matching process killer would match this very step's
+          # own shell, because the pattern ends up on its command line; that has cost a real run
+          # before. A Studio or an Xvfb that outlives the job holds VRAM on a machine three other
+          # slots share, so this cannot simply be skipped either.
+          for p in $(seq 5451 5560); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The logs, separately from the verdict, because the ask is to SEE that Studio functions
+      # rather than be told it does: Studio's own --verbose log per run, the browser console and
+      # page-error stream, and every failed resource load.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-sweep-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/sweep/out/logs
+            ${{ env.AMD_CI_WORK }}/sweep/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/sweep/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-sweep
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
