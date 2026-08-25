@@ -1,0 +1,30 @@
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts b/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts
+index b322b3a..743912c 100644
+--- a/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts
++++ b/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts
+@@ -359,11 +359,23 @@ export const OVERSIZED_OPEN_CODE_CHARS = 4 * 1024;
+ // that the code element and copy/download actions receive. The limit is inclusive.
+ export const MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS = 16 * 1024;
+ 
++// AMDCI_PIECE3B_NEUTRALISED
++// Piece 3b is the pair of SIZE THRESHOLDS in this module, and this turns both off while leaving
++// every other export here, and every call site, exactly as 9477 wrote them.
++//
++// Neither threshold has ever existed on main: `git log -S` over the whole history finds no
++// `MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS`, no `OVERSIZED_OPEN_CODE_CHARS` and no
++// `isOversizedStreamingCode`. So this does not restore a cap that main had; it removes one that
++// 9477 adds.
++//
++// `codeHighlighting === "plain"` is piece 3a and is deliberately still able to force a plain
++// body through the other arm of the `renderPlainBody` test in markdown-text.tsx, so the two
++// sub-pieces stay separable and each arm differs from its partner by one of them alone.
+ export const shouldAutoHighlightStreamingCode = (source: string): boolean =>
+-  source.length <= MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS;
++  source.length >= 0;
+ 
+ // Keep the wrapper mounted when the fence closes so the exact plain source can
+ // paint before a permitted final highlighted subtree mounts. Extreme sources use
+ // the same wrapper but remain plain after completion.
+ export const isOversizedStreamingCode = (sourceCharacters: number): boolean =>
+-  sourceCharacters >= OVERSIZED_OPEN_CODE_CHARS;
++  sourceCharacters < 0;

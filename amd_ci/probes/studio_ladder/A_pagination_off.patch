@@ -1,0 +1,12 @@
+diff --git a/studio/frontend/src/components/assistant-ui/reasoning.tsx b/studio/frontend/src/components/assistant-ui/reasoning.tsx
+--- a/studio/frontend/src/components/assistant-ui/reasoning.tsx
++++ b/studio/frontend/src/components/assistant-ui/reasoning.tsx
+@@ -333,7 +333,7 @@ function ReasoningText({
+ }
+ 
+ const ReasoningImpl: ReasoningMessagePartComponent = () => (
+-  <MarkdownText codeHighlighting="plain" paginateReasoning={true} />
++  <MarkdownText codeHighlighting="plain" paginateReasoning={false} />
+ );
+ 
+ const COPY_RESET_MS = 2000;

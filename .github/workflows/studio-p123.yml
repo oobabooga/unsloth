@@ -1,0 +1,141 @@
+name: "AMD CI: which piece of PR 9477 owns the 4.981x?"
+
+# A CAPABILITY question about the APP, not a differential one, so lib/differential.py and its
+# base/head pair are not used. The independent variable is which of PR 9477's mechanisms is
+# compiled into the bundle, and the control for "the mechanism caused this" is the same arm with
+# that one mechanism neutralised and nothing else changed.
+#
+# Why it exists: on this host, at a 100K-character thread, opening EVERY reasoning pane reads 5.1
+# effective fps at 93% busy on upstream main and 25.3 fps at 60% busy with all of 9477 applied and
+# pagination off. That 4.981x is one lump and nobody has split it. The branch already carries an
+# ablation of the same PR, but it was measured on a STREAMING window, and this campaign has
+# already been caught once by two different gestures sharing one name.
+
+on:
+  push:
+    branches: [amd-ci-9477-attribution]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  attribution:
+    name: "PR 9477 mechanism attribution in WebKitGTK (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 330
+    # Compositing a browser and seeding a 2 MB thread both allocate on the one gfx1151 that the
+    # four ephemeral slots share, so this takes the GPU group like any other measuring job. The
+    # group holds one runner plus one waiter and a third arrival evicts the waiter silently.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-p123"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. A skip would misreport missing hardware as nothing to see.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # SEPARATE AND EARLY, because it is the gate that protects the expensive job from the
+      # mistake this run is most likely to make. It replays the r500K numbers from run
+      # 32819830754, where the deliberately JAMMED arm read FASTER than the clean one, and
+      # asserts that the rung is now VOID rather than scoring and carrying the verdict.
+      - name: Criteria self-test (the r500K control fix)
+        run: |
+          set +e
+          python3 amd_ci/selftest_p123.py 2>&1 | tail -60
+          rc=${PIPESTATUS[0]}
+          echo "p123 selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # Deliberately its own step and deliberately early: step logs are only served once the JOB
+      # completes, so anything needed while a multi-hour job is in flight has to be visible in the
+      # per-step status, and anything needed afterwards comes from the artifact.
+      - name: Engine inventory
+        run: |
+          set +e
+          for p in /usr/bin/python3 /usr/bin/python3.12; do
+            [ -x "$p" ] || continue
+            echo "== $p"
+            "$p" -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('  WebKit', WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version())" 2>&1 | tail -2
+          done
+          node --version 2>&1
+          npm --version 2>&1
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      # TEN ARMS, ONE JOB. The GPU concurrency group holds one runner plus ONE waiter and a third
+      # arrival cancels the waiter silently, so splitting the arms across jobs would evict
+      # somebody. Arms are serialised inside this one job and interleaved within each repetition,
+      # so drift over the job cannot land entirely on whichever arm ran last.
+      #
+      # Repetitions are per rung: three at r100K, which is the rung that can carry a verdict and
+      # therefore the rung whose repetition spread has to be believable, and two at r500K, whose
+      # measurements cost three times as much and which is expected to be VOID on its own control.
+      - name: PR 9477 mechanism attribution on action:reasoning_toggle_all
+        timeout-minutes: 260
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_p123_probe.py \
+            --criteria amd_ci/criteria/studio_p123_attribution.py \
+            --out-dir "$AMD_CI_WORK/out/p123" \
+            -- --rungs 100K,500K --reps 100K:3,500K:2 --hog-ms 200
+          cat "$AMD_CI_WORK/out/p123/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/p123"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By PORT, then by PID. A pattern-matching process killer would match this very step's
+          # own shell, because the pattern ends up on its command line; that has cost a real run
+          # before. A Studio or an Xvfb that outlives the job holds VRAM on a machine three other
+          # slots share, so this cannot simply be skipped either.
+          for p in $(seq 5451 5540); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The logs, separately from the verdict, because the ask is to SEE that Studio functions
+      # rather than be told it does: Studio's own --verbose log per run, the browser console and
+      # page-error stream, and every failed resource load.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-p123-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/p123/out/logs
+            ${{ env.AMD_CI_WORK }}/p123/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/p123/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-p123
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
