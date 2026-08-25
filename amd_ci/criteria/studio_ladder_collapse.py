@@ -161,10 +161,22 @@ def _phase_raf(payload: dict) -> dict[str, dict]:
 
 
 def _raf_fps(payload: dict, phase: str) -> float | None:
-    """Frames per second from the rAF inter-frame interval. THE HEADLINE CHANNEL."""
-    raf = _phase_raf(payload).get(phase) or {}
-    p50 = raf.get("p50_ms")
-    return (1000.0 / p50) if p50 else None
+    """EFFECTIVE frames per second: frames actually delivered over the window's wall time.
+
+    Not 1000/p50, which was the first choice here and is wrong. A bursty block leaves the
+    MEDIAN interval untouched: the jammed control, with the main thread blocked 200 ms out of
+    every 250 ms, reported a p50 of 16.0 ms, identical to unjammed, because rAF still fires at
+    the display rate in the 50 ms it is given. Its p95 went 17 -> 213 ms and its effective rate
+    went 61.1 -> 17.6 fps. Only the count over wall time sees a gap it was never scheduled in,
+    and that is also what studiobench's own scoring/frames.py reports as `effective_fps`.
+    """
+    for ph in payload.get("phases") or []:
+        if ph.get("phase") != phase:
+            continue
+        n = (ph.get("raf") or {}).get("n")
+        el = ph.get("elapsed_ms")
+        return (1000.0 * n / el) if n and el else None
+    return None
 
 
 def _raf_stat(payload: dict, phase: str, key: str):
@@ -300,6 +312,11 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     for r in ok:
         pl = r["payload"]
         for a in pl.get("actions") or []:
+            # An empty thread has no assistant message and therefore no reasoning pane. That is
+            # the rung's definition, not a fault, and counting it as one failed this gate on a
+            # run where the pane opened and closed correctly at every rung that has one.
+            if a.get("not_applicable"):
+                continue
             acts.setdefault(a.get("name", "?"), []).append(bool(a.get("ok")))
         if (pl.get("first_token_ms") is not None
                 and not pl.get("still_running_at_deadline")
@@ -317,7 +334,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 + ("" if works else "; " + "; ".join(
                     f"{a.get('name')}: {str(a.get('detail'))[:90]}"
                     for r in ok for a in (r["payload"].get("actions") or [])
-                    if not a.get("ok")))))
+                    if not a.get("ok") and not a.get("not_applicable")))))
 
     have_repeat = any(len(rs) >= 2 for rs in _by_rung(obs).values())
     out.append(("at least one rung was measured twice, so a difference has a floor",

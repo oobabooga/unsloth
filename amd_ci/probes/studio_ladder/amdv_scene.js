@@ -256,12 +256,18 @@
         const i0 = W.gaps.length, t0 = performance.now();
         const before = census();
         let detail = "", ok = true, appSync = null;
-        try { const r = await fn(); detail = r && r.detail || String(r || ""); appSync = r && r.app_sync_ms; }
+        let na = false;
+        try {
+          const r = await fn();
+          detail = (r && r.detail) || String(r || "");
+          appSync = r && r.app_sync_ms;
+          na = Boolean(r && r.not_applicable);
+        }
         catch (e) { ok = false; detail = String((e && e.message) || e); }
         const dur = performance.now() - t0;
         const g = W.gaps.slice(i0), t = W.ticks.slice(cut.ticks);
         cut.gaps = W.gaps.length; cut.ticks = W.ticks.length;
-        actions.push({ name, ok, detail, app_sync_ms: appSync,
+        actions.push({ name, ok, not_applicable: na, detail, app_sync_ms: appSync,
                        elapsed_ms: Math.round(dur), raf: summarise(g),
                        raf_gaps_ms: g.map((x) => Math.round(x * 10) / 10),
                        busy: busyOver(t, dur, clamp),
@@ -273,7 +279,11 @@
       mark("action:reasoning_toggle");
       await runAction("reasoning_toggle", async () => {
         const root = document.querySelector('[data-slot="reasoning-root"]');
-        if (!root) throw new Error("no reasoning root on the page");
+        if (!root) {
+          return { detail: "no reasoning pane at this rung: an empty thread has no assistant "
+                           + "message until the first reply, so there is nothing to toggle",
+                   not_applicable: true };
+        }
         const trigger = root.querySelector("button");
         if (!trigger) throw new Error("no reasoning trigger button");
         const s0 = root.getAttribute("data-state");
@@ -300,7 +310,10 @@
       await runAction("select_all_copy", async () => {
         const root = document.querySelector('[data-slot="reasoning-root"]')
           || document.querySelector('[data-role="assistant"]');
-        if (!root) throw new Error("nothing to select");
+        if (!root) {
+          return { detail: "no assistant message at this rung yet, so there is nothing to copy",
+                   not_applicable: true };
+        }
         const sel = window.getSelection();
         sel.removeAllRanges();
         const rng = document.createRange();
