@@ -27,6 +27,12 @@ Three things decide the verdict, in order, and the order matters.
    the DOM keyed on the seeder's own last-turn marker, and a reply has to have streamed. A
    Desktop that sits on its installer screen produces a clean, flat, meaningless table.
 
+   The 0K rung is EMPTY BY CONSTRUCTION and is still a rung: it is the ~61 fps reference every
+   other rung's collapse is measured against, so an empty thread must be able to report a real
+   result rather than be dropped. It has no last-turn marker and no `[data-role]` node, so what
+   stands in for them there is the router's own query string plus a mounted shell and a live
+   composer with an empty message list; see amdv_desktop_boot.js::threadRendered.
+
 2. **What rendered?** Read from amdgpu's per-process fdinfo counters for the app's own web
    process, differenced per `drm-client-id`, against a software negative control run on the same
    binary and the same X server with `LIBGL_ALWAYS_SOFTWARE=1` the only difference. No in-page
@@ -58,8 +64,48 @@ NEEDS = [
 ORDER = ["0K", "1K", "10K", "100K", "500K", "1M"]
 MATERIAL_DROP_PCT = 10.0
 REPORTED_FLOOR_FPS = 5.0
-MIN_DOM_GROWTH = 5.0
 MIN_TOP_BUSY_PCT = 15.0
+
+# ── DID THE SEEDED THREAD MOUNT: a MEASURED floor, not a growth ratio ──────────────────────
+#
+# What this replaces, and why. The gate used to be "`final.elements` at the top rung is >= 5x
+# `final.elements` at the bottom rung". In run 32808701910 that failed a healthy seed: 62,666
+# elements at 100K against 274,973 at 500K is 4.4x, and the gate wanted 5x. The threshold
+# assumed DOM elements scale LINEARLY with tokens. They do not, for two compounding reasons:
+# longer messages amortise into fewer elements per token, and `final` is taken AFTER this
+# harness has streamed its own ~6,000-character tail into the thread, which adds a similar
+# ABSOLUTE number of nodes at every rung and so dilutes a large ratio more than a small one.
+# Lowering 5.0 until 4.4 passes would have made the gate decorative; the quantity was wrong,
+# not the number.
+#
+# What is asserted instead is three things that actually discriminate a seeded thread from an
+# unseeded one, all read from the MOUNT census -- taken the instant the thread is mounted and
+# before this harness touches it, which is precisely the quantity the gate's own name claims:
+#
+#   1. the mounted message count EQUALS the seeder's own count for that thread, exactly. Not a
+#      threshold at all: the seeder knows it wrote 18 messages, and 18 `[data-role]` nodes is
+#      the thread having mounted. This is what catches the failure the old ratio was reaching
+#      for, namely the PREVIOUS thread's DOM still being on screen;
+#   2. the mounted element count clears a per-rung FLOOR calibrated below;
+#   3. element counts increase STRICTLY with rung, so the ladder is a ladder.
+#
+# CALIBRATION SOURCE, so this is measured rather than guessed. `mount.census.elements` over
+# every completed run against studiobench corpus 23cd2464 on this runner:
+#
+#   rung   Studio web UI, WebKitGTK 2.52.3                        Unsloth Desktop, Tauri
+#   0K     546 x 7    (runs 32799285502, 32803626271, 32805404479)  none yet (all 0K legs failed)
+#   100K   19,958; 19,959 x3; 20,415                                19,955 x2   (run 32808701910)
+#   500K   110,328 x8; 110,350 x2 (incl. 32807566159 x4)            110,322 x2  (run 32808701910)
+#
+# The two engines agree to within 0.03% at 100K and 500K, and the spread within an engine is
+# under 2.3%, so the quantity is stable enough to floor. Each floor is ~60% of the LOWEST value
+# ever observed at that rung: generous against engine and version drift, and still one to two
+# orders of magnitude above the failure being guarded against, which is a thread that never
+# mounted and leaves the bare app shell of ~546 elements (0K's whole DOM) or less.
+#
+# A rung with no entry here is not silently waved through: the gate says so and fails, because
+# an uncalibrated rung is an unjudged one.
+MIN_MOUNT_ELEMENTS = {"0K": 300, "100K": 12000, "500K": 66000}
 CONTROL_MIN_DROP_PCT = 25.0
 # How much of the commanded scroll distance has to be actually travelled before the scroll
 # phase counts as a traversal rather than a jiggle. The unrepaired gesture measured 12% in
@@ -167,6 +213,79 @@ def _elements(scene):
     return (scene.get("final") or {}).get("elements")
 
 
+def _mount_census(scene):
+    """The DOM the instant the seeded thread mounted, before this harness added anything."""
+    return (scene.get("mount") or {}).get("census") or {}
+
+
+def _mount_elements(scene):
+    return _mount_census(scene).get("elements")
+
+
+def _seeded(r):
+    """What the SEEDER says it wrote, straight from the backend it wrote to."""
+    return _bench(r).get("seeded") or {}
+
+
+def _seed_rows(obs):
+    """Per completed ladder run: what was seeded, what mounted, and whether they agree."""
+    rows = []
+    for r in _ok_runs(obs):
+        sc, rung = _scene(r), r.get("rung", "?")
+        cen = _mount_census(sc)
+        want = _seeded(r).get("messages")
+        floor = MIN_MOUNT_ELEMENTS.get(rung)
+        el, got = cen.get("elements"), cen.get("messages")
+        # At 0K there is no message to find and no marker to match, so the only positive
+        # evidence that the app is on THIS thread rather than on the runtime's own bootstrap
+        # thread is the router's own query string, recorded by the page at scene start.
+        on_thread = (_scene(r).get("__desktop") or {}).get("on_requested_thread")
+        empty_ok = True if want else bool(on_thread)
+        rows.append({
+            "rung": rung, "rep": r.get("rep"), "seeded_messages": want,
+            "mounted_messages": got, "mount_elements": el, "floor": floor,
+            "on_requested_thread": on_thread,
+            "ok": bool(floor is not None and el is not None and el >= floor
+                       and want is not None and got == want and empty_ok),
+        })
+    return rows
+
+
+def _seed_ok(obs):
+    """(passed, one-line evidence). Shared by the gate and by the VOID branch of the verdict."""
+    rows = _seed_rows(obs)
+    if not rows:
+        return False, "no ladder run completed, so nothing mounted to check"
+    order = _rungs_sorted(obs)
+    els = [(rung, _agg(_by_rung(obs)[rung], "idle")["mount_elements"]) for rung in order]
+    mono = all(a is not None and b is not None and b > a
+               for (_, a), (_, b) in zip(els, els[1:]))
+    detail = "; ".join(
+        f"{rung}: {(el or 0):,.0f} elements at mount"
+        + (f" (floor {MIN_MOUNT_ELEMENTS[rung]:,})" if rung in MIN_MOUNT_ELEMENTS
+           else " (NO CALIBRATED FLOOR for this rung)")
+        for rung, el in els)
+    bad = [f"{x['rung']}#{x['rep']}: "
+           + ("no floor calibrated" if x["floor"] is None else
+              f"{x['mounted_messages']} of {x['seeded_messages']} seeded messages mounted"
+              if x["mounted_messages"] != x["seeded_messages"] else
+              "the page was not on the requested thread" if not x["on_requested_thread"] else
+              f"{x['mount_elements']} elements is under the {x['floor']:,} floor")
+           for x in rows if not x["ok"]]
+    passed = bool(rows) and not bad and mono and len(order) >= 2
+    if bad:
+        detail += " -- FAILED: " + "; ".join(bad)
+    elif not mono:
+        detail += " -- FAILED: element counts are not strictly increasing with rung"
+    elif len(order) < 2:
+        detail += " -- FAILED: only one rung produced a reading"
+    else:
+        msgs = "; ".join(f"{x['rung']}#{x['rep']} {x['mounted_messages']}/"
+                         f"{x['seeded_messages']} msgs" for x in rows)
+        detail += f" | mounted exactly what was seeded: {msgs}"
+    return passed, detail
+
+
 def _scroll_trace(scene):
     return scene.get("scroll_trace") or {}
 
@@ -194,7 +313,9 @@ def _agg(rs, phase):
     busy = [v for v in (_busy(_scene(r), phase) for r in rs) if v is not None]
     blocked = [v for v in (_blocked(_scene(r), phase) for r in rs) if v is not None]
     els = [v for v in (_elements(_scene(r)) for r in rs) if v is not None]
+    mels = [v for v in (_mount_elements(_scene(r)) for r in rs) if v is not None]
     return {"fps": vals, "n": len(vals),
+            "mount_elements": (sum(mels) / len(mels)) if mels else None,
             "fps_min": min(vals) if vals else None, "fps_max": max(vals) if vals else None,
             "spread": (max(vals) - min(vals)) if len(vals) >= 2 else None,
             "worst_ms": max(worst) if worst else None,
@@ -203,9 +324,8 @@ def _agg(rs, phase):
             "elements": (sum(els) / len(els)) if els else None}
 
 
-def _control_fps(obs):
-    """(jammed fps, unjammed fps at the same rung, the phase they are read from)."""
-    c = _find(obs, _is_hog)
+def _control_at(obs, c):
+    """One jam leg against the SAME rung unjammed: (jam fps, unjam fps, phase)."""
     if not c or not _bench(c).get("ok"):
         return None, None, "scroll"
     peers = [r for r in _ok_runs(obs) if r.get("rung") == c.get("rung")]
@@ -219,6 +339,48 @@ def _control_fps(obs):
             continue
         if best[0] is None or j < best[0]:
             best = (j, sum(u) / len(u), phase)
+    return best
+
+
+def _control_rows(obs):
+    """EVERY jam leg, one row per rung.
+
+    Per rung and not "the" control, because a control scheduled at a single rung is a single
+    point of failure for the whole run: in 32808701910 the only jam leg sat at 0K, 0K could not
+    complete, and the gate failed with "control did not complete" -- so six perfectly good
+    ladder readings had nothing to certify them. It is also the only comparison that means
+    anything: a jam has to be priced against the same rung unjammed, or the difference
+    confounds the jam with the thread size.
+    """
+    rows = []
+    for c in _runs(obs):
+        if not _is_hog(c):
+            continue
+        jam, unjam, phase = _control_at(obs, c)
+        done = bool(_bench(c).get("ok"))
+        why = (str(_bench(c).get("fatal") or _bench(c).get("error") or c.get("rc"))[:140]
+               if not done else
+               "the jam leg completed but no unjammed run at this rung did, so there is "
+               "nothing to price it against")
+        rows.append({
+            "rung": c.get("rung", "?"), "jam": jam, "unjam": unjam, "phase": phase,
+            "hog_ms": c.get("hog"), "period_ms": _bench(c).get("hog_period_ms", 250),
+            "completed": done, "why": why,
+            "resolves": bool(jam is not None and unjam is not None
+                             and jam < unjam * (1.0 - CONTROL_MIN_DROP_PCT / 100.0)),
+        })
+    rows.sort(key = lambda x: ORDER.index(x["rung"]) if x["rung"] in ORDER else 99)
+    return rows
+
+
+def _control_fps(obs):
+    """The single worst jam/unjam pair, for the headline sentence in the table."""
+    best = (None, None, "scroll")
+    for row in _control_rows(obs):
+        if row["jam"] is None:
+            continue
+        if best[0] is None or row["jam"] < best[0]:
+            best = (row["jam"], row["unjam"], row["phase"])
     return best
 
 
@@ -284,16 +446,10 @@ def gates(obs):
     binaries = {_bench(r).get("binary_sha256_16") for r in ok}
     out.append(("one binary across every rung", len(binaries) == 1, f"{sorted(binaries)}"))
 
-    base, top = (_rungs_sorted(obs) or [None])[0], (_rungs_sorted(obs) or [None])[-1]
-    grew, detail = False, "no runs"
-    if base and top and base != top:
-        b_el = _agg(_by_rung(obs)[base], "idle")["elements"]
-        t_el = _agg(_by_rung(obs)[top], "idle")["elements"]
-        if b_el and t_el:
-            grew = (t_el / b_el) >= MIN_DOM_GROWTH
-            detail = f"{base}: {b_el:,.0f} elements -> {top}: {t_el:,.0f} ({t_el / b_el:.1f}x)"
-    out.append((f"the seeded thread really mounted (DOM grew >= {MIN_DOM_GROWTH:.0f}x)",
-                grew, detail))
+    seeded_ok, seed_detail = _seed_ok(obs)
+    out.append(("the seeded thread really mounted (mounted message count equals the seeder's, "
+                "over a calibrated per-rung element floor, strictly increasing with rung)",
+                seeded_ok, seed_detail))
 
     # THE SCROLL GESTURE ACTUALLY TRAVELLED. This is a gate and not a footnote, because the
     # failure it guards against reads as a comfortable frame rate rather than as an error: the
@@ -315,19 +471,21 @@ def gates(obs):
     # THE POSITIVE CONTROL. Without it a flat frame rate cannot be told from a channel that
     # cannot read anything else, which is precisely how the web UI's first table came to be an
     # artefact.
-    jam, unjam, phase = _control_fps(obs)
-    c = _find(obs, _is_hog)
-    resolves = (jam is not None and unjam is not None
-                and jam < unjam * (1.0 - CONTROL_MIN_DROP_PCT / 100.0))
-    out.append((f"the headline frame channel resolves a jammed main thread "
-                f"(>= {CONTROL_MIN_DROP_PCT:.0f}% below the same rung unjammed)", resolves,
-                "no control run" if c is None else
-                (f"control did not complete: "
-                 f"{str(_bench(c).get('fatal') or _bench(c).get('error') or c.get('rc'))[:160]}"
-                 if jam is None else
-                 f"{c.get('rung')} with a {c.get('hog')} ms jam every "
-                 f"{_bench(c).get('hog_period_ms', 250)} ms: {jam:.1f} fps against "
-                 f"{unjam:.1f} fps unjammed, {phase} phase")))
+    # Run at EVERY rung, so the gate no longer rides on one leg: it passes when at least one
+    # rung resolves and NO rung whose jam leg produced a reading fails to. A jam leg that did
+    # not complete is named rather than ignored, but it does not by itself cost the run its
+    # verdict, which is the whole point of not pinning the control to a single rung.
+    crows = _control_rows(obs)
+    read = [x for x in crows if x["jam"] is not None]
+    resolves = bool(read) and all(x["resolves"] for x in read)
+    out.append((f"the headline frame channel resolves a jammed main thread at every rung it was "
+                f"run at (>= {CONTROL_MIN_DROP_PCT:.0f}% below the same rung unjammed)", resolves,
+                "no control run" if not crows else "; ".join(
+                    (f"{x['rung']}: did not complete ({x['why']})" if x["jam"] is None else
+                     f"{x['rung']} with a {x['hog_ms']} ms jam every {x['period_ms']} ms: "
+                     f"{x['jam']:.1f} vs {x['unjam']:.1f} fps unjammed ({x['phase']})"
+                     f"{'' if x['resolves'] else ' -- DOES NOT RESOLVE'}")
+                    for x in crows)))
 
     # DESKTOP REALLY FUNCTIONS: a reply streamed, and the interaction windows the users'
     # symptom lives in actually ran.
@@ -375,12 +533,13 @@ def _fmt(v, suffix="", nd=0):
 
 
 def table(obs):
-    rows = ["| rung | reps | DOM elements | phase | fps (effective rAF) | worst frame | busy | "
-            "blocked |", "|---|---|---|---|---|---|---|---|"]
+    rows = ["| rung | reps | DOM at mount | DOM elements | phase | fps (effective rAF) | "
+            "worst frame | busy | blocked |", "|---|---|---|---|---|---|---|---|---|"]
     by = _by_rung(obs)
     for rung in _rungs_sorted(obs):
         rs = by[rung]
         el = _agg(rs, "idle")["elements"]
+        mel = _agg(rs, "idle")["mount_elements"]
         for phase in ("idle", "scroll", "stream"):
             a = _agg(rs, phase)
             if not a["fps"]:
@@ -390,7 +549,7 @@ def table(obs):
             else:
                 fps = f"{a['fps_min']:.1f}-{a['fps_max']:.1f}"
             rows.append("| " + " | ".join([
-                rung, str(len(rs)), _fmt(el), phase, f"**{fps}**",
+                rung, str(len(rs)), _fmt(mel), _fmt(el), phase, f"**{fps}**",
                 _fmt(a["worst_ms"], " ms"),
                 "null" if a["busy"] is None else f"{a['busy']:.0f}%",
                 _fmt(a["blocked_ms"], " ms")]) + " |")
@@ -531,11 +690,43 @@ def table(obs):
              "so silence there is ambiguous between `PreserveEnvironment` and a crash before "
              "the line."]
 
-    jam, unjam, cphase = _control_fps(obs)
-    if jam is not None:
-        rows += ["", f"Positive control, the same rung with the main thread deliberately "
-                 f"jammed: **{jam:.1f} fps** against {unjam:.1f} fps unjammed ({cphase} phase). "
-                 f"This is what makes a reading here a finding rather than a broken instrument."]
+    crows = _control_rows(obs)
+    if crows:
+        rows += ["", "### The jammed positive control, at every rung", "",
+                 "| rung | jam | jammed fps | same rung unjammed | phase | resolves |",
+                 "|---|---|---|---|---|---|"]
+        for x in crows:
+            rows.append("| " + " | ".join([
+                x["rung"], f"{x['hog_ms']} ms every {x['period_ms']} ms",
+                "did not complete" if x["jam"] is None else f"**{x['jam']:.1f}**",
+                "-" if x["unjam"] is None else f"{x['unjam']:.1f}",
+                x["phase"], "yes" if x["resolves"] else
+                ("-" if x["jam"] is None else "NO")]) + " |")
+        rows += ["",
+                 "One per rung, and that is a repair rather than thoroughness. In run "
+                 "32808701910 the only jam leg was scheduled at 0K, 0K was the rung that could "
+                 "not complete, and the gate failed with *control did not complete* -- so six "
+                 "ladder readings that were fine had nothing certifying that the channel they "
+                 "were read on can move at all. A control placed at one rung is a single point "
+                 "of failure for the whole run. Per rung is also the only comparison that "
+                 "means anything: a jam has to be priced against the SAME rung unjammed, or "
+                 "the difference confounds the jam with the thread size."]
+
+    swpairs = _software_pairs(obs)
+    if swpairs:
+        rows += ["", "### The software negative control, at every rung", "",
+                 "| rung | real leg GFX ns | LIBGL_ALWAYS_SOFTWARE=1 GFX ns | software share |",
+                 "|---|---|---|---|"]
+        for rung, rns, sns in swpairs:
+            share = "-" if not rns or sns is None else f"{100.0 * sns / rns:.1f}%"
+            rows.append("| " + " | ".join([rung, _fmt(rns), _fmt(sns), share]) + " |")
+        rows += ["",
+                 f"Same rung on both sides, because GFX engine time scales with what is on "
+                 f"screen: a 500K real leg priced against a 0K software leg, which is what a "
+                 f"single-rung control forced, differs in the rung as well as in the "
+                 f"rasteriser. The share has to fall below "
+                 f"{SOFTWARE_MAX_FRACTION:.0%} before the real leg's counters are accepted as "
+                 f"the browser's own rendering."]
 
     bad = [r for r in _runs(obs) if r not in _ok_runs(obs) and not _is_control(r)]
     if bad:
@@ -569,12 +760,41 @@ def _worst_drop(obs):
     return worst
 
 
+def _software_pairs(obs):
+    """Per rung: (rung, the real leg's GFX ns, the SOFTWARE leg's GFX ns at the SAME rung).
+
+    Same-rung, because GFX engine time scales with what is on screen: pricing a 500K real leg
+    against a 0K software leg, which is what a single-rung control forced, compares two things
+    that differ in the rung as well as in the rasteriser.
+    """
+    out = []
+    by = _by_rung(obs)
+    for r in _runs(obs):
+        if not _is_software(r):
+            continue
+        rung = r.get("rung", "?")
+        peers = by.get(rung) or []
+        real = max([_gfx_ns(p) or 0 for p in peers] or [0])
+        out.append((rung, int(real), _gfx_ns(r)))
+    out.sort(key = lambda x: ORDER.index(x[0]) if x[0] in ORDER else 99)
+    return out
+
+
 def _gpu_story(obs) -> str:
-    sw = _find(obs, _is_software)
     real = [r for r in _ok_runs(obs)]
     real_ns = int(max([_gfx_ns(r) or 0 for r in real] or [0]))
-    sw_ns = _gfx_ns(sw)
-    sw_ns = int(sw_ns) if sw_ns is not None else None
+    # Prefer a SAME-RUNG pair; fall back to the old cross-rung comparison only when no software
+    # leg ran beside a real one.
+    # The heaviest rung that has both legs: the most demanding place to ask the question.
+    sw_ns = None
+    pairs = [(rns, sns) for _, rns, sns in _software_pairs(obs) if rns and sns is not None]
+    if pairs:
+        real_ns, sns = max(pairs, key = lambda p: p[0])
+        sw_ns = int(sns)
+    if sw_ns is None:
+        sw = _find(obs, _is_software)
+        sw_ns = _gfx_ns(sw)
+        sw_ns = int(sw_ns) if sw_ns is not None else None
     applied = {}
     for r in real:
         applied.update(_workaround_applied(r))
@@ -625,12 +845,14 @@ def verdict(obs):
             f"busy at {top} against {base_busy:.0f}% at {base}, over {top_el:,.0f} DOM elements "
             f"against {base_el:,.0f}. On the rendering path: {gpu}")
 
-    if top_busy < MIN_TOP_BUSY_PCT or (base_el and top_el / base_el < MIN_DOM_GROWTH):
+    seeded_ok, seed_detail = _seed_ok(obs)
+    if top_busy < MIN_TOP_BUSY_PCT or not seeded_ok:
         return "VOID", (
             f"the frame rate is flat ({base_fps:.1f} fps at {base}, {top_fps:.1f} fps at {top}) "
             f"but the venue was not loaded: the main thread reached only {top_busy:.0f}% busy at "
-            f"{top} over {top_el:,.0f} DOM elements. A flat reading on an unloaded page is "
-            f"evidence of no load, not evidence of no effect")
+            f"{top} over {top_el:,.0f} DOM elements, and the seed check says: {seed_detail}. A "
+            f"flat reading on an unloaded page is evidence of no load, not evidence of no "
+            f"effect")
 
     return "NO_COLLAPSE", (
         f"Desktop does NOT collapse: {base_fps:.1f} fps at {base} against {top_fps:.1f} fps at "
@@ -642,10 +864,15 @@ def verdict(obs):
 
 def observed_capabilities(obs):
     ok = _ok_runs(obs)
-    sw = _find(obs, _is_software)
-    real_ns = int(max([_gfx_ns(r) or 0 for r in ok] or [0]))
-    sw_ns = _gfx_ns(sw)
-    sw_ns = int(sw_ns) if sw_ns is not None else None
+    # Same-rung pairs, for the reason given at _software_pairs.
+    pairs = [(rns, sns) for _, rns, sns in _software_pairs(obs) if rns and sns is not None]
+    if pairs:
+        real_ns, sns = max(pairs, key = lambda p: p[0])
+        sw_ns = int(sns)
+    else:
+        real_ns = int(max([_gfx_ns(r) or 0 for r in ok] or [0]))
+        sw_ns = _gfx_ns(_find(obs, _is_software))
+        sw_ns = int(sw_ns) if sw_ns is not None else None
     gpu_ok = bool(real_ns and sw_ns is not None and sw_ns <= real_ns * SOFTWARE_MAX_FRACTION)
     return {
         "webkitgtk": bool(ok),

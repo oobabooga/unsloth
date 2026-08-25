@@ -25,9 +25,12 @@ What it does, in order:
   5. amdgpu per-process fdinfo sampled early and late and differenced per drm-client-id, so
      what actually rendered is read from the kernel driver rather than from an in-page string
      WebKitGTK is known to hardcode as `Apple GPU` on Linux/AMD;
-  6. two controls, both run LAST so a failure in either cannot cost the ladder: a JAMMED arm
-     (200 ms of main-thread spin every 250 ms) that a usable frame channel must fall on, and a
-     SOFTWARE arm (LIBGL_ALWAYS_SOFTWARE=1) whose amdgpu counters must collapse.
+  6. two controls, AT EVERY MEASURED RUNG and run LAST so a failure in either cannot cost the
+     ladder: a JAMMED arm (200 ms of main-thread spin every 250 ms) that a usable frame channel
+     must fall on, and a SOFTWARE arm (LIBGL_ALWAYS_SOFTWARE=1) whose amdgpu counters must
+     collapse. Per rung rather than once, because a control pinned to one rung dies with that
+     rung -- which is exactly what happened in run 32808701910 -- and because both comparisons
+     are only meaningful against the SAME rung's real leg.
 
 It reports what happened and decides nothing.
 """
@@ -76,7 +79,12 @@ def main() -> int:
     ap.add_argument("--rung-timeout", type = int, default = 2400)
     ap.add_argument("--hog-ms", type = int, default = 200)
     ap.add_argument("--hog-period-ms", type = int, default = 250)
-    ap.add_argument("--control-rung", default = "0K")
+    ap.add_argument("--control-rungs", default = "all",
+                    help = "which rungs get the jammed and software controls. `all` (the "
+                           "default) means EVERY measured rung: a control scheduled at one "
+                           "rung dies with that rung, which is what cost run 32808701910 its "
+                           "verdict. A comma list is accepted for a deliberately narrowed run "
+                           "and shows up in the report as a narrowed ladder.")
     ap.add_argument("--ablate-rung", default = "500K",
                     help = "the rung the fence-deferral ablation is run at, in BOTH arms")
     ap.add_argument("--ablate-reps", type = int, default = 2)
@@ -159,12 +167,33 @@ def main() -> int:
         rungs = [r.strip() for r in args.rungs.split(",") if r.strip()]
         plan = [{"rung": r, "rep": str(rep), "hog": 0, "software": False}
                 for rep in range(1, args.reps + 1) for r in rungs]
-        # Both controls LAST and on the smallest rung, so a failure in either cannot cost the
-        # ladder and neither can be mistaken for a ladder reading.
-        if args.hog_ms:
-            plan.append({"rung": args.control_rung, "rep": "hog", "hog": args.hog_ms,
-                         "software": False})
-        plan.append({"rung": args.control_rung, "rep": "sw", "hog": 0, "software": True})
+
+        # ── BOTH CONTROLS, AT EVERY MEASURED RUNG ────────────────────────────────────────────
+        #
+        # They stay LAST, so a failure in either still cannot cost the ladder. What changed is
+        # that they are no longer pinned to ONE rung, and that change is the whole reason run
+        # 32808701910 could not answer its question. Both controls were scheduled at 0K only;
+        # 0K was the rung that could not complete (an unsatisfiable navigation post-condition,
+        # see amdv_desktop_boot.js::threadRendered); so the single jam leg died with it and the
+        # gate "the headline frame channel resolves a jammed main thread" failed with "control
+        # did not complete" -- and with no working positive control, none of the six ladder
+        # readings that DID complete could be believed. A control that exists at exactly one
+        # rung is a single point of failure for the entire run, which is the opposite of what a
+        # control is for.
+        #
+        # Per-rung is also better than redundant. The jam has to be compared against the SAME
+        # rung unjammed, or the comparison confounds the jam with the thread size; and the
+        # software negative control's amdgpu counters have to be differenced against a real leg
+        # at the same rung, or a 500K real reading is being priced against a 0K software one.
+        # This is the shape probes/studio_p4_probe.py already uses on amd-ci-studio-ladder,
+        # where the JAM arm is measured inside the per-rung loop.
+        control_rungs = rungs if args.control_rungs.strip().lower() in ("all", "*") else \
+            [r.strip() for r in args.control_rungs.split(",") if r.strip()]
+        for r in control_rungs:
+            if args.hog_ms:
+                plan.append({"rung": r, "rep": "hog", "hog": args.hog_ms, "software": False})
+        for r in control_rungs:
+            plan.append({"rung": r, "rep": "sw", "hog": 0, "software": True})
         # The UNMODIFIED binary, launched into the same real backend with a real seeded thread.
         # It cannot open a specific thread -- that needs the injected script -- so it is
         # OBSERVED rather than driven: a mapped window, a painted framebuffer, and the backend's
@@ -192,6 +221,7 @@ def main() -> int:
             plan.append({"rung": args.ablate_rung, "rep": f"abl{rep}", "hog": 0,
                          "software": False, "defer_fence": "off"})
 
+        obs["control_rungs"] = control_rungs
         obs["plan"] = plan
         obs["runs"] = []
         port = args.first_port

@@ -507,6 +507,134 @@ def test_a_masked_renderer_string_cannot_carry_a_verdict() -> None:
           g["a display server was obtained"] is False, str(g))
 
 
+def _desktop_run(rung, rep, *, elements, mount_elements, messages, seeded_messages,
+                 fps, hog = 0, software = False, ok = True, error = None):
+    """One entry of desktop_ladder_probe's `runs`, with only what the criteria read."""
+    phases = [{"phase": p, "elapsed_ms": 10000,
+               "raf": {"n": int(fps * 10), "max_ms": 20},
+               "busy": {"busy_pct": 40.0, "blocked_ms": 100.0},
+               "census": {"elements": elements}}
+              for p in ("idle", "scroll", "stream")]
+    scene = {
+        "ok": True, "marks": [{"name": "mount"}], "phases": phases,
+        "first_token_ms": 100, "still_running_at_deadline": False,
+        "final": {"elements": elements, "messages": messages},
+        "mount": {"census": {"elements": mount_elements, "messages": messages}},
+        "scroll_trace": {"commanded_px": 10000, "travelled_px": 10000},
+        "actions": [{"name": "reasoning_toggle", "ok": True},
+                    {"name": "select_all_copy", "ok": True}],
+        "__desktop": {"nav": {"ok": True, "via": "history"}, "fence_arm": "default",
+                      "on_requested_thread": True, "expect_messages": seeded_messages},
+    }
+    bench = {
+        "ok": ok, "binary_sha256_16": "deadbeefdeadbeef", "hog_ms": hog,
+        "hog_period_ms": 250, "defer_fence_arm": "default",
+        "seeded": {"messages": seeded_messages, "thread_id": "t"},
+        "attach_preconditions_after_provision": {"all_ok": True},
+        "app": {"renderer_env": {}}, "amdgpu": {"total_gfx_ns_delta": 1_000_000},
+        "payload": scene if ok else None,
+    }
+    if not ok:
+        bench["error"] = error or "no result from the page"
+    return {"rung": rung, "rep": rep, "hog": hog, "software": software, "rc": 0 if ok else 5,
+            "payload": bench}
+
+
+def _desktop_obs(runs):
+    return {"xserver": {"display": ":9", "owned": True, "binary": "Xvfb"},
+            "install_layout": {"cli_exists": True, "studio_install_id": True},
+            "install": {"rc": 0, "seconds": 1}, "control_port_matches_build": True,
+            "runs": runs}
+
+
+def test_an_empty_rung_and_a_single_point_control() -> None:
+    """The three defects that made desktop run 32808701910 INCONCLUSIVE.
+
+    All three were in the instrument, not in the app under test, and each of them reads as a
+    plausible finding rather than as an error, which is exactly why they need a test.
+    """
+    print("\nThe desktop ladder's own instrument defects")
+    crit = _load(ROOT / "criteria" / "desktop_ladder_collapse.py")
+
+    # DEFECT 3. A seed that is healthy at every rung must not be failed by a growth RATIO.
+    # These are the real mount censuses measured on this runner at corpus 23cd2464; the final
+    # censuses give 4.4x from 100K to 500K, which the old `>= 5x` gate failed.
+    healthy = [
+        _desktop_run("0K", "1", elements = 757, mount_elements = 546,
+                     messages = 0, seeded_messages = 0, fps = 61.5),
+        _desktop_run("100K", "1", elements = 62666, mount_elements = 19955,
+                     messages = 18, seeded_messages = 18, fps = 44.0),
+        _desktop_run("500K", "1", elements = 274733, mount_elements = 110322,
+                     messages = 30, seeded_messages = 30, fps = 1.4),
+    ]
+    ok, detail = crit._seed_ok(_desktop_obs(healthy))
+    check("a 4.4x final-DOM ladder is a healthy seed, not a failed gate", ok, detail)
+
+    # ... and the gate is not thereby decorative: a thread that did not mount still fails.
+    unmounted = [
+        _desktop_run("0K", "1", elements = 757, mount_elements = 546,
+                     messages = 0, seeded_messages = 0, fps = 61.5),
+        _desktop_run("100K", "1", elements = 900, mount_elements = 560,
+                     messages = 0, seeded_messages = 18, fps = 61.0),
+        _desktop_run("500K", "1", elements = 1000, mount_elements = 600,
+                     messages = 0, seeded_messages = 30, fps = 61.0),
+    ]
+    ok2, d2 = crit._seed_ok(_desktop_obs(unmounted))
+    check("a thread that never mounted its messages still fails the gate", not ok2, d2)
+    check("and the reason names the message counts, not a ratio",
+          "seeded messages mounted" in d2, d2)
+
+    # A rung with no calibrated floor is not silently waved through.
+    uncal = [
+        _desktop_run("100K", "1", elements = 62666, mount_elements = 19955,
+                     messages = 18, seeded_messages = 18, fps = 44.0),
+        _desktop_run("1M", "1", elements = 500000, mount_elements = 220000,
+                     messages = 60, seeded_messages = 60, fps = 0.7),
+    ]
+    ok3, d3 = crit._seed_ok(_desktop_obs(uncal))
+    check("an uncalibrated rung is an unjudged one, and says so", not ok3, d3)
+
+    # DEFECT 2. A jam control at ONE rung dies with that rung. At every rung, one failed leg
+    # no longer costs the run its verdict.
+    def jam(rung, fps, ok = True):
+        return _desktop_run(rung, "hog", elements = 62666, mount_elements = 19955,
+                            messages = 18, seeded_messages = 18, fps = fps, hog = 200, ok = ok)
+
+    single = _desktop_obs(healthy + [jam("0K", 5.0, ok = False)])
+    g = dict((n, o) for n, o, _ in crit.gates(single))
+    control_gate = [k for k in g if "jammed main thread" in k][0]
+    check("a control that did not complete cannot certify the channel", g[control_gate] is False)
+
+    spread = _desktop_obs(healthy + [jam("0K", 5.0, ok = False), jam("100K", 5.0),
+                                     jam("500K", 0.3)])
+    g2 = dict((n, o) for n, o, _ in crit.gates(spread))
+    check("but a control at every rung survives one leg failing", g2[control_gate] is True)
+    rows = crit._control_rows(spread)
+    check("and each jam is priced against its OWN rung unjammed",
+          [r["rung"] for r in rows] == ["0K", "100K", "500K"]
+          and all(r["unjam"] is None or r["unjam"] > r["jam"] for r in rows if r["jam"]),
+          str(rows))
+
+    # A jam that does NOT move the channel still fails, at any rung: otherwise the gate would
+    # only be testing that a run happened.
+    limp = _desktop_obs(healthy + [jam("100K", 43.0)])
+    g3 = dict((n, o) for n, o, _ in crit.gates(limp))
+    check("a jam the channel cannot see is still a failure", g3[control_gate] is False)
+
+    # DEFECT 1. The page-side post-condition an empty thread could never satisfy.
+    boot = (ROOT / "probes" / "desktop_ladder" / "amdv_desktop_boot.js").read_text()
+    check("the navigation post-condition has an empty-thread branch",
+          "expectMessages === 0" in boot, "amdv_desktop_boot.js")
+    check("and a full reload cannot be spent twice, so a bad nav reports instead of looping",
+          "assignAlreadyUsed" in boot, "amdv_desktop_boot.js")
+    bench = (ROOT / "probes" / "desktop_ladder" / "amdv_desktop_bench.py").read_text()
+    check("the seeder's own message count reaches the page",
+          '"expectMessages"' in bench, "amdv_desktop_bench.py")
+    probe = (ROOT / "probes" / "desktop_ladder_probe.py").read_text()
+    check("and the controls are planned per rung rather than at one",
+          "control_rungs" in probe and 'default = "all"' in probe, "desktop_ladder_probe.py")
+
+
 def main() -> int:
     print("AMD CI selftest")
     test_void_rule()
@@ -523,6 +651,7 @@ def main() -> int:
     test_probe_established_capabilities_are_not_defaulted_true()
     test_capability_mode_is_not_a_disguised_differential()
     test_a_masked_renderer_string_cannot_carry_a_verdict()
+    test_an_empty_rung_and_a_single_point_control()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} failure(s):")

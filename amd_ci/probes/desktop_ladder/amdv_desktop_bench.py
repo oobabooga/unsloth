@@ -425,6 +425,11 @@ def main() -> int:
             "lsStamp": f"{seeded['thread_id']}:{ckpt}:{args.defer_fence}",
             "threadId": seeded["thread_id"],
             "lastMarker": seeded["last_marker"],
+            # The seeder's OWN message count for this thread, as written to the backend. The
+            # page's navigation post-condition needs it because an empty thread (0K) has no
+            # `[data-role]` node to wait for and the old unconditional wait for one could never
+            # be satisfied there; see the block comment at threadRendered in amdv_desktop_boot.js.
+            "expectMessages": int(seeded.get("messages") or 0),
             "settleMs": args.settle_ms,
             "hogMs": args.hog_ms,
             "hogPeriodMs": args.hog_period_ms,

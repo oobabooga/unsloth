@@ -170,7 +170,39 @@
     note("app_shell_ready_event", Date.now());
   });
 
-  function threadRendered(threadId, lastMarker) {
+  function onRequestedThread(threadId) {
+    try {
+      return new URLSearchParams(window.location.search).get("thread") === threadId;
+    } catch (e) {
+      return (window.location.search || "").indexOf(encodeURIComponent(threadId)) !== -1;
+    }
+  }
+
+  function threadRendered(threadId, lastMarker, expectMessages) {
+    // ── THE EMPTY THREAD IS A REAL RUNG, NOT A DEGENERATE ONE ────────────────────────────
+    //
+    // This cost run 32808701910 every one of its 0K legs, all four of them, and with them both
+    // of its controls. The post-condition below used to require at least one `[data-role]`
+    // node unconditionally. A 0K thread is seeded with ZERO messages by construction (the
+    // probe's SYNTHETIC_RUNGS path calls `seeder.create_thread` and stops), so it has no
+    // `[data-role]` node and never will. Every strategy therefore "failed", the last of them
+    // was `assign`, which reloads the document, which re-ran this whole file, which navigated
+    // and failed again -- a ~130 s cycle that repeated until the rung timed out at 1,290 s with
+    // "no result from the page". The page was fine; the post-condition was unsatisfiable.
+    //
+    // 0K is the 61 fps reference the entire collapse is measured against, so the fix is to make
+    // an empty thread REPORTABLE rather than to delete the rung. What is checked instead is the
+    // strongest thing that is true of an empty thread and false of a failed navigation:
+    // the router really is on THIS thread id, the shell is up, the composer is live, and the
+    // message list is empty -- which also rules out the specific failure the old comment was
+    // guarding against, namely the PREVIOUS thread's messages still being on screen because
+    // ChatRuntimeProvider has no `key` (chat-page.tsx:3950).
+    if (typeof expectMessages === "number" && expectMessages === 0) {
+      return onRequestedThread(threadId) &&
+             !!document.querySelector('[data-slot="sidebar-wrapper"]') &&
+             !!document.querySelector('textarea[aria-label="Message input"]') &&
+             document.querySelectorAll("[data-role]").length === 0;
+    }
     // Not "the URL changed": the URL changing is the thing attempted, not the result. And not
     // "[data-role] exists" on its own either -- ChatRuntimeProvider has NO `key`
     // (chat-page.tsx:3950), so switching threads does not remount it and the PREVIOUS thread's
@@ -230,21 +262,58 @@
     });
   }
 
-  async function openThread(threadId, lastMarker, order, perStrategyMs) {
+  // `assign` is a FULL DOCUMENT LOAD, so it re-runs this file from the top. Without a latch
+  // that survives the load, a navigation that cannot succeed becomes an infinite loop: try,
+  // fail, assign, reload, try, fail, assign... at roughly 130 s a cycle, until the rung's own
+  // timeout fires and reports "no result from the page" with no indication that anything was
+  // retried. Run 32808701910 spent 4 x 1,290 s in exactly that loop. The latch is keyed on the
+  // config stamp so it is per-run rather than per-profile, and the second pass reports a real
+  // failure instead of reloading again.
+  function assignAlreadyUsed(stamp) {
+    try { return window.sessionStorage.getItem("__amdv_nav_assign") === String(stamp); }
+    catch (e) { return false; }
+  }
+  function markAssignUsed(stamp) {
+    try { window.sessionStorage.setItem("__amdv_nav_assign", String(stamp)); } catch (e) {}
+  }
+
+  async function openThread(threadId, lastMarker, order, perStrategyMs, expectMessages, stamp) {
     var S = navStrategies(threadId);
     var tried = [];
     for (var i = 0; i < order.length; i++) {
       var name = order[i];
       if (!S[name]) { tried.push({ name: name, ran: false, reason: "unknown strategy" }); continue; }
+      if (name === "assign" && assignAlreadyUsed(stamp)) {
+        tried.push({ name: name, ran: false,
+                     reason: "a full reload was already spent on this run; refusing to loop" });
+        note("nav_attempt", { name: name, ran: false, err: "assign already used this run" });
+        continue;
+      }
       var ran = false, err = null;
+      if (name === "assign") markAssignUsed(stamp);
       try { ran = S[name](); } catch (e) { err = String(e); }
       note("nav_attempt", { name: name, ran: ran, err: err });
       if (!ran) { tried.push({ name: name, ran: false, err: err }); continue; }
-      var r = await waitFor(function () { return threadRendered(threadId, lastMarker); },
-                            perStrategyMs, name);
+      var r = await waitFor(function () {
+        return threadRendered(threadId, lastMarker, expectMessages);
+      }, perStrategyMs, name);
       tried.push({ name: name, ran: true, rendered: r.ok, ms: r.ms, err: err,
                    shell_ready_event: shellReady });
-      if (r.ok) return { ok: true, via: name, tried: tried };
+      if (r.ok) {
+        if (expectMessages === 0) {
+          // An empty thread has no DOM of its own to prove the router really loaded it, so the
+          // app's own one-shot readiness event (runtime-provider.tsx:1320-1334, dispatched when
+          // the REQUESTED thread's history has loaded) is given a bounded chance to arrive and
+          // is RECORDED either way. It is deliberately not required: the rung is the 61 fps
+          // reference the whole collapse is measured against, and making it depend on an event
+          // that has never been observed for an empty-but-real thread would be trading one
+          // unsatisfiable post-condition for another.
+          var sr = await waitFor(function () { return shellReady; }, 15000, "app_shell_ready");
+          tried[tried.length - 1].shell_ready_waited_ms = sr.ms;
+          tried[tried.length - 1].shell_ready_event = shellReady;
+        }
+        return { ok: true, via: name, tried: tried };
+      }
     }
     return { ok: false, via: null, tried: tried };
   }
@@ -317,11 +386,20 @@
     if (cfg.threadId) {
       nav = await openThread(cfg.threadId, cfg.lastMarker,
                              cfg.navOrder || ["history", "click", "assign"],
-                             cfg.navPerStrategyMs || 60000);
+                             cfg.navPerStrategyMs || 60000,
+                             // The seeder's OWN count, straight from the backend it wrote to.
+                             // 0 is a value here and not a missing field, so it is passed as a
+                             // number and read as one.
+                             typeof cfg.expectMessages === "number" ? cfg.expectMessages : null,
+                             cfg.lsStamp || "");
       note("nav", nav);
       if (!nav.ok) {
         post("/amdv/result", { __done: true, ok: false,
-                               error: "could not open the seeded thread", nav: nav });
+                               error: "could not open the seeded thread", nav: nav,
+                               expect_messages: cfg.expectMessages,
+                               dom: { data_role: document.querySelectorAll("[data-role]").length,
+                                      elements: document.getElementsByTagName("*").length,
+                                      href: location.href } });
         sentResult = true;
         return;
       }
@@ -352,6 +430,10 @@
     // constant.
     window.__av.__desktop = {
       nav: nav, app_shell: shell, control: CONTROL, shell_ready_event: shellReady,
+      // What the SEEDER put in the thread, carried through to the payload so the criteria can
+      // check the mounted DOM against it rather than against a growth ratio.
+      expect_messages: typeof cfg.expectMessages === "number" ? cfg.expectMessages : null,
+      on_requested_thread: onRequestedThread(cfg.threadId || ""),
       // The arm actually in force, read back from the global rather than from the config that
       // asked for it. An arm that failed to apply is the one failure that would make an
       // ablation table read as "the flag does nothing".
