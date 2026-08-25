@@ -1,0 +1,137 @@
+name: "AMD CI: build Unsloth Desktop (Tauri) and prove it launches"
+
+# Takes NO GPU, on purpose, and its launch leg is pinned to LIBGL_ALWAYS_SOFTWARE=1.
+#
+# Two reasons that is right rather than a compromise:
+#   * the amd-ci-gfx1151-gpu group holds one runner plus one waiter and a THIRD arrival cancels
+#     the waiter while the suites job stays green, so a 20-minute cargo build must not sit in
+#     it. Building and linting parallelise freely; only the measurement serialises.
+#   * the software leg IS the negative control the measuring job needs. WebKitGTK hardcodes
+#     `Apple GPU` in WEBGL_debug_renderer_info on Linux/AMD, so no in-page string can say what
+#     rendered. What decides is amdgpu per-process fdinfo accounting in the real leg against
+#     the same binary, same X server and same fixture home with the software rasteriser forced.
+#
+# The runner has neither cargo nor the Tauri -dev headers (established by the scouting run,
+# oobabooga/unsloth 32803564877), and no root. Both are fixed rootlessly inside the probe:
+# rustup into a private CARGO_HOME, and `apt-cache depends --recurse` + `apt-get download` +
+# `dpkg-deb -x` for the -dev closure. That closure resolves libwebkit2gtk-4.1-dev to
+# 2.52.3-0ubuntu0.24.04.1, i.e. the headers for exactly the 2.52.3 runtime the web UI ladder
+# already ran against, so the app is built against the engine it will run on.
+#
+# Deliberately NOT bundled. An AppImage sets the APPIMAGE environment variable and
+# studio/src-tauri/src/linux_webkit.rs branches on it, so bundling would change the rendering
+# decision this campaign exists to observe.
+
+on:
+  push:
+    branches: [amd-ci-desktop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "Build Desktop from source (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 180
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "desktop-build"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. Only `linux` is required: this job deliberately does not
+          # touch the GPU, so requiring rocm would gate on a thing it also masks.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # Its own step and deliberately early: step logs are only served once the JOB completes,
+      # so anything needed while a long job is in flight has to be visible in per-step status.
+      - name: Inventory
+        run: |
+          set +e
+          echo "== identity"; id
+          echo "== tools"
+          for t in rustc cargo node npm cc pkg-config dpkg-deb apt-get Xvfb xwd ffmpeg xwininfo; do
+            printf '%-12s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+          echo "== the inputs linux_webkit.rs decides on"
+          printf 'nvidia module: %s\n' "$([ -e /proc/driver/nvidia/version ] && echo PRESENT || echo absent)"
+          printf 'WAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s APPIMAGE=%s\n' \
+            "${WAYLAND_DISPLAY:-}" "${XDG_RUNTIME_DIR:-}" "${APPIMAGE:-}"
+          echo "== webkit runtime"
+          python3 -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('%d.%d.%d' % (WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version()))" 2>&1
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      - name: Build probe
+        timeout-minutes: 165
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/desktop_build_probe.py \
+            --criteria amd_ci/criteria/desktop_builds_and_launches.py \
+            --out-dir "$AMD_CI_WORK/out/build" \
+            -- --profile release --stage-dir "$AMD_CI_WORK/out/stage"
+          cat "$AMD_CI_WORK/out/build/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (INCONCLUSIVE) does not.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/build"
+
+      - name: Stop anything left behind
+        if: always()
+        run: |
+          set +e
+          # By PORT and by PID only. A pattern-matching process killer matches this very step's
+          # own shell, because the pattern lands on its command line; that has cost a real run
+          # before. An Xvfb or a Tauri process that outlives the job holds memory and a display
+          # on a machine three other slots share, so it cannot simply be skipped either.
+          for p in $(pgrep -u "$(id -u)" -x unsloth-studio 2>/dev/null); do
+            echo "killing leftover desktop pid $p"; kill -TERM "$p" 2>/dev/null
+          done
+          for p in $(pgrep -u "$(id -u)" -x Xvfb 2>/dev/null); do
+            echo "killing leftover Xvfb pid $p"; kill -TERM "$p" 2>/dev/null
+          done
+          sleep 2
+          exit 0
+
+      # The binary the measuring job downloads. $RUNNER_TEMP is wiped between jobs and nothing
+      # on this runner is cached, so an artifact is the only way to build once and measure once.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-binary
+          path: ${{ env.AMD_CI_WORK }}/out/stage
+          retention-days: 7
+          if-no-files-found: warn
+
+      # The logs, separately from the verdict, because the ask is to SEE that it functions
+      # rather than be told it does: the app's own stderr with G_MESSAGES_DEBUG=all, its
+      # tauri.log, and the screenshots of the X server before and after launch.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-build
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/desktop_build/*.png
+            ${{ env.AMD_CI_WORK }}/desktop_build/*.log
+          retention-days: 7
+          if-no-files-found: warn
