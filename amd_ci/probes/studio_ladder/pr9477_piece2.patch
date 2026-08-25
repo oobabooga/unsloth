@@ -1,0 +1,3450 @@
+diff --git a/studio/frontend/src/components/assistant-ui/markdown-text.tsx b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+index c6200aa2f..a67ba97bf 100644
+--- a/studio/frontend/src/components/assistant-ui/markdown-text.tsx
++++ b/studio/frontend/src/components/assistant-ui/markdown-text.tsx
+@@ -42,6 +42,7 @@ import { createMathPlugin } from "@streamdown/math";
+ import { mermaid } from "@streamdown/mermaid";
+ import {
+   type ComponentProps,
++  type ReactElement,
+   createContext,
+   memo,
+   useCallback,
+@@ -73,11 +74,21 @@ import "katex/dist/katex.min.css";
+ import { AudioPlayer } from "./audio-player";
+ import { SearchImageElement, SearchImagesContext } from "./search-image";
+ import { unslothDarkTheme, unslothLightTheme } from "./code-themes";
++import {
++  getStreamingCodeFence,
++  normalizeCodeFenceLanguage,
++} from "./streaming-code-policy";
+ import { stabilizeStreamingMarkdown } from "./streaming-markdown";
+ import {
++  type IncrementalMarkdownBlock,
+   IncrementalMarkdownCache,
++  type IncrementalMarkdownChunk,
++  type IncrementalMarkdownCodeFence,
++  type IncrementalMarkdownRender,
++  type IncrementalMarkdownTerminalCodeTail,
+   withoutStreamdownAnimationPlugin,
+ } from "./streaming-render-schedule";
++import { createStreamingTextPresentationScheduler } from "./streaming-text-presentation";
+ 
+ const math = createMathPlugin({ singleDollarTextMath: true });
+ const code = createCodePlugin({
+@@ -345,10 +356,40 @@ function useAnimationFreeBlockProps(props: BlockProps): BlockProps {
+  */
+ const RenderHtmlToolPresenceContext = createContext(false);
+ 
++/*
++ * The partitioning below hands one block more than Streamdown's own BlockProps.
++ *
++ * `codeFences` is the plan's record of the completed fences inside this block,
++ * carried alongside the content so a presentation path never has to re-parse it.
++ * `sourceContent` is the block's EXACT source before the tail repair appended a
++ * synthetic closing marker, which is the only string an open fence can be read
++ * from. `isFenceOpen` is the syntactic state of that fence, which is not the same
++ * question as whether the transport is still running: a stopped or cold-loaded
++ * reply can hold a fence that never closed.
++ *
++ * All three are destructured off before `useAnimationFreeBlockProps`, so the
++ * props that reach `<Block>` are exactly the ones Streamdown handed down.
++ */
++type StreamdownBlockProps = BlockProps & {
++  codeFences?: readonly IncrementalMarkdownCodeFence[];
++  isFenceOpen?: boolean;
++  sourceContent?: string;
++};
++
+ // Collapse a full-HTML answer in place into an artifact card. Diffusion keeps the
+ // raw code visible instead (the trailing MessageHtmlArtifacts appends its card).
++function StreamdownBlockContent(props: StreamdownBlockProps): ReactElement;
+ function StreamdownBlockContent(props: BlockProps) {
+-  const blockProps = useAnimationFreeBlockProps(props);
++  const {
++    // Carried by the plan so a presentation path never re-parses the block. It
++    // is destructured here to keep it OFF `<Block>`, which is a Streamdown
++    // component and would pass an unknown prop straight through.
++    codeFences: _codeFences,
++    isFenceOpen = false,
++    sourceContent,
++    ...renderProps
++  } = props as StreamdownBlockProps;
++  const blockProps = useAnimationFreeBlockProps(renderProps);
+   const shouldCollapseHtmlArtifacts = useChatRuntimeStore(
+     (state) =>
+       (state.artifactsEnabled || state.collapseHtmlArtifacts) &&
+@@ -360,6 +401,23 @@ function StreamdownBlockContent(props: BlockProps) {
+   const hasMermaidFence = props.content.includes("```mermaid");
+   const mermaidSource = getMermaidSource(props.content);
+   const codeFence = getCodeFence(props.content);
++  /*
++   * `getCodeFence` needs the CLOSING fence, so it can only ever see a settled
++   * block. The partitioned tail hands the still-open fence down as its own
++   * block, and `getStreamingCodeFence` reads that one from the exact source
++   * rather than from the repaired content, so the presentation below matches
++   * what actually arrived. It falls back to the artifact helper's answer, with
++   * the info string narrowed to the language token the highlighter can resolve.
++   */
++  const parsedStreamingCodeFence = getStreamingCodeFence(
++    sourceContent ?? props.content,
++  );
++  const streamingCodeFence =
++    parsedStreamingCodeFence ??
++    (codeFence && {
++      ...codeFence,
++      language: normalizeCodeFenceLanguage(codeFence.language),
++    });
+ 
+   if (props.isIncomplete && hasMermaidFence) {
+     return (
+@@ -419,18 +477,22 @@ function StreamdownBlockContent(props: BlockProps) {
+     );
+   }
+ 
+-  if (codeFence) {
++  if (streamingCodeFence) {
++    // Syntactic openness, not transport state. A fence the reply never closed
++    // holds a truncated document, and previewing that as an SVG or collapsing it
++    // into an HTML artifact would show a broken render as a finished one.
+     const svgSource =
+-      !props.isIncomplete && isSvgFence(codeFence)
+-        ? sanitizeSvg(codeFence.source)
++      !isFenceOpen && !props.isIncomplete && isSvgFence(streamingCodeFence)
++        ? sanitizeSvg(streamingCodeFence.source)
+         : null;
+     const htmlSource =
+       shouldCollapseHtmlArtifacts &&
+       !messageHasRenderableRenderHtmlTool &&
++      !isFenceOpen &&
+       !props.isIncomplete &&
+-      isHtmlFence(codeFence) &&
+-      isFullHtmlDocument(codeFence.source)
+-        ? codeFence.source
++      isHtmlFence(streamingCodeFence) &&
++      isFullHtmlDocument(streamingCodeFence.source)
++        ? streamingCodeFence.source
+         : null;
+     if (htmlSource) {
+       return (
+@@ -443,8 +505,8 @@ function StreamdownBlockContent(props: BlockProps) {
+         <FenceBlock
+           blockProps={blockProps}
+           isIncomplete={props.isIncomplete}
+-          language={codeFence.language}
+-          source={codeFence.source}
++          language={streamingCodeFence.language}
++          source={streamingCodeFence.source}
+         />
+         {svgSource && <SvgPreview source={svgSource} />}
+       </>
+@@ -610,59 +672,239 @@ function FenceBlock({
+  * nearest catcher is the ROUTER's, which replaces all of Studio and takes the
+  * reply and its runtime with it. Per block, so one fence losing its colours
+  * costs only that fence.
++ *
++ * The partitioning below multiplies the number of blocks mounted per reply, so
++ * the per-block boundary matters MORE here than it did before, not less.
+  */
+-const StreamdownBlock = memo((props: BlockProps) => (
++// `StreamdownBlockProps`, not `BlockProps`: the partitioned call sites pass
++// `codeFences`, `sourceContent` and `isFenceOpen` through the block component,
++// and the narrower annotation rejects all of them.
++const StreamdownBlock = memo((props: StreamdownBlockProps) => (
+   <MarkdownBlockBoundary content={props.content}>
+     <StreamdownBlockContent {...props} />
+   </MarkdownBlockBoundary>
+ ));
+ StreamdownBlock.displayName = "StreamdownBlock";
++
++/*
++ * THE PARTITION, carried down a context rather than through Streamdown.
++ *
++ * Streamdown owns the parser, the plugin instances and the highlighter, and its
++ * BlockComponent is the one place a caller can stand inside all of them. The
++ * plan below is therefore published on a context and read back by the single
++ * shell block, so every rendered block still receives the dependency's own
++ * providers and its exact incomplete-fence state.
++ */
++const StreamingMarkdownPlanContext =
++  createContext<IncrementalMarkdownRender | null>(null);
++
++// Streamdown parses the shell as ONE block; the partition decides the rest.
++const parseProviderShellBlock = (markdown: string): string[] => [markdown];
++
++type StableCommittedChunkProps = {
++  chunk: IncrementalMarkdownChunk;
++  shellProps: BlockProps;
++};
++
++function StableCommittedChunkContent({
++  chunk,
++  shellProps,
++}: StableCommittedChunkProps) {
++  return chunk.blocks.map((block, index) => (
++    <StreamdownBlock
++      {...shellProps}
++      codeFences={block.codeFences}
++      key={block.id}
++      content={block.content}
++      index={chunk.startIndex + index}
++      isIncomplete={false}
++    />
++  ));
++}
++
++// The provider shell creates a fresh props object when its one live block
++// changes. Completed chunks deliberately ignore that wrapper identity: their
++// Block configuration is constant for the lifetime of MarkdownText, and
++// Streamdown's own contexts still propagate real completion/config changes to
++// descendants. Only a changed chunk object should walk its completed blocks.
++const StableCommittedChunk = memo(
++  StableCommittedChunkContent,
++  (previous, next) => previous.chunk === next.chunk,
++);
++
++type StableCommittedChunksProps = {
++  chunks: readonly IncrementalMarkdownChunk[];
++  shellProps: BlockProps;
++};
++
++function StableCommittedChunksContent({
++  chunks,
++  shellProps,
++}: StableCommittedChunksProps) {
++  return chunks.map((chunk) => (
++    <StableCommittedChunk
++      key={chunk.id}
++      chunk={chunk}
++      shellProps={shellProps}
++    />
++  ));
++}
++
++// Ordinary token updates leave the chunks array untouched, so React does not
++// even map the growing committed list. A promotion changes the array, while the
++// chunk memo above still keeps every closed chunk out of that render.
++const StableCommittedChunks = memo(
++  StableCommittedChunksContent,
++  (previous, next) => previous.chunks === next.chunks,
++);
++
++type StableTerminalPrefixProps = {
++  blocks: readonly IncrementalMarkdownBlock[];
++  index: number;
++  shellProps: BlockProps;
++};
++
++function StableTerminalPrefixContent({
++  blocks,
++  index,
++  shellProps,
++}: StableTerminalPrefixProps) {
++  return blocks.map((block, blockIndex) => (
++    <StreamdownBlock
++      {...shellProps}
++      codeFences={block.codeFences}
++      key={block.id}
++      content={block.content}
++      index={index + blockIndex}
++      isIncomplete={false}
++    />
++  ));
++}
++
++const StableTerminalPrefix = memo(
++  StableTerminalPrefixContent,
++  (previous, next) => previous.blocks === next.blocks,
++);
++
++type TerminalCodeTailProps = {
++  codeTail: IncrementalMarkdownTerminalCodeTail;
++  index: number;
++  shellProps: BlockProps;
++};
++
++function TerminalCodeTail({
++  codeTail,
++  index,
++  shellProps,
++}: TerminalCodeTailProps) {
++  // Openness is a syntactic fact about the bytes; running is a transport fact.
++  // Only both together mean the copy and download actions are looking at a
++  // source that is still moving under them.
++  const isFenceOpen = !codeTail.isClosed;
++  const isStreaming = shellProps.isIncomplete;
++  const actionsDisabled = isFenceOpen && isStreaming;
++  return (
++    <>
++      <StableTerminalPrefix
++        blocks={codeTail.prefixBlocks}
++        index={index}
++        shellProps={shellProps}
++      />
++      <StreamdownBlock
++        {...shellProps}
++        key={codeTail.id}
++        content={codeTail.fenceMarkdown}
++        sourceContent={codeTail.fenceMarkdown}
++        index={index + codeTail.prefixBlocks.length}
++        isFenceOpen={isFenceOpen}
++        isIncomplete={actionsDisabled}
++      />
++    </>
++  );
++}
++
++function PartitionedStreamdownBlock(shellProps: BlockProps) {
++  const plan = useContext(StreamingMarkdownPlanContext);
++  if (!plan) {
++    return null;
++  }
++
++  return (
++    <>
++      <StableCommittedChunks chunks={plan.chunks} shellProps={shellProps} />
++      {plan.tail.map((block, index) => {
++        const codeTail = plan.terminalCodeTail;
++        if (codeTail?.blockId === block.id) {
++          return (
++            <TerminalCodeTail
++              key={codeTail.id}
++              codeTail={codeTail}
++              index={plan.committedBlockCount + index}
++              shellProps={shellProps}
++            />
++          );
++        }
++        return (
++          <StreamdownBlock
++            {...shellProps}
++            codeFences={block.codeFences}
++            key={block.id}
++            content={block.content}
++            sourceContent={
++              index === plan.tail.length - 1
++                ? plan.sourceShellMarkdown
++                : undefined
++            }
++            index={plan.committedBlockCount + index}
++            isIncomplete={
++              index === plan.tail.length - 1 && shellProps.isIncomplete
++            }
++          />
++        );
++      })}
++    </>
++  );
++}
++
++const PartitionedStreamdownShell = memo(PartitionedStreamdownBlock);
+ const AUDIO_PLAYER_RE = /<audio-player\s+src="([^"]+)"\s*\/>/;
+ 
+-// Coalesce only token events that arrive before the browser's next paint, as
+-// textgen does. There is no time or length throttle. Incremental block parsing
+-// bounds the work performed per paint, and completion returns immediately.
++// Coalesce ordinary token events to paint. Once a cumulative reply reaches
++// 24 KiB, publish at 75 ms intervals so reconciliation/mutation work stays in
++// the smooth 12-15 Hz band measured by the real trace. Completion, message
++// switches, and replacements still return their exact source immediately.
+ function useCoalescedStreamingText(
+   text: string,
+   isStreaming: boolean,
+   messageId: string,
+ ): string {
+   const [displayed, setDisplayed] = useState({ messageId, text });
+-  const pendingRef = useRef({ messageId, text });
+-  const rafRef = useRef<number | null>(null);
+   const activeMessageIdRef = useRef(messageId);
+-
+-  const cancelScheduledRender = useCallback(() => {
+-    if (rafRef.current !== null) {
+-      cancelAnimationFrame(rafRef.current);
+-      rafRef.current = null;
+-    }
+-  }, []);
++  const [scheduler] = useState(() =>
++    createStreamingTextPresentationScheduler({
++      publish: setDisplayed,
++      now: () => performance.now(),
++      requestFrame: (callback) => requestAnimationFrame(callback),
++      cancelFrame: (handle) => cancelAnimationFrame(handle),
++      setTimer: (callback, delay) => setTimeout(callback, delay),
++      clearTimer: (handle) => clearTimeout(handle),
++    }),
++  );
+ 
+   useEffect(() => {
+-    pendingRef.current = { messageId, text };
++    const pending = { messageId, text };
+     if (activeMessageIdRef.current !== messageId) {
+-      cancelScheduledRender();
++      scheduler.cancel();
+       activeMessageIdRef.current = messageId;
+     }
+     if (!isStreaming) {
+-      cancelScheduledRender();
+-      return;
+-    }
+-
+-    if (rafRef.current !== null) {
++      scheduler.flush(pending);
+       return;
+     }
++    scheduler.schedule(text.length, pending);
++  }, [isStreaming, messageId, scheduler, text]);
+ 
+-    rafRef.current = requestAnimationFrame(() => {
+-      rafRef.current = null;
+-      setDisplayed(pendingRef.current);
+-    });
+-  }, [cancelScheduledRender, messageId, text, isStreaming]);
+-
+-  useEffect(() => {
+-    return cancelScheduledRender;
+-  }, [cancelScheduledRender]);
++  useEffect(() => () => scheduler.cancel(), [scheduler]);
+ 
+   // Holding the last painted text is only correct while the reply is being
+   // appended to. A running message can also be replaced, as the audio path does
+@@ -682,6 +924,52 @@ function useCoalescedStreamingText(
+   return text;
+ }
+ 
++type PartitionedMarkdownTextProps = {
++  isStreaming: boolean;
++  markdown: string;
++  messageId: string;
++  statusType: string;
++};
++
++function PartitionedMarkdownText({
++  isStreaming,
++  markdown,
++  messageId,
++  statusType,
++}: PartitionedMarkdownTextProps) {
++  const [incrementalCache] = useState(() => new IncrementalMarkdownCache());
++  const incrementalRender = incrementalCache.update(markdown, isStreaming);
++
++  return (
++    <div data-status={statusType} className="min-w-0 max-w-full">
++      <StreamingMarkdownPlanContext.Provider value={incrementalRender}>
++        <Streamdown
++          key={messageId}
++          mode="streaming"
++          parseIncompleteMarkdown={false}
++          parseMarkdownIntoBlocksFn={parseProviderShellBlock}
++          isAnimating={isStreaming}
++          animated={STREAMDOWN_IMMEDIATE_UPDATES}
++          plugins={STREAMDOWN_PLUGINS}
++          components={STREAMDOWN_COMPONENTS}
++          // #9490's sanitizer allowance. The partitioned shell is a different
++          // Streamdown element from the one configured before, so this does not
++          // carry across by itself: without it the search image custom tag is
++          // stripped and inline results silently stop rendering, with nothing
++          // failing.
++          allowedTags={STREAMDOWN_ALLOWED_TAGS}
++          urlTransform={safeMarkdownUrl}
++          controls={STREAMDOWN_CONTROLS}
++          shikiTheme={STREAMDOWN_SHIKI_THEME}
++          BlockComponent={PartitionedStreamdownShell}
++        >
++          {incrementalRender.shellMarkdown}
++        </Streamdown>
++      </StreamingMarkdownPlanContext.Provider>
++    </div>
++  );
++}
++
+ /** False inside the reasoning block, which renders through this same component. */
+ export const SearchImagesEnabledContext = createContext(true);
+ 
+@@ -694,9 +982,8 @@ const MarkdownTextImpl = () => {
+       ? aui.part.query.index
+       : 0;
+   // Parts are keyed by index, so switching conversations hands this instance a
+-  // different message, and Streamdown only extends its parsed blocks: key it per
+-  // message. The cache generation joins the key for the case the Markdown string
+-  // cannot express, an edit that drops retained blocks without changing the tail.
++  // different message. Key the renderer so that message gets its own cache and
++  // provider shell, while completion of one message keeps both intact.
+   const messageId = useAuiState(({ message }) => message.id);
+   // Read once here for every block below: see RenderHtmlToolPresenceContext.
+   const messageHasRenderableRenderHtmlTool = useAuiState(({ message }) =>
+@@ -754,20 +1041,6 @@ const MarkdownTextImpl = () => {
+       ),
+     [displayText, isStreaming, messageTexts, precedingText, searchImages],
+   );
+-  const incrementalCacheRef = useRef({
+-    messageId,
+-    cache: new IncrementalMarkdownCache(),
+-  });
+-  if (incrementalCacheRef.current.messageId !== messageId) {
+-    incrementalCacheRef.current = {
+-      messageId,
+-      cache: new IncrementalMarkdownCache(),
+-    };
+-  }
+-  const incrementalCache = incrementalCacheRef.current.cache;
+-  const incrementalRender = isStreaming
+-    ? incrementalCache.update(processedText)
+-    : null;
+ 
+   const audioMatch = displayText.match(AUDIO_PLAYER_RE);
+   if (audioMatch) {
+@@ -778,26 +1051,19 @@ const MarkdownTextImpl = () => {
+     <RenderHtmlToolPresenceContext.Provider
+       value={messageHasRenderableRenderHtmlTool}
+     >
++      {/*
++       * The search-images provider stays OUTSIDE the partitioned renderer. Its
++       * value is per-message, while the partitioning below owns the Streamdown
++       * shell; nesting it inside would rebuild the provider with that shell.
++       */}
+       <SearchImagesContext.Provider value={searchImages}>
+-        <div data-status={status.type} className="min-w-0 max-w-full">
+-          <Streamdown
+-            key={`${messageId}:${incrementalCache.renderGeneration}`}
+-            mode="streaming"
+-            parseIncompleteMarkdown={!incrementalRender}
+-            parseMarkdownIntoBlocksFn={incrementalRender?.parseMarkdownIntoBlocks}
+-            isAnimating={isStreaming}
+-            animated={STREAMDOWN_IMMEDIATE_UPDATES}
+-            plugins={STREAMDOWN_PLUGINS}
+-            components={STREAMDOWN_COMPONENTS}
+-            allowedTags={STREAMDOWN_ALLOWED_TAGS}
+-            urlTransform={safeMarkdownUrl}
+-            controls={STREAMDOWN_CONTROLS}
+-            shikiTheme={STREAMDOWN_SHIKI_THEME}
+-            BlockComponent={StreamdownBlock}
+-          >
+-            {incrementalRender?.markdown ?? processedText}
+-          </Streamdown>
+-        </div>
++        <PartitionedMarkdownText
++          key={messageId}
++          isStreaming={isStreaming}
++          markdown={processedText}
++          messageId={messageId}
++          statusType={status.type}
++        />
+       </SearchImagesContext.Provider>
+     </RenderHtmlToolPresenceContext.Provider>
+   );
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts b/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts
+new file mode 100644
+index 000000000..b224aca8f
+--- /dev/null
++++ b/studio/frontend/src/components/assistant-ui/streaming-code-policy.ts
+@@ -0,0 +1,352 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { fromMarkdown } from "mdast-util-from-markdown";
++
++export type StreamingCodeFence = {
++  language: string | null;
++  source: string;
++};
++
++export type TerminalStreamingCodeFence = StreamingCodeFence & {
++  fenceMarkdown: string;
++  isClosed: boolean;
++  openingLine: string;
++  openingOffset: number;
++  // Preserve the separator before the closing marker; `source` omits it.
++  rawSource: string;
++};
++
++const FENCE_OPEN_RE = /^( {0,3})(`{3,}|~{3,})([^\r\n]*)$/;
++const INFO_SEPARATOR_RE = /[ \t]+/;
++
++
++export function normalizeCodeFenceLanguage(
++  language: string | null,
++): string | null {
++  return language?.trim().split(INFO_SEPARATOR_RE, 1)[0] || null;
++}
++
++export function getCodeFenceFilename(language: string | null): string {
++  const extByLanguage: Record<string, string> = {
++    bash: "sh",
++    "c++": "cpp",
++    csharp: "cs",
++    javascript: "js",
++    js: "js",
++    json: "json",
++    jsx: "jsx",
++    markdown: "md",
++    md: "md",
++    python: "py",
++    py: "py",
++    ruby: "rb",
++    rust: "rs",
++    shell: "sh",
++    sh: "sh",
++    sql: "sql",
++    ts: "ts",
++    tsx: "tsx",
++    typescript: "ts",
++    svg: "svg",
++    yaml: "yml",
++    yml: "yml",
++  };
++  const normalized = normalizeCodeFenceLanguage(language)?.toLowerCase();
++  const fallbackExt = normalized?.replace(/[^a-z0-9]+/g, "-");
++  const ext = normalized
++    ? extByLanguage[normalized] || fallbackExt || "txt"
++    : "txt";
++  return `snippet.${ext}`;
++}
++
++export const isClosingFenceLine = (
++  line: string,
++  marker: "`" | "~",
++  minimumLength: number,
++): boolean => {
++  let index = 0;
++  while (index < line.length && index < 4 && line[index] === " ") {
++    index += 1;
++  }
++  if (index > 3) {
++    return false;
++  }
++
++  const markerStart = index;
++  while (line[index] === marker) {
++    index += 1;
++  }
++  if (index - markerStart < minimumLength) {
++    return false;
++  }
++
++  for (; index < line.length; index += 1) {
++    if (line[index] !== " " && line[index] !== "\t") {
++      return false;
++    }
++  }
++  return true;
++};
++
++// Does any line at or after `from`, which must be a line start, close a fence
++// opened with `markerLength` copies of `marker`? A line scan, not a parse, so a
++// caller that has already settled the text before `from` pays only for what
++// arrived since.
++export function hasClosingFenceLine(
++  content: string,
++  from: number,
++  marker: "`" | "~",
++  markerLength: number,
++): boolean {
++  for (let lineStart = from; lineStart <= content.length; ) {
++    const lf = content.indexOf("\n", lineStart);
++    const rawEnd = lf < 0 ? content.length : lf;
++    const end =
++      rawEnd > lineStart && content[rawEnd - 1] === "\r" ? rawEnd - 1 : rawEnd;
++    if (
++      isClosingFenceLine(content.slice(lineStart, end), marker, markerLength)
++    ) {
++      return true;
++    }
++    if (lf < 0) return false;
++    lineStart = lf + 1;
++  }
++  return false;
++}
++
++// The marker a fence opening at `offset` uses, or null when that is not a fence
++// opening line.
++export function readFenceMarker(
++  content: string,
++  offset: number,
++): { marker: "`" | "~"; markerLength: number } | null {
++  const lf = content.indexOf("\n", offset);
++  const rawEnd = lf < 0 ? content.length : lf;
++  const end =
++    rawEnd > offset && content[rawEnd - 1] === "\r" ? rawEnd - 1 : rawEnd;
++  const opening = content.slice(offset, end).match(FENCE_OPEN_RE);
++  return opening
++    ? { marker: opening[2][0] as "`" | "~", markerLength: opening[2].length }
++    : null;
++}
++
++type FenceOpening = {
++  language: string | null;
++  marker: "`" | "~";
++  markerLength: number;
++  sourceStart: number;
++};
++
++const parseFenceOpening = (blockContent: string): FenceOpening | null => {
++  const openingLf = blockContent.indexOf("\n");
++  if (openingLf < 0) {
++    return null;
++  }
++
++  const openingEnd =
++    openingLf > 0 && blockContent[openingLf - 1] === "\r"
++      ? openingLf - 1
++      : openingLf;
++  const opening = blockContent.slice(0, openingEnd).match(FENCE_OPEN_RE);
++  if (!opening) {
++    return null;
++  }
++
++  const marker = opening[2][0] as "`" | "~";
++  const info = opening[3];
++  // Backtick fences cannot contain backticks in the info string.
++  if (marker === "`" && info.includes("`")) {
++    return null;
++  }
++
++  return {
++    language: normalizeCodeFenceLanguage(info),
++    marker,
++    markerLength: opening[2].length,
++    sourceStart: openingLf + 1,
++  };
++};
++
++type ClosingFence =
++  | { rawSourceEnd: number; sourceEnd: number }
++  | "content-after-close"
++  | null;
++
++const findClosingFence = (
++  blockContent: string,
++  opening: FenceOpening,
++): ClosingFence => {
++  let lineStart = opening.sourceStart;
++  while (lineStart <= blockContent.length) {
++    const lf = blockContent.indexOf("\n", lineStart);
++    const rawLineEnd = lf < 0 ? blockContent.length : lf;
++    const lineEnd =
++      rawLineEnd > lineStart && blockContent[rawLineEnd - 1] === "\r"
++        ? rawLineEnd - 1
++        : rawLineEnd;
++    const line = blockContent.slice(lineStart, lineEnd);
++
++    if (isClosingFenceLine(line, opening.marker, opening.markerLength)) {
++      const suffixStart = lf < 0 ? blockContent.length : lf + 1;
++      // A provider block containing content after the close is not code-only. Let
++      // Streamdown render it rather than hiding that suffix inside this replacement.
++      if (blockContent.slice(suffixStart).trim().length > 0) {
++        return "content-after-close";
++      }
++
++      let sourceEnd = lineStart;
++      if (
++        sourceEnd > opening.sourceStart &&
++        blockContent[sourceEnd - 1] === "\n"
++      ) {
++        sourceEnd -= 1;
++        if (
++          sourceEnd > opening.sourceStart &&
++          blockContent[sourceEnd - 1] === "\r"
++        ) {
++          sourceEnd -= 1;
++        }
++      }
++      return { rawSourceEnd: lineStart, sourceEnd };
++    }
++
++    if (lf < 0) {
++      return null;
++    }
++    lineStart = lf + 1;
++  }
++  return null;
++};
++
++// Streamdown passes one parser block here. The shared artifact helper intentionally
++// recognizes only a closed, unindented ``` fence, so it cannot select a still-open
++// fence. This parser is deliberately narrower than a Markdown splitter: it reads one
++// opening line and, when present, its matching closing line. Openness is derived
++// from those bytes even after transport completion; every source byte between
++// the syntactic lines is returned unchanged.
++type ParsedStreamingCodeFence = StreamingCodeFence & {
++  isClosed: boolean;
++  openingLine: string;
++  rawSource: string;
++};
++
++const parseStreamingCodeFence = (
++  blockContent: string,
++): ParsedStreamingCodeFence | null => {
++  const opening = parseFenceOpening(blockContent);
++  if (!opening) {
++    return null;
++  }
++
++  const closing = findClosingFence(blockContent, opening);
++  if (closing === "content-after-close") {
++    return null;
++  }
++  if (closing) {
++    return {
++      isClosed: true,
++      language: opening.language,
++      openingLine: blockContent.slice(0, opening.sourceStart),
++      rawSource: blockContent.slice(
++        opening.sourceStart,
++        closing.rawSourceEnd,
++      ),
++      source: blockContent.slice(opening.sourceStart, closing.sourceEnd),
++    };
++  }
++  return {
++    isClosed: false,
++    language: opening.language,
++    openingLine: blockContent.slice(0, opening.sourceStart),
++    rawSource: blockContent.slice(opening.sourceStart),
++    source: blockContent.slice(opening.sourceStart),
++  };
++};
++
++export function getStreamingCodeFence(
++  blockContent: string,
++): StreamingCodeFence | null {
++  const parsed = parseStreamingCodeFence(blockContent);
++  return parsed && { language: parsed.language, source: parsed.source };
++}
++
++type PositionedMarkdownNode = {
++  children?: readonly PositionedMarkdownNode[];
++  position?: {
++    end: { offset?: number };
++    start: { offset?: number };
++  };
++  type: string;
++};
++
++// Validate the offset with CommonMark itself rather than treating every line
++// that resembles a fence as Markdown. In particular, a marker inside a raw HTML
++// block is an HTML byte, not a fenced-code opener. The parser's final top-level
++// code node also proves that a nonterminal fence is not selected; a real terminal
++// closer remains explicit in the returned syntactic state.
++const terminalCodeNodeOffset = (markdown: string): number | null => {
++  const root = fromMarkdown(markdown) as PositionedMarkdownNode;
++  const node = root.children?.at(-1);
++  const start = node?.position?.start.offset;
++  const end = node?.position?.end.offset;
++  if (
++    node?.type !== "code" ||
++    start === undefined ||
++    end === undefined ||
++    markdown.slice(end).trim().length > 0
++  ) {
++    return null;
++  }
++  const lineStart = markdown.lastIndexOf("\n", start - 1) + 1;
++  const indentation = markdown.slice(lineStart, start);
++  return indentation.length <= 3 && /^ *$/.test(indentation)
++    ? lineStart
++    : start;
++};
++
++// Find only the final fenced code node inside one exact raw mutable provider
++// block. The returned offset is relative to that block; callers retain their
++// parser/block boundary and never search or slice the canonical whole message.
++export function getTerminalStreamingCodeFence(
++  blockContent: string,
++  // The offset this fence had on the previous chunk. An open fence absorbs every
++  // appended character -- CommonMark ends one only at a matching closing line or
++  // the end of the document -- so while it stays open its offset cannot move and
++  // the whole-tail parse below is recomputing a constant. Trusted only while the
++  // line scan still reports it open, which is the case the argument covers.
++  knownOpeningOffset?: number,
++): TerminalStreamingCodeFence | null {
++  if (knownOpeningOffset !== undefined) {
++    const fenceMarkdown = blockContent.slice(knownOpeningOffset);
++    const parsed = parseStreamingCodeFence(fenceMarkdown);
++    if (parsed && !parsed.isClosed) {
++      return { ...parsed, fenceMarkdown, openingOffset: knownOpeningOffset };
++    }
++  }
++
++  const openingOffset = terminalCodeNodeOffset(blockContent);
++  if (openingOffset === null) {
++    return null;
++  }
++
++  const fenceMarkdown = blockContent.slice(openingOffset);
++  const parsed = parseStreamingCodeFence(fenceMarkdown);
++  if (!parsed) {
++    return null;
++  }
++  return {
++    fenceMarkdown,
++    isClosed: parsed.isClosed,
++    language: parsed.language,
++    openingLine: parsed.openingLine,
++    openingOffset,
++    rawSource: parsed.rawSource,
++    source: parsed.source,
++  };
++}
++
++// The real Qwen 27B profile spends its dominant non-idle samples in TextMate
++// while one still-open TypeScript fence keeps growing. Four KiB preserves live
++// colour for ordinary snippets, but stops a generated file before its repeated
++// whole-tail parse/tokenization becomes a multi-frame task.
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts b/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
+index e2a1a671f..28af71ad9 100644
+--- a/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
++++ b/studio/frontend/src/components/assistant-ui/streaming-render-schedule.ts
+@@ -1,22 +1,24 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
++import { fromMarkdown } from "mdast-util-from-markdown";
++
+ import remend from "remend";
+ import { type BlockProps, parseMarkdownIntoBlocks } from "streamdown";
+ 
+-// How far behind the live edge a block has to be before it can be retained.
+-// The block list interleaves "\n\n" separators, so this is about four
+-// paragraphs of slack for a construct that a later line can still reinterpret.
++import {
++  getTerminalStreamingCodeFence,
++  hasClosingFenceLine,
++  isClosingFenceLine,
++  normalizeCodeFenceLanguage,
++  readFenceMarker,
++} from "./streaming-code-policy.ts";
++
++// Retain blocks only after they are outside the rollback window.
+ const ROLLBACK_BLOCKS = 8;
+-// A marker the reply never closes leaves the tail growing with nothing to
+-// retain, and the boundary scan is then paid on top of the full repair it was
+-// meant to replace. Give up at a character budget, since characters are what
+-// that scan costs, and a transient imbalance closes far below this. The budget
+-// is spent before giving up and that spending grows with the square of the tail,
+-// so the value matters. Measured on an emphasis marker that only closes 40,000
+-// characters later, 420 updates, five repetitions: the median cost against the
+-// full-document path is +73% at 32,768 and +1.6% at 8,192. 8,192 characters is
+-// still around 1,300 words of slack, well beyond a marker a later line closes.
++// Group retained blocks so token updates touch only the final partial chunk.
++const COMMITTED_CHUNK_BLOCKS = 8;
++// Bound stalled-tail scans; 8,192 characters preserves enough context for late closures.
+ const STALLED_TAIL_CHARACTERS = 8_192;
+ // remend repairs the trailing incomplete construct, but it reaches that
+ // decision with whole-string passes: one walks the text once per `[` looking
+@@ -110,12 +112,7 @@ const createRepairParity = (): RepairParity => ({
+   inlineMath: false,
+ });
+ 
+-// Marked keeps link reference definitions in one document-wide map and emits
+-// no token for a label it has already seen, so a definition that is retained
+-// while its twin is still live would be lexed apart and shown as a literal
+-// line. Keeping every definition in the live tail makes the two lexes agree.
+-// Marked reads a fenced block as code, so those do not count; anything else
+-// that merely looks like a definition costs retention, never correctness.
++// Keep link definitions in the live tail so Marked's document-wide map stays consistent.
+ function updateLinkDefinitionParity(parity: RepairParity, text: string): void {
+   if (!FENCED_CODE_BLOCK_RE.test(text) && LINK_DEFINITION_RE.test(text)) {
+     parity.linkDefinition = true;
+@@ -529,10 +526,82 @@ const hasNeutralRepairParity = (parity: RepairParity): boolean =>
+     parity.inlineMath,
+   ].includes(true);
+ 
+-export type IncrementalMarkdownRender = {
++export type IncrementalMarkdownCodeFence = Readonly<{
++  id: string;
++  language: string | null;
++  meta: string | null;
++  openingOffset: number;
++  source: string;
++  // Set only when live source preservation or a validated cold overlay owns
++  // the otherwise ambiguous line feed immediately before the closing fence.
++  terminalLineFeedIsExact?: true;
++
++}>;
++
++export type IncrementalMarkdownBlock = Readonly<{
++  codeFences: readonly IncrementalMarkdownCodeFence[];
++  content: string;
++  id: string;
++}>;
++
++export type IncrementalMarkdownChunk = Readonly<{
++  blocks: readonly IncrementalMarkdownBlock[];
++  id: string;
++  startIndex: number;
++}>;
++
++export type IncrementalMarkdownTerminalCodeTail = Readonly<{
++  blockId: string;
++  fenceMarkdown: string;
++  id: string;
++  isClosed: boolean;
++  language: string | null;
++  openingLine: string;
++  openingOffset: number;
++  prefixBlocks: readonly IncrementalMarkdownBlock[];
++  prefixMarkdown: string;
++  source: string;
++  sourceOffset: number;
++}>;
++
++export type IncrementalMarkdownRender = Readonly<{
++  chunks: readonly IncrementalMarkdownChunk[];
++  committedBlockCount: number;
++  epoch: number;
++  // The repaired Markdown still owned by the mutable rollback tail.
+   markdown: string;
+-  parseMarkdownIntoBlocks: (markdown: string) => string[];
+-};
++  // Streamdown parses this one block only so its public BlockComponent receives
++  // the dependency's exact incomplete-fence state beneath all private providers.
++  shellMarkdown: string;
++  // The same shell before remend appends synthetic closing markers. Presentation
++  // and copy paths use this exact source; Streamdown still parses shellMarkdown.
++  sourceShellMarkdown: string;
++  tail: readonly IncrementalMarkdownBlock[];
++  terminalCodeTail: IncrementalMarkdownTerminalCodeTail | null;
++}>;
++
++
++type IncrementalMarkdownRenderObservation = Readonly<{
++  codeFenceSourceLengths: readonly number[];
++  isStreaming: boolean;
++  sourceLength: number;
++  terminalSourceLength: number | null;
++}>;
++
++let incrementalMarkdownRenderObserver:
++  | ((observation: IncrementalMarkdownRenderObservation) => void)
++  | null = null;
++
++export function observeIncrementalMarkdownRenders(
++  observer: (observation: IncrementalMarkdownRenderObservation) => void,
++): () => void {
++  incrementalMarkdownRenderObserver = observer;
++  return () => {
++    if (incrementalMarkdownRenderObserver === observer) {
++      incrementalMarkdownRenderObserver = null;
++    }
++  };
++}
+ 
+ // Marker facts the retained prefix carries into the tail repair.
+ type RetainedContext = {
+@@ -818,6 +887,51 @@ function normalizeLineEndings(text: string): string {
+  * Semantically identical: `slice` clamps to the string length, so a `b` longer
+  * than `a` yields a short slice that cannot equal it.
+  */
++/*
++ * Is there a footnote reference or definition here, ignoring fenced code?
++ *
++ * A character class in ordinary code is shaped exactly like a footnote
++ * reference: `/[^a-z]/` matches `FOOTNOTE_REFERENCE_RE`. Testing the repaired
++ * tail as one string therefore reads a regex literal inside an open fence as a
++ * footnote and switches to full-document mode, which is sticky, so every later
++ * token re-repairs and re-lexes the whole reply. That is the quadratic this
++ * class exists to remove, restored by one line of the reply's own code.
++ *
++ * Fenced code is not Markdown, so scan lines and skip the fenced ones. Neither
++ * pattern can span a newline, so testing per line is exactly the whole-string
++ * test with the fenced lines removed.
++ */
++export function hasFootnoteConstruct(markdown: string): boolean {
++  let fence: { marker: "`" | "~"; markerLength: number } | null = null;
++  for (let lineStart = 0; lineStart <= markdown.length; ) {
++    const lf = markdown.indexOf("\n", lineStart);
++    const rawEnd = lf < 0 ? markdown.length : lf;
++    const end =
++      rawEnd > lineStart && markdown[rawEnd - 1] === "\r" ? rawEnd - 1 : rawEnd;
++    const line = markdown.slice(lineStart, end);
++
++    if (fence) {
++      if (isClosingFenceLine(line, fence.marker, fence.markerLength)) {
++        fence = null;
++      }
++    } else {
++      const opening = readFenceMarker(markdown, lineStart);
++      if (opening) {
++        fence = opening;
++      } else if (
++        FOOTNOTE_REFERENCE_RE.test(line) ||
++        FOOTNOTE_DEFINITION_RE.test(line)
++      ) {
++        return true;
++      }
++    }
++
++    if (lf < 0) break;
++    lineStart = lf + 1;
++  }
++  return false;
++}
++
+ export const hasPrefix = (a: string, b: string): boolean =>
+   a.length >= b.length && a.slice(0, b.length) === b;
+ 
+@@ -905,13 +1019,149 @@ function findCommitBoundary(
+ }
+ 
+ // Streamdown normally repairs and lexes the entire growing reply on every
+-// update. Retain blocks that are safely behind a rollback window and give
+-// Streamdown only the active tail. The parser callback puts the retained blocks
+-// back into its block list, so output and React keys stay identical.
++// update. Retain blocks that are safely behind a rollback window and expose
++// them as immutable chunks plus one mutable tail. MarkdownText renders this
++// plan through a single Streamdown provider shell, so neither Streamdown nor
++// React walks the complete growing block list for every token.
++type MarkdownCodeNode = {
++  children?: readonly MarkdownCodeNode[];
++  lang?: string | null;
++  meta?: string | null;
++  position?: { start: { offset?: number } };
++  type: string;
++  value?: string;
++};
++
++// A globally scoped Streamdown block (notably one containing footnotes) can
++// hold many completed nodes. Preserve canonical fenced-code facts before a
++// terminal tail is promoted or followed by prose.
++export function getCompletedCodeFences(
++  content: string,
++  blockId = "detached",
++): IncrementalMarkdownCodeFence[] {
++  const fences: IncrementalMarkdownCodeFence[] = [];
++  const visit = (node: MarkdownCodeNode): void => {
++    if (node.type === "code") {
++      const start = node.position?.start.offset;
++      if (start !== undefined) {
++        const lineEnd = content.indexOf("\n", start);
++        const openingLine = content.slice(
++          start,
++          lineEnd < 0 ? content.length : lineEnd,
++        );
++        // Slicing to "\n" leaves the CR of a CRLF opening line in place.
++        if (/^ {0,3}(?:`{3,}|~{3,})[^\r\n]*\r?$/.test(openingLine)) {
++          fences.push({
++            id: `${blockId}:fence:${start}`,
++            language: normalizeCodeFenceLanguage(node.lang ?? null),
++            meta: node.meta ?? null,
++            openingOffset: start,
++            source: node.value ?? "",
++          });
++        }
++      }
++    }
++    node.children?.forEach(visit);
++  };
++  visit(fromMarkdown(content) as MarkdownCodeNode);
++  return fences;
++}
++
++/*
++ * The same answer for a block that only grew, without re-parsing it.
++ *
++ * A block holding an unclosed fence is the whole live tail, and it is re-lexed
++ * on every token, so charging it a whole-document CommonMark parse each time
++ * makes one chunk cost the length of the fence and a reply the square of it.
++ * That is the exact shape #9517 removed from the repair path.
++ *
++ * While the last fence is open nothing else in the block can change: CommonMark
++ * ends a fenced code block only at a matching closing line or at the end of the
++ * document, so every earlier fence is settled and the appended characters can
++ * only extend that one body. So carry the previous result forward and re-parse
++ * only when a closing line actually arrives, which is once per fence.
++ */
++type OpenFenceMemo = {
++  blockId: string;
++  content: string;
++  fences: IncrementalMarkdownCodeFence[];
++  marker: "`" | "~";
++  markerLength: number;
++};
++
++// What mdast reports as the body of a still-open fence: everything after the
++// opening line, less the single trailing line ending it drops.
++const openFenceBody = (content: string, openingOffset: number): string => {
++  const lf = content.indexOf("\n", openingOffset);
++  if (lf < 0) return "";
++  const body = content.slice(lf + 1);
++  return body.endsWith("\n") ? body.slice(0, -1) : body;
++};
++
++// A block whose last fence runs unclosed to its end, or null. A closed fence
++// cannot pass: its body stops before a closer that is still in the content. Nor
++// can a half-written opening line, where the next character joins the info
++// string rather than the body.
++const openFenceOf = (
++  content: string,
++  fences: readonly IncrementalMarkdownCodeFence[],
++): Pick<OpenFenceMemo, "marker" | "markerLength"> | null => {
++  const last = fences.at(-1);
++  if (
++    !last ||
++    content.indexOf("\n", last.openingOffset) < 0 ||
++    last.source !== openFenceBody(content, last.openingOffset)
++  ) {
++    return null;
++  }
++  return readFenceMarker(content, last.openingOffset);
++};
++
++export function createCompletedCodeFenceCache(): (
++  content: string,
++  blockId: string,
++) => IncrementalMarkdownCodeFence[] {
++  let memo: OpenFenceMemo | null = null;
++
++  return (content, blockId) => {
++    if (
++      memo !== null &&
++      memo.blockId === blockId &&
++      content.length > memo.content.length &&
++      hasPrefix(content, memo.content) &&
++      // A closer has to start a line, and the appended text may continue the
++      // block's last partial one, so rescan from that line's start.
++      !hasClosingFenceLine(
++        content,
++        memo.content.lastIndexOf("\n") + 1,
++        memo.marker,
++        memo.markerLength,
++      )
++    ) {
++      const previous = memo.fences;
++      const last = previous[previous.length - 1];
++      const fences = [
++        ...previous.slice(0, -1),
++        { ...last, source: openFenceBody(content, last.openingOffset) },
++      ];
++      memo = { ...memo, content, fences };
++      return fences;
++    }
++
++    const fences = getCompletedCodeFences(content, blockId);
++    const open = openFenceOf(content, fences);
++    memo = open && { ...open, blockId, content, fences };
++    return fences;
++  };
++}
++
++
+ export class IncrementalMarkdownCache {
+   private source = "";
+   private tail = "";
+-  private committedBlocks: string[] = [];
++  private committedBlocks: IncrementalMarkdownBlock[] = [];
++  private committedChunks: IncrementalMarkdownChunk[] = [];
++  private tailBlocks: IncrementalMarkdownBlock[] = [];
+   private committedLength = 0;
+   private commitPoints: CommitPoint[] = [];
+   private context = createRetainedContext();
+@@ -919,33 +1169,257 @@ export class IncrementalMarkdownCache {
+   private openFenceHead: string | null = null;
+   private openFenceHeadInert = false;
+   private fullDocumentMode = false;
+-  private lastMarkdown: string | null = null;
+-  private droppedRetainedBlocks = false;
++  private lastRender: IncrementalMarkdownRender | null = null;
++  private lastCanonicalRender: IncrementalMarkdownRender | null = null;
++  private nextBlockIdentity = 0;
++  private epoch = 0;
++
++
++
++  private isStreaming = true;
+   // How often a rewrite discarded the whole retained prefix, and how many
+   // characters a rewind handed back to the live tail. Both redo work with an
+   // identical result, so time is the only other evidence they happened. Tests
+   // read these to hold the rewind path in place.
+   private retainedPrefixRebuilds = 0;
+   private rewoundCharacters = 0;
+-  // Bumped only when the Markdown string alone cannot signal a changed render.
+-  renderGeneration = 0;
+-
+-  readonly parseMarkdownIntoBlocks = (markdown: string): string[] => [
+-    ...this.committedBlocks,
+-    ...parseMarkdownIntoBlocks(markdown),
+-  ];
+-
+-  // Streamdown memoises the whole component on the Markdown string and ignores
+-  // the parser callback, so the string is the only thing that can schedule a
+-  // render. Retaining a block can wait for a string that differs, but dropping
+-  // retained blocks cannot, so that case moves the render identity instead.
+-  private render(markdown: string): IncrementalMarkdownRender {
+-    if (this.droppedRetainedBlocks && markdown === this.lastMarkdown) {
+-      this.renderGeneration += 1;
++
++  private completedCodeFences = createCompletedCodeFenceCache();
++
++  private createBlock(content: string): IncrementalMarkdownBlock {
++    const id = `${this.epoch}:${this.nextBlockIdentity}`;
++    const block = {
++      codeFences: this.completedCodeFences(content, id),
++      content,
++      id,
++    } satisfies IncrementalMarkdownBlock;
++    this.nextBlockIdentity += 1;
++    return block;
++  }
++
++  // Streamdown itself uses positional keys inside the bounded live tail. Match
++  // that behavior while preserving an exact block object when its content did
++  // not change. A promoted block carries this same identity into a chunk.
++  private reconcileTailBlocks(contents: string[]): IncrementalMarkdownBlock[] {
++    const previous = this.tailBlocks;
++    const next = contents.map((content, index) => {
++      const existing = previous[index];
++      if (!existing) {
++        return this.createBlock(content);
++      }
++      if (existing.content === content) {
++        return existing;
++      }
++      return {
++        codeFences: this.completedCodeFences(content, existing.id),
++        content,
++        id: existing.id,
++      } satisfies IncrementalMarkdownBlock;
++    });
++    this.tailBlocks = next;
++    return next;
++  }
++
++  // Preserve every closed chunk object. The one open chunk changes only when a
++  // block is committed, never for ordinary token-only tail updates.
++  private syncCommittedChunks(): void {
++    const previous = this.committedChunks;
++    const next: IncrementalMarkdownChunk[] = [];
++    for (
++      let start = 0, chunkIndex = 0;
++      start < this.committedBlocks.length;
++      start += COMMITTED_CHUNK_BLOCKS, chunkIndex += 1
++    ) {
++      const blocks = this.committedBlocks.slice(
++        start,
++        start + COMMITTED_CHUNK_BLOCKS,
++      );
++      const existing = previous[chunkIndex];
++      if (
++        existing &&
++        existing.blocks.length === blocks.length &&
++        existing.blocks.every((block, index) => block === blocks[index])
++      ) {
++        next.push(existing);
++      } else {
++        next.push({
++          blocks,
++          id: `chunk:${blocks[0].id}`,
++          startIndex: start,
++        });
++      }
+     }
+-    this.droppedRetainedBlocks = false;
+-    this.lastMarkdown = markdown;
+-    return { markdown, parseMarkdownIntoBlocks: this.parseMarkdownIntoBlocks };
++    this.committedChunks = next;
++  }
++
++  // A closing fence followed immediately by prose is no longer terminal, so
++  // mdast owns only its semantic code value and drops the separator newline.
++  // Carry the exact source observed while the fence was open into that newly
++  // completed block; later chunk promotion then retains the same actions.
++  private preserveTerminalCodeSource(
++    blocks: IncrementalMarkdownBlock[],
++    previous: IncrementalMarkdownTerminalCodeTail | null,
++  ): IncrementalMarkdownBlock[] {
++    if (!previous) return blocks;
++    let changed = false;
++    let blockOffset = this.committedLength;
++    const next = blocks.map((block) => {
++      const currentBlockOffset = blockOffset;
++      blockOffset += block.content.length;
++      let blockChanged = false;
++      const codeFences = block.codeFences.map((fence) => {
++        const samePersistentOccurrence =
++          (block.id === previous.blockId &&
++            fence.openingOffset === previous.openingOffset) ||
++          currentBlockOffset + fence.openingOffset === previous.sourceOffset;
++        if (
++          !samePersistentOccurrence ||
++          fence.language !== previous.language ||
++          fence.source === previous.source ||
++          (`${fence.source}\n` !== previous.source &&
++            `${fence.source}\r\n` !== previous.source)
++        ) {
++          return fence;
++        }
++        blockChanged = true;
++        return {
++          ...fence,
++          source: previous.source,
++          terminalLineFeedIsExact: true as const,
++        };
++      });
++      if (!blockChanged) return block;
++      changed = true;
++      return { ...block, codeFences };
++    });
++    if (changed) this.tailBlocks = next;
++    return changed ? next : blocks;
++  }
++
++
++
++
++  private publishCanonicalRender(
++    canonicalRender: IncrementalMarkdownRender,
++  ): IncrementalMarkdownRender {
++    const render = canonicalRender;
++    incrementalMarkdownRenderObserver?.({
++      codeFenceSourceLengths: render.tail.flatMap((block) =>
++        block.codeFences.map((fence) => fence.source.length),
++      ),
++      isStreaming: this.isStreaming,
++      sourceLength: this.source.length,
++      terminalSourceLength:
++        canonicalRender.terminalCodeTail?.source.length ?? null,
++    });
++
++    this.lastCanonicalRender = canonicalRender;
++    this.lastRender = render;
++    return render;
++  }
++
++
++  private render(
++    markdown: string,
++    blockContents: string[],
++    previousCodeTail = this.lastRender?.terminalCodeTail ?? null,
++  ): IncrementalMarkdownRender {
++    const tail = this.preserveTerminalCodeSource(
++      this.reconcileTailBlocks(blockContents),
++      previousCodeTail,
++    );
++    const shellMarkdown = tail.at(-1)?.content ?? "";
++    const shellStart = markdown.endsWith(shellMarkdown)
++      ? markdown.length - shellMarkdown.length
++      : -1;
++    const sourceShellIsExact =
++      shellStart >= 0 &&
++      shellStart <= this.tail.length &&
++      markdown.slice(0, shellStart) === this.tail.slice(0, shellStart);
++    const sourceShellMarkdown = sourceShellIsExact
++      ? this.tail.slice(shellStart)
++      : shellMarkdown;
++    // Fence syntax belongs to the source, not the transport status. A stopped or
++    // cold malformed reply still needs the same bounded terminal-code plan; only
++    // animation and action availability follow `isStreaming`.
++
++    // Same argument as the completed-fence cache above: while the fence stays
++    // open its opening offset cannot move, so the whole-tail parse that finds it
++    // is recomputing a constant once per token.
++    const settledOpeningOffset =
++      previousCodeTail !== null &&
++      !previousCodeTail.isClosed &&
++      hasPrefix(sourceShellMarkdown, previousCodeTail.prefixMarkdown) &&
++      sourceShellMarkdown.startsWith(
++        previousCodeTail.openingLine,
++        previousCodeTail.openingOffset,
++      )
++        ? previousCodeTail.openingOffset
++        : undefined;
++    const candidate = sourceShellIsExact
++      ? getTerminalStreamingCodeFence(sourceShellMarkdown, settledOpeningOffset)
++      : null;
++    const sourceOffset = candidate
++      ? this.committedLength + shellStart + candidate.openingOffset
++      : -1;
++    const keepsIdentity =
++      candidate !== null &&
++      previousCodeTail !== null &&
++      previousCodeTail.sourceOffset === sourceOffset &&
++      previousCodeTail.openingLine === candidate.openingLine;
++    const usesTerminalCodeTail =
++      candidate !== null && (!candidate.isClosed || keepsIdentity);
++
++    let terminalCodeTail: IncrementalMarkdownTerminalCodeTail | null = null;
++    const shellBlock = tail.at(-1);
++    if (usesTerminalCodeTail && candidate && shellBlock) {
++      const prefixMarkdown = sourceShellMarkdown.slice(
++        0,
++        candidate.openingOffset,
++      );
++      const prefixBlocks =
++        keepsIdentity && previousCodeTail?.prefixMarkdown === prefixMarkdown
++          ? previousCodeTail.prefixBlocks
++          : parseMarkdownIntoBlocks(remend(prefixMarkdown)).map((content) =>
++              this.createBlock(content),
++            );
++      const source =
++        candidate.isClosed &&
++        keepsIdentity &&
++        previousCodeTail &&
++        (candidate.rawSource === `${previousCodeTail.source}\n` ||
++          candidate.rawSource === `${previousCodeTail.source}\r\n`)
++          ? previousCodeTail.source
++          : candidate.rawSource;
++
++      terminalCodeTail = {
++        blockId: shellBlock.id,
++        fenceMarkdown: candidate.fenceMarkdown,
++        id: keepsIdentity
++          ? previousCodeTail.id
++          : `terminal-code:${this.epoch}:${this.nextBlockIdentity++}`,
++        isClosed: candidate.isClosed,
++        language: candidate.language,
++        openingLine: candidate.openingLine,
++        openingOffset: candidate.openingOffset,
++        prefixBlocks,
++        prefixMarkdown,
++        source,
++        sourceOffset,
++      };
++    }
++
++    const canonicalRender = {
++      chunks: this.committedChunks,
++      committedBlockCount: this.committedBlocks.length,
++      epoch: this.epoch,
++      markdown,
++      shellMarkdown,
++      sourceShellMarkdown,
++      tail,
++      terminalCodeTail,
++    } satisfies IncrementalMarkdownRender;
++    return this.publishCanonicalRender(canonicalRender);
+   }
+ 
+   // The repair of a tail sitting inside an open fence, or null to repair the
+@@ -971,19 +1445,41 @@ export class IncrementalMarkdownCache {
+   }
+ 
+   private resetIncrementalState(markdown: string): void {
+-    this.droppedRetainedBlocks ||= this.committedBlocks.length > 0;
++    const invalidatesRenderedBlocks =
++      this.lastRender !== null ||
++      this.committedBlocks.length > 0 ||
++      this.tailBlocks.length > 0;
++    if (invalidatesRenderedBlocks) {
++      this.epoch += 1;
++    }
+     this.source = markdown;
+     this.tail = markdown;
+     this.committedBlocks = [];
++    this.committedChunks = [];
++    this.tailBlocks = [];
+     this.committedLength = 0;
+     this.commitPoints = [];
+     this.context = createRetainedContext();
++    this.lastCanonicalRender = null;
++    this.lastRender = null;
+   }
+ 
+   private renderFullDocument(markdown: string): IncrementalMarkdownRender {
+-    this.resetIncrementalState(markdown);
+-    this.fullDocumentMode = true;
+-    return this.render(remend(markdown));
++
++    const previousCodeTail = this.lastRender?.terminalCodeTail ?? null;
++    if (!this.fullDocumentMode) {
++      this.resetIncrementalState(markdown);
++      this.fullDocumentMode = true;
++    } else {
++      this.source = markdown;
++      this.tail = markdown;
++    }
++    const repaired = remend(markdown);
++    return this.render(
++      repaired,
++      parseMarkdownIntoBlocks(repaired),
++      previousCodeTail,
++    );
+   }
+ 
+   // The text handed to the cache is not always an extension of the last one:
+@@ -1026,7 +1522,7 @@ export class IncrementalMarkdownCache {
+     let scanned = this.committedLength;
+     while (blocksBeforeLimit > 0 && scanned > safeLimit) {
+       blocksBeforeLimit -= 1;
+-      scanned -= this.committedBlocks[blocksBeforeLimit].length;
++      scanned -= this.committedBlocks[blocksBeforeLimit].content.length;
+     }
+     const blockLimit = blocksBeforeLimit - ROLLBACK_BLOCKS;
+     if (blockLimit <= 0) {
+@@ -1048,10 +1544,14 @@ export class IncrementalMarkdownCache {
+     const point = this.commitPoints[index];
+     if (point.length < this.committedLength) {
+       this.rewoundCharacters += this.committedLength - point.length;
++      const rewoundBlocks = this.committedBlocks.slice(point.blockCount);
+       this.committedBlocks.length = point.blockCount;
+       this.committedLength = point.length;
+       this.commitPoints.length = index + 1;
+-      this.droppedRetainedBlocks = true;
++      // Let blocks handed back to the mutable tail retain their identities when
++      // the repaired sequence still has the same positional shape.
++      this.tailBlocks = [...rewoundBlocks, ...this.tailBlocks];
++      this.syncCommittedChunks();
+     }
+ 
+     this.context = point.context;
+@@ -1072,7 +1572,12 @@ export class IncrementalMarkdownCache {
+     this.source = markdown;
+   }
+ 
+-  update(rawMarkdown: string): IncrementalMarkdownRender {
++  update(
++    rawMarkdown: string,
++    isStreaming = true,
++  ): IncrementalMarkdownRender {
++    const streamingChanged = this.isStreaming !== isStreaming;
++    this.isStreaming = isStreaming;
+     // Every boundary this class finds is a byte offset into the text it was
+     // handed, but the blocks it compares against come back from Streamdown with
+     // their line endings already normalised. On a CRLF reply the two disagree
+@@ -1080,19 +1585,18 @@ export class IncrementalMarkdownCache {
+     // `"para\r"`, nothing is ever committed, and the whole reply re-repairs and
+     // re-lexes on every frame. Normalise first so both sides speak LF.
+     const markdown = normalizeLineEndings(rawMarkdown);
+-
+     // Tokens arrive faster than frames, so the coalescer hands the same text to
+-    // several renders. Nothing about the result can differ, and repeating the
+-    // work would be the whole reply again once the document path is in use.
+-    if (markdown === this.source && this.lastMarkdown !== null) {
+-      return {
+-        markdown: this.lastMarkdown,
+-        parseMarkdownIntoBlocks: this.parseMarkdownIntoBlocks,
+-      };
++    // several renders. Nothing about the result can differ; return the exact
++    // same plan object so context consumers also do no work.
++    if (
++      !streamingChanged &&
++      markdown === this.source &&
++      this.lastRender !== null
++    ) {
++      return this.lastRender;
+     }
+ 
+     if (this.fullDocumentMode && hasPrefix(markdown, this.source)) {
+-      this.source = markdown;
+       return this.renderFullDocument(markdown);
+     }
+ 
+@@ -1104,18 +1608,14 @@ export class IncrementalMarkdownCache {
+     // Streamdown deliberately turns a repaired document containing footnotes
+     // into one block so definitions can resolve references anywhere in the
+     // document. Such a construct is globally scoped and cannot retain a prefix.
+-    if (
+-      FOOTNOTE_REFERENCE_RE.test(repaired) ||
+-      FOOTNOTE_DEFINITION_RE.test(repaired)
+-    ) {
++    if (hasFootnoteConstruct(repaired)) {
+       return this.renderFullDocument(markdown);
+     }
+ 
+     const blocks = parseMarkdownIntoBlocks(repaired);
+-
+     const candidateCount = Math.max(0, blocks.length - ROLLBACK_BLOCKS);
+     if (candidateCount === 0) {
+-      return this.render(repaired);
++      return this.render(repaired, blocks);
+     }
+ 
+     const commit = findCommitBoundary(this.tail, blocks, candidateCount);
+@@ -1128,7 +1628,7 @@ export class IncrementalMarkdownCache {
+       if (commit.repairBroke || this.tail.length > STALLED_TAIL_CHARACTERS) {
+         return this.renderFullDocument(markdown);
+       }
+-      return this.render(repaired);
++      return this.render(repaired, blocks);
+     }
+ 
+     const committedText = this.tail.slice(0, commit.length);
+@@ -1139,16 +1639,15 @@ export class IncrementalMarkdownCache {
+     );
+     const nextTail = this.tail.slice(commit.length);
+     const nextMarkdown = repairTail(nextTail, nextContext);
+-
+-    // A repeating reply can leave the tail unchanged once a block is retained.
+-    // Streamdown would then see the Markdown it already holds and skip the
+-    // render, so the retained blocks would never be displayed. Keep them in the
+-    // live tail instead; the next update commits them with a longer string.
+-    if (nextMarkdown === this.lastMarkdown) {
+-      return this.render(repaired);
+-    }
+-
+-    this.committedBlocks.push(...blocks.slice(0, commit.count));
++    // Preserve the previous terminal occurrence while every reconciled block is
++    // still present. A close can promote that block in this same update, so doing
++    // this after the committed/tail split loses its exact terminal line ending.
++    const reconciled = this.preserveTerminalCodeSource(
++      this.reconcileTailBlocks(blocks),
++      this.lastRender?.terminalCodeTail ?? null,
++    );
++    this.committedBlocks.push(...reconciled.slice(0, commit.count));
++    this.tailBlocks = reconciled.slice(commit.count);
+     this.committedLength += commit.length;
+     this.context = nextContext;
+     this.tail = nextTail;
+@@ -1157,8 +1656,9 @@ export class IncrementalMarkdownCache {
+       length: this.committedLength,
+       context: nextContext,
+     });
++    this.syncCommittedChunks();
+ 
+-    return this.render(nextMarkdown);
++    return this.render(nextMarkdown, parseMarkdownIntoBlocks(nextMarkdown));
+   }
+ }
+ 
+diff --git a/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts b/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts
+new file mode 100644
+index 000000000..98ab24f2d
+--- /dev/null
++++ b/studio/frontend/src/components/assistant-ui/streaming-text-presentation.ts
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++// Keep ordinary replies at paint cadence. Beyond 24 KiB, the real-model trace
++// already contains enough rich content that 60 publication attempts per second
++// create more mutation/reconciliation work than visible progress. 75 ms lands
++// at 12.5 Hz on a 60 Hz display, inside the requested smooth 12-15 Hz band.
++export const LONG_STREAM_PRESENTATION_CHARS = 24 * 1024;
++export const LONG_STREAM_PRESENTATION_MS = 75;
++
++type FrameHandle = number;
++type BrowserTimerHandle = ReturnType<typeof setTimeout>;
++
++type PresentationEnvironment<TimerHandle, Value> = {
++  publish: (value: Value) => void;
++  now: () => number;
++  requestFrame: (callback: FrameRequestCallback) => FrameHandle;
++  cancelFrame: (handle: FrameHandle) => void;
++  setTimer: (callback: () => void, delay: number) => TimerHandle;
++  clearTimer: (handle: TimerHandle) => void;
++};
++
++export type StreamingTextPresentationScheduler<Value> = {
++  cancel: () => void;
++  flush: (value: Value) => void;
++  schedule: (sourceCharacters: number, value: Value) => void;
++};
++
++export function createStreamingTextPresentationScheduler<TimerHandle, Value>({
++  publish,
++  now,
++  requestFrame,
++  cancelFrame,
++  setTimer,
++  clearTimer,
++}: PresentationEnvironment<TimerHandle, Value>): StreamingTextPresentationScheduler<Value> {
++  let frame: FrameHandle | null = null;
++  let timer: TimerHandle | null = null;
++  let scheduledLong = false;
++  let lastPublishedAt = Number.NEGATIVE_INFINITY;
++  let pendingValue!: Value;
++  let hasPending = false;
++
++  const cancelScheduled = (): void => {
++    if (frame !== null) {
++      cancelFrame(frame);
++      frame = null;
++    }
++    if (timer !== null) {
++      clearTimer(timer);
++      timer = null;
++    }
++  };
++
++  const cancel = (): void => {
++    cancelScheduled();
++    hasPending = false;
++  };
++
++  const publishOnFrame = (): void => {
++    frame = requestFrame(() => {
++      frame = null;
++      if (!hasPending) return;
++      const value = pendingValue;
++      hasPending = false;
++      lastPublishedAt = now();
++      publish(value);
++    });
++  };
++
++  const schedule = (sourceCharacters: number, value: Value): void => {
++    pendingValue = value;
++    hasPending = true;
++    const long = sourceCharacters >= LONG_STREAM_PRESENTATION_CHARS;
++    if (frame !== null || timer !== null) {
++      if (scheduledLong === long) return;
++      // A replacement can turn a long reply into a short one. Do not leave its
++      // first visible update waiting behind the long-tail timer.
++      cancelScheduled();
++    }
++    scheduledLong = long;
++    if (!long) {
++      publishOnFrame();
++      return;
++    }
++
++    const delay = Math.max(
++      0,
++      LONG_STREAM_PRESENTATION_MS - (now() - lastPublishedAt),
++    );
++    if (delay === 0) {
++      publishOnFrame();
++      return;
++    }
++    timer = setTimer(() => {
++      timer = null;
++      publishOnFrame();
++    }, delay);
++  };
++
++  const flush = (value: Value): void => {
++    cancelScheduled();
++    hasPending = false;
++    lastPublishedAt = now();
++    publish(value);
++  };
++
++  return { cancel, flush, schedule };
++}
++
++type AfterPaintEnvironment<TimerHandle> = Pick<
++  PresentationEnvironment<TimerHandle, never>,
++  "requestFrame" | "cancelFrame" | "setTimer" | "clearTimer"
++>;
++
++const browserAfterPaintEnvironment = (): AfterPaintEnvironment<BrowserTimerHandle> => ({
++  requestFrame: (callback) => requestAnimationFrame(callback),
++  cancelFrame: (handle) => cancelAnimationFrame(handle),
++  setTimer: (callback, delay) => setTimeout(callback, delay),
++  clearTimer: (handle) => clearTimeout(handle),
++});
++
++// Two animation frames guarantee the plain, source-complete code block and the
++// completion UI get a paint opportunity before a potentially expensive final
++// TextMate pass. The zero-delay task then starts colourization outside the RAF.
++export function scheduleAfterPaint(
++  callback: () => void,
++): () => void;
++export function scheduleAfterPaint<TimerHandle>(
++  callback: () => void,
++  environment: AfterPaintEnvironment<TimerHandle>,
++): () => void;
++export function scheduleAfterPaint<TimerHandle = BrowserTimerHandle>(
++  callback: () => void,
++  environment: AfterPaintEnvironment<TimerHandle> =
++    browserAfterPaintEnvironment() as unknown as AfterPaintEnvironment<TimerHandle>,
++): () => void {
++  let firstFrame: FrameHandle | null = null;
++  let secondFrame: FrameHandle | null = null;
++  let timer: TimerHandle | null = null;
++  let cancelled = false;
++
++  firstFrame = environment.requestFrame(() => {
++    firstFrame = null;
++    secondFrame = environment.requestFrame(() => {
++      secondFrame = null;
++      timer = environment.setTimer(() => {
++        timer = null;
++        if (!cancelled) callback();
++      }, 0);
++    });
++  });
++
++  return () => {
++    cancelled = true;
++    if (firstFrame !== null) environment.cancelFrame(firstFrame);
++    if (secondFrame !== null) environment.cancelFrame(secondFrame);
++    if (timer !== null) environment.clearTimer(timer);
++  };
++}
+diff --git a/studio/frontend/tests/markdown-block-remount-on-complete.test.ts b/studio/frontend/tests/markdown-block-remount-on-complete.test.ts
+index a3467e5a9..a4989d8dc 100644
+--- a/studio/frontend/tests/markdown-block-remount-on-complete.test.ts
++++ b/studio/frontend/tests/markdown-block-remount-on-complete.test.ts
+@@ -19,6 +19,22 @@ const source = ts.createSourceFile(
+   ts.ScriptKind.TSX,
+ );
+ 
++function findVariable(name: string): ts.VariableDeclaration | null {
++  let found: ts.VariableDeclaration | null = null;
++  const visit = (node: ts.Node): void => {
++    if (
++      ts.isVariableDeclaration(node) &&
++      ts.isIdentifier(node.name) &&
++      node.name.text === name
++    ) {
++      found = node;
++    }
++    node.forEachChild(visit);
++  };
++  source.forEachChild(visit);
++  return found;
++}
++
+ function findFunction(name: string): ts.FunctionDeclaration | null {
+   let found: ts.FunctionDeclaration | null = null;
+   const visit = (node: ts.Node): void => {
+@@ -42,8 +58,42 @@ const NULL_ANIMATION_PLUGIN_RE = /animatePlugin:\s*null/;
+ // spelling rather than loosened, because a version with memo INSIDE the boundary
+ // would render one component per block per token and no output test could tell
+ // the two apart.
+-const MEMOISED_BLOCK_RE =
+-  /const\s+StreamdownBlock\s*=\s*memo\(\s*\(props: BlockProps\) => \(\s*<MarkdownBlockBoundary content=\{props\.content\}>\s*<StreamdownBlockContent \{\.\.\.props\} \/>/;
++// Checked structurally rather than by matching source text. The regex this
++// replaced also pinned the PARAMETER ANNOTATION, `(props: BlockProps)`, which is
++// not part of the property and which the long-thinking-stream merge had to widen
++// to `StreamdownBlockProps`: that branch passes `codeFences`,
++// `canonicalCodeSource`, `sourceContent`, `actionsDisabled` and `isFenceOpen`
++// through the block component, and the narrower annotation rejects all of them.
++// A regex cannot tell an annotation change from a nesting change, so it failed on
++// the one that is harmless and would have kept passing had someone merely
++// reformatted the one that is not.
++function memoisedBlockBoundaryTag(): string | null {
++  const declaration = findVariable("StreamdownBlock");
++  const initializer = declaration?.initializer;
++  if (
++    !initializer ||
++    !ts.isCallExpression(initializer) ||
++    !ts.isIdentifier(initializer.expression) ||
++    initializer.expression.text !== "memo"
++  ) {
++    return null;
++  }
++  const inner = initializer.arguments[0];
++  if (!inner || !ts.isArrowFunction(inner)) return null;
++  let body: ts.Node = inner.body;
++  while (ts.isParenthesizedExpression(body)) body = body.expression;
++  if (!ts.isJsxElement(body)) return null;
++  const wrapper = body.openingElement.tagName.getText(source);
++  const child = body.children.find(
++    (node) => ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node),
++  );
++  const childTag = child
++    ? ts.isJsxElement(child)
++      ? child.openingElement.tagName.getText(source)
++      : child.tagName.getText(source)
++    : null;
++  return childTag === "StreamdownBlockContent" ? wrapper : null;
++}
+ 
+ test("the block props use the animation-free plugin list", () => {
+   const helper = findFunction("useAnimationFreeBlockProps");
+@@ -88,5 +138,15 @@ test("every Markdown block receives the animation-free props", () => {
+ });
+ 
+ test("completed custom blocks are memoised while the tail streams", () => {
+-  assert.match(source.getText(), MEMOISED_BLOCK_RE);
++  // `memo` OUTERMOST is the property. On a memo hit React skips the boundary and
++  // the block together, exactly as it did before the boundary existed. With memo
++  // INSIDE the boundary this would render one component per block per token, and
++  // no output test could tell the two apart -- which is why it is pinned here.
++  assert.equal(
++    memoisedBlockBoundaryTag(),
++    "MarkdownBlockBoundary",
++    "StreamdownBlock is not memo(...) wrapping MarkdownBlockBoundary around " +
++      "StreamdownBlockContent, so either the boundary moved outside the memo or " +
++      "the block is no longer boundaried at all",
++  );
+ });
+diff --git a/studio/frontend/tests/markdown-streaming-scheduling.test.ts b/studio/frontend/tests/markdown-streaming-scheduling.test.ts
+index 6385f0418..a768c1545 100644
+--- a/studio/frontend/tests/markdown-streaming-scheduling.test.ts
++++ b/studio/frontend/tests/markdown-streaming-scheduling.test.ts
+@@ -118,7 +118,7 @@ test("token updates keep Streamdown's expensive configuration props stable", ()
+   }
+ });
+ 
+-test("stream updates are paint-coalesced without a time or length throttle", () => {
++test("stream updates use the paint-aware bounded presentation scheduler", () => {
+   const markdownSource = source.getText();
+   const hookStart = markdownSource.indexOf(
+     "function useCoalescedStreamingText",
+@@ -127,8 +127,9 @@ test("stream updates are paint-coalesced without a time or length throttle", ()
+   assert.ok(hookStart >= 0 && hookEnd > hookStart);
+   const hook = markdownSource.slice(hookStart, hookEnd);
+ 
+-  assert.ok(hook.includes("requestAnimationFrame"));
+-  assert.ok(!hook.includes("setTimeout"));
++  assert.ok(hook.includes("createStreamingTextPresentationScheduler"));
++  assert.ok(hook.includes("scheduler.schedule(text.length, pending)"));
++  assert.ok(hook.includes("scheduler.flush(pending)"));
+ 
+   // A running message can be replaced rather than appended to, as the audio
+   // path does when it swaps its placeholder for the player, so holding the last
+@@ -154,30 +155,110 @@ test("stream updates are paint-coalesced without a time or length throttle", ()
+   );
+ });
+ 
+-test("streaming reparses only the active Markdown tail", () => {
++test("one Streamdown provider shell owns only the final mutable block", () => {
+   const streamdown = findChatStreamdown();
+   assert.ok(streamdown, "chat <Streamdown> is missing");
+   assert.equal(
+     jsxAttribute(streamdown, "parseIncompleteMarkdown")?.initializer?.getText(
+       source,
+     ),
+-    "{!incrementalRender}",
++    "{false}",
+   );
+   assert.equal(
+     jsxAttribute(streamdown, "parseMarkdownIntoBlocksFn")?.initializer?.getText(
+       source,
+     ),
+-    "{incrementalRender?.parseMarkdownIntoBlocks}",
++    "{parseProviderShellBlock}",
++  );
++  assert.equal(
++    jsxAttribute(streamdown, "BlockComponent")?.initializer?.getText(source),
++    "{PartitionedStreamdownShell}",
+   );
+ });
+ 
+-test("dropping retained blocks moves Streamdown's render identity", () => {
+-  // Streamdown compares only the Markdown string, so an edit that clears the
+-  // retained blocks while leaving the live tail alone has to remount instead.
++test("completion keeps the same provider shell and committed chunks are memoized", () => {
+   const streamdown = findChatStreamdown();
+   assert.ok(streamdown, "chat <Streamdown> is missing");
+   assert.equal(
+     jsxAttribute(streamdown, "key")?.initializer?.getText(source),
+-    "{`${messageId}:${incrementalCache.renderGeneration}`}",
++    "{messageId}",
++    "completion must not remount the document",
++  );
++
++  const markdownSource = source.getText();
++  const chunksStart = markdownSource.indexOf(
++    "const StableCommittedChunks = memo(",
++  );
++  const chunksEnd = markdownSource.indexOf(
++    "function PartitionedStreamdownBlock",
++    chunksStart,
++  );
++  assert.ok(chunksStart >= 0 && chunksEnd > chunksStart);
++  const chunksMemo = markdownSource.slice(chunksStart, chunksEnd);
++  assert.match(chunksMemo, /previous\.chunks === next\.chunks/);
++  assert.doesNotMatch(
++    chunksMemo,
++    /previous\.shellProps === next\.shellProps/,
++    "the provider shell creates a new wrapper props object per token",
++  );
++
++  const chunkStart = markdownSource.indexOf(
++    "const StableCommittedChunk = memo(",
++  );
++  const chunkEnd = markdownSource.indexOf(
++    "type StableCommittedChunksProps",
++    chunkStart,
++  );
++  assert.ok(chunkStart >= 0 && chunkEnd > chunkStart);
++  assert.match(
++    markdownSource.slice(chunkStart, chunkEnd),
++    /previous\.chunk === next\.chunk/,
++  );
++
++  const partitionStart = markdownSource.indexOf(
++    "function PartitionedStreamdownBlock",
++  );
++  const partitionEnd = markdownSource.indexOf(
++    "const PartitionedStreamdownShell",
++    partitionStart,
++  );
++  assert.ok(partitionStart >= 0 && partitionEnd > partitionStart);
++  assert.doesNotMatch(
++    markdownSource.slice(partitionStart, partitionEnd),
++    /plan\.chunks\.map/,
++    "a token-only context update must not map the committed chunk list",
++  );
++});
++
++test("syntactic fence openness is independent from stream and action state", () => {
++  const markdownSource = source.getText();
++  const tailStart = markdownSource.indexOf("function TerminalCodeTail");
++  const tailEnd = markdownSource.indexOf(
++    "function PartitionedStreamdownBlock",
++    tailStart,
++  );
++  assert.ok(tailStart >= 0 && tailEnd > tailStart);
++  const tail = markdownSource.slice(tailStart, tailEnd);
++
++  assert.match(tail, /const isFenceOpen = !codeTail\.isClosed/);
++  assert.match(tail, /const isStreaming = shellProps\.isIncomplete/);
++  assert.match(tail, /const actionsDisabled = isFenceOpen && isStreaming/);
++  assert.match(tail, /isFenceOpen=\{isFenceOpen\}/);
++  assert.match(tail, /isIncomplete=\{actionsDisabled\}/);
++
++  const blockStart = markdownSource.indexOf("function StreamdownBlockContent");
++  const blockEnd = markdownSource.indexOf(
++    "const StreamdownBlock = memo",
++    blockStart,
++  );
++  assert.ok(blockStart >= 0 && blockEnd > blockStart);
++  const block = markdownSource.slice(blockStart, blockEnd);
++
++  // A fence the reply never closed holds a truncated document, so completion of
++  // the transport alone must not promote it to an SVG preview or an artifact.
++  assert.match(block, /!isFenceOpen && !props\.isIncomplete && isSvgFence/);
++  assert.match(
++    block,
++    /!messageHasRenderableRenderHtmlTool &&\s*!isFenceOpen &&\s*!props\.isIncomplete/,
+   );
+ });
+diff --git a/studio/frontend/tests/streamdown-provider-shell.test.ts b/studio/frontend/tests/streamdown-provider-shell.test.ts
+new file mode 100644
+index 000000000..76c1f82a0
+--- /dev/null
++++ b/studio/frontend/tests/streamdown-provider-shell.test.ts
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import { createElement, Fragment, type ReactNode } from "react";
++import { renderToStaticMarkup } from "react-dom/server";
++import remend from "remend";
++import {
++  Block,
++  type BlockProps,
++  Streamdown,
++  parseMarkdownIntoBlocks,
++} from "streamdown";
++
++const renderMonolithic = (markdown: string): string =>
++  renderToStaticMarkup(
++    createElement(
++      Streamdown,
++      {
++        controls: { code: true },
++        isAnimating: true,
++        mode: "streaming",
++      },
++      markdown,
++    ),
++  );
++
++function renderThroughProviderShell(markdown: string): {
++  html: string;
++  shellIsIncomplete: boolean;
++} {
++  const repaired = remend(markdown);
++  const blocks = parseMarkdownIntoBlocks(repaired);
++  const shellMarkdown = blocks.at(-1) ?? "";
++  let shellIsIncomplete = false;
++
++  const ShellBlock = (shellProps: BlockProps): ReactNode => {
++    shellIsIncomplete = shellProps.isIncomplete;
++    return createElement(
++      Fragment,
++      null,
++      ...blocks.map((content, index) =>
++        createElement(Block, {
++          ...shellProps,
++          content,
++          index,
++          isIncomplete:
++            index === blocks.length - 1 && shellProps.isIncomplete,
++          key: index,
++        }),
++      ),
++    );
++  };
++
++  const html = renderToStaticMarkup(
++    createElement(
++      Streamdown,
++      {
++        BlockComponent: ShellBlock,
++        controls: { code: true },
++        isAnimating: true,
++        mode: "streaming",
++        parseIncompleteMarkdown: false,
++        parseMarkdownIntoBlocksFn: (content) => [content],
++      },
++      shellMarkdown,
++    ),
++  );
++  return { html, shellIsIncomplete };
++}
++
++test("one custom block can fan out under Streamdown's provider shell without changing layout", () => {
++  for (const markdown of [
++    "# Heading\n\nParagraph with **bold** and a [link](https://example.com).",
++    "> quoted\n\n- one\n- two\n\n| a | b |\n| - | - |\n| 1 | 2 |",
++    "Before\n\n```ts\nconst answer = 42;\n```\n\nAfter",
++  ]) {
++    assert.equal(
++      renderThroughProviderShell(markdown).html,
++      renderMonolithic(markdown),
++      JSON.stringify(markdown),
++    );
++  }
++});
++
++test("the provider shell receives and preserves incomplete-fence state", () => {
++  const markdown = "Before\n\n```ts\nconst answer = 42;";
++  const monolithic = renderMonolithic(markdown);
++  const shell = renderThroughProviderShell(markdown);
++
++  assert.equal(shell.shellIsIncomplete, true);
++  assert.match(shell.html, /data-incomplete="true"/);
++  assert.equal(shell.html, monolithic);
++});
+diff --git a/studio/frontend/tests/streaming-crlf-retention.test.ts b/studio/frontend/tests/streaming-crlf-retention.test.ts
+index bd035c182..0cead530e 100644
+--- a/studio/frontend/tests/streaming-crlf-retention.test.ts
++++ b/studio/frontend/tests/streaming-crlf-retention.test.ts
+@@ -10,6 +10,8 @@ import { stabilizeStreamingMarkdown } from "../src/components/assistant-ui/strea
+ import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
+ import { preprocessLaTeX } from "../src/lib/latex.ts";
+ 
++import { renderBlockContents } from "./streaming-render-plan.ts";
++
+ const processStreamingText = (text: string): string =>
+   stabilizeStreamingMarkdown(preprocessLaTeX(text), true);
+ 
+@@ -37,10 +39,10 @@ function stream(reply: string, step: number) {
+   let blocks: string[] = [];
+   for (let length = step; length <= reply.length; length += step) {
+     const render = cache.update(processStreamingText(reply.slice(0, length)));
+-    blocks = render.parseMarkdownIntoBlocks(render.markdown);
++    blocks = renderBlockContents(render);
+   }
+   const render = cache.update(processStreamingText(reply));
+-  blocks = render.parseMarkdownIntoBlocks(render.markdown);
++  blocks = renderBlockContents(render);
+   const internals = cache as unknown as { committedLength: number };
+   return { blocks, retained: internals.committedLength };
+ }
+@@ -96,7 +98,7 @@ test("a CRLF reply matches a whole-document split at every prefix", () => {
+       const input = processStreamingText(source.slice(0, length));
+       const render = cache.update(input);
+       assert.deepEqual(
+-        render.parseMarkdownIntoBlocks(render.markdown),
++        renderBlockContents(render),
+         parseMarkdownIntoBlocks(remend(asLf(input))),
+         `block mismatch at prefix ${length} of ${JSON.stringify(source.slice(0, 60))}`,
+       );
+@@ -116,7 +118,7 @@ test("an LF reply is untouched by the line-ending handling", () => {
+     const input = processStreamingText(reply.slice(0, length));
+     const render = cache.update(input);
+     assert.deepEqual(
+-      render.parseMarkdownIntoBlocks(render.markdown),
++      renderBlockContents(render),
+       parseMarkdownIntoBlocks(remend(input)),
+       `block mismatch at prefix ${length}`,
+     );
+diff --git a/studio/frontend/tests/streaming-latex-corpus.test.ts b/studio/frontend/tests/streaming-latex-corpus.test.ts
+index ebf70ab83..b41513999 100644
+--- a/studio/frontend/tests/streaming-latex-corpus.test.ts
++++ b/studio/frontend/tests/streaming-latex-corpus.test.ts
+@@ -28,6 +28,11 @@ import { stabilizeStreamingMarkdown } from "../src/components/assistant-ui/strea
+ import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
+ import { preprocessLaTeX } from "../src/lib/latex.ts";
+ 
++import {
++  committedBlockContents,
++  renderBlockContents,
++} from "./streaming-render-plan.ts";
++
+ const processStreamingText = (text: string): string =>
+   stabilizeStreamingMarkdown(preprocessLaTeX(text), true);
+ 
+@@ -165,10 +170,10 @@ function assertMatchesFullSplit(
+     const render = cache.update(input);
+     everRetained = Math.max(
+       everRetained,
+-      render.parseMarkdownIntoBlocks("").length,
++      committedBlockContents(render).length,
+     );
+     assert.deepEqual(
+-      render.parseMarkdownIntoBlocks(render.markdown),
++      renderBlockContents(render),
+       parseMarkdownIntoBlocks(remend(input)),
+       `block mismatch at prefix ${length} of ${name}: ${JSON.stringify(source.slice(0, 200))}`,
+     );
+@@ -243,7 +248,7 @@ test("rebuilds of the retained prefix do not grow with the reply", () => {
+     let retained = 0;
+     for (let length = 24; length <= reply.length; length += 24) {
+       const render = cache.update(processStreamingText(reply.slice(0, length)));
+-      retained = render.parseMarkdownIntoBlocks("").join("").length;
++      retained = committedBlockContents(render).join("").length;
+     }
+     return {
+       rebuilds: (cache as unknown as { retainedPrefixRebuilds: number })
+diff --git a/studio/frontend/tests/streaming-latex-retro-edit.test.ts b/studio/frontend/tests/streaming-latex-retro-edit.test.ts
+index f02c65c64..632846ede 100644
+--- a/studio/frontend/tests/streaming-latex-retro-edit.test.ts
++++ b/studio/frontend/tests/streaming-latex-retro-edit.test.ts
+@@ -10,6 +10,11 @@ import { stabilizeStreamingMarkdown } from "../src/components/assistant-ui/strea
+ import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
+ import { preprocessLaTeX } from "../src/lib/latex.ts";
+ 
++import {
++  committedBlockContents,
++  renderBlockContents,
++} from "./streaming-render-plan.ts";
++
+ const processStreamingText = (text: string): string =>
+   stabilizeStreamingMarkdown(preprocessLaTeX(text), true);
+ 
+@@ -24,11 +29,7 @@ const rebuilds = (cache: IncrementalMarkdownCache): number =>
+ const rewound = (cache: IncrementalMarkdownCache): number =>
+   (cache as unknown as { rewoundCharacters: number }).rewoundCharacters;
+ 
+-// `parseMarkdownIntoBlocks("")` splits to nothing, so passing an empty string
+-// returns exactly the blocks the cache has retained.
+-const retainedBlocks = (render: {
+-  parseMarkdownIntoBlocks: (markdown: string) => string[];
+-}): string[] => render.parseMarkdownIntoBlocks("");
++const retainedBlocks = committedBlockContents;
+ 
+ // Prose, inline math, display math, a list, a fence and currency: what an
+ // answer to a modelling question actually looks like.
+@@ -245,7 +246,7 @@ test("retaining across a rewrite still matches a full Streamdown split", () => {
+       const input = processStreamingText(reply.slice(0, length));
+       const render = cache.update(input);
+       assert.deepEqual(
+-        render.parseMarkdownIntoBlocks(render.markdown),
++        renderBlockContents(render),
+         parseMarkdownIntoBlocks(remend(input)),
+         `block mismatch at prefix ${length}`,
+       );
+@@ -274,7 +275,7 @@ test("a rewind restores the repair context of the commit it lands on", () => {
+     const input = processStreamingText(reply.slice(0, length));
+     const render = cache.update(input);
+     assert.deepEqual(
+-      render.parseMarkdownIntoBlocks(render.markdown),
++      renderBlockContents(render),
+       parseMarkdownIntoBlocks(remend(input)),
+       `block mismatch at prefix ${length}`,
+     );
+@@ -313,7 +314,7 @@ test("an edit that closes up a blank line cannot keep the block before it", () =
+     cache.update(source);
+     const render = cache.update(edited);
+     assert.deepEqual(
+-      render.parseMarkdownIntoBlocks(render.markdown),
++      renderBlockContents(render),
+       parseMarkdownIntoBlocks(remend(edited)),
+       `block mismatch after ${JSON.stringify(edited.slice(0, 24))}`,
+     );
+diff --git a/studio/frontend/tests/streaming-long-tail-presentation.test.ts b/studio/frontend/tests/streaming-long-tail-presentation.test.ts
+new file mode 100644
+index 000000000..f74c5806c
+--- /dev/null
++++ b/studio/frontend/tests/streaming-long-tail-presentation.test.ts
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import remend from "remend";
++import { parseMarkdownIntoBlocks } from "streamdown";
++
++import {
++  getCodeFenceFilename,
++  getStreamingCodeFence,
++  getTerminalStreamingCodeFence,
++  normalizeCodeFenceLanguage,
++} from "../src/components/assistant-ui/streaming-code-policy.ts";
++import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
++import {
++  LONG_STREAM_PRESENTATION_CHARS,
++  LONG_STREAM_PRESENTATION_MS,
++  createStreamingTextPresentationScheduler,
++  scheduleAfterPaint,
++} from "../src/components/assistant-ui/streaming-text-presentation.ts";
++import { renderBlockContents } from "./streaming-render-plan.ts";
++
++class FakeClock {
++  now = 0;
++  private nextHandle = 1;
++  private tasks = new Map<
++    number,
++    { at: number; callback: (now: number) => void }
++  >();
++
++  requestFrame = (callback: FrameRequestCallback): number => {
++    const handle = this.nextHandle++;
++    const at = Math.ceil((this.now + 0.001) / 16) * 16;
++    this.tasks.set(handle, { at, callback });
++    return handle;
++  };
++
++  cancelFrame = (handle: number): void => {
++    this.tasks.delete(handle);
++  };
++
++  setTimer = (callback: () => void, delay: number): number => {
++    const handle = this.nextHandle++;
++    // Even a zero-delay task runs after the current frame callback returns.
++    this.tasks.set(handle, {
++      at: this.now + Math.max(delay, 0.001),
++      callback: () => callback(),
++    });
++    return handle;
++  };
++
++  clearTimer = (handle: number): void => {
++    this.tasks.delete(handle);
++  };
++
++  advanceTo(target: number): void {
++    for (;;) {
++      const next = [...this.tasks.entries()]
++        .filter(([, task]) => task.at <= target)
++        .sort((left, right) => left[1].at - right[1].at)[0];
++      if (!next) break;
++      const [handle, task] = next;
++      this.tasks.delete(handle);
++      this.now = task.at;
++      task.callback(this.now);
++    }
++    this.now = target;
++  }
++}
++
++const codeSource = (characters: number): string => {
++  const line = 'export const row = { id: 42, label: "value" };\n';
++  return line.repeat(Math.ceil(characters / line.length)).slice(0, characters);
++};
++
++const prosePrefix = Array.from(
++  { length: 24 },
++  (_, index) => `Paragraph ${index} stays committed while the code grows.\n\n`,
++).join("");
++
++// Sizes only. These fixtures exercise a fence long enough to be the whole live
++// tail for many chunks; nothing here depends on a highlighting budget.
++const LARGE_CODE_CHARS = 4 * 1024;
++const VERY_LARGE_CODE_CHARS = 16 * 1024;
++
++test("terminal source survives marker, line-ending, close, completion, and reload", () => {
++  const prefix = "## Stable prefix\n\nParagraph with **bold** and a table.\n\n";
++  for (const target of [
++    VERY_LARGE_CODE_CHARS - 1,
++    VERY_LARGE_CODE_CHARS,
++    VERY_LARGE_CODE_CHARS + 1,
++  ]) {
++    for (const { lineEnding, marker } of [
++      { lineEnding: "\n", marker: "```" },
++      { lineEnding: "\r\n", marker: "~~~~" },
++    ]) {
++      const canonicalSource = codeSource(target);
++      const rawSource = canonicalSource.replaceAll("\n", lineEnding);
++      const rawPrefix = prefix.replaceAll("\n", lineEnding);
++      const opening = `${marker}typescript title="boundary.ts"${lineEnding}`;
++      const openMarkdown = rawPrefix + opening + rawSource;
++      const closedMarkdown = `${openMarkdown}${lineEnding}${marker}`;
++      const cache = new IncrementalMarkdownCache();
++
++      const open = cache.update(openMarkdown, true);
++      assert.equal(open.terminalCodeTail?.source, canonicalSource);
++
++      const closedWhileStreaming = cache.update(closedMarkdown, true);
++      assert.equal(closedWhileStreaming.terminalCodeTail?.isClosed, true);
++      assert.equal(
++        closedWhileStreaming.terminalCodeTail?.source,
++        canonicalSource,
++      );
++
++      const completed = cache.update(closedMarkdown, false);
++      assert.equal(completed.terminalCodeTail?.source, canonicalSource);
++
++      const reloaded = new IncrementalMarkdownCache().update(
++        closedMarkdown,
++        false,
++      );
++      assert.equal(reloaded.terminalCodeTail, null);
++      const reloadedFence = renderBlockContents(reloaded)
++        .map((content) => getStreamingCodeFence(content))
++        .find((fence) => fence !== null);
++      assert.equal(reloadedFence?.source, canonicalSource);
++    }
++  }
++});
++
++test("open fence extraction preserves exact bytes across supported fence forms", () => {
++  const backtickSource = "const first = 1;\r\n```\r\nconst last = 2;";
++  assert.deepEqual(
++    getStreamingCodeFence(
++      `   \`\`\`\`typescript title="generated.ts"\r\n${backtickSource}`,
++    ),
++    { language: "typescript", source: backtickSource },
++  );
++
++  const tildeSource = "alpha\n~~~\nomega";
++  assert.deepEqual(
++    getStreamingCodeFence(`~~~~ ts linenums\n${tildeSource}`),
++    { language: "ts", source: tildeSource },
++  );
++});
++
++test("a mixed mutable shell plans its terminal fence as its own tail block", () => {
++  const prefix = `## Live design\n\n${"Paragraph with **bold**, `inline code`, and a [link](https://example.com). ".repeat(
++    40,
++  )}The mutable paragraph still has *unfinished emphasis and a footnote[^live].\n\n`;
++  const source = codeSource(LARGE_CODE_CHARS + 2_000);
++  const opening = "````typescript title=generated.ts\n";
++  const plan = new IncrementalMarkdownCache().update(
++    `${prefix}${opening}${source}`,
++  );
++
++  assert.ok(
++    plan.terminalCodeTail,
++    "the mixed shell did not plan its terminal fence",
++  );
++  assert.equal(plan.terminalCodeTail.prefixMarkdown, prefix);
++  assert.equal(plan.terminalCodeTail.fenceMarkdown, opening + source);
++  assert.equal(plan.terminalCodeTail.source, source);
++  assert.equal(plan.terminalCodeTail.openingOffset, prefix.length);
++});
++
++test("stopped and cold unclosed terminal fences retain the bounded tail", () => {
++  const prefix =
++    "## Persisted malformed answer\n\n" +
++    "Surrounding **Markdown** remains rendered[^stable].\n\n" +
++    "| state | result |\n| --- | --- |\n| stopped | plain code |\n\n" +
++    "[^stable]: global provider definitions remain available.\n\n";
++  const opening = "```typescript title=generated.ts\n";
++  const source = codeSource(VERY_LARGE_CODE_CHARS + 1);
++  const markdown = prefix + opening + source;
++  const cache = new IncrementalMarkdownCache();
++
++  const running = cache.update(markdown, true);
++  const stopped = cache.update(markdown, false);
++  const cold = new IncrementalMarkdownCache().update(markdown, false);
++
++  assert.ok(running.terminalCodeTail);
++  assert.ok(stopped.terminalCodeTail);
++  assert.ok(cold.terminalCodeTail);
++  assert.equal(stopped.terminalCodeTail.id, running.terminalCodeTail.id);
++  for (const plan of [running, stopped, cold]) {
++    assert.equal(plan.terminalCodeTail?.isClosed, false);
++    assert.equal(plan.terminalCodeTail?.prefixMarkdown, prefix);
++    assert.equal(plan.terminalCodeTail?.source, source);
++  }
++});
++
++test("terminal fence extraction keeps exact offsets and rejects Markdown lookalikes", () => {
++  const prefix =
++    "> quoted prefix\r\n\r\nParagraph with **bold** and `inline code`.\r\n\r\n";
++  const source = `first\r\n${codeSource(LARGE_CODE_CHARS + 20)}`;
++  const opening = "  ~~~~typescript title=generated.ts\r\n";
++  assert.deepEqual(
++    getTerminalStreamingCodeFence(prefix + opening + source),
++    {
++      fenceMarkdown: opening + source,
++      isClosed: false,
++      language: "typescript",
++      openingLine: opening,
++      openingOffset: prefix.length,
++      rawSource: source,
++      source,
++    },
++  );
++
++  const ordinary = "ordinary prose ".repeat(400);
++  for (const markdown of [
++    `${prefix}\`inline ~~~ not a fence\`\n${ordinary}`,
++    `${prefix}    ~~~ts\n${ordinary}`,
++    `<div>\n~~~ts\n${ordinary}`,
++    `${prefix}~~~ts\n${ordinary}\n~~~\nAfter the closed fence.`,
++    ordinary,
++  ]) {
++    assert.equal(getTerminalStreamingCodeFence(markdown), null);
++  }
++});
++
++test("the mixed split keeps identity through growth and close, then invalidates narrowly", () => {
++  const prefix =
++    "## Rich prefix\n\nParagraph with **bold** and a footnote[^live].\n\n";
++  const opening = "````typescript meta\n";
++  const firstSource = codeSource(LARGE_CODE_CHARS + 200);
++  const cache = new IncrementalMarkdownCache();
++  const first = cache.update(prefix + opening + firstSource, true);
++  const firstTail = first.terminalCodeTail;
++  assert.ok(firstTail);
++
++  const grownSource = firstSource + codeSource(700);
++  const grown = cache.update(prefix + opening + grownSource, true);
++  assert.equal(grown.terminalCodeTail?.id, firstTail.id);
++  assert.equal(grown.terminalCodeTail?.prefixBlocks, firstTail.prefixBlocks);
++  assert.equal(grown.terminalCodeTail?.source, grownSource);
++
++  const rewoundSource = firstSource.slice(0, -100);
++  const rewound = cache.update(prefix + opening + rewoundSource, true);
++  assert.ok(rewound.terminalCodeTail);
++  assert.notEqual(
++    rewound.terminalCodeTail.id,
++    firstTail.id,
++    "a canonical source rewind retained the stale wrapper identity",
++  );
++  const regrown = cache.update(prefix + opening + grownSource, true);
++  assert.equal(regrown.terminalCodeTail?.id, rewound.terminalCodeTail.id);
++  assert.equal(regrown.terminalCodeTail?.source, grownSource);
++  const closedMarkdown = `${prefix}${opening}${grownSource}\n\`\`\`\``;
++  const closed = cache.update(closedMarkdown, false);
++  assert.equal(closed.terminalCodeTail?.id, regrown.terminalCodeTail?.id);
++  assert.equal(closed.terminalCodeTail?.isClosed, true);
++  assert.equal(closed.terminalCodeTail?.source, grownSource);
++  assert.deepEqual(
++    renderBlockContents(closed),
++    parseMarkdownIntoBlocks(remend(closedMarkdown)),
++  );
++
++  const historical = new IncrementalMarkdownCache().update(
++    closedMarkdown,
++    false,
++  );
++  assert.equal(
++    historical.terminalCodeTail,
++    null,
++    "a closed historical fence was split",
++  );
++
++  const replaced = cache.update(
++    `${prefix}\`\`not a fence\n${grownSource}`,
++    true,
++  );
++  assert.equal(replaced.terminalCodeTail, null);
++  assert.deepEqual(
++    renderBlockContents(replaced),
++    parseMarkdownIntoBlocks(remend(`${prefix}\`\`not a fence\n${grownSource}`)),
++  );
++});
++
++test("completion preserves a canonical trailing line ending for source actions", () => {
++  for (const { lineEnding, marker } of [
++    { lineEnding: "\n", marker: "```" },
++    { lineEnding: "\r\n", marker: "~~~~" },
++  ]) {
++    const prefix = `## Exact source${lineEnding}${lineEnding}`;
++    const opening = `${marker}typescript title="generated.ts"${lineEnding}`;
++    const source =
++      codeSource(LARGE_CODE_CHARS + 2_900).replaceAll("\n", lineEnding) +
++      lineEnding;
++    const canonicalSource = source.replaceAll("\r\n", "\n");
++    const cache = new IncrementalMarkdownCache();
++    const open = cache.update(prefix + opening + source, true);
++    assert.equal(open.terminalCodeTail?.source, canonicalSource);
++
++    const closed = cache.update(prefix + opening + source + marker, false);
++    assert.equal(closed.terminalCodeTail?.source, canonicalSource);
++  }
++});
++
++test("status completion before the final close keeps exact terminal source identity", () => {
++  const prefix =
++    "## Mixed terminal-fence fixture\n\n" +
++    "- first stable item\n- second stable item\n\n" +
++    "| phase | renderer |\n| --- | --- |\n| open | plain code |\n\n" +
++    "> Stable quote.\n\n" +
++    "$$x^2 + y^2 = z^2$$\n\n";
++  const source = `${codeSource(VERY_LARGE_CODE_CHARS)}\n`;
++  const opening = '```typescript title="boundary.ts"\n';
++  const openMarkdown = prefix + opening + source;
++  const completedMarkdown = `${openMarkdown}\`\`\`\n\n${"Settled after.\n\n".repeat(12)}`;
++  const cache = new IncrementalMarkdownCache();
++
++  for (let cursor = 512; cursor < openMarkdown.length; cursor += 512) {
++    cache.update(openMarkdown.slice(0, cursor), true);
++  }
++  const open = cache.update(openMarkdown, true);
++  assert.equal(open.terminalCodeTail?.source, source);
++
++  const statusFirst = cache.update(openMarkdown, false);
++  assert.equal(statusFirst.terminalCodeTail?.source, source);
++  const completed = cache.update(completedMarkdown, false);
++  const fence = [
++    ...completed.chunks.flatMap((chunk) => chunk.blocks),
++    ...completed.tail,
++  ]
++    .flatMap((block) => block.codeFences)
++    .find((candidate) => candidate.language === "typescript");
++  assert.equal(fence?.source, source);
++});
++
++test("fence metastrings stay out of language labels and filenames", () => {
++  assert.equal(
++    normalizeCodeFenceLanguage('  TypeScript\ttitle="generated.ts" {1,3}  '),
++    "TypeScript",
++  );
++  assert.equal(
++    getCodeFenceFilename('TypeScript title="generated.ts" {1,3}'),
++    "snippet.ts",
++  );
++  assert.equal(getCodeFenceFilename("custom lang metadata"), "snippet.custom");
++  assert.equal(normalizeCodeFenceLanguage(" \t "), null);
++  assert.equal(getCodeFenceFilename(" \t "), "snippet.txt");
++});
++
++test("deferred work cannot run before the pending render paints", () => {
++  const clock = new FakeClock();
++  let ran = 0;
++  const cancel = scheduleAfterPaint(
++    () => {
++      ran += 1;
++    },
++    {
++      requestFrame: clock.requestFrame,
++      cancelFrame: clock.cancelFrame,
++      setTimer: clock.setTimer,
++      clearTimer: clock.clearTimer,
++    },
++  );
++
++  clock.advanceTo(16);
++  assert.equal(ran, 0, "the first frame is reserved for the pending render");
++  clock.advanceTo(32);
++  assert.equal(ran, 0, "the second frame has not painted until it returns");
++  clock.advanceTo(32.001);
++  assert.equal(ran, 1);
++  cancel();
++});
++
++test("short streams remain frame-gated while long streams stay at or below 15 Hz", () => {
++  const clock = new FakeClock();
++  const commits: number[] = [];
++  const scheduler = createStreamingTextPresentationScheduler({
++    publish: () => commits.push(clock.now),
++    now: () => clock.now,
++    requestFrame: clock.requestFrame,
++    cancelFrame: clock.cancelFrame,
++    setTimer: clock.setTimer,
++    clearTimer: clock.clearTimer,
++  });
++
++  for (let at = 0; at <= 96; at += 4) {
++    clock.advanceTo(at);
++    scheduler.schedule(1000 + at, 1000 + at);
++  }
++  clock.advanceTo(128);
++  assert.ok(
++    commits.length >= 6,
++    `short stream committed only ${commits.length} frames`,
++  );
++
++  commits.length = 0;
++  for (let at = 200; at <= 2200; at += 8) {
++    clock.advanceTo(at);
++    scheduler.schedule(LONG_STREAM_PRESENTATION_CHARS + at, at);
++  }
++  clock.advanceTo(2400);
++  for (let index = 1; index < commits.length; index += 1) {
++    assert.ok(
++      commits[index] - commits[index - 1] >= 1000 / 15,
++      `${commits[index] - commits[index - 1]} ms between long-tail commits exceeds 15 Hz`,
++    );
++  }
++  assert.ok(
++    commits.length <= Math.ceil(2200 / LONG_STREAM_PRESENTATION_MS) + 1,
++    `long stream published ${commits.length} times in about two seconds`,
++  );
++});
++
++test("a completion flush cancels the cadence and publishes the exact pending value", () => {
++  const clock = new FakeClock();
++  let pending = "old";
++  const published: string[] = [];
++  const scheduler = createStreamingTextPresentationScheduler({
++    publish: (value: string) => published.push(value),
++    now: () => clock.now,
++    requestFrame: clock.requestFrame,
++    cancelFrame: clock.cancelFrame,
++    setTimer: clock.setTimer,
++    clearTimer: clock.clearTimer,
++  });
++
++  scheduler.schedule(LONG_STREAM_PRESENTATION_CHARS, pending);
++  clock.advanceTo(16);
++  pending = "complete exact value";
++  scheduler.schedule(LONG_STREAM_PRESENTATION_CHARS + pending.length, pending);
++  scheduler.flush(pending);
++  assert.equal(published.at(-1), pending);
++  const count = published.length;
++  clock.advanceTo(500);
++  assert.equal(
++    published.length,
++    count,
++    "a stale cadence fired after completion",
++  );
++});
++
++test("a 100K code stream bounds commits and never re-renders a committed chunk", () => {
++  const clock = new FakeClock();
++  const cache = new IncrementalMarkdownCache();
++  const body = codeSource(105_000);
++  let pendingBody = body.slice(0, LONG_STREAM_PRESENTATION_CHARS);
++  let pendingMarkdown = `${prosePrefix}\`\`\`typescript\n${pendingBody}`;
++  let finalPlan = cache.update(pendingMarkdown);
++  const firstChunks = new Map(
++    finalPlan.chunks.map((chunk) => [chunk.id, chunk]),
++  );
++  let repeatedCommittedChunkRenders = 0;
++  let openPresentations = 0;
++
++  const scheduler = createStreamingTextPresentationScheduler({
++    publish: ({
++      markdown,
++      incomplete,
++    }: {
++      markdown: string;
++      source: string;
++      incomplete: boolean;
++    }) => {
++      finalPlan = cache.update(markdown);
++      for (const chunk of finalPlan.chunks) {
++        const first = firstChunks.get(chunk.id);
++        if (first && first !== chunk) repeatedCommittedChunkRenders += 1;
++      }
++      if (incomplete) openPresentations += 1;
++    },
++    now: () => clock.now,
++    requestFrame: clock.requestFrame,
++    cancelFrame: clock.cancelFrame,
++    setTimer: clock.setTimer,
++    clearTimer: clock.clearTimer,
++  });
++
++  let arrival = 0;
++  for (
++    let length = LONG_STREAM_PRESENTATION_CHARS;
++    length <= body.length;
++    length += 512
++  ) {
++    clock.advanceTo(arrival);
++    pendingBody = body.slice(0, Math.min(length, body.length));
++
++    pendingMarkdown = `${prosePrefix}\`\`\`typescript\n${pendingBody}`;
++    scheduler.schedule(prosePrefix.length + pendingBody.length, {
++      markdown: pendingMarkdown,
++      source: pendingBody,
++      incomplete: true,
++    });
++    arrival += 8;
++  }
++  pendingBody = body;
++
++  pendingMarkdown = `${prosePrefix}\`\`\`typescript\n${pendingBody}`;
++
++  scheduler.schedule(prosePrefix.length + pendingBody.length, {
++    markdown: pendingMarkdown,
++    source: pendingBody,
++    incomplete: true,
++  });
++  clock.advanceTo(arrival + 200);
++  assert.ok(openPresentations > 0);
++  assert.ok(
++    openPresentations <=
++      Math.ceil((arrival + 200) / LONG_STREAM_PRESENTATION_MS) + 1,
++  );
++  assert.equal(repeatedCommittedChunkRenders, 0);
++
++  const closedMarkdown = `${prosePrefix}\`\`\`typescript\n${body}\n\`\`\``;
++  scheduler.flush({
++    markdown: closedMarkdown,
++    source: pendingBody,
++    incomplete: false,
++  });
++
++  assert.deepEqual(
++    renderBlockContents(finalPlan),
++    parseMarkdownIntoBlocks(remend(closedMarkdown)),
++  );
++});
+diff --git a/studio/frontend/tests/streaming-open-fence-parse-budget.test.ts b/studio/frontend/tests/streaming-open-fence-parse-budget.test.ts
+new file mode 100644
+index 000000000..b869a1fd9
+--- /dev/null
++++ b/studio/frontend/tests/streaming-open-fence-parse-budget.test.ts
+@@ -0,0 +1,258 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  IncrementalMarkdownCache,
++  createCompletedCodeFenceCache,
++  getCompletedCodeFences,
++  hasFootnoteConstruct,
++} from "../src/components/assistant-ui/streaming-render-schedule.ts";
++import { getTerminalStreamingCodeFence } from "../src/components/assistant-ui/streaming-code-policy.ts";
++
++import { renderBlockContents } from "./streaming-render-plan.ts";
++
++/**
++ * A fence that has opened and not closed is the whole live tail, and the tail is
++ * re-lexed on every token. #9517 removed one whole-tail pass from the repair
++ * path; two more were charging a whole-document CommonMark parse per chunk, one
++ * to list the block's completed fences and one to locate the terminal fence.
++ * Both are recomputing a constant while the fence stays open.
++ *
++ * These are complexity and equivalence tests, not timing tests. The shortcut has
++ * to answer exactly what the parse answered, and it has to stop re-deriving the
++ * settled part of the block.
++ */
++
++const codeLine = (index: number) =>
++  `    result_${index} = transform(payload[${index}], mode="strict")`;
++
++const fenceBody = (lines: number): string =>
++  Array.from({ length: lines }, (_, index) => codeLine(index)).join("\n");
++
++// A settled fence in front of the open one, so there is a result that must
++// survive untouched while the open one grows.
++const SETTLED = "```js\nconst a = 1;\n```\n\nNotes.\n\n```python\n";
++
++test("a settled fence is carried forward rather than re-parsed on every chunk", () => {
++  // `getCompletedCodeFences` allocates a fresh object per fence per call, so the
++  // settled fence surviving by reference is proof the block was not re-parsed.
++  const completedCodeFences = createCompletedCodeFenceCache();
++  const settled = completedCodeFences(`${SETTLED}${fenceBody(1)}`, "block")[0];
++
++  let previousOpen = null;
++  for (let lines = 2; lines <= 400; lines += 1) {
++    const fences = completedCodeFences(`${SETTLED}${fenceBody(lines)}`, "block");
++    assert.equal(fences.length, 2);
++    assert.equal(
++      fences[0],
++      settled,
++      "the settled fence was re-derived, so the whole block was parsed again",
++    );
++    assert.notEqual(
++      fences[1],
++      previousOpen,
++      "the open fence must still grow with the reply",
++    );
++    previousOpen = fences[1];
++  }
++});
++
++test("the carried-forward result is what the parse would have produced", () => {
++  const corpus = [
++    SETTLED,
++    "```python\n",
++    "~~~\n",
++    "````md\nnested ``` inside\n",
++    "> quoted\n\n```py\n",
++    "    indented code\n\n```py\n",
++    "<div>\n```py\n</div>\n\n```py\n",
++    "# Heading\n\n```py startLine=10\n",
++    "```\n",
++  ];
++  const suffixes = [
++    "x = 1",
++    "x = 1\n",
++    "x = 1\n\n",
++    "x = 1\n```",
++    "x = 1\n```\n",
++    "x = 1\n```\n\nafter\n\n```js\ny",
++    "x = 1\n~~~\n",
++    "x = 1\n````\n",
++  ];
++
++  for (const head of corpus) {
++    for (const suffix of suffixes) {
++      // Stream it a character at a time, which is the only way the shortcut is
++      // ever entered, and check every intermediate state against the parse.
++      const completedCodeFences = createCompletedCodeFenceCache();
++      const whole = `${head}${suffix}`;
++      for (let end = 1; end <= whole.length; end += 1) {
++        const content = whole.slice(0, end);
++        assert.deepEqual(
++          completedCodeFences(content, "block"),
++          getCompletedCodeFences(content, "block"),
++          `diverged at ${JSON.stringify(content)}`,
++        );
++      }
++    }
++  }
++});
++
++test("a rewritten or shortened block falls back to the parse", () => {
++  const completedCodeFences = createCompletedCodeFenceCache();
++  completedCodeFences(`${SETTLED}${fenceBody(20)}`, "block");
++  for (const content of [
++    `${SETTLED}${fenceBody(3)}`,
++    `Rewritten.\n\n${SETTLED}${fenceBody(20)}`,
++    SETTLED,
++  ]) {
++    assert.deepEqual(
++      completedCodeFences(content, "block"),
++      getCompletedCodeFences(content, "block"),
++    );
++  }
++  // A different block never reads another block's memo.
++  assert.deepEqual(
++    completedCodeFences(`${SETTLED}${fenceBody(21)}`, "other"),
++    getCompletedCodeFences(`${SETTLED}${fenceBody(21)}`, "other"),
++  );
++});
++
++test("the terminal fence offset shortcut is actually taken", () => {
++  // Inside an HTML block CommonMark calls this fence HTML content, so the
++  // whole-tail parse answers null while the line scan the shortcut uses answers
++  // the fence. The cache never hints such an offset -- it only ever passes one a
++  // parse produced -- so this input exists purely to make a disabled shortcut
++  // visible instead of silently costing a parse per token again.
++  const inHtmlBlock = "<div>\n```py\nx = 1";
++  assert.equal(getTerminalStreamingCodeFence(inHtmlBlock), null);
++  assert.equal(
++    getTerminalStreamingCodeFence(inHtmlBlock, 6)?.openingOffset,
++    6,
++    "the offset hint is being ignored, so every chunk pays for the parse",
++  );
++});
++
++test("the terminal fence offset shortcut agrees with the parse", () => {
++  const documents = [
++    "```python\nx = 1",
++    "```python\nx = 1\n```",
++    "```python\nx = 1\n```\ntrailing prose",
++    "Intro.\n\n```python\nx = 1",
++    "Intro.\n\n```python\nx = 1\n```\n",
++    "<div>\n```py\n</div>\n\n```py\nx",
++    "    ```py\n    x = 1",
++    "- item\n\n  ```py\n  x = 1",
++  ];
++  // The hint the cache actually passes: the offset the previous chunk's parse
++  // found, while that fence was open. Stream each document and check every step.
++  for (const document of documents) {
++    let hint: number | undefined;
++    for (let end = 1; end <= document.length; end += 1) {
++      const content = document.slice(0, end);
++      const parsed = getTerminalStreamingCodeFence(content);
++      assert.deepEqual(
++        getTerminalStreamingCodeFence(content, hint),
++        parsed,
++        `hint ${hint} changed the answer for ${JSON.stringify(content)}`,
++      );
++      hint = parsed && !parsed.isClosed ? parsed.openingOffset : undefined;
++    }
++  }
++});
++
++test("streaming an unterminated fence does not re-derive the settled prefix", () => {
++  // The whole-cache view of the same property. The terminal tail's prefix blocks
++  // are already memoised; its identity and the committed chunks must hold too,
++  // and the plan must still describe the exact reply.
++  const text = `Intro.\n\n\`\`\`python\ndef process(payload):\n${fenceBody(400)}`;
++  const cache = new IncrementalMarkdownCache();
++  let render = cache.update(text.slice(0, 64));
++  const identity = () => render.terminalCodeTail?.id;
++  let firstIdentity: string | undefined;
++  for (let end = 128; end < text.length; end += 128) {
++    render = cache.update(text.slice(0, end));
++    firstIdentity ??= identity();
++    assert.equal(
++      identity(),
++      firstIdentity,
++      "the open fence must keep one identity for its whole life",
++    );
++    assert.equal(render.terminalCodeTail?.isClosed, false);
++  }
++  render = cache.update(text);
++  assert.equal(
++    render.terminalCodeTail?.source,
++    text.slice(text.indexOf("\n", text.indexOf("```")) + 1),
++  );
++});
++
++/**
++ * A character class in ordinary code is shaped exactly like a footnote
++ * reference. Reading one as a footnote switches the cache to full-document
++ * mode, which is sticky, so every later token re-repairs and re-lexes the whole
++ * reply: the same quadratic, restored by one line of the reply's own code.
++ */
++test("a character class inside a fence is code, not a footnote", () => {
++  for (const line of [
++    "  slug = re.sub(/[^a-z]/g, '-', name);",
++    "  if (/[^0-9]/.test(value)) return null;",
++    "  grep -v '[^abc]' file.txt",
++  ]) {
++    assert.equal(
++      hasFootnoteConstruct(`\`\`\`js\n${line}\n`),
++      false,
++      `read as a footnote inside an open fence: ${line}`,
++    );
++    assert.equal(
++      hasFootnoteConstruct(`\`\`\`js\n${line}\n\`\`\`\n`),
++      false,
++      `read as a footnote inside a closed fence: ${line}`,
++    );
++    // The same characters outside a fence really are a footnote reference.
++    assert.equal(hasFootnoteConstruct(line), true, line);
++  }
++});
++
++test("real footnotes are still found outside fenced code", () => {
++  for (const markdown of [
++    "See the note[^1] for detail.",
++    "[^1]: the definition\n",
++    "```js\nconst x = 1;\n```\n\nAfter the fence[^note].",
++    "~~~\ncode\n~~~\n\n[^a]: after a tilde fence\n",
++    "````\n```js\nnested\n```\n````\n\nOutside[^x].",
++  ]) {
++    assert.equal(hasFootnoteConstruct(markdown), true, markdown);
++  }
++  for (const markdown of ["plain text", "```\n[^1]: inside\n```\n", ""]) {
++    assert.equal(hasFootnoteConstruct(markdown), false, markdown);
++  }
++});
++
++test("a fence holding a character class keeps the incremental plan", () => {
++  // Entering full-document mode resets the incremental state, which bumps the
++  // epoch. So a flat epoch across the stream is exactly the property at issue.
++  const body = Array.from({ length: 400 }, (_, index) =>
++    index === 3
++      ? "  slug = re.sub(/[^a-z]/g, '-', name);"
++      : `  ${codeLine(index)}`,
++  ).join("\n");
++  const text = `Intro.\n\n\`\`\`js\nfunction process() {\n${body}`;
++
++  const cache = new IncrementalMarkdownCache();
++  let render = cache.update(text.slice(0, 64));
++  for (let end = 128; end < text.length; end += 128) {
++    render = cache.update(text.slice(0, end));
++    assert.equal(
++      render.epoch,
++      0,
++      "the reply's own regex literal dropped the retained prefix",
++    );
++  }
++  render = cache.update(text);
++  assert.equal(render.epoch, 0);
++  assert.equal(renderBlockContents(render).join(""), render.markdown);
++});
+diff --git a/studio/frontend/tests/streaming-open-fence-repair.test.ts b/studio/frontend/tests/streaming-open-fence-repair.test.ts
+index 1452564ee..00d45cf6c 100644
+--- a/studio/frontend/tests/streaming-open-fence-repair.test.ts
++++ b/studio/frontend/tests/streaming-open-fence-repair.test.ts
+@@ -7,6 +7,8 @@ import remend from "remend";
+ 
+ import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
+ 
++import { renderBlockContents } from "./streaming-render-plan.ts";
++
+ /**
+  * A fence that has opened and not yet closed pins the cache: the whole fence
+  * lexes into one block, so no prefix is ever retained and the live tail grows
+@@ -204,8 +206,7 @@ test("a fence that never closes stays live and is never committed away", () => {
+     render = cache.update(text.slice(0, end));
+   }
+   render = cache.update(text);
+-  const blocks = render.parseMarkdownIntoBlocks(render.markdown);
+-  assert.equal(blocks.join(""), remend(text));
++  assert.equal(renderBlockContents(render).join(""), remend(text));
+ });
+ 
+ /**
+diff --git a/studio/frontend/tests/streaming-render-plan.ts b/studio/frontend/tests/streaming-render-plan.ts
+new file mode 100644
+index 000000000..a40c6ce9b
+--- /dev/null
++++ b/studio/frontend/tests/streaming-render-plan.ts
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import type { IncrementalMarkdownRender } from "../src/components/assistant-ui/streaming-render-schedule.ts";
++
++export const committedBlockContents = (
++  render: IncrementalMarkdownRender,
++): string[] => render.chunks.flatMap((chunk) =>
++  chunk.blocks.map((block) => block.content),
++);
++
++export const renderBlockContents = (
++  render: IncrementalMarkdownRender,
++): string[] => [
++  ...committedBlockContents(render),
++  ...render.tail.map((block) => block.content),
++];
+diff --git a/studio/frontend/tests/streaming-render-schedule.test.ts b/studio/frontend/tests/streaming-render-schedule.test.ts
+index 4f28be178..e1ef02422 100644
+--- a/studio/frontend/tests/streaming-render-schedule.test.ts
++++ b/studio/frontend/tests/streaming-render-schedule.test.ts
+@@ -13,6 +13,8 @@ import {
+ } from "../src/components/assistant-ui/streaming-render-schedule.ts";
+ import { preprocessLaTeX } from "../src/lib/latex.ts";
+ 
++import { renderBlockContents } from "./streaming-render-plan.ts";
++
+ test("only Streamdown's animation transformer is removed", () => {
+   const first = () => undefined;
+   const animation = () => undefined;
+@@ -108,6 +110,9 @@ const MARKDOWN_CASES = [
+ const processStreamingText = (text: string): string =>
+   stabilizeStreamingMarkdown(preprocessLaTeX(text), true);
+ 
++const processCompletedText = (text: string): string =>
++  stabilizeStreamingMarkdown(preprocessLaTeX(text), false);
++
+ test("incremental blocks match a full Streamdown split at every prefix", () => {
+   for (const source of MARKDOWN_CASES) {
+     const cache = new IncrementalMarkdownCache();
+@@ -115,7 +120,7 @@ test("incremental blocks match a full Streamdown split at every prefix", () => {
+       const input = processStreamingText(source.slice(0, length));
+       const render = cache.update(input);
+       assert.deepEqual(
+-        render.parseMarkdownIntoBlocks(render.markdown),
++        renderBlockContents(render),
+         parseMarkdownIntoBlocks(remend(input)),
+         `block mismatch at prefix ${length} of ${JSON.stringify(source)}`,
+       );
+@@ -123,6 +128,38 @@ test("incremental blocks match a full Streamdown split at every prefix", () => {
+   }
+ });
+ 
++
++test("completion preserves the partition and exact final block sequence", () => {
++  const cases = [
++    `${paragraphs(60)}## Result\n\nA **bold** [link](https://x.test).\n\n`,
++    `${paragraphs(60)}\`\`\`ts\nconst answer = 42;\n\`\`\`\n\n$$\nx+y\n$$\n\n`,
++    `${paragraphs(60)}<div>html block</div>\n\n- one\n- two\n\n`,
++    `A claim[^note]\n\n${paragraphs(60)}[^note]: final detail`,
++  ];
++
++  for (const source of cases) {
++    const cache = new IncrementalMarkdownCache();
++    let streaming = cache.update("");
++    for (let length = 7; length <= source.length; length += 7) {
++      streaming = cache.update(processStreamingText(source.slice(0, length)));
++    }
++    streaming = cache.update(processStreamingText(source));
++    const firstCommittedChunk = streaming.chunks[0];
++
++    const completedInput = processCompletedText(source);
++    const completed = cache.update(completedInput);
++    assert.equal(completed.epoch, streaming.epoch);
++    if (firstCommittedChunk) {
++      assert.equal(completed.chunks[0], firstCommittedChunk);
++    }
++    assert.deepEqual(
++      renderBlockContents(completed),
++      parseMarkdownIntoBlocks(remend(completedInput)),
++      JSON.stringify(source.slice(-100)),
++    );
++  }
++});
++
+ test("incremental parsing bounds the live tail and resets after an edit", () => {
+   const source = Array.from(
+     { length: 100 },
+@@ -135,7 +172,7 @@ test("incremental parsing bounds the live tail and resets after an edit", () =>
+   const edited = source.replace("paragraph 0", "changed 0");
+   const reset = cache.update(edited);
+   assert.deepEqual(
+-    reset.parseMarkdownIntoBlocks(reset.markdown),
++    renderBlockContents(reset),
+     parseMarkdownIntoBlocks(remend(edited)),
+   );
+ });
+@@ -195,7 +232,7 @@ test("single-dollar parity affects the retained tail repair", () => {
+     const input = source.slice(0, length);
+     const render = cache.update(input);
+     assert.deepEqual(
+-      render.parseMarkdownIntoBlocks(render.markdown),
++      renderBlockContents(render),
+       parseMarkdownIntoBlocks(remend(input)),
+     );
+   }
+@@ -215,7 +252,7 @@ test("a code character class matches Streamdown's own footnote short-circuit", (
+   const fallback = new IncrementalMarkdownCache().update(matching);
+   assert.equal(fallback.markdown, remend(matching));
+   assert.deepEqual(
+-    fallback.parseMarkdownIntoBlocks(fallback.markdown),
++    renderBlockContents(fallback),
+     parseMarkdownIntoBlocks(remend(matching)),
+   );
+ });
+@@ -232,7 +269,7 @@ test("a marker the reply never closes gives up on the retained prefix", () => {
+     true,
+   );
+   assert.deepEqual(
+-    render.parseMarkdownIntoBlocks(render.markdown),
++    renderBlockContents(render),
+     parseMarkdownIntoBlocks(remend(source)),
+   );
+ 
+@@ -248,31 +285,28 @@ test("a marker the reply never closes gives up on the retained prefix", () => {
+   );
+ });
+ 
+-test("an edit that drops retained blocks moves the render identity", () => {
+-  // Deleting exactly the retained prefix leaves the live tail, and with it the
+-  // only thing Streamdown compares, unchanged.
++test("resets invalidate block identities while appends keep the epoch", () => {
+   const source = paragraphs(30);
+   const cache = new IncrementalMarkdownCache();
+   const streamed = cache.update(source);
+   assert.ok(streamed.markdown.length < source.length / 3);
+-  const streamedGeneration = cache.renderGeneration;
+ 
++  // Deleting exactly the retained prefix leaves the same mutable Markdown, but
++  // it is a replacement and none of the old block identities may survive.
+   const edited = cache.update(streamed.markdown);
+   assert.equal(edited.markdown, streamed.markdown);
+-  assert.notEqual(cache.renderGeneration, streamedGeneration);
++  assert.notEqual(edited.epoch, streamed.epoch);
+   assert.deepEqual(
+-    edited.parseMarkdownIntoBlocks(edited.markdown),
++    renderBlockContents(edited),
+     parseMarkdownIntoBlocks(remend(streamed.markdown)),
+   );
+ 
+-  // A reply that only grows never remounts, including while the stabilizer
+-  // withholds an ambiguous trailing line.
+   const streaming = new IncrementalMarkdownCache();
++  let render = streaming.update("");
+   for (let length = 1; length <= source.length; length += 5) {
+-    streaming.update(source.slice(0, length));
+-    streaming.update(`${source.slice(0, length)}* **`);
++    render = streaming.update(source.slice(0, length));
+   }
+-  assert.equal(streaming.renderGeneration, 0);
++  assert.equal(render.epoch, 0);
+ });
+ 
+ test("a definition shown inside a fenced example still retains", () => {
+@@ -298,7 +332,7 @@ test("a definition shown inside a fenced example still retains", () => {
+       );
+     }
+     assert.deepEqual(
+-      repeatedRender.parseMarkdownIntoBlocks(repeatedRender.markdown),
++      renderBlockContents(repeatedRender),
+       parseMarkdownIntoBlocks(remend(processStreamingText(repeated))),
+     );
+   }
+@@ -319,6 +353,75 @@ test("an update with unchanged text repeats no work", () => {
+   assert.ok(performance.now() - started < 100);
+ });
+ 
++test("duplicate text returns the identical partitioned plan", () => {
++  const source = paragraphs(100);
++  const cache = new IncrementalMarkdownCache();
++  const first = cache.update(source);
++
++  assert.equal(cache.update(source), first);
++  assert.ok(first.chunks.length > 1);
++
++  assert.ok(first.chunks.every((chunk) => chunk.blocks.length <= 8));
++  assert.ok(first.tail.length <= 8);
++});
++
++test("token-only updates preserve every closed chunk object", () => {
++  const source = paragraphs(100);
++  const cache = new IncrementalMarkdownCache();
++  const first = cache.update(source);
++  const closedChunks = first.chunks.slice(0, -1);
++  assert.ok(closedChunks.length > 1);
++
++  const suffix = "the mutable paragraph is still receiving tokens";
++  for (let length = 1; length <= suffix.length; length += 1) {
++    const render = cache.update(source + suffix.slice(0, length));
++    assert.ok(render.tail.length <= 8);
++    closedChunks.forEach((chunk, index) => {
++      assert.equal(
++        render.chunks[index],
++        chunk,
++        `closed chunk ${index} changed at token ${length}`,
++      );
++    });
++  }
++});
++
++test("a promoted tail block keeps its persistent identity", () => {
++  const cache = new IncrementalMarkdownCache();
++  const first = cache.update(paragraphs(20));
++  const promoted = first.tail[0];
++  assert.ok(promoted);
++
++  const next = cache.update(paragraphs(50));
++  const committed = next.chunks.flatMap((chunk) => chunk.blocks);
++  assert.equal(
++    committed.find((block) => block.id === promoted.id),
++    promoted,
++  );
++});
++
++test("a safe rewind preserves surviving closed chunks", () => {
++  const source = paragraphs(120);
++  const cache = new IncrementalMarkdownCache();
++
++  for (let length = 40; length <= source.length; length += 40) {
++    cache.update(source.slice(0, length));
++  }
++  const first = cache.update(source);
++  const survivor = first.chunks[0];
++  assert.ok(survivor);
++
++  const editedSource = source.replace("part 90", "changed 90");
++  const edited = cache.update(editedSource);
++  assert.equal(edited.epoch, first.epoch);
++  assert.equal(edited.chunks[0], survivor);
++  assert.deepEqual(
++    renderBlockContents(edited),
++    parseMarkdownIntoBlocks(remend(editedSource)),
++  );
++});
++
++
+ test("Streamdown re-renders only when the Markdown string changes", () => {
+   // Its memo comparator is what decides whether the parser callback runs again,
+   // and it does not compare that callback. Retaining a block therefore has to
+@@ -339,25 +442,18 @@ test("Streamdown re-renders only when the Markdown string changes", () => {
+ });
+ 
+ test("a repeating reply keeps displaying every retained block", () => {
+-  // A reply that repeats a line leaves the tail unchanged when an update
+-  // retains exactly what it appended, so the cache must not hand Streamdown a
+-  // Markdown string it already holds.
+   const line = "I cannot provide that information.\n\n";
+   const step = line.length;
+   const source = `Here is the answer.\n\n${line.repeat(60)}`;
+   const cache = new IncrementalMarkdownCache();
+-  let displayedMarkdown: string | null = null;
+-  let displayed: string[] = [];
+ 
+   for (let length = step; length <= source.length; length += step) {
+     const input = source.slice(0, length);
+     const render = cache.update(input);
+-    if (render.markdown !== displayedMarkdown) {
+-      displayedMarkdown = render.markdown;
+-      displayed = render.parseMarkdownIntoBlocks(render.markdown);
+-    }
+-    assert.deepEqual(displayed, parseMarkdownIntoBlocks(remend(input)));
+-    // Retaining one update later must not let the live tail track the reply.
++    assert.deepEqual(
++      renderBlockContents(render),
++      parseMarkdownIntoBlocks(remend(input)),
++    );
+     assert.ok(render.markdown.length < step * 6);
+   }
+ });
+@@ -379,7 +475,7 @@ test("an emphasis marker that closes far later stays near the full-repair cost",
+   render = cache.update(input);
+ 
+   assert.deepEqual(
+-    render.parseMarkdownIntoBlocks(render.markdown),
++    renderBlockContents(render),
+     parseMarkdownIntoBlocks(remend(input)),
+   );
+   // Retaining nothing is the correct answer here; retaining the attempt is not.
+@@ -411,7 +507,7 @@ test("a fenced block larger than the budget keeps retaining", () => {
+   );
+   assert.ok(render.markdown.length < source.length / 4);
+   assert.deepEqual(
+-    render.parseMarkdownIntoBlocks(render.markdown),
++    renderBlockContents(render),
+     parseMarkdownIntoBlocks(remend(input)),
+   );
+ });

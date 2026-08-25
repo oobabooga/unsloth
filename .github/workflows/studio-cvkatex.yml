@@ -1,0 +1,209 @@
+name: "AMD CI: what does content-visibility on KaTeX actually buy, at 0K, 100K and 500K?"
+
+# THE QUESTION, and it is narrow.
+#
+# Run 32869180652 measured the 500K scroll collapse on this venue: 287.6 ms of blocked main
+# thread to move the scroller by ONE PIXEL, which is 3.2 fps, and `.katex{visibility:hidden}` at
+# 10.0 ms and 61.0 fps, +97%, with every gate passing including drift. That arm is a MECHANISM
+# PROBE and not a fix: it works by making the maths invisible, so its 97% is an UPPER BOUND on
+# what a real fix could recover.
+#
+# The mechanism is `RenderLayer::recursiveUpdateLayerPositionsAfterScroll`, which recurses over
+# every descendant RenderLayer unconditionally with exactly one early-out
+# (`!m_hasVisibleDescendant && !m_hasVisibleContent`), and
+# `RenderBoxModelObject::requiresLayer()` is true for `isPositioned()`, so `position: relative`
+# alone buys a layer. KaTeX sets it on `.katex`, `.base` and `.vlist`, and `position: absolute`
+# on `.katex-mathml` and `.vlist > span`, which is where this corpus's ~20,700 KaTeX layers come
+# from.
+#
+# `content-visibility: auto` reaches the SAME early-out for content the user cannot see:
+# `RenderLayer::computeHasVisibleContent()` returns false for `isSkippedContent()`. On screen
+# nothing changes. That is the fix this workflow measures.
+#
+# WHAT IT CAN AND CANNOT REACH, and this is the whole reason the run has three arms rather than
+# one. `content-visibility` needs SIZE CONTAINMENT to take effect, and size containment does not
+# apply to a non-atomic inline-level box (css-contain-2 #containment-size; WebKit checks it in
+# `Style::ContainmentChecker::shouldApplySizeContainment`). Shipped `katex.css` gives `.katex` no
+# `display`, so inline maths computes to `display: inline`. In this corpus 910 of the 1,027
+# `.katex` roots are inline, carrying 77,832 of the 101,306 descendants and about 15,291 of the
+# positioned boxes, against 117 display roots with 23,591 descendants and about 4,919 positioned
+# boxes. So the arms are: the shippable `.katex-display` rule; the same rule with `.katex` added,
+# which should read the SAME if that reading is right; and an exploratory hoist to the nearest
+# block-level ancestor, which bounds what a renderer-side change would be worth.
+#
+# EVERY ARM RE-READS ITS OWN EFFECT, TWICE. `getComputedStyle` says the declaration was ACCEPTED;
+# a height probe over the same sampled off-screen elements before and after says the engine ACTED
+# on it. For `content-visibility` those two come apart exactly where it matters, and an arm that
+# is accepted and inert is the vacuous-arm failure that wasted three `overflow-anchor` arms in
+# this campaign.
+#
+# 0K AND 100K ARE MEASURED TOO. The standing rule is short AND long context. 0K is an empty
+# thread with no scrollable range, so no gesture window is scored there and the rung's job is to
+# establish, by counting, that the selector matches nothing and therefore cannot cost anything.
+
+on:
+  push:
+    branches: [amd-ci-cvkatex]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  selftest:
+    name: "Self-test the scene and the scoring layer (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 20
+    # Explicitly blind to the device. This job exists to protect the expensive one and must never
+    # allocate on the single gfx1151 the four ephemeral slots share.
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-cvkatex-selftest"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The scoring layer, against synthetic payloads whose right answers are known, including
+      # every way THIS measurement can be wrong: a drifted page, a declaration the engine
+      # accepted and then ignored, an arm that moved scrollHeight, a jam the channel cannot see,
+      # a negative control that recovers, a rung with no scrollable range, and the case where
+      # adding `.katex` to the selector turns out to help after all. A criteria module that can
+      # only produce one answer is the failure mode that has cost this campaign the most.
+      - name: Criteria self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest_cvkatex.py 2>&1 | tail -80
+          rc=${PIPESTATUS[0]}
+          echo "cvkatex criteria selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The SCENE, against a hand-rolled DOM stub. It cannot measure anything, but it proves the
+      # scene reaches its end, posts the payload shape the criteria module reads, and that the
+      # per-arm "did the declaration take" checks can return BOTH answers.
+      #
+      # A missing `node` is the one case that does not fail here, and deliberately: this check is
+      # about the scene, not about the subject or the hardware, and it was run to green locally
+      # before the branch was pushed.
+      - name: Scene self-test
+        run: |
+          set +e
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::warning::node is not on this runner, so the scene self-test did not run here. \
+          It was run to green locally before this branch was pushed; see \
+          amd_ci/probes/studio_ladder/selftest_cvk_layers.mjs"
+            exit 0
+          fi
+          node amd_ci/probes/studio_ladder/selftest_cvk_layers.mjs 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          echo "scene selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+  measure:
+    name: "One-pixel scroll ablation at 0K / 100K / 500K in WebKitGTK (exclusive)"
+    needs: selftest
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 330
+    # Compositing a browser and seeding a 500K thread both allocate on the one gfx1151 the four
+    # ephemeral slots share. The group holds one runner plus exactly ONE waiter, and a third
+    # arrival silently CANCELS the waiter while the other job stays green, so the loss is easy to
+    # miss. Nothing else in this workflow takes the group.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-cvkatex"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. A skip would misreport missing hardware as nothing to see.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      # Its own step, and early, because step logs are only served once the job COMPLETES and
+      # this is the diagnostic worth having if the measurement never starts.
+      - name: Engine inventory
+        run: |
+          set +e
+          for p in /usr/bin/python3 /usr/bin/python3.12; do
+            [ -x "$p" ] || continue
+            echo "== $p"
+            "$p" -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('  WebKit', WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version())" 2>&1 | tail -2
+          done
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      # Three rungs, two repetitions each. The interleaved baselines inside ONE session are the
+      # floor that matters (six of them per repetition at the scrolling rungs), because a fresh
+      # mount per arm would put 500K-thread mount variance between the arms and that variance is
+      # far larger than the effects being separated. The second repetition exists so a per-rep
+      # disagreement is visible: a mean over a bimodal draw is a report of how many slow draws
+      # landed in an arm, not an estimate of anything.
+      - name: One-pixel ablation at 0K, 100K and 500K
+        timeout-minutes: 300
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_cvkatex_probe.py \
+            --criteria amd_ci/criteria/studio_cvkatex.py \
+            --out-dir "$AMD_CI_WORK/out/cvkatex" \
+            -- --rungs 0K,100K,500K --reps 2
+          cat "$AMD_CI_WORK/out/cvkatex/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not. A drifted
+          # page is a NON-result and must not tick.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/cvkatex"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By PORT, then by PID. A pattern-matching process killer would match this very step's
+          # own shell, because the pattern ends up on its command line; that has cost a real run.
+          # A Studio or an Xvfb that outlives the job holds VRAM on a machine three other slots
+          # share, so this cannot simply be skipped either.
+          for p in $(seq 5481 5540); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The raw observations, separately from the verdict. Every arm's full rAF gap series and
+      # both height probes are in here, so the run can be re-scored offline against the untouched
+      # artifact if the reader turns out to be wrong, rather than costing another exclusive slot.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-cvkatex
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-cvkatex-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/cvkatex/out/logs
+            ${{ env.AMD_CI_WORK }}/cvkatex/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
