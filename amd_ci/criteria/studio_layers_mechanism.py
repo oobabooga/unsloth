@@ -26,6 +26,22 @@ every arm. A before/after pair cannot separate an arm from page drift, and the l
 the earlier ablation failed on precisely that: baseline 17.5 fps against baseline_repeat 30.1 fps,
 a first-visit cost that made every ratio in that run meaningless.
 
+THE DRIFT GATE HAS ALREADY FIRED ONCE HERE, on run 32865232787, and its threshold is unchanged
+since. That run read baseline 261.4 ms blocked per scroll event against a 162.6 / 193.9 / 197.5 /
+184.5 cluster, and the DOM grew by 11,205 elements across the session while `.katex` (1,027),
+`.katex *` (101,306) and `pre` (330) all stayed pinned. The cause was the harness: the park
+position was recomputed as `scrollHeight * 0.5` per window, so an arm that made the thread 7.3%
+taller moved the window onto content that had never been visited, and mounting it was billed to
+whichever arm moved the scroller there. The fix is a FIXED park pixel plus a DISCARDED warm-up run
+to quiescence, both gated below. Widening this threshold instead would have switched off the one
+gate that was telling the truth.
+
+TWO ARMS ARE EXPECTED TO BE DISQUALIFIED ON scrollHeight, and that is a property of the ablation
+rather than a fault in the run: KaTeX uses relative positioning for vertical alignment, so forcing
+its descendants to static necessarily reflows the thread (measured: +7.3% for `[data-role] *`,
++3.8% for `.katex *`). Their numbers are printed, clearly marked, and cannot carry the headline.
+`.katex{visibility:hidden}` changes no layout at all, which is why it is the arm that can.
+
 GATES THAT ARE ABOUT THE INSTRUMENT FAIL THE RUN. Conditions that are about ONE ARM disqualify that
 arm and are printed, because a single bad arm should not throw away the others:
   * an arm whose declaration was DROPPED by the engine (checked by re-reading getComputedStyle on
@@ -65,6 +81,9 @@ DRIFT_MAX = 0.25
 NEGATIVE_MAX_SAVING = 0.15
 # The positive control must recover most of the way to the measured floor.
 POSITIVE_MIN_RECOVERY = 0.60
+# Elements the page may still mount during a SCORED window before that window is measuring
+# somebody else's deferred work rather than the gesture.
+MAX_SCORED_WINDOW_MUTATIONS = 200
 # An arm must beat its neighbouring baselines by more than this on blocked-ms-per-frame.
 ARM_MIN_SAVING = 0.20
 # scrollHeight change that pins the gesture.
@@ -130,6 +149,7 @@ def _scored(obs: dict) -> dict[str, list[dict]]:
                 "fps_ratio": (f / base_f) if (f and base_f) else None,
                 "fired": a.get("fired"),
                 "scroll_height_delta": a.get("scroll_height_delta"),
+                "mutations": a.get("mutations") or {},
                 "gesture": a.get("gesture") or {},
             }
             out.setdefault(a.get("name"), []).append(entry)
@@ -246,6 +266,60 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append((f"DRIFT: baseline_repeat within {DRIFT_MAX:.0%} of the first baseline",
                 drift_ok, "; ".join(drift_txt) or "no baseline windows"))
 
+    # THE DEFERRED-FENCE RESERVOIR. `code-fence-defer.tsx` ships `SHIP_DEFAULT = "defer"`, and
+    # `useFenceReached` latches on an IntersectionObserver with a 100% root margin -- which
+    # re-delivers on LAYOUT CHANGE, no scroll needed. So any arm that changes the thread's height
+    # mounts markup, and that mounting is permanent and contaminates every window after it. The
+    # warm-up drains it through the app's own `beforeprint` -> `upgradeEverythingForPrint` path.
+    # If anything is left deferred, an arm can still trip it.
+    latches = [(r["payload"].get("fence_latch") or {}) for r in ok]
+    left = [((l.get("after") or {}).get("fences_deferred")) for l in latches]
+    out.append(("the deferred-fence reservoir was drained before scoring",
+                bool(latches) and all(x == 0 for x in left),
+                "; ".join(
+                    f"rep: {(l.get('before') or {}).get('fences_deferred')} deferred -> "
+                    f"{(l.get('after') or {}).get('fences_deferred')} left, "
+                    f"{l.get('fences_latched')} latched, +{l.get('elements_added')} elements "
+                    f"(+{l.get('highlight_spans_added')} `pre span`), dispatched="
+                    f"{l.get('dispatched')} {l.get('error') or ''}" for l in latches)
+                or "no fence-latch record"))
+
+    # THE WARM-UP. A first-visit cost paid inside the first scored window is exactly what failed
+    # the previous run, so the window that absorbs it is discarded and its convergence is gated.
+    warm = [r["payload"].get("warmup") or {} for r in ok]
+    out.append(("the discarded warm-up reached quiescence before any scoring began",
+                bool(warm) and all(w.get("quiesced") for w in warm),
+                "; ".join(
+                    f"rep: {len(w.get('rounds') or [])} rounds, quiesced={w.get('quiesced')}, "
+                    f"absorbed {(w.get('mut_total') or {}).get('added_elements')} added elements "
+                    f"in {w.get('elapsed_ms')} ms, per-round element deltas "
+                    f"{[r_.get('element_delta') for r_ in (w.get('rounds') or [])]}"
+                    for w in warm) or "no warm-up window"))
+
+    # And it must STAY quiescent, or a scored window is measuring deferred mounting.
+    noisy = []
+    for rep_i, seq in _windows(obs):
+        for a in seq:
+            if a.get("arm") == POSITIVE:
+                continue  # detaching 28 messages is supposed to mutate the DOM
+            m = (a.get("mutations") or {}).get("added_elements")
+            if m is not None and m > MAX_SCORED_WINDOW_MUTATIONS:
+                noisy.append(f"rep {rep_i} {a.get('name')}: +{m} elements "
+                             f"{(a.get('mutations') or {}).get('buckets')}")
+    out.append((f"no scored window mounted more than {MAX_SCORED_WINDOW_MUTATIONS} elements",
+                not noisy, "; ".join(noisy) if noisy else "every scored window was quiescent"))
+
+    # Every window must have looked at the SAME content, which is what a fixed park pixel buys.
+    parks = {r["payload"].get("park") for r in ok}
+    park_ok = True
+    for _, seq in _windows(obs):
+        for a in seq:
+            g = a.get("gesture") or {}
+            if g and g.get("park") is not None and g["park"] not in parks:
+                park_ok = False
+    out.append(("every window parked at the same fixed pixel", park_ok and bool(parks),
+                f"park positions {sorted(x for x in parks if x is not None)}"))
+
     # The defect must still be present, or there is nothing to ablate. Priced against the FLOOR
     # measured on this very page (`still`), not against an assumed 60 fps.
     floor = _mean([e["bmpf"] for e in scored.get(FLOOR, []) if e.get("bmpf") is not None])
@@ -289,8 +363,8 @@ def table(obs: dict) -> str:
             "scroll per painted frame, so this is the cost of ONE SCROLL EVENT. `busy%` is a "
             "share of wall time and is shown only for continuity with earlier tables.", "",
             "| window | blocked ms/frame | vs its two neighbouring baselines | cost removed | "
-            "fps | busy | worst frame | scrollHeight | declaration took |",
-            "|---|---|---|---|---|---|---|---|---|"]
+            "fps | busy | worst frame | scrollHeight | elements mounted | declaration took |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for name in order:
         es = scored.get(name)
         if es is None:
@@ -298,10 +372,12 @@ def table(obs: dict) -> str:
             vals = [_bmpf(a) for _, seq in _windows(obs) for a in seq if a.get("name") == name]
             fps = [a.get("eff_fps") for _, seq in _windows(obs) for a in seq
                    if a.get("name") == name]
+            mut = [(a.get("mutations") or {}).get("added_elements") or 0
+                   for _, seq in _windows(obs) for a in seq if a.get("name") == name]
             rows.append(f"| `{name}` (baseline) | "
                         + ", ".join(f"{v:.1f}" for v in vals if v is not None)
                         + " | - | - | " + ", ".join(f"{v:.1f}" for v in fps if v is not None)
-                        + " | - | - | - | - |")
+                        + f" | - | - | - | {max(mut) if mut else 0} | - |")
             continue
         tag = {POSITIVE: " **[POSITIVE CONTROL]**", NEGATIVE: " **[NEGATIVE CONTROL]**",
                FLOOR: " **[FLOOR]**", BASELINE_REPEAT: " **[DRIFT CHECK]**"}.get(name, "")
@@ -323,6 +399,7 @@ def table(obs: dict) -> str:
             "-" if bu is None else f"{bu:.0f}%",
             "-" if wo is None else f"{wo:,.0f} ms",
             "-" if sh is None else f"{sh:+.2%}",
+            str(max((e["mutations"].get("added_elements") or 0) for e in es)),
             "-" if not fired else ("yes" if fired.get("fired") else
                                    f"NO ({fired.get('matching')}/{fired.get('sampled')})"),
         ]) + " |")
@@ -348,6 +425,51 @@ def table(obs: dict) -> str:
         rows.append(f"| `{name}` | " + ", ".join(str(v) for v in vals) + " | "
                     + ", ".join(str(v) for v in fps) + " | "
                     + ", ".join(str(v) for v in fr) + " |")
+
+    # THE DISCARDED WARM-UP, reported. The whole point of it is the first-visit work it absorbs,
+    # so throwing the window away without saying what was in it would repeat the mistake at one
+    # remove.
+    warm = [r["payload"].get("warmup") or {} for r in _runs(obs)]
+    if any(warm):
+        rows += ["", "The discarded warm-up, which is where the first-visit cost is now paid:", "",
+                 "| rep | rounds | quiesced | elements mounted | ms | per-round element delta | "
+                 "where they landed |", "|---|---|---|---|---|---|---|"]
+        for i, w in enumerate(warm, 1):
+            mt = w.get("mut_total") or {}
+            rows.append(f"| {i} | {len(w.get('rounds') or [])} | "
+                        f"{'yes' if w.get('quiesced') else 'NO'} | "
+                        f"{mt.get('added_elements')} | {w.get('elapsed_ms')} | "
+                        f"{[r_.get('element_delta') for r_ in (w.get('rounds') or [])]} | "
+                        f"{mt.get('buckets')} |")
+        lat = warm[0].get("fence_latch") or {}
+        lb, la = lat.get("before") or {}, lat.get("after") or {}
+        if lb and la:
+            rows += ["", f"Draining the deferred-fence reservoir through the app's own "
+                         f"`beforeprint` path latched **{lat.get('fences_latched')}** fences and "
+                         f"added **{lat.get('elements_added'):,}** elements, of which "
+                         f"{lat.get('highlight_spans_added'):,} are `pre span`, while `pre` "
+                         f"stayed at {la.get('code_blocks')} and `.katex` at "
+                         f"{la.get('katex_roots'):,}. That is the 11,205-element growth run "
+                         f"32865232787 could not name, and it is now paid before anything is "
+                         f"scored rather than by whichever arm happened to change the layout "
+                         f"height. **The caveat this buys, stated as a number:** the page is now "
+                         f"{la.get('elements'):,} elements against the {lb.get('elements'):,} the "
+                         f"local llvmpipe rig measured, so the local 78% / 79% / 86% figures are "
+                         f"for a page with {lb.get('highlight_spans'):,} `pre span` and this one "
+                         f"has {la.get('highlight_spans'):,}. None of those spans is positioned, "
+                         f"so the RenderLayer population under test is unchanged: `.katex` roots "
+                         f"and descendants are identical either way."]
+        cb = warm[0].get("census_before") or {}
+        ca = warm[0].get("census_after") or {}
+        if cb and ca:
+            rows += ["", f"Across the warm-up the page went from {cb.get('elements'):,} to "
+                         f"{ca.get('elements'):,} elements, `pre span` "
+                         f"{cb.get('highlight_spans')} -> {ca.get('highlight_spans')}, "
+                         f"`span` {cb.get('all_spans')} -> {ca.get('all_spans')}, `button` "
+                         f"{cb.get('buttons')} -> {ca.get('buttons')}, `[data-slot]` "
+                         f"{cb.get('data_slots')} -> {ca.get('data_slots')}, while `.katex` "
+                         f"stayed at {ca.get('katex_roots')} and `pre` at "
+                         f"{ca.get('code_blocks')}."]
 
     # What is in the page, because the whole attribution is content-dependent.
     cen = next((r["payload"].get("baseline_census") for r in _runs(obs)), None)

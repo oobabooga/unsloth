@@ -29,6 +29,7 @@ const check = (label, cond, detail = "") => {
 class El {
   constructor(tag, cls = "", attrs = {}) {
     this.tagName = tag.toUpperCase();
+    this.nodeType = 1;  // real nodes have one, and the scene sizes added subtrees by it
     this.className = cls;
     this.attrs = attrs;
     this.children = [];
@@ -59,7 +60,14 @@ class El {
 
 const matchOne = (el, sel) => {
   if (sel === "*") return true;
-  if (sel.startsWith("[") && sel.endsWith("]")) return sel.slice(1, -1) in el.attrs;
+  if (sel.startsWith("[") && sel.endsWith("]")) {
+    const inner = sel.slice(1, -1);
+    const eq = inner.indexOf("=");
+    if (eq < 0) return inner in el.attrs;
+    const k = inner.slice(0, eq);
+    const v = inner.slice(eq + 1).replace(/^["']|["']$/g, "");
+    return el.attrs[k] === v;
+  }
   if (sel.startsWith(".")) return el.className.split(" ").includes(sel.slice(1));
   return el.tagName === sel.toUpperCase();
 };
@@ -86,6 +94,20 @@ const queryAll = (root, sel) => {
   return Array.from(seen);
 };
 
+// A MutationObserver stub. The scene's whole diagnosis of the previous run's drift rests on
+// this channel, so the self-test has to drive it rather than let it silently observe nothing.
+function makeMO(hook) {
+  return class MutationObserver {
+    constructor(cb) { this.cb = cb; hook.push(this); }
+    observe() { this.active = true; }
+    disconnect() { this.active = false; }
+    fire(added) {
+      if (!this.active) return;
+      this.cb([{ addedNodes: added, removedNodes: [] }], this);
+    }
+  };
+}
+
 function buildWorld(opts) {
   const root = new El("body");
   const scroller = new El("div", "aui-thread-viewport");
@@ -93,6 +115,7 @@ function buildWorld(opts) {
   scroller.clientHeight = 800;
   scroller._top = 0;
   Object.defineProperty(scroller, "scrollTop", {
+    configurable: true,
     get() { return this._top; },
     set(v) { this._top = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, Math.round(v))); },
   });
@@ -101,6 +124,8 @@ function buildWorld(opts) {
   composer.ariaLabel = "Message input";
   root.appendChild(composer);
 
+  // Deferred code fences, the thing `beforeprint` -> `upgradeEverythingForPrint` drains.
+  const fences = [];
   for (let m = 0; m < 12; m++) {
     const msg = new El("div", "msg", { "data-role": true });
     scroller.appendChild(msg);
@@ -109,7 +134,11 @@ function buildWorld(opts) {
       msg.appendChild(kx);
       for (let d = 0; d < 6; d++) kx.appendChild(new El("span", "mord"));
     }
-    msg.appendChild(new El("pre", ""));
+    const pre = new El("pre", "");
+    pre.attrs["data-unsloth-fence-deferred"] = "true";
+    pre.getAttribute = (k) => pre.attrs[k] || null;
+    msg.appendChild(pre);
+    fences.push(pre);
   }
 
   const head = new El("head");
@@ -150,12 +179,18 @@ function buildWorld(opts) {
     };
   };
 
-  return { doc, scroller, computed, styles };
+  return { doc, scroller, computed, styles, root, fences };
 }
 
 async function runScene(opts) {
   const world = buildWorld(opts);
   const posted = [];
+  const observers = [];
+  // FIRST-VISIT MOUNTING, simulated: the first `mountRounds` gestures each add a chunk of nodes,
+  // then the page goes quiet. That is the shape run 32865232787 measured (+2,130 elements on the
+  // first visit to the park position) and it is what the discarded warm-up has to absorb.
+  let mountRounds = opts.mountRounds === undefined ? 2 : opts.mountRounds;
+  let parkSeen = null;
   const sandbox = {
     document: world.doc,
     getComputedStyle: world.computed,
@@ -165,20 +200,69 @@ async function runScene(opts) {
     location: { href: "http://127.0.0.1:5481/chat?thread=x" },
     innerWidth: 1440, innerHeight: 900,
     requestAnimationFrame: (fn) => setTimeout(() => fn(performance.now()), 4),
+    MutationObserver: makeMO(observers),
+    Event: class Event { constructor(t) { this.type = t; } },
     webkit: { messageHandlers: { bench: { postMessage: (s) => posted.push(JSON.parse(s)) } } },
     Date,
   };
+  const listeners = {};
+  sandbox.addEventListener = (t, fn) => { (listeners[t] = listeners[t] || []).push(fn); };
+  sandbox.dispatchEvent = (ev) => {
+    for (const fn of listeners[ev.type] || []) fn(ev);
+    return true;
+  };
   sandbox.window = sandbox;
+  // Stand in for `upgradeEverythingForPrint`: every remaining fence latches at once, adding
+  // spans INSIDE the `pre` that already existed, which is why `pre` never moves.
+  if (!opts.latchBroken) {
+    sandbox.addEventListener("beforeprint", () => {
+      const added = [];
+      for (const pre of world.fences) {
+        if (!pre.attrs["data-unsloth-fence-deferred"]) continue;
+        delete pre.attrs["data-unsloth-fence-deferred"];
+        for (let i = 0; i < 30; i++) { const sp = new El("span", ""); pre.appendChild(sp); added.push(sp); }
+      }
+      setTimeout(() => { for (const o of observers) o.fire(added); }, 0);
+    });
+  }
   // The scene closes over bare `window`, `document`, `getComputedStyle`, so evaluate it inside a
   // function whose parameters shadow the globals.
   const fn = new Function("window", "document", "getComputedStyle", "performance", "navigator",
                           "location", "setTimeout", "setInterval", "clearInterval",
-                          "requestAnimationFrame", SRC + "\n; return window.__lay;");
+                          "requestAnimationFrame", "MutationObserver",
+                          SRC + "\n; return window.__lay;");
   const W = fn(sandbox, sandbox.document, sandbox.getComputedStyle, performance,
                sandbox.navigator, sandbox.location, setTimeout, setInterval, clearInterval,
-               sandbox.requestAnimationFrame);
-  await W.run({ idleMs: 120, gestureFrames: 12, gestureCapMs: 4000, rung: "TEST", lastMarker: "SEEDED_MARKER_END",
-                hogMs: 5, hogPeriodMs: 40 });
+               sandbox.requestAnimationFrame, sandbox.MutationObserver);
+  // Drive the deferred mount off the scroller, the way a viewport-triggered mount really behaves.
+  const origSet = Object.getOwnPropertyDescriptor(world.scroller, "scrollTop").set;
+  Object.defineProperty(world.scroller, "scrollTop", {
+    configurable: true,
+    get() { return this._top; },
+    set(v) {
+      origSet.call(this, v);
+      if (parkSeen === null) parkSeen = this._top;
+      if (mountRounds > 0 && Math.abs(this._top - parkSeen) <= 2 && !this._mountedThisRound) {
+        this._mountedThisRound = true;
+        mountRounds--;
+        const added = [];
+        for (let i = 0; i < 3; i++) {
+          const n = new El("div", "", { "data-slot": "message-actions" });
+          n.setAttribute = () => {};
+          n.getAttribute = (k) => (k === "data-slot" ? "message-actions" : null);
+          for (let j = 0; j < 20; j++) n.appendChild(new El("span", ""));
+          world.root.children[0].appendChild(n);
+          added.push(n);
+        }
+        setTimeout(() => { for (const o of observers) o.fire(added); }, 0);
+        setTimeout(() => { this._mountedThisRound = false; }, 900);
+      }
+    },
+  });
+  await W.run({ idleMs: 120, gestureFrames: 12, gestureCapMs: 4000, rung: "TEST",
+                lastMarker: "SEEDED_MARKER_END", hogMs: 5, hogPeriodMs: 40,
+                warmupFrames: 8, warmupCapMs: 3000, warmupRounds: opts.warmupRounds || 8,
+                warmupQuietElements: 5, warmupQuietRounds: 2 });
   return { W, payload: posted.find((p) => p.__done) };
 }
 
@@ -216,6 +300,46 @@ console.log("scenario 1: every declaration takes");
   check("detach_messages actually removed messages",
         by.detach_messages.census_after.messages === 2,
         JSON.stringify(by.detach_messages.census_after));
+}
+
+{
+  // the fence / warm-up assertions, on the same scenario-1 run
+  const { payload } = await runScene({});
+  const L = payload.fence_latch;
+  check("the deferred-fence reservoir is drained before scoring", L && L.after.fences_deferred === 0,
+        JSON.stringify(L && { before: L.before.fences_deferred, after: L.after.fences_deferred }));
+  check("and the drain is reported as elements added inside an unchanged number of `pre`",
+        L.elements_added > 0 && L.before.code_blocks === L.after.code_blocks
+        && L.highlight_spans_added === L.elements_added,
+        JSON.stringify({ added: L.elements_added, spans: L.highlight_spans_added,
+                         pre: [L.before.code_blocks, L.after.code_blocks] }));
+  check("`.katex` is untouched by the drain, so the layer population under test is unchanged",
+        L.before.katex_roots === L.after.katex_roots
+        && L.before.katex_descendants === L.after.katex_descendants);
+  check("the warm-up reached quiescence and says so",
+        payload.warmup.quiesced === true, JSON.stringify(payload.warmup.rounds));
+  check("the warm-up is DISCARDED: no scored window is named after it",
+        !(payload.arms || []).some((a) => a.name.indexOf("warm") >= 0));
+  check("every scored window parked at the one fixed pixel",
+        (payload.arms || []).every((a) => !a.gesture || a.gesture.park === payload.park),
+        JSON.stringify((payload.arms || []).map((a) => a.gesture && a.gesture.park)));
+  const scored = (payload.arms || []).filter((a) => a.arm !== "detach_messages");
+  check("no scored window mounted anything once the reservoir was drained",
+        scored.every((a) => (a.mutations || {}).added_elements === 0),
+        JSON.stringify(scored.map((a) => [a.name, (a.mutations || {}).added_elements])));
+  check("the mutation census attributed the drained nodes to the code fences",
+        Object.keys(payload.warmup.mut_total.buckets || {}).some((k) => k.indexOf("pre") >= 0),
+        JSON.stringify(payload.warmup.mut_total.buckets));
+}
+
+console.log("scenario 1b: the page keeps mounting and the warm-up cannot converge");
+{
+  const { payload } = await runScene({ latchBroken: true, mountRounds: 99, warmupRounds: 3 });
+  check("the warm-up reports quiesced:false rather than proceeding as if settled",
+        payload.warmup.quiesced === false, JSON.stringify(payload.warmup.rounds));
+  check("and the fences are still deferred, which is the reason",
+        payload.fence_latch.after.fences_deferred > 0,
+        JSON.stringify(payload.fence_latch.after.fences_deferred));
 }
 
 console.log("scenario 2: the engine DROPS `.katex *{position:static}`");

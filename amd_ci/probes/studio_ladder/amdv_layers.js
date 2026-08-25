@@ -34,6 +34,18 @@
 //     every arm, so each arm is scored against its OWN two neighbours. The local run of the
 //     earlier ablation failed exactly this check (17.5 vs 30.1 fps) and that is what invalidated
 //     it. A drift-corrected number is the only honest one.
+//   * WARM-UP (discarded): run 32865232787 failed its own drift gate, reading a first baseline of
+//     261.4 ms blocked per scroll event against a 162.6 / 193.9 / 197.5 / 184.5 cluster, while
+//     the DOM grew 11,205 elements across the session with `.katex` (1,027), `.katex *`
+//     (101,306) and `pre` (330) all pinned. The cause is `code-fence-defer.tsx`, which ships
+//     `SHIP_DEFAULT = "defer"` and latches a deferred fence into a highlighted block whose spans
+//     land INSIDE the `pre` that already existed. It latches on an IntersectionObserver with a
+//     100% root margin, which re-delivers on LAYOUT CHANGE with no scroll at all, so any arm
+//     that changes the thread's height mounts markup and permanently contaminates every window
+//     after it. This scene therefore drains the reservoir through the app's own
+//     `beforeprint` -> `upgradeEverythingForPrint` path, then runs the identical gesture at the
+//     identical park position until the DOM stops changing, and throws that reading away. The
+//     threshold on the drift gate is UNCHANGED: the artefact is removed, not accommodated.
 //   * FIRED (per arm): a sample of the nodes the CSS claims to target is re-read through
 //     getComputedStyle after the arm is applied. An arm whose declaration was DROPPED reads as a
 //     clean null otherwise -- three `overflow-anchor` arms in this campaign were vacuous that way,
@@ -58,6 +70,66 @@
     setTimeout(tick, 1);
   };
   setTimeout(tick, 1);
+
+  // ── WHAT IS MUTATING, and where ───────────────────────────────────────────────────────────
+  //
+  // A count alone would not have settled the last run's drift: the census showed 11,205 elements
+  // appearing and could not say what they were. This attributes every added node to the nearest
+  // ancestor that identifies it, so "the first-visit work" is a named thing with a number rather
+  // than a hypothesis. It is installed before anything else so it sees the whole session.
+  const MUT = { added_nodes: 0, added_elements: 0, removed_nodes: 0, records: 0, buckets: {} };
+  const bucketOf = (n) => {
+    let e = (n && n.nodeType === 1) ? n : (n && n.parentElement);
+    let hops = 0;
+    while (e && hops++ < 40) {
+      const cls = String(e.className || "");
+      if (e.tagName === "PRE" || e.tagName === "CODE") return "inside_pre_or_code";
+      if (cls.split && cls.split(" ").indexOf("katex") >= 0) return "inside_katex";
+      if (e.getAttribute) {
+        if (e.getAttribute("data-streamdown")) return "streamdown:" + e.getAttribute("data-streamdown");
+        const slot = e.getAttribute("data-slot");
+        if (slot) return "data-slot:" + slot;
+        if (e.getAttribute("data-role")) return "message_direct";
+      }
+      e = e.parentElement;
+    }
+    return "other";
+  };
+  try {
+    new MutationObserver((list) => {
+      for (const m of list) {
+        MUT.records++;
+        MUT.removed_nodes += m.removedNodes.length;
+        for (const n of m.addedNodes) {
+          MUT.added_nodes++;
+          let size = 1;
+          if (n.nodeType === 1 && n.getElementsByTagName) {
+            size = 1 + n.getElementsByTagName("*").length;
+          } else if (n.nodeType !== 1) {
+            size = 0;
+          }
+          MUT.added_elements += size;
+          const b = bucketOf(n);
+          MUT.buckets[b] = (MUT.buckets[b] || 0) + size;
+        }
+      }
+    }).observe(document.documentElement,
+               { childList: true, subtree: true, characterData: false });
+  } catch (e) { /* recorded as a note once W exists */ }
+  const mutSnapshot = () => ({ added_nodes: MUT.added_nodes, added_elements: MUT.added_elements,
+                               removed_nodes: MUT.removed_nodes, records: MUT.records,
+                               buckets: Object.assign({}, MUT.buckets) });
+  const mutDelta = (a, b) => {
+    const d = { added_nodes: b.added_nodes - a.added_nodes,
+                added_elements: b.added_elements - a.added_elements,
+                removed_nodes: b.removed_nodes - a.removed_nodes,
+                records: b.records - a.records, buckets: {} };
+    for (const k of Object.keys(b.buckets)) {
+      const v = b.buckets[k] - (a.buckets[k] || 0);
+      if (v) d.buckets[k] = v;
+    }
+    return d;
+  };
 
   const q = (s) => document.querySelector(s);
   const post = (o) => {
@@ -147,6 +219,21 @@
     katex_descendants: document.querySelectorAll(".katex *").length,
     katex_display: document.querySelectorAll(".katex-display").length,
     code_blocks: document.querySelectorAll("pre").length,
+    // Run 32865232787 grew the DOM by 11,205 elements across one session while `.katex`,
+    // `.katex *` and `pre` all stayed pinned, so the growth was none of those. These buckets
+    // exist to name it rather than guess at it.
+    highlight_spans: document.querySelectorAll("pre span").length,
+    // The deferred code fences that have NOT yet upgraded. `code-fence-defer.tsx` ships with
+    // `SHIP_DEFAULT: FenceMode = "defer"`, so a fence renders a plain shell containing a real
+    // `<pre><code>` and swaps in the highlighted block later. That is why the last run saw
+    // 11,205 elements appear while `pre` never moved: the spans land INSIDE a `pre` that already
+    // existed.
+    fences_deferred: document.querySelectorAll('[data-unsloth-fence-deferred="true"]').length,
+    code_block_bodies: document.querySelectorAll('[data-streamdown="code-block-body"]').length,
+    all_spans: document.getElementsByTagName("span").length,
+    buttons: document.getElementsByTagName("button").length,
+    svgs: document.getElementsByTagName("svg").length,
+    data_slots: document.querySelectorAll("[data-slot]").length,
     doc_scroll_height: (document.scrollingElement || document.body).scrollHeight,
     scroller_scroll_height: el ? el.scrollHeight : null,
     scroller_client_height: el ? el.clientHeight : null,
@@ -214,12 +301,16 @@
   // a real gesture as inert -- that is the trap that made a 54,000 px commanded gesture travel
   // 6,610 px while the instrument saw nothing wrong. The guard that forces `auto` is kept as
   // well, but a measurement must not DEPEND on a guard having worked.
-  const gesture = async (el, frames, capMs, mode) => {
-    // Park at mid-thread. Near the bottom Studio's intent-aware autoscroll has an opinion, and at
-    // the very top a 1 px step in one direction has nowhere to go.
-    const span = Math.max(0, el.scrollHeight - el.clientHeight);
-    const mid = Math.round(span * 0.5);
-    el.scrollTop = mid;
+  //
+  // THE PARK POSITION IS A FIXED ABSOLUTE PIXEL, chosen once and reused by every window. It used
+  // to be recomputed as `scrollHeight * 0.5` per window, and that is what broke run
+  // 32865232787: `[data-role] *{position:static}` makes the thread 7.3% taller, so the mid point
+  // moved ~11,000 px, the window landed on CONTENT THAT HAD NEVER BEEN VISITED, and mounting it
+  // was billed to whichever arm happened to move the scroller there. The drift gate caught it as
+  // a first baseline of 261.4 ms against a 162-198 ms cluster. A fixed pixel means every window
+  // looks at the same content.
+  const gesture = async (el, frames, capMs, mode, park) => {
+    el.scrollTop = park;
     await sleep(400);
     const behaviour = getComputedStyle(el).scrollBehavior;
     const start = performance.now();
@@ -252,12 +343,14 @@
       let lastFrom = first;
       nativeRaf(step);
     });
-    return { mode, steps, stopped_by: stoppedBy, elapsed_ms: Math.round(performance.now() - start),
+    return { mode, steps, stopped_by: stoppedBy, park,
+             elapsed_ms: Math.round(performance.now() - start),
              commanded_px: commanded, travelled_px: travelled,
              travel_fraction: commanded > 0 ? Math.round((travelled / commanded) * 1000) / 1000
                                             : null,
              snapback_frames: snapback, scroll_behavior: behaviour,
-             start_top: first, end_top: el.scrollTop, mid_target: mid, span };
+             start_top: first, end_top: el.scrollTop,
+             scroll_height: el.scrollHeight, span: Math.max(0, el.scrollHeight - el.clientHeight) };
   };
 
   // ── a deliberate main-thread jam, used ONLY to prove the channel can report one ────────────
@@ -371,6 +464,8 @@
 
   W.run = async (opts) => {
     const o = Object.assign({ idleMs: 8000, gestureFrames: 80, gestureCapMs: 45000,
+                              warmupFrames: 60, warmupCapMs: 30000, warmupRounds: 10,
+                              warmupQuietElements: 50, warmupQuietRounds: 2,
                               lastMarker: null,
                               mountTimeoutMs: 420000, rung: "?", only: null,
                               hogMs: 200, hogPeriodMs: 250 }, opts || {});
@@ -454,6 +549,94 @@
       };
       W.liveness = liveness;
 
+      // ── THE PARK POSITION, fixed once, before anything is measured ──────────────────────
+      const park = Math.round(Math.max(0, el.scrollHeight - el.clientHeight) * 0.5);
+
+      // ── A DISCARDED WARM-UP, run to QUIESCENCE ─────────────────────────────────────────
+      //
+      // Run 32865232787 failed its own drift gate because the FIRST scored window paid a
+      // first-visit cost: 261.4 ms blocked per scroll event against a 162.6 / 193.9 / 197.5 /
+      // 184.5 cluster, while the DOM grew by 11,205 elements across the session. That growth was
+      // NOT KaTeX and NOT new code fences -- `.katex` stayed at 1,027, `.katex *` at 101,306 and
+      // `pre` at 330 throughout -- so it is some other viewport-triggered mount, and the
+      // mutation census above is what names it.
+      //
+      // This window runs the identical 1 px gesture at the identical fixed park position and
+      // THROWS THE READING AWAY, repeating until the DOM stops changing. It is bounded by rounds
+      // and by a wall clock, and whether it actually reached quiescence is recorded rather than
+      // assumed: a warm-up that did not converge is a reportable condition, not a silent one.
+      // Widening the drift threshold instead would have turned off the one gate that was telling
+      // the truth.
+      W.marks.push({ name: "warmup", wall_ms: Date.now() });
+      const warm = { rounds: [], quiesced: false, park,
+                     mut_before: mutSnapshot(), census_before: census(el) };
+      const warmT0 = performance.now();
+
+      // DRAIN THE DEFERRED-FENCE RESERVOIR FIRST, or no warm-up can converge.
+      //
+      // `useFenceReached` latches on three triggers, and two of them are not scrolling at all: an
+      // IntersectionObserver with a 100% root margin, and a capturing scroll listener that treats
+      // any move larger than one root height as a jump. An IntersectionObserver re-delivers on
+      // LAYOUT CHANGE with no scroll whatsoever, so `[data-role] *{position:static}` -- which
+      // makes this thread 7.3% taller -- slides fences into the band and latches them. That is
+      // not the arm's effect on scrolling; it is the arm paying for markup that any arm could
+      // have triggered, and it permanently contaminates every window after it (the last run's
+      // baseline_3 and baseline_4 mounted 1,898 and 2,322 elements during their SETTLE, having
+      // moved nothing).
+      //
+      // The reservoir is emptied on purpose, using the app's own path: `code-fence-defer.tsx`
+      // registers `beforeprint` -> `upgradeEverythingForPrint`, which latches every remaining
+      // fence at once. After that there is nothing left to mount, so a height change cannot
+      // trigger one.
+      //
+      // THE COST OF DOING THIS IS STATED RATHER THAN HIDDEN: it moves the page off the state the
+      // local llvmpipe rig measured (111,995 elements at this rung, which this venue reproduced
+      // to within one element at 111,994). Both counts are recorded below so the comparison with
+      // the local 78% / 79% / 86% carries its caveat as a number.
+      const latch = { before: census(el), dispatched: false, error: null };
+      try {
+        window.dispatchEvent(new Event("beforeprint"));
+        latch.dispatched = true;
+      } catch (e) { latch.error = err(e); }
+      // flushSync lands the swap in one task; the grammars arrive on a requestIdleCallback with a
+      // 2,000 ms timeout, and a fence whose grammar is late latches to a plain fallback first and
+      // grows its spans only once it arrives.
+      await sleep(6000);
+      latch.after = census(el);
+      latch.fences_latched = latch.before.fences_deferred - latch.after.fences_deferred;
+      latch.elements_added = latch.after.elements - latch.before.elements;
+      latch.highlight_spans_added = latch.after.highlight_spans - latch.before.highlight_spans;
+      warm.fence_latch = latch;
+      let quietRun = 0;
+      for (let i = 0; i < o.warmupRounds; i++) {
+        const m0 = mutSnapshot(), e0 = census(el);
+        let g = null, gErr = null;
+        try { g = await gesture(el, o.warmupFrames, o.warmupCapMs, "pixel", park); }
+        catch (e) { gErr = err(e); }
+        await sleep(800);
+        const m1 = mutSnapshot(), e1 = census(el);
+        const d = mutDelta(m0, m1);
+        const round = { i: i + 1, mutations: d,
+                        elements: e1.elements, element_delta: e1.elements - e0.elements,
+                        highlight_spans: e1.highlight_spans,
+                        scroll_height: e1.scroller_scroll_height,
+                        frames: g ? g.steps : null, error: gErr };
+        warm.rounds.push(round);
+        if (Math.abs(round.element_delta) <= o.warmupQuietElements
+            && d.added_elements <= o.warmupQuietElements) {
+          quietRun++;
+          if (quietRun >= o.warmupQuietRounds) { warm.quiesced = true; break; }
+        } else {
+          quietRun = 0;
+        }
+        if (performance.now() - warmT0 > o.warmupCapMs * o.warmupRounds) break;
+      }
+      warm.elapsed_ms = Math.round(performance.now() - warmT0);
+      warm.mut_total = mutDelta(warm.mut_before, mutSnapshot());
+      warm.census_after = census(el);
+      W.warmup = warm;
+      slice();
+
       const baselineCensus = census(el);
       const positioned = {
         message_descendants: positionedEstimate("[data-role] *", 1500),
@@ -464,11 +647,15 @@
         if (o.only && o.only.indexOf(windowName) < 0) continue;
         const arm = ARMS[armKey];
         const before = census(el);
+        const mutAtStart = mutSnapshot();
         let detail = "", ok = true, applyError = null;
         try { detail = await arm.apply(); }
         catch (e) { ok = false; applyError = err(e); detail = applyError.message; }
         // Let the mutation settle so its own style/layout cost is not billed to the gesture.
-        await sleep(1500);
+        // Removing 28 messages is a far bigger job than adding a stylesheet and needs longer:
+        // the positive control's window carried a 20,249 ms frame last run, which was the
+        // removal itself leaking into the reading.
+        await sleep(arm.destructive ? 5000 : 1500);
         const applied = census(el);
         let fired = null;
         if (arm.fired) {
@@ -480,7 +667,8 @@
         W.marks.push({ name: "arm:" + windowName, wall_ms: Date.now() });
         const aT0 = performance.now();
         let gest = null, gestError = null;
-        try { gest = await gesture(el, o.gestureFrames, o.gestureCapMs, arm.mode || "pixel"); }
+        try { gest = await gesture(el, o.gestureFrames, o.gestureCapMs, arm.mode || "pixel",
+                                   park); }
         catch (e) { ok = false; gestError = err(e); }
         const elapsed = performance.now() - aT0;
         const s = slice();
@@ -504,6 +692,9 @@
           raf_gaps_ms: s.g.map((x) => Math.round(x * 10) / 10),
           busy: b,
           census_before: before, census_applied: applied, census_after: census(el),
+          // Per window, so a window that paid for someone else's deferred mounting is visible as
+          // a number instead of being averaged into the arm it landed on.
+          mutations: mutDelta(mutAtStart, mutSnapshot()),
           scroll_height_delta: (applied.scroller_scroll_height !== null
                                 && before.scroller_scroll_height)
             ? Math.round(((applied.scroller_scroll_height / before.scroller_scroll_height) - 1)
@@ -527,6 +718,8 @@
                hardwareConcurrency: navigator.hardwareConcurrency },
              url: location.href, mount: { ms: Math.round(mountMs), census: census(el) },
              clamp, guard, liveness, idle: idleClean, idle_jammed: idleJammed,
+             warmup: warm, park, fence_latch: warm.fence_latch,
+             mutations_total: mutDelta(warm.mut_before, mutSnapshot()),
              baseline_census: baselineCensus, positioned,
              gesture_frames: o.gestureFrames, gesture_cap_ms: o.gestureCapMs, idle_ms: o.idleMs,
              notes: W.notes, marks: W.marks, arms: W.arms, final: census(el) });

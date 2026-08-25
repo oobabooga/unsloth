@@ -153,6 +153,19 @@ jobs:
       # visible: a mean over a bimodal draw is a report of how many slow draws landed in an arm,
       # not an estimate of anything, and every table this criteria module prints carries per-rep
       # columns for that reason.
+      # SECOND ATTEMPT. Run 32865232787 failed its own DRIFT gate and was correctly INCONCLUSIVE:
+      # first baseline 261.4 ms blocked per scroll event against a 162.6 / 193.9 / 197.5 / 184.5
+      # cluster. The cause was found in the artifact, not guessed: the DOM grew 11,205 elements
+      # across the session while `.katex` and `pre` stayed pinned, which is the deferred code
+      # fence in `code-fence-defer.tsx` latching spans INSIDE `pre` elements that already existed.
+      # It latches off an IntersectionObserver with a 100% root margin, which re-delivers on
+      # layout change alone, so the arm that made the thread 7.3% taller was paying for markup any
+      # arm could have triggered. The harness compounded it by recomputing the park position as
+      # `scrollHeight * 0.5` per window, moving each window onto content never visited before.
+      #
+      # Three fixes, none of which touch the drift threshold: a FIXED park pixel, a DISCARDED
+      # warm-up run to quiescence, and draining the fence reservoir first through the app's own
+      # `beforeprint` path. The drift gate stays exactly as strict as it was.
       - name: One-pixel ablation at r500K
         timeout-minutes: 250
         run: |
