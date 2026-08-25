@@ -26,8 +26,15 @@ like a host limitation and was not:
     as well, so even glib-2.0, which the host does have, stopped resolving. The result read as
     "nothing is available" when in fact everything was, in two places at once.
 
-So the closure is enumerated with `apt-cache depends --recurse`, and PKG_CONFIG_PATH is the
-fetched tree FOLLOWED BY the system directories, with PKG_CONFIG_LIBDIR left alone.
+  * `apt-cache depends --recurse` then returned 234 packages for eleven roots on this runner,
+    where the same command on a developer box returns 390 for `libgtk-3-dev` alone, and the
+    ones it omitted were precisely the header-carrying `libpango1.0-dev`, `libatk1.0-dev`,
+    `libcairo2-dev` and `libgdk-pixbuf-2.0-dev`. That extracted cleanly, resolved
+    `webkit2gtk-4.1`, and failed the build twenty minutes later inside `pango-sys`.
+
+So the closure is walked HERE, breadth-first over single-level `apt-cache depends`, every
+header-carrying -dev package is named explicitly rather than inferred, and PKG_CONFIG_PATH is
+the fetched tree FOLLOWED BY the system directories, with PKG_CONFIG_LIBDIR left alone.
 """
 
 from __future__ import annotations
@@ -57,6 +64,17 @@ DEV_ROOTS = [
     # is why the repo's own studio-tauri-smoke.yml does not name them, and are absent here.
     "libudev-dev",
     "zlib1g-dev",
+    # The GTK -dev closure, named explicitly rather than left to a dependency walk. Each of
+    # these is a Depends of libgtk-3-dev and each carries headers a -sys crate compiles
+    # against; naming them costs one apt round trip apiece and removes a whole class of
+    # "the build failed 20 minutes in at pango-sys" cycles.
+    "libpango1.0-dev", "libatk1.0-dev", "libatk-bridge2.0-dev", "libcairo2-dev",
+    "libgdk-pixbuf-2.0-dev", "libglib2.0-dev", "libepoxy-dev", "libharfbuzz-dev",
+    "libfreetype-dev", "libfontconfig-dev", "libfribidi-dev", "libpng-dev", "libjpeg-dev",
+    "libx11-dev", "libxext-dev", "libxrender-dev", "libxi-dev", "libxtst-dev",
+    "libxcomposite-dev", "libxcursor-dev", "libxdamage-dev", "libxfixes-dev",
+    "libxinerama-dev", "libxrandr-dev", "libxkbcommon-dev", "libwayland-dev",
+    "wayland-protocols", "libegl1-mesa-dev", "libgl-dev", "libgles-dev",
 ]
 
 # Where a Debian package puts .pc files. Both are searched under the fetched root.
@@ -78,6 +96,55 @@ def sh(cmd, timeout=600, env=None, cwd=None):
 
 
 _PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+
+
+_DEP_RE = re.compile(r"^\s+\|?(?:Pre)?Depends:\s+(\S+)\s*$")
+
+
+def _closure_bfs(roots: list[str], max_pkgs: int = 900,
+                 max_rounds: int = 3) -> tuple[list[str], dict]:
+    """Breadth-first over single-level `apt-cache depends`, done here rather than by apt.
+
+    `apt-cache depends --recurse` was tried first and is what this replaces. On the AMD CI
+    runner it returned 234 packages for eleven roots, where the same command on a developer
+    box returns 390 for `libgtk-3-dev` ALONE, and the packages it omitted were exactly the ones
+    that carry the headers: `libpango1.0-dev`, `libatk1.0-dev`, `libcairo2-dev`,
+    `libgdk-pixbuf-2.0-dev`. The result extracted cleanly, resolved `webkit2gtk-4.1` and then
+    failed the build at `pango-sys`, which is a much more expensive way to find out.
+
+    Single-level `apt-cache depends` is unambiguous and the traversal is ours, so the outcome
+    no longer depends on which apt behaviour a host happens to have. Virtual packages
+    (`<name>`) are skipped because `apt-get download` cannot fetch them.
+    """
+    seen: set[str] = set()
+    order: list[str] = []
+    queue = list(roots)
+    rounds = 0
+    # Depth-bounded, because every header this build needs lives in a -dev package that is
+    # either a root or one hop from one, while an unbounded walk wanders off into the whole
+    # runtime archive and costs an apt round trip per hop for nothing.
+    while queue and len(order) < max_pkgs and rounds < max_rounds:
+        rounds += 1
+        batch, queue = queue, []
+        for name in batch:
+            if name in seen or not _PKG_RE.match(name):
+                continue
+            seen.add(name)
+            order.append(name)
+            r = sh(["apt-cache", "depends", "--no-recommends", "--no-suggests", "--no-conflicts",
+                    "--no-breaks", "--no-replaces", "--no-enhances", name], timeout = 120)
+            for ln in (r.get("stdout") or "").splitlines():
+                m = _DEP_RE.match(ln)
+                if not m:
+                    continue
+                dep = m.group(1)
+                if dep.startswith("<") or dep.endswith(">") or dep in seen:
+                    continue
+                if _PKG_RE.match(dep):
+                    queue.append(dep)
+    return order, {"count": len(order), "rounds": rounds, "roots": len(roots),
+                   "stopped_early": bool(queue),
+                   "truncated": len(order) >= max_pkgs}
 
 
 def _closure(roots: list[str]) -> tuple[list[str], dict]:
@@ -136,7 +203,7 @@ def fetch_devroot(work: Path, roots: list[str] | None = None) -> dict:
     root.mkdir(parents = True, exist_ok = True)
     debs.mkdir(parents = True, exist_ok = True)
 
-    pkgs, meta = _closure(roots)
+    pkgs, meta = _closure_bfs(roots)
     out: dict = {"root": str(root), "closure": meta, "requested": len(pkgs)}
 
     # One apt-get download for the whole list. Individually it is 200+ round trips; in one
@@ -244,6 +311,135 @@ def compile_link_proof(work: Path, env=None) -> dict:
     run = sh([str(binp)], timeout = 120, env = env)
     return {"stage": "ok" if run.get("rc") == 0 else "run",
             "output": (run.get("stdout") or "").strip(), "detail": run}
+
+
+def descendants(root_pid: int) -> set[str]:
+    """Every process under `root_pid`, by walking /proc ppid chains."""
+    parent: dict[str, str] = {}
+    for p in _proc_dirs():
+        try:
+            stat = Path(p, "stat").read_text()
+            parent[os.path.basename(p)] = stat.rsplit(")", 1)[1].split()[1]
+        except Exception:  # noqa: BLE001
+            continue
+    out: set[str] = set()
+    for pid in parent:
+        cur, hops = pid, 0
+        while cur in parent and hops < 40:
+            if cur == str(root_pid):
+                out.add(pid)
+                break
+            cur = parent[cur]
+            hops += 1
+    return out
+
+
+def _proc_dirs():
+    import glob as _glob
+    return _glob.glob("/proc/[0-9]*")
+
+
+def sample_amdgpu(root_pid: int, name_filter=("WebKit", "webkit", "unsloth")) -> dict:
+    """amdgpu's own per-process accounting for the app and its children.
+
+    This is the ONLY reading that can say what rendered, and the reason is worth restating
+    every time it is used: WebKitGTK hardcodes `Apple GPU` / `Apple Inc.` into
+    WEBGL_debug_renderer_info on Linux, on AMD, in cross-platform WebCore, and the runtime
+    unmask switch was deleted upstream. So there is no in-page device string, and `gl.RENDERER`
+    returns `WebKit WebGL`. What is left is the kernel driver's own books: `drm-engine-gfx`
+    nanoseconds and `drm-memory-vram`, per open file description, keyed by `drm-client-id`,
+    written by amdgpu and by nothing in userspace.
+
+    Sampled twice and DIFFERENCED per client id, because a cumulative counter read once cannot
+    say when the time was accrued. Mapped shared objects are recorded unfiltered beside it: a
+    name is corroboration only, never the deciding gate, because since Mesa 24.2 one
+    `libgallium-*.so` contains radeonsi and llvmpipe alike and `libdrm_amdgpu.so.1` is a hard
+    DT_NEEDED of it that maps in the SOFTWARE leg too.
+    """
+    import glob as _glob
+    mine = descendants(root_pid) | {str(root_pid)}
+    procs = []
+    for p in _proc_dirs():
+        pid = os.path.basename(p)
+        if pid not in mine:
+            continue
+        try:
+            cmd = Path(p, "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                errors = "replace").strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if name_filter and not any(t in cmd for t in name_filter):
+            continue
+        entry = {"pid": pid, "cmdline": cmd[:200], "dri_fds": [], "fdinfo": [],
+                 "mapped_all": []}
+        try:
+            names = set()
+            for ln in Path(p, "maps").read_text(errors = "replace").splitlines():
+                path = ln.split(" ", 5)[-1].strip() if " " in ln else ""
+                base = os.path.basename(path)
+                if ".so" in base:
+                    names.add(base)
+            entry["mapped_all"] = sorted(names)[:400]
+        except Exception:  # noqa: BLE001
+            pass
+        for fd in _glob.glob(f"{p}/fd/*"):
+            try:
+                tgt = os.readlink(fd)
+            except Exception:  # noqa: BLE001
+                continue
+            if not tgt.startswith("/dev/dri/"):
+                continue
+            entry["dri_fds"].append(tgt)
+            try:
+                txt = Path(p, "fdinfo", os.path.basename(fd)).read_text(errors = "replace")
+                entry["fdinfo"].append({
+                    k: v.strip() for k, v in
+                    (ln.split(":", 1) for ln in txt.splitlines() if ":" in ln)
+                    if k.startswith("drm-")})
+            except Exception:  # noqa: BLE001
+                pass
+        procs.append(entry)
+    return {"t_monotonic": time.monotonic(), "t_wall": time.time(), "processes": procs}
+
+
+def amdgpu_delta(early: dict, late: dict) -> dict:
+    """GFX engine nanoseconds accrued BETWEEN two samples, differenced per drm-client-id."""
+    def by_client(sample):
+        out = {}
+        for pr in (sample or {}).get("processes", []):
+            for fi in pr.get("fdinfo", []):
+                cid = fi.get("drm-client-id")
+                if not cid:
+                    continue
+                try:
+                    gfx = int(str(fi.get("drm-engine-gfx", "0")).split()[0])
+                except Exception:  # noqa: BLE001
+                    gfx = 0
+                vram = str(fi.get("drm-memory-vram", ""))
+                prev = out.get(cid, {"gfx_ns": 0, "vram": vram, "pid": pr["pid"],
+                                     "cmdline": pr["cmdline"]})
+                prev["gfx_ns"] = max(prev["gfx_ns"], gfx)
+                prev["vram"] = vram or prev["vram"]
+                out[cid] = prev
+        return out
+
+    a, b = by_client(early), by_client(late)
+    rows = []
+    for cid, late_row in b.items():
+        base = a.get(cid, {}).get("gfx_ns", 0)
+        rows.append({"client_id": cid, "pid": late_row["pid"],
+                     "cmdline": late_row["cmdline"], "vram": late_row["vram"],
+                     "gfx_ns_early": base, "gfx_ns_late": late_row["gfx_ns"],
+                     "gfx_ns_delta": late_row["gfx_ns"] - base})
+    return {
+        "clients": rows,
+        "total_gfx_ns_delta": sum(r["gfx_ns_delta"] for r in rows),
+        "total_gfx_ns_late": sum(r["gfx_ns_late"] for r in rows),
+        "render_nodes_open": sorted({fd for s in (late or {}).get("processes", [])
+                                     for fd in s.get("dri_fds", [])}),
+        "seconds": round((late or {}).get("t_monotonic", 0) - (early or {}).get(
+            "t_monotonic", 0), 2) if early and late else None,
+    }
 
 
 def start_xserver_exclusive(work: Path, xvfb_root: Path, width=1440, height=900) -> tuple:
