@@ -78,6 +78,8 @@ def main():
     # Explicit, because on the AMD CI runner this harness runs out of amd_ci/ and not out
     # of the workspace `scripts/` directory these default to.
     ap.add_argument("--scene", default="", help="path to amdv_scene.js")
+    ap.add_argument("--entry", default="window.__av.run",
+                    help="the page-side entry point the scene exposes")
     ap.add_argument("--driver", default="", help="path to wkgtk_drive.py")
     # A DELIBERATELY JAMMED ARM, and the only thing that makes a flat frame rate mean anything.
     # GdkFrameClock ticks under `begin_updating()` whether or not the page had anything new to
@@ -250,13 +252,13 @@ def main():
         initp.write_text(init_js + "\n" + scene + "\n" + hog)
 
         runp = work / f"run_{tag}.js"
-        runp.write_text("window.__av.run(%s);" % json.dumps({
+        runp.write_text("%s(%s);" % (args.entry, json.dumps({
             "idleMs": args.idle_ms, "recoverMs": args.recover_ms,
             "maxMs": int(exp_ms * 4 + 240000), "rung": args.rung,
             "lastMarker": seeded["last_marker"],
             "mountTimeoutMs": 420000,
             "skipSend": bool(args.skip_send),
-        }))
+        })))
 
         conlog = outp.parent / f"console_{tag}.jsonl"
         resultp = work / f"result_{tag}.json"

@@ -86,6 +86,21 @@ jobs:
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/ladder"
 
+      # ATTRIBUTION. Same job as the ladder deliberately: the GPU concurrency group holds one
+      # runner plus one waiter and a THIRD arrival cancels the waiter silently, so a second job
+      # here would race the Tauri work on the same box. One job, arms serialised inside it.
+      - name: Ablation probe (mechanism attribution at 500K)
+        timeout-minutes: 200
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_ablate_probe.py \
+            --criteria amd_ci/criteria/studio_ablate_mechanism.py \
+            --out-dir "$AMD_CI_WORK/out/ablate" \
+            -- --rung 500K --reps 2
+          cat "$AMD_CI_WORK/out/ablate/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/ablate"
+
       - name: Stop anything left holding the GPU
         if: always()
         run: |
@@ -94,7 +109,7 @@ jobs:
           # step's own shell, because the pattern ends up on its command line; that has cost a
           # real run before. A Studio or an Xvfb that outlives the job holds VRAM on a machine
           # three other slots share, so this cannot simply be skipped either.
-          for p in $(seq 5451 5460); do
+          for p in $(seq 5451 5480); do
             pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
             [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
           done
