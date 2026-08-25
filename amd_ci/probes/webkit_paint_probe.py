@@ -8,11 +8,14 @@ The question it exists to settle cannot be answered by inspection. A host can
 have libwebkit2gtk-4.1, a render node, and a hardware EGL context, and still
 composite pages on the CPU, because the engine picks its own driver in its own
 process. So the reading that matters is taken from INSIDE the page:
-`WEBGL_debug_renderer_info` reports the renderer WebKit's own GL context got,
-and it is the same string the standalone EGL probe reads, which makes the two
-directly comparable. Two independent corroborations are collected beside it:
-which of WebKit's auxiliary processes hold /dev/dri/renderD128 open, and what
-amdgpu's per-fd counters say those processes did.
+`WEBGL_debug_renderer_info` reports the renderer WebKit's own GL context got.
+On this port it does NOT: every WebKit port masks that extension to a fixed
+"Apple GPU", so the in-page string is a mask and not a reading. What is
+collected instead: which of WebKit's auxiliary processes hold
+/dev/dri/renderD128 open, what amdgpu's per-fd counters say those processes did
+between an early sample and the end of the animation, every shared object mapped
+into those processes, and the same page run a second time with mesa forced onto
+its software rasteriser as a negative control.
 
 It also has to solve the display problem: GTK needs a display server, this host
 has no X server, no compositor and no root. The attempts are recorded in order
@@ -55,22 +58,46 @@ var host=document.getElementById('host');
 for(var i=0;i<24;i++){var d=document.createElement('div');d.className='card';
   d.style.left=(40+(i%6)*200)+'px';d.style.top=(30+Math.floor(i/6)*160)+'px';
   d.style.animationDelay=(i*0.05)+'s';host.appendChild(d);}
-var n=0,t0=null,last=null,deltas=[];
+var n=0,t0=null,last=null,deltas=[],emitted=false;
 function frame(t){ if(t0===null){t0=t;last=t;} n++; deltas.push(t-last); last=t;
   if(t-t0<__MS__){requestAnimationFrame(frame);} else {finish(t-t0);} }
 function finish(ms){
-  var renderer=null,vendor=null,ok=false,err=null;
+  var renderer=null,vendor=null,plain_r=null,plain_v=null,ok=false,err=null,nx=null;
   try{ var c=document.createElement('canvas');
     var gl=c.getContext('webgl')||c.getContext('experimental-webgl');
     if(gl){ ok=true; var e=gl.getExtension('WEBGL_debug_renderer_info');
-      renderer=e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER);
-      vendor=e?gl.getParameter(e.UNMASKED_VENDOR_WEBGL):gl.getParameter(gl.VENDOR); } }
+      plain_r=gl.getParameter(gl.RENDERER); plain_v=gl.getParameter(gl.VENDOR);
+      renderer=e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):plain_r;
+      vendor=e?gl.getParameter(e.UNMASKED_VENDOR_WEBGL):plain_v;
+      var ex=gl.getSupportedExtensions(); nx=ex?ex.length:null; } }
   catch(x){ err=''+x; }
   deltas.sort(function(a,b){return a-b;});
   var p95=deltas.length?deltas[Math.min(deltas.length-1,Math.floor(deltas.length*0.95))]:null;
-  document.title='RESULT'+JSON.stringify({frames:n,ms:ms,fps:n/(ms/1000),
-    p95_frame_ms:p95,webgl:ok,webgl_renderer:renderer,webgl_vendor:vendor,webgl_error:err,
-    ua:navigator.userAgent});
+  var base={frames:n,ms:ms,fps:n/(ms/1000),
+    p95_frame_ms:p95,webgl:ok,webgl_renderer:renderer,webgl_vendor:vendor,
+    webgl_renderer_plain:plain_r,webgl_vendor_plain:plain_v,webgl_extensions:nx,
+    webgl_error:err,ua:navigator.userAgent};
+  function emit(extra){ if(emitted){return;} emitted=true;
+    for(var k in extra){base[k]=extra[k];}
+    document.title='RESULT'+JSON.stringify(base); }
+  // WebGPU's GPUAdapterInfo is the one in-page surface that is NOT masked the
+  // way WEBGL_debug_renderer_info is. Recorded whatever it says, including
+  // "absent", because on most WebKitGTK builds WebGPU is off by default.
+  try{
+    if(navigator.gpu && navigator.gpu.requestAdapter){
+      var to=setTimeout(function(){emit({webgpu:'timeout'});},3000);
+      navigator.gpu.requestAdapter().then(function(a){
+        clearTimeout(to);
+        if(!a){emit({webgpu:'no adapter'});return;}
+        var p=a.info?Promise.resolve(a.info):
+              (a.requestAdapterInfo?a.requestAdapterInfo():Promise.resolve(null));
+        p.then(function(i){emit({webgpu:i?JSON.stringify({vendor:i.vendor,
+            architecture:i.architecture,device:i.device,description:i.description}):
+            'adapter present, no info'});},
+          function(e){emit({webgpu:'info error: '+e});});
+      },function(e){clearTimeout(to);emit({webgpu:'requestAdapter error: '+e});});
+    } else { emit({webgpu:'absent'}); }
+  }catch(x){ emit({webgpu:'threw: '+x}); }
 }
 requestAnimationFrame(frame);
 </script></body></html>"""
@@ -270,23 +297,36 @@ def webkit_child(out: Path, ms: int, snapshot: Path) -> int:
                 continue
             pid = os.path.basename(p)
             entry = {"pid": pid, "cmdline": cmd[:200], "dri_fds": [], "fdinfo": [],
-                     "mapped_drivers": []}
+                     "mapped_drivers": [], "mapped_all": []}
             # Which mesa driver the engine's own process loaded. WebKitGTK
             # returns a masked "Apple GPU" from WEBGL_debug_renderer_info on
             # every port, so the in-page string cannot name the device; a
             # mapped radeonsi_dri.so or swrast_dri.so can, and the engine does
             # not choose what its own address space says.
+            #
+            # `mapped_drivers` was a NAME WHITELIST, and on this host it came
+            # back with only libEGL/libgbm in it, which read as "no AMD driver"
+            # and cost a PARTIAL verdict. A whitelist cannot distinguish "the
+            # driver is not loaded" from "the driver is not on my list", so
+            # `mapped_all` now records every mapped shared object unfiltered and
+            # the whitelist is only a convenience view over it.
             try:
                 maps = Path(p, "maps").read_text(errors = "replace")
-                names = set()
+                names, every = set(), set()
                 for ln in maps.splitlines():
                     path = ln.split(" ", 5)[-1].strip() if " " in ln else ""
                     base = os.path.basename(path)
+                    if ".so" not in base:
+                        continue
+                    every.add(base)
                     if base.endswith("_dri.so") or any(
                             t in base for t in ("radeonsi", "llvmpipe", "swrast", "libEGL",
-                                                "libgbm", "libvulkan", "libGLX", "libGLESv2")):
+                                                "libgbm", "libvulkan", "libGLX", "libGLESv2",
+                                                "gallium", "amdgpu", "libdrm", "radeon",
+                                                "zink", "libLLVM", "virtio")):
                         names.add(base)
                 entry["mapped_drivers"] = sorted(names)
+                entry["mapped_all"] = sorted(every)[:400]
             except Exception:  # noqa: BLE001
                 pass
             for fd in glob.glob(f"{p}/fd/*"):
@@ -313,6 +353,7 @@ def webkit_child(out: Path, ms: int, snapshot: Path) -> int:
         state["done"] = True
         res["finish_reason"] = reason
         res["webkit_processes"] = collect_processes()
+        res["sample_t1_monotonic"] = time.monotonic()
 
         def record_png(path):
             data = path.read_bytes()
@@ -377,6 +418,18 @@ def webkit_child(out: Path, ms: int, snapshot: Path) -> int:
         if ev == WebKit2.LoadEvent.FINISHED:
             res["load_finished"] = True
 
+    def sample_t0():
+        # A cumulative fdinfo counter read once cannot say WHEN the engine time
+        # was spent. Sampling early and again at the end makes the reported
+        # figure an amount accrued while the page was animating, which is the
+        # claim, rather than a lifetime total that a single startup blit could
+        # also produce.
+        if not state["done"] and "webkit_processes_t0" not in res:
+            res["webkit_processes_t0"] = collect_processes()
+            res["sample_t0_monotonic"] = time.monotonic()
+        return False
+
+    GLib.timeout_add(1200, sample_t0)
     view.connect("notify::title", on_title)
     view.connect("load-changed", on_load)
     view.connect("web-process-terminated",
@@ -422,22 +475,36 @@ def main() -> int:
         if not xinfo.get("display"):
             obs["webkit"] = {"skipped": "no display server could be started"}
         else:
-            child_out = args.out.parent / "webkit_child.json"
-            snap = args.out.parent / "page.png"
-            cmd = ["dbus-run-session", "--"] if shutil.which("dbus-run-session") else []
-            cmd += [sys.executable, os.path.abspath(__file__), "--webkit-child",
-                    "--out", str(child_out), "--ms", str(args.ms), "--snapshot", str(snap)]
-            env = {"DISPLAY": xinfo["display"], "GDK_BACKEND": "x11",
-                   "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", str(work))}
-            r = sh(cmd, timeout = args.ms // 1000 + 180, env = env)
-            obs["webkit_run"] = {k: r.get(k) for k in ("rc", "stdout", "stderr", "present")}
-            if child_out.is_file():
-                try:
-                    obs["webkit"] = json.loads(child_out.read_text())
-                except Exception as e:  # noqa: BLE001
-                    obs["webkit"] = {"parse_error": f"{type(e).__name__}: {e}"}
-            else:
-                obs["webkit"] = {"missing_output": True}
+            def run_child(tag: str, extra_env: dict) -> tuple[dict, dict]:
+                child_out = args.out.parent / f"webkit_child{tag}.json"
+                snap = args.out.parent / f"page{tag}.png"
+                cmd = ["dbus-run-session", "--"] if shutil.which("dbus-run-session") else []
+                cmd += [sys.executable, os.path.abspath(__file__), "--webkit-child",
+                        "--out", str(child_out), "--ms", str(args.ms), "--snapshot", str(snap)]
+                env = {"DISPLAY": xinfo["display"], "GDK_BACKEND": "x11",
+                       "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", str(work))}
+                env.update(extra_env)
+                r = sh(cmd, timeout = args.ms // 1000 + 180, env = env)
+                run = {k: r.get(k) for k in ("rc", "stdout", "stderr", "present")}
+                run["env_overrides"] = extra_env
+                if child_out.is_file():
+                    try:
+                        return run, json.loads(child_out.read_text())
+                    except Exception as e:  # noqa: BLE001
+                        return run, {"parse_error": f"{type(e).__name__}: {e}"}
+                return run, {"missing_output": True}
+
+            obs["webkit_run"], obs["webkit"] = run_child("", {})
+
+            # NEGATIVE CONTROL. The same engine, the same page, the same X
+            # server, with mesa told to use its software rasteriser. Without it,
+            # "amdgpu attributed engine time to WebKit" is a reading with no
+            # baseline: something else in the process could have touched the
+            # GPU. With it, the amount of engine time becomes a DIFFERENCE
+            # caused by the only variable changed, which is which renderer the
+            # browser drew with.
+            obs["control_run"], obs["control"] = run_child(
+                "_sw", {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe"})
 
             # The same reading the standalone EGL probe takes, from the same
             # host, so the two strings can be compared directly.

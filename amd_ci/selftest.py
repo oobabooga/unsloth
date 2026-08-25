@@ -439,6 +439,57 @@ def test_a_masked_renderer_string_cannot_carry_a_verdict() -> None:
           ["the view really painted, not a blank surface"] is False, "")
     check("and a real one passes it", all(g.values()), str(g))
 
+    # The whitelist hole this cost a run to find: recent mesa maps no library
+    # whose name contains "radeonsi", so a name-based gate reported PARTIAL on a
+    # host where amdgpu had billed 121 ms of GFX engine time to WebKit's own
+    # process. A negative control has to be able to carry the verdict alone.
+    only_kernel = _fake_webkit_obs(mapped = ("libEGL.so.1", "libgallium-25.0.7.so"))
+    v, why = crit.verdict(only_kernel)
+    check("kernel evidence with no device-naming library and no control -> PARTIAL",
+          v == "PARTIAL", f"{v}: {why}")
+    check("and libgallium alone is not accepted as an AMD driver",
+          crit._amd_driver_mapped(only_kernel) is False, str(crit._mapped(only_kernel)))
+
+    with_control = dict(only_kernel)
+    with_control["control"] = {
+        "gi": True, "page": {"frames": 300, "ms": 5000, "webgl_renderer": "Apple GPU"},
+        "snapshot_bytes": 190000, "snapshot_distinct_bytes": 256,
+        "webkit_processes": [{"pid": "9", "cmdline": ".../WebKitWebProcess", "dri_fds": [],
+                              "fdinfo": [], "mapped_drivers": ["llvmpipe"],
+                              "mapped_all": ["libgallium-25.0.7.so"]}]}
+    v, why = crit.verdict(with_control)
+    check("the same reading plus a collapsed software control -> CAPABLE",
+          v == "CAPABLE", f"{v}: {why}")
+    check("and the reason cites the control, not a library name",
+          "forced to software" in why and "masks" in why, why)
+
+    # A control that does NOT collapse means the counter is not tracking the
+    # renderer, so it must not be allowed to confirm anything.
+    bad_control = dict(with_control)
+    bad_control["control"] = dict(with_control["control"])
+    bad_control["control"]["webkit_processes"] = [{
+        "pid": "9", "cmdline": ".../WebKitWebProcess", "dri_fds": ["/dev/dri/renderD128"],
+        "fdinfo": [{"drm-driver": "amdgpu", "drm-engine-gfx": "90000000 ns",
+                    "drm-client-id": "77"}],
+        "mapped_drivers": [], "mapped_all": []}]
+    v, why = crit.verdict(bad_control)
+    check("a control that also used the GPU -> PARTIAL, not CAPABLE",
+          v == "PARTIAL", f"{v}: {why}")
+    check("and gpu_browser_compositing is not claimed then",
+          crit.observed_capabilities(bad_control)["gpu_browser_compositing"] is False, "")
+
+    # The delta reading: engine time accrued WHILE the page animated.
+    windowed = _fake_webkit_obs()
+    windowed["webkit"]["webkit_processes"][0]["fdinfo"][0]["drm-client-id"] = "1846"
+    windowed["webkit"]["webkit_processes_t0"] = [{
+        "pid": "255976", "dri_fds": ["/dev/dri/renderD128"],
+        "fdinfo": [{"drm-engine-gfx": "11379468 ns", "drm-client-id": "1846"}],
+        "mapped_drivers": []}]
+    check("the animation-window delta is differenced per DRM client id",
+          crit._gfx_delta_ns(windowed) == 91379468 - 11379468, str(crit._gfx_delta_ns(windowed)))
+    check("and is None, not 0, when no early sample was taken",
+          crit._gfx_delta_ns(_fake_webkit_obs()) is None, "")
+
     no_display = _fake_webkit_obs()
     no_display["xserver"] = {"display": None, "attempts": []}
     g = dict((n, ok) for n, ok, _ in crit.gates(no_display))
