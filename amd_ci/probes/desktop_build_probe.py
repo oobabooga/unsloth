@@ -322,7 +322,7 @@ def main() -> int:
         # reason they are not the same build.
         pristine = None
         if args.stage_dir:
-            pristine = Path(args.stage_dir) / (binary.name + "-pristine")
+            pristine = Path(args.stage_dir) / "desktop-pristine"
             pristine.parent.mkdir(parents = True, exist_ok = True)
             shutil.copy2(binary, pristine)
         obs["instrument"] = instrument_frontend(repo)
@@ -344,7 +344,7 @@ def main() -> int:
             obs["cargo_build_instrumented"]["stderr"] = \
                 (obs["cargo_build_instrumented"].get("stderr") or "")[-4000:]
             if args.stage_dir and binary.is_file():
-                shutil.copy2(binary, Path(args.stage_dir) / (binary.name + "-instrumented"))
+                shutil.copy2(binary, Path(args.stage_dir) / "desktop-instrumented")
         obs["binary"]["pristine_staged"] = str(pristine) if pristine else None
 
         # ── 5. a display, then LAUNCH ──
@@ -374,6 +374,12 @@ def main() -> int:
         logp = work / "launch_stderr.log"
         env = dict(os.environ)
         env.update(build_env)
+        # BUILD-time only. The fetched tree also contains runtime .so files, and leaving it on
+        # LD_LIBRARY_PATH would run the app against those copies rather than against the host's
+        # libwebkit2gtk-4.1 2.52.3 -- the very library the web UI ladder was measured on. Same
+        # versions either way, but "the same library" should be a fact and not a coincidence.
+        for k in ("LD_LIBRARY_PATH", "LIBRARY_PATH", "RUSTFLAGS", "PKG_CONFIG_PATH"):
+            env.pop(k, None)
         env.update({
             "DISPLAY": xinfo["display"],
             "HOME": str(home),
@@ -455,8 +461,9 @@ def main() -> int:
             # here, and it names WHICH is which so the measuring job cannot mix them up.
             (stage / "MANIFEST.json").write_text(json.dumps({
                 "commit": obs.get("commit"), "profile": args.profile,
-                "pristine": binary.name + "-pristine",
-                "instrumented": binary.name + "-instrumented",
+                "cargo_binary_name": binary.name,
+                "pristine": "desktop-pristine",
+                "instrumented": "desktop-instrumented",
                 "control_port": AMDV_CONTROL_PORT,
                 "instrument": obs.get("instrument"),
                 "bytes": obs["binary"]["bytes"],

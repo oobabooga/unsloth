@@ -257,8 +257,22 @@ def fetch_devroot(work: Path, roots: list[str] | None = None) -> dict:
     # The fetched tree FIRST, the system directories after it. Not PKG_CONFIG_LIBDIR: that
     # REPLACES the search path rather than extending it, and doing so is what made the first
     # attempt report that even glib was missing.
+    libdir = str(root / "usr/lib/x86_64-linux-gnu")
     out["env"] = {
         "PKG_CONFIG_PATH": ":".join(pcdirs + list(SYSTEM_PC)),
+        # THE LINK SEARCH PATH, and it is not optional even though pkg-config resolves.
+        # Observed: every crate compiled and the final link then failed with `unable to find
+        # library -lgdk-3`, `-lwebkit2gtk-4.1`, `-lpango-1.0` and a dozen more. The .pc files
+        # hardcode `libdir=/usr/lib/x86_64-linux-gnu`, so the `-L` they emit points at the
+        # SYSTEM directory, which has the runtime `libgdk-3.so.0` and not the unversioned
+        # `libgdk-3.so` symlink that only the -dev package ships. Both the gcc driver
+        # (LIBRARY_PATH) and rustc (-L native=) are told, because the failing link went
+        # through gcc to rust-lld and either one alone leaves a way for it to be missed.
+        "LIBRARY_PATH": ":".join(
+            [libdir] + ([os.environ["LIBRARY_PATH"]] if os.environ.get("LIBRARY_PATH") else [])),
+        "RUSTFLAGS": " ".join(
+            [f"-L native={libdir}"] + ([os.environ["RUSTFLAGS"]]
+                                       if os.environ.get("RUSTFLAGS") else [])),
         # pkgconf recomputes `prefix` from where it found the .pc file, so the -I flags point
         # into the fetched tree without a sysroot. Recorded rather than assumed: the probe
         # verifies it by compiling and LINKING, not by reading a version string.

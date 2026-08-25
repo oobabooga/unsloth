@@ -89,8 +89,12 @@ def _is_software(r):
     return bool(r.get("software")) or str(r.get("rep")) == "sw"
 
 
+def _is_pristine(r):
+    return bool(r.get("no_scene")) or str(r.get("rep")) == "pristine"
+
+
 def _is_control(r):
-    return _is_hog(r) or _is_software(r)
+    return _is_hog(r) or _is_software(r) or _is_pristine(r)
 
 
 def _ok_runs(obs):
@@ -303,6 +307,21 @@ def gates(obs):
                 f"streamed {streamed}/{len(ok)}; reasoning_toggle {sum(toggles)}/{len(toggles)}; "
                 f"select_all_copy {sum(copies)}/{len(copies)}"))
 
+    # THE UNMODIFIED APP. Everything above is measured on a binary with our scene compiled
+    # into the bundle, which is unavoidable and is also exactly the kind of thing that turns
+    # "Desktop works" into "our build of Desktop works". This leg is the shipped code path:
+    # no injected script, no control channel, observed only.
+    pr = _find(obs, _is_pristine)
+    prb = _bench(pr) if pr else {}
+    pinfo = prb.get("pristine") or {}
+    out.append(("the UNMODIFIED binary reached the Studio shell over a real backend",
+                bool(prb.get("ok")),
+                "no pristine leg" if pr is None else
+                f"window_mapped={pinfo.get('window_mapped')} "
+                f"backend_requests={pinfo.get('backend_requests_seen')} "
+                f"seeded_thread_id_in_backend_log={pinfo.get('thread_id_in_log')} "
+                f"screenshot={pinfo.get('screenshot_bytes')} B"))
+
     have_repeat = any(len(rs) >= 2 for rs in _by_rung(obs).values())
     out.append(("at least one rung was measured twice, so a difference has a floor", have_repeat,
                 ", ".join(f"{k}x{len(v)}" for k, v in sorted(_by_rung(obs).items())) or "none"))
@@ -365,9 +384,10 @@ def table(obs):
         b = _bench(r)
         amd = b.get("amdgpu") or {}
         vram = ", ".join(sorted({c.get("vram") or "" for c in amd.get("clients") or []})) or "-"
-        label = f"{r.get('rung')} rep {r.get('rep')}" + (" (SOFTWARE control)" if _is_software(r)
-                                                         else " (jammed control)" if _is_hog(r)
-                                                         else "")
+        label = f"{r.get('rung')} rep {r.get('rep')}" + (
+            " (SOFTWARE control)" if _is_software(r) else
+            " (jammed control)" if _is_hog(r) else
+            " (UNMODIFIED binary)" if _is_pristine(r) else "")
         rows.append("| " + " | ".join([
             label, _fmt(amd.get("total_gfx_ns_delta")), vram,
             str(len(amd.get("render_nodes_open") or [])),
@@ -442,8 +462,9 @@ def _worst_drop(obs):
 def _gpu_story(obs) -> str:
     sw = _find(obs, _is_software)
     real = [r for r in _ok_runs(obs)]
-    real_ns = max([_gfx_ns(r) or 0 for r in real] or [0])
-    sw_ns = _gfx_ns(sw) if sw is not None else None
+    real_ns = int(max([_gfx_ns(r) or 0 for r in real] or [0]))
+    sw_ns = _gfx_ns(sw)
+    sw_ns = int(sw_ns) if sw_ns is not None else None
     applied = {}
     for r in real:
         applied.update(_workaround_applied(r))
@@ -512,8 +533,9 @@ def verdict(obs):
 def observed_capabilities(obs):
     ok = _ok_runs(obs)
     sw = _find(obs, _is_software)
-    real_ns = max([_gfx_ns(r) or 0 for r in ok] or [0])
-    sw_ns = _gfx_ns(sw) if sw is not None else None
+    real_ns = int(max([_gfx_ns(r) or 0 for r in ok] or [0]))
+    sw_ns = _gfx_ns(sw)
+    sw_ns = int(sw_ns) if sw_ns is not None else None
     gpu_ok = bool(real_ns and sw_ns is not None and sw_ns <= real_ns * SOFTWARE_MAX_FRACTION)
     return {
         "webkitgtk": bool(ok),

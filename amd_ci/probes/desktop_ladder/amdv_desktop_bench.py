@@ -194,6 +194,15 @@ def main() -> int:
     ap.add_argument("--hog-ms", type = int, default = 0)
     ap.add_argument("--hog-period-ms", type = int, default = 250)
     ap.add_argument("--skip-send", action = "store_true")
+    ap.add_argument("--no-scene", action = "store_true",
+                    help = "launch the PRISTINE binary and observe it, with no control channel "
+                           "and no scene. This leg exists so that 'Unsloth Desktop functions on "
+                           "this runner' is a claim about an UNMODIFIED app: it cannot open a "
+                           "specific thread, because that needs the injected script, but it can "
+                           "show the real Studio shell over a real backend with the seeded "
+                           "thread in its list, and the backend's own access log records the "
+                           "requests it made to get there.")
+    ap.add_argument("--observe-seconds", type = int, default = 120)
     ap.add_argument("--software", action = "store_true",
                     help = "the NEGATIVE CONTROL leg: LIBGL_ALWAYS_SOFTWARE=1, everything "
                            "else identical. Without it the amdgpu counters are a number "
@@ -384,9 +393,23 @@ def main() -> int:
             return 6
 
         # ── the control channel, then the app ──
-        control = Control(args.control_port, outp.parent).start()
-        control.store.set_config({
+        if not args.no_scene:
+            control = Control(args.control_port, outp.parent).start()
+        # The same localStorage the web UI ladder seeds through a document-start user script,
+        # minus the auth tokens: under Tauri the app mints its own pair through desktop-login
+        # and writing a stale one over it would log the page out to fix the harness.
+        seed_ls = {
+            "unsloth_chat_external_providers": json.dumps([provider.as_provider_entry()]),
+            "unsloth_chat_external_provider_keys": json.dumps(
+                {provider.id: provider.api_key} if provider.api_key else {}),
+            "unsloth_chat_connections_enabled": "true",
+            "unsloth_chat_last_external_checkpoint": ckpt,
+        }
+        if control is not None:
+            control.store.set_config({
             "ready": True,
+            "localStorage": seed_ls,
+            "lsStamp": f"{seeded['thread_id']}:{ckpt}",
             "threadId": seeded["thread_id"],
             "lastMarker": seeded["last_marker"],
             "settleMs": args.settle_ms,
@@ -400,7 +423,7 @@ def main() -> int:
                 "mountTimeoutMs": 420000,
                 "skipSend": bool(args.skip_send),
             },
-        })
+            })
 
         aenv = dict(env)
         aenv["DISPLAY"] = args.display
@@ -434,14 +457,20 @@ def main() -> int:
 
         # Did the PAGE ever reach us? Distinguishes "the app never painted our script" from
         # "the scene ran and failed", which otherwise both present as a missing result.
-        out["page_contact"] = control.wait_for_contact(300)
+        out["page_contact"] = control.wait_for_contact(300) if control is not None else None
 
         # amdgpu, sampled early and again at the end and DIFFERENCED per drm-client-id, so the
         # figure is engine time accrued WHILE the ladder ran rather than a cumulative counter.
         out["amdgpu_early"] = sample_amdgpu(app.pid)
 
-        total = exp_ms / 1000 * 4 + 1200
-        result = control.wait_for_result(total)
+        if control is None:
+            # The pristine leg: nothing to wait for but the app itself. Observed rather than
+            # driven, on purpose.
+            time.sleep(args.observe_seconds)
+            result = None
+        else:
+            total = exp_ms / 1000 * 4 + 1200
+            result = control.wait_for_result(total)
         out["amdgpu_late"] = sample_amdgpu(app.pid)
         out["amdgpu"] = amdgpu_delta(out["amdgpu_early"], out["amdgpu_late"])
         out["app"]["alive_at_end"] = app.poll() is None
@@ -459,6 +488,31 @@ def main() -> int:
                                  "bytes": png.stat().st_size if png.is_file() else 0}
 
         out["payload"] = result
+        if args.no_scene:
+            # What "it functions" means for an UNMODIFIED app with no injected script: a mapped
+            # toplevel, a framebuffer that is not empty, and -- the part that cannot be faked by
+            # a splash screen -- the BACKEND's own access log showing the app asked it for the
+            # thread list. Nothing here is asserted by the app about itself.
+            log_text = ""
+            for cand in (logdir / f"backend_{tag}_serve.log", blog):
+                if Path(cand).is_file():
+                    log_text += Path(cand).read_text(errors = "replace")
+            asked = [ln for ln in log_text.splitlines()
+                     if "/api/chat/threads" in ln or "/api/auth/desktop-login" in ln]
+            out["pristine"] = {
+                "backend_requests_seen": len(asked),
+                "sample": asked[:25],
+                "thread_id_in_log": bool(seeded.get("thread_id")
+                                         and seeded["thread_id"] in log_text),
+                "window_mapped": bool((out.get("windows") or "").count("+-")),
+                "screenshot_bytes": (out.get("screenshot") or {}).get("bytes"),
+            }
+            out["ok"] = bool(out["pristine"]["backend_requests_seen"]
+                             and out["pristine"]["window_mapped"])
+            if not out["ok"]:
+                out["error"] = ("the pristine app did not both map a window and talk to the "
+                                "backend")
+            return 0 if out["ok"] else 7
         out["ok"] = bool(result and result.get("ok"))
         if not out["ok"]:
             out["error"] = (result or {}).get("error") if result else "no result from the page"

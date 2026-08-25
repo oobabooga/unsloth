@@ -135,3 +135,116 @@ jobs:
             ${{ env.AMD_CI_WORK }}/desktop_build/*.log
           retention-days: 7
           if-no-files-found: warn
+
+  ladder:
+    name: "Desktop ladder on the real gfx1151 (exclusive)"
+    needs: build
+    # Gated on the commit message, deliberately, and NOT run on every push to this branch.
+    # The measurement takes the one GPU on a machine four ephemeral slots share, and the group
+    # holds one runner plus one waiter: a THIRD arrival cancels the waiter while the suites job
+    # stays green, so the loss is easy to miss. Iterating on the build must not queue a
+    # measurement each time. `workflow_dispatch` would do the same job, but dispatching is an
+    # Actions WRITE and no token here has that scope.
+    if: contains(github.event.head_commit.message, '[ladder]')
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "desktop-ladder"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. Only `linux` is checkable before Studio brings a torch
+          # along; that this is really the gfx1151 APU is established by the sibling
+          # display-capability run and is not re-litigated here.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-binary
+          path: ${{ env.AMD_CI_WORK }}/binary
+
+      - name: Binary inventory
+        run: |
+          set +e
+          ls -l "$AMD_CI_WORK/binary"
+          cat "$AMD_CI_WORK/binary/MANIFEST.json"
+          chmod +x "$AMD_CI_WORK"/binary/desktop-* 2>/dev/null
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      - name: Ladder probe
+        timeout-minutes: 280
+        run: |
+          set +e
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/desktop_ladder_probe.py \
+            --criteria amd_ci/criteria/desktop_ladder_collapse.py \
+            --out-dir "$AMD_CI_WORK/out/ladder" \
+            -- --rungs 0K,100K,500K --reps 2 \
+               --binary "$AMD_CI_WORK/binary/desktop-instrumented" \
+               --pristine "$AMD_CI_WORK/binary/desktop-pristine" \
+               --manifest "$AMD_CI_WORK/binary/MANIFEST.json"
+          cat "$AMD_CI_WORK/out/ladder/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/ladder"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By NAME with pgrep -x and then by PID. A pattern-matching process killer would match
+          # this very step's own shell, because the pattern ends up on its command line; that has
+          # cost a real run before. A Tauri app, a Studio or an Xvfb that outlives the job holds
+          # VRAM on a machine three other slots share, so this cannot be skipped either.
+          for name in unsloth-studio Xvfb; do
+            for p in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+              echo "killing leftover $name pid $p"; kill -TERM "$p" 2>/dev/null
+            done
+          done
+          for p in $(seq 8888 8908); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The logs, separately from the verdict, because the ask is to SEE that Desktop functions
+      # rather than be told it does: the app's own stderr under G_MESSAGES_DEBUG=all, its
+      # tauri.log, the Studio backend at LOG_LEVEL=DEBUG, the page's console and error stream,
+      # and a screenshot per run.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-ladder-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/desktop_ladder/out/logs
+            ${{ env.AMD_CI_WORK }}/desktop_ladder/out/**/*.jsonl
+            ${{ env.AMD_CI_WORK }}/desktop_ladder/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-ladder
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn

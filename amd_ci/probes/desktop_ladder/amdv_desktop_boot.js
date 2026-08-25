@@ -212,10 +212,47 @@
   }
 
   // ---- the run ------------------------------------------------------------------------
+  // localStorage the app reads on its FIRST paint: the pacer provider, its key, and the
+  // last-selected checkpoint. The web UI ladder seeded these through a document-start user
+  // script, which Desktop has no equivalent of, and they cannot simply be written late: the
+  // model chip restores from storage asynchronously during boot, and a run whose composer never
+  // gets an enabled send button measures a thread it never streamed into. So they are written
+  // and the document is RELOADED once, before anything is measured and before the settle
+  // window, with a stamp so the second boot does not loop.
+  //
+  // The auth tokens the web harness seeds are deliberately NOT written here. Under Tauri
+  // `requireAuth` is a no-op and the app mints its own pair through desktop-login; overwriting
+  // them would replace a live session with a stale one.
+  function applyLocalStorage(cfg) {
+    if (!cfg.localStorage) return false;
+    var stamp = String(cfg.lsStamp || "");
+    try {
+      if (window.localStorage.getItem("__amdv_ls") === stamp) return false;
+    } catch (e) { return false; }
+    try {
+      Object.keys(cfg.localStorage).forEach(function (k) {
+        window.localStorage.setItem(k, cfg.localStorage[k]);
+      });
+      window.localStorage.setItem("__amdv_ls", stamp);
+    } catch (e) {
+      note("local_storage_failed", String(e));
+      return false;
+    }
+    note("local_storage_seeded", Object.keys(cfg.localStorage));
+    return true;
+  }
+
   async function begin(cfg) {
     if (started) return;
     started = true;
     note("config", cfg);
+
+    if (applyLocalStorage(cfg)) {
+      note("reloading_once_after_seed", location.href);
+      // A short delay so the note reaches the harness before the document goes away.
+      setTimeout(function () { window.location.reload(); }, 400);
+      return;
+    }
 
     // The APP SHELL, not the startup screen. provider.tsx:739 renders StartupScreen until the
     // backend is running AND desktop auth has completed, and a scene that started measuring on

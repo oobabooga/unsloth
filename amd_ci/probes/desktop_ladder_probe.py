@@ -162,6 +162,15 @@ def main() -> int:
             plan.append({"rung": args.control_rung, "rep": "hog", "hog": args.hog_ms,
                          "software": False})
         plan.append({"rung": args.control_rung, "rep": "sw", "hog": 0, "software": True})
+        # The UNMODIFIED binary, launched into the same real backend with a real seeded thread.
+        # It cannot open a specific thread -- that needs the injected script -- so it is
+        # OBSERVED rather than driven: a mapped window, a painted framebuffer, and the backend's
+        # own access log showing the app asked it for the thread list. This is what makes
+        # "Unsloth Desktop functions on this runner" a claim about the shipped app rather than
+        # about a build with our scene compiled into it.
+        if args.pristine and Path(args.pristine).is_file():
+            plan.append({"rung": "100K", "rep": "pristine", "hog": 0, "software": False,
+                         "no_scene": True, "binary": args.pristine})
 
         obs["plan"] = plan
         obs["runs"] = []
@@ -172,7 +181,7 @@ def main() -> int:
             outp.parent.mkdir(parents = True, exist_ok = True)
             cmd = [sys.executable, str(LADDER / "amdv_desktop_bench.py"),
                    "--rung", item["rung"], "--rep", item["rep"],
-                   "--binary", str(binary),
+                   "--binary", str(item.get("binary") or binary),
                    "--base-home", str(base_home),
                    "--run-home", str(work / f"home_{tag}"),
                    "--sb-root", str(repo),
@@ -187,6 +196,8 @@ def main() -> int:
                 cmd.append("--skip-send")
             if item["software"]:
                 cmd.append("--software")
+            if item.get("no_scene"):
+                cmd.append("--no-scene")
             t0 = time.time()
             r = sh(cmd, timeout = args.rung_timeout)
             entry = {**item, "port": port, "seconds": round(time.time() - t0, 1),
