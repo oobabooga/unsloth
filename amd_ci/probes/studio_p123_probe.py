@@ -1,70 +1,108 @@
 #!/usr/bin/env python3
-"""Probe: WHICH PIECE of PR 9477 owns the 4.981x on `action:reasoning_toggle_all`?
+"""Probe: WHAT owns the 4.981x on `action:reasoning_toggle_all`, and can we have it for free?
 
 Observes only. criteria/studio_p123_attribution.py judges.
 
 WHAT IS BEING SPLIT. At r100K, on the gesture that opens EVERY reasoning pane, upstream main
-(`90f85fdbf`) reads 5.1 effective fps at 93% busy and 4,746 ms blocked. Arm `N111` -- all of 9477
+(`90f85fdbf`) reads 5.1 effective fps at 93% busy and 4,746 ms blocked. Arm `A11` -- all of PR 9477
 with `REASONING_PAGINATION_ENABLED = false` -- reads 25.3 fps at 60% busy. That 4.981x is one lump
-and piece 4 cannot be in it, because the flag is off in every arm here. So it belongs to piece 1
-(streamed content fidelity), piece 2 (the streaming render schedule and text presentation) and/or
-piece 3 (the streaming code policy).
+and nobody has split it.
 
-WHY THIS IS RECONCILIATION AND NOT DISCOVERY. The branch already carries an ablation, in
-`6adc583a2`: at 250K STREAMED reasoning characters on WebKitGTK 2.50.4, worst main-thread freeze
-went base 6,821 ms, null 6,878, the streaming-render rewrite alone 869, plus the plain-code policy
-211, plus pagination 79. On that window piece 2 dominates and piece 3 is a clear second.
+Do NOT read that as "piece 4 excluded by construction". The flag being false stops
+`selectReasoningMarkdownPage` and the Show more control, but `reasoning-scroll-pin.ts` is wired
+unconditionally at `reasoning.tsx:291-296` and no flag gates it. It is inert on this gesture and
+live during a stream, which is a claim about this window and not about the module.
 
-But that is a STREAMING window and this is a SETTLED one: a thread that finished streaming long
-ago, whose panes are then opened. This campaign has already been caught once by exactly that
-distinction -- `reasoning_toggle` names a one-pane gesture and an all-panes gesture, and pagination
-reads 1.9% on one and 1.913x on the other, both correctly. So the question here is not "what is the
-ordering" but "does the published ordering reproduce on this window", and both orderings are
-reported side by side rather than one being assumed to carry the other.
+RECONCILIATION, NOT DISCOVERY. The branch already carries an ablation, in `6adc583a2`: at 250K
+STREAMED reasoning characters on WebKitGTK 2.50.4, worst main-thread freeze went base 6,821 ms,
+null 6,878, the streaming-render rewrite alone 869, plus the plain-code policy 211, plus pagination
+79. On THAT window piece 2 dominates. But that is a streaming window and this is a settled one: a
+thread that finished streaming long ago, whose panes are then opened. This campaign has already
+been caught once by exactly that distinction, when `reasoning_toggle` turned out to name a one-pane
+gesture and an all-panes gesture and pagination read 1.9% on one and 1.913x on the other, both
+correctly. So both orderings are reported side by side and neither is assumed to carry the other.
 
-THE DESIGN IS A FULL 2^3 FACTORIAL. Eight corners plus upstream main. A subtractive-only design
-(remove one piece from the whole) is blind to redundancy: if pieces 2 and 3 are each independently
-sufficient, removing either alone changes nothing and the design reports "no piece matters", which
-would be false. An additive-only design is blind to a piece that only pays off in company. All
-eight corners give every piece FOUR one-piece-at-a-time isolations, one per context of the other
-two, in the same spirit as the p4 probe's single one-literal flip.
+PIECE 3 IS TWO MECHANISMS, and its only entry point lives in `reasoning.tsx`, a file a naive
+taxonomy assigns to piece 4. Any mapping that calls `reasoning.tsx` piece 4's file mis-assigns the
+dominant mount-gesture mechanism.
 
-Piece 3 is carried as TWO mechanisms, because reading the source shows it is two, with very
-different user-visible costs: `3a` is `reasoning.tsx` passing `codeHighlighting="plain"`, which
-makes every reasoning fence permanently plain AT ANY SIZE and is not a cap at all; `3b` is the pair
-of size thresholds in `streaming-code-policy.ts`. Piece 1 sits outside the factorial because it is
-a stream-time mechanism and this window is a settled thread, so it gets one isolation rather than
-four. Both choices are budget decisions and both are stated here rather than buried.
+    3a  `reasoning.tsx:344` passes `codeHighlighting="plain"`, so EVERY fence inside a reasoning
+        pane is permanently plain AT ANY SIZE. Main renders a bare `<MarkdownText />` and the
+        context defaults to "syntax". This is not a cap at all.
+    3b  `isOversizedStreamingCode` sends a fence down the plain-first path at
+        `OVERSIZED_OPEN_CODE_CHARS` = 4,096 -- NOT the 16 KiB constant this campaign has been
+        quoting -- and `shouldAutoHighlightStreamingCode` then refuses the later upgrade above
+        `MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS` = 16,384.
 
-    arm     p1   p2   p3a  p3b   built as
-    main    -    -    -    -     90f85fdbf, no patches
-    Z       off  off  off  off   C_tip + all four off-patches      <- CLOSURE CONTROL
-    A000    on   off  off  off   C_tip + p2_off + p3a_off + p3b_off
-    A100    on   ON   off  off   C_tip + p3a_off + p3b_off
-    A010    on   off  ON   off   C_tip + p2_off + p3b_off
-    A001    on   off  off  ON    C_tip + p2_off + p3a_off
-    A110    on   ON   ON   off   C_tip + p3b_off
-    A101    on   ON   off  ON    C_tip + p3a_off
-    A011    on   off  ON   ON    C_tip + p2_off
-    A111    on   ON   ON   ON    C_tip alone                       <- the 4.981x endpoint
+THE ARM THAT MATTERS MOST IS `M`, AND IT IS NOT ONE OF 9477'S MECHANISMS.
 
-`Z` is the gate that can falsify the whole exercise: with all four mechanisms neutralised it should
-behave like `main`. If it does not, something in 9477 that none of the four patches turns off is
-carrying part of the lump, and every per-mechanism share below is a share of less than the whole.
-The criteria reports that as a number rather than asserting it away. `Z -> A000` is piece 1's only
-isolation, and it is an additive one.
+`code-fence-defer.tsx` is BYTE-IDENTICAL between main and this branch. The per-fence deferral
+machinery -- an IntersectionObserver per fence, a ResizeObserver per nested-scroller fence, a
+pre-paint `useLayoutEffect` doing `getComputedStyle` ancestor walks and a `getBoundingClientRect`
+inside the commit that just inserted the whole trace, registration into a module-global `unreached`
+set, a document-wide capturing scroll listener, and a jump path that walks `unreached` and issues
+two `flushSync` renders -- is MAIN'S OWN CODE. 9477 does not touch a line of it.
 
-EVERY ARM IS ONE UPSTREAM COMMIT PLUS PATCHES. Unlike the p4 probe, nothing here needs a commit
-that lives only on a pull request, so `refs/pull/9477/head` is not fetched and no arm can silently
-land on a default branch tip. The `HEAD == ref` assertion is kept anyway and is reported as
-"asked X, landed Y".
+What 9477 does is pass `codeHighlighting="plain"`, which makes `renderPlainBody` non-null, which
+passes `enabled = false` into `useFenceReached` at `markdown-text.tsx:849-855`, which turns all of
+that machinery off as a SIDE EFFECT while also removing every syntax colour. Those two costs have
+never been told apart. `M` is `A00` plus one flip of that `enabled` argument: colours ON, machinery
+OFF. If `M` captures the win, the speed is available with no fidelity cost at all and 9477's piece
+3 can be dropped entirely. If it does not, the cost is genuinely the tokenizer and the trade is
+real. Nobody has run this arm.
+
+THE ARMS.
+
+    arm    p1   p2   p3a  p3b  defer  built as
+    main   -    -    -    -    on     90f85fdbf, no patches
+    Z      off  off  off  off  on     C_tip + all four off-patches   <- CLOSURE CONTROL
+    M      on   off  off  on   OFF    A00 + p3m_off                  <- the decoupling arm
+    A00    on   off  off  on   on     C_tip + p2_off + p3a_off
+    A10    on   ON   off  on   on     C_tip + p3a_off
+    A01    on   off  ON   on   on     C_tip + p2_off
+    A11    on   ON   ON   on   on     C_tip alone                    <- the 4.981x endpoint
+    N1     on*  ON   ON   on   on     C_tip + p1_off   (* p1 off)    <- predicted null
+    N3b    on   ON   ON   off  on     C_tip + p3b_off                <- predicted null
+
+The 2^2 over (p2, p3a) gives each of the two live mechanisms TWO one-mechanism isolations, one in
+each context of the other, so a mechanism whose effect depends on its company says so instead of
+being averaged. A subtractive-only design cannot see redundancy: if p2 and p3a were each
+independently sufficient, removing either alone would change nothing and that design would report
+"nothing matters", which would be false.
+
+The decomposition `M` buys:
+
+    A00 -> M     the cost of MAIN's fence-deferral machinery, colours held ON
+    M   -> A01   the additional cost of the colours, machinery held OFF
+    A00 -> A01   both together, which is all `codeHighlighting="plain"` has ever been measured as
+
+`Z` is the gate that can falsify the whole exercise: with all four of 9477's mechanisms
+neutralised it should behave like `main`. If it does not, something in 9477 that none of these
+patches turns off is carrying part of the lump, and every share below is a share of less than the
+whole. That is reported as a number, not asserted away.
+
+PIECE 1 AND PIECE 3b ARE PREDICTED NULLS, AND THE PREDICTIONS ARE RECORDED IN THE ARTIFACT BEFORE
+THE RUN. See `PREDICTED_NULLS`. Writing them down first is what makes a null read as CONFIRMED
+INERT rather than as a flip that quietly failed to take, and one of them falsifies the harness
+rather than the piece if it comes out wrong.
+
+WHY THE ARMS ARE NEUTRALISATIONS ON TOP OF C RATHER THAN ONE PIECE ADDED TO MAIN. Piece 2's
+`streaming-render-schedule.ts` imports piece 3's `streaming-code-policy.ts` and
+`fenced-code-provenance.ts`, so "piece 2 alone on main" would drag piece 3 in with it and would not
+be one piece. Every arm here is C with something turned off, and the four off-patches are disjoint
+BY FILE, so they compose in any order. All 16 subsets were verified to apply and the extreme
+corners were built with the real production `tsc -b && vite build` before this was pushed.
+
+EVERY ARM IS ONE UPSTREAM COMMIT PLUS PATCHES. Nothing here needs a commit that lives only on a
+pull request, so `refs/pull/9477/head` is not fetched and no arm can silently land on a default
+branch tip. The `HEAD == ref` assertion is kept anyway and is reported as "asked X, landed Y".
 
 THE JAMMED POSITIVE CONTROL RUNS AT EVERY RUNG, in the same loop as the arms. `--hog-ms 200
 --hog-period-ms 250` blocks the page's main thread on a timer. The p4 run took this control
-globally -- `ctrl_ok or drop >= 25` -- so r100K's working control licensed r500K, where the JAMMED
-arm read 0.14 fps against the clean arm's 0.08 and the ratios were therefore computed inside a
-channel that could not resolve anything. The criteria here gates each rung by its own control, on
-each channel separately.
+GLOBALLY -- `ctrl_ok or drop >= 25` -- so r100K's working control licensed r500K, where the
+deliberately jammed arm read 0.14 fps against the clean arm's 0.08 and every ratio was therefore
+computed inside a channel that could not resolve anything. The criteria here gates each rung by its
+own control, on each channel separately, and r500K is expected to come out VOID on that test.
 
 `--frame-clock passive`, not `updating`: `begin_updating()` drives the clock itself and read 60.0
 fps with the main thread 80% blocked.
@@ -94,29 +132,9 @@ BASE_REF = "90f85fdbf8fd6f9df1b99aff44f1e45da4c808d0"
 #: subject. Hashed as well as path-checked, so "one instrument" is a fact about content.
 INSTRUMENT_REF = BASE_REF
 
-#: PIECE 3 IS TWO MECHANISMS, NOT ONE, and they have completely different user-visible costs.
-#: Splitting them is not fussiness: reading the source establishes that
-#:
-#:   3a  `reasoning.tsx` passes `codeHighlighting="plain"`, so EVERY fence inside a reasoning
-#:       pane is permanently plain AT ANY SIZE. Main renders a bare `<MarkdownText />` and the
-#:       context defaults to "syntax". This is not a cap at all.
-#:   3b  `isOversizedStreamingCode` sends a fence down the plain-first path at
-#:       `OVERSIZED_OPEN_CODE_CHARS` = 4 KiB -- NOT the 16 KiB constant the campaign has been
-#:       quoting -- and `shouldAutoHighlightStreamingCode` then refuses the later upgrade to a
-#:       highlighted subtree above `MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS` = 16 KiB.
-#:
-#: On the gesture under test the panes being opened are reasoning panes, so 3a and 3b act on
-#: different fences and folding them into one arm would price whichever happens to dominate and
-#: attribute it to both.
-#:
-#: PIECE 1 SITS OUTSIDE THE FACTORIAL, on a budget argument that is stated rather than hidden.
-#: It is a STREAM-TIME mechanism (chat adapter, assistant-content parsing) and this window is a
-#: SETTLED thread that finished streaming before the measurement began, so it is the least likely
-#: of the four to carry the lump. Sixteen corners would price it with four isolations each; ten
-#: arms price the three live candidates with four each and piece 1 with one, which is enough to
-#: show whether it moves anything at all.
-FACTORS = ("p2", "p3a", "p3b")
-PIECES = ("p1",) + FACTORS
+#: The two mechanisms that can plausibly move a MOUNT gesture, swept as a 2^2 factorial.
+FACTORS = ("p2", "p3a")
+PIECES = ("p1", "p2", "p3a", "p3b")
 #: the patch that turns each mechanism OFF, applied on top of C_tip.patch
 OFF_PATCH = {"p1": "p1_off.patch", "p2": "p2_off.patch",
              "p3a": "p3a_off.patch", "p3b": "p3b_off.patch"}
@@ -126,14 +144,20 @@ SENTINEL = {"p1": "AMDCI_PIECE1_NEUTRALISED",
             "p2": "AMDCI_PIECE2_NEUTRALISED",
             "p3a": "AMDCI_PIECE3A_NEUTRALISED",
             "p3b": "AMDCI_PIECE3B_NEUTRALISED"}
+#: not one of 9477's mechanisms at all: it turns MAIN's fence-deferral machinery off while
+#: leaving every colour in place. See `M` below.
+DEFER_PATCH = "p3m_off.patch"
+DEFER_SENTINEL = "AMDCI_FENCEDEFER_DISABLED"
 
-#: the eight corners of the 2^3 over FACTORS. Piece 1 is ON at every corner.
-MASKS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1),
-         (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1))
+MASKS = ((0, 0), (1, 0), (0, 1), (1, 1))
 REFERENCE = "main"
-#: everything 9477 does, neutralised. Should behave like `main`; if it does not, the patches do
-#: not span the change and every share below is a share of less than the whole.
 CLOSURE = "Z"
+#: the decoupling arm, and the one most likely to change what ships
+DECOUPLE = "M"
+BASELINE_ARM = "A00"
+#: the two single-mechanism null checks, each one piece away from `A11`
+NULL_P1 = "N1"
+NULL_P3B = "N3b"
 
 
 def arm_of(mask) -> str:
@@ -144,23 +168,56 @@ def _arms() -> "dict[str, tuple[str, tuple[str, ...]]]":
     out: dict[str, tuple[str, tuple[str, ...]]] = {REFERENCE: (BASE_REF, ())}
     for mask in MASKS:
         patches = ["C_tip.patch"]
-        # deterministic order, so an arm is a function of its piece set and nothing else
         for i, piece in enumerate(FACTORS):
             if mask[i] == 0:
                 patches.append(OFF_PATCH[piece])
         out[arm_of(mask)] = (BASE_REF, tuple(patches))
     out[CLOSURE] = (BASE_REF, ("C_tip.patch", "p1_off.patch", "p2_off.patch",
                                "p3a_off.patch", "p3b_off.patch"))
+    # `M` is `A00` plus exactly one thing, so `A00 -> M` prices the machinery and nothing else.
+    out[DECOUPLE] = (BASE_REF, ("C_tip.patch", "p2_off.patch", "p3a_off.patch", DEFER_PATCH))
+    # each is `A11` minus exactly one mechanism, which is what makes a null here a null about
+    # that mechanism rather than about the arm
+    out[NULL_P1] = (BASE_REF, ("C_tip.patch", "p1_off.patch"))
+    out[NULL_P3B] = (BASE_REF, ("C_tip.patch", "p3b_off.patch"))
     return out
 
 
 ARMS = _arms()
-#: `Z` early, right after `main`: it is the arm most likely to expose a patch-composition problem
-#: (it stacks all four neutralisations), and finding that out before eight installs is cheap.
-ARM_ORDER = (REFERENCE, CLOSURE) + tuple(arm_of(m) for m in MASKS)
+#: ORDER MATTERS, AND IT IS NOT ALPHABETICAL. Arms are measured in this order within every
+#: repetition, so a run that is cut short loses the LAST arms rather than a random five. The first
+#: five carry the entire recommendation:
+#:
+#:   main -> A11   the 4.981x lump itself
+#:   A00  -> M     MAIN's fence-deferral machinery, colours held ON
+#:   M    -> A01   the colours themselves, machinery held OFF
+#:   A00  -> A01   both together, which is all `codeHighlighting="plain"` has been measured as
+#:
+#: `Z`, `A10`, `N1` and `N3b` are the closure control, the p2-in-context edge and the two
+#: predicted nulls. All four are worth having and none of them changes what we would ship.
+ARM_ORDER = (REFERENCE, BASELINE_ARM, DECOUPLE, arm_of((0, 1)), arm_of((1, 1)),
+             arm_of((1, 0)), CLOSURE, NULL_P1, NULL_P3B)
+
+#: PREDICTIONS, RECORDED BEFORE THE RUN so that a null reads as CONFIRMED INERT rather than as a
+#: flip that quietly failed to take. Both are mechanistic, both are falsifiable, and one of them
+#: falsifies the harness rather than the piece if it comes out wrong.
+PREDICTED_NULLS = {
+    NULL_P1: ("p1 must read the same as A11. Piece 1 executes only inside the chat adapter's SSE "
+              "loop, and this thread is SEEDED through PUT /api/chat/threads/{id}/messages as "
+              "finished parts, so that loop never runs. A NON-null here does not mean piece 1 "
+              "helps; it means the harness is streaming when it believes it is not, and it "
+              "falsifies the harness rather than the piece."),
+    NULL_P3B: ("p3b must read the same as A11. The largest fenced code block anywhere in this "
+               "thread is 2,781 characters, against OVERSIZED_OPEN_CODE_CHARS = 4,096 and "
+               "MAX_AUTO_HIGHLIGHT_SOURCE_CODE_UNITS = 16,384, so both predicates already sit at "
+               "their permissive value for every fence in the corpus and neutralising them cannot "
+               "change a single render. The settled fence census in the artifact is what makes "
+               "this checkable rather than asserted."),
+}
 
 EMPTY_STATE = {
-    "patch_ok": False, "dirty_files": 0, "piece_mask": None, "pagination_literal": None,
+    "patch_ok": False, "dirty_files": 0, "piece_mask": None, "fence_defer_enabled": None,
+    "pagination_literal": None,
     "install": {"rc": None}, "unsloth_bin": None, "home": None, "repo_root": None,
     "dist": {"path": None, "exists": False, "index_html": False, "asset_files": 0},
 }
@@ -194,6 +251,23 @@ def clone_at(repo_url: str, ref: str, dest: Path) -> dict:
     return out
 
 
+def bundle_hash(dist: Path) -> str:
+    """Content hash of a built frontend bundle. The SAME definition `amdv_rung_bench.py` uses, so
+    the hash recorded at build time and the one recorded at measure time are comparable and a
+    dist that changed in between would show up rather than pass silently."""
+    h = hashlib.sha256()
+    n = 0
+    for f in sorted((dist / "assets").rglob("*")) if (dist / "assets").is_dir() else []:
+        if f.is_file() and f.suffix in (".js", ".css"):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+            n += 1
+    idx = dist / "index.html"
+    if idx.exists():
+        h.update(idx.read_bytes())
+    return f"{h.hexdigest()[:16]}({n} files)"
+
+
 def tree_hash(root: Path) -> str:
     """Content hash of a directory tree. Used on the instrument, so that "one instrument for
     every arm" is checkable by CONTENT and not only by resolved path: a path assertion cannot
@@ -205,25 +279,30 @@ def tree_hash(root: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def read_piece_mask(root: Path) -> tuple:
-    """Read each piece's ON/OFF state back out of the SOURCE the arm was built from.
+def read_sentinels(root: Path) -> dict:
+    """Read every mechanism's ON/OFF state back out of the SOURCE the arm was built from.
 
     Not from the patch list: a patch that applied to the wrong hunk still returns rc=0, and the
-    whole factorial turns on each arm really carrying the piece set it is labelled with. Each
-    `*_off.patch` plants a sentinel comment; a piece is ON when its sentinel is ABSENT.
+    whole design turns on each arm really carrying the mechanism set it is labelled with. Each
+    patch plants a sentinel comment; a mechanism is ON when its sentinel is ABSENT.
     """
     src = root / "studio" / "frontend" / "src"
-    found = {p: False for p in PIECES}
+    wanted = dict(SENTINEL)
+    wanted["_defer"] = DEFER_SENTINEL
+    found = {k: False for k in wanted}
     if src.is_dir():
         for f in src.rglob("*.ts*"):
             try:
                 text = f.read_text(encoding="utf-8", errors="replace")
             except Exception:                                            # noqa: BLE001
                 continue
-            for piece in PIECES:
-                if SENTINEL[piece] in text:
-                    found[piece] = True
-    return tuple(not found[p] for p in PIECES)
+            for key, needle in wanted.items():
+                if needle in text:
+                    found[key] = True
+    return {"piece_mask": [not found[p] for p in PIECES],
+            # main's own fence-deferral machinery, which 9477 does not touch: `code-fence-defer`
+            # is byte-identical between the two trees. It is ON everywhere except arm `M`.
+            "fence_defer_enabled": not found["_defer"]}
 
 
 def build_state(work: Path, name: str, repo_url: str, ref: str, patches: tuple[str, ...],
@@ -262,7 +341,7 @@ def build_state(work: Path, name: str, repo_url: str, ref: str, patches: tuple[s
     out["dirty_files"] = len([l for l in (sh(["git", "status", "--porcelain"], cwd=str(root),
                                              timeout=60).get("stdout") or "").splitlines()
                               if l.strip()])
-    out["piece_mask"] = list(read_piece_mask(root))
+    out.update(read_sentinels(root))
 
     # Piece 4 must be OFF on every arm here, by construction. Read it back rather than trust it:
     # an arm that silently shipped pagination would put piece 4 back into the lump being split.
@@ -283,6 +362,7 @@ def build_state(work: Path, name: str, repo_url: str, ref: str, patches: tuple[s
     out["install"] = inst
 
     dist = root / "studio" / "frontend" / "dist"
+    out["bundle_hash"] = bundle_hash(dist)
     out["dist"] = {"path": str(dist), "exists": dist.is_dir(),
                    "index_html": (dist / "index.html").is_file(),
                    "asset_files": len(list((dist / "assets").rglob("*")))
@@ -362,15 +442,128 @@ def parse_reps(spec: str, rungs: list[str]) -> dict:
     return {r: out.get(r, 2) for r in rungs}
 
 
+def do_build(args, obs: dict, work: Path) -> int:
+    """BUILD MODE. No GPU, no display, no measurement. Runs in its own job.
+
+    Every arm differs from every other ONLY inside `studio/frontend/src`: outside the frontend,
+    `C_tip.patch` touches five TEST files and no backend source, and all four off-patches touch
+    nothing but `studio/frontend/src`. So an arm's entire identity is its built `dist`, and the
+    backend the measuring job installs can be any one of them. That is asserted below rather than
+    assumed, because it is the premise the whole split rests on.
+
+    This also removes a confound rather than only saving time. Nine installs in the measuring job
+    meant nine chances for an install to differ between arms; one install for all of them means an
+    install flake can no longer land on one arm and be read as that arm's mechanism.
+    """
+    # PRE-FLIGHT. Every arm's patch stack, dry-run against one throwaway checkout, before any
+    # install. Cheap to ask, and it names the arm and the patch.
+    pre = work / "preflight"
+    obs["preflight"] = {"clone": clone_at(args.repo, BASE_REF, pre)}
+    if not obs["preflight"]["clone"].get("checkout_ok"):
+        obs["fatal"] = (f"the preflight checkout asked for {BASE_REF[:9]} and landed on "
+                        f"{str(obs['preflight']['clone'].get('commit'))[:9]}")
+        return 0
+    stacks = {}
+    for name in ARM_ORDER:
+        _, patches = ARMS[name]
+        sh(["git", "checkout", "--force", "--detach", BASE_REF], cwd=str(pre), timeout=300)
+        sh(["git", "clean", "-fdx", "--", "studio"], cwd=str(pre), timeout=300)
+        steps = []
+        for p in patches:
+            r = sh(["git", "apply", "--check", str(LADDER / p)], cwd=str(pre), timeout=300)
+            if r.get("rc") == 0:
+                r = sh(["git", "apply", str(LADDER / p)], cwd=str(pre), timeout=300)
+            steps.append({"patch": p, "rc": r.get("rc"), "stderr": (r.get("stderr") or "")[:300]})
+        ok = all(s["rc"] == 0 for s in steps)
+        sent = read_sentinels(pre) if ok else {}
+        # THE PREMISE, CHECKED. Nothing may differ outside the frontend, or one dist cannot stand
+        # for one arm and the measuring job's single backend install would silently erase a
+        # difference that mattered.
+        changed = [l[3:] for l in (sh(["git", "status", "--porcelain"], cwd=str(pre),
+                                      timeout=60).get("stdout") or "").splitlines() if l.strip()]
+        outside = [c for c in changed if not c.startswith("studio/frontend/")]
+        stacks[name] = {"steps": steps, "ok": ok, "piece_mask": sent.get("piece_mask"),
+                        "fence_defer_enabled": sent.get("fence_defer_enabled"),
+                        "changed_outside_frontend": outside}
+        print(f"== preflight {name}: ok={ok} mask={stacks[name]['piece_mask']} "
+              f"defer={stacks[name]['fence_defer_enabled']} outside={outside}", flush=True)
+    sh(["git", "checkout", "--force", "--detach", BASE_REF], cwd=str(pre), timeout=300)
+    obs["preflight"]["stacks"] = stacks
+    shutil.rmtree(pre, ignore_errors=True)
+    bad = [n for n, v in stacks.items() if not v["ok"]]
+    if bad:
+        obs["fatal"] = (f"these arms' patch stacks do not apply on {BASE_REF[:9]}: {bad}. "
+                        f"Nothing was built.")
+        print(f"== {obs['fatal']}", flush=True)
+        return 0
+
+    dists = Path(args.dist_out)
+    dists.mkdir(parents=True, exist_ok=True)
+    obs["states"] = {}
+    for name in ARM_ORDER:
+        ref, patches = ARMS[name]
+        # A build failure fails THIS ARM's gate and the loop continues. Aborting the run on the
+        # first bad arm is what threw away three good arms earlier in this campaign.
+        try:
+            st = build_state(work, name, args.repo, ref, patches, args.install_timeout)
+        except Exception as e:                                           # noqa: BLE001
+            st = {"name": name, "ref": ref, "patches": list(patches), **EMPTY_STATE,
+                  "why": f"{type(e).__name__}: {e}"}
+        obs["states"][name] = st
+        if (st.get("dist") or {}).get("index_html"):
+            dest = dists / name
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(st["dist"]["path"], dest)
+            st["exported_dist"] = str(dest)
+            st["exported_bundle_hash"] = bundle_hash(dest)
+        print(f"== built {name}: asked {ref[:9]} landed {str(st.get('commit'))[:9]} "
+              f"patch_ok={st.get('patch_ok')} mask={st.get('piece_mask')} "
+              f"defer={st.get('fence_defer_enabled')} "
+              f"pagination={st.get('pagination_literal')} "
+              f"bundle={st.get('exported_bundle_hash')} "
+              f"install rc={(st.get('install') or {}).get('rc')}", flush=True)
+        # the arm's own tree is large and there are nine of them on a shared disk
+        shutil.rmtree(st.get("repo_root") or "/nonexistent", ignore_errors=True)
+        shutil.rmtree(st.get("home") or "/nonexistent", ignore_errors=True)
+
+    manifest = {
+        "base_ref": BASE_REF, "arms": {k: list(v[1]) for k, v in ARMS.items()},
+        "arm_order": list(ARM_ORDER), "pieces": list(PIECES),
+        "predicted_nulls": PREDICTED_NULLS,
+        "states": {n: {k: v for k, v in s.items()
+                       if k in ("ref", "ref_landed", "commit", "checkout_ok", "patches",
+                                "patch_ok", "patch_steps", "piece_mask", "fence_defer_enabled",
+                                "pagination_literal", "dirty_files", "why",
+                                "exported_dist", "exported_bundle_hash", "dist")}
+                   for n, s in obs["states"].items()},
+        "install": {n: {"rc": (s.get("install") or {}).get("rc"),
+                        "seconds": (s.get("install") or {}).get("seconds")}
+                    for n, s in obs["states"].items()},
+    }
+    (dists / "build_manifest.json").write_text(json.dumps(manifest, indent=2))
+    obs["build_manifest"] = str(dists / "build_manifest.json")
+    obs["arms_built"] = [n for n, s in obs["states"].items() if s.get("exported_dist")]
+    obs["arms_not_built"] = [n for n in ARM_ORDER if n not in obs["arms_built"]]
+    print(f"== built {len(obs['arms_built'])}/{len(ARM_ORDER)}: {obs['arms_built']}", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--state", default="host")
     ap.add_argument("--checkout", default="")
+    ap.add_argument("--mode", default="measure", choices=["build", "measure"],
+                    help="build: clone, patch and build every arm's frontend, no GPU and no "
+                         "display. measure: install ONE backend and drive each arm's prebuilt "
+                         "dist. They are separate jobs because building holds the exclusive GPU "
+                         "group for work that does not touch the GPU.")
+    ap.add_argument("--dist-out", default="", help="where build mode writes the per-arm dists")
+    ap.add_argument("--dist-in", default="", help="where measure mode reads them from")
     ap.add_argument("--work", default=os.environ.get("AMD_CI_WORK", "/tmp/studio_p123"))
     ap.add_argument("--repo", default="https://github.com/unslothai/unsloth")
-    ap.add_argument("--rungs", default="100K,500K")
-    ap.add_argument("--reps", default="100K:3,500K:2")
+    ap.add_argument("--rungs", default="100K")
+    ap.add_argument("--reps", default="100K:5")
     ap.add_argument("--first-port", type=int, default=5461)
     ap.add_argument("--install-timeout", type=int, default=3600)
     ap.add_argument("--rung-timeout", type=int, default=2400)
@@ -382,13 +575,23 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     rungs = [r.strip() for r in args.rungs.split(",") if r.strip()]
     reps = parse_reps(args.reps, rungs)
-    obs: dict = {"rungs": rungs, "reps": reps, "base_ref": BASE_REF,
+    obs: dict = {"mode": args.mode, "rungs": rungs, "reps": reps, "base_ref": BASE_REF,
                  "pieces": list(PIECES), "sentinels": SENTINEL,
+                 "defer_sentinel": DEFER_SENTINEL,
+                 "predicted_nulls": PREDICTED_NULLS,
                  "arms": {k: list(v[1]) for k, v in ARMS.items()},
+                 "arm_order": list(ARM_ORDER),
                  "arm_refs": {k: v[0] for k, v in ARMS.items()},
                  "patch_bytes": {p.name: p.stat().st_size
                                  for p in sorted(LADDER.glob("*.patch"))}}
 
+    if args.mode == "build":
+        try:
+            return do_build(args, obs, work)
+        finally:
+            args.out.write_text(json.dumps(obs, indent=2))
+
+    # ── MEASURE MODE ─────────────────────────────────────────────────────────────────────────
     obs["inventory"] = inventory()
     if not obs["inventory"]["Xvfb"]:
         obs["fetch_xvfb"] = fetch_xvfb(work)
@@ -406,51 +609,54 @@ def main() -> int:
             obs["fatal"] = "no python on this host can import gi + WebKit2 4.1"
             return 0
 
-        # PRE-FLIGHT, BEFORE ANY INSTALL. Nine installs are the expensive part of this job, and
-        # every one of them is wasted if a patch does not apply. Each arm's patch stack is
-        # dry-run against a throwaway checkout first, so a bad patch costs seconds rather than
-        # the whole GPU hold, and it names which patch and which arm.
-        pre = work / "preflight"
-        obs["preflight"] = {"clone": clone_at(args.repo, BASE_REF, pre)}
-        if not obs["preflight"]["clone"].get("checkout_ok"):
-            obs["fatal"] = (f"the preflight checkout asked for {BASE_REF[:9]} and landed on "
-                            f"{str(obs['preflight']['clone'].get('commit'))[:9]}")
+        dists = Path(args.dist_in)
+        mpath = dists / "build_manifest.json"
+        if not mpath.is_file():
+            obs["fatal"] = (f"no build manifest at {mpath}: the build job did not produce one, so "
+                            f"there is nothing to measure and this is a non-result rather than a "
+                            f"finding")
             return 0
-        stacks = {}
-        for name in ARM_ORDER:
-            _, patches = ARMS[name]
-            sh(["git", "checkout", "--force", "--detach", BASE_REF], cwd=str(pre), timeout=300)
-            sh(["git", "clean", "-fdx", "--", "studio"], cwd=str(pre), timeout=300)
-            steps = []
-            for p in patches:
-                r = sh(["git", "apply", "--check", str(LADDER / p)], cwd=str(pre), timeout=300)
-                if r.get("rc") == 0:
-                    r = sh(["git", "apply", str(LADDER / p)], cwd=str(pre), timeout=300)
-                steps.append({"patch": p, "rc": r.get("rc"),
-                              "stderr": (r.get("stderr") or "")[:300]})
-            mask = read_piece_mask(pre) if all(s["rc"] == 0 for s in steps) else None
-            stacks[name] = {"steps": steps, "ok": all(s["rc"] == 0 for s in steps),
-                            "piece_mask": list(mask) if mask else None}
-            print(f"== preflight {name}: ok={stacks[name]['ok']} mask={stacks[name]['piece_mask']}",
-                  flush=True)
-        sh(["git", "checkout", "--force", "--detach", BASE_REF], cwd=str(pre), timeout=300)
-        obs["preflight"]["stacks"] = stacks
-        shutil.rmtree(pre, ignore_errors=True)
-        bad = [n for n, v in stacks.items() if not v["ok"]]
-        if bad:
-            obs["fatal"] = (f"these arms' patch stacks do not apply on {BASE_REF[:9]}: {bad}. "
-                            f"Nothing was installed.")
-            print(f"== {obs['fatal']}", flush=True)
-            return 0
+        manifest = json.loads(mpath.read_text())
+        obs["build"] = manifest
+        # The build job's integrity facts are carried through verbatim so the criteria's gates
+        # read them exactly as if the build had happened here.
+        obs["states"] = {n: dict(s) for n, s in manifest["states"].items()}
 
-        # THE INSTRUMENT, cloned once, before any arm, and hashed.
+        # ONE BACKEND, INSTALLED ONCE. Every arm differs only inside `studio/frontend/src`, which
+        # the build job asserted per arm, so the backend is common and installing it nine times
+        # would only add nine chances for one arm's install to differ from another's.
+        shared = work / "backend"
+        obs["shared_backend"] = clone_at(args.repo, BASE_REF, shared)
+        if not obs["shared_backend"].get("checkout_ok"):
+            obs["fatal"] = (f"the shared backend checkout asked for {BASE_REF[:9]} and landed on "
+                            f"{str(obs['shared_backend'].get('commit'))[:9]}")
+            return 0
+        shome = work / "home_shared"
+        shome.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        inst = sh(["bash", "install.sh", "--local"], cwd=str(shared),
+                  timeout=args.install_timeout, env={"UNSLOTH_STUDIO_HOME": str(shome)})
+        inst["seconds"] = round(time.time() - t0, 1)
+        inst["stdout"] = (inst.get("stdout") or "")[-3000:]
+        obs["shared_install"] = inst
+        binp = None
+        for c in [shome / "bin" / "unsloth", *sorted(shome.glob(".venv*/bin/unsloth"))]:
+            if c.exists() and os.access(c, os.X_OK):
+                binp = str(c)
+                break
+        obs["shared_unsloth_bin"] = binp
+        if not binp:
+            obs["fatal"] = f"the shared backend install produced no unsloth CLI (rc={inst.get('rc')})"
+            return 0
+        print(f"== shared backend installed in {inst['seconds']}s: {binp}", flush=True)
+
+        # THE INSTRUMENT, cloned once, hashed, and outside every arm's tree.
         instrument = work / "instrument"
         obs["instrument"] = clone_at(args.repo, INSTRUMENT_REF, instrument)
         obs["instrument"]["path"] = str(instrument)
         if not obs["instrument"].get("checkout_ok"):
             obs["fatal"] = (f"the instrument checkout asked for {INSTRUMENT_REF[:9]} and landed "
-                            f"on {str(obs['instrument'].get('commit'))[:9]}; refusing to measure "
-                            f"any arm with an instrument that is not the one declared")
+                            f"on {str(obs['instrument'].get('commit'))[:9]}")
             return 0
         sb = instrument / "tests" / "studio" / "studiobench"
         obs["instrument"]["studiobench_present"] = sb.is_dir()
@@ -459,36 +665,39 @@ def main() -> int:
             return 0
         ihash = tree_hash(sb)
         obs["instrument"]["studiobench_hash"] = ihash
-        print(f"== instrument: {instrument} at {obs['instrument']['commit'][:9]} "
-              f"studiobench_hash={ihash}", flush=True)
+        print(f"== instrument at {obs['instrument']['commit'][:9]} hash={ihash}", flush=True)
 
-        obs["states"] = {}
+        # Each arm becomes a state the measure path understands: its OWN dist, the SHARED bin and
+        # home. The bundle hash is re-read here and compared with the one the build job recorded,
+        # so a dist that changed in transit shows up instead of passing silently.
+        usable = []
         for name in ARM_ORDER:
-            ref, patches = ARMS[name]
-            obs["states"][name] = build_state(work, name, args.repo, ref, patches,
-                                              args.install_timeout)
-            st = obs["states"][name]
-            print(f"== built {name}: asked {ref[:9]} landed {str(st.get('commit'))[:9]} "
-                  f"patch_ok={st.get('patch_ok')} mask={st.get('piece_mask')} "
-                  f"pagination={st.get('pagination_literal')} "
-                  f"install rc={(st.get('install') or {}).get('rc')}", flush=True)
-
-        usable = [n for n in ARM_ORDER
-                  if (obs["states"][n].get("dist") or {}).get("exists")
-                  and obs["states"][n].get("unsloth_bin") and obs["states"][n].get("patch_ok")]
+            st = obs["states"].get(name) or {}
+            d = dists / name
+            st["dist"] = {"path": str(d), "exists": d.is_dir(),
+                          "index_html": (d / "index.html").is_file(),
+                          "asset_files": len(list((d / "assets").rglob("*")))
+                          if (d / "assets").is_dir() else 0}
+            st["unsloth_bin"] = binp
+            st["home"] = str(shome)
+            st["bundle_hash_at_measure"] = bundle_hash(d) if d.is_dir() else None
+            st["bundle_hash_matches_build"] = (
+                st.get("exported_bundle_hash") == st["bundle_hash_at_measure"])
+            obs["states"][name] = st
+            if st["dist"]["index_html"] and st.get("patch_ok"):
+                usable.append(name)
+            else:
+                print(f"== arm {name} has no usable dist, skipping it and continuing", flush=True)
         obs["arms_built"] = usable
         obs["arms_not_built"] = [n for n in ARM_ORDER if n not in usable]
         if not usable:
-            obs["fatal"] = "no arm built"
+            obs["fatal"] = "no arm arrived with a usable dist"
             return 0
 
         obs["runs"] = []
         port = args.first_port
 
-        # ── THE JAMMED POSITIVE CONTROL, AT EVERY RUNG, IN THE SAME LOOP AS THE ARMS ─────────
-        # A control taken only at the cheapest rung is not a control for the expensive one. The
-        # p4 run measured it at both but SCORED it globally, which let a rung whose control read
-        # backwards carry the verdict.
+        # ── THE JAMMED POSITIVE CONTROL, AT EVERY RUNG ───────────────────────────────────────
         control_arm = REFERENCE if REFERENCE in usable else usable[0]
         for rung in rungs:
             obs["runs"].append(measure(work, obs["states"][control_arm], "JAM", rung, "jam", port,
@@ -496,7 +705,11 @@ def main() -> int:
                                        instrument, ihash, hog_ms=args.hog_ms))
             port += 1
 
-        # ── the arms, interleaved within each rep so drift cannot land on whoever ran last ───
+        # ── the arms, interleaved within each rep, in ARM_ORDER ───────────────────────────────
+        # ARM_ORDER is deliberately not alphabetical: `main`, `A00`, `M`, `A01`, `A11` come first,
+        # which is every arm the recommendation needs. A run cut short after five arms still
+        # answers the lump, the decoupling and p3a; one cut short after five alphabetical arms
+        # would answer nothing.
         for rep in range(1, max(reps.values()) + 1):
             for rung in rungs:
                 if rep > reps[rung]:

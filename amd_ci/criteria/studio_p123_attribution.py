@@ -98,24 +98,27 @@ FIDELITY_ACTION = "reasoning_fidelity_settled"
 
 EXPECTED_CORPUS = "23cd2464"
 
-#: The four mechanisms. Piece 3 is carried as TWO, because the source shows it is two and their
-#: user-visible costs are not comparable: 3a makes every reasoning fence plain at ANY size and is
-#: not a cap, 3b is a pair of size thresholds on reply fences.
-FACTORS = ("p2", "p3a", "p3b")
-PIECES = ("p1",) + FACTORS
+#: The mechanisms, and what each is. Piece 3 is carried as TWO because the source shows it is two
+#: and their user-visible costs are not comparable. `defer` is not one of 9477's mechanisms at all:
+#: it is MAIN's fence-deferral machinery, which `code-fence-defer.tsx` shows is byte-identical
+#: between the two trees, and which 9477 turns off only as a side effect of 3a.
+FACTORS = ("p2", "p3a")
+PIECES = ("p1", "p2", "p3a", "p3b")
 PIECE_LABEL = {
     "p1": "streamed content fidelity (chat-adapter, parse-assistant-content)",
     "p2": "the streaming render rewrite (streaming-render-schedule, streaming-text-presentation)",
     "p3a": "reasoning panes render code plain at any size (reasoning.tsx codeHighlighting)",
-    "p3b": "the code size thresholds (4 KiB plain-first, 16 KiB no-upgrade)",
+    "p3b": "the code size thresholds (4,096 plain-first, 16,384 no-upgrade)",
+    "defer": "MAIN's per-fence deferral machinery (observers, layout reads, flushSync jumps)",
 }
 
 REFERENCE = "main"
 CLOSURE = "Z"
-#: mask -> arm name. bit i of the mask is FACTORS[i], 1 = that mechanism is ON. Piece 1 is ON at
-#: every corner; `Z` is the only arm with it off.
-MASKS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1),
-         (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1))
+DECOUPLE = "M"
+NULL_P1 = "N1"
+NULL_P3B = "N3b"
+#: mask -> arm name. bit i is FACTORS[i], 1 = ON.
+MASKS = ((0, 0), (1, 0), (0, 1), (1, 1))
 
 
 def arm_of(mask) -> str:
@@ -123,11 +126,30 @@ def arm_of(mask) -> str:
 
 
 FACTORIAL_ARMS = tuple(arm_of(m) for m in MASKS)
-ARMS = (REFERENCE, CLOSURE) + FACTORIAL_ARMS
-WHOLE = arm_of((1, 1, 1))     # = A111 = C_tip alone, the arm the 4.981x was measured on
-NEUTRAL = CLOSURE             # = Z, everything neutralised
-#: piece 1's single isolation: `Z` has it off, `A000` has it on and nothing else on.
-P1_EDGE = (CLOSURE, arm_of((0, 0, 0)))
+ARMS = (REFERENCE, CLOSURE, DECOUPLE) + FACTORIAL_ARMS + (NULL_P1, NULL_P3B)
+WHOLE = arm_of((1, 1))        # = A11 = C_tip alone, the arm the 4.981x was measured on
+NEUTRAL = CLOSURE
+BASELINE = arm_of((0, 0))     # = A00, everything live turned off but piece 1 and 3b left on
+
+#: THE DECOMPOSITION `M` BUYS. `A00 -> A01` is all that `codeHighlighting="plain"` has ever been
+#: measured as; these two split it, and the split is the whole recommendation.
+DECOUPLE_EDGES = (
+    (BASELINE, DECOUPLE, "MAIN's fence-deferral machinery, colours held ON"),
+    (DECOUPLE, arm_of((0, 1)), "the colours themselves, machinery held OFF"),
+)
+
+#: single-mechanism isolations that are not part of the 2^2 sweep. Each is one flip from `A11`.
+EXTRA_EDGES = {
+    "p1": (NULL_P1, WHOLE, "one flip from the whole"),
+    "p3b": (NULL_P3B, WHOLE, "one flip from the whole"),
+}
+
+#: PREDICTED NULLS, asserted BEFORE the run by the probe and re-stated here so the report says
+#: "confirmed inert" rather than "flat, cause unknown". A null that was predicted is a result; a
+#: null that was not is an open question about whether the flip took at all.
+PREDICTED_NULL_ARMS = (NULL_P1, NULL_P3B)
+#: how close to `A11` a predicted-null arm has to land for the prediction to be called confirmed
+NULL_TOLERANCE = 1.15
 
 #: A rung counts as a venue only if the REFERENCE arm is this loaded on this gesture. Anchored on
 #: the measured r100K reading of the reference arm: 93% busy, 1,779 ms worst frame.
@@ -156,6 +178,10 @@ CLOSURE_TOLERANCE = 1.25
 #: this campaign has already published a gate on thread-wide `assistant_chars` that rendered a
 #: 78% cut in REASONING characters as "+2%, did not fire".
 ENGAGEMENT_MIN_PCT = 10.0
+
+#: every mechanism that has at least one isolation edge, in the order the report walks them.
+#: `defer` is last because it is not one of 9477's mechanisms and reads as a separate question.
+SWEPT = FACTORS + ("p1", "p3b", "defer")
 
 
 # ── accessors. Everything reads payload["actions"], never payload["phases"] ───────────────────
@@ -248,21 +274,23 @@ def _rungs(obs: dict) -> list[str]:
 def edges(piece: str):
     """Every pair of arms that differ ONLY in `piece`, as (off_arm, on_arm, context).
 
-    Four per factor, one for each setting of the other two, reported individually rather than
-    averaged so a mechanism whose effect depends on its company says so. Piece 1 has exactly one,
-    by the budget decision recorded in the probe: it is a stream-time mechanism being asked about
-    on a settled thread, so it gets an existence check rather than a context sweep.
+    Two per swept factor, one for each setting of the other, reported individually rather than
+    averaged so a mechanism whose effect depends on its company says so. `p1` and `p3b` get one
+    each, and both are PREDICTED NULLS, so what matters for them is not a ratio but whether the
+    prediction held.
     """
-    if piece == "p1":
-        return [(P1_EDGE[0], P1_EDGE[1], "alone, against everything neutralised")]
+    if piece in EXTRA_EDGES:
+        return [EXTRA_EDGES[piece]]
+    if piece == "defer":
+        return [DECOUPLE_EDGES[0]]
     i = FACTORS.index(piece)
     out = []
     for mask in MASKS:
         if mask[i] != 0:
             continue
-        on = tuple(1 if k == i else mask[k] for k in range(3))
-        others = [FACTORS[k] for k in range(3) if k != i and mask[k] == 1]
-        ctx = ("with " + " and ".join(others)) if others else "alone (piece 1 only)"
+        on = tuple(1 if k == i else mask[k] for k in range(len(FACTORS)))
+        others = [FACTORS[k] for k in range(len(FACTORS)) if k != i and mask[k] == 1]
+        ctx = ("with " + " and ".join(others)) if others else "alone"
         out.append((arm_of(mask), arm_of(on), ctx))
     return out
 
@@ -372,9 +400,14 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     # was built and not a restatement of the patch list.
     # order is PIECES = (p1, p2, p3a, p3b). Piece 1 is ON at every factorial corner and off only
     # at the closure arm, which is the whole reason `Z -> A000` is piece 1's isolation.
-    want = {REFERENCE: None, CLOSURE: (False, False, False, False)}
+    # order is PIECES = (p1, p2, p3a, p3b). The factorial corners leave p1 and p3b ON; only the
+    # closure arm and the two null arms turn them off.
+    want = {REFERENCE: None, CLOSURE: (False, False, False, False),
+            DECOUPLE: (True, False, False, True),
+            NULL_P1: (False, True, True, True),
+            NULL_P3B: (True, True, True, False)}
     for m in MASKS:
-        want[arm_of(m)] = (True,) + tuple(bool(b) for b in m)
+        want[arm_of(m)] = (True, bool(m[0]), bool(m[1]), True)
     got = {n: (st.get(n) or {}).get("piece_mask") for n in ARMS}
     mask_ok = all(tuple(got[n] or ()) == want[n] for n in ARMS if want[n] is not None)
     out.append(("each arm's source carries the piece mask it is supposed to", mask_ok,
@@ -397,7 +430,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     # patch is a no-op at the bundle level, the pair it defines can only ever find nothing, and
     # that nothing would read as "this piece does not matter".
     bad_edges, seen = [], 0
-    for piece in PIECES:
+    for piece in SWEPT:
         for lo, hi, _ in edges(piece):
             a, b = _bundles(obs, lo), _bundles(obs, hi)
             seen += 1
@@ -414,6 +447,48 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append(("the arms really are distinct trees (one bundle each, all different)",
                 len(distinct) == len([v for v in per_arm.values() if v]),
                 "; ".join(f"{n}={v}" for n, v in per_arm.items())[:700]))
+
+    # THE SERVED BUNDLE, READ OUT OF THE BROWSER, NOT OFF THE DISK.
+    #
+    # This gate exists because of a silent-wrong-result mode the two-job design introduces.
+    # `studio/backend/run.py::_resolve_frontend_path` tries `--frontend` first and, if that path
+    # has no `index.html`, FALLS BACK to the dist inside the installed package. With one shared
+    # backend install, that fallback exists and is the BASE bundle. So an arm whose dist failed to
+    # arrive would not error: it would quietly serve main's frontend and be measured and reported
+    # as that arm. A disk-side hash cannot see this, because the disk-side hash is of the
+    # directory that was never served.
+    #
+    # `build.scripts` is the `<script src>` list the page actually loaded, and Vite emits
+    # content-hashed filenames, so two arms that served different bundles cannot share it.
+    served = {}
+    for r in ok:
+        served.setdefault(r.get("arm"), set()).add(
+            tuple(sorted((r["payload"].get("build") or {}).get("scripts") or [])))
+    collisions = []
+    for a in ARMS:
+        for b in ARMS:
+            if a >= b or a not in served or b not in served:
+                continue
+            ha = (st.get(a) or {}).get("exported_bundle_hash")
+            hb = (st.get(b) or {}).get("exported_bundle_hash")
+            if ha and hb and ha != hb and served[a] & served[b]:
+                collisions.append(f"{a}/{b}")
+    every_arm_one = all(len(v) == 1 for v in served.values()) and bool(served)
+    out.append(("every arm's BROWSER loaded that arm's own bundle, not the shared backend's "
+                "fallback", not collisions and every_arm_one,
+                (f"arms serving an identical script set despite different builds: "
+                 f"{', '.join(collisions)}" if collisions else
+                 f"{len({next(iter(v)) for v in served.values()})} distinct served script sets "
+                 f"across {len(served)} arms")))
+
+    # and the dist that was measured is byte-for-byte the dist that was built
+    moved = [n for n in ARMS
+             if (st.get(n) or {}).get("exported_bundle_hash")
+             and (st.get(n) or {}).get("bundle_hash_matches_build") is False]
+    out.append(("every arm's dist survived the trip from the build job unchanged", not moved,
+                "; ".join(f"{n}: built {(st.get(n) or {}).get('exported_bundle_hash')} "
+                          f"measured {(st.get(n) or {}).get('bundle_hash_at_measure')}"
+                          for n in moved) or "every bundle hash matched the build job's"))
 
     engines = {(r["payload"].get("engine_probe") or {}).get("is_webkit_gtk_ua") for r in ok}
     out.append(("every measurement really was WebKitGTK", bool(ok) and engines == {True},
@@ -464,8 +539,8 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         cnotes.append(f"r{rung}: {REFERENCE} {a:.1f} fps vs {NEUTRAL} {b:.1f} fps ({ratio:.2f}x)")
         if rung_state(obs, rung)["state"] == "SCORED":
             closed = closed and (1.0 / CLOSURE_TOLERANCE) <= ratio <= CLOSURE_TOLERANCE
-    out.append((f"CLOSURE: with all three pieces neutralised, {NEUTRAL} behaves like {REFERENCE} "
-                f"(within {CLOSURE_TOLERANCE:.2f}x), so the three patches span the change",
+    out.append((f"CLOSURE: with all four of 9477's mechanisms neutralised, {NEUTRAL} behaves like {REFERENCE} "
+                f"(within {CLOSURE_TOLERANCE:.2f}x), so the four patches span the change",
                 closed, "; ".join(cnotes) or "no closure reading"))
 
     # THE SETTLED CENSUS REALLY SETTLED, or the fidelity numbers are snapshots of a busy page.
@@ -478,9 +553,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     # measurable cannot be credited or blamed, and a flat ratio for it means nothing.
     for piece, field, where, label in (
             ("p3a", "spans", "reasoning", "highlight spans inside the reasoning panes"),
-            ("p3b", "spans", "thread", "highlight spans across the whole thread"),
-            ("p2", "elements", None, "DOM elements while the panes are open"),
-            ("p1", "reasoning_chars", None, "reasoning characters in the DOM")):
+            ("p2", "elements", None, "DOM elements while the panes are open")):
         fired, fnotes = False, []
         for rung in _rungs(obs):
             for lo, hi, ctx in edges(piece):
@@ -613,7 +686,7 @@ def table(obs: dict) -> str:
         rows += ["The lump being split, and whether the split closes:", "",
                  "| comparison | meaning | eff fps | worst frame |", "|---|---|---|---|"]
         for lo, hi, what in ((REFERENCE, WHOLE, "ALL of 9477, pagination off -- the 4.981x"),
-                             (REFERENCE, NEUTRAL, "CLOSURE: all three pieces neutralised")):
+                             (REFERENCE, NEUTRAL, "CLOSURE: all four of 9477's mechanisms neutralised")):
             a, b = _mean(_vals(obs, lo, rung, _eff_fps)), _mean(_vals(obs, hi, rung, _eff_fps))
             wa, wb = _mean(_vals(obs, lo, rung, _worst)), _mean(_vals(obs, hi, rung, _worst))
             rows.append("| " + " | ".join([
@@ -622,11 +695,11 @@ def table(obs: dict) -> str:
                 "-" if not (wa and wb) else f"{wb / wa:.3f}x ({wa:,.0f} -> {wb:,.0f} ms)"]) + " |")
         rows.append("")
 
-        rows += ["Per piece, FOUR one-piece-at-a-time isolations each, one in every context of "
-                 "the other two. Each row differs from its partner by exactly one piece:", "",
-                 "| piece | off -> on | context | eff fps | worst frame | rep spread (fps) |",
+        rows += ["Every isolation edge. Each row differs from its partner by exactly one "
+                 "mechanism:", "",
+                 "| mechanism | off -> on | context | eff fps | worst frame | rep spread (fps) |",
                  "|---|---|---|---|---|---|"]
-        for piece in PIECES:
+        for piece in SWEPT:
             for e in _edge_ratios(obs, piece, rung):
                 rows.append("| " + " | ".join([
                     piece, f"`{e['off']}` -> `{e['on']}`", e["ctx"],
@@ -637,10 +710,53 @@ def table(obs: dict) -> str:
                     f"{e['spread']:.1f}"]) + " |")
         rows.append("")
 
-        rows += ["Main effect of each piece, the geometric mean of its four edges (geometric "
+        # ── THE SPLIT THAT DECIDES WHAT SHIPS ────────────────────────────────────────────
+        rows += ["Splitting `codeHighlighting=\"plain\"` into the two costs it removes together. "
+                 "`code-fence-defer.tsx` is byte-identical between main and this branch, so the "
+                 "deferral machinery is MAIN's own code and 9477 turns it off only as a side "
+                 "effect. `M` keeps every colour and turns the machinery off directly:", "",
+                 "| comparison | what it prices | eff fps | worst frame | rep spread (fps) |",
+                 "|---|---|---|---|---|"]
+        for lo, hi, what in DECOUPLE_EDGES:
+            a, b = _mean(_vals(obs, lo, rung, _eff_fps)), _mean(_vals(obs, hi, rung, _eff_fps))
+            wa, wb = _mean(_vals(obs, lo, rung, _worst)), _mean(_vals(obs, hi, rung, _worst))
+            fl = max(_spread(_vals(obs, lo, rung, _eff_fps)) or 0.0,
+                     _spread(_vals(obs, hi, rung, _eff_fps)) or 0.0)
+            rows.append("| " + " | ".join([
+                f"`{lo}` -> `{hi}`", what,
+                "-" if not (a and b) else f"**{b / a:.3f}x** ({a:.1f} -> {b:.1f})",
+                "-" if not (wa and wb) else f"{wb / wa:.3f}x ({wa:,.0f} -> {wb:,.0f} ms)",
+                f"{fl:.1f}"]) + " |")
+        a00 = _mean(_vals(obs, BASELINE, rung, _eff_fps))
+        a01 = _mean(_vals(obs, arm_of((0, 1)), rung, _eff_fps))
+        if a00 and a01:
+            rows.append(f"| `{BASELINE}` -> `{arm_of((0, 1))}` | both together, which is all "
+                        f"`codeHighlighting=\"plain\"` has ever been measured as | "
+                        f"**{a01 / a00:.3f}x** ({a00:.1f} -> {a01:.1f}) | - | - |")
+        rows.append("")
+
+        # ── PREDICTED NULLS ──────────────────────────────────────────────────────────────
+        rows += ["Predicted nulls, written down BEFORE the run so a flat reading is a result "
+                 "rather than an unexplained flat reading:", "",
+                 "| arm | mechanism turned off | predicted | measured | verdict |",
+                 "|---|---|---|---|---|"]
+        for arm, piece in ((NULL_P1, "p1"), (NULL_P3B, "p3b")):
+            a = _mean(_vals(obs, WHOLE, rung, _eff_fps))
+            b = _mean(_vals(obs, arm, rung, _eff_fps))
+            if not (a and b):
+                rows.append(f"| `{arm}` | {piece} | no change from `{WHOLE}` | - | not measured |")
+                continue
+            r = b / a
+            held = (1.0 / NULL_TOLERANCE) <= r <= NULL_TOLERANCE
+            rows.append(f"| `{arm}` | {piece} | no change from `{WHOLE}` | "
+                        f"{r:.3f}x ({a:.1f} -> {b:.1f}) | "
+                        f"{'CONFIRMED INERT' if held else 'PREDICTION FAILED'} |")
+        rows.append("")
+
+        rows += ["Main effect of each mechanism, the geometric mean of its edges (geometric "
                  "because these are ratios):", "",
-                 "| piece | what it is | main effect | edges |", "|---|---|---|---|"]
-        for piece in PIECES:
+                 "| mechanism | what it is | main effect | edges |", "|---|---|---|---|"]
+        for piece in SWEPT:
             me, n = _main_effect(obs, piece, rung)
             rows.append(f"| {piece} | {PIECE_LABEL[piece]} | "
                         f"{'-' if me is None else f'**{me:.3f}x**'} | {n} |")
@@ -713,7 +829,7 @@ def verdict(obs: dict) -> tuple[str, str]:
     lump = (whole / base) if (base and whole) else None
 
     ranked = []
-    for piece in PIECES:
+    for piece in SWEPT:
         me, n = _main_effect(obs, piece, rung)
         if me:
             ranked.append((me, piece, n))
@@ -731,7 +847,7 @@ def verdict(obs: dict) -> tuple[str, str]:
     if base and neutral:
         r = neutral / base
         if not ((1.0 / CLOSURE_TOLERANCE) <= r <= CLOSURE_TOLERANCE):
-            closure = (f". CLOSURE FAILED: with all three pieces neutralised {NEUTRAL} still reads "
+            closure = (f". CLOSURE FAILED: with all four of 9477's mechanisms neutralised {NEUTRAL} still reads "
                        f"{r:.2f}x the reference, so something in 9477 that none of these three "
                        f"patches turns off carries part of the lump and these shares are of less "
                        f"than the whole")
@@ -741,7 +857,7 @@ def verdict(obs: dict) -> tuple[str, str]:
 
     detail = (f"at r{rung}, {REFERENCE} -> {WHOLE} (all of 9477, pagination off) is "
               f"{lump:.3f}x" if lump else f"at r{rung}")
-    detail += (f". Splitting it by one-piece-at-a-time ablation over all four contexts, "
+    detail += (f". Splitting it by one-mechanism-at-a-time ablation over every context, "
                f"{top_piece} ({PIECE_LABEL[top_piece]}) has a main effect of {top_ratio:.3f}x "
                f"against {others or 'no other piece'}. Its edges: {edge_txt}{closure}")
 
@@ -758,7 +874,7 @@ def verdict(obs: dict) -> tuple[str, str]:
             "spread, so the ranking is directional rather than settled")
     return "NO_SINGLE_OWNER", detail + (
         ". No piece clears the ratio threshold on its own, so the lump is either shared or "
-        "carried by something these three patches do not isolate")
+        "carried by something these patches do not isolate")
 
 
 def observed_capabilities(obs: dict) -> dict[str, bool]:

@@ -44,7 +44,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def run(arm: str, rung: str, rep: str, *, n: int, elapsed: int, busy, worst: float,
         spans_reasoning: int = 1000, spans_thread: int = 7000, fences: int = 10,
         elements: int = 40000, reasoning_chars: int = 200000, settled: bool = True,
-        bundle: str | None = None) -> dict:
+        bundle: str | None = None, scripts: str | None = None) -> dict:
     """One measurement, shaped exactly like a real payload."""
     act = {
         "name": C.ACTION, "ok": True, "elapsed_ms": elapsed,
@@ -74,6 +74,7 @@ def run(arm: str, rung: str, rep: str, *, n: int, elapsed: int, busy, worst: flo
     return {"arm": arm, "rung": rung, "rep": rep, "payload": {
         "ok": True, "actions": [act, fid],
         "engine_probe": {"is_webkit_gtk_ua": True},
+        "build": {"scripts": [scripts or f"/assets/index-{arm}.js"], "css": []},
         "run_meta": {"bundle_hash": bundle or f"bundle_{arm}", "corpus_hash": C.EXPECTED_CORPUS,
                      "instrument_pacer_file": "/w/instrument/tests/studio/studiobench/pacer.py",
                      "instrument_sb_root": "/w/instrument", "instrument_hash": "cafebabe"},
@@ -87,11 +88,20 @@ def base_obs(runs: list[dict], rungs: list[str]) -> dict:
             mask = None
         elif arm == C.CLOSURE:
             mask = [False, False, False, False]
+        elif arm == C.DECOUPLE:
+            mask = [True, False, False, True]
+        elif arm == C.NULL_P1:
+            mask = [False, True, True, True]
+        elif arm == C.NULL_P3B:
+            mask = [True, True, True, False]
         else:
-            mask = [True] + [c == "1" for c in arm[1:]]
+            mask = [True, arm[1] == "1", arm[2] == "1", True]
         states[arm] = {"ref": C_REF, "ref_landed": C_REF, "commit": C_REF, "checkout_ok": True,
                        "patch_ok": True, "piece_mask": mask, "patches": [],
                        "dist": {"index_html": True, "asset_files": 607},
+                       "exported_bundle_hash": f"hash_{arm}",
+                       "bundle_hash_at_measure": f"hash_{arm}",
+                       "bundle_hash_matches_build": True,
                        "install": {"rc": 0}}
     return {"rungs": rungs, "states": states, "runs": runs,
             "xserver": {"display": ":99"}}
@@ -177,17 +187,19 @@ def test_attributes_to_the_owning_mechanism() -> None:
     """p3a carries the lump; the report must name p3a and not p2."""
     print("\n[3] the mechanism that owns the win is the one named")
     # p3a on -> ~5x, everything else flat. Bits are (p2, p3a, p3b).
-    fps = {C.REFERENCE: 5.1, C.CLOSURE: 5.2,
-           "A000": 5.2, "A100": 5.3, "A010": 25.0, "A001": 5.2,
-           "A110": 25.4, "A101": 5.3, "A011": 25.2, "A111": 25.3}
-    spans = {a: (0 if a in ("A010", "A110", "A011", "A111") else 4271) for a in fps}
+    # p3a carries the lump: every arm with p3a ON is fast. `M` is fast too, which is the
+    # finding that would let the colours stay.
+    fps = {C.REFERENCE: 5.1, C.CLOSURE: 5.2, "A00": 5.2, "A10": 5.3,
+           "A01": 25.0, "A11": 25.3, C.DECOUPLE: 23.0,
+           C.NULL_P1: 25.2, C.NULL_P3B: 25.4}
+    spans = {a: (0 if a in ("A01", "A11") else 4271) for a in fps}
     obs = _factorial_obs(fps, spans=spans)
     v, detail = C.verdict(obs)
     check("verdict attributes", v.startswith("ATTRIBUTED"), v)
     check("it names p3a", "p3a" in detail, detail[:150])
     me_p3a, n_p3a = C._main_effect(obs, "p3a", "100K")
     me_p2, _ = C._main_effect(obs, "p2", "100K")
-    check("p3a has four isolation edges", n_p3a == 4, str(n_p3a))
+    check("p3a has two isolation edges", n_p3a == 2, str(n_p3a))
     check("p3a's main effect is the large one", me_p3a > 4.0, f"{me_p3a:.2f}x")
     check("p2's main effect is flat", 0.9 < me_p2 < 1.1, f"{me_p2:.2f}x")
     g = dict((name, okv) for name, okv, _ in C.gates(obs))
@@ -202,8 +214,9 @@ def test_redundancy_is_visible_not_hidden() -> None:
     nothing. The factorial must still show both as large in the contexts where they act."""
     print("\n[4] redundancy is visible rather than reported as 'nothing matters'")
     fast, slow = 25.0, 5.1
-    fps = {C.REFERENCE: slow, C.CLOSURE: slow, "A000": slow}
-    for m in ("100", "010", "001", "110", "101", "011", "111"):
+    fps = {C.REFERENCE: slow, C.CLOSURE: slow, "A00": slow, C.DECOUPLE: slow,
+           C.NULL_P1: fast, C.NULL_P3B: fast}
+    for m in ("10", "01", "11"):
         on_p2, on_p3a = m[0] == "1", m[1] == "1"
         fps["A" + m] = fast if (on_p2 or on_p3a) else slow
     obs = _factorial_obs(fps)
@@ -212,8 +225,8 @@ def test_redundancy_is_visible_not_hidden() -> None:
     check("p2 still reads above 1x despite being redundant with p3a", me_p2 > 1.3, f"{me_p2:.2f}x")
     check("p3a still reads above 1x too", me_p3a > 1.3, f"{me_p3a:.2f}x")
     e_p2 = C._edge_ratios(obs, "p2", "100K")
-    alone = [e for e in e_p2 if e["off"] == "A000"][0]
-    with_p3a = [e for e in e_p2 if e["off"] == "A010"][0]
+    alone = [e for e in e_p2 if e["off"] == "A00"][0]
+    with_p3a = [e for e in e_p2 if e["off"] == "A01"][0]
     check("p2's edge is large where p3a is absent", alone["ratio"] > 4.0, f"{alone['ratio']:.2f}x")
     check("and flat where p3a already fired, which is the interaction being made visible",
           0.9 < with_p3a["ratio"] < 1.1, f"{with_p3a['ratio']:.2f}x")
@@ -222,9 +235,9 @@ def test_redundancy_is_visible_not_hidden() -> None:
 def test_closure_failure_is_reported() -> None:
     """If Z does not match main, the split is of less than the whole and the verdict says so."""
     print("\n[5] a failed closure is reported rather than absorbed")
-    fps = {C.REFERENCE: 5.1, C.CLOSURE: 15.0,
-           "A000": 15.1, "A100": 15.2, "A010": 25.0, "A001": 15.1,
-           "A110": 25.4, "A101": 15.3, "A011": 25.2, "A111": 25.3}
+    fps = {C.REFERENCE: 5.1, C.CLOSURE: 15.0, "A00": 15.1, "A10": 15.2,
+           "A01": 25.0, "A11": 25.3, C.DECOUPLE: 20.0,
+           C.NULL_P1: 25.2, C.NULL_P3B: 25.4}
     obs = _factorial_obs(fps)
     g = dict((name, okv) for name, okv, _ in C.gates(obs))
     closure = [k for k in g if k.startswith("CLOSURE")][0]
@@ -247,6 +260,29 @@ def test_unsettled_fidelity_census_is_refused() -> None:
     check("and it names the arm", C.WHOLE in g[k][1], g[k][1])
 
 
+def test_served_bundle_fallback_is_caught() -> None:
+    """The exact silent failure the shared backend introduces: an arm whose dist did not arrive
+    falls back to the installed package's dist and serves MAIN's bundle under that arm's name."""
+    print("\n[7] an arm that silently served the shared backend's fallback bundle is caught")
+    runs = [run("JAM", "100K", "jam", n=7, elapsed=5406, busy=98.5, worst=1816)]
+    for arm in (C.REFERENCE, C.WHOLE):
+        # A11 is BUILT differently but SERVES main's script: the fallback fired.
+        runs.append(run(arm, "100K", "1", n=27, elapsed=5106, busy=92.7, worst=1779,
+                        scripts="/assets/index-main.js"))
+    obs = base_obs(runs, ["100K"])
+    g = {name: (okv, ev) for name, okv, ev in C.gates(obs)}
+    k = [x for x in g if x.startswith("every arm's BROWSER loaded")][0]
+    check("the gate fails when two differently-built arms serve one bundle", g[k][0] is False)
+    check("and it names the pair", C.WHOLE in g[k][1] and C.REFERENCE in g[k][1], g[k][1])
+
+    # and it passes when each arm serves its own
+    runs2 = [run("JAM", "100K", "jam", n=7, elapsed=5406, busy=98.5, worst=1816)]
+    for arm in (C.REFERENCE, C.WHOLE):
+        runs2.append(run(arm, "100K", "1", n=27, elapsed=5106, busy=92.7, worst=1779))
+    g2 = {name: okv for name, okv, _ in C.gates(base_obs(runs2, ["100K"]))}
+    check("and passes when every arm serves its own bundle", g2[k] is True)
+
+
 def test_never_quotes_p50() -> None:
     print("\n[7] fps_p50 is never the statistic")
     src = (HERE / "criteria" / "studio_p123_attribution.py").read_text()
@@ -266,7 +302,7 @@ def test_never_quotes_p50() -> None:
 
 def test_table_renders() -> None:
     print("\n[8] the report renders without exploding on a partial run")
-    fps = {C.REFERENCE: 5.1, C.CLOSURE: 5.2, "A010": 25.0, "A111": 25.3}
+    fps = {C.REFERENCE: 5.1, C.CLOSURE: 5.2, "A01": 25.0, "A11": 25.3}
     obs = _factorial_obs(fps)
     txt = C.table(obs)
     check("table is produced", len(txt) > 500, f"{len(txt)} chars")
@@ -281,7 +317,7 @@ def main() -> int:
     for fn in (test_r500k_control_is_per_rung, test_floor_downgrades_rather_than_scores,
                test_attributes_to_the_owning_mechanism, test_redundancy_is_visible_not_hidden,
                test_closure_failure_is_reported, test_unsettled_fidelity_census_is_refused,
-               test_never_quotes_p50, test_table_renders):
+               test_served_bundle_fallback_is_caught, test_never_quotes_p50, test_table_renders):
         fn()
     print()
     if FAILURES:
