@@ -291,9 +291,16 @@
       }
       var ran = false, err = null;
       if (name === "assign") markAssignUsed(stamp);
-      // Cleared per attempt. The latch is set by the app's FIRST app-shell-ready, which fires
-      // for the shell's own startup navigation long before ours, so an un-cleared latch made
-      // the bounded wait below return in 0 ms and wait for nothing.
+      // Cleared per attempt, and THIS is what made the 0K rung measurable. The latch is set by
+      // the app's FIRST app-shell-ready, which fires for the shell's own startup navigation
+      // long before ours, so an un-cleared latch made the bounded wait below return in 0 ms and
+      // wait for nothing. At 0K the post-condition is satisfiable the instant pushState runs --
+      // there are no messages to appear -- so the whole navigation returned in 0 ms, the scene
+      // started measuring on a thread the app had not switched to yet, and 12 s later the send
+      // phase found a Send button that was still disabled and sat there for its full 120 s
+      // budget. In run 32819187840 that cost reps 1 and 2 and the software control at 0K.
+      // Cleared, the wait is a real ~100 ms wait for THIS navigation's event and the same legs
+      // in run 32827211717 sent in 52 ms.
       shellReady = false;
       try { ran = S[name](); } catch (e) { err = String(e); }
       note("nav_attempt", { name: name, ran: ran, err: err });

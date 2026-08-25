@@ -437,11 +437,19 @@
       // history resolves, and the captured node is left detached from the document. Setting
       // `.value` on a detached textarea updates nothing the app can see: the visible composer
       // stays empty, the Send button CORRECTLY stays disabled, and the run dies 120 s later in
-      // `waitFor(enabledSend)` blaming the model chip. That is how run 32819187840 lost all
-      // three of its 0K legs -- reps 1 and 2 and the software control -- while the DOM it
-      // reported at the failure had a live composer, a live Send button and the pacer chip
-      // present. Re-resolving costs nothing, changes no measured window (the send phase is not
-      // one of the four scored phases), and is applied identically at every rung.
+      // `waitFor(enabledSend)` blaming the model chip.
+      //
+      // MEASURED OUTCOME, so this is not credited with more than it did. This was one of two
+      // candidate mechanisms for run 32819187840 losing all three of its 0K legs (reps 1 and 2
+      // and the software control) in exactly that timeout, with a live composer, a live Send
+      // button and the pacer chip all present in the DOM it reported at the failure. The other
+      // was the navigation returning before the app had switched to the requested thread, and
+      // that is the one that was actually at fault: with both repairs in, run 32827211717 sent
+      // in 52 ms at 0K and reported `composer_refreshes: 0` on every leg at every rung, so this
+      // guard never fired. It is kept as a guard, not as the fix. It costs nothing, changes no
+      // measured window (the send phase is not one of the four scored phases), is applied
+      // identically at every rung, and it turns the next occurrence of a stale node from a
+      // silent 120 s timeout into a counter in the payload.
       let composerRefreshes = 0;
       const liveComposer = () => {
         if (!document.contains(ta)) {
