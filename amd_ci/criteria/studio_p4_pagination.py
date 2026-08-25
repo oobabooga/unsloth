@@ -168,10 +168,21 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append(("a display server was obtained", bool((obs.get("xserver") or {}).get("display")),
                 obs.get("fatal") or str((obs.get("xserver") or {}).get("display"))))
 
+    # SAID versus LANDED, on every arm, always. The previous run reported this as `Aoff: []` --
+    # technically true and completely uninformative, while the real fact was that the checkout had
+    # silently stayed on a main commit. A gate that fails must say what it saw.
+    landed = "; ".join(
+        f"{n}: asked {str((st.get(n) or {}).get('ref'))[:9]} "
+        f"landed {str((st.get(n) or {}).get('ref_landed') or (st.get(n) or {}).get('commit'))[:9]}"
+        + ("" if (st.get(n) or {}).get("checkout_ok", True) else " MISMATCH")
+        for n in ARMS)
+    out.append(("every arm checked out the commit it was asked for",
+                all((st.get(n) or {}).get("checkout_ok") for n in ARMS), landed))
+
     bad = [n for n in ARMS if not (st.get(n) or {}).get("patch_ok")]
     out.append(("every arm's patches applied cleanly and completely", not bad,
-                "; ".join(f"{n}: {(st.get(n) or {}).get('patch_steps')}" for n in bad)[:400]
-                or "all five arms patched"))
+                "; ".join(f"{n}: {(st.get(n) or {}).get('why') or (st.get(n) or {}).get('patch_steps')}"
+                          for n in bad)[:500] or "all five arms patched"))
 
     # THE FLAG, READ OUT OF THE SOURCE. The whole run turns on this one literal.
     want = {"baseT": None, "C": "false", "B": "true", "Aoff": "false", "A": "true"}
