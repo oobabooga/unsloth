@@ -46,6 +46,9 @@ def main():
     # decides whether every composite goes through that software GL stack is the hardware
     # acceleration policy, so it has to be settable rather than left at whatever the headless
     # X server negotiates.
+    ap.add_argument("--frame-clock", default="passive", choices=["updating", "passive"],
+                    help="updating: GdkFrameClock.begin_updating(), a free-running display-rate "
+                         "clock. passive: emissions only when a frame is actually requested.")
     ap.add_argument("--accel", choices=["always", "never", "ondemand", "default"],
                     default="default")
     args = ap.parse_args()
@@ -101,7 +104,9 @@ def main():
             return
         if isinstance(obj, dict) and obj.get("__done"):
             gaps = [round((b - a) * 1000, 1) for a, b in zip(draw_ts, draw_ts[1:])]
+            obj["frame_clock_mode"] = args.frame_clock
             obj["widget_draws"] = {
+                "mode": args.frame_clock,
                 "n": len(draw_ts),
                 "first": draw_ts[0] if draw_ts else None,
                 "last": draw_ts[-1] if draw_ts else None,
@@ -168,7 +173,17 @@ def main():
         if fc is None:
             return True
         fc.connect("after-paint", lambda *a: draw_ts.append(time.time()))
-        fc.begin_updating()
+        # begin_updating() FORCES the frame clock to tick at the display rate whether or not
+        # anything asked for a frame. Measured: with the main thread deliberately blocked 200 ms
+        # out of every 250 ms, the after-paint series still read 60.0 fps in every phase, while
+        # the same gesture took 2.5x longer in wall clock. Under `updating` this channel cannot
+        # read below the display rate and therefore cannot carry a frame-rate claim at all.
+        #
+        # `passive` leaves the clock to be driven by actual frame requests, so an emission means
+        # a frame was really produced. Which of the two is in force is recorded in the payload,
+        # because a number from `updating` and a number from `passive` are different quantities.
+        if args.frame_clock == "updating":
+            fc.begin_updating()
         fc_state["wired"] = True
         emit("frame_clock_wired", True)
         return False

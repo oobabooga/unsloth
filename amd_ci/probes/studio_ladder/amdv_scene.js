@@ -262,33 +262,76 @@
         ta.focus();
         await sleep(150);
       };
+      // Fill, then CONFIRM the composer really holds the text before doing anything with it.
+      // At 100K the app is busy enough that a fixed 250 ms wait after dispatching `input` is
+      // sometimes not enough, and the send button then sends an empty composer, which looks
+      // exactly like a send that was ignored.
       const fill = async (text) => {
         await focusComposer();
         setter.call(ta, text);
         ta.dispatchEvent(new Event("input", { bubbles: true }));
+        const dl = performance.now() + 10000;
+        while (performance.now() < dl && (ta.value || "") !== text) await sleep(100);
         await sleep(250);
+        return (ta.value || "") === text;
+      };
+      // Some composers commit on Enter and not on the button, and a busy main thread makes the
+      // difference visible. Both are tried before an attempt is called a failure.
+      const pressEnter = async () => {
+        for (const type of ["keydown", "keypress", "keyup"]) {
+          ta.dispatchEvent(new KeyboardEvent(type, {
+            key: "Enter", code: "Enter", keyCode: 13, which: 13,
+            bubbles: true, cancelable: true }));
+        }
+        await sleep(200);
       };
       const composerT0 = performance.now();
-      await fill(o.prompt);
+      const filled0 = await fill(o.prompt);
       const composerMs = performance.now() - composerT0;
-      const send = await waitFor(W.dom.sendButton, 20000, "send button");
+      // WAIT FOR THE BUTTON TO BE ENABLED, not merely present.
+      //
+      // This was a real flake and it lied in the direction that matters. The model chip is
+      // restored from localStorage asynchronously, and until it resolves the app keeps Send
+      // disabled. With the composer already filled, a disabled Send means the MODEL is not
+      // ready, not that the composer is empty -- and clicking it does nothing, silently. The
+      // observed failures were 0K and 500K on one pass and 100K on another, i.e. a race, not a
+      // rung effect. Left in, it would have deleted whichever rungs happened to lose the race
+      // and left a ladder with holes in it that looked like data.
+      const enabledSend = () => {
+        const b = W.dom.sendButton();
+        if (!b) return null;
+        const off = b.disabled || b.getAttribute("aria-disabled") === "true";
+        return off ? null : b;
+      };
+      const send = await waitFor(enabledSend, 120000, "an ENABLED send button (the model chip " +
+                                 "restores from localStorage asynchronously)");
       const sendT = performance.now();
       let started = false;
       const attempts = [];
-      for (let attempt = 0; attempt < 6 && !started; attempt++) {
-        if (attempt > 0) { await fill(o.prompt); await sleep(1000 * attempt); }
-        const btn = W.dom.sendButton() || send;
-        attempts.push({ attempt, has_button: !!btn,
-                        disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled")) : null,
-                        composer_value_len: (ta.value || "").length });
-        if (btn) btn.click();
-        const dl = performance.now() + 45000;
-        while (performance.now() < dl) {
-          if (W.dom.isRunning()) { started = true; break; }
-          await sleep(50);
-        }
-      }
       W.sendAttempts = attempts;
+      for (let attempt = 0; attempt < 6 && !started; attempt++) {
+        const filled = attempt === 0 ? filled0 : await fill(o.prompt);
+        const btn = enabledSend() || W.dom.sendButton() || send;
+        const a = { attempt, filled, has_button: !!btn, via: null,
+                    disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled")) : null,
+                    composer_value_len: (ta.value || "").length };
+        attempts.push(a);
+        if (btn) { btn.click(); a.via = "button"; }
+        let dl = performance.now() + 20000;
+        while (performance.now() < dl && !started) {
+          if (W.dom.isRunning()) started = true; else await sleep(50);
+        }
+        if (!started) {
+          await pressEnter();
+          a.via = a.via ? a.via + "+enter" : "enter";
+          dl = performance.now() + 20000;
+          while (performance.now() < dl && !started) {
+            if (W.dom.isRunning()) started = true; else await sleep(50);
+          }
+        }
+        a.started = started;
+        if (!started) await sleep(1000 * (attempt + 1));
+      }
       if (!started) {
         throw new Error("timeout waiting for stream to start (stop/queue button). attempts=" +
                         JSON.stringify(attempts));
@@ -352,7 +395,10 @@
       });
     } catch (e) {
       post({ __done: true, ok: false, rung: o.rung, phase: W.phase,
-             error: String((e && e.stack) || e), marks: W.marks, url: location.href,
+             error: String((e && e.message) || e),
+             error_stack: String((e && e.stack) || ""),
+             send_attempts: W.sendAttempts || null,
+             marks: W.marks, url: location.href,
              dom: { composer: !!W.dom.composer(), send: !!W.dom.sendButton(),
                     running: W.dom.isRunning(), elements: W.dom.elements(),
                     messages: W.dom.messages(),

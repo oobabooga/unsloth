@@ -21,11 +21,27 @@ Three things decide it, and the order matters.
    difference smaller than the repeat spread is not a difference. With no repeat there is no
    floor at all, and the verdict is INCONCLUSIVE rather than a number.
 
-3. **Only then, the frame rate.** Read from GdkFrameClock::after-paint, one emission per
-   presented frame of the toplevel, NOT from requestAnimationFrame. Under a headless X server
-   rAF is not vsync locked and reports gaps of 8-9 ms, so it measures main-thread availability
-   and would read "120 Hz" on a server with no refresh rate. Both are recorded; only the
-   presented series can carry a claim about frames a user sees.
+3. **Only then, the frame rate, from the channel that a control shows can move.**
+
+   Both frame channels are recorded and the choice between them was settled by experiment, not
+   by argument, because the first version of this file got it backwards.
+
+   `GdkFrameClock::after-paint` was chosen first, on the reasoning that it is one emission per
+   PRESENTED frame of the toplevel while rAF under a headless X server is not vsync locked.
+   That reasoning is sound and the conclusion was still wrong: the driver calls
+   `begin_updating()`, which forces the clock to tick at the display rate whether or not
+   anything asked for a frame. Measured, with the main thread deliberately blocked 200 ms out of
+   every 250 ms: the after-paint series read **60.0 fps in every phase**, while the same scroll
+   gesture took 2.5x longer in wall clock. Without `begin_updating()` it reads 1.7 fps on a
+   healthy idle page. Under Xvfb there is no vblank and no compositor consumer, so this channel
+   is pinned either at the display rate or at whatever the app happened to request, and it
+   cannot carry a frame-rate claim in either direction.
+
+   The rAF channel does move, monotonically with load, reproducibly across repeats. So the
+   headline is the rAF inter-frame interval, and the after-paint number is printed beside it and
+   labelled as the artefact it is. A jammed positive control gates the whole run: if the
+   headline channel does not fall when the main thread is deliberately blocked, nothing here
+   means anything.
 """
 
 from __future__ import annotations
@@ -60,18 +76,59 @@ MIN_DOM_GROWTH = 5.0
 # Chromium sat at 1-2%.
 MIN_TOP_BUSY_PCT = 15.0
 
+# How far the jammed control has to fall below the same rung unjammed before the presented-frame
+# channel counts as able to read anything other than the display rate. A 200 ms jam every 250 ms
+# leaves the main thread 20% available; a channel that still reads 60 fps under that is reading a
+# clock, not frames.
+CONTROL_MIN_DROP_PCT = 25.0
+
 
 def _runs(obs: dict) -> list[dict]:
     return [r for r in (obs.get("runs") or []) if isinstance(r, dict)]
 
 
+def _is_control(r: dict) -> bool:
+    """The deliberately jammed arm. Never a ladder reading."""
+    return bool(r.get("hog_ms")) or str(r.get("rep")) == "hog"
+
+
 def _ok_runs(obs: dict) -> list[dict]:
+    """Completed LADDER runs. The jammed control is excluded: it is an instrument check."""
     out = []
     for r in _runs(obs):
         p = r.get("payload") or {}
-        if p.get("ok") and p.get("marks"):
+        if p.get("ok") and p.get("marks") and not _is_control(r):
             out.append(r)
     return out
+
+
+def _control(obs: dict) -> dict | None:
+    for r in _runs(obs):
+        if _is_control(r):
+            return r
+    return None
+
+
+def _control_fps(obs: dict) -> tuple[float | None, float | None, str]:
+    """(jammed fps, unjammed fps at the same rung, the phase they are read from)."""
+    c = _control(obs)
+    if not c or not (c.get("payload") or {}).get("ok"):
+        return None, None, "scroll"
+    rung = c.get("rung")
+    peers = [r for r in _ok_runs(obs) if r.get("rung") == rung]
+    best = (None, None, "scroll")
+    for phase in ("scroll", "stream", "idle"):
+        j = _raf_fps(c["payload"], phase)
+        if j is None:
+            continue
+        u = [_raf_fps(r["payload"], phase) for r in peers]
+        u = [x for x in u if x is not None]
+        if not u:
+            continue
+        # The phase where the jam bites hardest is the one that proves the channel resolves.
+        if best[0] is None or j < best[0]:
+            best = (j, sum(u) / len(u), phase)
+    return best
 
 
 def _draw_ts(payload: dict) -> list[float]:
@@ -99,6 +156,28 @@ def _phase_fps(payload: dict) -> dict[str, float | None]:
     return out
 
 
+def _phase_raf(payload: dict) -> dict[str, dict]:
+    return {ph.get("phase"): (ph.get("raf") or {}) for ph in (payload.get("phases") or [])}
+
+
+def _raf_fps(payload: dict, phase: str) -> float | None:
+    """Frames per second from the rAF inter-frame interval. THE HEADLINE CHANNEL."""
+    raf = _phase_raf(payload).get(phase) or {}
+    p50 = raf.get("p50_ms")
+    return (1000.0 / p50) if p50 else None
+
+
+def _raf_stat(payload: dict, phase: str, key: str):
+    return (_phase_raf(payload).get(phase) or {}).get(key)
+
+
+def _blocked(payload: dict, phase: str):
+    for ph in payload.get("phases") or []:
+        if ph.get("phase") == phase:
+            return (ph.get("busy") or {}).get("blocked_ms")
+    return None
+
+
 def _busy(payload: dict, phase: str):
     for ph in payload.get("phases") or []:
         if ph.get("phase") == phase:
@@ -124,14 +203,20 @@ def _rungs_sorted(obs: dict) -> list[str]:
 def _agg(rs: list[dict], phase: str) -> dict:
     vals = []
     for r in rs:
-        f = _phase_fps(r["payload"]).get(phase)
+        f = _raf_fps(r["payload"], phase)
         if f is not None:
             vals.append(f)
+    pres = [x for x in (_phase_fps(r["payload"]).get(phase) for r in rs) if x is not None]
+    worst = [x for x in (_raf_stat(r["payload"], phase, "max_ms") for r in rs) if x is not None]
+    blocked = [x for x in (_blocked(r["payload"], phase) for r in rs) if x is not None]
     busy = [b for b in (_busy(r["payload"], phase) for r in rs) if b is not None]
     els = [e for e in (_elements(r["payload"]) for r in rs) if e is not None]
     return {"fps": vals, "n": len(vals),
             "fps_min": min(vals) if vals else None, "fps_max": max(vals) if vals else None,
             "spread": (max(vals) - min(vals)) if len(vals) >= 2 else None,
+            "presented": (sum(pres) / len(pres)) if pres else None,
+            "worst_ms": max(worst) if worst else None,
+            "blocked_ms": (sum(blocked) / len(blocked)) if blocked else None,
             "busy": (sum(busy) / len(busy)) if busy else None,
             "elements": (sum(els) / len(els)) if els else None}
 
@@ -183,6 +268,27 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append((f"the seeded thread really mounted (DOM grew >= {MIN_DOM_GROWTH:.0f}x)",
                 grew, detail))
 
+    # THE POSITIVE CONTROL, and the gate this whole run turns on.
+    #
+    # GdkFrameClock ticks under `begin_updating()` whether or not the page had anything new to
+    # show. So "60 fps at every rung" is equally consistent with a compositor that kept up and
+    # with a channel that cannot read anything else, and only a deliberately jammed main thread
+    # tells them apart. If the jam does not move the number, no flat reading here means
+    # anything and this is INCONCLUSIVE, not NO_COLLAPSE.
+    jam, unjam, phase = _control_fps(obs)
+    c = _control(obs)
+    resolves = (jam is not None and unjam is not None
+                and jam < unjam * (1.0 - CONTROL_MIN_DROP_PCT / 100.0))
+    out.append((f"the headline frame channel resolves a jammed main thread "
+                f"(>= {CONTROL_MIN_DROP_PCT:.0f}% below the same rung unjammed)", resolves,
+                "no control run" if c is None else
+                (f"control did not complete: "
+                 f"{str((c.get('payload') or {}).get('error') or c.get('rc'))[:160]}"
+                 if jam is None else
+                 f"{c.get('rung')} with a {c.get('hog_ms')} ms jam every "
+                 f"{(c.get('payload') or {}).get('run_meta', {}).get('hog_period_ms', '?')} ms: "
+                 f"{jam:.1f} fps against {unjam:.1f} fps unjammed, {phase} phase")))
+
     have_repeat = any(len(rs) >= 2 for rs in _by_rung(obs).values())
     out.append(("at least one rung was measured twice, so a difference has a floor",
                 have_repeat,
@@ -190,56 +296,74 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     return out
 
 
+def _fmt(v, suffix="", nd=0):
+    if v is None:
+        return "-"
+    return f"{v:,.{nd}f}{suffix}"
+
+
 def table(obs: dict) -> str:
-    rows = ["| rung | reps | DOM elements | idle fps | scroll fps | stream fps | "
-            "idle busy | scroll busy | stream busy |", "|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| rung | reps | DOM elements | phase | fps (rAF) | worst frame | busy | blocked | "
+            "after-paint fps (ARTEFACT) |",
+            "|---|---|---|---|---|---|---|---|---|"]
     by = _by_rung(obs)
     for rung in _rungs_sorted(obs):
         rs = by[rung]
-        cells = []
+        el = _agg(rs, "idle")["elements"]
         for phase in ("idle", "scroll", "stream"):
             a = _agg(rs, phase)
-            cells.append("-" if not a["fps"] else
-                         (f"{a['fps_min']:.1f}" if a["n"] == 1 else
-                          f"{a['fps_min']:.1f}-{a['fps_max']:.1f}"))
-        busies = []
-        for phase in ("idle", "scroll", "stream"):
-            b = _agg(rs, phase)["busy"]
-            busies.append("null" if b is None else f"{b:.0f}%")
-        el = _agg(rs, "idle")["elements"]
-        rows.append(f"| {rung} | {len(rs)} | {'-' if el is None else f'{el:,.0f}'} | "
-                    + " | ".join(cells) + " | " + " | ".join(busies) + " |")
+            if not a["fps"]:
+                fps = "-"
+            elif a["n"] == 1:
+                fps = f"{a['fps_min']:.1f}"
+            else:
+                fps = f"{a['fps_min']:.1f}-{a['fps_max']:.1f}"
+            busy = "null" if a["busy"] is None else f"{a['busy']:.0f}%"
+            rows.append("| " + " | ".join([
+                rung, str(len(rs)), _fmt(el), phase, f"**{fps}**",
+                _fmt(a["worst_ms"], " ms"), busy, _fmt(a["blocked_ms"], " ms"),
+                _fmt(a["presented"], "", 1)]) + " |")
 
-    rows.append("")
-    rows.append("Frame rate is the PRESENTED series (GdkFrameClock::after-paint, one emission "
-                "per rendered frame of the toplevel), not requestAnimationFrame. Under a "
-                "headless X server rAF is not vsync locked and reports 8-9 ms gaps on an idle "
-                "page, so it measures main-thread availability and cannot carry a claim about "
-                "frames a user sees.")
-    rows.append("")
-    rows.append("Repeat spread at the same rung, which is the only floor a rung-to-rung "
-                "difference in this table has:")
-    rows.append("")
-    rows.append("| rung | phase | readings | spread |")
-    rows.append("|---|---|---|---|")
+    rows += [
+        "",
+        "**fps is the rAF inter-frame interval (1000 / p50). The after-paint column is printed "
+        "only so that it is not quoted later: it is an artefact.** The driver calls "
+        "`GdkFrameClock.begin_updating()`, which ticks the clock at the display rate whether or "
+        "not anything asked for a frame. Measured with the main thread blocked 200 ms out of "
+        "every 250 ms, that column read 60.0 fps in every phase while the same gesture took 2.5x "
+        "longer in wall clock; with `begin_updating()` removed it reads 1.7 fps on a healthy "
+        "idle page. Under Xvfb there is no vblank, so it is pinned in one direction or the "
+        "other and cannot move with load.",
+        "",
+        "Repeat spread at the same rung, which is the only floor a rung-to-rung difference in "
+        "this table has:",
+        "",
+        "| rung | phase | readings (fps) | spread |",
+        "|---|---|---|---|",
+    ]
     for rung in _rungs_sorted(obs):
         for phase in ("idle", "scroll", "stream"):
-            a = _agg(_by_rung(obs)[rung], phase)
+            a = _agg(by[rung], phase)
             if a["spread"] is None:
                 continue
-            rows.append(f"| {rung} | {phase} | "
-                        f"{', '.join(f'{v:.1f}' for v in a['fps'])} | {a['spread']:.1f} fps |")
+            reads = ", ".join(f"{v:.1f}" for v in a["fps"])
+            rows.append(f"| {rung} | {phase} | {reads} | {a['spread']:.1f} fps |")
 
-    # Anything that failed, named rather than dropped.
-    bad = [r for r in _runs(obs) if r not in _ok_runs(obs)]
+    jam, unjam, cphase = _control_fps(obs)
+    if jam is not None:
+        rows += ["",
+                 f"Positive control, the same rung with the main thread deliberately jammed: "
+                 f"**{jam:.1f} fps** against {unjam:.1f} fps unjammed ({cphase} phase). This is "
+                 f"what makes a reading here a finding rather than a broken instrument."]
+
+    bad = [r for r in _runs(obs) if r not in _ok_runs(obs) and not _is_control(r)]
     if bad:
-        rows.append("")
-        rows.append("Runs that did not complete:")
-        rows.append("")
+        rows += ["", "Runs that did not complete:", ""]
         for r in bad:
-            p = r.get("payload") or {}
+            pl = r.get("payload") or {}
             rows.append(f"- {r.get('rung')} rep {r.get('rep')}: rc={r.get('rc')} "
-                        f"phase={p.get('phase')} {str(p.get('error') or r.get('error'))[:200]}")
+                        f"phase={pl.get('phase')} "
+                        f"{str(pl.get('error') or r.get('error'))[:200]}")
     return "\n".join(rows)
 
 

@@ -79,6 +79,14 @@ def main():
     # of the workspace `scripts/` directory these default to.
     ap.add_argument("--scene", default="", help="path to amdv_scene.js")
     ap.add_argument("--driver", default="", help="path to wkgtk_drive.py")
+    # A DELIBERATELY JAMMED ARM, and the only thing that makes a flat frame rate mean anything.
+    # GdkFrameClock ticks under `begin_updating()` whether or not the page had anything new to
+    # show, so "60 fps at every rung" is consistent with BOTH a compositor keeping up and a
+    # channel that cannot read anything else. Blocking the main thread on purpose separates
+    # those: a channel that resolves must read far below 60 here.
+    ap.add_argument("--hog-ms", type=int, default=0)
+    ap.add_argument("--hog-period-ms", type=int, default=250)
+    ap.add_argument("--frame-clock", default="passive", choices=["updating", "passive"])
     args = ap.parse_args()
 
     def P(v, default_parent=WS):
@@ -227,8 +235,13 @@ def main():
         )
         scene_path = Path(args.scene) if args.scene else (WS / "scripts" / "amdv_scene.js")
         scene = scene_path.read_text()
+        hog = ""
+        if args.hog_ms:
+            hog = ("(() => { setInterval(() => { const t = performance.now();"
+                   " while (performance.now() - t < %d) {} }, %d); })();\n"
+                   % (args.hog_ms, args.hog_period_ms))
         initp = work / f"init_{tag}.js"
-        initp.write_text(init_js + "\n" + scene + "\n")
+        initp.write_text(init_js + "\n" + scene + "\n" + hog)
 
         runp = work / f"run_{tag}.js"
         runp.write_text("window.__av.run(%s);" % json.dumps({
@@ -247,11 +260,11 @@ def main():
         # `search.thread`). A path-style URL renders the not-found page, which still has a
         # body and would have been measured as an empty thread at every rung.
         url = f"{base}/chat?thread={seeded['thread_id']}"
-        driver_path = Path(args.driver) if args.driver else (WS / "scripts" / "wkgtk_drive.py")
+        driver_path = Path(args.driver) if args.driver else (WS / "scripts" / "amdv_drive.py")
         drive = [args.python_gi, str(driver_path),
                  "--url", url, "--init-script", str(initp), "--script", str(runp),
                  "--out", str(resultp), "--timeout", str(total_timeout),
-                 "--accel", args.accel]
+                 "--accel", args.accel, "--frame-clock", args.frame_clock]
         denv = dict(os.environ)
         denv["DISPLAY"] = args.display
         print(f"[{tag}] driving {url}, timeout {total_timeout:.0f}s", flush=True)
@@ -282,6 +295,8 @@ def main():
             "renderer": "REAL WebKitGTK via libwebkit2gtk-4.1 (PyGObject), NOT Playwright WebKit",
             "accel_policy": args.accel, "driver_exit": r.returncode,
             "scene": str(scene_path), "driver": str(driver_path),
+            "hog_ms": args.hog_ms, "hog_period_ms": args.hog_period_ms,
+            "frame_clock": args.frame_clock,
             "display": args.display, "ts": time.time(),
         }
         outp.write_text(json.dumps(payload))

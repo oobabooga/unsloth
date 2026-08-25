@@ -102,6 +102,12 @@ def main() -> int:
     ap.add_argument("--first-port", type = int, default = 5451)
     ap.add_argument("--install-timeout", type = int, default = 3600)
     ap.add_argument("--rung-timeout", type = int, default = 1800)
+    # The positive control. Without it a flat frame rate cannot be told apart from a frame
+    # channel that reads 60 no matter what, which is the failure that made every headless
+    # Chromium number worthless in the other direction.
+    ap.add_argument("--hog-ms", type = int, default = 200)
+    ap.add_argument("--hog-period-ms", type = int, default = 250)
+    ap.add_argument("--control-rung", default = "0K")
     args = ap.parse_args()
     args.out.parent.mkdir(parents = True, exist_ok = True)
 
@@ -161,49 +167,57 @@ def main() -> int:
         obs["runs"] = []
         port = args.first_port
         rungs = [r.strip() for r in args.rungs.split(",") if r.strip()]
-        for rep in range(1, args.reps + 1):
-            for rung in rungs:
-                rhome = work / f"home_{rung}_r{rep}"
-                # Its own home per run: two runs sharing one home share a studio.db, and the
-                # second would mount the first's threads.
-                if rhome.exists():
-                    shutil.rmtree(rhome, ignore_errors = True)
-                rhome.mkdir(parents = True, exist_ok = True)
-                for name in ("assets", "bin", "cache", "compiled_cache", "llama.cpp", "share",
-                             "unsloth_studio", "whisper.cpp"):
-                    src = home / name
-                    if src.exists() and not (rhome / name).exists():
-                        os.symlink(src, rhome / name)
-                for name in ("exports", "outputs", "logs", "runs", "rag", "auth"):
-                    (rhome / name).mkdir(parents = True, exist_ok = True)
+        # (rung, rep-label, hog_ms). The jammed control runs LAST, on the smallest rung, so it
+        # cannot be confused with a ladder reading and so a failure in it cannot cost the
+        # ladder.
+        plan = [(rung, str(rep), 0)
+                for rep in range(1, args.reps + 1) for rung in rungs]
+        if args.hog_ms:
+            plan.append((args.control_rung, "hog", args.hog_ms))
+        for rung, rep, hog_ms in plan:
+            rhome = work / f"home_{rung}_r{rep}"
+            # Its own home per run: two runs sharing one home share a studio.db, and the
+            # second would mount the first's threads.
+            if rhome.exists():
+                shutil.rmtree(rhome, ignore_errors = True)
+            rhome.mkdir(parents = True, exist_ok = True)
+            for name in ("assets", "bin", "cache", "compiled_cache", "llama.cpp", "share",
+                         "unsloth_studio", "whisper.cpp"):
+                src = home / name
+                if src.exists() and not (rhome / name).exists():
+                    os.symlink(src, rhome / name)
+            for name in ("exports", "outputs", "logs", "runs", "rag", "auth"):
+                (rhome / name).mkdir(parents = True, exist_ok = True)
 
-                outp = work / "out" / f"{rung}_rep{rep}.json"
-                outp.parent.mkdir(parents = True, exist_ok = True)
-                cmd = [sys.executable, str(LADDER / "amdv_rung_bench.py"),
-                       "--rung", rung, "--rep", str(rep),
-                       "--dist", str(dist), "--home", str(rhome),
-                       "--port", str(port), "--display", xinfo["display"],
-                       "--sb-root", str(repo), "--unsloth-bin", unsloth_bin,
-                       "--python-gi", py_gi,
-                       "--scene", str(LADDER / "amdv_scene.js"),
-                       "--driver", str(LADDER / "wkgtk_drive.py"),
-                       "--out", str(outp)]
-                t0 = time.time()
-                r = sh(cmd, timeout = args.rung_timeout,
-                       env = {"UNSLOTH_WORKSPACE": str(work)})
-                entry = {"rung": rung, "rep": rep, "port": port,
-                         "seconds": round(time.time() - t0, 1),
-                         "rc": r.get("rc"), "error": r.get("error"),
-                         "stdout_tail": "\n".join((r.get("stdout") or "").splitlines()[-40:]),
-                         "stderr_tail": (r.get("stderr") or "")[-3000:]}
-                if outp.is_file():
-                    try:
-                        entry["payload"] = json.loads(outp.read_text())
-                    except Exception as e:  # noqa: BLE001
-                        entry["payload_error"] = f"{type(e).__name__}: {e}"
-                obs["runs"].append(entry)
-                port += 1
-                time.sleep(10)
+            outp = work / "out" / f"{rung}_rep{rep}.json"
+            outp.parent.mkdir(parents = True, exist_ok = True)
+            cmd = [sys.executable, str(LADDER / "amdv_rung_bench.py"),
+                   "--rung", rung, "--rep", str(rep),
+                   "--hog-ms", str(hog_ms), "--hog-period-ms", str(args.hog_period_ms),
+                   "--dist", str(dist), "--home", str(rhome),
+                   "--port", str(port), "--display", xinfo["display"],
+                   "--sb-root", str(repo), "--unsloth-bin", unsloth_bin,
+                   "--python-gi", py_gi,
+                   "--scene", str(LADDER / "amdv_scene.js"),
+                   "--driver", str(LADDER / "amdv_drive.py"),
+                   "--frame-clock", "updating",
+                   "--out", str(outp)]
+            t0 = time.time()
+            r = sh(cmd, timeout = args.rung_timeout,
+                   env = {"UNSLOTH_WORKSPACE": str(work)})
+            entry = {"rung": rung, "rep": rep, "hog_ms": hog_ms, "port": port,
+                     "seconds": round(time.time() - t0, 1),
+                     "rc": r.get("rc"), "error": r.get("error"),
+                     "stdout_tail": "\n".join((r.get("stdout") or "").splitlines()[-40:]),
+                     "stderr_tail": (r.get("stderr") or "")[-3000:]}
+            if outp.is_file():
+                try:
+                    entry["payload"] = json.loads(outp.read_text())
+                except Exception as e:  # noqa: BLE001
+                    entry["payload_error"] = f"{type(e).__name__}: {e}"
+            obs["runs"].append(entry)
+            port += 1
+            time.sleep(10)
         return 0
     finally:
         if xproc is not None and xproc.poll() is None:
