@@ -59,21 +59,30 @@ PARK = {"500K": 153387, "100K": 30119, "10K": 4102, "0K": 0}
 
 def window(name, arm, bmpf, fps, *, fired = None, took = None, sh = 0.0, ok = True, frames = 80,
            travel = 1.0, mode = "pixel", mutations = 0, park = PARK["500K"], selector = "none",
-           robust_bmpf = None, stalls = 0, worst_gap = 900):
+           robust_bmpf = None, stalls = 0, worst_gap = 900, p50 = None):
     """One measured window.
 
     `robust_bmpf` defaults to the mean, which is the healthy case: dropping the single worst frame
     changes nothing when no frame dominated. A window that caught one of this venue's 8.6 s stalls
-    is built by passing a robust figure far below the mean, which is what run 32876363634 looked
-    like on the arm that read 112.9 ms/frame at a p50 of 17 ms.
+    is built by passing a robust figure far below the mean, one frame over a second, and a worst
+    gap in the thousands, which is what run 32876363634 looked like on the arm that read 112.9
+    ms/frame at a p50 of 17 ms.
+
+    `p50` defaults to `16 + bmpf`, the same monotone stand-in the fps channel uses, so a case that
+    moves the mean moves the median with it unless it says otherwise. Cases about stalls pass the
+    two apart on purpose, since that is the whole point of the statistic.
     """
     if robust_bmpf is None and bmpf is not None:
         robust_bmpf = round(bmpf * 0.98, 1)
+    if p50 is None and bmpf is not None:
+        p50 = round(16.0 + bmpf)
     return {
         "name": name, "arm": arm, "ok": ok,
         "blocked_ms_per_frame": bmpf, "eff_fps": fps, "frames": frames,
         "busy": {"busy_pct": 90.0, "blocked_ms": (bmpf or 0) * frames},
-        "raf": {"max_ms": worst_gap, "n": frames},
+        "raf": {"max_ms": worst_gap, "n": frames, "p50_ms": p50,
+                "p95_ms": None if p50 is None else round(p50 * 1.05),
+                "over_100": stalls},
         "robust": {"blocked_ms": None if robust_bmpf is None else round(robust_bmpf * (frames - 1)),
                    "frames": frames - 1, "blocked_ms_per_frame": robust_bmpf,
                    "stall_frames_over_1s": stalls, "worst_tick_ms": worst_gap,
@@ -91,6 +100,17 @@ def window(name, arm, bmpf, fps, *, fired = None, took = None, sh = 0.0, ok = Tr
                     "travel_fraction": None if mode == "still" else travel,
                     "snapback_frames": 0, "stopped_by": "frames"},
     }
+
+
+def stall(mean, robust, *, stalls = 1, gap = 8595):
+    """Override one window: the MEAN it reported, and what it reads with that frame dropped.
+
+    p50 follows the robust figure, not the mean, because that is what a median does: in run
+    32876363634 the same arm read 10.0 and 112.9 ms/frame in two sessions at an identical p50 of
+    17 ms. Pass `stalls = 0` and a small gap to build the FALSE POSITIVE from run 32882865551
+    instead: `still_no_scroll` at r100K, 0.5 against 0.2, no frame over a second, worst gap 48 ms.
+    """
+    return {"mean": mean, "robust": robust, "stalls": stalls, "gap": gap}
 
 
 def fired_ok(sel, prop, want):
@@ -204,19 +224,19 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
                  vh_late = None, neg = 285.0, floor = 1.5, pos = 2.0, repeat = None,
                  cvd_fired = None, cvd_took = None, cva_took = None, cvd_sh = 0.0,
                  jam_clean = 61.0, jam_jammed = 17.0, idle_fps = 61.0, warm = None,
-                 base_mutations = 0, stalled = None):
+                 base_mutations = 0, stalled = None, p50s = None):
     """One repetition of a scored rung, in the scene's SEQUENCE order.
 
     fps is derived from blocked-ms-per-frame so the two channels stay consistent: the campaign's
     own arithmetic trap was reading busy%, a share of WALL time, as if it were work per event.
 
-    `stalled` is {window name: robust blocked-ms-per-frame}, which builds a window that caught one
-    of this venue's 8.6 s main-thread stalls: the mean is what it is, and the same window with its
-    single worst frame dropped is far cheaper.
+    `stalled` is {window name: stall(...)}, which overrides that window's mean, robust figure,
+    stall count and worst gap together. `p50s` is {window name: median rAF gap} for cases about
+    the median specifically.
     """
     repeat = base if repeat is None else repeat
     vh_late = vh if vh_late is None else vh_late
-    stalled = stalled or {}
+    stalled, p50s = stalled or {}, p50s or {}
     park = PARK.get(rung, 153387)
     cen = census_long()
 
@@ -224,10 +244,16 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
         return round(1000.0 / (16.0 + b), 1)
 
     def w(name, arm, b, **kw):
-        if name in stalled:
-            kw.setdefault("robust_bmpf", stalled[name])
-            kw.setdefault("stalls", 1)
-            kw.setdefault("worst_gap", 8600)
+        o = stalled.get(name)
+        if o:
+            b = o["mean"]
+            kw.setdefault("robust_bmpf", o["robust"])
+            kw.setdefault("stalls", o["stalls"])
+            kw.setdefault("worst_gap", o["gap"])
+            # A median is not moved by the frame that moved the mean.
+            kw.setdefault("p50", round(16.0 + o["robust"]))
+        if name in p50s:
+            kw["p50"] = p50s[name]
         return window(name, arm, b, f(b), park = park, **kw)
 
     # The scene's SEQUENCE, with the reference upper bound run TWICE: fourth, and again twelfth
@@ -537,26 +563,43 @@ check("the verdict still rests on the shippable arm", v == "HELPS"
 check("and the exploratory arm is reported as a bound on a renderer-side hoist, labelled",
       "EXPLORATORY, NOT SHIPPABLE AS WRITTEN" in why and "+93%" in why, why)
 
-print("case 17: a window whose mean is 6x its robust figure, which is one 8.6 s stall")
-# 112.9 ms/frame against 18.8 with the single worst frame dropped is the shape run 32876363634
-# actually produced on the upper-bound arm, at an unchanged p50 of 17 ms.
-o = obs(vh = 112.9, stalled = {"katex_root_visibility_hidden": 18.8})
+print("case 17: an 8.6 s stall inside a ~10 ms upper-bound window (run 32876363634's shape)")
+o = obs(stalled = {"katex_root_visibility_hidden": stall(112.9, 18.8, gap = 8400)})
 ok, ev = gate(o, "dominated by a single frame")
 check("the stall gate fails", ok is False, ev)
 check("and it names the rung, the window and both numbers",
       "500K:" in ev and "katex_root_visibility_hidden" in ev and "112.9" in ev and "18.8" in ev,
       ev)
 check("and it prints the ratio, the stall count and the worst gap",
-      "6.0x" in ev and "1 frame over 1 s" in ev and "8600 ms" in ev, ev)
+      "6.0x" in ev and "1 frame over 1 s" in ev and "8400 ms" in ev, ev)
 v, why = C.verdict(o)
 check("the verdict is INCONCLUSIVE, not a reading of the stalled window",
       v == "INCONCLUSIVE" and "dominated by a single frame" in why, f"{v}: {why}")
 
-print("case 17b: a BASELINE caught the stall, which is worse and is exempt from nothing")
-o = obs(stalled = {"baseline_3": 40.0})
+print("case 17b: a BASELINE caught one, which contaminates the arms on both sides of it")
+# At a CHEAP rung, where one 8.6 s frame is worth more than everything else in the window.
+CHEAP_100K = {"base": 12.0, "repeat": 12.0, "neg": 11.8, "cvd": 7.0, "cva": 7.0, "cvm": 3.0,
+              "vh": 1.5, "floor": 0.5, "pos": 0.4}
+o = obs(rungs = ("0K", "100K", "500K"),
+        per_rung = {"100K": dict(CHEAP_100K, stalled = {"baseline_3": stall(110.0, 12.0)})})
 ok, ev = gate(o, "dominated by a single frame")
 check("the stall gate fails on a baseline too", ok is False, ev)
-check("and it names the baseline window", "baseline_3" in ev, ev)
+check("and it names the rung and the baseline window", "100K:" in ev and "baseline_3" in ev, ev)
+check("and the clean rung is not blamed for it",
+      ev.split("500K:")[-1].find("FAILS AT THIS RUNG") < 0, ev)
+check("the table marks the baseline row disqualified",
+      "`baseline_3` (baseline)  **[DISQUALIFIED: caught a stall]**" in C.table(o), C.table(o))
+
+print("case 17b2: the same stall on a 500K baseline does NOT fire, and that is correct")
+# A 287.6 ms/frame baseline that catches one 8.6 s frame reads ~378: a 1.3x ratio, because the
+# window's real cost already dwarfs the stall. The gate fires where the stall DOMINATES, which is
+# the claim it makes; a window whose reading moves by a third is a different problem from one
+# whose reading is a single frame, and the drift and repeat gates are what cover that.
+o = obs(stalled = {"baseline_3": stall(287.6 + 90.0, 287.6)})
+ok, ev = gate(o, "dominated by a single frame")
+check("a 1.3x inflation of an already-expensive window does not fire", ok is True, ev)
+check("and the module says so rather than silently rounding it away",
+      "survives dropping its worst frame" in ev, ev)
 
 print("case 17c: a clean run, where the mean survives dropping its worst frame")
 o = obs()
@@ -565,6 +608,103 @@ check("the stall gate passes", ok is True, ev)
 check("and it says so rather than staying silent",
       "survives dropping its worst frame" in ev, ev)
 check("the 0K rung is excused, having no windows", "0K: no scrollable range" in ev, ev)
+
+print("case 17d: the FALSE POSITIVE from run 32882865551 -- 0.5 vs 0.2 ms, no frame over 1 s")
+o = obs(stalled = {"still_no_scroll": stall(0.5, 0.2, stalls = 0, gap = 48)})
+ok, ev = gate(o, "dominated by a single frame")
+check("a 2.5x ratio between two near-zero numbers does NOT fire", ok is True, ev)
+bad = [n for n, ok_, ev_ in C.gates(o) if not ok_]
+check("and the run is not voided by it", not bad, str(bad))
+check("the window is not disqualified either",
+      not C._disqualified("still_no_scroll", C._scored(o, "500K")["still_no_scroll"]),
+      str(C._disqualified("still_no_scroll", C._scored(o, "500K")["still_no_scroll"])))
+check("both discriminators are what saved it: no frame over 1 s, and a mean under the floor",
+      C._stall_dominated({"blocked_ms_per_frame": 0.5,
+                          "robust": {"blocked_ms_per_frame": 0.2,
+                                     "stall_frames_over_1s": 0, "worst_gap_ms": 48}}) is None
+      and C._stall_dominated({"blocked_ms_per_frame": 0.5,
+                              "robust": {"blocked_ms_per_frame": 0.2,
+                                         "stall_frames_over_1s": 1, "worst_gap_ms": 48}}) is None)
+
+print("case 17e: a stalled CONTROL disqualifies the control and does NOT void the run")
+# 500K `still_no_scroll` in run 32882865551: mean 102.3, robust 10.3, one 8,595 ms frame.
+o = obs(stalled = {"still_no_scroll": stall(102.3, 10.3, gap = 8595)})
+ok, ev = gate(o, "dominated by a single frame")
+check("the stall gate PASSES, because a control carries no conclusion", ok is True, ev)
+check("and it still says the control caught one and was disqualified",
+      "no conclusion-carrying window caught a stall" in ev and "still_no_scroll" in ev
+      and "CONTROL, disqualified but not fatal" in ev, ev)
+dq = C._disqualified("still_no_scroll", C._scored(o, "500K")["still_no_scroll"])
+check("the control window is disqualified", bool(dq) and "caught one of this host" in dq, str(dq))
+check("and the disqualification says its gate is re-read on the robust figure",
+      "re-evaluated on the robust figure" in (dq or ""), str(dq))
+ok, ev = gate(o, "exhibits the collapse")
+check("the collapse gate passes on the robust floor", ok is True, ev)
+check("and says so explicitly, and why", "read on its ROBUST figure" in ev
+      and "voiding the whole run" in ev, ev)
+ok, ev = gate(o, "POSITIVE control recovers")
+check("the positive control's gate also passes", ok is True, ev)
+bad = [n for n, ok_, ev_ in C.gates(o) if not ok_]
+check("no gate fails, so a 26 minute GPU run is not thrown away", not bad, str(bad))
+v, why = C.verdict(o)
+check("and the run still produces an answer", v == "HELPS", f"{v}: {why}")
+
+print("case 17f: a stalled CANDIDATE arm DOES void the run")
+o = obs(stalled = {"content_visibility_katex_display": stall(112.9, 18.8)})
+ok, ev = gate(o, "dominated by a single frame")
+check("the stall gate fails", ok is False, ev)
+check("and it names the candidate", "content_visibility_katex_display" in ev, ev)
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE", v == "INCONCLUSIVE", f"{v}: {why}")
+
+print("case 17g: the reference upper bound's LATE window caught one -- also fatal")
+o = obs(stalled = {"katex_root_visibility_hidden_late": stall(112.9, 18.8)})
+ok, ev = gate(o, "dominated by a single frame")
+check("the late upper-bound window carries a conclusion too", ok is False, ev)
+check("and it is named", "katex_root_visibility_hidden_late" in ev, ev)
+
+print("case 21: the positive control goes BELOW the floor, which is expected arithmetic")
+# run 32882865551: detach_messages 1.9 ms against baseline 240.7 and floor 102.2 read 173%.
+o = obs(base = 240.7, floor = 10.3, pos = 1.9, repeat = 240.7)
+ok, ev = gate(o, "POSITIVE control recovers")
+check("the gate passes", ok is True, ev)
+check("the reported recovery is capped at 100%", "= 100%" in ev, ev)
+check("and the raw ratio is printed beside it", "capped from a raw 104%" in ev, ev)
+check("and it says why going below the floor is expected rather than an instrument fault",
+      "expected rather than an instrument fault" in ev
+      and "updateLayoutIgnorePendingStylesheets" in ev and "scales with DOM size" in ev, ev)
+bad = [n for n, ok_, ev_ in C.gates(o) if not ok_]
+check("nothing else fails because of it", not bad, str(bad))
+
+print("case 22: the `.katex` comparison is decided on p50, not on the mean")
+# run 32882865551 at r500K: baselines 246-250 ms, display 216-217, all 217-218.
+same = {"baseline": 248, "baseline_2": 248, "baseline_3": 248, "baseline_4": 248,
+        "baseline_5": 248, "baseline_6": 248, "baseline_repeat": 248,
+        "content_visibility_katex_display": 216, "content_visibility_katex_all": 217}
+o = obs(p50s = same)
+ok, ev = gate(o, "adding `.katex` to the selector buys nothing")
+check("216 against 217 buys nothing", ok is True, ev)
+check("and the evidence says it was decided ON p50, with both medians",
+      "ON p50" in ev and "216 ms median rAF gap against 248" in ev and "217 ms against 248" in ev,
+      ev)
+check("and it prints the mean beside it, as the metric a stall can move",
+      "On the MEAN, which one stalled frame can move" in ev, ev)
+o = obs(p50s = dict(same, content_visibility_katex_all = 150))
+ok, ev = gate(o, "adding `.katex` to the selector buys nothing")
+check("216 against 150 does not", ok is False, ev)
+check("and it says the spec reading is wrong on the metric a stall cannot corrupt",
+      "metric a stall cannot corrupt" in ev and "leaving something on the table" in ev, ev)
+
+print("case 22b: p50 is reported per arm against its own neighbouring baselines")
+o = obs(p50s = same)
+tbl = C.table(o)
+check("the report carries the p50 section",
+      "p50, the one statistic a stall cannot move" in tbl, tbl)
+check("with each arm's median against its neighbours'",
+      "| 216 ms | 248 ms |" in tbl and "| 217 ms | 248 ms |" in tbl, tbl)
+check("the per-rung table has a p50 column", "| p50 rAF gap | stalls > 1 s |" in tbl, tbl)
+check("and the headline table shows p50 as the deciding column and the mean beside it",
+      "cost removed on p50 (decides)" in tbl and "cost removed on the MEAN" in tbl, tbl)
 
 print("case 18: the early and late readings of the reference upper bound disagree by 10x")
 o = obs(vh = 10.0, vh_late = 100.0)
@@ -608,11 +748,11 @@ check("and it says the mean is primary and the robust figure sits alongside it",
 check("the shipped rule's own declaration is quoted",
       "`.katex-display{content-visibility:auto;cont...`" in tbl, tbl)
 check("the upper bound's declaration is quoted in full", "`.katex{visibility:hidden}`" in tbl, tbl)
-check("the robust column and the stall count are rendered, per rep rather than averaged",
-      "| **172.0** | 168.6, 168.6 | 0, 0 |" in tbl, tbl)
+check("the robust, p50 and stall columns are rendered, per rep rather than averaged",
+      "| **172.0** | 168.6, 168.6 | 188, 188 | 0, 0 |" in tbl, tbl)
 check("the per-rep table carries them too, since a stall lands in ONE repetition",
-      "| window | selector | blocked ms/frame per rep | robust per rep | stalls > 1 s per rep |"
-      in tbl, tbl)
+      "| window | selector | blocked ms/frame per rep | robust per rep | p50 per rep | "
+      "stalls > 1 s per rep |" in tbl, tbl)
 v, why = C.verdict(o)
 check("and the verdict quotes the selector beside the arm name",
       "`content_visibility_katex_display` (`.katex-display{content-visibility:auto;cont...`)"
