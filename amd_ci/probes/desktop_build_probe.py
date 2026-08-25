@@ -71,6 +71,63 @@ RENDERER_VARS = [
 ]
 
 
+LADDER = HERE / "desktop_ladder"
+SCENE = HERE / "studio_ladder" / "amdv_scene.js"
+
+# The control server's port has to be a compile-time constant, because the page is served from
+# the binary at `tauri://localhost` under a CSP of `default-src 'self'` with no `unsafe-eval`:
+# there is no way to tell an already-built bundle where to call. So the number is fixed here,
+# the measuring job refuses to run if it is occupied, and both facts are recorded.
+AMDV_CONTROL_PORT = 5473
+
+
+def instrument_frontend(repo: Path) -> dict:
+    """Add two classic <script> tags and two files to the frontend, and nothing else.
+
+    Placed in `studio/frontend/public/` and referenced from `studio/frontend/index.html`
+    alongside the existing `crypto-boot.js` / `theme-boot.js`, which is the mechanism the app
+    already uses and proves survives a vite build: `public/` is copied verbatim and a
+    root-absolute classic script src is left alone, because it is a public-dir URL and not a
+    module-graph entry. A classic script also runs DURING PARSE, i.e. before the deferred
+    module entry, which reproduces the document-start user-script semantics the web UI ladder
+    got from WebKitGTK's UserScriptInjectionTime.START.
+
+    Two things this is careful NOT to do. It does not edit `dist/index.html` after the fact:
+    that works, but it makes `tauri build` unusable, because `beforeBuildCommand` re-runs vite
+    with `emptyOutDir` and silently discards the edit. And it does not touch a single line of
+    application code: the scene is the SAME FILE the web UI ladder used, byte for byte, which
+    is what makes the two sets of numbers comparable at all.
+    """
+    fe = repo / "studio" / "frontend"
+    pub = fe / "public"
+    idx = fe / "index.html"
+    out: dict = {"index_html": str(idx)}
+    if not idx.is_file() or not pub.is_dir():
+        out["error"] = "frontend index.html or public/ missing"
+        return out
+
+    scene = SCENE.read_text()
+    boot = (LADDER / "amdv_desktop_boot.js").read_text().replace(
+        "__AMDV_CONTROL_URL__", f"http://127.0.0.1:{AMDV_CONTROL_PORT}")
+    (pub / "av-scene.js").write_text(scene)
+    (pub / "av-boot.js").write_text(boot)
+    out["scene_bytes"] = len(scene)
+    out["boot_bytes"] = len(boot)
+    out["scene_sha_source"] = str(SCENE)
+
+    html = idx.read_text()
+    tag = '<script src="/av-scene.js"></script>\n    <script src="/av-boot.js"></script>\n    '
+    anchor = '<script src="/theme-boot.js"></script>'
+    if anchor in html:
+        html = html.replace(anchor, anchor + "\n    " + tag.strip(), 1)
+    else:
+        html = html.replace("</head>", "    " + tag.strip() + "\n</head>", 1)
+    idx.write_text(html)
+    out["injected"] = ("av-scene.js" in idx.read_text())
+    out["anchor_found"] = anchor in html
+    return out
+
+
 def renderer_decision_inputs() -> dict:
     """Every input linux_webkit.rs::rendering_plan reads, sampled from this host.
 
@@ -254,6 +311,42 @@ def main() -> int:
         obs["binary"]["ldd"] = sh(["ldd", str(binary)], timeout = 180,
                                   env = build_env).get("stdout", "")[-4000:]
 
+        # ── 4b. the INSTRUMENTED binary, built second and kept separate ──
+        #
+        # Two binaries on purpose. The pristine one answers "does Unsloth Desktop function on
+        # this runner", and that claim has to be about an unmodified app or it is not the
+        # claim anyone cares about. The instrumented one carries the ladder, because the
+        # scene has to be inside the bundle: `tauri://localhost` runs under
+        # `default-src 'self'` with no `unsafe-eval`, so there is no way to inject anything
+        # into an already-built binary. Saying which binary produced which number is the whole
+        # reason they are not the same build.
+        pristine = None
+        if args.stage_dir:
+            pristine = Path(args.stage_dir) / (binary.name + "-pristine")
+            pristine.parent.mkdir(parents = True, exist_ok = True)
+            shutil.copy2(binary, pristine)
+        obs["instrument"] = instrument_frontend(repo)
+        if obs["instrument"].get("injected"):
+            t0 = time.time()
+            obs["npm_build_instrumented"] = sh(["npm", "run", "build"], cwd = str(fe),
+                                               timeout = 3600)
+            obs["npm_build_instrumented"]["seconds"] = round(time.time() - t0, 1)
+            obs["npm_build_instrumented"]["stdout"] = \
+                (obs["npm_build_instrumented"].get("stdout") or "")[-2000:]
+            di = dist / "index.html"
+            obs["instrument"]["survived_vite"] = (
+                di.is_file() and "av-boot.js" in di.read_text()
+                and (dist / "av-boot.js").is_file() and (dist / "av-scene.js").is_file())
+            t0 = time.time()
+            obs["cargo_build_instrumented"] = sh(cmd, cwd = str(st), timeout = 7200,
+                                                 env = build_env)
+            obs["cargo_build_instrumented"]["seconds"] = round(time.time() - t0, 1)
+            obs["cargo_build_instrumented"]["stderr"] = \
+                (obs["cargo_build_instrumented"].get("stderr") or "")[-4000:]
+            if args.stage_dir and binary.is_file():
+                shutil.copy2(binary, Path(args.stage_dir) / (binary.name + "-instrumented"))
+        obs["binary"]["pristine_staged"] = str(pristine) if pristine else None
+
         # ── 5. a display, then LAUNCH ──
         obs["inventory"] = inventory()
         if not obs["inventory"].get("Xvfb"):
@@ -270,6 +363,13 @@ def main() -> int:
         shutil.rmtree(home, ignore_errors = True)
         for sub in (".unsloth/studio", ".config", "xdg", ".local/share"):
             (home / sub).mkdir(parents = True, exist_ok = True)
+
+        # The PRISTINE binary, not the instrumented one. "Does Unsloth Desktop function here"
+        # has to be a claim about an unmodified app; the instrumented build exists only to
+        # carry the ladder and is launched by the measuring job, which says so.
+        launch_binary = pristine if (pristine and pristine.is_file()) else binary
+        obs["launch_binary"] = {"path": str(launch_binary),
+                                "pristine": bool(pristine and pristine.is_file())}
 
         logp = work / "launch_stderr.log"
         env = dict(os.environ)
@@ -305,10 +405,10 @@ def main() -> int:
         obs["screenshot_empty"] = screenshot(work, xinfo["display"], "empty_before_launch")
 
         with open(logp, "wb") as fh:
-            proc = subprocess.Popen([str(binary)], env = env, cwd = str(work),
+            proc = subprocess.Popen([str(launch_binary)], env = env, cwd = str(work),
                                     stdin = subprocess.DEVNULL, stdout = fh,
                                     stderr = subprocess.STDOUT, start_new_session = True)
-        obs["launch"] = {"pid": proc.pid, "binary": str(binary), "log": str(logp)}
+        obs["launch"] = {"pid": proc.pid, "binary": str(launch_binary), "log": str(logp)}
 
         samples = []
         deadline = time.time() + args.launch_seconds
@@ -351,10 +451,15 @@ def main() -> int:
         if args.stage_dir:
             stage = Path(args.stage_dir)
             stage.mkdir(parents = True, exist_ok = True)
-            shutil.copy2(binary, stage / binary.name)
+            # Both binaries were staged as they were produced; only the manifest is written
+            # here, and it names WHICH is which so the measuring job cannot mix them up.
             (stage / "MANIFEST.json").write_text(json.dumps({
                 "commit": obs.get("commit"), "profile": args.profile,
-                "binary": binary.name, "bytes": obs["binary"]["bytes"],
+                "pristine": binary.name + "-pristine",
+                "instrumented": binary.name + "-instrumented",
+                "control_port": AMDV_CONTROL_PORT,
+                "instrument": obs.get("instrument"),
+                "bytes": obs["binary"]["bytes"],
                 "built_at": time.time(),
                 "devroot_note": "built against the rootlessly fetched -dev closure; the "
                                 "RUNTIME libraries come from the host and are the same "

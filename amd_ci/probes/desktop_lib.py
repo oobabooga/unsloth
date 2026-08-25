@@ -33,6 +33,7 @@ fetched tree FOLLOWED BY the system directories, with PKG_CONFIG_LIBDIR left alo
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -48,6 +49,14 @@ DEV_ROOTS = [
     "librsvg2-dev",
     "libxdo-dev",
     "libssl-dev",
+    # Added after a real run: `libdbus-sys` panics its build script when dbus-1.pc is absent,
+    # which is not obvious from the Tauri dependency table because nothing in tauri.conf.json
+    # or Cargo.toml names dbus. It arrives through the notification / opener plugins.
+    "libdbus-1-dev",
+    # Insurance of the same kind. These are preinstalled on GitHub's ubuntu-22.04 image, which
+    # is why the repo's own studio-tauri-smoke.yml does not name them, and are absent here.
+    "libudev-dev",
+    "zlib1g-dev",
 ]
 
 # Where a Debian package puts .pc files. Both are searched under the fetched root.
@@ -68,24 +77,42 @@ def sh(cmd, timeout=600, env=None, cwd=None):
         return {"error": f"{type(ex).__name__}: {ex}"}
 
 
+_PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+
+
 def _closure(roots: list[str]) -> tuple[list[str], dict]:
     """Every package `apt-cache depends --recurse` reaches from the roots.
 
     Recommends and Suggests are excluded: they pull in half the archive and none of them
     carries a header. Virtual packages (names in <angle brackets>) are dropped, because
     `apt-get download` cannot fetch them.
+
+    Two things here were learned from a run that looked like it worked. The first version
+    filtered lines by prefix and let a name through that `apt-get download` then rejected as
+    `ibdeflate0`, one character short: a permissive filter turns any stray byte into a package
+    name and the only symptom is a download failure buried in a list of 224 successes. So
+    names are now matched against the Debian package-name grammar and anything else is
+    reported rather than attempted.
+
+    The second is worse and is the reason that run produced no headers at all: the ROOTS
+    themselves are only in the output if the parse worked, so a parse that silently drops them
+    yields a large closure of runtime libraries with not one -dev package in it, and
+    `pkg-config` then reports the same "not found" a host with nothing installed would. The
+    roots are therefore unioned in unconditionally and never depend on parsing.
     """
     cmd = ["apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
            "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances", *roots]
     r = sh(cmd, timeout = 900)
-    names: list[str] = []
+    names: list[str] = list(roots)
+    rejected: list[str] = []
     for ln in (r.get("stdout") or "").splitlines():
-        if ln.startswith(" ") or ln.startswith("|") or not ln.strip():
+        if not ln or ln[0].isspace() or ln.startswith("|"):
             continue
         name = ln.strip()
-        if name.startswith("<") or ":" in name.split()[0] and not name.startswith("lib"):
-            continue
         if name.startswith("<") or name.endswith(">"):
+            continue  # virtual; apt-get download cannot fetch it
+        if not _PKG_RE.match(name):
+            rejected.append(name[:60])
             continue
         names.append(name)
     seen, out = set(), []
@@ -93,7 +120,9 @@ def _closure(roots: list[str]) -> tuple[list[str], dict]:
         if n not in seen:
             seen.add(n)
             out.append(n)
-    return out, {"rc": r.get("rc"), "count": len(out), "stderr": (r.get("stderr") or "")[-500:]}
+    return out, {"rc": r.get("rc"), "count": len(out), "roots": roots,
+                 "rejected_lines": rejected[:20],
+                 "stderr": (r.get("stderr") or "")[-500:]}
 
 
 def fetch_devroot(work: Path, roots: list[str] | None = None) -> dict:
@@ -137,6 +166,24 @@ def fetch_devroot(work: Path, roots: list[str] | None = None) -> dict:
             extract_failed.append(f.name)
     out["extracted"] = extracted
     out["extract_failed"] = extract_failed[:20]
+
+    # Did the ROOTS actually land? A closure of 224 runtime libraries with no -dev package in
+    # it extracts cleanly and resolves nothing, and that is exactly what happened once. Each
+    # root is re-fetched individually if its .deb is not on disk, and the outcome is recorded
+    # per root rather than as an aggregate.
+    out["roots"] = {}
+    for p in roots:
+        have = sorted(debs.glob(p + "_*.deb"))
+        if not have:
+            r = sh(["apt-get", "download", p], timeout = 600, cwd = str(debs))
+            have = sorted(debs.glob(p + "_*.deb"))
+            for f in have:
+                sh(["dpkg-deb", "-x", str(f), str(root)], timeout = 300)
+            out["roots"][p] = {"retried": True, "rc": r.get("rc"),
+                               "deb": [f.name for f in have],
+                               "err": (r.get("stderr") or "")[-200:]}
+        else:
+            out["roots"][p] = {"retried": False, "deb": [f.name for f in have]}
 
     pcdirs = [str(root / s) for s in PC_SUBDIRS if (root / s).is_dir()]
     out["pkgconfig_dirs"] = pcdirs
