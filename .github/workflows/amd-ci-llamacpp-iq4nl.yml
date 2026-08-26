@@ -1,0 +1,166 @@
+name: "AMD CI: llama.cpp IQ4_NL kernel check on gfx1151"
+
+# Adapted from amd_ci/templates/workflow.yml. The plumbing that is kept verbatim
+# is the part that has already cost runs: the preamble, the runs-on selector, the
+# GPU concurrency group, announce.py closing every Differential, and the artifact
+# upload. What is replaced is state resolution: there is no PR here, so
+# lib/states.py does not apply and states.json is written directly, with model
+# directories as the states.
+#
+# The question: across the field reports of Qwen3.8-27B, IQ4_NL is present in
+# exactly the GGUFs that crash and absent from exactly the ones that work. This
+# builds the smallest pair of models that differ only in that one quant type and
+# runs both on each AMD backend this host has.
+#
+# This is the CHEAP branch. It downloads a few hundred MB, not 60 GB, and it
+# holds the shared GPU for minutes rather than hours.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-iq4nl]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b10631"
+  LEMONADE_TAG: "b1316"
+  TINY_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  TINY_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+
+jobs:
+
+  gpu:
+    name: "llama.cpp IQ4_NL kernel check (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-iq4nl"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          # gate.py reads gpu_archs from torch.cuda.get_device_properties(), and
+          # this job deliberately has no torch, so --expect-arch gfx1151 would
+          # always fail here and --require rocm gpu with it. The arch assertion
+          # moves into the probe, where a criteria gate turns a miss into
+          # INCONCLUSIVE instead of a silent wrong-hardware pass. This still
+          # FAILS rather than skipping.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          # Recorded, not judged.
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          grep -o 'gfx[0-9a-z]*' "$AMD_CI_WORK/out/rocminfo.txt" | sort -u || true
+
+      - name: Fetch llama.cpp binaries
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          L="https://github.com/lemonade-sdk/llamacpp-rocm/releases/download/$LEMONADE_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          # The vendor build for this exact arch. Not required: if it moves or
+          # 404s, the two upstream backends still answer the question.
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$L/llama-$LEMONADE_TAG-ubuntu-rocm-gfx1151-x64.zip" \
+            --dest "$AMD_CI_WORK/lcpp/lemonade" --out "$AMD_CI_WORK/out/bin_lemonade.json" \
+            || echo "note: lemonade build unavailable, continuing with upstream only"
+          # python, not jq: jq is not guaranteed on this runner, and a missing
+          # jq under `set -e` would fail the step with a message about jq rather
+          # than about the fetch.
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Kernel characterisation
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          set +e
+          # test-backend-ops checks each op against a CPU reference, per quant
+          # type, with no model at all. It is not shipped in every prebuilt, so a
+          # miss is recorded rather than fatal. This step has NO base and NO head,
+          # so it gets no verdict: it is a fact about the host, not a comparison.
+          for BK in "Vulkan0:$VULKAN_BIN" "ROCm0:$ROCM_BIN"; do
+            DEV="${BK%%:*}"
+            DIR="${BK#*:}"
+            python3 amd_ci/probes/llamacpp_ops_probe.py \
+              --state "$DEV" --out "$AMD_CI_WORK/out/ops_$DEV.json" \
+              --bin-dir "$DIR" --backend "$DEV"
+            rc=$?
+            echo "ops probe $DEV rc=$rc"
+          done
+          python3 amd_ci/lib/report_ops.py "$AMD_CI_WORK/out" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the IQ4_NL / IQ4_XS pair
+        timeout-minutes: 40
+        run: |
+          set -eu
+          python3 -m pip install --quiet --user huggingface_hub || true
+          # local_dir keeps the download inside $RUNNER_TEMP, which is the only
+          # tree the runner reclaims between jobs; the default cache would leave
+          # it in $HOME on a persistent, shared host.
+          python3 amd_ci/lib/fetch_gguf.py --repo "$TINY_REPO" --file "$TINY_FILE" \
+            --local-dir "$AMD_CI_WORK/tiny" --out "$AMD_CI_WORK/out/tiny.json"
+          python3 amd_ci/lib/build_iq_repro.py \
+            --bin-dir "$VULKAN_BIN" \
+            --source "$AMD_CI_WORK/tiny/$TINY_FILE" \
+            --root "$AMD_CI_WORK/repro" \
+            --out "$AMD_CI_WORK/out/states_iq.json" \
+            --report "$AMD_CI_WORK/out/repro_build.json"
+
+      - name: Differential - Vulkan, iq4_xs vs iq4_nl
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_iq.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/iq_vulkan" \
+            --title "IQ4_NL vs IQ4_XS ffn_down, Vulkan, $LLAMA_TAG" \
+            -- --bin-dir "$VULKAN_BIN" --gguf repro.gguf --ctx-size 4096 \
+               --load-timeout 600 --request-timeout 600
+          cat "$AMD_CI_WORK/out/iq_vulkan/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/iq_vulkan"
+
+      - name: Differential - ROCm, iq4_xs vs iq4_nl
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_iq.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/iq_rocm" \
+            --title "IQ4_NL vs IQ4_XS ffn_down, ROCm, $LLAMA_TAG" \
+            -- --bin-dir "$ROCM_BIN" --gguf repro.gguf --ctx-size 4096 \
+               --load-timeout 600 --request-timeout 600
+          cat "$AMD_CI_WORK/out/iq_rocm/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/iq_rocm"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-iq4nl-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
