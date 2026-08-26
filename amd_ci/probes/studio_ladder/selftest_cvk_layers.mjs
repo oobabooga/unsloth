@@ -221,6 +221,18 @@ function buildWorld(opts) {
   const dropped = new Set(opts.dropRules || []);
   const root = new El("body");
   world.root = root;
+  // THE SHIP DEFAULT, MODELLED. On the head of PR 9731 `SHIP_DEFAULT` is `"contain"`, so
+  // `applyMathBlockContainment()` sets this attribute before the first render and the page the
+  // scene is injected into is ALREADY the fixed state. Every baseline would then be the fix, and
+  // the harness's one rule makes that a VOID and not a pass, so the scene has to clear it and the
+  // stub has to be able to hand it a page that needs clearing.
+  if (opts.bootContained) root.setAttribute(PRODUCT_ATTR, "on");
+  // ...and the other answer. A document element whose `removeAttribute` does nothing for this key
+  // stands in for any build where the clear does not take. Without this the readback assertions in
+  // scenario 7d would pass on a scene that never cleared anything.
+  if (opts.attributeStuck) {
+    root.removeAttribute = (k) => { if (k !== PRODUCT_ATTR) delete root.attrs[k]; };
+  }
   const scroller = new El("div", "aui-thread-viewport");
   // Scenario 5 shortens this to under the 200 px the scene requires. Everything else about the
   // page is left alone, so the check isolates the range gate instead of also emptying the DOM.
@@ -449,6 +461,28 @@ async function runScene(opts) {
     return true;
   };
   sandbox.window = sandbox;
+  // `installOverrideWatcher` from the product, modelled: assigning the global REAPPLIES, which is
+  // the whole reason that accessor exists (a devtools flip that changed nothing left the session
+  // measuring the arm it was already in). `overrideWatcher: false` is a build that predates it, and
+  // that is the case the scene's direct `removeAttribute` has to cover on its own.
+  world.overrideWrites = [];
+  if (opts.overrideWatcher !== false) {
+    let held;
+    Object.defineProperty(sandbox, "__UNSLOTH_MATH_BLOCK_CONTAINMENT__", {
+      configurable: true,
+      enumerable: true,
+      get: () => held,
+      set: (next) => {
+        held = next;
+        world.overrideWrites.push(next);
+        if (next === true || next === "1" || next === "contain") {
+          world.root.setAttribute(PRODUCT_ATTR, "on");
+        } else {
+          world.root.removeAttribute(PRODUCT_ATTR);
+        }
+      },
+    });
+  }
   // Stand in for `upgradeEverythingForPrint`: every remaining fence latches at once, adding
   // spans INSIDE the `pre` that already existed, which is why `pre` never moves.
   if (!opts.latchBroken) {
@@ -895,6 +929,78 @@ console.log("scenario 7c: the product rule inside a grouping rule is still found
         P.sheets_unreadable === 0, JSON.stringify([P.sheets_readable, P.sheets_unreadable]));
   check("the arm fired", arm && arm.fired && arm.fired.fired === true,
         JSON.stringify(arm && arm.fired));
+  }
+}
+
+console.log("scenario 7d: THE PAGE BOOTS FIXED -- the ship default is now `contain`");
+{
+  // The case this whole revision exists for. `SHIP_DEFAULT` on the head of PR 9731 is `"contain"`,
+  // so the page arrives with the attribute already set and every baseline would be the FIXED
+  // state. A session run unchanged would report every arm flat and be read as "the fix does
+  // nothing", which is the harness's one rule (base does not exhibit the defect => VOID) arriving
+  // silently. The scene has to clear it before anything is measured, and say so in the payload.
+  const { payload, world } = await runScene({ bootContained: true, crossOriginSheets: 0,
+                                              only: ["baseline", "product_math_block_containment"] });
+  const B = payload && payload.math_containment_boot;
+  check("the scene completed and posted its boot readback",
+        Boolean(payload && payload.ok === true && B),
+        JSON.stringify((payload && (payload.error_detail || payload.error))
+                       || Object.keys(payload || {})));
+  if (!B) {
+    check("scenario 7d cannot continue without a posted boot readback", false,
+          "the scene did not reach the end of its run");
+  } else {
+  check("it SAW the page boot in the fixed state, rather than assuming a flag it could not read",
+        B.attribute_at_boot === "on" && B.ship_default_was_on === true, JSON.stringify(B));
+  check("it drove the product's OWN runtime override, and the override took",
+        B.override_assigned === true && world.overrideWrites.length === 1
+        && world.overrideWrites[0] === false, JSON.stringify(world.overrideWrites));
+  check("the attribute is gone immediately after, read back off the document element",
+        B.attribute_after === null, JSON.stringify(B));
+  check("and gone again once the thread has really mounted, with real blocks to sample",
+        B.post_mount && B.post_mount.attribute === null && B.post_mount.blocks > 0
+        && B.post_mount.any_auto === false
+        && B.post_mount.cv.every((v) => v === "visible"), JSON.stringify(B.post_mount));
+  const base = (payload.arms || []).filter((a) => a.arm === "baseline");
+  check("so the BASELINE windows are the flag-off arm, which is the premise of the whole run",
+        base.length > 0, JSON.stringify((payload.arms || []).map((a) => a.arm)));
+  const arm = (payload.arms || []).find((a) => a.arm === "product_math_block_containment");
+  check("and the product arm still turns it back on and fires",
+        Boolean(arm && arm.fired && arm.fired.fired === true), JSON.stringify(arm && arm.fired));
+  check("the toggle check saw `visible` off and `auto` on, not `auto` on both sides",
+        payload.product_rule.toggle_check.off_values.every((v) => v === "visible")
+        && payload.product_rule.toggle_check.moved
+           === payload.product_rule.toggle_check.sampled,
+        JSON.stringify(payload.product_rule.toggle_check));
+  check("and the attribute is off again at the end, so nothing leaks into a later window",
+        !(PRODUCT_ATTR in world.root.attrs), JSON.stringify(world.root.attrs));
+  }
+}
+
+console.log("scenario 7e: THE CLEAR DOES NOT TAKE -- the readback must say so, not stay quiet");
+{
+  // Anti-vacuity for 7d. Every assertion above would pass on a scene that cleared nothing if the
+  // stub could not boot contained; this is the other direction, where the clear is defeated. The
+  // readback has to REPORT the fixed state rather than reporting what it asked for. The criteria
+  // module's `flag_off_premise` gate is what turns this into a VOID; here the only claim is that
+  // the scene's own record can carry the bad news.
+  const { payload } = await runScene({ bootContained: true, attributeStuck: true,
+                                       overrideWatcher: false, crossOriginSheets: 0,
+                                       only: ["baseline", "product_math_block_containment"] });
+  const B = payload && payload.math_containment_boot;
+  check("the scene still completed and still posted a boot readback",
+        Boolean(payload && payload.ok === true && B),
+        JSON.stringify((payload && (payload.error_detail || payload.error))
+                       || Object.keys(payload || {})));
+  if (!B) {
+    check("scenario 7e cannot continue without a posted boot readback", false,
+          "the scene did not reach the end of its run");
+  } else {
+  check("the attribute is REPORTED as still set, which is the answer 7d could not produce",
+        B.attribute_at_boot === "on" && B.attribute_after === "on", JSON.stringify(B));
+  check("and the post-mount sample reports real blocks computing to `auto`",
+        B.post_mount && B.post_mount.attribute === "on" && B.post_mount.blocks > 0
+        && B.post_mount.any_auto === true, JSON.stringify(B.post_mount));
   }
 }
 

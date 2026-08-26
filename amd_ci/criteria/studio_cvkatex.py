@@ -1099,6 +1099,49 @@ def _gate_records(obs: dict) -> list[dict]:
     g("every window parked at the same fixed pixel within its rung",
       *_per_rung(obs, _park, scored_only = True))
 
+    # ── THE PREMISE EVERY BASELINE RESTS ON, AND IT IS NOT AN ASSUMPTION ────────────────────
+    #
+    # `SHIP_DEFAULT` on the head of PR 9731 is `"contain"`, so the page BOOTS with
+    # `data-math-block-containment="on"`. Run unchanged, every baseline window in this session
+    # would be the FIXED state, `product_math_block_containment` would toggle an attribute that was
+    # already set, and the run would come back with every arm flat. That reads as "the fix does
+    # nothing" and it is exactly the shape the harness's one rule exists for: a base state that does
+    # not exhibit the defect is a VOID, not a pass.
+    #
+    # The scene therefore clears the flag through the product's own runtime override before
+    # anything is measured, and READS ITS OWN SWITCH BACK OUT: the attribute as found at boot, the
+    # attribute immediately after, and once the thread has really mounted the attribute again plus
+    # the computed `content-visibility` of real `.aui-math-block` elements. This gate is that
+    # record. A downstream side effect is not a substitute for it, because the failure mode here is
+    # a whole session that is quietly the wrong experiment.
+    #
+    # A rung with no maths (0K) has no block to sample, so `blocks == 0` with the attribute absent
+    # is the CORRECT answer there and not a miss.
+    def _flag_off(rung, rs):
+        bits, oks = [], []
+        for r in rs:
+            b = (r.get("payload") or {}).get("math_containment_boot")
+            if not isinstance(b, dict) or not b:
+                oks.append(False)
+                bits.append(f"rep {r.get('rep')}: NO BOOT READBACK WAS RECORDED, so nothing "
+                            f"establishes which arm the baselines were in")
+                continue
+            pm = b.get("post_mount") or {}
+            ok = (b.get("attribute_after") is None and pm.get("attribute") is None
+                  and not pm.get("any_auto"))
+            oks.append(ok)
+            bits.append(
+                f"rep {r.get('rep')}: booted "
+                f"{'ON (ship default is `contain`)' if b.get('ship_default_was_on') else 'off'}"
+                f", override {'assigned' if b.get('override_assigned') else 'NOT ASSIGNED'}"
+                f", attribute after {b.get('attribute_after')!r}"
+                f", at mount {pm.get('attribute')!r} over {pm.get('blocks')} "
+                f"`.{PRODUCT_BLOCK_CLASS}` computing {pm.get('cv') or []}")
+        return (bool(oks) and all(oks)), "; ".join(bits)
+
+    g("the session was put into the flag-OFF state before any window, read back off the running "
+      "page, so every baseline is the flag-off arm", *_per_rung(obs, _flag_off))
+
     # The defect must still be present, or there is nothing to ablate. Priced against the FLOOR
     # measured on this very page (`still`), not against an assumed 60 fps.
     def _collapse(rung, rs):
@@ -1503,8 +1546,10 @@ def _product_lines(obs: dict, rung: str) -> list[str]:
             f"unreadable, {pr.get('rules_scanned')} rules scanned)",
             f"- matched selectorText, verbatim: `{pr.get('selector_text')}`",
             f"- matched cssText, verbatim: `{pr.get('css_text')}`",
-            f"- covered by it on this page: **{pr.get('blocks')}** `.{PRODUCT_BLOCK_CLASS}` and "
-            f"**{pr.get('katex_display')}** `.katex-display`",
+            f"- covered by it on this page: **{pr.get('blocks')}** `.{PRODUCT_BLOCK_CLASS}`, "
+            f"**{pr.get('display_blocks')}** `.aui-math-display` (the renderer-applied display "
+            f"marker, which `guardEquationNumbers` withholds from any block carrying an "
+            f"`eqn-num`) of **{pr.get('katex_display')}** `.katex-display` roots",
             f"- toggle check, computed `content-visibility` on {tc.get('sampled')} sampled blocks: "
             f"attribute off -> {tc.get('off_values')}, attribute on -> {tc.get('on_values')}, "
             f"moved {tc.get('moved')}/{tc.get('sampled')}"
@@ -1518,6 +1563,29 @@ def _product_lines(obs: dict, rung: str) -> list[str]:
             rows.append("- per repetition, presence: "
                         + ", ".join(f"rep {rep}: {'yes' if (p_ or {}).get('present') else 'NO'}"
                                     for rep, p_ in _product_rules(obs, rung)))
+    boots = [((r.get("payload") or {}).get("math_containment_boot") or {}, r.get("rep"))
+             for r in _rung_runs(obs, rung)]
+    rows += ["", f"**Which arm the BASELINES were in at {rung}, read back off the running page.** "
+                 f"The ship default on the branch under test is `contain`, so the page boots with "
+                 f"`{PRODUCT_ATTR}=\"on\"` and an unmodified session would measure the FIXED state "
+                 f"as its own baseline. The scene clears it through the product's own runtime "
+                 f"override before anything is measured:", ""]
+    for b, rep in boots:
+        if not b:
+            rows.append(f"- rep {rep}: **NO BOOT READBACK.** Which arm the baselines were in is "
+                        f"not established, so no number at this rung is readable.")
+            continue
+        pm = b.get("post_mount") or {}
+        rows.append(
+            f"- rep {rep}: booted "
+            f"`{PRODUCT_ATTR}={b.get('attribute_at_boot')!r}`"
+            + (" (the ship default, ON)" if b.get("ship_default_was_on") else " (already off)")
+            + f", runtime override "
+              f"{'assigned' if b.get('override_assigned') else '**NOT ASSIGNED**'}"
+            + (f" ({b.get('override_error')})" if b.get("override_error") else "")
+            + f", attribute immediately after: `{b.get('attribute_after')!r}`, "
+              f"at mount: `{pm.get('attribute')!r}` over {pm.get('blocks')} "
+              f"`.{PRODUCT_BLOCK_CLASS}` computing `{pm.get('cv') or []}`")
     if void:
         rows += ["", f"**`{PRODUCT}` IS VOID AT {rung}, AND ITS NUMBER MUST NOT BE READ AS A "
                      f"RESULT.** {void}."]

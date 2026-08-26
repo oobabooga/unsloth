@@ -140,9 +140,30 @@ def main() -> int:
         home = work / "studio_home"
         home.mkdir(parents = True, exist_ok = True)
         t0 = time.time()
+        # BUILD THE BUNDLE WITH THE FEATURE'S SHIP DEFAULT TURNED OFF.
+        #
+        # `SHIP_DEFAULT` on the branch under test is `"contain"`, so a default build boots with
+        # `data-math-block-containment="on"` and every baseline window in the session would be the
+        # FIXED state. The harness's one rule makes that a VOID rather than a pass, and the shape it
+        # produces -- every arm flat -- reads as "the fix does nothing".
+        #
+        # THIS DOES NOT MAKE A DIFFERENT BUNDLE FROM THE SHIPPED ONE IN ANY WAY THE MEASUREMENT CAN
+        # SEE. The flag is one inlined string. The stylesheet rule is emitted unconditionally and
+        # the `.aui-math-block` / `.aui-math-display` marker classes are emitted at render time
+        # whether the feature is on or off, so the arm that sets the attribute is arming exactly the
+        # rule a shipped install arms, over exactly the elements a shipped install marks. What
+        # changes is only which state the page STARTS in, which is the one thing this run needs to
+        # control.
+        #
+        # It is belt and braces rather than the only line of defence: the scene ALSO clears the flag
+        # through the product's own runtime override at scene evaluation, and reads the attribute
+        # back out of the running page. So a build flag that failed to reach vite costs nothing, and
+        # the criteria module gates on the readback rather than on this env var.
+        build_env = {"UNSLOTH_STUDIO_HOME": str(home),
+                     "VITE_UNSLOTH_MATH_BLOCK_CONTAINMENT": "off"}
+        obs["build_env"] = dict(build_env)
         obs["install"] = sh(["bash", "install.sh", "--local"], cwd = str(repo),
-                            timeout = args.install_timeout,
-                            env = {"UNSLOTH_STUDIO_HOME": str(home)})
+                            timeout = args.install_timeout, env = build_env)
         obs["install"]["seconds"] = round(time.time() - t0, 1)
         obs["install"]["stdout"] = (obs["install"].get("stdout") or "")[-4000:]
 

@@ -278,8 +278,28 @@ def positioned_long():
                                          "estimate": 15291}}
 
 
-def common(cen, *, jam_clean, jam_jammed, idle_fps, warm, park, prod = None):
+def boot_readback(*, booted_on = True, cleared = True, blocks = 402, assigned = True):
+    """The scene's flag-OFF readback, in the shape `forceContainmentOff` posts it.
+
+    `cleared = False` is the case the whole gate exists for: the ship default on the branch under
+    test is `contain`, so a session that did not clear it measures the FIXED state as its own
+    baseline and every arm comes back flat.
+    """
+    cv = ["visible"] * min(blocks, 8) if cleared else ["auto"] * min(blocks, 8)
+    return {"attribute_at_boot": "on" if booted_on else None,
+            "ship_default_was_on": booted_on,
+            "override_assigned": assigned, "override_error": None,
+            "attribute_after": None if cleared else "on",
+            "blocks_after": blocks, "cv_after": cv,
+            "post_mount": {"attribute": None if cleared else "on", "blocks": blocks,
+                           "display_blocks": 1 if blocks else 0, "cv": cv,
+                           "any_auto": (not cleared) and blocks > 0}}
+
+
+def common(cen, *, jam_clean, jam_jammed, idle_fps, warm, park, prod = None, boot = None):
     return {
+        "math_containment_boot": boot_readback(
+            blocks = cen["product_math_blocks"]) if boot is None else boot,
         # PER RUNG AND PER REP, because a payload is one repetition of one rung. At 0K this is the
         # only thing the rung has to say about the product build.
         "product_rule": product_rule(blocks = cen["product_math_blocks"],
@@ -321,7 +341,8 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
                  cvd_fired = None, cvd_took = None, cva_took = None, cvd_sh = 0.0,
                  jam_clean = 61.0, jam_jammed = 17.0, idle_fps = 61.0, warm = None,
                  base_mutations = 0, stalled = None, p50s = None,
-                 prodv = 62.0, prod = None, prod_fired = None, prod_took = None, prod_sh = 0.0):
+                 prodv = 62.0, prod = None, prod_fired = None, prod_took = None, prod_sh = 0.0,
+                 boot = None):
     """One repetition of a scored rung, in the scene's SEQUENCE order.
 
     fps is derived from blocked-ms-per-frame so the two channels stay consistent: the campaign's
@@ -402,19 +423,19 @@ def payload_long(*, rung = "500K", base = 287.6, cvd = 172.0, cva = 170.0, cvm =
          "scrollable_px": 315749}
     p.update(common(cen, jam_clean = jam_clean, jam_jammed = jam_jammed, idle_fps = idle_fps,
                     warm = warm if warm is not None else warmup(cen, park = park), park = park,
-                    prod = prod))
+                    prod = prod, boot = boot))
     return p
 
 
 def payload_short(*, rung = "0K", jam_clean = 61.2, jam_jammed = 17.2, idle_fps = 61.2,
-                  warm = None, prod = None):
+                  warm = None, prod = None, boot = None):
     """The 0K rung: an empty thread. No arms, no scrollable range, and no maths to skip."""
     cen = census_short()
     p = {"ok": True, "rung": rung, "arms": [], "no_scroll_range": True, "scrollable_px": 0}
     p.update(common(cen, jam_clean = jam_clean, jam_jammed = jam_jammed, idle_fps = idle_fps,
                     warm = warm if warm is not None else warmup(
                         cen, deltas = (4, 0), left_deferred = 0, latched_from = 0, park = 0),
-                    park = 0, prod = prod))
+                    park = 0, prod = prod, boot = boot))
     return p
 
 
@@ -427,7 +448,7 @@ SUBJECT = {"repo": "https://github.com/unslothai/unsloth",
 
 
 def obs(reps = 2, rungs = ("0K", "500K"), short_kw = None, per_rung = None, prod_kw = None,
-        subject = SUBJECT, **kw):
+        subject = SUBJECT, boot_kw = None, **kw):
     """rung OUTER, repetition INNER, exactly as the probe writes it.
 
     `prod_kw` is applied to EVERY rung, because one bundle serves them all: a fixture that made
@@ -442,12 +463,20 @@ def obs(reps = 2, rungs = ("0K", "500K"), short_kw = None, per_rung = None, prod
                 if prod_kw is not None:
                     sk.setdefault("prod", product_rule(
                         **{**{"blocks": 0, "katex_display": 0}, **prod_kw}))
+                # ONE BUNDLE AND ONE BOOT PATH SERVE EVERY RUNG, so the flag-off readback is
+                # applied to all of them. At 0K there is no maths, so `blocks` is 0 there and an
+                # empty sample is the correct answer rather than a miss.
+                if boot_kw is not None:
+                    sk.setdefault("boot", boot_readback(
+                        **{**{"blocks": 0}, **boot_kw}))
                 pl = payload_short(rung = rung, **sk)
             else:
                 over = dict(kw)
                 over.update((per_rung or {}).get(rung, {}))
                 if prod_kw is not None:
                     over.setdefault("prod", product_rule(**prod_kw))
+                if boot_kw is not None:
+                    over.setdefault("boot", boot_readback(**boot_kw))
                 pl = payload_long(rung = rung, **over)
             runs.append({"rung": rung, "rep": rep, "rc": 0, "payload": pl})
     s = dict(subject or {})
@@ -1125,6 +1154,57 @@ check("and says why an unattributable number is not a measurement",
       and "claim about a specific branch" in ev, ev)
 v, why = C.verdict(o)
 check("the verdict is INCONCLUSIVE", v == "INCONCLUSIVE", f"{v}: {why}")
+
+print("case 31: THE SHIP DEFAULT IS `contain`, so a session that did not clear it is VOID")
+# The most dangerous shape this revision can produce, and it is dangerous because it is QUIET.
+# `SHIP_DEFAULT` on the branch under test is `"contain"`, so the page boots with the attribute
+# already set. A session that did not clear it measures the FIXED state as its own baseline, every
+# arm comes back flat, and the plausible reading -- "the fix does nothing" -- is the wrong one.
+o = obs(boot_kw = {"cleared": False})
+precondition("case 31",
+             o["runs"][2]["payload"]["math_containment_boot"]["attribute_after"] == "on"
+             and o["runs"][2]["payload"]["math_containment_boot"]["post_mount"]["any_auto"] is True,
+             str(o["runs"][2]["payload"]["math_containment_boot"]))
+ok, ev = gate(o, "the session was put into the flag-OFF state")
+check("the flag-off gate FAILS", ok is False, ev)
+check("and the evidence quotes the attribute it read back, not what it asked for",
+      "attribute after 'on'" in ev and "computing ['auto'" in ev, ev)
+v, why = C.verdict(o)
+check("the verdict is INCONCLUSIVE and names the gate", v == "INCONCLUSIVE"
+      and "flag-OFF state" in why, f"{v}: {why}")
+
+print("case 31b: no boot readback at all, which is a different failure from a bad one")
+o = obs()
+for r in o["runs"]:
+    r["payload"].pop("math_containment_boot", None)
+precondition("case 31b",
+             all("math_containment_boot" not in r["payload"] for r in o["runs"]),
+             "the fixture still carries a boot readback")
+ok, ev = gate(o, "the session was put into the flag-OFF state")
+check("the gate fails on a missing readback too", ok is False, ev)
+check("and says the premise is unestablished rather than violated",
+      "NO BOOT READBACK WAS RECORDED" in ev, ev)
+
+print("case 31c: the healthy case passes and the report SHOWS which arm the baselines were in")
+# Anti-vacuity for 25 and 25b: the gate has to be able to pass, and the reader has to be able to
+# see the readback rather than take the gate's word for it.
+o = obs(boot_kw = {"cleared": True})
+precondition("case 31c",
+             o["runs"][2]["payload"]["math_containment_boot"]["attribute_at_boot"] == "on"
+             and o["runs"][2]["payload"]["math_containment_boot"]["attribute_after"] is None,
+             str(o["runs"][2]["payload"]["math_containment_boot"]))
+ok, ev = gate(o, "the session was put into the flag-OFF state")
+check("the gate passes when the session really was cleared", ok is True, ev)
+check("and it says the page booted ON, so the clearing was not a no-op",
+      "booted ON (ship default is `contain`)" in ev, ev)
+bad = [n for n, k, e in C.gates(o) if not k]
+check("and no other gate is disturbed by it", not bad, str(bad))
+tbl = C.table(o)
+check("the report prints the boot readback for the reader",
+      "Which arm the BASELINES were in at 500K, read back off the running page" in tbl, tbl[:200])
+check("naming the ship default, the override and the attribute after it",
+      "(the ship default, ON)" in tbl and "runtime override assigned" in tbl, tbl)
+
 
 print("\n" + (f"{FAIL} FAILED" if FAIL else "all cvkatex criteria self-tests passed"))
 sys.exit(1 if FAIL else 0)

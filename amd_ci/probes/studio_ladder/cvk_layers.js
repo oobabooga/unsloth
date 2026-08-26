@@ -62,6 +62,17 @@
 // shipped" without depending on measuring anything, and the criteria module VOIDS the arm rather
 // than reporting its null when they do not hold.
 //
+// THE SHIP DEFAULT HAS SINCE MOVED, AND THAT INVERTS THE WHOLE SESSION IF IT IS IGNORED. When the
+// paragraphs above were written PR 9731 shipped the feature OFF, so the page booted without the
+// attribute and the baselines were the flag-off arm for free. On the head of that PR
+// `SHIP_DEFAULT` is `"contain"`: the page now boots with `data-math-block-containment="on"`, every
+// baseline would be the FIXED state, and a session run unchanged would come back with every arm
+// flat and read as "the fix does nothing". `forceContainmentOff` puts the session into the flag-off
+// state at scene evaluation, through the product's own runtime override, and records the readback
+// (attribute at boot, attribute after, and the computed `content-visibility` of real marked blocks
+// once the thread has mounted) so that the premise every baseline rests on is a MEASUREMENT rather
+// than an assumption. The criteria module gates on it.
+//
 // The class those blocks carry is added BEFORE the warm-up, so every window including every
 // baseline sees the same DOM and the arm only ever toggles a stylesheet. An arm that mutates the
 // DOM inside its own measured window is billing itself for someone else's work (defect #48).
@@ -435,14 +446,69 @@
 
   // ── THE PRODUCT IMPLEMENTATION'S OWN NAMES, frozen, and never re-derived from a label ──────
   //
-  // These three strings are the contract with the branch under test. The class is emitted at
-  // render time on the nearest block-level ancestor of every INLINE maths root, ALWAYS, so the DOM
-  // is identical whether the feature is on or off (defect #48). Display maths needs no marker: its
-  // own `span.katex-display` root is already block-level, and the product rule names it directly.
-  // The attribute is the only thing the feature flag moves, and it lives on the document element.
+  // These strings are the contract with the branch under test. The class is emitted at render time
+  // on the nearest block-level ancestor of every INLINE maths root, ALWAYS, so the DOM is identical
+  // whether the feature is on or off (defect #48).
+  //
+  // UPDATED for the head of PR 9731. Display maths no longer relies on `span.katex-display` being
+  // named directly: the renderer applies its own `.aui-math-display` class and the stylesheet names
+  // THAT, because `guardEquationNumbers` has to be able to withhold containment from a display
+  // block carrying an `eqn-num`. So a display root that exists is not necessarily a display root
+  // that the rule reaches, and the two are counted separately rather than assumed equal.
   const PRODUCT_ATTR = "data-math-block-containment";
   const PRODUCT_BLOCK = "aui-math-block";
   const PRODUCT_SEL = "." + PRODUCT_BLOCK;
+  const PRODUCT_DISPLAY = "aui-math-display";
+  const PRODUCT_DISPLAY_SEL = "." + PRODUCT_DISPLAY;
+
+  // ── THE SHIP DEFAULT MOVED, AND WITHOUT THIS THE WHOLE SESSION WOULD BE VACUOUS ────────────
+  //
+  // When this scene was written the feature shipped OFF, so the page booted without the attribute,
+  // every baseline window was the flag-off arm by default, and `product_math_block_containment`
+  // was the only window with containment in force. On the head of PR 9731 `SHIP_DEFAULT` is
+  // `"contain"`, so the page boots with `data-math-block-containment="on"` already set and EVERY
+  // BASELINE WOULD ALREADY BE THE FIXED STATE. The harness's one rule is that a base state which
+  // does not exhibit the defect is a VOID and not a pass, and this is exactly the shape that rule
+  // exists for: the run would come back with all arms flat and read as "the fix does nothing".
+  //
+  // So the session is put into the flag-OFF state before anything is measured, through the
+  // product's OWN documented runtime override (`__UNSLOTH_MATH_BLOCK_CONTAINMENT__`, redefined as
+  // an accessor by `installOverrideWatcher` precisely so that assigning it reapplies), with a
+  // direct `removeAttribute` behind it in case the build under test predates that accessor.
+  //
+  // AND IT READS ITS OWN SWITCH BACK OUT. The attribute as found at boot, the attribute after, and
+  // the computed `content-visibility` of a real marked block after, all recorded. A downstream
+  // side effect is not a substitute: the criteria module gates on this record, because "the
+  // baselines were the flag-off arm" is the premise every number in the run rests on.
+  //
+  // This runs at SCENE EVALUATION, which the driver does once after load finishes, so it is the
+  // earliest moment this file can act, and it is before `run()` waits for the thread to mount.
+  const forceContainmentOff = () => {
+    const rec = { attribute_at_boot: document.documentElement.getAttribute(PRODUCT_ATTR),
+                  override_assigned: false, override_error: null,
+                  attribute_after: null, blocks_after: null, cv_after: [],
+                  ship_default_was_on: null };
+    rec.ship_default_was_on = rec.attribute_at_boot !== null;
+    try {
+      // `window`, not `globalThis`: they are the same object in a page, and only the former is
+      // the one this scene's own self-test can substitute.
+      window.__UNSLOTH_MATH_BLOCK_CONTAINMENT__ = false;
+      rec.override_assigned = true;
+    } catch (e) {
+      rec.override_error = String((e && e.message) || e);
+    }
+    // Belt and braces. If the accessor is not installed the assignment above is inert, and the
+    // attribute is what the stylesheet actually reads.
+    document.documentElement.removeAttribute(PRODUCT_ATTR);
+    rec.attribute_after = document.documentElement.getAttribute(PRODUCT_ATTR);
+    const all = document.querySelectorAll(PRODUCT_SEL);
+    rec.blocks_after = all.length;
+    for (let i = 0; i < all.length && i < 8; i++) {
+      rec.cv_after.push(getComputedStyle(all[i]).contentVisibility);
+    }
+    return rec;
+  };
+  W.containBoot = forceContainmentOff();
 
   // DOES THE RULE THE ARM TOGGLES ACTUALLY EXIST IN THIS BUILD?
   //
@@ -790,14 +856,15 @@
         const pr = W.productRule || {};
         document.documentElement.setAttribute(PRODUCT_ATTR, "on");
         const blocks = document.querySelectorAll(PRODUCT_SEL).length;
-        const disp = document.querySelectorAll(".katex-display").length;
+        const disp = document.querySelectorAll(PRODUCT_DISPLAY_SEL).length;
+        const roots = document.querySelectorAll(".katex-display").length;
         const sel = (pr.present && pr.selector_text)
           ? pr.selector_text
           : `NO RULE MENTIONING [${PRODUCT_ATTR}] WAS FOUND IN ANY READABLE STYLESHEET `
             + `(${pr.sheets_readable} readable, ${pr.sheets_unreadable} unreadable), so this `
             + `attribute toggle applies NOTHING`;
         return `${sel} <- set [${PRODUCT_ATTR}="on"] on <html>, covering ${blocks} `
-             + `${PRODUCT_SEL} and ${disp} .katex-display`;
+             + `${PRODUCT_SEL} and ${disp} ${PRODUCT_DISPLAY_SEL} of ${roots} .katex-display`;
       },
       revert: async () => { document.documentElement.removeAttribute(PRODUCT_ATTR); },
       fired: () => firedCheck(PRODUCT_SEL, "contentVisibility", "auto", 400),
@@ -1045,8 +1112,31 @@
       const productRule = findProductRule();
       productRule.blocks = document.querySelectorAll(PRODUCT_SEL).length;
       productRule.katex_display = document.querySelectorAll(".katex-display").length;
+      // The renderer-applied display marker, counted separately from the KaTeX display roots it is
+      // put on. `guardEquationNumbers` withholds it from any block carrying an `eqn-num`, so these
+      // two are allowed to differ and a reader must be able to see that they did.
+      productRule.display_blocks = document.querySelectorAll(PRODUCT_DISPLAY_SEL).length;
       productRule.toggle_check = productToggleCheck(24);
       W.productRule = productRule;
+
+      // THE FLAG-OFF PREMISE, RE-READ ONCE THE THREAD IS ACTUALLY MOUNTED. `forceContainmentOff`
+      // ran at scene evaluation, when the thread may not have existed and there was nothing whose
+      // computed style could be sampled. This is the same readback taken against real blocks, and
+      // it is what the criteria module gates on. `attribute` must be absent and no marked block may
+      // compute to `auto`, or every baseline in this session is the FIXED state and the run is a
+      // VOID rather than a null.
+      const cvSample = [];
+      const marked = document.querySelectorAll(PRODUCT_SEL);
+      for (let i = 0; i < marked.length && i < 8; i++) {
+        cvSample.push(getComputedStyle(marked[i]).contentVisibility);
+      }
+      W.containBoot.post_mount = {
+        attribute: document.documentElement.getAttribute(PRODUCT_ATTR),
+        blocks: marked.length,
+        display_blocks: productRule.display_blocks,
+        cv: cvSample,
+        any_auto: cvSample.some((v) => v === "auto"),
+      };
       if (!productRule.present) {
         W.notes.push(`no rule mentioning \`${PRODUCT_ATTR}\` was found in any of the `
                    + `${productRule.sheets_readable} readable stylesheets `
@@ -1282,6 +1372,9 @@
              // product arm cannot be scored without it, and at 0K -- where there are no windows
              // at all -- it is the only thing this rung has to say about the product build.
              product_rule: W.productRule,
+             // THE PREMISE OF EVERY BASELINE IN THIS SESSION, read back out of the running page
+             // rather than assumed from a build flag. See `forceContainmentOff`.
+             math_containment_boot: W.containBoot,
              mutations_total: mutDelta(warm.mut_before, mutSnapshot()),
              baseline_census: baselineCensus, positioned,
              gesture_frames: o.gestureFrames, gesture_cap_ms: o.gestureCapMs, idle_ms: o.idleMs,
@@ -1291,6 +1384,7 @@
       const E = err(e);
       post({ __done: true, ok: false, rung: o.rung,
              error: E.message, error_detail: E, notes: W.notes,
+             math_containment_boot: W.containBoot, product_rule: W.productRule,
              marks: W.marks, arms: W.arms, url: location.href,
              dom: { elements: document.getElementsByTagName("*").length,
                     messages: document.querySelectorAll("[data-role]").length,

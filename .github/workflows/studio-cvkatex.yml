@@ -1,6 +1,29 @@
-name: "AMD CI: what does content-visibility on KaTeX actually buy, at 0K, 100K and 500K?"
+name: "AMD CI: does PR 9731 move the 500K scroll on a real GPU, flag OFF against flag ON?"
 
-# THE QUESTION, and it is narrow.
+# THE QUESTION THIS REVISION ASKS, and it is the merge decision on PR 9731.
+#
+# PR 9731 is open, review-converged and unmerged. Everything measured on it so far was measured
+# when the feature shipped OFF and the flag was a thing a harness turned on. `SHIP_DEFAULT` is now
+# `"contain"`, and the +92% in the PR description comes from runs 32902943628 and 32906688232, both
+# taken at commit 2f34f85dbd -- before the list-marker exemption, before `guardEquationNumbers`,
+# before the `.aui-math-display` marker and before the `@media print` rule, all of which WITHHOLD
+# containment from blocks that used to get it. So the number the merge decision rests on was taken
+# on a build that no longer exists, and the question here is what the CURRENT head is worth on the
+# 500K scroll on a real GPU.
+#
+# THE TRAP THAT INVERTS THIS RUN IF IT IS IGNORED. Because the default is now `contain`, the page
+# BOOTS FIXED. Run unchanged, every interleaved baseline in this session would be the fixed state,
+# `product_math_block_containment` would set an attribute that was already set, and the run would
+# come back with every arm flat -- which reads as "the fix does nothing" and is instead the
+# harness's one rule firing silently (base does not exhibit the defect => VOID, not a pass). Two
+# independent measures are taken against it, and the criteria module gates on the second, not the
+# first: the bundle is BUILT with `VITE_UNSLOTH_MATH_BLOCK_CONTAINMENT=off`, and the scene clears
+# the flag through the product's own runtime override at scene evaluation and then READS THE
+# ATTRIBUTE AND THE COMPUTED `content-visibility` OF REAL BLOCKS BACK OUT OF THE RUNNING PAGE.
+#
+# Everything below is the previous revision's text and still describes the instrument.
+#
+# THE ORIGINAL QUESTION, and it was narrow.
 #
 # Run 32869180652 measured the 500K scroll collapse on this venue: 287.6 ms of blocked main
 # thread to move the scroller by ONE PIXEL, which is 3.2 fps, and `.katex{visibility:hidden}` at
@@ -43,7 +66,7 @@ name: "AMD CI: what does content-visibility on KaTeX actually buy, at 0K, 100K a
 
 on:
   push:
-    branches: [amd-ci-cvkatex]
+    branches: [amd-ci-cvk9731]
   workflow_dispatch:
     inputs:
       subject_ref:
@@ -80,7 +103,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "studio-cvkatex-selftest"
+          source amd_ci/lib/preamble.sh "studio-cvk9731-selftest"
 
       - name: Toolkit self-test
         run: |
@@ -143,7 +166,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "studio-cvkatex"
+          source amd_ci/lib/preamble.sh "studio-cvk9731"
 
       - name: Hardware gate
         run: |
