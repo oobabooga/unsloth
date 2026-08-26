@@ -28,6 +28,9 @@ env:
   LEMONADE_TAG: "b1316"
   TINY_REPO: "unsloth/Qwen3-0.6B-GGUF"
   TINY_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  # Pinned: fetch_gguf.py has no default revision, so an unpinned state cannot
+  # silently resolve to a moving main.
+  TINY_REV: "main"
 
 jobs:
 
@@ -96,10 +99,14 @@ jobs:
         timeout-minutes: 40
         run: |
           set +e
-          # test-backend-ops checks each op against a CPU reference, per quant
-          # type, with no model at all. It is not shipped in every prebuilt, so a
-          # miss is recorded rather than fatal. This step has NO base and NO head,
-          # so it gets no verdict: it is a fact about the host, not a comparison.
+          # test-backend-ops would check each op against a CPU reference, per
+          # quant type, with no model at all. MEASURED on this runner: it is
+          # shipped in NONE of the three prebuilts (upstream vulkan, upstream
+          # rocm, lemonade gfx1151), so getting it means building llama.cpp here.
+          # The step stays because the probe records its own absence, and that
+          # absence is a real gap in coverage that the report should state rather
+          # than quietly skip. The tiny-GGUF differential below is what actually
+          # exercises the kernels.
           for BK in "Vulkan0:$VULKAN_BIN" "ROCm0:$ROCM_BIN"; do
             DEV="${BK%%:*}"
             DIR="${BK#*:}"
@@ -115,11 +122,12 @@ jobs:
         timeout-minutes: 40
         run: |
           set -eu
-          python3 -m pip install --quiet --user huggingface_hub || true
-          # local_dir keeps the download inside $RUNNER_TEMP, which is the only
-          # tree the runner reclaims between jobs; the default cache would leave
-          # it in $HOME on a persistent, shared host.
+          # Plain HTTPS, no huggingface_hub: MEASURED on this runner, the module
+          # is absent and `pip install --user` did not put one on sys.path.
+          # --local-dir keeps the file inside $RUNNER_TEMP, the only tree the
+          # runner reclaims between jobs on this persistent, shared host.
           python3 amd_ci/lib/fetch_gguf.py --repo "$TINY_REPO" --file "$TINY_FILE" \
+            --revision "$TINY_REV" \
             --local-dir "$AMD_CI_WORK/tiny" --out "$AMD_CI_WORK/out/tiny.json"
           python3 amd_ci/lib/build_iq_repro.py \
             --bin-dir "$VULKAN_BIN" \
