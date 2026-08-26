@@ -15,7 +15,7 @@ name: "AMD CI: validate PR 9779"
 
 on:
   push:
-    branches: [amd-ci-pr9779]
+    branches: [amd-ci-pr9779-defaulton]
   workflow_dispatch:
 
 permissions:
