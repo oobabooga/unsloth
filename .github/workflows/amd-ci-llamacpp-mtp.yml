@@ -1,0 +1,294 @@
+name: "AMD CI: Qwen3.8-27B V2 vs V3 GGUF on gfx1151"
+
+# Adapted from amd_ci/templates/workflow.yml. Kept verbatim, because each has
+# already cost a run: the preamble, the runs-on selector, the GPU concurrency
+# group, announce.py closing every Differential, and the artifact upload.
+# Replaced: state resolution. There is no PR here, so lib/states.py does not
+# apply; the states are model directories, written by lib/write_states.py.
+#
+# The claim under test, from r/LocalLLaMA and HF discussions #83 / #98: the
+# Unsloth V3 GGUFs of Qwen3.8-27B die on AMD right after prefill and before the
+# first token, while the V2 revision works.
+#
+# Three competing explanations, and one cell for each:
+#   context checkpoints  qwen35 is an SSM hybrid, so it has recurrent state, and
+#                        a checkpoint is taken exactly at the prefill/generation
+#                        boundary. llama.cpp#27560 reports 0xC0000005 there on
+#                        Windows/Vulkan with this exact file, cleared entirely by
+#                        --ctx-checkpoints 0, with no MTP involved.  -> R1 vs R2
+#   IQ4_NL kernels       IQ4_NL is present in exactly the quants that crash
+#                        (V3 Q4_K_XL: 6 tensors, Q5_K_XL: 1) and absent from
+#                        exactly the ones that work (V3 Q6_K_XL, V2 Q4_K_XL).
+#                        IQ4_XS appears in a working file, so it is not it.  -> Q1
+#   MTP                  the original hypothesis, and V3 did add an MTP sidecar
+#                        that V2 lacks.                                     -> R3
+#
+# Two state sets. Both put the WORKING model at `base`, because the criteria
+# module is MODE="regression" and asks whether head is worse than base:
+#   rev    base = V2 UD-Q4_K_XL   head = V3 UD-Q4_K_XL   (the thread's claim)
+#   quant  base = V3 UD-Q6_K_XL   head = V3 UD-Q4_K_XL   (same revision, same
+#          day, same pipeline; only the recipe differs - which is what the field
+#          reports actually partition on)
+#
+# UD-Q4_K_XL is used throughout because it is one of the few filenames present in
+# BOTH revisions. The OP compared V2 `Q4_K_M` against V3 `UD-Q4_K_M`, which are
+# different recipes and not a controlled comparison.
+#
+# This is the EXPENSIVE branch: ~62 GB of downloads and a long hold on the shared
+# GPU. Run the cheap amd-ci-llamacpp-iq4nl branch first.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-mtp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b10631"
+  LEMONADE_TAG: "b1316"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  # Pinned revisions. fetch_gguf.py has no default revision on purpose: an
+  # unpinned state would silently resolve to a moving main and compare a file
+  # with itself.
+  REV_V2: "408fcc1807ab264d8cd644a7c4c0f58fbd32eebc"
+  REV_V3: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  FILE_Q4: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  FILE_Q6: "Qwen3.8-27B-UD-Q6_K_XL.gguf"
+  FILE_MTP: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+  # Pinned, never -c 0: V3 UD-Q4_K_XL is reported to resolve to a smaller default
+  # context than V2, so -c 0 would vary a second thing between the states.
+  CTX: "65536"
+
+jobs:
+
+  gpu:
+    name: "Qwen3.8-27B V2 vs V3 on gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 350
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. The group holds one runner plus one waiter, so a third
+    # arrival evicts the waiter; `cancel-in-progress: false` protects the job
+    # already running, not the one queued behind it. Re-run the job, not the
+    # workflow: a re-push would redo 62 GB of downloads for nothing.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-mtp"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          # gate.py reads gpu_archs from torch.cuda.get_device_properties(), and
+          # this job deliberately has no torch, so --expect-arch gfx1151 would
+          # always fail here. The arch assertion moves into the probe, where a
+          # criteria gate turns a miss into INCONCLUSIVE rather than a silent
+          # wrong-hardware pass. This still FAILS rather than skipping.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          df -h "$AMD_CI_WORK" | tail -1
+          free -g | head -2
+
+      - name: Fetch llama.cpp binaries
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          L="https://github.com/lemonade-sdk/llamacpp-rocm/releases/download/$LEMONADE_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$L/llama-$LEMONADE_TAG-ubuntu-rocm-gfx1151-x64.zip" \
+            --dest "$AMD_CI_WORK/lcpp/lemonade" --out "$AMD_CI_WORK/out/bin_lemonade.json" \
+            || echo "note: lemonade build unavailable, continuing with upstream only"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Fetch models
+        timeout-minutes: 120
+        run: |
+          set -eu
+          # --as-name gives every state the same filename, so one --gguf value
+          # serves both states of every cell while the directories stay distinct.
+          # Nothing on this runner is cached, so this is the long pole: ~62 GB.
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V2" --as-name model.gguf --local-dir "$M/v2_q4" \
+            --out "$AMD_CI_WORK/out/model_v2_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V3" --as-name model.gguf --local-dir "$M/v3_q4" \
+            --out "$AMD_CI_WORK/out/model_v3_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q6" \
+            --revision "$REV_V3" --as-name model.gguf --local-dir "$M/v3_q6" \
+            --out "$AMD_CI_WORK/out/model_v3_q6.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_MTP" \
+            --revision "$REV_V3" --as-name mtp.gguf --local-dir "$M/mtp" \
+            --out "$AMD_CI_WORK/out/model_mtp.json"
+          echo "MTP_GGUF=$M/mtp/mtp.gguf" >> "$GITHUB_ENV"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Resolve states
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/v2_q4" --path "head=$M/v3_q4" \
+            --label "base=V2 408fcc180" --label "head=V3 4ca720788" \
+            --out "$AMD_CI_WORK/out/states_rev.json"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/v3_q6" --path "head=$M/v3_q4" \
+            --label "base=V3 Q6_K_XL" --label "head=V3 Q4_K_XL" \
+            --out "$AMD_CI_WORK/out/states_quant.json"
+
+      - name: R1 - rev, Vulkan, no MTP, checkpoints default
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R1" \
+            --title "R1 V2 vs V3, Vulkan, spec-type none, checkpoints default" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R1"
+
+      - name: R2 - rev, Vulkan, no MTP, ctx-checkpoints 0
+        if: always()
+        run: |
+          set +e
+          # llama.cpp#27560's workaround. R1 crashing and R2 not is the whole
+          # checkpoint hypothesis in one comparison.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R2" \
+            --title "R2 V2 vs V3, Vulkan, spec-type none, --ctx-checkpoints 0" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --extra-arg=-ctxcp --extra-arg=0 \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R2"
+
+      - name: Q1 - quant, Vulkan, Q6_K_XL vs Q4_K_XL
+        if: always()
+        run: |
+          set +e
+          # Same revision, same pipeline; the recipe is the only difference, and
+          # IQ4_NL is present in head and absent from base.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_quant.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/Q1" \
+            --title "Q1 V3 Q6_K_XL vs V3 Q4_K_XL, Vulkan, checkpoints default" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/Q1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/Q1"
+
+      - name: R3 - rev, Vulkan, MTP forced on BOTH states
+        if: always()
+        run: |
+          set +e
+          # The V3 sidecar is handed to the V2 weights too. If both states crash,
+          # the quant is exonerated and MTP is the variable; the criteria gate
+          # refuses the cell outright if MTP never actually engaged.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R3" \
+            --title "R3 V2 vs V3, Vulkan, spec-type draft-mtp with the V3 sidecar" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --spec-type draft-mtp --draft-model "$MTP_GGUF" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R3"
+
+      - name: R4 - rev, Vulkan, minimal config
+        if: always()
+        run: |
+          set +e
+          # Is the elaborate config load-bearing, or does a plain one crash too?
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R4" \
+            --title "R4 V2 vs V3, Vulkan, minimal: -c 8192, no flash-attn, no KV quant" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size 8192 \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R4"
+
+      - name: R5 - rev, upstream ROCm
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R5" \
+            --title "R5 V2 vs V3, upstream ROCm 7.14, spec-type none" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R5/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R5"
+
+      - name: R6 - rev, Lemonade ROCm gfx1151
+        if: always()
+        run: |
+          set +e
+          if [ -z "${LEMONADE_BIN:-}" ]; then
+            echo "lemonade build was not fetched; this backend is untested, not passing"
+            exit 0
+          fi
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/R6" \
+            --title "R6 V2 vs V3, Lemonade ROCm gfx1151 $LEMONADE_TAG, spec-type none" \
+            -- --bin-dir "$LEMONADE_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-kvu \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/R6/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R6"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-mtp-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
