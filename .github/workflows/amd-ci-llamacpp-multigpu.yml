@@ -1,0 +1,341 @@
+name: "AMD CI: Qwen3.8-27B split across spoofed devices on gfx1151"
+
+# Adapted from amd_ci/templates/workflow.yml. Kept verbatim: the preamble, the
+# runs-on selector, the GPU concurrency group, announce.py closing every
+# Differential, and the artifact upload.
+#
+# WHY. The single-device matrix (branch amd-ci-llamacpp-mtp) came back
+# NO_REGRESSION on every one of seven cells: V2 vs V3, Q6_K_XL vs Q4_K_XL,
+# --ctx-checkpoints 0, MTP genuinely engaged (draft_n=22) on both revisions,
+# a minimal config, upstream ROCm, and the Lemonade gfx1151 build. So whatever
+# the reporters are hitting needs something this host did not have. Every
+# reporter who gave a full configuration was on TWO GPUs.
+#
+# This runner has one. Two ways to give llama.cpp more than one device anyway,
+# both of which drive the real multi-device scheduler:
+#
+#   RPC            several ggml-rpc-server processes on the SAME physical GPU.
+#                  llama.cpp sees RPC0, RPC1 and splits layers across them via
+#                  ggml_backend_sched, -sm layer / -sm row, -ts. Also the only
+#                  way to reach llama.cpp#24177, which is an RPC bug:
+#                  ggml_backend_rpc_device_supports_op() returns true
+#                  unconditionally, bypassing the TOP_K guard that makes
+#                  single-GPU ROCm fall back to CPU instead of aborting.
+#   dual backend   libggml-vulkan.so copied into the ROCm build, so ONE binary
+#                  enumerates Vulkan0 AND ROCm0. This is not a trick: on
+#                  llama.cpp#24492 @Kononnable narrowed the "pre-allocated tensor
+#                  ... cannot run the operation (NONE)" abort to exactly this
+#                  configuration, fixed by naming --spec-draft-device.
+#
+# WHAT THIS IS NOT. One physical device means no PCIe hop, no second driver
+# context, no per-card VRAM ceiling, no NUMA. It reproduces multi-backend
+# SCHEDULING, not two cards. The criteria module carries that into every verdict
+# and keeps multi_gpu in NEEDS so the report still says the host has one card.
+#
+# SAFETY on a shared, persistent host. The RPC servers are a fixture: started
+# once, stopped by PID, never `pkill -f` (E002). The fixture self-destructs on
+# --max-seconds so an abandoned one cannot outlive the job holding VRAM, and a
+# final `if: always()` step stops anything whose PID was recorded, skipping PIDs
+# whose cmdline no longer matches in case of reuse. Context is capped and the
+# model is the 17.6 GB Q4, so two devices sharing one 64 GiB pool have room.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-multigpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b10631"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  REV_V2: "408fcc1807ab264d8cd644a7c4c0f58fbd32eebc"
+  REV_V3: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  FILE_Q4: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  FILE_MTP: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+  # Smaller than the single-device matrix: two devices share one 64 GiB pool.
+  CTX: "32768"
+  RPC_A: "50152"
+  RPC_B: "50153"
+
+jobs:
+
+  gpu:
+    name: "Qwen3.8-27B spoofed multi-device on gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 350
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-multigpu"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          # gate.py reads gpu_archs from torch, which this job does not have, so
+          # --expect-arch gfx1151 would always fail here. The arch assertion
+          # lives in the probe and a criteria gate turns a miss into
+          # INCONCLUSIVE. This still FAILS rather than skipping.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          free -g | head -2
+
+      - name: Fetch llama.cpp binaries and merge backends
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Merge Vulkan into the ROCm build
+        continue-on-error: true
+        run: |
+          set +e
+          # Exits non-zero unless BOTH backends enumerate a device, so a merged
+          # directory that quietly loaded one cannot pass as multi-device. The
+          # M6/M7 cells check MERGED_BIN before running.
+          python3 amd_ci/lib/merge_backends.py \
+            --into "$ROCM_BIN" --from-dir "$VULKAN_BIN" --lib libggml-vulkan.so \
+            --dest "$AMD_CI_WORK/lcpp/merged" --out "$AMD_CI_WORK/out/merged.json"
+          rc=$?
+          echo "merge rc=$rc"
+          if [ "$rc" -eq 0 ]; then
+            echo "MERGED_BIN=$AMD_CI_WORK/lcpp/merged" >> "$GITHUB_ENV"
+          else
+            echo "note: dual-backend merge did not yield two backends; M6/M7 will report that"
+          fi
+
+      - name: Fetch models
+        timeout-minutes: 120
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V2" --as-name model.gguf --local-dir "$M/v2_q4" \
+            --out "$AMD_CI_WORK/out/model_v2_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V3" --as-name model.gguf --local-dir "$M/v3_q4" \
+            --out "$AMD_CI_WORK/out/model_v3_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_MTP" \
+            --revision "$REV_V3" --as-name mtp.gguf --local-dir "$M/mtp" \
+            --out "$AMD_CI_WORK/out/model_mtp.json"
+          echo "MTP_GGUF=$M/mtp/mtp.gguf" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/v2_q4" --path "head=$M/v3_q4" \
+            --label "base=V2 408fcc180" --label "head=V3 4ca720788" \
+            --out "$AMD_CI_WORK/out/states_rev.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: M0 - single device control, Vulkan0
+        run: |
+          set +e
+          # Without this, "both states crashed on the split" is unreadable: it
+          # could be the split or it could be the run. Single-device criteria,
+          # because this cell is single-device by design.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_mtp_regression.py \
+            --out-dir "$AMD_CI_WORK/out/M0" \
+            --title "M0 control: V2 vs V3, single Vulkan0, no split" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M0/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M0"
+
+      - name: M1 - RPC 2-way, split-mode layer
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M1" \
+            --title "M1 V2 vs V3, 2x RPC on one gfx1151, -sm layer" \
+            --fixture amd_ci/probes/rpc_servers_fixture.py \
+            --fixture-arg=--bin-dir --fixture-arg="$VULKAN_BIN" \
+            --fixture-arg=--device --fixture-arg=Vulkan0 \
+            --fixture-arg=--port --fixture-arg="$RPC_A" \
+            --fixture-arg=--port --fixture-arg="$RPC_B" \
+            --fixture-arg=--log-dir --fixture-arg="$AMD_CI_WORK/out/M1" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=--rpc --extra-arg="127.0.0.1:$RPC_A,127.0.0.1:$RPC_B" \
+               --extra-arg=-dev --extra-arg=RPC0,RPC1 \
+               --extra-arg=-sm --extra-arg=layer --extra-arg=-ts --extra-arg=50,50 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M1"
+
+      - name: M2 - RPC 2-way, split-mode row
+        if: always()
+        run: |
+          set +e
+          # kostich on llama.cpp#24492: "it still breaks if I try MTP on multiple
+          # GPUs with split mode set to tensor".
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M2" \
+            --title "M2 V2 vs V3, 2x RPC on one gfx1151, -sm row" \
+            --fixture amd_ci/probes/rpc_servers_fixture.py \
+            --fixture-arg=--bin-dir --fixture-arg="$VULKAN_BIN" \
+            --fixture-arg=--device --fixture-arg=Vulkan0 \
+            --fixture-arg=--port --fixture-arg="$RPC_A" \
+            --fixture-arg=--port --fixture-arg="$RPC_B" \
+            --fixture-arg=--log-dir --fixture-arg="$AMD_CI_WORK/out/M2" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=--rpc --extra-arg="127.0.0.1:$RPC_A,127.0.0.1:$RPC_B" \
+               --extra-arg=-dev --extra-arg=RPC0,RPC1 \
+               --extra-arg=-sm --extra-arg=row --extra-arg=-mg --extra-arg=0 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M2"
+
+      - name: M3 - RPC 2-way + MTP, draft device NOT named
+        if: always()
+        run: |
+          set +e
+          # The llama.cpp#24492 trigger: with more than one device available and
+          # no --spec-draft-device, llama_prepare_model_devices can place the
+          # draft on a different backend from the shared KV tensors.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M3" \
+            --title "M3 V2 vs V3, 2x RPC + draft-mtp, no --spec-draft-device" \
+            --fixture amd_ci/probes/rpc_servers_fixture.py \
+            --fixture-arg=--bin-dir --fixture-arg="$VULKAN_BIN" \
+            --fixture-arg=--device --fixture-arg=Vulkan0 \
+            --fixture-arg=--port --fixture-arg="$RPC_A" \
+            --fixture-arg=--port --fixture-arg="$RPC_B" \
+            --fixture-arg=--log-dir --fixture-arg="$AMD_CI_WORK/out/M3" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --spec-type draft-mtp --draft-model "$MTP_GGUF" \
+               --extra-arg=--rpc --extra-arg="127.0.0.1:$RPC_A,127.0.0.1:$RPC_B" \
+               --extra-arg=-dev --extra-arg=RPC0,RPC1 \
+               --extra-arg=-sm --extra-arg=layer --extra-arg=-ts --extra-arg=50,50 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M3"
+
+      - name: M4 - RPC 2-way + MTP, draft device named
+        if: always()
+        run: |
+          set +e
+          # The reported fix for M3. If M3 aborts and M4 does not, the answer for
+          # the dual-GPU reporters is a flag, not a quant.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M4" \
+            --title "M4 V2 vs V3, 2x RPC + draft-mtp, --spec-draft-device RPC0" \
+            --fixture amd_ci/probes/rpc_servers_fixture.py \
+            --fixture-arg=--bin-dir --fixture-arg="$VULKAN_BIN" \
+            --fixture-arg=--device --fixture-arg=Vulkan0 \
+            --fixture-arg=--port --fixture-arg="$RPC_A" \
+            --fixture-arg=--port --fixture-arg="$RPC_B" \
+            --fixture-arg=--log-dir --fixture-arg="$AMD_CI_WORK/out/M4" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --spec-type draft-mtp --draft-model "$MTP_GGUF" \
+               --extra-arg=--rpc --extra-arg="127.0.0.1:$RPC_A,127.0.0.1:$RPC_B" \
+               --extra-arg=-dev --extra-arg=RPC0,RPC1 \
+               --extra-arg=-devd --extra-arg=RPC0 \
+               --extra-arg=-sm --extra-arg=layer --extra-arg=-ts --extra-arg=50,50 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M4"
+
+      - name: M5 - dual backend, -dev Vulkan0,ROCm0
+        if: always()
+        run: |
+          set +e
+          if [ -z "${MERGED_BIN:-}" ]; then
+            echo "no dual-backend build; this configuration is UNTESTED, not passing"
+            exit 0
+          fi
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M5" \
+            --title "M5 V2 vs V3, one binary over Vulkan0 + ROCm0" \
+            -- --bin-dir "$MERGED_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --extra-arg=-dev --extra-arg=Vulkan0,ROCm0 \
+               --extra-arg=-sm --extra-arg=layer --extra-arg=-ts --extra-arg=50,50 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M5/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M5"
+
+      - name: M6 - dual backend + MTP, draft device NOT named
+        if: always()
+        run: |
+          set +e
+          # The exact shape @Kononnable reported on llama.cpp#24492: both
+          # backends live in one build, MTP on, draft device left to the
+          # scheduler.
+          if [ -z "${MERGED_BIN:-}" ]; then
+            echo "no dual-backend build; this configuration is UNTESTED, not passing"
+            exit 0
+          fi
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/M6" \
+            --title "M6 V2 vs V3, Vulkan0 + ROCm0 + draft-mtp, no --spec-draft-device" \
+            -- --bin-dir "$MERGED_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --spec-type draft-mtp --draft-model "$MTP_GGUF" \
+               --extra-arg=-dev --extra-arg=Vulkan0,ROCm0 \
+               --extra-arg=-sm --extra-arg=layer --extra-arg=-ts --extra-arg=50,50 \
+               --extra-arg=-fa --extra-arg=on \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/M6/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/M6"
+
+      - name: Stop anything still holding the GPU
+        if: always()
+        run: |
+          set +e
+          # Third layer of cleanup, for the case where a STEP was killed and
+          # neither the fixture's own PID-stop nor its --max-seconds
+          # self-destruct got the chance to run. By recorded PID, with a cmdline
+          # recheck against PID reuse. Never `pkill -f`: on a shared host that
+          # pattern matches the shell running it.
+          python3 amd_ci/lib/kill_recorded.py "$AMD_CI_WORK/out"
+          { rocm-smi --showmeminfo vram --csv || true; } 2>&1 | tail -5
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-multigpu-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
