@@ -46,8 +46,12 @@ jobs:
           . "$WORK/venv/bin/activate"
           export TMPDIR="$WORK/tmp"
           pip install -q --upgrade pip
-          pip install -q "$AMD_INDEX/$TORCH_WHL" "$AMD_INDEX/$VISION_WHL" "$AMD_INDEX/$TRITON_WHL"
+          # torch pins its own triton; installing the standalone triton wheel alongside it is an
+          # unsolvable resolution. Let torch bring its dependency, and graft the rest on --no-deps.
+          pip install -q "$AMD_INDEX/$TORCH_WHL"
+          pip install -q --no-deps "$AMD_INDEX/$VISION_WHL"
           python -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
+          python -c "import torchvision; print('torchvision', torchvision.__version__)" || echo "torchvision import failed (non-fatal)"
           echo "$WORK/venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$WORK/venv" >> "$GITHUB_ENV"
           echo "TMPDIR=$WORK/tmp" >> "$GITHUB_ENV"
