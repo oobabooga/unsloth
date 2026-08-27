@@ -7,33 +7,77 @@ on:
 permissions: {}
 
 jobs:
-  amd:
+  wheels:
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
-      - name: Probe formats
+      - name: Wheel architecture lists
         run: |
           set +e
-          echo "===== which ====="
-          for t in rocminfo amd-smi rocm-smi hipconfig lspci; do
-            printf '%s: %s\n' "$t" "$(command -v $t || echo MISSING)"
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/dl" "$W/tmp"
+          export TMPDIR="$W/tmp"
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          pip install -q --upgrade pip >/dev/null 2>&1
+
+          GENERIC=https://download.pytorch.org/whl/rocm7.1
+          A110=https://repo.amd.com/rocm/whl/gfx110X-all/
+          A103=https://repo.amd.com/rocm/whl/gfx103X-all/
+          A1152=https://repo.amd.com/rocm/whl/gfx1152/
+
+          echo "===== available torch versions per index ====="
+          for u in "$GENERIC" "$A110" "$A103" "$A1152"; do
+            echo "--- $u"
+            pip index versions torch --index-url "$u" 2>&1 | head -5
           done
-          echo "===== amd-smi list ====="
-          amd-smi list 2>&1 | head -60
-          echo "===== amd-smi static --asic ====="
-          amd-smi static --asic 2>&1 | head -80
-          echo "===== amd-smi version ====="
-          amd-smi version 2>&1 | head -5
-          echo "===== rocminfo (agent headers + gfx) ====="
-          rocminfo 2>&1 | grep -nE '^\*+$|^Agent [0-9]+|Name:|gfx' | head -60
-          echo "===== KFD topology ====="
-          for n in /sys/class/kfd/kfd/topology/nodes/*/; do
-            printf '%s vendor_id=%s gfx_target_version=%s\n' \
-              "$n" \
-              "$(grep -oE 'vendor_id [0-9]+' $n/properties | head -1)" \
-              "$(grep -oE 'gfx_target_version [0-9]+' $n/properties | head -1)"
+
+          echo "===== generic rocm7.1: install + get_arch_list ====="
+          pip install -q torch --index-url "$GENERIC" 2>&1 | tail -3
+          python3 - <<'PY'
+import torch
+print("VERSION", torch.__version__, "HIP", getattr(torch.version, "hip", None))
+try:
+    print("ARCHLIST", sorted(torch.cuda.get_arch_list()))
+except Exception as e:
+    print("ARCHLIST_ERR", type(e).__name__, e)
+PY
+          echo "--- rocblas/hipblaslt arch files (generic) ---"
+          python3 -c "import torch,os;print(os.path.dirname(torch.__file__))" > "$W/tp"
+          TP=$(cat "$W/tp")
+          ls "$TP/lib/rocblas/library" 2>/dev/null | grep -oE 'gfx[0-9a-z]+' | sort -u | tr '\n' ' '; echo
+          ls "$TP/lib/hipblaslt/library" 2>/dev/null | grep -oE 'gfx[0-9a-z]+' | sort -u | tr '\n' ' '; echo
+          pip uninstall -y -q torch >/dev/null 2>&1
+
+          for pair in "gfx110X-all $A110" "gfx103X-all $A103" "gfx1152 $A1152"; do
+            set -- $pair
+            leaf=$1; url=$2
+            echo "===== $leaf: install + get_arch_list ====="
+            pip install -q torch --index-url "$url" 2>&1 | tail -3
+            python3 - <<'PY'
+import torch, os
+print("VERSION", torch.__version__, "HIP", getattr(torch.version, "hip", None))
+try:
+    print("ARCHLIST", sorted(torch.cuda.get_arch_list()))
+except Exception as e:
+    print("ARCHLIST_ERR", type(e).__name__, e)
+tp = os.path.dirname(torch.__file__)
+for sub in ("lib/rocblas/library", "lib/hipblaslt/library"):
+    p = os.path.join(tp, sub)
+    if os.path.isdir(p):
+        import re
+        arch = sorted({m for f in os.listdir(p) for m in re.findall(r"gfx[0-9a-z]+", f)})
+        print(sub, arch)
+PY
+            echo "--- rocm meta-package requires (family read-back) ---"
+            python3 - <<'PY'
+from importlib import metadata
+try:
+    print("ROCM_REQUIRES", metadata.requires("rocm"))
+except Exception as e:
+    print("ROCM_REQUIRES_ERR", type(e).__name__, e)
+print("DISTS", sorted(d.metadata["Name"] for d in metadata.distributions()
+                      if "rocm-sdk" in (d.metadata["Name"] or "")))
+PY
+            pip uninstall -y -q torch >/dev/null 2>&1
           done
-          echo "===== /opt/rocm version ====="
-          cat /opt/rocm/.info/version 2>&1 | head -3
           echo "===== END ====="
           exit 0
