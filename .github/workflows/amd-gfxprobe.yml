@@ -1,0 +1,39 @@
+name: AMD DevLab gfx probe
+
+on:
+  push:
+    branches: [amd-devlab-gfxprobe-9829]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 20
+    steps:
+      - name: Probe formats
+        run: |
+          set +e
+          echo "===== which ====="
+          for t in rocminfo amd-smi rocm-smi hipconfig lspci; do
+            printf '%s: %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+          echo "===== amd-smi list ====="
+          amd-smi list 2>&1 | head -60
+          echo "===== amd-smi static --asic ====="
+          amd-smi static --asic 2>&1 | head -80
+          echo "===== amd-smi version ====="
+          amd-smi version 2>&1 | head -5
+          echo "===== rocminfo (agent headers + gfx) ====="
+          rocminfo 2>&1 | grep -nE '^\*+$|^Agent [0-9]+|Name:|gfx' | head -60
+          echo "===== KFD topology ====="
+          for n in /sys/class/kfd/kfd/topology/nodes/*/; do
+            printf '%s vendor_id=%s gfx_target_version=%s\n' \
+              "$n" \
+              "$(grep -oE 'vendor_id [0-9]+' $n/properties | head -1)" \
+              "$(grep -oE 'gfx_target_version [0-9]+' $n/properties | head -1)"
+          done
+          echo "===== /opt/rocm version ====="
+          cat /opt/rocm/.info/version 2>&1 | head -3
+          echo "===== END ====="
+          exit 0
