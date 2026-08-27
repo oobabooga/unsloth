@@ -1,0 +1,243 @@
+name: "AMD CI: what frame rate does a user get at 0K / 100K / 500K today, against before the campaign?"
+
+# THE QUESTION, and it is the user's own, asked as they asked it:
+#
+#   "60 FPS downgrading to 5 FPS when the context length grows from 0K to 100K to 500K."
+#
+# Every number this campaign has published was measured on a BRANCH with a flag forced on. Seven
+# PRs landed on main, the flags now ship ON BY DEFAULT, and nobody has measured MAIN AS IT NOW
+# STANDS against the complaint. That is what this workflow does.
+#
+#   pre   c87fe20e3, the last commit before the campaign started. The "60 fps" side.
+#   head  today's main, installed as it ships.
+#
+# NOTHING IS FORCED ON EITHER ARM, and that is the whole point. `code-fence-mode.ts` has
+# `SHIP_DEFAULT = "defer"` and `math-block-mode.ts` has `SHIP_DEFAULT = "contain"`, so the head arm
+# BOOTS into the fixed state. Setting a flag here would measure a configuration no user runs. The
+# scene instead reads each arm's state back out of the running page, per rung, and the criteria
+# module VOIDs a head session that did not boot into the shipped state or that something forced.
+#
+# THE TRAP THAT WOULD MAKE THIS A TWO-VARIABLE EXPERIMENT. `pre` has no `tests/studio/studiobench`
+# at all, so the pacer, seeder, corpus and scene MUST come from one pinned checkout for both arms.
+# An arm measured with the harness that shipped alongside it differs from the other arm by the
+# change AND by the measuring device, and the difference gets reported as the change. Both arms
+# also take unsloth-zoo from ITS main, which `install.sh --local` already does, and the resolved
+# commit is read back out of each venv and compared by a gate.
+#
+# THE OTHER TRAP, and it is the one that voids frame-rate work generally. Two of the three
+# plausible frame channels are BLIND: `GdkFrameClock::after-paint` reads 60.0 fps with the main
+# thread 80% blocked, and `1000/p50` of rAF gaps reads 16.0 ms jammed and unjammed alike. The
+# headline here is therefore effective frame rate over WALL TIME, and the scene opens a
+# DELIBERATELY JAMMED window inside EVERY session, at every rung, on both arms. If that control
+# does not resolve, the criteria module returns VOID and `announce.py` fails the job. The
+# documented pass on this venue is about 61 -> 17 fps.
+#
+# ONE MORE THING THIS RUN HAS TO CHECK RATHER THAN INHERIT. `math-block-mode.ts::gateOnEngine`
+# turns containment OFF unless `CSS.supports("anchor-name: --unsloth-probe")` is true. If this
+# runner's WebKitGTK fails that probe then the head arm ran WITHOUT the scroll fix, and the honest
+# report of a small delta is "the fix was never on". That has its own verdict string.
+#
+# SEQUENTIAL, ALWAYS. Two WebKitGTK toplevels on one X server occlude each other and the lower one
+# stops being asked to paint, which reads as a frame rate.
+
+on:
+  push:
+    branches: [amd-ci-final-arms]
+  workflow_dispatch:
+    inputs:
+      ref_pre:
+        description: >-
+          The commit of unslothai/unsloth to install as the `pre` arm: the last commit before the
+          campaign started. This is the subject, not this harness; the workflow itself always runs
+          from the branch it was dispatched on.
+        required: false
+        default: c87fe20e3
+      ref_head:
+        description: >-
+          The commit to install as the `head` arm, as it ships. PINNED TO A SHA rather than
+          `main`, because `main` moves: a run that clones "main" cannot be reproduced later and
+          cannot be quoted against a specific set of merged PRs.
+        required: false
+        default: 40b4702cd39f3e51b3f5404b1525c3e1c4fc5bd8
+      rungs:
+        description: "Ladder rungs, comma separated."
+        required: false
+        default: 0K,100K,500K
+      reps:
+        description: "Repetitions per arm per rung. Two is the minimum a difference can have a floor against."
+        required: false
+        default: "2"
+      subject_repo:
+        description: "Repository to clone for both arms."
+        required: false
+        default: https://github.com/unslothai/unsloth
+
+permissions:
+  contents: read
+
+jobs:
+
+  selftest:
+    name: "Self-test the scene and the scoring layer (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 25
+    # Explicitly blind to the device. This job exists to protect the expensive one and must never
+    # allocate on the single gfx1151 the four ephemeral slots share.
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-final-arms-selftest"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The scoring layer, against synthetic payloads whose right answers are known, including
+      # every way THIS measurement can be wrong: a jam the channel cannot see, a base that never
+      # collapsed, an engine that fails the containment gate, a head arm that was forced, a pre arm
+      # carrying head's markers, two arms on two zoos, two arms reporting one bundle, a rung
+      # measured once, and a regression whose repetitions overlap. A criteria module that can only
+      # produce one answer is the failure mode that has cost this campaign the most.
+      - name: Criteria self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest_arms.py 2>&1 | tail -80
+          rc=${PIPESTATUS[0]}
+          echo "arms criteria selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The SCENE, against a hand-rolled DOM stub. It cannot measure anything, but it proves the
+      # scene reaches its end, posts the payload shape the criteria module reads, that the jammed
+      # control really falls, and that the readback can report the UN-fixed state as well as the
+      # fixed one.
+      #
+      # A missing `node` is the one case that does not fail here, and deliberately: this check is
+      # about the scene, not about the subject or the hardware, and it was run to green locally
+      # before the branch was pushed.
+      - name: Scene self-test
+        run: |
+          set +e
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::warning::node is not on this runner, so the scene self-test did not run here. \
+          It was run to green locally before this branch was pushed; see \
+          amd_ci/probes/studio_ladder/selftest_final_scene.mjs"
+            exit 0
+          fi
+          node amd_ci/probes/studio_ladder/selftest_final_scene.mjs 2>&1 | tail -60
+          rc=${PIPESTATUS[0]}
+          echo "scene selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+  measure:
+    name: "Two shipped builds up the ladder at 0K / 100K / 500K in WebKitGTK (exclusive)"
+    needs: selftest
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 480
+    # Compositing a browser and seeding a 500K thread both allocate on the one gfx1151 the four
+    # ephemeral slots share. The group holds one runner plus exactly ONE waiter, and a third
+    # arrival silently CANCELS the waiter while the other job stays green, so the loss is easy to
+    # miss. Nothing else in this workflow takes the group.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-final-arms"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. A skip would misreport missing hardware as nothing to see.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      # Its own step, and early, because step logs are only served once the job COMPLETES and this
+      # is the diagnostic worth having if the measurement never starts.
+      - name: Engine inventory
+        run: |
+          set +e
+          for p in /usr/bin/python3 /usr/bin/python3.12 /usr/bin/python3.13; do
+            [ -x "$p" ] || continue
+            echo "== $p"
+            "$p" -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('  WebKit', WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version())" 2>&1 | tail -2
+          done
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      # Two installs, three rungs, two repetitions, arm order swapped on the second repetition.
+      # Both arms arrive through `env` rather than being interpolated into the shell line, so a
+      # dispatch input cannot become part of the command.
+      - name: The ladder, both arms, at 0K / 100K / 500K
+        timeout-minutes: 450
+        env:
+          SUBJECT_REPO: ${{ inputs.subject_repo || 'https://github.com/unslothai/unsloth' }}
+          REF_PRE: ${{ inputs.ref_pre || 'c87fe20e3' }}
+          REF_HEAD: ${{ inputs.ref_head || '40b4702cd39f3e51b3f5404b1525c3e1c4fc5bd8' }}
+          RUNGS: ${{ inputs.rungs || '0K,100K,500K' }}
+          REPS: ${{ inputs.reps || '2' }}
+        run: |
+          set +e
+          echo "pre  arm: $SUBJECT_REPO at $REF_PRE"
+          echo "head arm: $SUBJECT_REPO at $REF_HEAD"
+          echo "rungs $RUNGS, reps $REPS"
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_arms_probe.py \
+            --criteria amd_ci/criteria/studio_arms_ladder.py \
+            --out-dir "$AMD_CI_WORK/out/arms" \
+            -- --rungs "$RUNGS" --reps "$REPS" \
+               --repo "$SUBJECT_REPO" --ref-pre "$REF_PRE" --ref-head "$REF_HEAD"
+          cat "$AMD_CI_WORK/out/arms/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not. A run whose
+          # jam control never resolved is a NON-result and must not tick.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/arms"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By PORT, then by PID. A pattern-matching process killer would match this very step's
+          # own shell, because the pattern ends up on its command line; that has cost a real run,
+          # and the `[e]` bracket trick does not fix it. A Studio or an Xvfb that outlives the job
+          # holds VRAM on a machine three other slots share, so this cannot simply be skipped.
+          for p in $(seq 5541 5600); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The raw observations, separately from the verdict. Every window's full rAF gap series and
+      # every readback are in here, so the run can be re-scored offline against the untouched
+      # artifact if the reader turns out to be wrong, rather than costing another exclusive slot.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-final-arms
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-final-arms-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/arms/out/logs
+            ${{ env.AMD_CI_WORK }}/arms/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn

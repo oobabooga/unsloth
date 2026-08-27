@@ -1,0 +1,61 @@
+diff --git a/studio/frontend/src/features/chat/api/chat-adapter.ts b/studio/frontend/src/features/chat/api/chat-adapter.ts
+index 8dd7228..72234d7 100644
+--- a/studio/frontend/src/features/chat/api/chat-adapter.ts
++++ b/studio/frontend/src/features/chat/api/chat-adapter.ts
+@@ -3893,9 +3893,15 @@ export function createOpenAIStreamAdapter(
+       unstable_assistantMessageId,
+     }) {
+       const fencedCodeProvenance = new AssistantFencedCodeProvenanceTracker();
++      // AMDCI_PIECE1_NEUTRALISED
++      // Ablation arm: publish the parts array unannotated, as before piece 1.
++      // No `__unslothFenceProvenance` key is attached, so the per-token fence
++      // scan never runs and `readFencedCodeProvenance` in markdown-text.tsx
++      // reads `undefined` and yields the empty ordinal list.
++      void fencedCodeProvenance;
+       const publishedAssistantContent = <T extends { type: string }>(
+         parts: readonly T[],
+-      ): T[] => fencedCodeProvenance.annotate(parts);
++      ): T[] => [...parts];
+       // Before the first await: hydration and a model load both run ahead of the
+       // first resolveProjectId, and a send survives navigation. Only consulted
+       // while the thread's own row is still missing.
+diff --git a/studio/frontend/src/features/chat/utils/parse-assistant-content.ts b/studio/frontend/src/features/chat/utils/parse-assistant-content.ts
+index d1f1fe5..0a1f221 100644
+--- a/studio/frontend/src/features/chat/utils/parse-assistant-content.ts
++++ b/studio/frontend/src/features/chat/utils/parse-assistant-content.ts
+@@ -93,26 +93,17 @@ export type ReasoningMirrorGuard = {
+ export function createReasoningMirrorGuard(
+   suppressTerminalMirror: boolean,
+ ): ReasoningMirrorGuard {
+-  let reasoning = "";
+-  let hasVisibleText = false;
++  // AMDCI_PIECE1_NEUTRALISED
++  // Ablation arm: the guard becomes the identity, which is what the adapter did
++  // before piece 1 -- `const { text: delta } = extractDeltaText(rawDelta)` was
++  // published as-is, terminal mirror included. Nothing else in the guard has an
++  // observable effect, so this is the whole of its behaviour.
++  void suppressTerminalMirror;
++  void MIN_REASONING_MIRROR_CHARACTERS;
+ 
+   return {
+-    appendReasoning(delta: string): void {
+-      reasoning += delta;
+-    },
+-    filterVisibleText(delta: string, terminal: boolean): string {
+-      if (!delta) return "";
+-      if (
+-        terminal &&
+-        suppressTerminalMirror &&
+-        reasoning.length >= MIN_REASONING_MIRROR_CHARACTERS &&
+-        !hasVisibleText &&
+-        reasoning.length === delta.length &&
+-        reasoning === delta
+-      ) {
+-        return "";
+-      }
+-      hasVisibleText = true;
++    appendReasoning(): void {},
++    filterVisibleText(delta: string): string {
+       return delta;
+     },
+   };
