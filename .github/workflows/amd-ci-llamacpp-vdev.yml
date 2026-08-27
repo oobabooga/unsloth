@@ -1,0 +1,237 @@
+name: "AMD CI: virtual devices and tensor split on gfx1151"
+
+# Follow-up to unslothai/unsloth#9792. That report's largest self-declared gap
+# was that `-sm row` / tensor split could not be reached on this host at all:
+# RPC refused it ("RPC0 does not support split buffers") and so did the
+# dual-backend build ("Vulkan0 does not support split buffers"). Tensor split is
+# exactly the mode @kostich flagged on ggml-org/llama.cpp#24492, so the gap sat
+# on top of the most suspicious configuration.
+#
+# @Kononnable pointed out a third mechanism: GGML_CUDA_DEVICES, which makes one
+# physical card enumerate as several VIRTUAL devices. Provenance, since the
+# comment's shell prompt says `pr-27742` and that is a different PR (it is the
+# Qwen3.8-Flash-Next model-support PR): the virtual-device feature is
+# ggml-org/llama.cpp#25228, merged 2026-07-16 as commit 79bba02, first carried by
+# tag b10043. It lives in the shared CUDA-family backend, so HIP builds compile
+# it, and b10631 postdates it.
+#
+# Structure, and the reason for it: the cheap question comes first. Whether this
+# host can reach tensor split AT ALL is answerable with a 400 MB model in
+# minutes, and it decides whether the 35 GB V2-vs-V3 comparison is worth
+# downloading onto a shared runner. If row split is refused again, that is the
+# result - a third independent mechanism failing - and the big download is
+# skipped rather than spent proving nothing.
+#
+#   A0/A1/A2  capability, 0.6B: single device; 3 virtual devices -sm layer;
+#             3 virtual devices -sm row. Observation only, no verdict.
+#   V2/V3     only if A2 reached tensor split: 27B V2 vs V3 under -sm row, and
+#             under -sm row with MTP engaged.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-vdev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b10631"
+  SMALL_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  SMALL_REV: "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+  SMALL_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  REV_V2: "408fcc1807ab264d8cd644a7c4c0f58fbd32eebc"
+  REV_V3: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  FILE_Q4: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  FILE_MTP: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+  VDEVS: "3"
+  CTX: "8192"
+
+jobs:
+
+  gpu:
+    name: "virtual devices and tensor split on gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 350
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-vdev"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch llama.cpp ROCm build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          # ROCm only. GGML_CUDA_DEVICES is read by the CUDA-family backend, so
+          # the Vulkan build cannot answer this question at all.
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Fetch the 0.6B capability model
+        timeout-minutes: 20
+        run: |
+          set -eu
+          python3 amd_ci/lib/fetch_gguf.py --repo "$SMALL_REPO" --file "$SMALL_FILE" \
+            --revision "$SMALL_REV" --as-name model.gguf \
+            --local-dir "$AMD_CI_WORK/models/small" \
+            --out "$AMD_CI_WORK/out/model_small.json"
+
+      - name: A0-A2 - can this host reach tensor split at all?
+        if: always()
+        run: |
+          set +e
+          # Observation, not judgement: the probe is run directly, with no
+          # criteria module, because "is this configuration reachable" is a
+          # capability question and there is no base/head comparison in it.
+          M="$AMD_CI_WORK/models/small"
+          O="$AMD_CI_WORK/out/cap"
+          mkdir -p "$O"
+          python3 amd_ci/probes/llamacpp_mtp_probe.py --state a0 --checkout "$M" \
+            --out "$O/obs_a0.json" --bin-dir "$ROCM_BIN" --gguf model.gguf \
+            --ctx-size "$CTX" --load-timeout 600 --request-timeout 300
+          python3 amd_ci/probes/llamacpp_mtp_probe.py --state a1 --checkout "$M" \
+            --out "$O/obs_a1.json" --bin-dir "$ROCM_BIN" --gguf model.gguf \
+            --ctx-size "$CTX" --env "GGML_CUDA_DEVICES=$VDEVS" \
+            --extra-arg=-sm --extra-arg=layer \
+            --load-timeout 600 --request-timeout 300
+          python3 amd_ci/probes/llamacpp_mtp_probe.py --state a2 --checkout "$M" \
+            --out "$O/obs_a2.json" --bin-dir "$ROCM_BIN" --gguf model.gguf \
+            --ctx-size "$CTX" --env "GGML_CUDA_DEVICES=$VDEVS" \
+            --extra-arg=-sm --extra-arg=row \
+            --load-timeout 600 --request-timeout 300
+          python3 -c "$CAP_PY" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "$CAP_PY" --env >> "$GITHUB_ENV"
+        env:
+          CAP_PY: |
+            import json, os, sys
+            O = os.environ["AMD_CI_WORK"] + "/out/cap"
+            def load(n):
+                try:
+                    return json.load(open(f"{O}/obs_{n}.json"))
+                except Exception:
+                    return {}
+            a0, a1, a2 = load("a0"), load("a1"), load("a2")
+            def accel(o):
+                return {d: n for d, n in (o.get("layers_by_device") or {}).items()
+                        if not d.upper().startswith("CPU") and not d.upper().endswith("_HOST")}
+            # Reached means: it generated a token AND the graph really sat on two
+            # or more accelerator devices. Either alone would overstate it - a
+            # run that silently collapsed onto one device is a single-device run.
+            row_ok = bool(a2.get("succeeded")) and len(accel(a2)) >= 2
+            layer_ok = bool(a1.get("succeeded")) and len(accel(a1)) >= 2
+            if "--env" in sys.argv:
+                print(f"ROW_OK={'1' if row_ok else '0'}")
+                print(f"LAYER_OK={'1' if layer_ok else '0'}")
+                raise SystemExit(0)
+            print("### Capability: GGML_CUDA_DEVICES on ROCm, 0.6B\n")
+            print("| cell | config | devices | tokens | markers |")
+            print("|---|---|---|---|---|")
+            for name, o, cfg in (("A0", a0, "1 device, no -sm"),
+                                 ("A1", a1, f"GGML_CUDA_DEVICES={os.environ['VDEVS']}, -sm layer"),
+                                 ("A2", a2, f"GGML_CUDA_DEVICES={os.environ['VDEVS']}, -sm row")):
+                print("| %s | %s | `%s` | %s | %s |" % (
+                    name, cfg, o.get("layers_by_device"), o.get("tokens_generated"),
+                    ", ".join(o.get("markers") or []) or "-"))
+            print("\n`--list-devices` under GGML_CUDA_DEVICES=%s:\n\n```\n%s\n```" % (
+                os.environ["VDEVS"], (a1.get("list_devices") or "")[:1500]))
+            print("\nTensor split reached: **%s**. Layer split across virtual "
+                  "devices reached: **%s**." % (row_ok, layer_ok))
+            if not row_ok:
+                print("\nThe 27B cells are skipped: with tensor split unreachable, "
+                      "downloading 35 GB would measure nothing it has not already "
+                      "measured. This is the third mechanism to refuse it on this "
+                      "host, after RPC and the dual-backend build.")
+                tail = (a2.get("log_tail") or "")[-1200:]
+                print("\nA2 log tail:\n\n```\n%s\n```" % tail)
+
+      - name: Fetch the 27B models
+        if: always() && env.ROW_OK == '1'
+        timeout-minutes: 120
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V2" --as-name model.gguf --local-dir "$M/v2_q4" \
+            --out "$AMD_CI_WORK/out/model_v2_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_Q4" \
+            --revision "$REV_V3" --as-name model.gguf --local-dir "$M/v3_q4" \
+            --out "$AMD_CI_WORK/out/model_v3_q4.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$FILE_MTP" \
+            --revision "$REV_V3" --as-name mtp.gguf --local-dir "$M/mtp" \
+            --out "$AMD_CI_WORK/out/model_mtp.json"
+          echo "MTP_GGUF=$M/mtp/mtp.gguf" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/v2_q4" --path "head=$M/v3_q4" \
+            --label "base=V2 408fcc180" --label "head=V3 4ca720788" \
+            --out "$AMD_CI_WORK/out/states_rev.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: V2 - V2 vs V3, tensor split across virtual devices
+        if: always() && env.ROW_OK == '1'
+        run: |
+          set +e
+          # The cell #9792 could not run. The multidevice criteria module refuses
+          # any state whose graph did not really land on two or more accelerator
+          # devices, so a run that collapsed back to one device reads
+          # INCONCLUSIVE rather than as a confident negative.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/V2" \
+            --title "V2 V2 vs V3, ROCm, GGML_CUDA_DEVICES=$VDEVS, -sm row" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --env "GGML_CUDA_DEVICES=$VDEVS" \
+               --extra-arg=-sm --extra-arg=row \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/V2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/V2"
+
+      - name: V3 - V2 vs V3, tensor split plus MTP
+        if: always() && env.ROW_OK == '1'
+        run: |
+          set +e
+          # @kostich's exact shape on ggml-org/llama.cpp#24492: MTP on multiple
+          # GPUs with split mode set to tensor. The V3 sidecar is handed to the
+          # V2 weights as well, so MTP is engaged on both states.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_rev.json" \
+            --probe amd_ci/probes/llamacpp_mtp_probe.py \
+            --criteria amd_ci/criteria/llamacpp_multidevice.py \
+            --out-dir "$AMD_CI_WORK/out/V3" \
+            --title "V3 V2 vs V3, ROCm, GGML_CUDA_DEVICES=$VDEVS, -sm row, MTP engaged" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ctx-size "$CTX" \
+               --env "GGML_CUDA_DEVICES=$VDEVS" \
+               --spec-type draft-mtp --draft-model "$MTP_GGUF" \
+               --extra-arg=-sm --extra-arg=row \
+               --load-timeout 1800 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/V3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/V3"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-vdev-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
