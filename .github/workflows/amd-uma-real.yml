@@ -1,0 +1,100 @@
+name: AMD DevLab UMA real model
+
+on:
+  push:
+    branches: [amd-ci-uma-real]
+
+permissions: {}
+
+env:
+  LLAMA_TAG: b10639-mix-f6f92fe
+  BUNDLE: app-b10639-mix-f6f92fe-linux-x64-rocm-gfx1151.tar.gz
+  GGUF_REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  GGUF_REV: 178b998806b7b406c311a3e6174aa99cf6304eaf
+  QUANT: UD-IQ4_XS
+
+jobs:
+  real-model:
+    name: Qwen3.8-Flash-Next UD-IQ4_XS, the reported model
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Bundle and hardware
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/bin" "$W/models/real" "$W/out"
+          echo "W=$W" >> "$GITHUB_ENV"
+          curl -fL --retry 3 -o "$W/$BUNDLE" \
+            "https://github.com/unslothai/llama.cpp/releases/download/$LLAMA_TAG/$BUNDLE"
+          tar xzf "$W/$BUNDLE" -C "$W/bin"; rm -f "$W/$BUNDLE"
+          {
+            echo "## Host and build"; echo '```'
+            LD_LIBRARY_PATH="$W/bin" "$W/bin/llama-server" --version 2>&1 | head -4
+            head -3 /proc/meminfo
+            for f in /sys/class/drm/card*/device/mem_info_vram_total /sys/class/drm/card*/device/mem_info_gtt_total; do
+              [ -r "$f" ] && echo "$f = $(cat $f)"
+            done
+            df -h "$RUNNER_TEMP" | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download the 87 GiB model
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; M="$W/models/real"
+          for i in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-$QUANT-$i-of-00003.gguf"
+            [ -s "$M/$F" ] && continue
+            curl -fL --retry 5 --retry-delay 10 -o "$M/$F" \
+              "https://huggingface.co/$GGUF_REPO/resolve/$GGUF_REV/$QUANT/$F"
+          done
+          ls -l "$M"
+          du -sh "$M"
+
+      - name: A/B with the MoE experts split so both states fit
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"
+          M="$W/models/real/Qwen3.8-Flash-Next-$QUANT-00001-of-00003.gguf"
+          OUT="$W/out/split"; mkdir -p "$OUT"
+          ARGS=(--bin-dir "$W/bin" --gguf "$M" --ngl 999 --ctx-size 8192
+                --n-predict 64 --repeats 2 --load-timeout 3000 --request-timeout 1800
+                --extra --n-cpu-moe --extra 26)
+          python3 tools/llama_ab.py "${ARGS[@]}" --label "UMA absent" \
+            --env "-GGML_CUDA_ENABLE_UNIFIED_MEMORY" --out "$OUT/base.json"
+          python3 tools/llama_ab.py "${ARGS[@]}" --label "UMA=1" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --out "$OUT/head.json"
+          python3 tools/compare.py \
+            "Qwen3.8-Flash-Next UD-IQ4_XS, --n-cpu-moe 26 (identical placement in both states)" \
+            "$OUT/base.json" "$OUT/head.json" | tee "$OUT/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Full offload, both states, purely observational
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"
+          M="$W/models/real/Qwen3.8-Flash-Next-$QUANT-00001-of-00003.gguf"
+          OUT="$W/out/full"; mkdir -p "$OUT"
+          ARGS=(--bin-dir "$W/bin" --gguf "$M" --ngl 999 --ctx-size 8192
+                --n-predict 64 --repeats 1 --load-timeout 3000 --request-timeout 1800)
+          python3 tools/llama_ab.py "${ARGS[@]}" --label "UMA absent" \
+            --env "-GGML_CUDA_ENABLE_UNIFIED_MEMORY" --out "$OUT/base.json"
+          python3 tools/llama_ab.py "${ARGS[@]}" --label "UMA=1" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --out "$OUT/head.json"
+          python3 tools/compare.py \
+            "Qwen3.8-Flash-Next UD-IQ4_XS, full offload (87 GiB against a 64 GiB pool)" \
+            "$OUT/base.json" "$OUT/head.json" | tee "$OUT/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-real-model
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
