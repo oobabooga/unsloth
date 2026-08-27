@@ -11,7 +11,7 @@ env:
   AMD_INDEX: https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
   TORCH_WHL: torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl
   VISION_WHL: torchvision-0.24.0%2Brocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl
-  TRITON_WHL: triton-3.5.1%2Brocm7.2.1.git6ccc0111-cp312-cp312-linux_x86_64.whl
+  TRITON_WHL: triton-3.6.0%2Brocm7.2.1.gitba5c1517-cp312-cp312-linux_x86_64.whl
 
 jobs:
   amd:
@@ -46,9 +46,10 @@ jobs:
           . "$WORK/venv/bin/activate"
           export TMPDIR="$WORK/tmp"
           pip install -q --upgrade pip
-          # torch pins its own triton; installing the standalone triton wheel alongside it is an
-          # unsolvable resolution. Let torch bring its dependency, and graft the rest on --no-deps.
-          pip install -q "$AMD_INDEX/$TORCH_WHL"
+          # torch pins one exact triton build, and that build is only on the AMD index, so both
+          # URLs go in the same resolve. torchvision pins a torch this one does not match, so it
+          # is grafted on afterwards.
+          pip install -q "$AMD_INDEX/$TORCH_WHL" "$AMD_INDEX/$TRITON_WHL"
           pip install -q --no-deps "$AMD_INDEX/$VISION_WHL"
           python -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
           python -c "import torchvision; print('torchvision', torchvision.__version__)" || echo "torchvision import failed (non-fatal)"
