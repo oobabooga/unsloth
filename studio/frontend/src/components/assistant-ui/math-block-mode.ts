@@ -68,7 +68,10 @@ export type MathBlockMode = "off" | "contain";
  *
  * Moving this line is the whole of "turn block containment off again".
  */
-export const SHIP_DEFAULT: MathBlockMode = "contain";
+// PROBE BRANCH ONLY, NEVER TO BE MERGED. Flipped to "off" so the AMD arms workflow can run
+// this commit against d99cee713 and attribute the 100K scroll regression. The two trees are
+// otherwise byte-identical, so a difference is the containment and nothing else.
+export const SHIP_DEFAULT: MathBlockMode = "off";
 
 /*
  * THE FIND-IN-PAGE GATE, and why it is a proxy rather than a direct test.
