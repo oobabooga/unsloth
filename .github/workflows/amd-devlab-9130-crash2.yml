@@ -1,0 +1,271 @@
+name: AMD DevLab issue 9130 crash v2
+
+on:
+  push:
+    branches: [amd-devlab-9130-crash2]
+
+permissions: {}
+
+env:
+  MAIN_SHA: 177a57b3b416cd572d3ed482eb2e08e6a3de5061
+  AMD_INDEX: https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
+  TORCH_WHL: torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl
+  VISION_WHL: torchvision-0.24.0%2Brocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl
+  TRITON_WHL: triton-3.5.1%2Brocm7.2.1.git6ccc0111-cp312-cp312-linux_x86_64.whl
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    steps:
+      - name: Hardware and ROCm
+        run: |
+          set +e
+          cat /opt/rocm/.info/version; hipconfig --version; echo
+          rocminfo 2>/dev/null | grep -E "gfx1151" | head -2
+          python3 --version
+          free -h | head -2
+          true
+
+      - name: Fetch Studio
+        run: |
+          set -eux
+          WORK="$RUNNER_TEMP/c2"
+          mkdir -p "$WORK"/{tmp,logs,cache/hf}
+          git init -q "$WORK/src"
+          git -C "$WORK/src" remote add origin https://github.com/unslothai/unsloth.git
+          git -C "$WORK/src" fetch -q --depth 1 origin "$MAIN_SHA"
+          git -C "$WORK/src" checkout -q "$MAIN_SHA"
+          git -C "$WORK/src" log -1 --format='%H %s'
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+
+      - name: Install torch matched to the host ROCm
+        run: |
+          set -eux
+          python3 -m venv "$WORK/venv"
+          . "$WORK/venv/bin/activate"
+          export TMPDIR="$WORK/tmp"
+          pip install -q --upgrade pip
+          pip install -q "$AMD_INDEX/$TORCH_WHL" "$AMD_INDEX/$VISION_WHL" "$AMD_INDEX/$TRITON_WHL"
+          python -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
+          echo "$WORK/venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$WORK/venv" >> "$GITHUB_ENV"
+          echo "TMPDIR=$WORK/tmp" >> "$GITHUB_ENV"
+          echo "HF_HOME=$WORK/cache/hf" >> "$GITHUB_ENV"
+          echo "HF_HUB_CACHE=$WORK/cache/hf/hub" >> "$GITHUB_ENV"
+          echo "HF_XET_CACHE=$WORK/cache/hf/xet" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$WORK/src/studio/backend" >> "$GITHUB_ENV"
+
+      - name: Do GPU kernels run now
+        id: kernels
+        run: |
+          set +e
+          cat > "$WORK/gpu_probe.py" <<'PROBE'
+          """Find out whether any GPU kernel runs at all on this gfx1151 runner, and which call dies.
+
+          Each probe is its own process (the harness runs this file once per probe name) because a HIP
+          fault is not recoverable: the point is the exit code, not an exception.
+          """
+
+          import faulthandler
+          import json
+          import sys
+
+          faulthandler.enable()
+
+          import torch
+
+          probe = sys.argv[1]
+          print(json.dumps({
+              "probe": probe,
+              "torch": torch.__version__,
+              "hip": torch.version.hip,
+              "device": torch.cuda.get_device_name(0),
+              "arch": torch.cuda.get_device_properties(0).gcnArchName,
+          }), flush=True)
+
+          dev = torch.device("cuda")
+
+          if probe == "alloc":
+              x = torch.empty(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "note": "allocation only, no kernel"}), flush=True)
+          elif probe == "fill":
+              x = torch.ones(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "sum": float(x.sum().item())}), flush=True)
+          elif probe == "h2d":
+              x = torch.ones(1024).to(dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "back": float(x.cpu().sum().item())}), flush=True)
+          elif probe == "matmul":
+              a = torch.randn(512, 512, device=dev)
+              b = torch.randn(512, 512, device=dev)
+              c = a @ b
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(c.shape)}), flush=True)
+          elif probe == "conv":
+              x = torch.randn(1, 32, 64, 64, device=dev)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          elif probe == "conv_bf16":
+              x = torch.randn(1, 32, 64, 64, device=dev, dtype=torch.bfloat16)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev, torch.bfloat16)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          else:
+              raise SystemExit(f"unknown probe {probe}")
+          PROBE
+          ok=1
+          for p in alloc fill h2d matmul conv conv_bf16; do
+            out=$(python "$WORK/gpu_probe.py" "$p" 2>&1); code=$?
+            printf '%-10s exit=%-4s %s\n' "$p" "$code" "$(echo "$out" | grep -E '^\{|Fatal|Error' | tr '\n' ' ' | cut -c1-220)"
+            [ "$p" = "conv" ] && [ $code -ne 0 ] && ok=0
+          done
+          echo "kernels_ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "kernels_ok=$ok"
+          true
+
+      - name: Install Studio deps
+        if: steps.kernels.outputs.kernels_ok == '1'
+        run: |
+          set -eux
+          pip install -q -r "$WORK/src/studio/backend/requirements/studio.txt"
+          pip install -q python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests pillow safetensors 'numpy<3' \
+            'transformers>=4.51,<5.5' accelerate sentencepiece protobuf
+          pip install -q -r "$WORK/src/studio/backend/requirements/diffusers-pin.txt" || pip install -q 'diffusers>=0.35'
+          python -c "import torch, diffusers, transformers; print(torch.__version__, diffusers.__version__, transformers.__version__)"
+
+      - name: Reproduce - real generation in a live server process
+        if: steps.kernels.outputs.kernels_ok == '1'
+        run: |
+          set +e
+          cat > "$WORK/server.py" <<'SERVER'
+          """A minimal stand-in for the Studio API process, built on the real diffusion backend.
+
+          Same shape as studio/backend/routes/inference.py: one FastAPI process, the diffusion pipeline
+          loaded into it, and /generate handing the blocking call to the default executor with
+          ``asyncio.to_thread(backend.generate, ...)``. That threading model is the thing under test, so
+          it is copied rather than approximated. /health is the "is the server still up" probe -- the
+          reporter's observation was that port 8888 went dead.
+          """
+
+          import asyncio
+          import os
+          import sys
+
+          import uvicorn
+          from fastapi import FastAPI
+          from pydantic import BaseModel
+
+          from core.inference.diffusion import DiffusionBackend
+
+          backend = DiffusionBackend()
+          app = FastAPI()
+
+
+          class LoadBody(BaseModel):
+              repo: str
+
+
+          class GenBody(BaseModel):
+              prompt: str = "a photograph of a red bicycle leaning on a stone wall"
+              width: int = 1024
+              height: int = 1024
+              steps: int = 8
+              guidance: float = 0.0
+              seed: int = 1234
+
+
+          @app.get("/health")
+          def health() -> dict:
+              return {"ok": True, "pid": os.getpid()}
+
+
+          @app.post("/load")
+          def load(body: LoadBody) -> dict:
+              return backend.begin_load(body.repo, model_kind="pipeline", gpu_ordinal=0)
+
+
+          @app.get("/load-status")
+          def load_status() -> dict:
+              progress = backend.load_progress()
+              return {
+                  "phase": progress.get("phase"),
+                  "error": progress.get("error"),
+                  "downloaded": progress.get("downloaded"),
+                  "total": progress.get("total"),
+                  "loaded": bool(backend.status().get("loaded")),
+              }
+
+
+          @app.post("/generate")
+          async def generate(body: GenBody) -> dict:
+              # Exactly how the Studio route dispatches it.
+              result = await asyncio.to_thread(
+                  backend.generate,
+                  prompt=body.prompt,
+                  width=body.width,
+                  height=body.height,
+                  steps=body.steps,
+                  guidance=body.guidance,
+                  seed=body.seed,
+              )
+              images = result.get("images") or []
+              return {"images": len(images), "keys": sorted(result.keys())}
+
+
+          if __name__ == "__main__":
+              port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
+              uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+          SERVER
+          BASE=http://127.0.0.1:8899
+          python "$WORK/server.py" 8899 > "$WORK/logs/server.log" 2>&1 &
+          SERVER_PID=$!
+          echo "server pid=$SERVER_PID"
+          for i in $(seq 1 90); do curl -sf --max-time 5 "$BASE/health" >/dev/null && break; sleep 2; done
+          curl -s --max-time 30 "$BASE/health"; echo
+          curl -s --max-time 60 -X POST "$BASE/load" -H 'Content-Type: application/json' \
+            -d '{"repo": "unsloth/Z-Image-Turbo"}' | head -c 300; echo
+          for i in $(seq 1 180); do
+            kill -0 "$SERVER_PID" 2>/dev/null || { echo "SERVER DIED DURING LOAD at t=$((i*10))s"; break; }
+            STATUS=$(curl -s --max-time 20 "$BASE/load-status")
+            case "$STATUS" in
+              *'"loaded":true'*) echo "loaded after $((i*10))s"; break;;
+              *'"phase":"error"'*) echo "LOAD FAILED: $STATUS"; break;;
+            esac
+            [ $((i % 6)) -eq 0 ] && echo "  t=$((i*10))s $STATUS"
+            sleep 10
+          done
+          REPRODUCED=no
+          if kill -0 "$SERVER_PID" 2>/dev/null; then
+            for wh in "1024 1024" "1536 1536" "2048 2048" "2560 2560" "3072 3072"; do
+              set -- $wh
+              echo "::group::generate ${1}x${2}"
+              START=$(date +%s)
+              curl -s --max-time 2400 -X POST "$BASE/generate" -H 'Content-Type: application/json' \
+                -d "{\"width\": $1, \"height\": $2, \"steps\": 8}" | head -c 500
+              echo; echo "elapsed=$(( $(date +%s) - START ))s"
+              if kill -0 "$SERVER_PID" 2>/dev/null && curl -sf --max-time 15 "$BASE/health" >/dev/null; then
+                echo "SERVER ALIVE after ${1}x${2}"
+              else
+                echo "SERVER DEAD after ${1}x${2}  <-- issue #9130 reproduced"
+                REPRODUCED=yes
+                wait "$SERVER_PID"; echo "server exit status=$?"
+                echo "::endgroup::"; break
+              fi
+              echo "::endgroup::"
+            done
+          else
+            echo "server was already dead before any generation"
+            wait "$SERVER_PID"; echo "server exit status=$?"
+          fi
+          echo "reproduced=$REPRODUCED"
+          echo "--- server log tail ---"
+          tail -40 "$WORK/logs/server.log"
+          kill -9 "$SERVER_PID" 2>/dev/null
+          true
