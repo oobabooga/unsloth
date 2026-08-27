@@ -1,0 +1,342 @@
+name: "AMD CI: does PR 9695's 5.02x survive a rebase onto today's main?"
+
+# THE QUESTION.
+#
+# PR 9695 renders fenced code inside reasoning panes PLAIN. On this venue it measured **5.021x** on
+# `action:reasoning_toggle_all` at r100K (runs 32833058576 / 32841817590), with the reasoning span
+# census falling 74,250 -> 10,917. That number was taken against a main that no longer exists.
+# Since then main merged a great deal of work on EXACTLY this path -- PR 9799 (the idle grammar
+# pre-warm that was warming on an EMPTY STRING), PR 9731, PR 9787 -- and main's own per-fence
+# deferral now ships on by default, so a fence nobody has scrolled to already renders the plain
+# shell on `main` too.
+#
+# A DEAD WIN IS THE CORRECT ANSWER IF THAT IS WHAT THE BOX SAYS. There is a live precedent: PR
+# 9731's +92% turned out to be stale for exactly this reason. The criteria module is written so
+# that WIN_ABSORBED is as reachable as WIN_SURVIVES and is a FINDING that keeps the job green.
+#
+#   main   0be140dbd, unpatched
+#   head   0be140dbd + `git diff 0be140dbd..<PR 9695 head, rebased>` (3 files, +104/-7)
+#
+# WHERE THE BASE/HEAD ENFORCEMENT LIVES, STATED HERE AND AGAIN IN THE VERDICT ARTIFACT.
+#
+# `lib/differential.py` is NOT used, and the VOID rule it exists to enforce is implemented in
+# `criteria/studio_r9695_rebase.py` instead. differential.py runs the probe ONCE PER STATE -- base
+# leg, then head leg -- and this measurement cannot be laid out that way. PR 9695 is not
+# flag-gated: its whole mechanism is `reasoning.tsx` wrapping `<MarkdownText/>` in
+# `<MarkdownCodeHighlightingContext.Provider value="plain">`, a hardcoded literal read back with
+# `useContext`, with no env var, no `__UNSLOTH_*__` global and no `VITE_*` switch. So the two arms
+# are two separate FRONTEND BUILDS and cannot be toggled inside one running instance.
+#
+# What is done instead: BOTH bundles are built in the no-GPU job from ONE checkout, and the
+# measuring probe alternates WHICH DIST IS SERVED per repetition, relaunching Studio each time on
+# a fresh port with a fresh Studio home and a freshly seeded thread, with the arm order swapped on
+# alternate repetitions. That is rep-granularity interleaving of the two UNMODIFIED shipping
+# artifacts, on one host, in one job, against ONE backend install. It matters because this host
+# blocks the main thread for roughly 8.6 seconds every 30 at r500K: two sequential legs let such a
+# stall sit entirely on one arm and be reported as that arm's mechanism.
+#
+# No flag was added to PR 9695 to make interleaving possible. A runtime-flippable switch would be
+# a real context read that is not in the shipping artifact, which changes the thing being measured
+# to suit the instrument.
+#
+# THE RULE IS KEPT VERBATIM: if the `main` arm does not exhibit the defect at a rung, that rung is
+# VOID and scores nothing, however large the head-vs-main ratio. It is pinned by
+# `amd_ci/selftest_r9695.py`, which is MUTATION-VERIFIED: every guard is re-run against a
+# deliberately broken copy of the criteria module and must go RED there. That self-test runs in
+# the no-GPU job, before a slot is spent.
+#
+# TWO CONTROLS, BOTH INSIDE EVERY SESSION.
+#
+#   `idle_jammed` is the POSITIVE control: 200 ms of spin every 250 ms, at every rung, on both
+#   arms, in every repetition. Two of the three plausible frame channels are blind
+#   (`GdkFrameClock::after-paint` reads 60.0 fps with the main thread 80% blocked; `1000/p50` of
+#   rAF gaps read 62.5 -> 62.5 under a jam that took the correct channel from 62.0 to 16.6), so
+#   without it a flat frame rate cannot be told from an instrument that cannot go down.
+#
+#   `idle` is the IDLE control, and on this question it is the one most likely to matter. At r500K
+#   a `plain` arm once read +50% against the arm it was being compared with while its idle window
+#   was already stalling in 3 repetitions of 5. A repetition that fails it is DISCARDED BY NAME
+#   and the count is printed in the report.
+#
+# BOTH RUNGS, AND NEITHER LICENSES THE OTHER. r100K is where the 5.02x was measured; r500K is the
+# rung the complaint is actually about. Each is gated on its OWN controls.
+
+on:
+  push:
+    branches: [amd-ci-9695-rebase]
+  workflow_dispatch:
+    inputs:
+      rungs:
+        description: "Ladder rungs, comma separated. Both are required for an answer."
+        required: false
+        default: 100K,500K
+      reps:
+        description: >-
+          Repetitions per arm per rung. Five, because the criteria module discards repetitions
+          whose idle or jam control did not hold and still needs three to form a cell.
+        required: false
+        default: "100K:5,500K:5"
+      subject_repo:
+        description: "Repository to clone for both arms."
+        required: false
+        default: https://github.com/unslothai/unsloth
+
+permissions:
+  contents: read
+
+jobs:
+
+  build:
+    name: "Build both frontends from ONE checkout, and self-test the scoring layer (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 120
+    # Explicitly blind to the device. Building two frontends needs no GPU, and holding the
+    # exclusive gfx1151 group while it happens costs everyone else on the box for nothing.
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-r9695-build"
+
+      - name: Toolkit self-test
+        run: |
+          set +e
+          python3 amd_ci/selftest.py 2>&1 | tail -20
+          rc=${PIPESTATUS[0]}
+          echo "selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # THE GATE THAT PROTECTS THE EXPENSIVE JOB, and it is mutation-verified rather than merely
+      # present. Enforcement has moved out of the shared, reviewed lib/differential.py into
+      # per-task criteria code, which is exactly where a check quietly stops checking. Each guard
+      # is asserted GREEN on a synthetic payload whose right answer is known, then re-run against
+      # a deliberately BROKEN copy of the criteria module where it must go RED. A mutation that
+      # changes nothing means the assertion was not testing anything, and this step fails on it.
+      - name: Criteria self-test, MUTATION-VERIFIED
+        run: |
+          set +e
+          python3 amd_ci/selftest_r9695.py 2>&1 | tail -80
+          rc=${PIPESTATUS[0]}
+          echo "r9695 criteria selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # The SCENE, against a hand-rolled DOM stub. It cannot measure anything real, but it proves
+      # the scene reaches its end, posts the payload shape the criteria module reads, that the
+      # jammed control really falls while 1000/p50 on the same series does not, and that the
+      # reasoning-scoped fence census can report BOTH arms rather than only the convenient one.
+      #
+      # A missing `node` is the one case that does not fail here, and deliberately: this checks
+      # the harness, not the subject or the hardware, and it was run to green locally before this
+      # branch was pushed. It is not a hardware gate, so the "gates fail rather than skip" rule
+      # does not apply to it.
+      - name: Scene self-test
+        run: |
+          set +e
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::warning::node is not on this runner, so the scene self-test did not run here. \
+          It was run to green locally before this branch was pushed; see \
+          amd_ci/probes/studio_ladder/selftest_r9695_scene.mjs"
+            exit 0
+          fi
+          node amd_ci/probes/studio_ladder/selftest_r9695_scene.mjs 2>&1 | tail -70
+          rc=${PIPESTATUS[0]}
+          echo "scene selftest rc=$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+      # ITS OWN STEP, AND EARLY. Step logs are only served once the job COMPLETES, so anything
+      # needed to debug a bad run has to be readable from here or from the artifact. This is the
+      # diagnostic that says WHAT was measured: the patch itself, the marker it plants, and the
+      # fact that the marker is absent from the base tree so its presence identifies the arm.
+      - name: What is being built, in full
+        run: |
+          set +e
+          echo "== base commit"
+          echo "0be140dbd458535f7f93dc1eaffe703611ff9acf"
+          echo "== the arm patch, verbatim"
+          wc -l amd_ci/probes/studio_ladder/r9695.patch
+          cat amd_ci/probes/studio_ladder/r9695.patch
+          echo "== the head marker this run identifies the arms by"
+          grep -c "MarkdownCodeHighlightingContext" amd_ci/probes/studio_ladder/r9695.patch
+          echo "== the scored gesture, quoted out of the scene"
+          grep -n 'mark("action:' amd_ci/probes/studio_ladder/r9695_scene.js
+          exit 0
+
+      - name: Build both arms from one checkout
+        timeout-minutes: 100
+        run: |
+          set +e
+          python3 amd_ci/probes/studio_r9695_probe.py \
+            --mode build \
+            --dist-out "$AMD_CI_WORK/dists" \
+            --out "$AMD_CI_WORK/out/build_obs.json"
+          echo "build probe rc=$?"
+          ls -la "$AMD_CI_WORK/dists" 2>/dev/null | head -20
+          python3 - <<'PY'
+          import json, os, pathlib
+          w = pathlib.Path(os.environ["AMD_CI_WORK"])
+          m = w / "dists" / "build_manifest.json"
+          if not m.is_file():
+              print("::error::no build manifest was produced, so there is nothing to measure")
+              raise SystemExit(1)
+          d = json.loads(m.read_text())
+          hashes = {}
+          for n, s in d["states"].items():
+              print(f"{n:6s} landed={str(s.get('commit'))[:9]} patch_ok={s.get('patch_ok')} "
+                    f"marker={s.get('head_marker_present')} "
+                    f"bundle={s.get('exported_bundle_hash')}")
+              if s.get("exported_bundle_hash"):
+                  hashes.setdefault(s["exported_bundle_hash"], []).append(n)
+          # TWO ARMS THAT HASH THE SAME ARE ONE ARM, and a run comparing an arm with itself
+          # produces a beautifully tight 1.000x that means nothing. Fail here rather than spend a
+          # GPU slot proving it.
+          dupes = {h: v for h, v in hashes.items() if len(v) > 1}
+          if dupes:
+              print(f"::error::the arms share a bundle hash, so they are the same tree: {dupes}")
+              raise SystemExit(1)
+          if len(d["states"]) != 2 or len(hashes) != 2:
+              print(f"::error::expected two arms and two distinct bundles, got "
+                    f"{len(d['states'])} arms and {len(hashes)} bundles")
+              raise SystemExit(1)
+          print(f"built {len(hashes)} distinct bundles across {len(d['states'])} arms")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r9695-dists
+          path: ${{ env.AMD_CI_WORK }}/dists
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r9695-build-observations
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  measure:
+    name: "Two arms x two rungs x five reps in WebKitGTK (exclusive)"
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 300
+    # Compositing a browser and seeding a 500K thread both allocate on the one gfx1151 the four
+    # ephemeral slots share. The group holds one runner plus exactly ONE waiter, and a third
+    # arrival silently CANCELS the waiter while the other job stays green, so the loss is easy to
+    # miss. Nothing else in this workflow takes the group.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "studio-r9695"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # Fails rather than skips. A skip would misreport missing hardware as nothing to see.
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      # ITS OWN STEP, AND EARLY, for the same reason as the build job's inventory: step logs are
+      # only served once the job completes, and this is what tells a bad run apart from a run that
+      # never started.
+      - name: Engine inventory
+        run: |
+          set +e
+          for p in /usr/bin/python3 /usr/bin/python3.12 /usr/bin/python3.13; do
+            [ -x "$p" ] || continue
+            echo "== $p"
+            "$p" -c "import gi; gi.require_version('WebKit2','4.1'); from gi.repository import WebKit2; print('  WebKit', WebKit2.get_major_version(), WebKit2.get_minor_version(), WebKit2.get_micro_version())" 2>&1 | tail -2
+          done
+          echo "== free space, which two clones and a venv have to fit in"
+          df -h "$RUNNER_TEMP" | tail -2
+          echo "== who else is on the GPU right now"
+          ls -la /dev/dri 2>&1 | head -10
+          echo "always exits 0: this is inventory, the probe's own gate decides"
+          exit 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: r9695-dists
+          path: ${{ env.AMD_CI_WORK }}/dists
+
+      - name: The arms that arrived
+        run: |
+          set +e
+          ls -la "$AMD_CI_WORK/dists" | head -20
+          python3 - <<'PY'
+          import json, os, pathlib
+          m = pathlib.Path(os.environ["AMD_CI_WORK"]) / "dists" / "build_manifest.json"
+          d = json.loads(m.read_text())
+          for n, s in d["states"].items():
+              print(f"{n:6s} bundle={s.get('exported_bundle_hash')} "
+                    f"marker={s.get('head_marker_present')}")
+          PY
+          exit 0
+
+      - name: reasoning_toggle_all at r100K and r500K, both arms interleaved
+        timeout-minutes: 260
+        env:
+          SUBJECT_REPO: ${{ inputs.subject_repo || 'https://github.com/unslothai/unsloth' }}
+          RUNGS: ${{ inputs.rungs || '100K,500K' }}
+          REPS: ${{ inputs.reps || '100K:5,500K:5' }}
+        run: |
+          set +e
+          echo "subject $SUBJECT_REPO, rungs $RUNGS, reps $REPS"
+          python3 amd_ci/lib/capability_run.py \
+            --probe amd_ci/probes/studio_r9695_probe.py \
+            --criteria amd_ci/criteria/studio_r9695_rebase.py \
+            --out-dir "$AMD_CI_WORK/out/r9695" \
+            -- --mode measure --dist-in "$AMD_CI_WORK/dists" \
+               --repo "$SUBJECT_REPO" --rungs "$RUNGS" --reps "$REPS"
+          cat "$AMD_CI_WORK/out/r9695/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not. WIN_ABSORBED
+          # is a finding and must tick; a run whose controls never resolved must not.
+          python3 amd_ci/lib/announce.py "$AMD_CI_WORK/out/r9695"
+
+      - name: Stop anything left holding the GPU
+        if: always()
+        run: |
+          set +e
+          # By PORT, then by PID. A pattern-matching process killer would match this very step's
+          # own shell, because the pattern ends up on its command line; that has cost a real run,
+          # and the `[e]` bracket trick does not fix it. A Studio or an Xvfb that outlives the job
+          # holds VRAM on a machine three other slots share, so this cannot simply be skipped.
+          for p in $(seq 5601 5650); do
+            pid=$(ss -lptnH "sport = :$p" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+            [ -n "$pid" ] && { echo "killing $pid on port $p"; kill -TERM "$pid" 2>/dev/null; }
+          done
+          sleep 3
+          exit 0
+
+      # The raw observations, separately from the verdict. Every window's full rAF gap series and
+      # every census are in here, so the run can be re-scored offline against the untouched
+      # artifact if the reader turns out to be wrong, rather than costing another exclusive slot.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-r9695
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-r9695-logs
+          path: |
+            ${{ env.AMD_CI_WORK }}/r9695/out/logs
+            ${{ env.AMD_CI_WORK }}/r9695/out/*.jsonl
+            ${{ env.AMD_CI_WORK }}/**/logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
