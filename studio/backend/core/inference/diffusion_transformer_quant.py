@@ -28,7 +28,7 @@ import threading as _threading
 from typing import Any, Optional
 
 # stdlib-only module (no torch), so this stays inside the "imported lazily" promise above.
-from core._torchao_stub import is_stubbed
+from core._torchao_stub import is_stubbed, torch_is_rocm
 
 TQ_INT8 = "int8"
 TQ_FP8 = "fp8"
@@ -450,11 +450,40 @@ def dense_transformer_supported(target: Any) -> bool:
     # giving the wrong VRAM budget and compile policy.
     if is_stubbed("torchao"):
         return False
+    # ROCm answers device "cuda" and hands out a capability pair from get_device_capability() --
+    # but that pair is the AMD gfx version, NOT an NVIDIA SM level: gfx1103 (Radeon 780M) reports
+    # (11, 0), gfx1151 (Strix Halo) (11, 5), gfx942 (MI300X) (9, 4). Every floor in _AUTO_LADDER is
+    # an NVIDIA compute capability, so an unguarded compare reads any RDNA 3/4 card as "Blackwell
+    # sm_100+" and offers it fp8 / mxfp8 / int8 tensor-core paths it has none of. That is #9396: an
+    # integrated 780M walked into the int8 smoke probe and SEGFAULTED the backend inside the first
+    # torch.amin torchao launches. Nothing here was designed for or measured on AMD, and
+    # supports_default_torch_compile is already False on ROCm, so even a scheme whose kernels ran
+    # would run eager -- ~30x slower than the GGUF path it replaced. So the gate names the BUILD,
+    # not the device string, and AMD keeps GGUF exactly as an NVIDIA card below the floor does.
+    if torch_is_rocm():
+        return False
     try:
         import torch
         return getattr(target, "dtype", None) is torch.bfloat16
     except Exception:
         return False
+
+
+def dense_transformer_unsupported_reason(target: Any) -> str:
+    """Why ``dense_transformer_supported`` said no, for the load routes' 409 body.
+
+    Three different hosts fold into that one False and need different things from the user: an AMD
+    card (nothing to install -- the schemes are NVIDIA tensor-core paths), the Windows-ROCm torchao
+    stub, and everything else (CPU / MPS / XPU, or a target that is not bf16)."""
+    if getattr(target, "device", None) == "cuda" and torch_is_rocm():
+        return (
+            "the dense torchao quant schemes are NVIDIA tensor-core paths (int8 sm_80+, fp8 "
+            "sm_89+, fp4/mx sm_100+) and this is a ROCm/AMD GPU, so the checkpoint runs at the "
+            "precision it ships with"
+        )
+    if is_stubbed("torchao"):
+        return "this platform ships a torchao stub whose quantize_ is a no-op"
+    return "this device cannot run a dense torchao quant (it needs a CUDA GPU in bf16)"
 
 
 def select_transformer_quant_scheme(
@@ -561,21 +590,35 @@ def _scheme_supported(
     # get_device_capability() (0 MiB after both, 614 MiB after the first tensor). Worth a child
     # because /images/download-plan calls assert_precision_available while the user is only
     # STAGING, so a plan alone cost the backend ~700 MiB it can never give back.
-    if (scheme, device) not in _SMOKE_CACHE:
+    # ONE cache key for the child's verdicts and the in-process probe's. They used to differ --
+    # this wrote (scheme, "cuda") while _smoke_probe reads (scheme, "cuda:0") -- so a child that
+    # answered was never read back: the parent re-ran the whole probe in-process anyway, paying
+    # the context the child exists to save, and on the ROCm host in #9396 dying to the same
+    # segfault the child had just proved fatal. Resolving the key here rather than inside
+    # _smoke_probe costs nothing new: it is the same call, on the same path, a few lines earlier.
+    card = _smoke_cache_device_key(device)
+    if (scheme, card) not in _SMOKE_CACHE:
         with _CHILD_PROBE_LOCK:
             # Re-checked under the lock: the route answers plans concurrently, and a burst of
             # them must not each spawn a child that imports torch.
-            if (scheme, device) not in _SMOKE_CACHE:
+            if (scheme, card) not in _SMOKE_CACHE:
                 table = _child_probe_table(device)
                 if table is not None:
                     for name, child_verdict in table.items():
                         # None is the child's out-of-memory: not a verdict, so not cached.
                         if child_verdict is not None:
-                            _SMOKE_CACHE[(name, device)] = child_verdict
-                    if table.get(scheme, False) is None:
-                        # Same answer the in-process probe gives an OOM, without re-running it
-                        # here: it would meet the same full GPU and pay the context on the way.
-                        return unproven_ok
+                            _SMOKE_CACHE[(name, card)] = child_verdict
+                    if scheme in table:
+                        if table[scheme] is None:
+                            # Same answer the in-process probe gives an OOM, without re-running
+                            # it here: it would meet the same full GPU and pay the context on the
+                            # way.
+                            return unproven_ok
+                        # The child ran the same _run_smoke_probe this process would, so its
+                        # answer IS the answer; re-deriving it here only risks the crash it just
+                        # survived. A scheme MISSING from the table is not an answer, and still
+                        # falls through to the probe below.
+                        return table[scheme]
     return _smoke_probe(scheme, device, unproven_ok = unproven_ok)
 
 
@@ -696,7 +739,46 @@ def _child_probe_table(device: str) -> Optional[dict[str, Optional[bool]]]:
                 break
     finally:
         _close_probe_child(proc, queue)
-    return table if isinstance(table, dict) else None
+    return table if isinstance(table, dict) else _crashed_child_verdict(proc, device)
+
+
+# Signals that mean the probe took its interpreter down instead of answering: a fault inside the
+# GPU userspace, not a scheduling accident. SIGKILL is deliberately absent -- that is the OOM
+# killer or an operator, and says nothing about the scheme; so is SIGTERM, which is how
+# ``_close_probe_child`` retires a child that overran the timeout.
+_PROBE_CRASH_SIGNALS = frozenset({4, 6, 7, 8, 11})  # ILL, ABRT, BUS, FPE, SEGV
+
+
+def _crashed_child_verdict(proc: Any, device: str) -> Optional[dict[str, Optional[bool]]]:
+    """``False`` for every scheme when the probe child was killed by a CRASH signal, else None.
+
+    The child exists so that a probe faulting inside the GPU userspace cannot take the backend with
+    it. Reading its death as "no verdict" defeated that at the one moment it mattered: the caller
+    then re-ran the identical probe IN-PROCESS and died the same way. That is #9396 -- a ROCm
+    ``torch.amin`` segfault in the int8 probe child, then the server exiting on SIGSEGV ("Server
+    stopped unexpectedly"), on every retry, since a crash cached nothing either.
+
+    A crashed child IS a verdict. It cannot say WHICH scheme faulted (the child dies mid-table, and
+    every scheme enters torchao through the same ``quantize_``), so the whole table goes False:
+    that also caches it, so the next load answers from memory instead of spawning another child to
+    die. A timeout, or a child that exits non-zero without posting, still returns None and falls
+    back in-process -- only a fatal signal proves the probe itself is fatal here."""
+    try:
+        exitcode = proc.exitcode if proc is not None else None
+    except Exception:  # noqa: BLE001 -- no handle left: nothing proven, fall back as before
+        return None
+    if exitcode is None or exitcode >= 0 or -exitcode not in _PROBE_CRASH_SIGNALS:
+        return None
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "diffusion.transformer_quant: probe child died on signal %s quantising on %s; treating "
+        "every dense quant scheme as unusable here rather than re-running the same probe in this "
+        "process, which would take the server down the same way",
+        -exitcode,
+        device,
+    )
+    return {scheme: False for scheme in TQ_SCHEMES}
 
 
 def _adopt_probe_pid(pid: Optional[int]) -> None:

@@ -169,11 +169,13 @@ def _installed_torch_is_rocm() -> Optional[bool]:
     return False if (tagged is False and hip is False) else None
 
 
-def _is_windows_rocm() -> bool:
-    """True on a Windows host whose active torch is a ROCm build."""
-    # Gate on the active torch runtime, not env vars: HIP_PATH/ROCM_PATH outlive a revert to CUDA.
-    if sys.platform != "win32":
-        return False
+def torch_is_rocm() -> bool:
+    """True when the active torch is a ROCm/HIP build.
+
+    Gate on the runtime, not env vars: HIP_PATH/ROCM_PATH outlive a revert to CUDA. Prefers an
+    already-imported torch, then the on-disk signals, and imports only as a last resort -- callers
+    reach this from import-time paths where importing torch costs seconds.
+    """
     mod = sys.modules.get("torch")
     if mod is not None:
         return _module_is_rocm(mod)
@@ -186,6 +188,11 @@ def _is_windows_rocm() -> bool:
     except Exception:
         return False
     return _module_is_rocm(torch)
+
+
+def _is_windows_rocm() -> bool:
+    """True on a Windows host whose active torch is a ROCm build."""
+    return sys.platform == "win32" and torch_is_rocm()
 
 
 def _ensure_finder() -> None:
