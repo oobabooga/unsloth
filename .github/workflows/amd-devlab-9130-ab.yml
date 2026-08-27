@@ -1,0 +1,423 @@
+name: AMD DevLab issue 9130 A/B
+
+on:
+  push:
+    branches: [amd-devlab-9130-ab]
+
+permissions: {}
+
+env:
+  A_SHA: 064ff16e68aafe95a20abeaeee929edb9998ca54
+  B_SHA: 89f1e50c8eea36ebc69924856c2a082eb75badca
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 75
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu | head -20
+          free -h
+          df -h /mnt/scratch "$RUNNER_TEMP" 2>/dev/null || true
+          lspci -nn | grep -iE 'vga|display' || true
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -20 || true
+          rocm-smi 2>/dev/null || true
+
+      - name: Fetch both sides
+        run: |
+          set -eux
+          WORK_ROOT="$RUNNER_TEMP/ab"
+          mkdir -p "$WORK_ROOT"
+          git init -q "$WORK_ROOT/src"
+          git -C "$WORK_ROOT/src" remote add origin https://github.com/unslothai/unsloth.git
+          git -C "$WORK_ROOT/src" fetch -q --depth 1 origin "$A_SHA" "$B_SHA"
+          git -C "$WORK_ROOT/src" worktree add -q --detach "$WORK_ROOT/A" "$A_SHA"
+          git -C "$WORK_ROOT/src" worktree add -q --detach "$WORK_ROOT/B" "$B_SHA"
+          echo "--- A (pre-fix) ---"
+          git -C "$WORK_ROOT/A" log -1 --format='%H%n%s'
+          echo "--- B (post-fix) ---"
+          git -C "$WORK_ROOT/B" log -1 --format='%H%n%s'
+          echo "--- the change under test ---"
+          git -C "$WORK_ROOT/src" diff --stat "$A_SHA" "$B_SHA" || true
+          echo "WORK_ROOT=$WORK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install environment
+        run: |
+          set -eux
+          mkdir -p "$WORK_ROOT"/{tmp,cache/torch,results}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export TORCH_HOME="$WORK_ROOT/cache/torch"
+          python -m pip install -q --upgrade pip
+          pip install -q --index-url https://download.pytorch.org/whl/rocm7.1 \
+            --extra-index-url https://pypi.org/simple 'torch>=2.10,<2.12'
+          pip install -q -r "$WORK_ROOT/B/studio/backend/requirements/studio.txt"
+          pip install -q \
+            python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' 'transformers>=4.51,<5.5'
+          echo "$WORK_ROOT/venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$WORK_ROOT/venv" >> "$GITHUB_ENV"
+          echo "TMPDIR=$WORK_ROOT/tmp" >> "$GITHUB_ENV"
+          echo "TORCH_HOME=$WORK_ROOT/cache/torch" >> "$GITHUB_ENV"
+
+      - name: Platform premise
+        run: |
+          set -eux
+          export PYTHONPATH="$WORK_ROOT/B/studio/backend"
+          python - <<'PY'
+          import torch
+          assert torch.cuda.is_available(), "PyTorch did not detect the AMD GPU"
+          props = torch.cuda.get_device_properties(0)
+          print("torch", torch.__version__, "hip", torch.version.hip)
+          print("device", torch.cuda.get_device_name(0))
+          print("is_integrated", getattr(props, "is_integrated", None),
+                "integrated", getattr(props, "integrated", None))
+          from core.inference.diffusion_device import resolve_diffusion_device_target
+          from core.inference.diffusion_memory import snapshot_device_memory
+          target = resolve_diffusion_device_target(ordinal=0)
+          snap = snapshot_device_memory(target)
+          print("target", target)
+          print("memory", snap)
+          # The guard under test only exists for unified memory, so the A/B is only meaningful
+          # on a machine the classifier calls unified. This asserts that premise before spending
+          # the matrix on it.
+          assert snap.memory_kind == "unified_memory", snap.memory_kind
+          assert snap.total_mib and snap.total_mib >= 32 * 1024, snap.total_mib
+          PY
+
+      - name: Write the probe
+        run: |
+          mkdir -p "$WORK_ROOT"
+          cat > "$WORK_ROOT/ab_probe.py" <<'PROBE'
+          #!/usr/bin/env python3
+          """One A/B probe of the Studio diffusion pre-download memory guard (issue #9130 / PR #9629).
+
+          Runs ONE (side, model, probe) cell in its own process with its own Hub cache, so the bytes it
+          reports are only the bytes this cell moved. Prints a single JSON object on stdout.
+
+          probe=plan  -> DiffusionBackend.download_plan(): what the UI staging panel is told.
+          probe=load  -> DiffusionBackend.begin_load(): the real load path, with a wall-clock budget.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import os
+          import sys
+          import time
+          from pathlib import Path
+
+
+          def cache_bytes(root: Path) -> tuple[int, int]:
+              """(bytes, files) actually written under the Hub cache, following no symlinks."""
+              total = 0
+              count = 0
+              for path in root.rglob("*"):
+                  try:
+                      if path.is_symlink() or not path.is_file():
+                          continue
+                      total += path.stat().st_size
+                      count += 1
+                  except OSError:
+                      continue
+              return total, count
+
+
+          def largest(root: Path, n: int = 6) -> list:
+              out = []
+              for path in root.rglob("*"):
+                  try:
+                      if path.is_symlink() or not path.is_file():
+                          continue
+                      out.append((path.stat().st_size, str(path.relative_to(root))))
+                  except OSError:
+                      continue
+              out.sort(reverse=True)
+              return [{"bytes": s, "path": p} for s, p in out[:n]]
+
+
+          def main() -> int:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--side", required=True)
+              ap.add_argument("--repo", required=True)
+              ap.add_argument("--probe", required=True, choices=("plan", "load"))
+              ap.add_argument("--budget-seconds", type=float, default=90.0)
+              ap.add_argument("--gpu-ordinal", type=int, default=0)
+              args = ap.parse_args()
+
+              # Count the whole HF_HOME subtree: the hub cache and the xet cache both live under it, and
+              # both are bytes this cell pulled over the network.
+              hub = Path(os.environ["HF_HOME"])
+              hub.mkdir(parents=True, exist_ok=True)
+
+              result = {
+                  "side": args.side,
+                  "repo": args.repo,
+                  "probe": args.probe,
+                  "commit": os.environ.get("AB_COMMIT", ""),
+              }
+
+              from core.inference.diffusion import DiffusionBackend, hub_cache_dir
+              from core.inference.diffusion_device import resolve_diffusion_device_target
+              from core.inference.diffusion_memory import snapshot_device_memory
+
+              try:
+                  target = resolve_diffusion_device_target(ordinal=args.gpu_ordinal)
+                  snapshot = snapshot_device_memory(target)
+                  result["device"] = {
+                      "device": getattr(target, "device", None),
+                      "backend": getattr(target, "backend", None),
+                      "dtype": str(getattr(target, "dtype", "")),
+                      "memory_kind": snapshot.memory_kind,
+                      "total_mib": snapshot.total_mib,
+                      "free_mib": snapshot.free_mib,
+                  }
+              except Exception as exc:  # noqa: BLE001 -- recorded, not fatal: the probes still run
+                  result["device"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
+              # The path the loader itself resolves, so the byte count below is over the cache the code used.
+              result["hub_cache_dir"] = hub_cache_dir()
+
+              backend = DiffusionBackend()
+              started = time.monotonic()
+
+              if args.probe == "plan":
+                  try:
+                      plan = backend.download_plan(
+                          args.repo, model_kind="pipeline", gpu_ordinal=args.gpu_ordinal
+                      )
+                      result["elapsed_s"] = round(time.monotonic() - started, 2)
+                      result["ok"] = True
+                      result["incompatible_reason"] = plan.get("incompatible_reason")
+                      result["total_bytes"] = plan.get("total_bytes")
+                      result["missing_bytes"] = plan.get("missing_bytes")
+                      result["entries"] = len(plan.get("entries") or ())
+                  except Exception as exc:  # noqa: BLE001 -- the verdict may be an exception on either side
+                      result["elapsed_s"] = round(time.monotonic() - started, 2)
+                      result["ok"] = False
+                      result["raised"] = f"{type(exc).__name__}: {exc}"
+                  moved, files = cache_bytes(hub)
+                  result["cache_bytes"] = moved
+                  result["cache_files"] = files
+                  print(json.dumps(result))
+                  return 0
+
+              # probe == load
+              phases = []
+              try:
+                  backend.begin_load(args.repo, model_kind="pipeline", gpu_ordinal=args.gpu_ordinal)
+              except Exception as exc:  # noqa: BLE001 -- a synchronous refusal is a valid outcome
+                  result["elapsed_s"] = round(time.monotonic() - started, 2)
+                  result["outcome"] = "refused_sync"
+                  result["error"] = f"{type(exc).__name__}: {exc}"
+                  moved, files = cache_bytes(hub)
+                  result["cache_bytes"] = moved
+                  result["cache_files"] = files
+                  result["cache_largest"] = largest(hub)
+                  print(json.dumps(result))
+                  return 0
+
+              outcome = "still_downloading_at_budget"
+              error = None
+              while time.monotonic() - started < args.budget_seconds:
+                  progress = backend.load_progress()
+                  phase = progress.get("phase")
+                  stamp = round(time.monotonic() - started, 2)
+                  if not phases or phases[-1]["phase"] != phase:
+                      phases.append({"phase": phase, "at_s": stamp, "downloaded": progress.get("downloaded")})
+                  if phase == "error":
+                      outcome = "refused_async"
+                      error = progress.get("error")
+                      break
+                  if phase == "ready":
+                      outcome = "loaded"
+                      break
+                  time.sleep(0.5)
+
+              result["elapsed_s"] = round(time.monotonic() - started, 2)
+              result["outcome"] = outcome
+              result["error"] = error
+              result["phases"] = phases
+              try:
+                  final = backend.load_progress()
+                  result["expected_bytes"] = final.get("total")
+                  result["reported_downloaded"] = final.get("downloaded")
+              except Exception:  # noqa: BLE001
+                  pass
+              moved, files = cache_bytes(hub)
+              result["cache_bytes"] = moved
+              result["cache_files"] = files
+              result["cache_largest"] = largest(hub)
+              try:
+                  backend.unload()
+              except Exception:  # noqa: BLE001
+                  pass
+              print(json.dumps(result))
+              # A daemon download thread may still be live; leave immediately rather than joining it.
+              sys.stdout.flush()
+              os._exit(0)
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PROBE
+          python -c "import ast,sys; ast.parse(open('$WORK_ROOT/ab_probe.py').read())"
+
+      - name: A/B matrix
+        run: |
+          set -u
+          RESULTS="$WORK_ROOT/results"
+          BUDGET=90
+          run_cell () {
+            side="$1"; sha="$2"; repo="$3"; probe="$4"
+            cell="${side}__$(echo "$repo" | tr '/' '_')__${probe}"
+            export HF_HOME="$WORK_ROOT/cells/$cell"
+            export HF_HUB_CACHE="$HF_HOME/hub"
+            export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+            export HF_XET_CACHE="$HF_HOME/xet"
+            export PYTHONPATH="$WORK_ROOT/$side/studio/backend"
+            export AB_COMMIT="$sha"
+            mkdir -p "$HF_HOME/hub"
+            echo "::group::$cell"
+            timeout 600 python "$WORK_ROOT/ab_probe.py" \
+              --side "$side" --repo "$repo" --probe "$probe" --budget-seconds "$BUDGET" \
+              > "$RESULTS/$cell.json" 2> "$RESULTS/$cell.log"
+            status=$?
+            echo "exit=$status"
+            cat "$RESULTS/$cell.json" 2>/dev/null || true
+            echo "--- stderr tail ---"
+            tail -20 "$RESULTS/$cell.log" 2>/dev/null || true
+            echo "::endgroup::"
+            # Free the cell's bytes before the next one; disk is shared and A downloads for real.
+            rm -rf "$HF_HOME"
+          }
+          for probe in plan load; do
+            for repo in unsloth/Qwen-Image-2512 unsloth/FLUX.2-dev unsloth/Z-Image-Turbo; do
+              run_cell A "$A_SHA" "$repo" "$probe"
+              run_cell B "$B_SHA" "$repo" "$probe"
+            done
+          done
+          ls -la "$RESULTS"
+
+      - name: Verdict
+        run: |
+          set -u
+          python - <<'PY'
+          import json, os, pathlib, sys
+
+          results = pathlib.Path(os.environ["WORK_ROOT"]) / "results"
+          cells = {}
+          for path in sorted(results.glob("*.json")):
+              try:
+                  data = json.loads(path.read_text() or "{}")
+              except json.JSONDecodeError:
+                  data = {"parse_error": path.read_text()[:400]}
+              if data.get("side"):
+                  cells[(data["side"], data["repo"], data["probe"])] = data
+              else:
+                  cells[("?", path.stem, "?")] = data
+
+          OVERSIZED = ("unsloth/Qwen-Image-2512", "unsloth/FLUX.2-dev")
+          CONTROL = "unsloth/Z-Image-Turbo"
+          MB = 1024 * 1024
+
+          def mb(n):
+              return "n/a" if n is None else f"{n / MB:,.1f} MB"
+
+          print("\n=== download_plan: what the staging panel is told ===")
+          row = "{:<26} {:<5} {:>12} {:>10}  {}"
+          print(row.format("model", "side", "plan bytes", "cache", "incompatible_reason"))
+          for repo in (*OVERSIZED, CONTROL):
+              for side in ("A", "B"):
+                  c = cells.get((side, repo, "plan"), {})
+                  reason = c.get("incompatible_reason") or c.get("raised") or "None"
+                  print(row.format(
+                      repo.split("/")[-1], side, mb(c.get("total_bytes")),
+                      mb(c.get("cache_bytes")), (reason[:96] + "...") if len(reason) > 99 else reason,
+                  ))
+
+          print("\n=== begin_load: the real load path, 90 s budget ===")
+          row2 = "{:<26} {:<5} {:>26} {:>8} {:>12}  {}"
+          print(row2.format("model", "side", "outcome", "elapsed", "downloaded", "error"))
+          for repo in (*OVERSIZED, CONTROL):
+              for side in ("A", "B"):
+                  c = cells.get((side, repo, "load"), {})
+                  err = (c.get("error") or "")[:80]
+                  print(row2.format(
+                      repo.split("/")[-1], side, str(c.get("outcome")),
+                      f"{c.get('elapsed_s')}s", mb(c.get("cache_bytes")), err,
+                  ))
+
+          failures = []
+
+          def check(label, ok, detail=""):
+              print(("PASS  " if ok else "FAIL  ") + label + ("  " + detail if detail else ""))
+              if not ok:
+                  failures.append(label)
+
+          print("\n=== assertions ===")
+          for repo in OVERSIZED:
+              a_plan = cells.get(("A", repo, "plan"), {})
+              b_plan = cells.get(("B", repo, "plan"), {})
+              a_load = cells.get(("A", repo, "load"), {})
+              b_load = cells.get(("B", repo, "load"), {})
+              name = repo.split("/")[-1]
+              check(f"A/{name}: plan raises no memory objection",
+                    a_plan.get("incompatible_reason") is None,
+                    repr(a_plan.get("incompatible_reason"))[:120])
+              check(f"A/{name}: load is still downloading at the budget",
+                    a_load.get("outcome") == "still_downloading_at_budget",
+                    f"outcome={a_load.get('outcome')} error={str(a_load.get('error'))[:100]}")
+              check(f"A/{name}: load moved real weight bytes",
+                    (a_load.get("cache_bytes") or 0) > 50 * MB,
+                    mb(a_load.get("cache_bytes")))
+              check(f"B/{name}: plan reports the memory refusal",
+                    bool(b_plan.get("incompatible_reason")),
+                    str(b_plan.get("incompatible_reason"))[:120])
+              check(f"B/{name}: load refuses",
+                    b_load.get("outcome") in ("refused_sync", "refused_async"),
+                    f"outcome={b_load.get('outcome')}")
+              check(f"B/{name}: refusal names unified memory",
+                    "unified memory" in str(b_load.get("error") or ""),
+                    str(b_load.get("error"))[:160])
+              check(f"B/{name}: refusal happened before the weights moved",
+                    (b_load.get("cache_bytes") or 0) < 10 * MB,
+                    mb(b_load.get("cache_bytes")))
+              a_bytes = a_load.get("cache_bytes") or 0
+              b_bytes = b_load.get("cache_bytes") or 0
+              print(f"      {name}: A pulled {mb(a_bytes)} in {a_load.get('elapsed_s')}s, "
+                    f"B pulled {mb(b_bytes)} and refused after {b_load.get('elapsed_s')}s")
+
+          name = CONTROL.split("/")[-1]
+          for side in ("A", "B"):
+              plan = cells.get((side, CONTROL, "plan"), {})
+              load = cells.get((side, CONTROL, "load"), {})
+              check(f"{side}/{name} (control, fits): plan raises no memory objection",
+                    plan.get("incompatible_reason") is None,
+                    str(plan.get("incompatible_reason"))[:120])
+              check(f"{side}/{name} (control, fits): load proceeds to download",
+                    load.get("outcome") == "still_downloading_at_budget"
+                    and (load.get("cache_bytes") or 0) > 50 * MB,
+                    f"outcome={load.get('outcome')} bytes={mb(load.get('cache_bytes'))} "
+                    f"error={str(load.get('error'))[:100]}")
+
+          print()
+          if failures:
+              print(f"{len(failures)} assertion(s) failed:")
+              for f in failures:
+                  print("  -", f)
+              sys.exit(1)
+          print("A/B holds: pre-fix downloads an oversized pipeline, post-fix refuses it first, "
+                "and a pipeline that fits is untouched on both sides.")
+          PY
+
+      - name: Raw results
+        if: always()
+        run: |
+          for f in "$WORK_ROOT"/results/*.json; do
+            echo "===== $f ====="; cat "$f"; echo
+          done
