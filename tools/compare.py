@@ -5,8 +5,13 @@ import sys
 
 
 def load(p):
-    with open(p) as fh:
-        return json.load(fh)
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except Exception as exc:
+        print("**BROKEN HARNESS** - could not read `%s`: %r. No comparison was made."
+              % (p, exc))
+        raise SystemExit(2)
 
 
 def key(rec):

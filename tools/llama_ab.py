@@ -4,7 +4,10 @@
 Runs the same model, the same prompts and the same sampler twice, changing only
 the environment, and compares the emitted token ids. GGML_CUDA_ENABLE_UNIFIED_MEMORY
 is read with getenv() != nullptr, so the only honest control is the name being
-ABSENT: pass it as `-GGML_CUDA_ENABLE_UNIFIED_MEMORY` to unset it.
+ABSENT: pass it as `--env=unset:GGML_CUDA_ENABLE_UNIFIED_MEMORY`.
+
+Always use the `--env=...` / `--extra=...` spelling: a value that starts with a
+dash is read as another option in the two-token form.
 """
 import argparse
 import json
@@ -41,7 +44,9 @@ def free_port():
 def build_env(spec):
     env = dict(os.environ)
     for item in spec:
-        if item.startswith("-"):
+        if item.startswith("unset:"):
+            env.pop(item[len("unset:"):], None)
+        elif item.startswith("-"):
             env.pop(item[1:], None)
         else:
             k, _, v = item.partition("=")
@@ -126,8 +131,16 @@ def main():
 
     log_path = args.out + ".server.log"
     with open(log_path, "wb") as log:
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
-                                start_new_session=True)
+        try:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                                    start_new_session=True)
+        except Exception as exc:
+            out["server_ready"] = False
+            out["server_note"] = "could not spawn llama-server: %r" % (exc,)
+            with open(args.out, "w") as fh:
+                json.dump(out, fh, indent=1)
+            print(out["server_note"])
+            return 1
         ok, why = wait_ready(port, proc, args.load_timeout)
         out["server_ready"] = ok
         out["server_note"] = why

@@ -1,0 +1,109 @@
+name: AMD DevLab UMA v2
+
+on:
+  push:
+    branches: [amd-ci-uma-v2]
+
+permissions: {}
+
+env:
+  LLAMA_TAG: b10639-mix-f6f92fe
+  BUNDLE: app-b10639-mix-f6f92fe-linux-x64-rocm-gfx1151.tar.gz
+
+jobs:
+  small-hybrids:
+    name: UMA A/B, small recurrent hybrids
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Bundle
+        run: bash tools/get_bundle.sh
+      - name: Falcon-H1-1.5B (mamba2 hybrid, 0.9 GiB)
+        run: |
+          bash tools/ab_one.sh "Falcon-H1-1.5B-Instruct Q4_K_M (mamba2 hybrid)" falcon \
+            unsloth/Falcon-H1-1.5B-Instruct-GGUF \
+            18b2d368c505b87c844dec1ec7a2f77090962e72 \
+            Falcon-H1-1.5B-Instruct-Q4_K_M.gguf
+      - name: granite-4.0-h-tiny (mamba2 hybrid MoE, 4 GiB)
+        run: |
+          bash tools/ab_one.sh "granite-4.0-h-tiny Q4_K_M (mamba2 hybrid MoE)" granite \
+            unsloth/granite-4.0-h-tiny-GGUF \
+            56b37fdc52891304726c4a0a8b140dd1fc1582d5 \
+            granite-4.0-h-tiny-Q4_K_M.gguf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-v2-small
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
+
+  qwen3-next:
+    name: UMA A/B, Qwen3-Next-80B (gated delta-net MoE)
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Bundle
+        run: bash tools/get_bundle.sh
+      - name: Qwen3-Next-80B-A3B UD-Q2_K_XL, 28 GiB
+        env:
+          NPREDICT: 128
+        run: |
+          bash tools/ab_one.sh "Qwen3-Next-80B-A3B-Instruct UD-Q2_K_XL (gated delta-net MoE)" qwen3next \
+            unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF \
+            6688872b7a4e5eb8a121ceea08009530a024ba1d \
+            Qwen3-Next-80B-A3B-Instruct-UD-Q2_K_XL.gguf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-v2-qwen3next
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
+
+  reported-model:
+    name: UMA A/B, the reported Qwen3.8-Flash-Next UD-IQ4_XS
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Bundle
+        run: bash tools/get_bundle.sh
+      - name: Download the 87 GiB model
+        run: |
+          set -e
+          M="$RUNNER_TEMP/uma/models"; mkdir -p "$M"
+          for i in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-UD-IQ4_XS-$i-of-00003.gguf"
+            [ -s "$M/$F" ] && continue
+            curl -fL --retry 5 --retry-delay 10 -o "$M/$F" \
+              "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/178b998806b7b406c311a3e6174aa99cf6304eaf/UD-IQ4_XS/$F"
+          done
+          ls -l "$M"; df -h "$RUNNER_TEMP" | tail -1; free -h
+      - name: A/B with --n-cpu-moe 26 so both states fit and place identically
+        env:
+          NPREDICT: 96
+        run: |
+          bash tools/ab_one.sh "Qwen3.8-Flash-Next UD-IQ4_XS, --n-cpu-moe 26" reported \
+            unsloth/Qwen3.8-Flash-Next-GGUF \
+            178b998806b7b406c311a3e6174aa99cf6304eaf \
+            UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+            --n-cpu-moe 26
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-v2-reported
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
