@@ -1,0 +1,184 @@
+name: AMD DevLab UMA probe
+
+on:
+  push:
+    branches: [amd-ci-uma-probe]
+
+permissions: {}
+
+env:
+  LLAMA_TAG: b10639-mix-f6f92fe
+  BUNDLE: app-b10639-mix-f6f92fe-linux-x64-rocm-gfx1151.tar.gz
+
+jobs:
+  managed-memory:
+    name: hipMallocManaged correctness on gfx1151
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Hardware and ROCm inventory
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/out"
+          echo "W=$W" >> "$GITHUB_ENV"
+          {
+            echo "## Host"; echo
+            echo '```'
+            uname -a
+            echo "--- meminfo"
+            head -5 /proc/meminfo
+            echo "--- amdgpu sysfs"
+            for f in /sys/class/drm/card*/device/mem_info_vram_total \
+                     /sys/class/drm/card*/device/mem_info_vram_used \
+                     /sys/class/drm/card*/device/mem_info_gtt_total \
+                     /sys/class/drm/card*/device/mem_info_gtt_used; do
+              [ -r "$f" ] && echo "$f = $(cat $f)"
+            done
+            echo "--- rocm packages"
+            (dpkg -l 2>/dev/null | grep -iE '^ii +(rocm|hip|hsa)' | awk '{print $2, $3}' | head -30) || true
+            echo "--- rocm dirs"
+            ls -d /opt/rocm* 2>/dev/null
+            cat /opt/rocm/.info/version 2>/dev/null
+            echo "--- compilers"
+            for c in hipcc amdclang++ clang++ g++; do printf '%s: %s\n' "$c" "$(command -v $c || echo MISSING)"; done
+            ls /opt/rocm*/bin/hipcc /opt/rocm*/llvm/bin/clang++ 2>/dev/null
+            echo "--- xnack"
+            rocminfo 2>/dev/null | grep -iE 'xnack|Name: *gfx|Marketing' | head
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rocminfo > "$W/out/rocminfo.txt" 2>&1
+          rocm-smi --showmeminfo all > "$W/out/rocm-smi.txt" 2>&1
+          cat /proc/meminfo > "$W/out/meminfo.txt"
+
+      - name: Fetch the Unsloth gfx1151 llama.cpp bundle
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/bin"
+          curl -fL --retry 3 -o "$W/$BUNDLE" \
+            "https://github.com/unslothai/llama.cpp/releases/download/$LLAMA_TAG/$BUNDLE"
+          tar xzf "$W/$BUNDLE" -C "$W/bin"
+          rm -f "$W/$BUNDLE"
+          ls "$W/bin" | head -5
+          echo "LCPP_BIN=$W/bin" >> "$GITHUB_ENV"
+
+      - name: Build the managed-memory test
+        id: build
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"
+          HIPCC="$(command -v hipcc || ls /opt/rocm*/bin/hipcc 2>/dev/null | head -1)"
+          echo "hipcc: ${HIPCC:-MISSING}"
+          if [ -z "$HIPCC" ]; then
+            echo "no hipcc; will try the bundled clang"
+            CLANGXX="$(ls /opt/rocm*/llvm/bin/clang++ 2>/dev/null | head -1)"
+            echo "clang++: ${CLANGXX:-MISSING}"
+            [ -z "$CLANGXX" ] && { echo "built=no" >> "$GITHUB_OUTPUT"; exit 0; }
+            "$CLANGXX" -x hip --offload-arch=gfx1151 -O2 \
+              --rocm-path="$(ls -d /opt/rocm* | head -1)" \
+              tools/managed_mem_test.hip -o "$W/managed_mem_test" \
+              -L"$(ls -d /opt/rocm* | head -1)/lib" -lamdhip64 2>&1 | tail -20
+          else
+            "$HIPCC" --offload-arch=gfx1151 -O2 tools/managed_mem_test.hip \
+              -o "$W/managed_mem_test" 2>&1 | tail -20
+          fi
+          if [ -x "$W/managed_mem_test" ]; then echo "built=yes" >> "$GITHUB_OUTPUT";
+          else echo "built=no" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Run the managed-memory test
+        if: steps.build.outputs.built == 'yes'
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"
+          {
+            echo "## hipMallocManaged vs hipMalloc, gfx1151"; echo
+            echo "Same allocation swap ggml makes when GGML_CUDA_ENABLE_UNIFIED_MEMORY is present."
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          timeout 2400 "$W/managed_mem_test" 1 8 24 40 56 72 88 2>&1 | tee "$W/out/managed_mem_test.txt"
+          cat "$W/out/managed_mem_test.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a missing compiler
+        if: steps.build.outputs.built != 'yes'
+        run: |
+          echo "## hipMallocManaged test NOT RUN" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "No HIP compiler on the runner image, so the allocator was never exercised directly." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-managed-memory
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
+
+  hybrid-models:
+    name: UMA A/B on recurrent / hybrid architectures
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the Unsloth gfx1151 llama.cpp bundle
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/bin" "$W/models" "$W/out"
+          curl -fL --retry 3 -o "$W/$BUNDLE" \
+            "https://github.com/unslothai/llama.cpp/releases/download/$LLAMA_TAG/$BUNDLE"
+          tar xzf "$W/$BUNDLE" -C "$W/bin"
+          rm -f "$W/$BUNDLE"
+          "$W/bin/llama-server" --version 2>&1 | head -5 || true
+          echo "W=$W" >> "$GITHUB_ENV"
+          {
+            echo "## Build"; echo '```'
+            LD_LIBRARY_PATH="$W/bin" "$W/bin/llama-server" --version 2>&1 | head -5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: A/B Falcon-H1-1.5B (mamba2 hybrid, 0.9 GiB)
+        run: |
+          set +e
+          bash tools/ab_one.sh \
+            "Falcon-H1-1.5B-Instruct (mamba2 hybrid)" \
+            unsloth/Falcon-H1-1.5B-Instruct-GGUF \
+            18b2d368c505b87c844dec1ec7a2f77090962e72 \
+            Falcon-H1-1.5B-Instruct-Q4_K_M.gguf \
+            falcon
+
+      - name: A/B granite-4.0-h-tiny (mamba2 hybrid MoE, 4 GiB)
+        run: |
+          set +e
+          bash tools/ab_one.sh \
+            "granite-4.0-h-tiny (mamba2 hybrid MoE)" \
+            unsloth/granite-4.0-h-tiny-GGUF \
+            56b37fdc52891304726c4a0a8b140dd1fc1582d5 \
+            granite-4.0-h-tiny-Q4_K_M.gguf \
+            granite
+
+      - name: A/B Qwen3-Next-80B-A3B IQ4_XS (gated delta-net MoE, 40 GiB)
+        run: |
+          set +e
+          bash tools/ab_one.sh \
+            "Qwen3-Next-80B-A3B-Instruct IQ4_XS (gated delta-net MoE)" \
+            unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF \
+            6688872b7a4e5eb8a121ceea08009530a024ba1d \
+            Qwen3-Next-80B-A3B-Instruct-IQ4_XS.gguf \
+            qwen3next
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-hybrid-models
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
