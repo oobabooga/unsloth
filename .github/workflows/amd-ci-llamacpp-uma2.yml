@@ -1,0 +1,315 @@
+name: "AMD CI: GGML_CUDA_ENABLE_UNIFIED_MEMORY on gfx1151 (Unsloth build)"
+
+# Second attempt at HF unsloth/Qwen3.8-Flash-Next-GGUF discussion #30. The first
+# run (oobabooga/unsloth, branch amd-ci-llamacpp-uma) returned INCONCLUSIVE on
+# every cell for a reason worth recording rather than quietly fixing:
+#
+#   llama_model_load: error loading model: unknown model architecture: 'qwen4exp'
+#
+# UPSTREAM llama.cpp b10639 cannot load Qwen3.8-Flash-Next at all. qwen4exp
+# support is ggml-org/llama.cpp#27742, which is still OPEN and not in any
+# upstream tag (master's src/llama-arch.cpp has no qwen4 entry). The reporter's
+# binary self-identifies as b10639-2a36554fc, which is the UNSLOTH build:
+# unslothai/llama.cpp release b10639-mix-f6f92fe, whose manifest records
+# "source_commit": "2a36554fc89e1fdbbd0de8cb382afbc1677b1b65". Same version
+# number, different code. This branch uses that exact binary, verified locally to
+# print `build 10639, commit 2a36554fc`.
+#
+# TWO DEVIATIONS FROM THE REPORT, both forced by this host and neither hidden:
+#
+#  1. NOT the reported model file. The runner has 62 GB of system RAM and a
+#     64 GiB GPU pool; UD-IQ4_XS is 87.24 GiB and EVERY Flash-Next quant is
+#     >= 72 GB, so no variant of that model fits in any configuration. The
+#     hardware gate records `free` and rocminfo into the artifact so this is
+#     checkable rather than asserted.
+#  2. Therefore this tests the MECHANISM, not the file. That is a defensible
+#     substitution because ggml-org/llama.cpp#26148 reports the same corruption
+#     on the same gfx1151 with a DIFFERENT model (Qwen3-Coder-Next), and because
+#     what the variable changes is the allocator - ggml-cuda.cu:139-166 swaps
+#     cudaMalloc for cudaMallocManaged (hipMallocManaged under vendors/hip.h)
+#     and then requests hipMemAdviseSetCoarseGrain, discarding the error. None of
+#     that is model-specific.
+#
+# The verdict must therefore say "the mechanism did/did not reproduce at these
+# sizes on this host", never "discussion #30 does/does not reproduce".
+#
+# Cells, cheapest first:
+#   W1  0.6B,  ROCm,    unset vs =1                    does it need size at all?
+#   W2  27B,   ROCm,    unset vs =1                    the main comparison
+#   W3  27B,   ROCm,    unset vs =0                    presence-only semantics
+#   W4  27B,   ROCm,    =1 vs =1 + HIP_LAUNCH_BLOCKING allocator or async race?
+#   W5  27B,   Vulkan,  unset vs =1                    negative control
+#   W6  27B,   ROCm,    unset vs =1, -c 262144         memory pressure: the
+#       reporter's own context size, and the only oversubscription this host can
+#       reach. The torch-based VRAM holder fixture is unusable here because this
+#       job deliberately has no torch, so KV cache is the available lever.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-uma2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The reporter's exact build, not an upstream tag of the same number.
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  SMALL_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  SMALL_REV: "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+  SMALL_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  BIG_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  BIG_REV: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  BIG_FILE: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  CTX: "8192"
+  CTX_PRESSURE: "262144"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "unified memory on gfx1151, Unsloth build (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 350
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-uma2"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          # This is evidence, not decoration: it is what makes the claim that the
+          # 87 GiB reported file cannot run here checkable by a reader.
+          { free -g; } > "$AMD_CI_WORK/out/free.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Unsloth llama.cpp build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          # The gfx1151 ROCm bundle ships its own HIP, rocBLAS and hipBLASLt with
+          # gfx1151 kernels, flat alongside the binaries, so the probe's existing
+          # LD_LIBRARY_PATH=--bin-dir is sufficient.
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-vulkan.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Fetch models
+        timeout-minutes: 90
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$SMALL_REPO" --file "$SMALL_FILE" \
+            --revision "$SMALL_REV" --as-name model.gguf --local-dir "$M/s_ctl" \
+            --out "$AMD_CI_WORK/out/model_small.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$BIG_REPO" --file "$BIG_FILE" \
+            --revision "$BIG_REV" --as-name model.gguf --local-dir "$M/b_ctl" \
+            --out "$AMD_CI_WORK/out/model_big.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Build the state directories
+        run: |
+          set -eu
+          # Hardlinks: write_states.py resolve()s paths and refuses two states on
+          # the same directory, so a symlink would be rejected and a copy would
+          # cost another 18 GB. Distinct directories over identical bytes is
+          # exactly what the "same model file" gate asserts.
+          M="$AMD_CI_WORK/models"
+          for D in s_uma1; do
+            mkdir -p "$M/$D"; ln -f "$M/s_ctl/model.gguf" "$M/$D/model.gguf"
+          done
+          for D in b_uma1 b_uma0 b_uma1lb; do
+            mkdir -p "$M/$D"; ln -f "$M/b_ctl/model.gguf" "$M/$D/model.gguf"
+          done
+          # `-NAME` means UNSET, and it is the only honest control: ggml enables
+          # unified memory on the PRESENCE of the name, so `NAME=` would enable
+          # the very thing being controlled for.
+          for D in s_ctl b_ctl; do
+            printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/$D/env"
+          done
+          for D in s_uma1 b_uma1; do
+            printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/$D/env"
+          done
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=0' > "$M/b_uma0/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' 'HIP_LAUNCH_BLOCKING=1' \
+            > "$M/b_uma1lb/env"
+          for D in s_ctl s_uma1 b_ctl b_uma1 b_uma0 b_uma1lb; do
+            echo "--- $D/env"; cat "$M/$D/env"
+          done
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/s_ctl" --path "head=$M/s_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_small.json"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/b_ctl" --path "head=$M/b_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_big.json"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/b_ctl" --path "head=$M/b_uma0" \
+            --label "base=unset" --label "head==0" \
+            --out "$AMD_CI_WORK/out/states_big0.json"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/b_uma1" --path "head=$M/b_uma1lb" \
+            --label "base==1" --label "head==1 + blocking" \
+            --out "$AMD_CI_WORK/out/states_biglb.json"
+
+      - name: W1 - 0.6B, ROCm, unset vs =1
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_small.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W1" \
+            --title "W1 Qwen3-0.6B, ROCm, UNIFIED_MEMORY unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 900 --request-timeout 600
+          cat "$AMD_CI_WORK/out/W1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W1"
+
+      - name: W2 - 27B, ROCm, unset vs =1
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_big.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W2" \
+            --title "W2 Qwen3.8-27B UD-Q4_K_XL, ROCm, UNIFIED_MEMORY unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 1800 --request-timeout 1200
+          cat "$AMD_CI_WORK/out/W2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W2"
+
+      - name: W3 - 27B, ROCm, unset vs =0
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # ggml tests presence, not truthiness. If =0 behaves like =1, then
+          # anyone "turning it off" that way is still running with it on.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_big0.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W3" \
+            --title "W3 27B, ROCm, unset vs =0 (presence-only semantics), gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 1800 --request-timeout 1200
+          cat "$AMD_CI_WORK/out/W3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W3"
+
+      - name: W4 - 27B, ROCm, =1 vs =1 with HIP_LAUNCH_BLOCKING
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # Both states have unified memory on; only launch serialisation differs.
+          # A divergence here means the workaround changed something, which points
+          # at an async ordering race exposed by managed memory rather than at
+          # hipMallocManaged returning bad memory. llama.cpp's own gfx1151 CI sets
+          # HIP_LAUNCH_BLOCKING for exactly this class of problem.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_biglb.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W4" \
+            --title "W4 27B, ROCm, =1 vs =1 + HIP_LAUNCH_BLOCKING=1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 1800 --request-timeout 1200
+          cat "$AMD_CI_WORK/out/W4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W4"
+
+      - name: W5 - 27B, Vulkan, unset vs =1 (negative control)
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: Vulkan
+        run: |
+          set +e
+          # The Vulkan backend never reads this variable, so the pair must come
+          # out identical. A difference here would mean the harness manufactures
+          # differences on its own and W2 would prove nothing. The criteria
+          # module's device gate is flipped by AMD_CI_EXPECT_DEVICE, so this cell
+          # cannot pass by quietly landing on ROCm.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_big.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W5" \
+            --title "W5 27B, Vulkan, unset vs =1 - negative control, gfx1151" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 1800 --request-timeout 1200
+          cat "$AMD_CI_WORK/out/W5/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W5"
+
+      - name: W6 - 27B, ROCm, unset vs =1 under memory pressure
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # Managed memory only has real work to do when an allocation cannot sit
+          # resident, and nothing else on this host can create that: the model
+          # that would (87 GiB) does not fit, and the VRAM-holder fixture needs
+          # torch, which this job deliberately does not have. The reporter's own
+          # -c 262144 is the remaining lever. If this cell OOMs, its gate says so
+          # and it reads INCONCLUSIVE rather than as a negative.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_big.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/W6" \
+            --title "W6 27B, ROCm, unset vs =1, -c 262144 memory pressure, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX_PRESSURE" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 2400 --request-timeout 1800
+          cat "$AMD_CI_WORK/out/W6/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/W6"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-uma2-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
