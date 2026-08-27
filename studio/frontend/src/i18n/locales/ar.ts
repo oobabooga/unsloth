@@ -1331,6 +1331,9 @@ export const ar = {
         showAllQuantizations: "إظهار جميع خيارات التكميم",
         showAllQuantizationsDescription:
           "عند التفعيل: تُدرج جميع خيارات التكميم ضمن «On Device»، بما فيها الخيارات غير المُنزَّلة. عند التعطيل: لا تظهر إلا خيارات التكميم المُنزَّلة.",
+        showMemoryBar: "إظهار شريط استخدام VRAM",
+        showMemoryBarDescription:
+          "يعرض أسفل صف كل نموذج تم تنزيله الاستخدام التقديري لذاكرة VRAM: الأوزان، وذاكرة KV المؤقتة عند طول السياق الذي سيُحمَّل به، وأي حجز لمسودة فك التشفير التخميني.",
       },
       menu: {
         title: "قائمة المحادثة",
@@ -1357,10 +1360,29 @@ export const ar = {
       rememberParamsPerModel: "تذكر الإعدادات لكل نموذج",
       rememberParamsPerModelDescription:
         "عند تبديل النموذج تُستعاد درجة الحرارة والموجّه وبقية الإعدادات التي استخدمتها آخر مرة مع ذلك النموذج. عند الإيقاف تبقى مجموعة إعدادات واحدة لكل النماذج.",
+      autoCompact: "ضغط المحادثات الطويلة تلقائيًا",
+      autoCompactDescription:
+        "عندما تصل محادثة GGUF محلية إلى طول السياق المحدد، احذف الأدوار الأقدم بدلًا من إرجاع خطأ. لا يعتمد ذلك على ذاكرة VRAM المتاحة.",
+      compactionStyle: "عند امتلاء السياق",
+      compactionStyleDescription:
+        "يُبقي الخيار الافتراضي للخادم UNSLOTH_CONTEXT_POLICY. تحتفظ إعادة ضبط المحادثة بأحدث دور والتعليمات الدائمة. تحذف النافذة المنزلقة الأدوار الأقدم ويمكنها الاحتفاظ بمزيد من السجل الحديث.",
+      compactionStyleInherit: "استخدام إعداد الخادم الافتراضي",
+      compactionStyleCheckpoint: "إعادة ضبط المحادثة",
+      compactionStyleRollingDefault: "حذف الأدوار الأقدم (مساحة إضافية نحو 25%)",
+      compactionStyleRolling10: "حذف الأدوار الأقدم (مساحة إضافية نحو 10%)",
+      compactionStyleRolling5: "حذف الأدوار الأقدم (مساحة إضافية نحو 5%)",
+      compactionStyleRollingNone: "حذف الأدوار الأقدم (دون اقتطاع إضافي)",
+      autoCompactKeywords:
+        "ضغط تلقائي سياق نافذة اقتطاع منزلقة نقطة تحقق هامش compaction rolling checkpoint headroom",
       thinking: {
         collapseByDefault: "طيّ التفكير افتراضيًا",
         collapseByDefaultDescription:
           "إبقاء التفكير مطويًا أثناء تفكير النموذج بدلًا من فتحه تلقائيًا. وسّع أي كتلة لقراءتها.",
+      },
+      tools: {
+        collapseByDefault: "طيّ نشاط الأدوات افتراضيًا",
+        collapseByDefaultDescription:
+          "إبقاء مدخلات الأدوات ومخرجاتها مطوية أثناء التشغيل. وسّع أي صف أداة لفحصه.",
       },
       webSearch: {
         title: "البحث على الويب",
@@ -2352,5 +2374,14 @@ export const ar = {
       datasetStreaming: "مجموعة البيانات: تُقرأ بالتدفّق (من دون تنزيل كامل)",
       modelWeights: "أوزان النموذج",
     },
+  },
+  modelMemory: {
+    readout:
+      "الأوزان {model} + السياق {context} = {total} من {budget} من VRAM القابلة للاستخدام",
+    readoutWithSpec:
+      "الأوزان {model} + KV {kv} + مسودة MTP {spec} = {total} من {budget} من VRAM القابلة للاستخدام",
+    kvRate: "KV محجوزة مسبقًا، ~{rate}/توكن",
+    oomLikely: "مع الإعدادات الحالية يُرجَّح نفاد الذاكرة",
+    tooLarge: "أكبر من ذاكرة الرسوميات، وسيُفرَّغ جزء منه إلى المعالج. التكميم الأصغر أسرع",
   },
 } satisfies DeepPartialMessageTree<typeof en>;

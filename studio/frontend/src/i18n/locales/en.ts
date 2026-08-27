@@ -1324,6 +1324,9 @@ export const en = {
         showAllQuantizations: "Show all quantizations",
         showAllQuantizationsDescription:
           "On: list every quantization in “On Device”, including not downloaded. Off: show only downloaded quantizations.",
+        showMemoryBar: "Show VRAM usage bar",
+        showMemoryBarDescription:
+          "Chart each downloaded model's estimated VRAM use under its row: weights, KV cache at the context it will load with, and any speculative draft reserve.",
       },
       menu: {
         title: "Chat menu",
@@ -1350,10 +1353,29 @@ export const en = {
       rememberParamsPerModel: "Remember settings per model",
       rememberParamsPerModelDescription:
         "Switching models restores the temperature, prompt and other settings you last used with that model. Off keeps one set of settings for every model.",
+      autoCompact: "Auto-compact long chats",
+      autoCompactDescription:
+        "When a local GGUF chat fills the context length you set, drop older turns instead of returning an error. This is not based on free VRAM.",
+      compactionStyle: "When context fills",
+      compactionStyleDescription:
+        "Use server default keeps UNSLOTH_CONTEXT_POLICY. Reset conversation keeps the latest turn and standing instructions. A sliding window drops oldest turns and can keep more recent history.",
+      compactionStyleInherit: "Use server default",
+      compactionStyleCheckpoint: "Reset conversation",
+      compactionStyleRollingDefault: "Drop oldest turns (~25% extra room)",
+      compactionStyleRolling10: "Drop oldest turns (~10% extra room)",
+      compactionStyleRolling5: "Drop oldest turns (~5% extra room)",
+      compactionStyleRollingNone: "Drop oldest turns (no extra trim)",
+      autoCompactKeywords:
+        "compaction compact auto-compact context window truncate rolling checkpoint headroom",
       thinking: {
         collapseByDefault: "Collapse Thinking by default",
         collapseByDefaultDescription:
           "Keep reasoning collapsed while the model thinks instead of streaming it open. Expand any block to read it.",
+      },
+      tools: {
+        collapseByDefault: "Collapse tool activity by default",
+        collapseByDefaultDescription:
+          "Keep tool inputs and outputs collapsed while tools run. Expand any tool row to inspect it.",
       },
       webSearch: {
         title: "Web search",
@@ -2334,5 +2356,16 @@ export const en = {
       datasetStreaming: "Dataset: streaming (no full download)",
       modelWeights: "Model weights",
     },
+  },
+  modelMemory: {
+    readout:
+      "Weights {model} + context {context} = {total} of {budget} usable VRAM",
+    readoutWithSpec:
+      "Weights {model} + KV {kv} + MTP draft {spec} = {total} of {budget} usable VRAM",
+    // Measured against llama.cpp: the cache is allocated at context creation,
+    // sized to n_ctx, so the rate is what a longer context actually costs.
+    kvRate: "KV reserved, ~{rate}/token",
+    oomLikely: "With current settings OOM likely",
+    tooLarge: "Larger than VRAM, will offload to CPU. A smaller quantization runs faster",
   },
 } as const;

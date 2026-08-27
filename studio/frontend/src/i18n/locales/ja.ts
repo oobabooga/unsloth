@@ -1319,6 +1319,9 @@ export const ja = {
         showAllQuantizations: "すべての量子化オプションを表示",
         showAllQuantizationsDescription:
           "オン: 「On Device」にあるすべての量子化オプションを、未ダウンロードのものも含めて一覧表示します。オフ: ダウンロード済みの量子化オプションのみを表示します。",
+        showMemoryBar: "VRAM 使用量バーを表示",
+        showMemoryBarDescription:
+          "ダウンロード済みモデルの行の下に、推定 VRAM 使用量を表示します。内訳は重み、実際に読み込まれるコンテキスト長での KV キャッシュ、および投機的デコードの下書き用に確保される領域です。",
       },
       menu: {
         title: "チャットメニュー",
@@ -1344,10 +1347,29 @@ export const ja = {
       rememberParamsPerModel: "モデルごとに設定を記憶",
       rememberParamsPerModelDescription:
         "モデルを切り替えると、そのモデルで最後に使った温度やプロンプトなどの設定が復元されます。オフの場合は、すべてのモデルで同じ設定を使います。",
+      autoCompact: "長いチャットを自動圧縮",
+      autoCompactDescription:
+        "ローカル GGUF チャットが設定したコンテキスト長に達したら、エラーを返す代わりに古いターンを削除します。空き VRAM には基づきません。",
+      compactionStyle: "コンテキストが満杯になったとき",
+      compactionStyleDescription:
+        "サーバー既定値を使うと UNSLOTH_CONTEXT_POLICY が維持されます。会話をリセットすると最新ターンと継続指示が残ります。スライディングウィンドウは古いターンを削除し、より多くの最近の履歴を残せます。",
+      compactionStyleInherit: "サーバー既定値を使用",
+      compactionStyleCheckpoint: "会話をリセット",
+      compactionStyleRollingDefault: "古いターンを削除（約 25% の追加余裕）",
+      compactionStyleRolling10: "古いターンを削除（約 10% の追加余裕）",
+      compactionStyleRolling5: "古いターンを削除（約 5% の追加余裕）",
+      compactionStyleRollingNone: "古いターンを削除（追加の切り詰めなし）",
+      autoCompactKeywords:
+        "圧縮 自動圧縮 コンテキスト ウィンドウ 切り詰め スライディング チェックポイント 余裕 compaction rolling headroom",
       thinking: {
         collapseByDefault: "思考をデフォルトで折りたたむ",
         collapseByDefaultDescription:
           "モデルの思考中も自動で展開せず、折りたたんだままにします。読みたいときはブロックを展開してください。",
+      },
+      tools: {
+        collapseByDefault: "ツールの動作をデフォルトで折りたたむ",
+        collapseByDefaultDescription:
+          "ツールの実行中は入力と出力を折りたたんだままにします。確認するにはツール行を展開してください。",
       },
       webSearch: {
         title: "ウェブ検索",
@@ -2305,5 +2327,14 @@ export const ja = {
       datasetStreaming: "データセット: ストリーミング（完全なダウンロードなし）",
       modelWeights: "モデルの重み",
     },
+  },
+  modelMemory: {
+    readout:
+      "重み {model} + コンテキスト {context} = 使用可能な VRAM {budget} 中 {total}",
+    readoutWithSpec:
+      "重み {model} + KV {kv} + MTP 下書き {spec} = 使用可能な VRAM {budget} 中 {total}",
+    kvRate: "KV は事前確保、約 {rate}/トークン",
+    oomLikely: "現在の設定ではメモリ不足になる可能性があります",
+    tooLarge: "VRAM を超えるため CPU にオフロードされます。より小さい量子化の方が高速です",
   },
 } satisfies DeepPartialMessageTree<typeof en>;
