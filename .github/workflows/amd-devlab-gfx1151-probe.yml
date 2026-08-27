@@ -1,0 +1,143 @@
+name: AMD DevLab gfx1151 GPU probe
+
+on:
+  push:
+    branches: [amd-devlab-gfx1151-probe]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - name: Host ROCm
+        run: |
+          set +e
+          uname -a
+          cat /opt/rocm/.info/version 2>/dev/null && echo "(/opt/rocm/.info/version)"
+          ls -d /opt/rocm* 2>/dev/null
+          hipconfig --version 2>/dev/null; echo
+          rocminfo 2>/dev/null | grep -E "Name:|gfx" | head -12
+          rocm-smi --showdriverversion 2>/dev/null
+          dpkg -l 2>/dev/null | grep -iE "rocm|hip-|hsa-" | awk '{print $2, $3}' | head -25
+          dmesg -T 2>/dev/null | tail -5
+          true
+
+      - name: Probe wheels
+        run: |
+          set +e
+          WORK="$RUNNER_TEMP/probe"
+          mkdir -p "$WORK/tmp"
+          export TMPDIR="$WORK/tmp"
+          cat > "$WORK/gpu_probe.py" <<'PROBE'
+          """Find out whether any GPU kernel runs at all on this gfx1151 runner, and which call dies.
+
+          Each probe is its own process (the harness runs this file once per probe name) because a HIP
+          fault is not recoverable: the point is the exit code, not an exception.
+          """
+
+          import faulthandler
+          import json
+          import sys
+
+          faulthandler.enable()
+
+          import torch
+
+          probe = sys.argv[1]
+          print(json.dumps({
+              "probe": probe,
+              "torch": torch.__version__,
+              "hip": torch.version.hip,
+              "device": torch.cuda.get_device_name(0),
+              "arch": torch.cuda.get_device_properties(0).gcnArchName,
+          }), flush=True)
+
+          dev = torch.device("cuda")
+
+          if probe == "alloc":
+              x = torch.empty(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "note": "allocation only, no kernel"}), flush=True)
+          elif probe == "fill":
+              x = torch.ones(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "sum": float(x.sum().item())}), flush=True)
+          elif probe == "h2d":
+              x = torch.ones(1024).to(dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "back": float(x.cpu().sum().item())}), flush=True)
+          elif probe == "matmul":
+              a = torch.randn(512, 512, device=dev)
+              b = torch.randn(512, 512, device=dev)
+              c = a @ b
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(c.shape)}), flush=True)
+          elif probe == "conv":
+              x = torch.randn(1, 32, 64, 64, device=dev)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          elif probe == "conv_bf16":
+              x = torch.randn(1, 32, 64, 64, device=dev, dtype=torch.bfloat16)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev, torch.bfloat16)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          else:
+              raise SystemExit(f"unknown probe {probe}")
+          PROBE
+          python3 -c "import ast; ast.parse(open('$WORK/gpu_probe.py').read())" || exit 1
+
+          run_probes () {
+            label="$1"; py="$2"
+            echo "::group::probes for $label"
+            for p in alloc fill h2d matmul conv conv_bf16; do
+              out=$("$py" "$WORK/gpu_probe.py" "$p" 2>&1)
+              code=$?
+              printf '%-10s exit=%-4s %s\n' "$p" "$code" "$(echo "$out" | tr '\n' ' ' | cut -c1-320)"
+            done
+            echo "--- dmesg tail ---"
+            dmesg -T 2>/dev/null | tail -8
+            echo "::endgroup::"
+          }
+
+          for idx in rocm7.1 rocm6.4 rocm7.0; do
+            venv="$WORK/venv-$idx"
+            echo "===== installing torch from $idx ====="
+            python3 -m venv "$venv" || continue
+            "$venv/bin/pip" install -q --upgrade pip
+            "$venv/bin/pip" install -q --index-url "https://download.pytorch.org/whl/$idx" \
+              --extra-index-url https://pypi.org/simple torch
+            if [ $? -ne 0 ]; then echo "$idx: install failed, skipping"; rm -rf "$venv"; continue; fi
+            "$venv/bin/python" -c "import torch; print('installed', torch.__version__)" || { rm -rf "$venv"; continue; }
+            run_probes "$idx" "$venv/bin/python"
+            [ "$idx" = "rocm7.1" ] && cp -r "$venv" "$WORK/venv-main" 2>/dev/null
+            [ "$idx" != "rocm7.1" ] && rm -rf "$venv"
+          done
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+
+      - name: Probe env workarounds on the rocm7.1 wheel
+        run: |
+          set +e
+          PY="$WORK/venv-main/bin/python"
+          [ -x "$PY" ] || { echo "no rocm7.1 venv"; exit 0; }
+          try_env () {
+            desc="$1"; shift
+            out=$(env "$@" "$PY" "$WORK/gpu_probe.py" conv 2>&1)
+            code=$?
+            printf '%-46s exit=%-4s %s\n' "$desc" "$code" "$(echo "$out" | tr '\n' ' ' | cut -c1-260)"
+          }
+          try_env "baseline"                                    X=1
+          try_env "HSA_OVERRIDE_GFX_VERSION=11.0.0"             HSA_OVERRIDE_GFX_VERSION=11.0.0
+          try_env "HSA_OVERRIDE_GFX_VERSION=11.5.1"             HSA_OVERRIDE_GFX_VERSION=11.5.1
+          try_env "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM=0"           MIOPEN_DEBUG_CONV_IMPLICIT_GEMM=0
+          try_env "MIOPEN_FIND_MODE=NORMAL"                     MIOPEN_FIND_MODE=NORMAL
+          try_env "TORCH_BLAS_PREFER_HIPBLASLT=0"               TORCH_BLAS_PREFER_HIPBLASLT=0
+          try_env "AMD_SERIALIZE_KERNEL=3"                      AMD_SERIALIZE_KERNEL=3
+          try_env "HIP_VISIBLE_DEVICES=0 + serialize"           HIP_VISIBLE_DEVICES=0 AMD_SERIALIZE_KERNEL=3
+          echo "--- dmesg tail ---"
+          dmesg -T 2>/dev/null | tail -10
+          true
