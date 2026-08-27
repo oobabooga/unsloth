@@ -1,0 +1,145 @@
+name: AMD DevLab UMA pressure
+
+on:
+  push:
+    branches: [amd-ci-uma-pressure]
+
+permissions: {}
+
+env:
+  LLAMA_TAG: b10639-mix-f6f92fe
+  BUNDLE: app-b10639-mix-f6f92fe-linux-x64-rocm-gfx1151.tar.gz
+  GGUF_REPO: unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF
+  GGUF_REV: 6688872b7a4e5eb8a121ceea08009530a024ba1d
+  GGUF_FILE: Qwen3-Next-80B-A3B-Instruct-IQ4_XS.gguf
+
+jobs:
+  pressure:
+    name: UMA under memory pressure and long generation
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Bundle and model
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/bin" "$W/models" "$W/out"
+          echo "W=$W" >> "$GITHUB_ENV"
+          curl -fL --retry 3 -o "$W/$BUNDLE" \
+            "https://github.com/unslothai/llama.cpp/releases/download/$LLAMA_TAG/$BUNDLE"
+          tar xzf "$W/$BUNDLE" -C "$W/bin"; rm -f "$W/$BUNDLE"
+          curl -fL --retry 5 --retry-delay 10 -o "$W/models/$GGUF_FILE" \
+            "https://huggingface.co/$GGUF_REPO/resolve/$GGUF_REV/$GGUF_FILE"
+          ls -l "$W/models"
+
+      - name: P1 KV pressure, -c 262144 --parallel 3
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"; OUT="$W/out/p1"; mkdir -p "$OUT"
+          A=(--bin-dir "$W/bin" --gguf "$W/models/$GGUF_FILE" --ngl 999
+             --ctx-size 262144 --n-predict 128 --repeats 2
+             --load-timeout 2400 --request-timeout 1800
+             --extra --parallel --extra 3)
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA absent" \
+            --env "-GGML_CUDA_ENABLE_UNIFIED_MEMORY" --out "$OUT/base.json"
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA=1" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --out "$OUT/head.json"
+          python3 tools/compare.py "P1 Qwen3-Next-80B IQ4_XS, -c 262144 --parallel 3 (KV pressure)" \
+            "$OUT/base.json" "$OUT/head.json" | tee "$OUT/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+      - name: P2 long generation, 512 tokens
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"; OUT="$W/out/p2"; mkdir -p "$OUT"
+          A=(--bin-dir "$W/bin" --gguf "$W/models/$GGUF_FILE" --ngl 999
+             --ctx-size 16384 --n-predict 512 --repeats 2
+             --load-timeout 2400 --request-timeout 1800)
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA absent" \
+            --env "-GGML_CUDA_ENABLE_UNIFIED_MEMORY" --out "$OUT/base.json"
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA=1" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --out "$OUT/head.json"
+          python3 tools/compare.py "P2 Qwen3-Next-80B IQ4_XS, 512-token greedy generation" \
+            "$OUT/base.json" "$OUT/head.json" | tee "$OUT/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+      - name: P3 does disabling HIP graphs change the UMA=1 result
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"; OUT="$W/out/p3"; mkdir -p "$OUT"
+          A=(--bin-dir "$W/bin" --gguf "$W/models/$GGUF_FILE" --ngl 999
+             --ctx-size 16384 --n-predict 128 --repeats 2
+             --load-timeout 2400 --request-timeout 1800)
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA=1" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --out "$OUT/base.json"
+          python3 tools/llama_ab.py "${A[@]}" --label "UMA=1 + graphs off" \
+            --env "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" --env "GGML_CUDA_DISABLE_GRAPHS=1" \
+            --out "$OUT/head.json"
+          python3 tools/compare.py "P3 UMA=1 with and without HIP graphs" \
+            "$OUT/base.json" "$OUT/head.json" | tee "$OUT/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-pressure
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
+
+  xnack:
+    name: Does hipMallocManaged oversubscribe with HSA_XNACK=1
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          set -e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/out"
+          HIPCC="$(command -v hipcc || ls /opt/rocm*/bin/hipcc | head -1)"
+          "$HIPCC" --offload-arch=gfx1151 -O2 tools/managed_mem_test.hip -o "$W/managed_mem_test"
+
+      - name: XNACK off (default) then XNACK on
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"
+          {
+            echo "## Can hipMallocManaged exceed the 64 GiB carve-out?"
+            echo
+            echo "Studio sets the variable to let llama.cpp use shared system RAM."
+            echo "Managed memory can only oversubscribe when the GPU can take page"
+            echo "faults, which is what HSA_XNACK controls. Studio never sets it."
+            echo
+            echo '### HSA_XNACK unset (what Studio actually launches with)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rocminfo 2>/dev/null | grep -i xnack
+          timeout 900 "$W/managed_mem_test" 56 72 88 2>&1 | tee "$W/out/xnack_off.txt"
+          cat "$W/out/xnack_off.txt" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            echo
+            echo '### HSA_XNACK=1'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          HSA_XNACK=1 rocminfo 2>/dev/null | grep -i xnack
+          HSA_XNACK=1 timeout 900 "$W/managed_mem_test" 56 72 88 2>&1 | tee "$W/out/xnack_on.txt"
+          cat "$W/out/xnack_on.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-xnack
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
