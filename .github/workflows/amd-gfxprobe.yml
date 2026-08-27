@@ -8,32 +8,26 @@ permissions:
   contents: read
 
 jobs:
-  wheels:
+  owns:
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Generic wheel arch lists at the versions the installer pins
+      - name: Does torch itself declare the rocm family
         run: |
           set +e
           W="$RUNNER_TEMP/w"; mkdir -p "$W/tmp"
           export TMPDIR="$W/tmp" PIP_CACHE_DIR="$W/pipcache"
-          python3 -m venv "$W/venv"
-          . "$W/venv/bin/activate"
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
           python -m pip install -q --upgrade pip
-          # (spec, index) pairs exactly as _ROCM_TORCH_PKG_SPECS resolves them.
-          for pair in "torch==2.10.0|https://download.pytorch.org/whl/rocm7.1" \
-                      "torch==2.11.0|https://download.pytorch.org/whl/rocm7.1" \
-                      "torch==2.13.0|https://download.pytorch.org/whl/rocm7.1" \
-                      "torch==2.11.0|https://download.pytorch.org/whl/rocm7.2" \
-                      "torch|https://download.pytorch.org/whl/rocm7.0" \
-                      "torch|https://download.pytorch.org/whl/rocm6.3"; do
-            spec="${pair%%|*}"; url="${pair##*|}"
-            echo "========== $spec from $url =========="
-            python -m pip install -q "$spec" --index-url "$url" 2>&1 | tail -2
-            python "$GITHUB_WORKSPACE/probe/archlist.py" 2>&1 | grep -E "VERSION|ARCHLIST"
-            python -m pip uninstall -y -q torch 2>&1 | tail -1
-            rm -rf "$W/pipcache"
-          done
+
+          echo "========== AMD per-arch torch (gfx110X-all) =========="
+          python -m pip install -q torch --index-url https://repo.amd.com/rocm/whl/gfx110X-all/ 2>&1 | tail -2
+          python "$GITHUB_WORKSPACE/probe/owns.py"
+
+          echo "========== now install GENERIC rocm7.1 torch over it =========="
+          python -m pip install -q "torch>=2.4,<2.11.0" --force-reinstall --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/rocm7.1 2>&1 | tail -2
+          python "$GITHUB_WORKSPACE/probe/owns.py"
           echo "===== END ====="
           exit 0
