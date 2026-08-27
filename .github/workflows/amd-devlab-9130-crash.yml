@@ -1,0 +1,378 @@
+name: AMD DevLab issue 9130 crash
+
+on:
+  push:
+    branches: [amd-devlab-9130-crash]
+
+permissions: {}
+
+env:
+  MAIN_SHA: 177a57b3b416cd572d3ed482eb2e08e6a3de5061
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 110
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          free -h
+          rocminfo 2>/dev/null | grep -E "Marketing Name:|gfx1151" | head -6 || true
+          rocm-smi 2>/dev/null || true
+          dmesg -T 2>/dev/null | tail -5 || true
+
+      - name: Fetch Studio
+        run: |
+          set -eux
+          WORK_ROOT="$RUNNER_TEMP/crash"
+          mkdir -p "$WORK_ROOT"
+          git init -q "$WORK_ROOT/src"
+          git -C "$WORK_ROOT/src" remote add origin https://github.com/unslothai/unsloth.git
+          git -C "$WORK_ROOT/src" fetch -q --depth 1 origin "$MAIN_SHA"
+          git -C "$WORK_ROOT/src" checkout -q "$MAIN_SHA"
+          git -C "$WORK_ROOT/src" log -1 --format='%H%n%s'
+          echo "WORK_ROOT=$WORK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install environment
+        run: |
+          set -eux
+          mkdir -p "$WORK_ROOT"/{tmp,cache/torch,cache/hf,logs}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          python -m pip install -q --upgrade pip
+          pip install -q --index-url https://download.pytorch.org/whl/rocm7.1 \
+            --extra-index-url https://pypi.org/simple 'torch>=2.10,<2.12'
+          pip install -q -r "$WORK_ROOT/src/studio/backend/requirements/studio.txt"
+          pip install -q \
+            python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests pillow safetensors \
+            'numpy<3' 'transformers>=4.51,<5.5' accelerate sentencepiece protobuf
+          pip install -q -r "$WORK_ROOT/src/studio/backend/requirements/diffusers-pin.txt" \
+            || pip install -q 'diffusers>=0.35'
+          python -c "import torch, diffusers; print('torch', torch.__version__, 'diffusers', diffusers.__version__)"
+          echo "$WORK_ROOT/venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$WORK_ROOT/venv" >> "$GITHUB_ENV"
+          echo "TMPDIR=$WORK_ROOT/tmp" >> "$GITHUB_ENV"
+          echo "TORCH_HOME=$WORK_ROOT/cache/torch" >> "$GITHUB_ENV"
+          echo "HF_HOME=$WORK_ROOT/cache/hf" >> "$GITHUB_ENV"
+          echo "HF_HUB_CACHE=$WORK_ROOT/cache/hf/hub" >> "$GITHUB_ENV"
+          echo "HF_XET_CACHE=$WORK_ROOT/cache/hf/xet" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$WORK_ROOT/src/studio/backend" >> "$GITHUB_ENV"
+
+      - name: Write probes
+        run: |
+          cat > "$WORK_ROOT/conv_stress.py" <<'CONV'
+          """Drive MIOpen convolutions on gfx1151 with VAE-decoder-shaped work.
+
+          The backtrace in issue #9130 faults inside MIOpen's EvaluateInvokers, i.e. a torch conv2d.
+          This walks conv shapes a diffusion VAE decoder actually runs, at rising resolution, and reports
+          per shape whether the launch came back clean. One JSON line per shape, flushed, so a shape that
+          kills the process is identifiable as the last line printed.
+          """
+
+          import json
+          import sys
+          import time
+
+          import torch
+
+          assert torch.cuda.is_available(), "no GPU"
+          dev = torch.device("cuda")
+          print(json.dumps({
+              "torch": torch.__version__,
+              "hip": torch.version.hip,
+              "device": torch.cuda.get_device_name(0),
+          }), flush=True)
+
+          # (in_channels, H, W, out_channels, kernel) -- the shapes a VAE decoder walks up through.
+          SHAPES = [
+              (512, 128, 128, 512, 3),
+              (512, 256, 256, 512, 3),
+              (256, 512, 512, 256, 3),
+              (128, 1024, 1024, 128, 3),
+              (128, 1536, 1536, 128, 3),
+              (128, 2048, 2048, 128, 3),
+              (64, 2560, 2560, 64, 3),
+              (128, 3072, 3072, 128, 3),
+              (32, 4096, 4096, 32, 3),
+          ]
+
+          failures = 0
+          for dtype in (torch.bfloat16, torch.float16, torch.float32):
+              for (ci, h, w, co, k) in SHAPES:
+                  row = {"dtype": str(dtype), "in_ch": ci, "h": h, "w": w, "out_ch": co, "k": k}
+                  try:
+                      x = torch.randn(1, ci, h, w, device=dev, dtype=dtype)
+                      conv = torch.nn.Conv2d(ci, co, k, padding=k // 2).to(dev, dtype)
+                      torch.cuda.synchronize()
+                      start = time.time()
+                      y = conv(x)
+                      torch.cuda.synchronize()
+                      row["ok"] = True
+                      row["ms"] = round((time.time() - start) * 1000, 1)
+                      row["out"] = list(y.shape)
+                      del x, y, conv
+                      torch.cuda.empty_cache()
+                  except Exception as exc:  # noqa: BLE001 -- an OOM is a pass, a launch failure is the bug
+                      row["ok"] = False
+                      row["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+                      row["launch_failure"] = "launch failure" in str(exc).lower()
+                      if row["launch_failure"]:
+                          failures += 1
+                      torch.cuda.empty_cache()
+                  print(json.dumps(row), flush=True)
+
+          print(json.dumps({"summary": "done", "launch_failures": failures}), flush=True)
+          sys.exit(2 if failures else 0)
+          CONV
+          cat > "$WORK_ROOT/server.py" <<'SERVER'
+          """A minimal stand-in for the Studio API process, built on the real diffusion backend.
+
+          Same shape as studio/backend/routes/inference.py: one FastAPI process, the diffusion pipeline
+          loaded into it, and /generate handing the blocking call to the default executor with
+          ``asyncio.to_thread(backend.generate, ...)``. That threading model is the thing under test, so
+          it is copied rather than approximated. /health is the "is the server still up" probe -- the
+          reporter's observation was that port 8888 went dead.
+          """
+
+          import asyncio
+          import os
+          import sys
+
+          import uvicorn
+          from fastapi import FastAPI
+          from pydantic import BaseModel
+
+          from core.inference.diffusion import DiffusionBackend
+
+          backend = DiffusionBackend()
+          app = FastAPI()
+
+
+          class LoadBody(BaseModel):
+              repo: str
+
+
+          class GenBody(BaseModel):
+              prompt: str = "a photograph of a red bicycle leaning on a stone wall"
+              width: int = 1024
+              height: int = 1024
+              steps: int = 8
+              guidance: float = 0.0
+              seed: int = 1234
+
+
+          @app.get("/health")
+          def health() -> dict:
+              return {"ok": True, "pid": os.getpid()}
+
+
+          @app.post("/load")
+          def load(body: LoadBody) -> dict:
+              return backend.begin_load(body.repo, model_kind="pipeline", gpu_ordinal=0)
+
+
+          @app.get("/load-status")
+          def load_status() -> dict:
+              progress = backend.load_progress()
+              return {
+                  "phase": progress.get("phase"),
+                  "error": progress.get("error"),
+                  "downloaded": progress.get("downloaded"),
+                  "total": progress.get("total"),
+                  "loaded": bool(backend.status().get("loaded")),
+              }
+
+
+          @app.post("/generate")
+          async def generate(body: GenBody) -> dict:
+              # Exactly how the Studio route dispatches it.
+              result = await asyncio.to_thread(
+                  backend.generate,
+                  prompt=body.prompt,
+                  width=body.width,
+                  height=body.height,
+                  steps=body.steps,
+                  guidance=body.guidance,
+                  seed=body.seed,
+              )
+              images = result.get("images") or []
+              return {"images": len(images), "keys": sorted(result.keys())}
+
+
+          if __name__ == "__main__":
+              port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
+              uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+          SERVER
+          cat > "$WORK_ROOT/fault_inject.py" <<'FAULT'
+          """Does a GPU-level fault raised on the generation thread stay contained?
+
+          Not a reproduction of the reporter's MIOpen fault: this INDUCES a real device memory fault
+          (an out-of-bounds device gather) so the escalation path can be observed on demand. The fault
+          itself is genuine -- the same class of unrecoverable HIP error -- and it is raised inside a
+          try/except on a worker thread of a process whose main thread is serving, which is the exact
+          arrangement /images/generate runs under.
+
+          argv[1] == "inproc"  -> fault on a worker thread of this process (Studio's model today)
+          argv[1] == "subproc" -> fault inside a forked worker (what the issue asks for)
+          """
+
+          import json
+          import multiprocessing as mp
+          import os
+          import sys
+          import threading
+          import time
+
+          HEARTBEAT = os.environ.get("FAULT_HEARTBEAT", "/tmp/heartbeat")
+
+
+          def serve() -> None:
+              """Stands in for the API process staying responsive."""
+              while True:
+                  with open(HEARTBEAT, "w", encoding="utf-8") as handle:
+                      handle.write(str(time.time()))
+                  time.sleep(0.2)
+
+
+          def fault() -> None:
+              import torch
+
+              device = torch.device("cuda")
+              torch.zeros(1, device=device).sum().item()  # force the context up
+              src = torch.zeros(8, device=device)
+              idx = torch.full((1024,), 2 ** 30, device=device, dtype=torch.long)
+              out = src[idx]  # out-of-bounds device gather
+              torch.cuda.synchronize()
+              print(json.dumps({"unexpected": "the fault did not fire", "out": float(out.sum())}), flush=True)
+
+
+          def guarded_fault() -> None:
+              try:
+                  fault()
+              except BaseException as exc:  # noqa: BLE001 -- the point is whether catching it is enough
+                  print(json.dumps({"caught": f"{type(exc).__name__}: {str(exc)[:200]}"}), flush=True)
+
+
+          def main() -> int:
+              mode = sys.argv[1]
+              threading.Thread(target=serve, daemon=True).start()
+              time.sleep(0.5)
+              if mode == "inproc":
+                  worker = threading.Thread(target=guarded_fault)
+                  worker.start()
+                  worker.join(120)
+                  print(json.dumps({"mode": mode, "survived": True, "pid": os.getpid()}), flush=True)
+                  return 0
+              child = mp.get_context("spawn").Process(target=guarded_fault)
+              child.start()
+              child.join(180)
+              print(json.dumps({
+                  "mode": mode,
+                  "survived": True,
+                  "pid": os.getpid(),
+                  "child_exitcode": child.exitcode,
+              }), flush=True)
+              # The parent proving it still owns a working GPU context is the whole point of isolation.
+              import torch
+
+              torch.cuda.init()
+              value = float((torch.ones(1024, device="cuda") * 2).sum().item())
+              print(json.dumps({"parent_gpu_still_works": value == 2048.0, "sum": value}), flush=True)
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          FAULT
+          for f in conv_stress server fault_inject; do
+            python -c "import ast; ast.parse(open('$WORK_ROOT/'+'$f'+'.py').read()); print('$f ok')"
+          done
+
+      - name: Repro 1 - MIOpen convolution stress
+        run: |
+          set +e
+          python "$WORK_ROOT/conv_stress.py" 2>&1 | tee "$WORK_ROOT/logs/conv_stress.log"
+          echo "conv_stress exit=${PIPESTATUS[0]}"
+          grep -c '"launch_failure": true' "$WORK_ROOT/logs/conv_stress.log" > "$WORK_ROOT/logs/conv_failures" 2>/dev/null
+          echo "launch failures: $(cat "$WORK_ROOT/logs/conv_failures" 2>/dev/null || echo 0)"
+
+      - name: Repro 2 - real generation in a live server process
+        run: |
+          set +e
+          BASE=http://127.0.0.1:8899
+          python "$WORK_ROOT/server.py" 8899 > "$WORK_ROOT/logs/server.log" 2>&1 &
+          SERVER_PID=$!
+          echo "server pid=$SERVER_PID"
+          for i in $(seq 1 90); do
+            curl -sf --max-time 5 "$BASE/health" >/dev/null && break
+            sleep 2
+          done
+          curl -s --max-time 30 "$BASE/health"; echo
+          curl -s --max-time 60 -X POST "$BASE/load" -H 'Content-Type: application/json' \
+            -d '{"repo": "unsloth/Z-Image-Turbo"}' | head -c 400; echo
+          echo "--- waiting for the load (downloads ~33 GB) ---"
+          for i in $(seq 1 240); do
+            STATUS=$(curl -s --max-time 20 "$BASE/load-status")
+            case "$STATUS" in
+              *'"loaded":true'*) echo "loaded after $((i*10))s"; break;;
+              *'"phase":"error"'*) echo "LOAD FAILED: $STATUS"; break;;
+            esac
+            [ $((i % 6)) -eq 0 ] && echo "  t=$((i*10))s $STATUS"
+            sleep 10
+          done
+          curl -s --max-time 20 "$BASE/load-status"; echo
+          REPRODUCED=no
+          for wh in "1024 1024" "1536 1536" "2048 2048" "2560 2560" "3072 3072"; do
+            set -- $wh
+            echo "::group::generate ${1}x${2}"
+            START=$(date +%s)
+            curl -s --max-time 2400 -X POST "$BASE/generate" -H 'Content-Type: application/json' \
+              -d "{\"width\": $1, \"height\": $2, \"steps\": 8}" | head -c 600
+            echo
+            echo "elapsed=$(( $(date +%s) - START ))s"
+            if kill -0 "$SERVER_PID" 2>/dev/null && curl -sf --max-time 15 "$BASE/health" >/dev/null; then
+              echo "SERVER ALIVE after ${1}x${2}"
+            else
+              echo "SERVER DEAD after ${1}x${2}  <-- issue #9130 reproduced"
+              REPRODUCED=yes
+              wait "$SERVER_PID"; echo "server exit status=$?"
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+          done
+          echo "reproduced=$REPRODUCED" | tee "$WORK_ROOT/logs/repro2"
+          echo "--- server log tail ---"
+          tail -60 "$WORK_ROOT/logs/server.log"
+          kill "$SERVER_PID" 2>/dev/null
+          sleep 3
+          kill -9 "$SERVER_PID" 2>/dev/null
+          true
+
+      - name: Isolation check - a genuine device fault, contained or not
+        run: |
+          set +e
+          export FAULT_HEARTBEAT="$WORK_ROOT/logs/heartbeat"
+          for mode in inproc subproc; do
+            echo "::group::fault mode=$mode"
+            rm -f "$FAULT_HEARTBEAT"
+            python "$WORK_ROOT/fault_inject.py" "$mode" 2>&1 | tail -25
+            echo "exit=${PIPESTATUS[0]}  (134 = SIGABRT, the C++ terminate in the issue)"
+            echo "::endgroup::"
+          done
+          true
+
+      - name: Verdict
+        if: always()
+        run: |
+          set +e
+          echo "=== issue #9130 crash reproduction ==="
+          echo "conv launch failures: $(cat "$WORK_ROOT/logs/conv_failures" 2>/dev/null || echo 0)"
+          cat "$WORK_ROOT/logs/repro2" 2>/dev/null || echo "reproduced=unknown"
+          grep -iE "launch failure|terminate called|Memory access fault|HSA_STATUS" \
+            "$WORK_ROOT/logs/server.log" "$WORK_ROOT/logs/conv_stress.log" 2>/dev/null | head -20 \
+            || echo "no launch-failure / terminate signature in any log"
