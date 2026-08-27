@@ -143,12 +143,63 @@ def child_managed(mib):
     return 0
 
 
+def child_managed_bounded(mib):
+    """Allocate MANAGED memory and touch it; expected to fit in host RAM."""
+    import torch
+
+    torch.cuda.is_available()
+    lib = ctypes.CDLL("libamdhip64.so")
+    lib.hipMallocManaged.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint
+    ]
+    lib.hipMallocManaged.restype = ctypes.c_int
+    ptr = ctypes.c_void_p()
+    size = int(mib) * MIB
+    before_avail = meminfo_mib("MemAvailable")
+    before_vram = sysfs_vram().get("mem_info_vram_used")
+    rc = lib.hipMallocManaged(ctypes.byref(ptr), ctypes.c_size_t(size), ctypes.c_uint(1))
+    print(f"RESULT hipMallocManaged({mib} MiB) rc={rc} ptr={ptr.value}")
+    if rc != 0 or not ptr.value:
+        return 0
+    ctypes.memset(ptr.value, 1, size)
+    print(f"RESULT touched {mib} MiB; MemAvailable {before_avail} -> "
+          f"{meminfo_mib('MemAvailable')} MiB; vram_used {before_vram} -> "
+          f"{sysfs_vram().get('mem_info_vram_used')} MiB")
+    return 0
+
+
+def child_hipmalloc_bounded(mib):
+    """Plain device allocation of ``mib``; reports success or the failure mode."""
+    import torch
+
+    before_avail = meminfo_mib("MemAvailable")
+    before_vram = sysfs_vram().get("mem_info_vram_used")
+    try:
+        buf = torch.empty(int(mib) * MIB, dtype = torch.uint8, device = "cuda")
+        buf[0] = 1
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001
+        print(f"RESULT hipMalloc({mib} MiB) raised {type(exc).__name__}: {str(exc)[:300]}")
+        return 0
+    print(f"RESULT hipMalloc({mib} MiB) succeeded; MemAvailable {before_avail} -> "
+          f"{meminfo_mib('MemAvailable')} MiB; vram_used {before_vram} -> "
+          f"{sysfs_vram().get('mem_info_vram_used')} MiB")
+    return 0
+
+
 # ---------------------------------------------------------------------- driver
 
-def run_child(mode, arg, extra = None):
-    cmd = [sys.executable, os.path.abspath(__file__), "--child", mode, "--arg", str(arg)]
+def run_child(mode, arg, extra = None, log = None):
+    cmd = [sys.executable, os.path.abspath(__file__), "--out", "/dev/null",
+           "--child", mode, "--arg", str(arg)]
     if extra:
         cmd += extra
+    if log:
+        with open(log, "w", encoding = "utf-8") as f:
+            proc = subprocess.run(cmd, stdout = f, stderr = subprocess.STDOUT, timeout = 1800)
+        with open(log, encoding = "utf-8") as f:
+            tail = f.read()[-4000:]
+        return {"returncode": proc.returncode, "log_tail": tail}
     proc = subprocess.run(cmd, capture_output = True, text = True, timeout = 1800)
     return {
         "returncode": proc.returncode,
@@ -172,6 +223,10 @@ def main():
         return child_hipmalloc(float(args.arg))
     if args.child == "managed":
         return child_managed(float(args.arg))
+    if args.child == "managed_bounded":
+        return child_managed_bounded(float(args.arg))
+    if args.child == "hipmalloc_bounded":
+        return child_hipmalloc_bounded(float(args.arg))
 
     report = {}
 
@@ -227,6 +282,13 @@ def main():
         occupied["devices"] = torch_devices()
         occupied["MemAvailable_mib"] = meminfo_mib("MemAvailable")
         occupied["sysfs"] = sysfs_vram()
+        # Codex's scenario: ask each pool for MORE than the occupied carve-out has
+        # left, but less than host RAM has. Only the managed path should answer.
+        _free_now = occupied["devices"][0]["mem_get_info_free_mib"]
+        _ask = _free_now + 6144
+        occupied["ask_mib"] = _ask
+        occupied["hipMalloc_of_ask"] = run_child("hipmalloc_bounded", _ask)
+        occupied["hipMallocManaged_of_ask"] = run_child("managed_bounded", _ask)
     hold.kill()
     try:
         hold.wait(timeout = 30)
@@ -246,7 +308,9 @@ def main():
         "hipMalloc_over_by_8gib": run_child("hipmalloc", free_mib + 8192),
     }
     emit()
-    report["exhaustion"]["hipMallocManaged_over_by_6gib"] = run_child("managed", avail_mib + 6144)
+    report["exhaustion"]["hipMallocManaged_over_by_6gib"] = run_child(
+        "managed", avail_mib + 6144, log = os.path.join(os.path.dirname(args.out), "oom_child.log")
+    )
     emit()
     print("probe complete", flush = True)
     return 0

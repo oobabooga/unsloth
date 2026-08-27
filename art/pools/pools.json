@@ -1,0 +1,86 @@
+{
+  "host": {
+    "MemTotal_mib": 63936,
+    "MemAvailable_mib": 58949,
+    "sysfs": {
+      "mem_info_vram_total": [
+        65536
+      ],
+      "mem_info_vram_used": [
+        189
+      ],
+      "mem_info_gtt_total": [
+        31968
+      ]
+    },
+    "rocm_version": "7.2.1",
+    "kernel": "6.17.0-1032-oem"
+  },
+  "torch": {
+    "version": "2.10.0+rocm7.2.1.gitb07cec22",
+    "hip": "7.2.53211",
+    "is_available": true,
+    "devices": [
+      {
+        "ordinal": 0,
+        "name": "AMD Radeon Graphics",
+        "gcnArchName": "gfx1151",
+        "is_integrated": true,
+        "props_total_mib": 65536,
+        "mem_get_info_free_mib": 65380,
+        "mem_get_info_total_mib": 65536
+      }
+    ]
+  },
+  "repo_helpers_at_pr_head": {
+    "_rocm_selected_pool_mib()": 65536,
+    "_rocm_selected_pool_mib([0])": 65536,
+    "_available_system_memory_mib()": 58519,
+    "_unified_memory_would_help()": false,
+    "_amd_apu_wants_unified_memory()": true,
+    "_rocm_unified_memory_gpu_ids()": [
+      0
+    ]
+  },
+  "with_24gib_of_the_carve_out_held_by_another_process": {
+    "waited_s": 1,
+    "child_alive": null,
+    "devices": [
+      {
+        "ordinal": 0,
+        "name": "AMD Radeon Graphics",
+        "gcnArchName": "gfx1151",
+        "is_integrated": true,
+        "props_total_mib": 65536,
+        "mem_get_info_free_mib": 40658,
+        "mem_get_info_total_mib": 65536
+      }
+    ],
+    "MemAvailable_mib": 58136,
+    "sysfs": {
+      "mem_info_vram_total": [
+        65536
+      ],
+      "mem_info_vram_used": [
+        24941
+      ],
+      "mem_info_gtt_total": [
+        31968
+      ]
+    }
+  },
+  "exhaustion": {
+    "free_vram_mib_at_probe": 65380,
+    "MemAvailable_mib_at_probe": 58534,
+    "hipMalloc_over_by_8gib": {
+      "returncode": 2,
+      "stdout": "",
+      "stderr": "usage: pool_probe.py [-h] --out OUT [--repo REPO] [--child CHILD] [--arg ARG]\n                     [--ready READY]\npool_probe.py: error: the following arguments are required: --out\n"
+    },
+    "hipMallocManaged_over_by_6gib": {
+      "returncode": 2,
+      "stdout": "",
+      "stderr": "usage: pool_probe.py [-h] --out OUT [--repo REPO] [--child CHILD] [--arg ARG]\n                     [--ready READY]\npool_probe.py: error: the following arguments are required: --out\n"
+    }
+  }
+}

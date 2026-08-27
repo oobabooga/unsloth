@@ -73,4 +73,5 @@ jobs:
           path: |
             ${{ runner.temp }}/pools.json
             ${{ runner.temp }}/probe.log
+            ${{ runner.temp }}/oom_child.log
           if-no-files-found: warn
