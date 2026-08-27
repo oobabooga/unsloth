@@ -1,0 +1,76 @@
+name: AMD DevLab 9884 pools
+
+on:
+  push:
+    branches: [amd-devlab-9884-pools]
+
+permissions:
+  contents: read
+
+jobs:
+  pools:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hardware
+        run: |
+          uname -a
+          free -h
+          cat /opt/rocm/.info/version 2>/dev/null || true
+          rocm-smi 2>/dev/null || true
+          for f in /sys/class/drm/card*/device/mem_info_vram_total \
+                   /sys/class/drm/card*/device/mem_info_vram_used \
+                   /sys/class/drm/card*/device/mem_info_gtt_total; do
+            [ -r "$f" ] && echo "$f = $(cat "$f")"
+          done
+
+      - name: Environment
+        run: |
+          set -euxo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{tmp,cache/pip}
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          export PIP_CACHE_DIR="$WORK_ROOT/cache/pip"
+          python -m pip install -q --upgrade pip
+          AMD=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
+          pip install -q \
+            "$AMD/torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl" \
+            "$AMD/triton-3.6.0%2Brocm7.2.1.gitba5c1517-cp312-cp312-linux_x86_64.whl"
+          pip install -q 'numpy<3' psutil structlog rich httpx
+          python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+
+      - name: Clone the PR head
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch worktree-apu-unified-memory-carveout \
+            https://github.com/oobabooga/unsloth "$RUNNER_TEMP/prhead"
+          git -C "$RUNNER_TEMP/prhead" log --oneline -1
+
+      - name: Probe the pools
+        run: |
+          set -uxo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          . "$WORK_ROOT/venv/bin/activate"
+          export TMPDIR="$WORK_ROOT/tmp"
+          python "$GITHUB_WORKSPACE/pool_probe.py" \
+            --out "$RUNNER_TEMP/pools.json" \
+            --repo "$RUNNER_TEMP/prhead" > "$RUNNER_TEMP/probe.log" 2>&1
+          echo "probe exit: $?"
+          echo "===================== probe.log ====================="
+          cat "$RUNNER_TEMP/probe.log" || true
+          echo "===================== pools.json ===================="
+          cat "$RUNNER_TEMP/pools.json" || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pools
+          path: |
+            ${{ runner.temp }}/pools.json
+            ${{ runner.temp }}/probe.log
+          if-no-files-found: warn
