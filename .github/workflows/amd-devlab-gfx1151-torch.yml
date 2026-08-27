@@ -1,0 +1,131 @@
+name: AMD DevLab gfx1151 working torch
+
+on:
+  push:
+    branches: [amd-devlab-gfx1151-torch]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - name: Setup
+        run: |
+          set +e
+          WORK="$RUNNER_TEMP/torchprobe"
+          mkdir -p "$WORK/tmp"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          echo "TMPDIR=$WORK/tmp" >> "$GITHUB_ENV"
+          cat > "$WORK/gpu_probe.py" <<'PROBE'
+          """Find out whether any GPU kernel runs at all on this gfx1151 runner, and which call dies.
+
+          Each probe is its own process (the harness runs this file once per probe name) because a HIP
+          fault is not recoverable: the point is the exit code, not an exception.
+          """
+
+          import faulthandler
+          import json
+          import sys
+
+          faulthandler.enable()
+
+          import torch
+
+          probe = sys.argv[1]
+          print(json.dumps({
+              "probe": probe,
+              "torch": torch.__version__,
+              "hip": torch.version.hip,
+              "device": torch.cuda.get_device_name(0),
+              "arch": torch.cuda.get_device_properties(0).gcnArchName,
+          }), flush=True)
+
+          dev = torch.device("cuda")
+
+          if probe == "alloc":
+              x = torch.empty(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "note": "allocation only, no kernel"}), flush=True)
+          elif probe == "fill":
+              x = torch.ones(1024, device=dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "sum": float(x.sum().item())}), flush=True)
+          elif probe == "h2d":
+              x = torch.ones(1024).to(dev)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "back": float(x.cpu().sum().item())}), flush=True)
+          elif probe == "matmul":
+              a = torch.randn(512, 512, device=dev)
+              b = torch.randn(512, 512, device=dev)
+              c = a @ b
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(c.shape)}), flush=True)
+          elif probe == "conv":
+              x = torch.randn(1, 32, 64, 64, device=dev)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          elif probe == "conv_bf16":
+              x = torch.randn(1, 32, 64, 64, device=dev, dtype=torch.bfloat16)
+              conv = torch.nn.Conv2d(32, 32, 3, padding=1).to(dev, torch.bfloat16)
+              y = conv(x)
+              torch.cuda.synchronize()
+              print(json.dumps({"ok": True, "shape": list(y.shape)}), flush=True)
+          else:
+              raise SystemExit(f"unknown probe {probe}")
+          PROBE
+          python3 -c "import ast; ast.parse(open('$WORK/gpu_probe.py').read()) or print('probe ok')"
+          cat /opt/rocm/.info/version; ls -d /opt/rocm*; which docker; docker info 2>&1 | head -3
+          true
+
+      - name: A - rocm7.1 wheel against the host ROCm libs
+        run: |
+          set +e
+          python3 -m venv "$WORK/venvA"
+          "$WORK/venvA/bin/pip" install -q --upgrade pip
+          "$WORK/venvA/bin/pip" install -q --index-url https://download.pytorch.org/whl/rocm7.1 \
+            --extra-index-url https://pypi.org/simple torch numpy
+          "$WORK/venvA/bin/python" -c "import torch; print('A installed', torch.__version__)"
+          for p in fill matmul conv; do
+            out=$(LD_LIBRARY_PATH=/opt/rocm/lib "$WORK/venvA/bin/python" "$WORK/gpu_probe.py" "$p" 2>&1)
+            printf 'A(host-libs) %-8s exit=%-4s %s\n' "$p" "$?" "$(echo "$out" | grep -E '^\{|Error|error' | tr '\n' ' ' | cut -c1-200)"
+          done
+          true
+
+      - name: B - AMD repo.radeon.com ROCm 7.2 wheel
+        run: |
+          set +e
+          for rel in rocm-rel-7.2 rocm-rel-7.2.1 rocm-rel-7.1; do
+            url="https://repo.radeon.com/rocm/manylinux/$rel/"
+            echo "--- $url ---"
+            curl -sfL "$url" | grep -oE 'torch-[0-9][^"<]*whl' | head -5
+          done
+          python3 -m venv "$WORK/venvB"
+          "$WORK/venvB/bin/pip" install -q --upgrade pip
+          "$WORK/venvB/bin/pip" install -q numpy
+          "$WORK/venvB/bin/pip" install -q --no-index \
+            --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/ torch
+          if [ $? -ne 0 ]; then
+            echo "rocm-rel-7.2 find-links install failed; trying plain index"
+            "$WORK/venvB/bin/pip" install -q \
+              --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/ torch
+          fi
+          "$WORK/venvB/bin/python" -c "import torch; print('B installed', torch.__version__, torch.version.hip)"
+          for p in fill matmul conv; do
+            out=$("$WORK/venvB/bin/python" "$WORK/gpu_probe.py" "$p" 2>&1)
+            printf 'B(amd-wheel) %-8s exit=%-4s %s\n' "$p" "$?" "$(echo "$out" | grep -E '^\{|Error|error' | tr '\n' ' ' | cut -c1-200)"
+          done
+          true
+
+      - name: C - rocm/pytorch container
+        run: |
+          set +e
+          IMG=rocm/pytorch:latest
+          docker pull "$IMG" >/dev/null 2>&1 || { echo "pull failed"; docker pull "$IMG" 2>&1 | tail -3; }
+          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+            --security-opt seccomp=unconfined -v "$WORK:/w" "$IMG" \
+            bash -lc 'python -c "import torch;print(torch.__version__, torch.version.hip, torch.cuda.get_device_name(0))"; for p in fill matmul conv; do python /w/gpu_probe.py $p; echo "C $p exit=$?"; done' 2>&1 | tail -30
+          true
