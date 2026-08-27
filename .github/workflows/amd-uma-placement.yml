@@ -1,0 +1,54 @@
+name: AMD DevLab UMA placement
+
+on:
+  push:
+    branches: [amd-ci-uma-placement]
+
+permissions: {}
+
+jobs:
+  placement:
+    name: Does hipMallocManaged land in VRAM or in system RAM
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build and measure
+        run: |
+          set +e
+          W="$RUNNER_TEMP/uma"; mkdir -p "$W/out"
+          HIPCC="$(command -v hipcc || ls /opt/rocm*/bin/hipcc | head -1)"
+          "$HIPCC" --offload-arch=gfx1151 -O2 tools/placement_test.hip -o "$W/placement_test" || exit 1
+          {
+            echo "## Where hipMallocManaged actually puts the pages"
+            echo
+            echo "Same size, both allocators, every page written before reading amdgpu's"
+            echo "own counters. Studio sets GGML_CUDA_ENABLE_UNIFIED_MEMORY to let the GPU"
+            echo "reach shared system RAM; this is whether that is what happens."
+            echo
+            echo '```'
+            echo "--- carve-out and RAM"
+            for f in /sys/class/drm/card*/device/mem_info_vram_total \
+                     /sys/class/drm/card*/device/mem_info_gtt_total; do
+              [ -r "$f" ] && echo "$f = $(cat "$f")"
+            done
+            grep -E 'MemTotal|MemAvailable' /proc/meminfo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for G in 8 24; do
+            echo "===== $G GiB ====="
+            timeout 600 "$W/placement_test" "$G"
+          done 2>&1 | tee "$W/out/placement.txt"
+          cat "$W/out/placement.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-placement
+          path: ${{ runner.temp }}/uma/out
+          retention-days: 7
