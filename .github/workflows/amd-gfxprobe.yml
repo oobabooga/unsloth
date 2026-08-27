@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Wheel architecture lists
+      - name: Generic wheel arch lists at the versions the installer pins
         run: |
           set +e
           W="$RUNNER_TEMP/w"; mkdir -p "$W/tmp"
@@ -21,20 +21,18 @@ jobs:
           python3 -m venv "$W/venv"
           . "$W/venv/bin/activate"
           python -m pip install -q --upgrade pip
-          for pair in "generic-rocm7.1|https://download.pytorch.org/whl/rocm7.1" \
-                      "gfx110X-all|https://repo.amd.com/rocm/whl/gfx110X-all/" \
-                      "gfx103X-all|https://repo.amd.com/rocm/whl/gfx103X-all/" \
-                      "gfx1152|https://repo.amd.com/rocm/whl/gfx1152/"; do
-            leaf="${pair%%|*}"; url="${pair##*|}"
-            echo "========== $leaf =========="
-            echo "--- available torch versions ---"
-            python -m pip index versions torch --index-url "$url" 2>&1 | head -4
-            echo "--- install ---"
-            python -m pip install -q torch --index-url "$url" 2>&1 | tail -3
-            python "$GITHUB_WORKSPACE/probe/archlist.py" 2>&1
+          # (spec, index) pairs exactly as _ROCM_TORCH_PKG_SPECS resolves them.
+          for pair in "torch==2.10.0|https://download.pytorch.org/whl/rocm7.1" \
+                      "torch==2.11.0|https://download.pytorch.org/whl/rocm7.1" \
+                      "torch==2.13.0|https://download.pytorch.org/whl/rocm7.1" \
+                      "torch==2.11.0|https://download.pytorch.org/whl/rocm7.2" \
+                      "torch|https://download.pytorch.org/whl/rocm7.0" \
+                      "torch|https://download.pytorch.org/whl/rocm6.3"; do
+            spec="${pair%%|*}"; url="${pair##*|}"
+            echo "========== $spec from $url =========="
+            python -m pip install -q "$spec" --index-url "$url" 2>&1 | tail -2
+            python "$GITHUB_WORKSPACE/probe/archlist.py" 2>&1 | grep -E "VERSION|ARCHLIST"
             python -m pip uninstall -y -q torch 2>&1 | tail -1
-            python -m pip freeze 2>/dev/null | grep -i rocm | head -5
-            python -m pip uninstall -y -q -r <(python -m pip freeze | grep -iE '^(rocm|pytorch-triton)' | cut -d= -f1) 2>&1 | tail -1
             rm -rf "$W/pipcache"
           done
           echo "===== END ====="
