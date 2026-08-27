@@ -51,6 +51,7 @@ jobs:
           # is grafted on afterwards.
           pip install -q "$AMD_INDEX/$TORCH_WHL" "$AMD_INDEX/$TRITON_WHL"
           pip install -q --no-deps "$AMD_INDEX/$VISION_WHL"
+          pip install -q 'numpy<3'   # torchvision imports it at module scope; --no-deps skipped it
           python -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
           # Importing is not enough: a torchvision built against another torch imports fine and
           # then fails at the first op, which surfaces far away as a transformers import error.
