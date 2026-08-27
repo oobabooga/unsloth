@@ -141,6 +141,12 @@ jobs:
               return [{"bytes": s, "path": p} for s, p in out[:n]]
 
 
+          def emit(result: dict, out: str) -> None:
+              payload = json.dumps(result)
+              Path(out).write_text(payload, encoding="utf-8")
+              print(payload)
+
+
           def main() -> int:
               ap = argparse.ArgumentParser()
               ap.add_argument("--side", required=True)
@@ -148,6 +154,9 @@ jobs:
               ap.add_argument("--probe", required=True, choices=("plan", "load"))
               ap.add_argument("--budget-seconds", type=float, default=90.0)
               ap.add_argument("--gpu-ordinal", type=int, default=0)
+              # Studio's logger writes its startup banner to stdout, so the machine-readable result goes to
+              # its own file rather than being fished back out of a mixed stream.
+              ap.add_argument("--out", required=True)
               args = ap.parse_args()
 
               # Count the whole HF_HOME subtree: the hub cache and the xet cache both live under it, and
@@ -203,7 +212,7 @@ jobs:
                   moved, files = cache_bytes(hub)
                   result["cache_bytes"] = moved
                   result["cache_files"] = files
-                  print(json.dumps(result))
+                  emit(result, args.out)
                   return 0
 
               # probe == load
@@ -218,7 +227,7 @@ jobs:
                   result["cache_bytes"] = moved
                   result["cache_files"] = files
                   result["cache_largest"] = largest(hub)
-                  print(json.dumps(result))
+                  emit(result, args.out)
                   return 0
 
               outcome = "still_downloading_at_budget"
@@ -252,11 +261,11 @@ jobs:
               result["cache_bytes"] = moved
               result["cache_files"] = files
               result["cache_largest"] = largest(hub)
+              emit(result, args.out)
               try:
                   backend.unload()
               except Exception:  # noqa: BLE001
                   pass
-              print(json.dumps(result))
               # A daemon download thread may still be live; leave immediately rather than joining it.
               sys.stdout.flush()
               os._exit(0)
@@ -285,7 +294,7 @@ jobs:
             echo "::group::$cell"
             timeout 600 python "$WORK_ROOT/ab_probe.py" \
               --side "$side" --repo "$repo" --probe "$probe" --budget-seconds "$BUDGET" \
-              > "$RESULTS/$cell.json" 2> "$RESULTS/$cell.log"
+              --out "$RESULTS/$cell.json" > "$RESULTS/$cell.log" 2>&1
             status=$?
             echo "exit=$status"
             cat "$RESULTS/$cell.json" 2>/dev/null || true
