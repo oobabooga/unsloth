@@ -79,7 +79,24 @@ FIXED_MIN_RATIO = 1.5
 
 # A head cell counts as a regression when it is this much worse than the same pre cell AND the
 # repetitions agree about the direction.
-REGRESSION_MIN_LOSS = 0.20
+#
+# WAS 0.20, AND IT HID A REAL FINDING. Run 33040070879 measured 100K scroll at 58.5/57.6 fps on
+# `pre` against 54.5/53.8 on `head`: a 7% loss with non-overlapping repetitions, which this module
+# then reported as "no cell has head worse than pre". The non-overlap requirement below is the
+# real noise guard and it is a strong one -- every repetition of one arm must beat every
+# repetition of the other -- so the proportional bar does not also need to be large. A bar whose
+# only effect is to suppress findings the direction test already qualified is not a bar.
+REGRESSION_MIN_LOSS = 0.05
+
+# Mean frame rate is the wrong instrument for a HITCH, and the same run proved it: worst frame at
+# 100K scroll went 49 ms -> 440 ms, nine times longer and plainly visible, while the mean moved 7%.
+# One 440 ms frame in a 30-second window costs about 1% of the mean. So worst-frame is scored
+# separately rather than being expected to show up in the average.
+#
+# Both conditions. A jump from 8 ms to 40 ms is 5x and nobody can see it, so there is an absolute
+# floor at the point a frame reads as a stutter rather than as a frame.
+HITCH_MIN_MS = 150.0
+HITCH_MIN_RATIO = 3.0
 # Below this frame rate a proportional comparison is noise: at 3 fps a 20% loss is 0.6 fps. Set
 # ABOVE the pre arm's own documented 500K scroll figure of 3.2 fps, because a floor that sits
 # under the one cell it was written for is not a floor.
@@ -430,6 +447,48 @@ def _base_collapses(obs: dict) -> tuple[bool, str]:
                 f"because a low frame rate on a page with nothing to draw is not a collapse")
 
 
+def _worst_frames(obs: dict, arm: str, rung: str, phase: str) -> list[float]:
+    """Worst rAF gap per REPETITION, not maxed across them.
+
+    The table reports `max()` over the repetitions, which is the right number to show a reader and
+    the wrong one to test with: a single unlucky draw in one repetition would convict an arm. Kept
+    per repetition here so the same non-overlap rule the frame-rate test uses can apply.
+    """
+    out = []
+    for cell in _cells(obs, arm, rung):
+        v = _sub(_phase(cell, phase), "raf").get("max_ms")
+        if isinstance(v, (int, float)):
+            out.append(float(v))
+    return out
+
+
+def _hitch_regressions(obs: dict) -> list[str]:
+    """Head stutters where pre did not, whatever the mean frame rate says."""
+    out = []
+    for rung in _rungs(obs):
+        for phase in SCORED_PHASES:
+            pre = _worst_frames(obs, "pre", rung, phase)
+            head = _worst_frames(obs, "head", rung, phase)
+            if not pre or not head:
+                continue
+            mp, mh = _mean(pre), _mean(head)
+            if mp is None or mh is None or mp <= 0:
+                continue
+            if mh < HITCH_MIN_MS or mh / mp < HITCH_MIN_RATIO:
+                continue
+            # Same direction rule as the frame-rate test: every head repetition must stutter worse
+            # than every pre repetition, or one slow draw is being reported as a regression.
+            if min(head) <= max(pre):
+                out.append(f"{rung} {phase}: WORST FRAME head {_reps_str(head, 0)} against pre "
+                           f"{_reps_str(pre, 0)} ms, {mh / mp:.1f}x but the repetitions OVERLAP, "
+                           f"so this is not settled")
+                continue
+            out.append(f"{rung} {phase}: WORST FRAME head {_reps_str(head, 0)} against pre "
+                       f"{_reps_str(pre, 0)} ms, {mh / mp:.1f}x WORSE (a visible hitch the mean "
+                       f"frame rate does not show)")
+    return out
+
+
 def _regressions(obs: dict) -> list[str]:
     """Head worse than pre, computed BEFORE anything else and reported first."""
     out = []
@@ -453,6 +512,7 @@ def _regressions(obs: dict) -> list[str]:
                 continue
             out.append(f"{rung} {phase}: head {_reps_str(head)} against pre {_reps_str(pre)} fps, "
                        f"{loss * 100:.0f}% WORSE")
+    out.extend(_hitch_regressions(obs))
     for name in ACTIONS:
         for rung in _rungs(obs):
             pre = [_action(r, name).get("eff_fps") for r in _cells(obs, "pre", rung)]
