@@ -152,9 +152,11 @@ jobs:
           # diffusers' PEFT loader imports peft; without it every transformer model in the
           # pinned diffusers fails to import and no image model can load at all.
           pip install -q --no-deps 'peft==0.18.1'
-          python -c "import peft, diffusers.loaders.peft; print('peft', peft.__version__, 'loader ok')"
           pip install -q -r "$WORK/src/studio/backend/requirements/diffusers-pin.txt" || pip install -q 'diffusers>=0.35'
           python -c "import torch, diffusers, transformers; print(torch.__version__, diffusers.__version__, transformers.__version__)"
+          # The chain that broke every earlier attempt: torchvision ops -> transformers ->
+          # peft -> diffusers' PEFT loader. If this imports, an image model can actually load.
+          python -c "import peft, diffusers.loaders.peft, diffusers.models.transformers.transformer_z_image as t; print('peft', peft.__version__, 'z-image transformer ok')"
 
       - name: Reproduce - real generation in a live server process
         if: steps.kernels.outputs.kernels_ok == '1'
