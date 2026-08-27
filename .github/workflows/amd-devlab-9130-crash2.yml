@@ -145,6 +145,10 @@ jobs:
           # The version Studio pins itself (constraints.txt). An older transformers makes the
           # pinned diffusers fail to import PreTrainedModel, which is a harness fault, not a bug.
           pip install -q 'transformers==5.5.0'
+          # diffusers' PEFT loader imports peft; without it every transformer model in the
+          # pinned diffusers fails to import and no image model can load at all.
+          pip install -q --no-deps 'peft==0.18.1'
+          python -c "import peft, diffusers.loaders.peft; print('peft', peft.__version__, 'loader ok')"
           pip install -q -r "$WORK/src/studio/backend/requirements/diffusers-pin.txt" || pip install -q 'diffusers>=0.35'
           python -c "import torch, diffusers, transformers; print(torch.__version__, diffusers.__version__, transformers.__version__)"
 
