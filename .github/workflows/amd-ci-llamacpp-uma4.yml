@@ -1,0 +1,273 @@
+name: "AMD CI: is the unified-memory corruption size or architecture (gfx1151)"
+
+# Follow-up to amd-ci-llamacpp-uma3, run 33220532522, which REPRODUCED the
+# corruption on this hardware for the first time:
+#
+#   cell  model                              GiB   offload  verdict
+#   U2    Qwen3-30B-A3B UD-Q4_K_XL (MoE)     16.5  full     NO_REGRESSION
+#   U3    Qwen3-Coder-Next Q4_K_M  (MoE)     45.1  full     REGRESSION
+#   U4    same, llama.cpp#26148 flags        45.1  full     REGRESSION
+#   U5    same, --ngl 24                     45.1  partial  INCONCLUSIVE (my error)
+#
+# U3 head: " Paris.,,, or or or is is is is,,,,, from from from from from from"
+# U3 base: " Paris. The capital of Germany is Berlin. The capital of Italy is Rome."
+#
+# Every gate green in U3 and U4: same four shards and 48410992032 bytes, same
+# build, identical layer placement (ROCm0: 196 in both states), no OOM, greedy,
+# 3/3 identical repeats inside each state. `ROCm0 model buffer size = 45995.69
+# MiB` in BOTH states, so nothing about placement or fitting differs and the only
+# variable really is which allocator produced those bytes.
+#
+# WHAT U3 KILLED, AND WHAT IT DID NOT
+#
+# Mixture-of-experts alone is not the variable: U2 is 128 experts at 16.5 GiB and
+# is clean. Size is the surviving explanation, and 45.1 GiB against this host's
+# 64.0 GiB HIP pool is 72% of it, which is the first configuration in any of
+# these runs where a managed allocation has real work to do.
+#
+# But U2 and U3 differ in size AND in architecture (qwen3_moe against
+# qwen3_next). uma3 broke one confound and left a second. These three cells close
+# it, and none of them needs anything new written:
+#
+#   V2  Qwen3-30B-A3B Q8_0, 30.25 GiB, full offload
+#       SIZE, held inside one architecture. Same model family as the clean U2 at
+#       nearly double the footprint. If this diverges, size is the axis outright.
+#   V1  Qwen3-Coder-Next at --ngl 98, about half the footprint
+#       PRESSURE, held inside one model and one architecture. The complement of
+#       V2 from the other direction.
+#   V3  Qwen3-Coder-Next, =1 against =1 + HIP_LAUNCH_BLOCKING=1
+#       An async ordering race. uma2's W4 asked exactly this and could not answer
+#       it, because it asked of a configuration that never broke. It is
+#       answerable now, and it is the cell that decides whether there is an
+#       upstream llama.cpp bug to file separately from ggml-org/llama.cpp#26148.
+#
+# ON U5, because the failure is worth not repeating: --ngl 24 was chosen from the
+# config's 48 hidden layers. llama.cpp counts 196. It offloaded 96 and left 100
+# on the CPU, the majority-on-GPU gate failed and the base timed out at zero
+# completions. Half is --ngl 98, and V1 carries much longer timeouts because a
+# partial offload of an 80B model is slow rather than broken.
+#
+# BOUNDS. 62 GB of RAM, no swap, one physical gfx1151, Linux, upstream ROCm.
+# Nothing here speaks to Windows, to discrete RDNA 3 or 4, or to the 128 GB hosts
+# the Reddit reporters have. `free` is recorded around every cell.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-uma4]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  # 30.25 GiB, single file. Same repo and revision as uma3's clean U2, so V2
+  # changes the footprint and holds the architecture.
+  A3B_REPO: "unsloth/Qwen3-30B-A3B-GGUF"
+  A3B_REV: "d5b1d57bd0b504ac62ae6c725904e96ef228dc74"
+  A3B_FILE: "Qwen3-30B-A3B-Q8_0.gguf"
+  # 45.1 GiB over four shards, the model that reproduced in U3 and U4.
+  CODER_REPO: "Qwen/Qwen3-Coder-Next-GGUF"
+  CODER_REV: "b82fb7382639d97b38fa7672e526c760c2fb358e"
+  CODER_DIR: "Qwen3-Coder-Next-Q4_K_M"
+  CODER_HEAD: "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+  # Half of the 196 layers llama.cpp actually reports for this model.
+  NGL_HALF: "98"
+
+jobs:
+
+  gpu:
+    name: "unified memory, size against architecture, on gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 500
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-uma4"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Unsloth llama.cpp build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: HIP managed memory reading, again on this runner
+        if: always()
+        run: |
+          set +e
+          # Cheap, and the pool is handed out fresh per job, so it is a reading of
+          # THIS host rather than a repeat of uma3's. On uma3 it came back
+          # fine-grain as allocated, coarse-grain after the advise, every advice
+          # succeeding, and the advise correctly refused on a plain hipMalloc
+          # pointer.
+          python3 amd_ci/probes/hip_managed_memory_probe.py \
+            --lib-dir "$ROCM_BIN" --mib 512 \
+            --out "$AMD_CI_WORK/out/V0_hip_managed.json"
+          {
+            echo '### HIP managed memory on this runner'
+            echo '```json'
+            cat "$AMD_CI_WORK/out/V0_hip_managed.json" 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch the 30B-A3B Q8_0
+        timeout-minutes: 120
+        run: |
+          set -eu
+          # Fetched and measured first: it is the smaller download and the
+          # cleaner single-variable test, so a job that dies late still answers
+          # the size question.
+          python3 amd_ci/lib/fetch_gguf.py --repo "$A3B_REPO" --file "$A3B_FILE" \
+            --revision "$A3B_REV" --as-name model.gguf \
+            --local-dir "$AMD_CI_WORK/models/a3b_ctl" \
+            --out "$AMD_CI_WORK/out/model_a3b.json"
+          M="$AMD_CI_WORK/models"
+          mkdir -p "$M/a3b_uma1"
+          ln -f "$M/a3b_ctl/model.gguf" "$M/a3b_uma1/model.gguf"
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/a3b_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/a3b_uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/a3b_ctl" --path "head=$M/a3b_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_a3b.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: V2 - Qwen3-30B-A3B Q8_0 30.25 GiB, same arch as the clean U2
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # uma3's U2 flags verbatim. U2 was this exact model and repo at 16.5 GiB
+          # and came out clean, so the only thing that moves here is the footprint.
+          free -g > "$AMD_CI_WORK/out/free_V2_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_a3b.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/V2" \
+            --title "V2 Qwen3-30B-A3B Q8_0 (MoE, 30.25 GiB), ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 2400
+          free -g > "$AMD_CI_WORK/out/free_V2_after.txt"
+          cat "$AMD_CI_WORK/out/V2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/V2"
+
+      - name: Fetch Qwen3-Coder-Next
+        if: always()
+        timeout-minutes: 180
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003 00004; do
+            F="Qwen3-Coder-Next-Q4_K_M-$N-of-00004.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$CODER_REPO" \
+              --file "$CODER_DIR/$F" --revision "$CODER_REV" --as-name "$F" \
+              --local-dir "$M/coder_ctl" \
+              --out "$AMD_CI_WORK/out/model_coder_$N.json"
+          done
+          for D in coder_uma1 coder_uma1lb; do
+            mkdir -p "$M/$D"
+            for F in "$M"/coder_ctl/*.gguf; do ln -f "$F" "$M/$D/$(basename "$F")"; done
+          done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/coder_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/coder_uma1/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' 'HIP_LAUNCH_BLOCKING=1' \
+            > "$M/coder_uma1lb/env"
+          for D in coder_ctl coder_uma1 coder_uma1lb; do echo "--- $D/env"; cat "$M/$D/env"; done
+          python3 amd_ci/lib/write_states.py --require-file "$CODER_HEAD" \
+            --path "base=$M/coder_ctl" --path "head=$M/coder_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_coder.json"
+          python3 amd_ci/lib/write_states.py --require-file "$CODER_HEAD" \
+            --path "base=$M/coder_uma1" --path "head=$M/coder_uma1lb" \
+            --label "base==1" --label "head==1 + blocking" \
+            --out "$AMD_CI_WORK/out/states_coderlb.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: V1 - Qwen3-Coder-Next at --ngl 98, half the footprint
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # 98 of the 196 layers llama.cpp reports, so roughly half of U3's
+          # 45995 MiB managed allocation, with the model and architecture held
+          # fixed. Timeouts are large because half of an 80B model on CPU is slow,
+          # and uma3's U5 died on a timeout rather than on a finding.
+          free -g > "$AMD_CI_WORK/out/free_V1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_coder.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/V1" \
+            --title "V1 Qwen3-Coder-Next Q4_K_M at --ngl 98, ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$CODER_HEAD" --ngl "$NGL_HALF" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 5400 --request-timeout 5400
+          free -g > "$AMD_CI_WORK/out/free_V1_after.txt"
+          cat "$AMD_CI_WORK/out/V1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/V1"
+
+      - name: V3 - Qwen3-Coder-Next, =1 against =1 with HIP_LAUNCH_BLOCKING
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # Both states have unified memory on and full offload, so both should
+          # corrupt if the launch order is irrelevant. If serialising the launches
+          # restores the control's text, this is an async ordering race exposed by
+          # managed memory rather than the allocator handing back bad bytes, and
+          # that is an upstream llama.cpp or ROCm bug rather than an Unsloth one.
+          free -g > "$AMD_CI_WORK/out/free_V3_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_coderlb.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/V3" \
+            --title "V3 Qwen3-Coder-Next Q4_K_M, =1 vs =1 + HIP_LAUNCH_BLOCKING=1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_V3_after.txt"
+          cat "$AMD_CI_WORK/out/V3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/V3"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-uma4-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
