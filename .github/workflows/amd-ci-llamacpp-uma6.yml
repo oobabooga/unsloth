@@ -1,0 +1,221 @@
+name: "AMD CI: the actually-reported model, Qwen3.8-Flash-Next (gfx1151)"
+
+# THE MODEL EVERY REPORTER IS ACTUALLY ON, and it has never been run on our
+# hardware. Six Reddit reporters, adi-0's controlled repro on HF discussion #30,
+# huaj1ng and data-based confirming the workaround: all Qwen3.8-Flash-Next. Every
+# run so far has substituted something else.
+#
+# WHY IT WAS SKIPPED, AND WHY THAT REASONING WAS TOO NARROW
+#
+# uma2 recorded that the runner has 62 GB of RAM and a 64.0 GiB pool while the
+# smallest Flash-Next quant is 67.6 GiB, and concluded the model "does not fit in
+# any configuration". That is only true of FULL offload. llama.cpp fits params to
+# free device memory by default and will place what it can on the GPU and the
+# rest on the CPU, which is a perfectly real run of the real architecture. The
+# corruption also does not need full offload: uma4's V1 corrupted with the
+# allocator active, and uma5's X3 is testing partial offload directly.
+#
+# The other half of the original blocker is genuinely gone. uma1 failed with
+# `unknown model architecture: 'qwen4exp'` because it used an UPSTREAM binary.
+# The Unsloth build b10639-mix-f6f92fe (source commit 2a36554fc) is the one adi-0
+# ran Flash-Next on, so it loads this architecture. Upstream has since gained it
+# too, in ggml-org/llama.cpp#27742 as 6c84c7d5d on 2026-08-27.
+#
+# CELLS, cheapest first, both on the reported model:
+#
+#   Y1  UD-IQ1_S   67.6 GiB  cheapest route to the qwen4exp architecture
+#   Y2  UD-IQ4_XS  87.2 GiB  adi-0's EXACT file, snapshot 178b998 in his report,
+#                            the one with the controlled temperature-0 repro
+#
+# Y2 is the highest-provenance cell available anywhere in this investigation: the
+# reported model, the reported quant, the reported build, the reported arch, the
+# reported variable. If it diverges, the chain from our hardware to the field
+# reports is complete with nothing substituted.
+#
+# READ THE PLACEMENT GATE BEFORE READING THE VERDICT. Neither of these fully
+# offloads on a 64.0 GiB pool, so both cells are partial-offload runs and the
+# claim they support is "the reported model corrupts on this arch when the
+# allocator is swapped", NOT "it corrupts in the reporters' configuration". The
+# reporters have 128 GB and full offload. The criteria module asserts the two
+# states placed layers IDENTICALLY, which is what makes a partial run comparable
+# at all; a cell where they differ is not a result.
+#
+# Generation will be slow with most of an 80B-class model on the CPU, hence the
+# large timeouts. A timeout reads INCONCLUSIVE, not clean.
+#
+# BOUNDS. 62 GB RAM, no swap, 64.0 GiB pool, one gfx1151, Linux, upstream ROCm.
+# Nothing here speaks to Windows, discrete RDNA 3 or 4, or the 128 GB hosts.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-uma6]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # adi-0's binary: "build b10639-2a36554fc", the Unsloth build, not upstream.
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  FN_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  FN_REV: "c8b5954a88c2775c546b92593eda40ea041d3176"
+  SMALL_DIR: "UD-IQ1_S"
+  SMALL_HEAD: "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  BIG_DIR: "UD-IQ4_XS"
+  BIG_HEAD: "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+  # adi-0 used -c 8192 --parallel 1 -fa off. Matched.
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "Qwen3.8-Flash-Next, the reported model, on gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 500
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-uma6"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Unsloth llama.cpp build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Confirm this build knows qwen4exp before spending an hour on a download
+        if: always()
+        run: |
+          set +e
+          # uma1 burned a whole run discovering its binary could not load this
+          # architecture. Ninety seconds here instead of ninety minutes there.
+          "$ROCM_BIN/llama-completion" --version 2>&1 | head -3
+          "$ROCM_BIN/llama-completion" --list-devices 2>&1 | head -5
+          { echo '### build'; "$ROCM_BIN/llama-completion" --version 2>&1 | head -3; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch Flash-Next UD-IQ1_S, 67.6 GiB
+        timeout-minutes: 240
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-UD-IQ1_S-$N-of-00003.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$FN_REPO" \
+              --file "$SMALL_DIR/$F" --revision "$FN_REV" --as-name "$F" \
+              --local-dir "$M/fn1_ctl" --out "$AMD_CI_WORK/out/model_fn1_$N.json"
+          done
+          mkdir -p "$M/fn1_uma1"
+          for F in "$M"/fn1_ctl/*.gguf; do ln -f "$F" "$M/fn1_uma1/$(basename "$F")"; done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/fn1_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/fn1_uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file "$SMALL_HEAD" \
+            --path "base=$M/fn1_ctl" --path "head=$M/fn1_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_fn1.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Y1 - Qwen3.8-Flash-Next UD-IQ1_S, the reported architecture
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # First time qwen4exp has run on our hardware at all. Partial offload,
+          # so read the layer-split gate alongside the verdict.
+          free -g > "$AMD_CI_WORK/out/free_Y1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_fn1.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/Y1" \
+            --title "Y1 Qwen3.8-Flash-Next UD-IQ1_S (67.6 GiB, qwen4exp), ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$SMALL_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          free -g > "$AMD_CI_WORK/out/free_Y1_after.txt"
+          cat "$AMD_CI_WORK/out/Y1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/Y1"
+
+      - name: Fetch Flash-Next UD-IQ4_XS, 87.2 GiB, adi-0's exact file
+        if: always()
+        timeout-minutes: 300
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          # Reclaim IQ1_S: 67.6 plus 87.2 GiB alongside the rest is not worth the
+          # risk of filling the disk mid-download, and Y1 is already measured.
+          rm -rf "$M/fn1_ctl" "$M/fn1_uma1"
+          for N in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-UD-IQ4_XS-$N-of-00003.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$FN_REPO" \
+              --file "$BIG_DIR/$F" --revision "$FN_REV" --as-name "$F" \
+              --local-dir "$M/fn4_ctl" --out "$AMD_CI_WORK/out/model_fn4_$N.json"
+          done
+          mkdir -p "$M/fn4_uma1"
+          for F in "$M"/fn4_ctl/*.gguf; do ln -f "$F" "$M/fn4_uma1/$(basename "$F")"; done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/fn4_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/fn4_uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file "$BIG_HEAD" \
+            --path "base=$M/fn4_ctl" --path "head=$M/fn4_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_fn4.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Y2 - Qwen3.8-Flash-Next UD-IQ4_XS, adi-0's exact file
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # The reported model, quant, build, architecture and variable, with
+          # nothing substituted. The one thing that still differs from adi-0 is
+          # the offload split, because he has 128 GB and this host has 62.
+          free -g > "$AMD_CI_WORK/out/free_Y2_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_fn4.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/Y2" \
+            --title "Y2 Qwen3.8-Flash-Next UD-IQ4_XS (87.2 GiB), adi-0's file, ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$BIG_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          free -g > "$AMD_CI_WORK/out/free_Y2_after.txt"
+          cat "$AMD_CI_WORK/out/Y2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/Y2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-uma6-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
