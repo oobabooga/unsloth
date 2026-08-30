@@ -1,0 +1,565 @@
+# Final narrowing: every available build between b9804 (clean) and b9832 (broken).
+#
+# The 20-point sweep (run 33336657780) put the boundary here and, importantly,
+# showed the property is MONOTONIC: clean through b9804, broken from b9832
+# onward, including b9856 which is after the #20793 revert. There is no island,
+# so the cause persists past 2026-06-30.
+#
+# 28 commits separate the two builds. Exactly one touches the scheduler surface
+# (3fc4e105, #20793 "reintroduce less synchronizations during split compute"),
+# but that was REVERTED on 06-30 by 86b94708 while b9856 and b10000 stay broken,
+# so #20793 alone cannot account for it. The other candidates in range that can
+# reach a HIP managed-memory path are:
+#
+#   0ed235ea  [CUDA] cudaMemcpy2DAsync fast path in ggml_cuda_cpy   NOT reverted
+#   2f18fe13  CUDA: cublasSgemmBatched mapping for HIP/MUSA headers NOT reverted
+#   f818065d  CUDA: batch out_prod broadcast via cublasSgemmBatched NOT reverted
+#
+# An async 2D copy that is correct on device memory and wrong on managed memory
+# is the most mechanically plausible of these, but that is a hypothesis and this
+# sweep is what decides it. Everything else in the range is Vulkan, SYCL,
+# OpenCL, CPU or non-ggml.
+#
+# 18 of the 27 interior builds publish a ubuntu-rocm tarball. The nine without
+# one (9805-9809, 9812, 9815, 9818, 9819) are gaps: if the boundary falls inside
+# a gap the answer is a two-to-five commit range rather than a single commit,
+# and the verdict must say so rather than naming the nearest tested build.
+#
+# Same shape as the previous sweep and for the same reasons: sequential cells in
+# one job because a cell holds a 45.1 GiB model on a 62 GB host, so parallel
+# cells would thrash; each cell deletes its build tree before the next fetch;
+# 30-minute per-cell timeouts; artifacts every 5 cells. Footprint stays at 73%
+# of RAM because Family B is inert below roughly half.
+
+name: "AMD CI: pinpoint the unified memory commit"
+
+on:
+  push:
+    branches: [amd-ci-uma-narrow2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CODER_REPO: "Qwen/Qwen3-Coder-Next-GGUF"
+  CODER_REV: "b82fb7382639d97b38fa7672e526c760c2fb358e"
+  CODER_DIR: "Qwen3-Coder-Next-Q4_K_M"
+  CODER_HEAD: "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+  LOAD_TIMEOUT: "900"
+  REQ_TIMEOUT: "420"
+
+jobs:
+
+  gpu:
+    name: "pinpoint unified memory commit, 18 builds, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 420
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "uma-narrow2"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch Qwen3-Coder-Next Q4_K_M, 45.1 GiB over four shards
+        timeout-minutes: 240
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003 00004; do
+            F="Qwen3-Coder-Next-Q4_K_M-$N-of-00004.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$CODER_REPO" \
+              --file "$CODER_DIR/$F" --revision "$CODER_REV" --as-name "$F" \
+              --local-dir "$M/ctl" --out "$AMD_CI_WORK/out/model_$N.json"
+          done
+          mkdir -p "$M/uma1"
+          for F in "$M"/ctl/*.gguf; do ln -f "$F" "$M/uma1/$(basename "$F")"; done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file "$CODER_HEAD" \
+            --path "base=$M/ctl" --path "head=$M/uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: "P1 - b9810"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9810/llama-b9810-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p1" --out "$AMD_CI_WORK/out/bin_p1.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p1.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P1_b9810" \
+            --title "P1 Qwen3-Coder-Next Q4_K_M, upstream b9810, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P1_b9810/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p1"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P1_b9810" || true
+
+      - name: "P2 - b9811"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9811/llama-b9811-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p2" --out "$AMD_CI_WORK/out/bin_p2.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p2.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P2_b9811" \
+            --title "P2 Qwen3-Coder-Next Q4_K_M, upstream b9811, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P2_b9811/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p2"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P2_b9811" || true
+
+      - name: "P3 - b9813"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9813/llama-b9813-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p3" --out "$AMD_CI_WORK/out/bin_p3.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p3.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P3_b9813" \
+            --title "P3 Qwen3-Coder-Next Q4_K_M, upstream b9813, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P3_b9813/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p3"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P3_b9813" || true
+
+      - name: "P4 - b9814"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9814/llama-b9814-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p4" --out "$AMD_CI_WORK/out/bin_p4.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p4.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P4_b9814" \
+            --title "P4 Qwen3-Coder-Next Q4_K_M, upstream b9814, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P4_b9814/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p4"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P4_b9814" || true
+
+      - name: "P5 - b9816"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9816/llama-b9816-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p5" --out "$AMD_CI_WORK/out/bin_p5.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p5.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P5_b9816" \
+            --title "P5 Qwen3-Coder-Next Q4_K_M, upstream b9816, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P5_b9816/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p5"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P5_b9816" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-narrow2-after-P5
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: "P6 - b9817"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9817/llama-b9817-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p6" --out "$AMD_CI_WORK/out/bin_p6.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p6.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P6_b9817" \
+            --title "P6 Qwen3-Coder-Next Q4_K_M, upstream b9817, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P6_b9817/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p6"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P6_b9817" || true
+
+      - name: "P7 - b9820"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9820/llama-b9820-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p7" --out "$AMD_CI_WORK/out/bin_p7.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p7.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P7_b9820" \
+            --title "P7 Qwen3-Coder-Next Q4_K_M, upstream b9820, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P7_b9820/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p7"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P7_b9820" || true
+
+      - name: "P8 - b9821"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9821/llama-b9821-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p8" --out "$AMD_CI_WORK/out/bin_p8.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p8.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P8_b9821" \
+            --title "P8 Qwen3-Coder-Next Q4_K_M, upstream b9821, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P8_b9821/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p8"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P8_b9821" || true
+
+      - name: "P9 - b9822"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9822/llama-b9822-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p9" --out "$AMD_CI_WORK/out/bin_p9.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p9.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P9_b9822" \
+            --title "P9 Qwen3-Coder-Next Q4_K_M, upstream b9822, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P9_b9822/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p9"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P9_b9822" || true
+
+      - name: "P10 - b9823"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9823/llama-b9823-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p10" --out "$AMD_CI_WORK/out/bin_p10.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p10.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P10_b9823" \
+            --title "P10 Qwen3-Coder-Next Q4_K_M, upstream b9823, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P10_b9823/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p10"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P10_b9823" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-narrow2-after-P10
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: "P11 - b9824"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9824/llama-b9824-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p11" --out "$AMD_CI_WORK/out/bin_p11.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p11.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P11_b9824" \
+            --title "P11 Qwen3-Coder-Next Q4_K_M, upstream b9824, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P11_b9824/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p11"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P11_b9824" || true
+
+      - name: "P12 - b9825"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9825/llama-b9825-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p12" --out "$AMD_CI_WORK/out/bin_p12.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p12.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P12_b9825" \
+            --title "P12 Qwen3-Coder-Next Q4_K_M, upstream b9825, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P12_b9825/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p12"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P12_b9825" || true
+
+      - name: "P13 - b9826"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9826/llama-b9826-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p13" --out "$AMD_CI_WORK/out/bin_p13.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p13.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P13_b9826" \
+            --title "P13 Qwen3-Coder-Next Q4_K_M, upstream b9826, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P13_b9826/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p13"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P13_b9826" || true
+
+      - name: "P14 - b9827"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9827/llama-b9827-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p14" --out "$AMD_CI_WORK/out/bin_p14.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p14.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P14_b9827" \
+            --title "P14 Qwen3-Coder-Next Q4_K_M, upstream b9827, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P14_b9827/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p14"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P14_b9827" || true
+
+      - name: "P15 - b9828"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9828/llama-b9828-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p15" --out "$AMD_CI_WORK/out/bin_p15.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p15.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P15_b9828" \
+            --title "P15 Qwen3-Coder-Next Q4_K_M, upstream b9828, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P15_b9828/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p15"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P15_b9828" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-narrow2-after-P15
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: "P16 - b9829"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9829/llama-b9829-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p16" --out "$AMD_CI_WORK/out/bin_p16.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p16.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P16_b9829" \
+            --title "P16 Qwen3-Coder-Next Q4_K_M, upstream b9829, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P16_b9829/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p16"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P16_b9829" || true
+
+      - name: "P17 - b9830"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9830/llama-b9830-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p17" --out "$AMD_CI_WORK/out/bin_p17.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p17.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P17_b9830" \
+            --title "P17 Qwen3-Coder-Next Q4_K_M, upstream b9830, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P17_b9830/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p17"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P17_b9830" || true
+
+      - name: "P18 - b9831"
+        if: always()
+        timeout-minutes: 30
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/ggml-org/llama.cpp/releases/download/b9831/llama-b9831-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/p18" --out "$AMD_CI_WORK/out/bin_p18.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_p18.json'))['bin_dir'])")"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P18_b9831" \
+            --title "P18 Qwen3-Coder-Next Q4_K_M, upstream b9831, unset vs =1, gfx1151" \
+            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
+          cat "$AMD_CI_WORK/out/P18_b9831/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$AMD_CI_WORK/lcpp/p18"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P18_b9831" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-narrow2-after-P18
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
