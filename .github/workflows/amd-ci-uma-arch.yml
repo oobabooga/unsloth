@@ -1,0 +1,260 @@
+name: "AMD CI: is the unified-memory corruption in the BUILD or the BACKEND (gfx1151)"
+
+# Follow-up to amd-ci-llamacpp-uma3 (run 33220532522) and -uma4 (run 33221943818),
+# which reproduced silent output corruption on this host when
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 is set:
+#
+#   U2  Qwen3-30B-A3B UD-Q4_K_XL  16.5 GiB  qwen3_moe   NO_REGRESSION
+#   V2  Qwen3-30B-A3B Q8_0        30.2 GiB  qwen3_moe   NO_REGRESSION
+#   U3  Qwen3-Coder-Next Q4_K_M   45.1 GiB  qwen3_next  REGRESSION
+#   V1  same at --ngl 98, ~half offloaded                REGRESSION
+#
+# V1 is the cell that matters for THIS branch. Halving the footprint of the
+# dirty model did not clean it up, so "the allocation is large relative to the
+# 64.0 GiB pool" is not the axis. What U2/V2 and U3/V1 also differ in is the
+# ARCHITECTURE: qwen3_moe is clean at both sizes tested, qwen3_next is dirty at
+# both sizes tested. That confound has never been broken, and it is cheap to
+# break, because there is a 16.35 GiB SSM-hybrid file already pinned in the
+# amd-ci-llamacpp-mtp branch.
+#
+# The second thing this branch settles is provenance, which every field report
+# raises and no run has measured. The Unsloth Strix Halo builds, the upstream
+# ggml-org ROCm 7.14 builds and the Lemonade gfx1151 builds are three different
+# compilers over three different source trees, and the reporters are spread
+# across all three. ggml-org/llama.cpp#26148 reports this exact defect on this
+# exact chip from a SELF-BUILT b10107, which already argues the bug is not
+# Unsloth's packaging - but that is an inference from someone else's box, and
+# this asks it here with one variable moving.
+#
+# CELLS. One model, one pair of state directories, four binaries. Each cell is
+# `base` = the name absent from the child environment, `head` = the name set to
+# 1, with the binary as the only other thing that changes between cells.
+#
+#   A1  Unsloth b10639-mix ROCm gfx1151   the build Studio ships and adi-0 ran
+#   A2  upstream ggml-org ROCm 7.14       is it in upstream HIP too
+#   A3  Lemonade ROCm gfx1151             a third, independently built HIP tree
+#   A4  upstream Vulkan                   NEGATIVE CONTROL, see below
+#
+# A4 is not filler. ggml reads GGML_CUDA_ENABLE_UNIFIED_MEMORY only in the
+# CUDA/HIP allocator (ggml/src/ggml-cuda/ggml-cuda.cu:139-166), so the Vulkan
+# backend must ignore it completely. If A4 diverges, the whole method is wrong -
+# something other than the allocator is moving - and A1-A3 mean nothing. The
+# criteria module asserts the backend the weights actually landed on, per cell,
+# so a Vulkan run cannot pass a ROCm cell by accident, and system_info is not
+# consulted for it (it names ROCm and never Vulkan).
+#
+# WHAT A CLEAN SWEEP WOULD MEAN. If A1-A4 all return NO_REGRESSION, the axis is
+# NOT the architecture and the qwen3_next/qwen3_moe confound stays open; the
+# branch has then cost 16 GiB and about half an hour, and amd-ci-uma-prov is
+# running the same four binaries against the model that is already known to
+# corrupt here. The two branches are deliberately not redundant.
+#
+# BOUNDS. 62 GB of RAM, no swap, a 64.0 GiB HIP pool, one integrated gfx1151,
+# Linux, RADV. Nothing here speaks to Windows, to discrete RDNA 3 or 4, or to
+# the 128 GB hosts every field reporter has.
+
+on:
+  push:
+    branches: [amd-ci-uma-arch]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # adi-0's binary, and the one Unsloth Studio installs: "build b10639-2a36554fc".
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  # Both pinned to versions already proven to load this file on this host, in
+  # amd-ci-llamacpp-mtp cells R5 and R6. A newer tag would add an unmeasured
+  # variable to a cell whose whole point is that only the binary changes.
+  LLAMA_TAG: "b10631"
+  LEMONADE_TAG: "b1316"
+  # qwen35 is an SSM hybrid (ssm_conv1d / ssm_dt / ssm_norm / ssm_a per block,
+  # established from the GGUF headers in unslothai/unsloth#9792), at 16.35 GiB -
+  # a quarter of the footprint of the dirty cell and the same class of recurrent
+  # state. That is the confound-breaking pair.
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  GGUF_REV: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  GGUF_FILE: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "unified memory across three builds and two backends, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "uma-arch"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch all four llama.cpp builds
+        timeout-minutes: 45
+        run: |
+          set -eu
+          U="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          L="https://github.com/lemonade-sdk/llamacpp-rocm/releases/download/$LEMONADE_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$U/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/unslothrocm" \
+            --out "$AMD_CI_WORK/out/bin_unslothrocm.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$L/llama-$LEMONADE_TAG-ubuntu-rocm-gfx1151-x64.zip" \
+            --dest "$AMD_CI_WORK/lcpp/lemonade" --out "$AMD_CI_WORK/out/bin_lemonade.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Record what each build says it is
+        if: always()
+        run: |
+          set +e
+          # Cheap, and it is the evidence that "three builds" is three builds.
+          for B in "$UNSLOTHROCM_BIN" "$ROCM_BIN" "$VULKAN_BIN" "$LEMONADE_BIN"; do
+            echo "--- $B"
+            LD_LIBRARY_PATH="$B" "$B/llama-server" --version 2>&1 | head -3
+            LD_LIBRARY_PATH="$B" "$B/llama-server" --list-devices 2>&1 | head -6
+          done | tee "$AMD_CI_WORK/out/builds.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch Qwen3.8-27B UD-Q4_K_XL, 16.35 GiB
+        timeout-minutes: 120
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$GGUF_FILE" \
+            --revision "$GGUF_REV" --as-name model.gguf --local-dir "$M/ctl" \
+            --out "$AMD_CI_WORK/out/model.json"
+          # Hardlink rather than copy: the criteria module gates on the two states
+          # holding byte-identical shards, and a second 16 GiB copy would only be a
+          # way of getting that wrong.
+          mkdir -p "$M/uma1"
+          for F in "$M"/ctl/*.gguf; do ln -f "$F" "$M/uma1/$(basename "$F")"; done
+          # `-NAME` is a real unset. ggml tests getenv(...) != nullptr, so `NAME=0`
+          # would enable exactly what the control is controlling for.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/uma1/env"
+          # One pair of state directories serves all four cells: the binary is a
+          # probe argument, not part of the state.
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/ctl" --path "head=$M/uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: A1 - Unsloth ROCm gfx1151 build, the one Studio ships
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_A1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/A1" \
+            --title "A1 Qwen3.8-27B UD-Q4_K_XL (SSM hybrid, 16.35 GiB), UNSLOTH ROCm build, unset vs =1, gfx1151" \
+            -- --bin-dir "$UNSLOTHROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 2400 --request-timeout 2400
+          free -g > "$AMD_CI_WORK/out/free_A1_after.txt"
+          cat "$AMD_CI_WORK/out/A1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/A1"
+
+      - name: A2 - upstream ggml-org ROCm 7.14 build
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/A2" \
+            --title "A2 same file, UPSTREAM ggml-org ROCm 7.14 build, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 2400 --request-timeout 2400
+          cat "$AMD_CI_WORK/out/A2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/A2"
+
+      - name: A3 - Lemonade ROCm gfx1151 build
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/A3" \
+            --title "A3 same file, LEMONADE ROCm gfx1151 build, unset vs =1, gfx1151" \
+            -- --bin-dir "$LEMONADE_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 2400 --request-timeout 2400
+          cat "$AMD_CI_WORK/out/A3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/A3"
+
+      - name: A4 - upstream Vulkan, the negative control
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: Vulkan
+        run: |
+          set +e
+          # The variable is read only by the CUDA/HIP allocator, so this cell has
+          # a predicted answer. A divergence here invalidates A1-A3 rather than
+          # adding to them.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/A4" \
+            --title "A4 same file, UPSTREAM VULKAN build, unset vs =1, gfx1151 (negative control)" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 2400 --request-timeout 2400
+          free -g > "$AMD_CI_WORK/out/free_A4_after.txt"
+          cat "$AMD_CI_WORK/out/A4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/A4"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-arch-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
