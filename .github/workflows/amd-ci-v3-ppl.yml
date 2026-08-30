@@ -1,0 +1,224 @@
+name: "AMD CI: is the Qwen3.8-27B V3 recipe numerically broken on ROCm or Vulkan (gfx1151)"
+
+# The question this run exists to answer is narrow and it is the one nobody has
+# asked: **is the V3 quantisation arithmetically sound on AMD?** Every previous
+# cell compared two states to each other on token IDs, which has no oracle for
+# "is either of them right". Perplexity against a fixed corpus does.
+#
+# That distinction is not academic here. On this hardware class a greedy
+# completion canary has been observed running clean for forty minutes against a
+# backend that was numerically broken throughout (ggml-org/llama.cpp#27506), and
+# only perplexity against a control caught it. So a NO_REGRESSION from a
+# token-vector cell - including unslothai/unsloth#9792's twenty - does not
+# establish that the arithmetic is fine.
+#
+# WHAT IS ALREADY EXCLUDED, from the files rather than from the thread
+# (scripts/gguf_tensors_range.py, scripts/gguf_kv_diff.py):
+#
+#   * NOT the chat template. V2 and V3 carry byte-identical templates, 9993
+#     bytes. The Dirk repack, which one reporter says works, is V3 with ONLY the
+#     template swapped - same 866 tensors, same types, one differing KV key.
+#   * NOT the vocab, merges, rope or context metadata. All hash identical.
+#   * NOT file size. V3 UD-Q4_K_XL is 347 MiB SMALLER than V2's, so "V3 no longer
+#     fits and the first-token allocation tips it over" is dead.
+#   * NOT a missing Vulkan kernel. IQ4_NL has complete coverage in
+#     ggml-vulkan.cpp: mul_mat_mat, mul_mat_id, mul_mat_vec f32/f16,
+#     mul_mat_vec_id, dequant, get_rows, cpy and set_rows pipelines all exist.
+#   * NOT gate/up type mismatch. UD-Q6_K_XL, which the field says WORKS, has 27
+#     blocks whose ffn_gate and ffn_up carry different types.
+#
+# WHAT SURVIVES. V2 -> V3 is a recipe change and nothing else: 306 of 866 tensors
+# changed type, and V3 introduced three types V2 never used - IQ4_NL, Q3_K and
+# IQ3_S. "Contains at least one IQ4_NL tensor" still partitions every reported
+# file correctly, 5 for 5, and the minimal crashing file (UD-Q5_K_XL) has exactly
+# one: `blk.17.ffn_gate.weight`, IQ4_NL, [5120, 17408] - a tensor UD-Q4_K_XL also
+# carries as IQ4_NL and UD-Q6_K_XL does not carry at all.
+#
+# CELLS. Base is the revision reported to work; head is the one reported to
+# crash. Same binary, same corpus, same context, same chunk count within a cell.
+#
+#   P1  Vulkan, V2 UD-Q4_K_XL vs V3 UD-Q4_K_XL
+#   P2  ROCm,   the same pair
+#
+# HOW TO READ EITHER OUTCOME, decided before the run rather than after:
+#
+#   * A ratio inside the band on BOTH backends exonerates the recipe
+#     numerically on this hardware. The remaining suspect is then squarely the
+#     Windows AMD Vulkan/HIP driver stack, which is a specific, filable
+#     conclusion rather than a shrug - and it is where ggml-org/llama.cpp#20916
+#     already points: IQ quants crashing llama-server on RDNA3 Vulkan, closed as
+#     STALE in May and never fixed, alongside #20464, #20554 and #16339.
+#   * A blown ratio on one backend and not the other is a backend bug in the
+#     IQ4_NL path, reportable upstream with these two files as the repro.
+#
+# WHAT THIS CANNOT DO, and it is the important limit: the field failure is a
+# CRASH at the first generated token on **Windows**, on **discrete** RDNA3/RDNA4,
+# in several cases on **two cards**. This runner is Linux, integrated, one card,
+# RADV. Perplexity here cannot see that crash and a clean result does not deny
+# it. This cell is about arithmetic, and it is the only part of the question this
+# host can answer honestly.
+#
+# `test-backend-ops` would be the sharper instrument and it is NOT shipped in any
+# release tarball (checked: ggml-org b10690 ubuntu-vulkan and ubuntu-rocm both
+# lack it), and this runner has no compiler. Op-level testing needs a build
+# elsewhere.
+#
+# BOUNDS. 62 GB of RAM, no swap, one integrated gfx1151, Linux, RADV.
+
+on:
+  push:
+    branches: [amd-ci-v3-ppl]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b10631"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  REV_V2: "408fcc1807ab264d8cd644a7c4c0f58fbd32eebc"
+  REV_V3: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  GGUF_FILE: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  PPL_CTX: "4096"
+  PPL_CHUNKS: "24"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "V2 vs V3 perplexity on both backends, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 420
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "v3-ppl"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Vulkan and ROCm builds
+        timeout-minutes: 45
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-rocm-7.14-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Confirm llama-perplexity is present in both builds
+        run: |
+          set -eu
+          # The probe needs this specific binary and it is easy to assume. Ninety
+          # seconds here beats discovering it after a 33 GiB download.
+          for B in "$VULKAN_BIN" "$ROCM_BIN"; do
+            test -x "$B/llama-perplexity" || { echo "no llama-perplexity in $B"; exit 1; }
+            echo "ok: $B/llama-perplexity"
+          done
+
+      - name: Fetch wikitext-2
+        timeout-minutes: 20
+        run: |
+          set -eu
+          # The same corpus llama.cpp's own scripts/get-wikitext-2.sh uses, so the
+          # numbers here are comparable with every perplexity figure in the
+          # upstream threads.
+          C="$AMD_CI_WORK/corpus"
+          mkdir -p "$C"
+          curl -sSL -o "$C/wikitext-2-raw-v1.zip" \
+            "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+          python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+            "$C/wikitext-2-raw-v1.zip" "$C"
+          test -f "$C/wikitext-2-raw/wiki.test.raw"
+          wc -c "$C/wikitext-2-raw/wiki.test.raw"
+
+      - name: Fetch both revisions of UD-Q4_K_XL, 33 GiB total
+        timeout-minutes: 180
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          # --as-name gives both states the same filename so one --gguf value
+          # serves both, while the directories stay distinct.
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$GGUF_FILE" \
+            --revision "$REV_V2" --as-name model.gguf --local-dir "$M/v2" \
+            --out "$AMD_CI_WORK/out/model_v2.json"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$GGUF_FILE" \
+            --revision "$REV_V3" --as-name model.gguf --local-dir "$M/v3" \
+            --out "$AMD_CI_WORK/out/model_v3.json"
+          # No environment variable is under test in this run; the file exists so
+          # the probe records an explicit empty override set rather than guessing.
+          printf '%s\n' '# no per-state environment in this cell' > "$M/v2/env"
+          printf '%s\n' '# no per-state environment in this cell' > "$M/v3/env"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/v2" --path "head=$M/v3" \
+            --label "base=V2 408fcc18" --label "head=V3 4ca72078" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: P1 - Vulkan, V2 vs V3 perplexity
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: Vulkan
+        run: |
+          set +e
+          # Vulkan first: it is the backend every Windows reporter in the thread
+          # is actually on.
+          free -g > "$AMD_CI_WORK/out/free_P1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ppl_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ppl_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P1" \
+            --title "P1 Qwen3.8-27B UD-Q4_K_XL, V2 vs V3 perplexity, upstream VULKAN b10631, gfx1151" \
+            -- --bin-dir "$VULKAN_BIN" --gguf model.gguf --ngl "$NGL" \
+               --corpus "$AMD_CI_WORK/corpus/wikitext-2-raw/wiki.test.raw" \
+               --ctx-size "$PPL_CTX" --chunks "$PPL_CHUNKS" --timeout 10800
+          free -g > "$AMD_CI_WORK/out/free_P1_after.txt"
+          cat "$AMD_CI_WORK/out/P1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P1"
+
+      - name: P2 - ROCm, V2 vs V3 perplexity
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ppl_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ppl_regression.py \
+            --out-dir "$AMD_CI_WORK/out/P2" \
+            --title "P2 same pair, upstream ROCm 7.14 b10631, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --corpus "$AMD_CI_WORK/corpus/wikitext-2-raw/wiki.test.raw" \
+               --ctx-size "$PPL_CTX" --chunks "$PPL_CHUNKS" --timeout 10800
+          free -g > "$AMD_CI_WORK/out/free_P2_after.txt"
+          cat "$AMD_CI_WORK/out/P2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v3-ppl-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
