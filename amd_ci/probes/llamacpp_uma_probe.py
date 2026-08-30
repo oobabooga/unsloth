@@ -63,7 +63,17 @@ MARKERS = {
 LAYER_DEV_RE = re.compile(r"load_tensors: layer\s+\d+ assigned to device ([\w:.\-]+)")
 BUFFER_DEV_RE = re.compile(r"load_tensors:\s+(\S+)\s+model buffer size")
 GFX_RE = re.compile(r"gfx\d{3,4}[a-z]*", re.IGNORECASE)
-BUILD_RE = re.compile(r"build\s*[:=]?\s*(\d+)\s*\(([0-9a-f]+)\)|version:\s*\S+\s*\(build\s*(\d+)")
+# Three spellings across the release eras. Older builds print
+# "version: 10000 (47a39665e)", newer ones "version: 0.3.0-dev (build 10631,
+# commit 5d5cb4c3a)". Missing the older one made every pre-b10xxx cell fail the
+# "same build" gate with build=None and go INCONCLUSIVE, which is what made the
+# first bisect sweep uncertifiable. The bare-version alternative is LAST so it
+# cannot shadow the "0.3.0-dev" form.
+BUILD_RE = re.compile(
+    r"build\s*[:=]?\s*(\d+)\s*\(([0-9a-f]+)\)"
+    r"|version:\s*\S+\s*\(build\s*(\d+)"
+    r"|version:\s*(\d+)\s*\("
+)
 
 
 def free_port() -> int:
