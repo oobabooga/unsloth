@@ -1,0 +1,229 @@
+name: "AMD CI: does the qwen4exp multi-sequence path corrupt on gfx1151"
+
+# ggml-org/llama.cpp#27941 (draft, open) fixes four correctness defects in the
+# qwen4exp implementation - the architecture of Qwen3.8-Flash-Next, and the model
+# behind most of the field reports. Two of them are reachable without any AMD
+# involvement at all:
+#
+#   1. Sequence copies lost their indexer keys. The update context never built
+#      `ctx_idx`, so a copied sequence kept the destination stream's stale keys.
+#      Silently wrong output, reachable through the OpenAI `n` parameter.
+#   2. Blocks were keyed on position alone, correct only for a single sequence,
+#      so under `--kv-unified` a block could be pooled from ANOTHER sequence's
+#      cells. Now keyed on (sequence set, index bucket).
+#
+# Both live in `src/llama-memory-hybrid-idx.cpp`, and a code search says that
+# file is reached from exactly one model: `src/models/qwen4exp.cpp`. So this is
+# Qwen3.8-Flash-Next and nothing else - not DeepSeek-V4-Flash, not
+# Qwen3-Coder-Next, not Qwen3.8-27B.
+#
+# WHY THIS RUN EXISTS. Every Flash-Next cell so far (uma6's Y1 and Y2) passed
+# `--parallel 1`, one sequence, one slot, no images. That is precisely the
+# configuration in which defect 2 CANNOT fire. But llama-server's default with no
+# `--parallel` is auto-slots with `kv_unified = true` - visible in the field logs
+# as `n_slots = 4, kv_unified = 'true'` - and Unsloth Studio leaves it there: it
+# appends `--kv-unified` only when `n_parallel > 1` and otherwise passes no
+# `--parallel` at all, so the default path is what users get. Nobody has run
+# Flash-Next in that configuration on this hardware.
+#
+# It also matters for one specific reporter. On HF discussion #30 and the
+# r/unsloth thread, edsonmedina reports Flash-Next gibberish, unchanged by the
+# Studio update, and says plainly "I only use Vulkan". Studio never sets
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY on a Vulkan launch and cell A4 confirmed Vulkan
+# ignores it, so the unified-memory account cannot explain him. #27941 can:
+# it is backend-independent.
+#
+# CELLS. The unified-memory variable is ABSENT in every state here, deliberately,
+# so nothing in this run is confounded with the allocator question.
+#
+#   F1  ROCm,   base `--parallel 1`  vs  head `-np 4 --kv-unified`
+#   F2  Vulkan, the same pair
+#
+# The head is written explicitly rather than left to llama-server's auto-slots:
+# `n_slots = 4, kv_unified = 'true'` is what the field logs show anyway, and an
+# automatic count could differ between the two builds and move a second variable.
+#
+# F2 is the cell that speaks to edsonmedina, and it is also the cleanest possible
+# separation: Vulkan cannot be running the HIP allocator path, so a divergence
+# there is the model implementation and nothing else.
+#
+# WHAT A DIVERGENCE WOULD AND WOULD NOT SHOW. It would show that the
+# multi-sequence path changes this model's output on this hardware, which is what
+# #27941 describes. It would NOT prove #27941 is the fix, because this runner has
+# no compiler and every published build predates it: #27941 is a draft and its
+# Unsloth counterpart unslothai/llama.cpp#143 is still open, so b10639-mix,
+# b10672, b10679 and b10687 all lack it. Confirming the fix needs a build, and
+# that has to happen somewhere else.
+#
+# A CLEAN RESULT IS ALSO A RESULT, and a weak one: three sequential greedy
+# requests over four slots may simply never pool a block across sequences. This
+# cell can demonstrate the defect, not bound it.
+#
+# UD-IQ1_S at 67.56 GiB is the only Flash-Next quant that fits 62 GB of RAM at
+# all, and it does so as a partial offload. uma6's Y1 established that its
+# control state loads and generates cleanly here, which is what makes it usable
+# as a base.
+#
+# BOUNDS. 62 GB of RAM, no swap, a 64.0 GiB HIP pool, one integrated gfx1151,
+# Linux, RADV. The reporters have 128 GB and full offload.
+
+on:
+  push:
+    branches: [amd-ci-qwen4exp-seq]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  LLAMA_TAG: "b10690"
+  FN_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  FN_REV: "c8b5954a88c2775c546b92593eda40ea041d3176"
+  FN_DIR: "UD-IQ1_S"
+  FN_HEAD: "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  CTX: "16384"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "qwen4exp single vs multi sequence, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 500
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "qwen4exp-seq"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { vulkaninfo --summary || true; } > "$AMD_CI_WORK/out/vulkaninfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the ROCm and Vulkan builds
+        timeout-minutes: 45
+        run: |
+          set -eu
+          U="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          R="https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$U/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/llama-$LLAMA_TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Confirm both builds know qwen4exp before spending three hours downloading
+        if: always()
+        run: |
+          set +e
+          # uma1 burned a whole run discovering its binary could not load this
+          # architecture. Upstream gained qwen4exp in ggml-org#27742 on 2026-08-27,
+          # so b10690 should have it; this is ninety seconds to be sure.
+          for B in "$ROCM_BIN" "$VULKAN_BIN"; do
+            echo "--- $B"
+            LD_LIBRARY_PATH="$B" "$B/llama-server" --version 2>&1 | head -3
+          done | tee "$AMD_CI_WORK/out/builds.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch Flash-Next UD-IQ1_S, 67.56 GiB
+        timeout-minutes: 300
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-UD-IQ1_S-$N-of-00003.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$FN_REPO" \
+              --file "$FN_DIR/$F" --revision "$FN_REV" --as-name "$F" \
+              --local-dir "$M/one_seq" --out "$AMD_CI_WORK/out/model_$N.json"
+          done
+          mkdir -p "$M/auto_slots"
+          for F in "$M"/one_seq/*.gguf; do ln -f "$F" "$M/auto_slots/$(basename "$F")"; done
+          # `-NAME` is a real unset. The allocator variable is absent from BOTH
+          # states in this run, so nothing here is confounded with it.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_N_PARALLEL=1' \
+            > "$M/one_seq/env"
+          # Four slots with a unified KV pool. Written EXPLICITLY rather than left
+          # to llama-server's auto-slots, for two reasons: it is exactly what the
+          # field logs show (`n_slots = 4, kv_unified = 'true'`), and an automatic
+          # slot count could differ between the two builds in F1 and F2, which
+          # would move a second variable. With kv_unified the pool is the full
+          # `-c` regardless of slot count, so total KV - and therefore layer
+          # placement, which the criteria module gates on - stays equal to the
+          # base's.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_N_PARALLEL=4' \
+            'LLAMA_ARG_KV_UNIFIED=1' > "$M/auto_slots/env"
+          python3 amd_ci/lib/write_states.py --require-file "$FN_HEAD" \
+            --path "base=$M/one_seq" --path "head=$M/auto_slots" \
+            --label "base=--parallel 1" --label "head=-np 4 --kv-unified" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: F1 - ROCm, one sequence vs four slots
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_F1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/F1" \
+            --title "F1 Qwen3.8-Flash-Next UD-IQ1_S (qwen4exp), ROCm, --parallel 1 vs -np 4 kv-unified, UMA absent both, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$FN_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          free -g > "$AMD_CI_WORK/out/free_F1_after.txt"
+          cat "$AMD_CI_WORK/out/F1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/F1"
+
+      - name: F2 - Vulkan, one sequence vs four slots
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: Vulkan
+        run: |
+          set +e
+          # The cell that speaks to the Vulkan-only reporter. Vulkan cannot be
+          # running the HIP allocator path, so a divergence here is the model
+          # implementation and nothing else.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/F2" \
+            --title "F2 same file, VULKAN, --parallel 1 vs -np 4 kv-unified, UMA absent both, gfx1151" \
+            -- --bin-dir "$VULKAN_BIN" --gguf "$FN_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          free -g > "$AMD_CI_WORK/out/free_F2_after.txt"
+          cat "$AMD_CI_WORK/out/F2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/F2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen4exp-seq-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
