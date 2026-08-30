@@ -1,0 +1,273 @@
+name: "AMD CI: is the unified-memory corruption a FOOTPRINT threshold (gfx1151)"
+
+# Everything measured so far, ordered by footprint, all on gfx1151 with
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY absent vs = 1 and nothing else moving:
+#
+#   cell  model                        GiB   arch         verdict
+#   U2    Qwen3-30B-A3B UD-Q4_K_XL     16.5  qwen3_moe    NO_REGRESSION
+#   A1-A4 Qwen3.8-27B UD-Q4_K_XL       16.4  qwen35       NO_REGRESSION (4 builds)
+#   V2    Qwen3-30B-A3B Q8_0           30.2  qwen3_moe    NO_REGRESSION
+#   U3/U4 Qwen3-Coder-Next Q4_K_M      45.1  qwen3_next   REGRESSION
+#   V1    same at --ngl 98                                REGRESSION
+#   Y1    Qwen3.8-Flash-Next UD-IQ1_S  67.6  qwen4exp     REGRESSION (head SIGKILLed)
+#
+# The architecture hypothesis is DEAD as of run 33305962968. A1 put a 16.35 GiB
+# SSM hybrid - `qwen35`, the same recurrent-state class as the two dirty models -
+# through the Unsloth, upstream and Lemonade HIP builds and the Vulkan build, and
+# all four were clean. Recurrent state is not the axis, and neither is the build:
+# three independently compiled HIP trees agreed exactly.
+#
+# What is left is FOOTPRINT, and the earlier argument against it was wrong.
+# uma4 read V1 (`--ngl 98`, "about half offloaded") as halving the footprint and
+# concluded size was not the axis. It does not halve anything that matters here:
+# with the managed allocator active the offloaded half is host memory too, and
+# the CPU half was always host memory, so total host residency in V1 is the same
+# ~45 GiB as in U3. V1 never tested a smaller footprint. Nothing has.
+#
+# This host has 62 GB of RAM and no swap. Sorted by residency as a fraction of
+# that, the boundary is unambiguous and every cell falls on the right side:
+# 16.4 (26%) clean, 30.2 (49%) clean, 45.1 (73%) corrupt, 67.6 (109%) killed.
+# The field reports fit the same rule on 128 GB: Qwen3.8-Flash-Next UD-IQ4_XS is
+# 87.2 GiB (68%), and ggml-org/llama.cpp#26148's reporter has 64 GB and the
+# 45.1 GiB file (70%).
+#
+# CELLS. One model, one repo, one revision, one architecture. Only the quant, and
+# therefore the footprint, moves. That is the comparison none of the previous
+# runs made: every earlier pair changed the model as well as the size.
+#
+#   D1  Qwen3.8-27B BF16        50.90 GiB  82% of RAM   decisive
+#   D2  Qwen3.8-27B UD-Q8_K_XL  29.30 GiB  47% of RAM   midpoint
+#
+# against A1's already-measured UD-Q4_K_XL at 16.35 GiB. D1 first, because it is
+# the cell that decides: if a 50.9 GiB `qwen35` corrupts where the 16.35 GiB
+# `qwen35` did not, footprint is the axis outright and architecture, quant family
+# and build are all excluded. If D1 is clean, footprint is excluded too and
+# Qwen3-Coder-Next is doing something none of the other six models do.
+#
+#   D3  the ggml-org/llama.cpp#27506 rule, on the BF16 file already fetched
+#
+# D3 is a different question on the same download and costs one more model load.
+# #27506, #27579, #27556, #25992 and lemonade-sdk/llamacpp-rocm#123 are one
+# defect: c7d87229 (#24233) restored `prop.integrated` on HIP, which re-enabled a
+# host-buffer path, and #27311's authors traced the corruption to an H2D input
+# write racing a still-running graph. The reported rule is that corruption tracks
+# `n_ubatch < n_batch`, 8/8, and is clean whenever the whole prompt lands in one
+# ubatch. D3 holds the unified-memory variable ABSENT in both states and moves
+# only `LLAMA_ARG_UBATCH`, over a prompt long enough to span several ubatches. It
+# is the first test of that rule on this runner, and it is what says whether the
+# unified-memory corruption is that race or a second, independent defect.
+#
+# BOUNDS. 62 GB of RAM, no swap, a 64.0 GiB HIP pool, one integrated gfx1151,
+# Linux, RADV. The footprint fractions above are the whole point of the cell and
+# they are fractions of THIS host's RAM; a 128 GB machine crosses the same line
+# at a different file size.
+
+on:
+  push:
+    branches: [amd-ci-uma-size]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  GGUF_REV: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  BF16_DIR: "BF16"
+  BF16_HEAD: "Qwen3.8-27B-BF16-00001-of-00002.gguf"
+  Q8_FILE: "Qwen3.8-27B-UD-Q8_K_XL.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "unified memory against footprint, one model, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 500
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "uma-size"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Unsloth llama.cpp build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Build the long prompt for D3, and record it
+        run: |
+          set -eu
+          # D3 needs a prompt that spans several ubatches at -ub 512. Written to a
+          # file and read back into the environment rather than inlined, so the
+          # exact bytes are in the artifact and the step is not a wall of prose.
+          # Deliberately non-repetitive: a prompt of one repeated sentence makes
+          # degenerate output the expected answer and would hide the defect.
+          python3 -c 'import sys,random; random.seed(20260830); w="harbour lantern gravel obsidian quarry meridian thistle furnace cobalt marrow trellis vellum cinder antler basalt pollen ridge shale nectar tundra amber quill fathom bramble ochre".split(); L=["%d. %s." % (i," ".join(random.choice(w) for _ in range(9))) for i in range(1,151)]; open(sys.argv[1],"w").write("Below is an indexed list of unrelated nouns. Read it, then answer.\n"+"\n".join(L)+"\n\nQuestion: the capital of France is")' "$AMD_CI_WORK/out/long_prompt.txt"
+          wc -c "$AMD_CI_WORK/out/long_prompt.txt"
+
+      - name: Fetch Qwen3.8-27B BF16, 50.90 GiB over two shards
+        timeout-minutes: 300
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002; do
+            F="Qwen3.8-27B-BF16-$N-of-00002.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" \
+              --file "$BF16_DIR/$F" --revision "$GGUF_REV" --as-name "$F" \
+              --local-dir "$M/bf16_ctl" --out "$AMD_CI_WORK/out/model_bf16_$N.json"
+          done
+          # Hardlinks: the criteria module gates on both states holding
+          # byte-identical shards, and a second 51 GiB copy would not fit anyway.
+          for S in bf16_uma1 bf16_ub_big bf16_ub_small; do
+            mkdir -p "$M/$S"
+            for F in "$M"/bf16_ctl/*.gguf; do ln -f "$F" "$M/$S/$(basename "$F")"; done
+          done
+          # `-NAME` is a real unset: ggml tests getenv(...) != nullptr, so `NAME=0`
+          # would enable exactly what the control is controlling for.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/bf16_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/bf16_uma1/env"
+          # D3's pair. The variable under test stays ABSENT in both; what moves is
+          # the ubatch, through llama.cpp's own LLAMA_ARG_* environment interface,
+          # because per-state arguments can only arrive through the state dir.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_BATCH=4096' \
+            'LLAMA_ARG_UBATCH=4096' > "$M/bf16_ub_big/env"
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_BATCH=4096' \
+            'LLAMA_ARG_UBATCH=512' > "$M/bf16_ub_small/env"
+          python3 amd_ci/lib/write_states.py --require-file "$BF16_HEAD" \
+            --path "base=$M/bf16_ctl" --path "head=$M/bf16_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_bf16.json"
+          python3 amd_ci/lib/write_states.py --require-file "$BF16_HEAD" \
+            --path "base=$M/bf16_ub_big" --path "head=$M/bf16_ub_small" \
+            --label "base=ub==b" --label "head=ub<b" \
+            --out "$AMD_CI_WORK/out/states_ubatch.json"
+          df -h "$AMD_CI_WORK" | tail -1
+          free -g
+
+      - name: D1 - Qwen3.8-27B BF16, 50.90 GiB, 82% of this host's RAM
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # The decisive cell. Same repo, revision and architecture as A1's clean
+          # 16.35 GiB run; only the footprint differs.
+          free -g > "$AMD_CI_WORK/out/free_D1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_bf16.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/D1" \
+            --title "D1 Qwen3.8-27B BF16 (qwen35, 50.90 GiB, 82% of RAM), Unsloth ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$BF16_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          free -g > "$AMD_CI_WORK/out/free_D1_after.txt"
+          cat "$AMD_CI_WORK/out/D1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D1"
+
+      - name: D3 - the llama.cpp#27506 ubatch rule, no unified memory in either state
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # Same download, different question: does THIS host show the
+          # `n_ubatch < n_batch` corruption that #27506 / #27311 describe, with
+          # GGML_CUDA_ENABLE_UNIFIED_MEMORY absent throughout? A divergence here
+          # means the two defect families meet; a clean result means the
+          # unified-memory corruption is its own bug.
+          PROMPT=$(cat "$AMD_CI_WORK/out/long_prompt.txt")
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_ubatch.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/D3" \
+            --title "D3 Qwen3.8-27B BF16, UMA absent in both, -b 4096 with -ub 4096 vs -ub 512, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf "$BF16_HEAD" --ngl "$NGL" \
+               --ctx-size 8192 --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --prompt-text "$PROMPT" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 7200 --request-timeout 7200
+          cat "$AMD_CI_WORK/out/D3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D3"
+
+      - name: Fetch Qwen3.8-27B UD-Q8_K_XL, 29.30 GiB
+        if: always()
+        timeout-minutes: 180
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          # Reclaim BF16 first: 50.9 plus 29.3 GiB is not worth risking the disk
+          # mid-download when D1 and D3 are already measured.
+          rm -rf "$M/bf16_ctl" "$M/bf16_uma1" "$M/bf16_ub_big" "$M/bf16_ub_small"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$Q8_FILE" \
+            --revision "$GGUF_REV" --as-name model.gguf --local-dir "$M/q8_ctl" \
+            --out "$AMD_CI_WORK/out/model_q8.json"
+          mkdir -p "$M/q8_uma1"
+          for F in "$M"/q8_ctl/*.gguf; do ln -f "$F" "$M/q8_uma1/$(basename "$F")"; done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/q8_ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/q8_uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/q8_ctl" --path "head=$M/q8_uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_q8.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: D2 - Qwen3.8-27B UD-Q8_K_XL, 29.30 GiB, 47% of this host's RAM
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # The midpoint. Only meaningful once D1 has an answer: it refines a
+          # boundary rather than establishing one.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_q8.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/D2" \
+            --title "D2 Qwen3.8-27B UD-Q8_K_XL (qwen35, 29.30 GiB, 47% of RAM), Unsloth ROCm, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 5400 --request-timeout 5400
+          free -g > "$AMD_CI_WORK/out/free_D2_after.txt"
+          cat "$AMD_CI_WORK/out/D2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-size-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
