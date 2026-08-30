@@ -1,0 +1,220 @@
+name: "AMD CI: the reporters' OWN llama-server flags on gfx1151"
+
+# Every cell run so far used OUR flags: `--parallel 1 -fa off`, default batching
+# (`-b 2048 -ub 512` by llama.cpp's defaults), no KV quantisation, `-c 8192`, and
+# a six-token prompt. The reporters do not run anything like that. From the
+# thread on HF unsloth/Qwen3.8-Flash-Next-GGUF discussion #30, home-ai-agent's
+# actual command is:
+#
+#   llama-server -m $MODEL --host 0.0.0.0 --port 8080 --alias local-model-ai
+#     --no-mmap -c 262144 -ctk q8_0 -ctv q8_0 -b 2048 -ub 512
+#     -ngl 99 -np 1 -t 12 -tb 16 -lm none -fa on -lv 4 --n-cpu-moe 16
+#
+# That matters more than it looks. `amd-ci-uma-arch` (run 33305962968) reported
+# this exact model CLEAN on four builds, and the honest reading of that result is
+# "clean under our flags", not "clean". If the reporters' flags corrupt where
+# ours do not, then every NO_REGRESSION in this investigation is bounded by a
+# configuration nobody in the field actually uses, and that is worth knowing
+# before any of it is repeated back to users.
+#
+# There is a specific reason to expect the flags to matter. ggml-org/llama.cpp#27506,
+# #27579, #25992 and lemonade-sdk/llamacpp-rocm#123 are one defect - c7d87229
+# (#24233) restored `prop.integrated` on HIP, re-enabling a host-buffer path that
+# widens an H2D-write-vs-graph-compute race - and the rule its investigators
+# established is that **corruption tracks `n_ubatch < n_batch`, 8/8**, clean only
+# when the whole prompt lands in a single ubatch. home-ai-agent runs
+# `-b 2048 -ub 512`. So do llama.cpp's defaults, but our prompt was six tokens
+# long and never spanned a second ubatch. Theirs do.
+#
+# CELLS. One model - the 16.35 GiB Qwen3.8-27B UD-Q4_K_XL that A1-A4 called clean
+# - and a ~3,000 token prompt so prefill really does span several ubatches.
+#
+#   E1  the reporters' flag set, UMA absent in both, `-ub 2048` vs `-ub 512`
+#       The #27506 rule, at the reporters' settings. This is the cell that says
+#       whether this host shows that defect at all.
+#   E2  the reporters' flag set held fixed at their `-ub 512`, UMA unset vs = 1
+#       A1 re-asked under the flags people actually use. A divergence here and
+#       not in A1 means our flags, not the model, produced the clean answer.
+#
+# DEVIATIONS FROM THE REPORTED COMMAND, both deliberate and both stated in the
+# verdict rather than buried:
+#   * `-c 262144` -> `-c 65536`. Their host has 128 GB; this one has 62 GB, and a
+#     262144-token q8_0 KV cache alongside the weights does not fit. A cell that
+#     OOMs measures nothing.
+#   * `-lv 4` dropped. The probe already runs the server at `-v` with its own
+#     `--log-file`, and a second verbosity flag only changes what is parsed.
+#   * `--n-cpu-moe 16` kept for fidelity, and it is a no-op here: `qwen35` is
+#     dense, so there are no MoE layers to move. Recorded, not relied on.
+#
+# BOUNDS. 62 GB of RAM, no swap, a 64.0 GiB HIP pool, one integrated gfx1151,
+# Linux, RADV. Nothing here speaks to Windows, discrete RDNA 3 or 4, or the
+# 128 GB hosts every reporter has.
+
+on:
+  push:
+    branches: [amd-ci-uma-userflags]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_LLAMA_TAG: "b10639-mix-f6f92fe"
+  GGUF_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  GGUF_REV: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  GGUF_FILE: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  NPREDICT: "30"
+  REPEATS: "3"
+
+jobs:
+
+  gpu:
+    name: "the reporters' own flags, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "uma-userflags"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the Unsloth llama.cpp build
+        timeout-minutes: 30
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download/$UNSLOTH_LLAMA_TAG"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/app-$UNSLOTH_LLAMA_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Build the multi-ubatch prompt, and record it
+        run: |
+          set -eu
+          # ~3,000 tokens. At the reporters' `-ub 512` that is six ubatches; at
+          # the control's `-ub 2048` it is one, which is exactly the boundary
+          # #27506 draws. Non-repetitive on purpose: a prompt of one repeated
+          # sentence makes
+          # degenerate output the expected answer and would hide the defect.
+          python3 -c 'import sys,random; random.seed(20260830); w="harbour lantern gravel obsidian quarry meridian thistle furnace cobalt marrow trellis vellum cinder antler basalt pollen ridge shale nectar tundra amber quill fathom bramble ochre".split(); L=["%d. %s." % (i," ".join(random.choice(w) for _ in range(9))) for i in range(1,151)]; open(sys.argv[1],"w").write("Below is an indexed list of unrelated nouns. Read it, then answer.\n"+"\n".join(L)+"\n\nQuestion: the capital of France is")' "$AMD_CI_WORK/out/long_prompt.txt"
+          wc -c "$AMD_CI_WORK/out/long_prompt.txt"
+
+      - name: Fetch Qwen3.8-27B UD-Q4_K_XL, 16.35 GiB
+        timeout-minutes: 120
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$GGUF_REPO" --file "$GGUF_FILE" \
+            --revision "$GGUF_REV" --as-name model.gguf --local-dir "$M/ub_big" \
+            --out "$AMD_CI_WORK/out/model.json"
+          for S in ub_small uma_off uma_on; do
+            mkdir -p "$M/$S"
+            for F in "$M"/ub_big/*.gguf; do ln -f "$F" "$M/$S/$(basename "$F")"; done
+          done
+          # E1: the variable under test stays ABSENT in both states; only the
+          # ubatch moves, through llama.cpp's own LLAMA_ARG_* interface, because
+          # per-state arguments can only arrive through the state directory.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_UBATCH=2048' \
+            > "$M/ub_big/env"
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_UBATCH=512' \
+            > "$M/ub_small/env"
+          # E2: both states at the reporters' -ub 512; the unified-memory name is
+          # the only difference. `-NAME` is a real unset - ggml tests
+          # getenv(...) != nullptr, so `NAME=0` would enable what it controls for.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' 'LLAMA_ARG_UBATCH=512' \
+            > "$M/uma_off/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' 'LLAMA_ARG_UBATCH=512' \
+            > "$M/uma_on/env"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/ub_big" --path "head=$M/ub_small" \
+            --label "base=ub 2048 == b" --label "head=ub 512 < b" \
+            --out "$AMD_CI_WORK/out/states_ubatch.json"
+          python3 amd_ci/lib/write_states.py --require-file model.gguf \
+            --path "base=$M/uma_off" --path "head=$M/uma_on" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states_uma.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: E1 - the reporters' flags, UMA absent, ub 2048 vs ub 512
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # home-ai-agent's flag set verbatim apart from the two deviations named
+          # in the header. If this diverges, ggml-org/llama.cpp#27506 reproduces
+          # on this runner and the unified-memory question changes shape.
+          PROMPT=$(cat "$AMD_CI_WORK/out/long_prompt.txt")
+          free -g > "$AMD_CI_WORK/out/free_E1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_ubatch.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/E1" \
+            --title "E1 Qwen3.8-27B UD-Q4_K_XL, reporters' flags, UMA absent both, -b 2048 with -ub 2048 vs -ub 512, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl 99 \
+               --ctx-size 65536 --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --prompt-text "$PROMPT" \
+               --extra-arg=--no-mmap --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-b --extra-arg=2048 \
+               --extra-arg=-np --extra-arg=1 --extra-arg=-t --extra-arg=12 \
+               --extra-arg=-tb --extra-arg=16 --extra-arg=-lm --extra-arg=none \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--n-cpu-moe --extra-arg=16 \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_E1_after.txt"
+          cat "$AMD_CI_WORK/out/E1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/E1"
+
+      - name: E2 - the reporters' flags at their -ub 512, unified memory unset vs =1
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # A1 re-asked under the flags people actually use. A1 was NO_REGRESSION
+          # on this exact file; if this one diverges, A1's answer was about our
+          # configuration rather than about the model.
+          PROMPT=$(cat "$AMD_CI_WORK/out/long_prompt.txt")
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_uma.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/E2" \
+            --title "E2 same file and reporters' flags at -ub 512, unset vs =1, gfx1151" \
+            -- --bin-dir "$ROCM_BIN" --gguf model.gguf --ngl 99 \
+               --ctx-size 65536 --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --prompt-text "$PROMPT" \
+               --extra-arg=--no-mmap --extra-arg=-ctk --extra-arg=q8_0 \
+               --extra-arg=-ctv --extra-arg=q8_0 --extra-arg=-b --extra-arg=2048 \
+               --extra-arg=-np --extra-arg=1 --extra-arg=-t --extra-arg=12 \
+               --extra-arg=-tb --extra-arg=16 --extra-arg=-lm --extra-arg=none \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--n-cpu-moe --extra-arg=16 \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_E2_after.txt"
+          cat "$AMD_CI_WORK/out/E2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/E2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-userflags-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
