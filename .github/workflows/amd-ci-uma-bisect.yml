@@ -1,0 +1,268 @@
+name: "AMD CI: release bisect of the unified-memory corruption (gfx1151)"
+
+# Did upstream llama.cpp ever run this configuration correctly, or has
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY been corrupting output on gfx1151 for as long
+# as the model has been loadable?
+#
+# WHAT IS ALREADY ESTABLISHED
+#
+# amd-ci-llamacpp-uma3 (run 33220532522) and -uma4 (run 33221943818) reproduced
+# silent output corruption on this host with the Unsloth b10639 ROCm build:
+# Qwen3-Coder-Next Q4_K_M diverges from its own control at token index 2 under
+# greedy decoding, same file, same flags, same seed, prompt cache off, with the
+# presence of that one environment variable as the only difference.
+# ggml-org/llama.cpp#26148 reports the same defect on the same chip and the same
+# model from a SELF-BUILT b10107, and states that b10064 is affected too.
+#
+# So two builds are known bad and nothing is known good. A user-visible
+# regression window is the missing piece: if b8500 is clean, something between
+# March and July 2026 broke it and the range can be handed to upstream. If b8500
+# is already dirty, the defect predates every release that can load this
+# architecture and "roll back" is not advice worth giving anyone.
+#
+# CELLS. One model, one pair of state directories, five upstream ROCm builds.
+# Every cell is `base` = the name absent from the child environment, `head` = the
+# name set to 1, with the BINARY as the only other thing that changes.
+#
+#   C1  b10631  2026-08-26  ROCm 7.14  current; the positive control
+#   C2  b8500   2026-03-24  ROCm 7.2   oldest release that can load qwen3_next
+#   C3  b9500   2026-06-04  ROCm 7.2   midpoint of C2..C4
+#   C4  b9000   2026-05-02  ROCm 7.2
+#   C5  b10000  2026-07-14  ROCm 7.2   two days before the #26148 reporter's b10064
+#
+# Ordered so the bracket exists early: C1 and C2 are the two ends, C3 halves
+# whatever range they leave, and C4/C5 quarter it. A cell that is cut short by
+# the job timeout therefore costs resolution, not the answer.
+#
+# BISECT FLOOR. qwen3_next landed upstream in ff55414c4 on 2025-11-28, so b8500
+# is a floor imposed by the model, not by the releases. Nothing here can say
+# whether the allocator was correct before this architecture existed.
+#
+# THE ROCm RUNTIME IS NOT HELD CONSTANT ACROSS CELLS. Upstream switched its
+# Ubuntu ROCm builds from 7.2 to 7.14 between b10000 and b10631, so C1 differs
+# from C2-C5 in the runtime as well as the source. That is a confound BETWEEN
+# cells and not within one: each cell compares a binary against itself with one
+# environment variable moved, which is the only comparison any verdict here
+# rests on. A boundary that falls exactly at the 7.2 -> 7.14 step should be read
+# as "source or runtime", and named that way.
+#
+# CPU AND CUDA ARE REPORTED CLEAN IN THE FIELD and neither is reachable here:
+# this host has no NVIDIA GPU, and a CPU-only cell fails the majority-on-GPU
+# gate by construction. The Vulkan negative control lives in amd-ci-uma-arch.
+#
+# BOUNDS. 62 GB of RAM, no swap, a 64.0 GiB HIP pool, one integrated gfx1151,
+# Linux, RADV. Nothing here speaks to Windows, to discrete RDNA 3 or 4, or to
+# the 128 GB hosts the field reporters have.
+
+on:
+  push:
+    branches: [amd-ci-uma-bisect]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The asset filename encodes the ROCm version and it CHANGED mid-range, so the
+  # five URLs are spelled out rather than built from a tag in a loop. A generated
+  # name would 404 on half of these and the step would report a download failure
+  # where the real answer is "that release does not ship that file".
+  BIN_C1: "b10631/llama-b10631-bin-ubuntu-rocm-7.14-x64.tar.gz"
+  BIN_C2: "b8500/llama-b8500-bin-ubuntu-rocm-7.2-x64.tar.gz"
+  BIN_C3: "b9500/llama-b9500-bin-ubuntu-rocm-7.2-x64.tar.gz"
+  BIN_C4: "b9000/llama-b9000-bin-ubuntu-rocm-7.2-x64.tar.gz"
+  BIN_C5: "b10000/llama-b10000-bin-ubuntu-rocm-7.2-x64.tar.gz"
+  # #26148's model, and the one that reproduced here in U3, U4 and V1. 45.1 GiB
+  # over four shards.
+  CODER_REPO: "Qwen/Qwen3-Coder-Next-GGUF"
+  CODER_REV: "b82fb7382639d97b38fa7672e526c760c2fb358e"
+  CODER_DIR: "Qwen3-Coder-Next-Q4_K_M"
+  CODER_HEAD: "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "unified memory across five upstream releases, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 500
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "uma-bisect"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch the five upstream ROCm builds
+        timeout-minutes: 60
+        run: |
+          set -eu
+          R="https://github.com/ggml-org/llama.cpp/releases/download"
+          for PAIR in "c1:$BIN_C1" "c2:$BIN_C2" "c3:$BIN_C3" "c4:$BIN_C4" "c5:$BIN_C5"; do
+            NAME="${PAIR%%:*}"
+            REL="${PAIR#*:}"
+            python3 amd_ci/lib/fetch_llamacpp.py --url "$R/$REL" \
+              --dest "$AMD_CI_WORK/lcpp/$NAME" \
+              --out "$AMD_CI_WORK/out/bin_$NAME.json"
+          done
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out"
+
+      - name: Record what each release says it is
+        if: always()
+        run: |
+          set +e
+          # The evidence that five cells really are five different builds.
+          for B in "$C1_BIN" "$C2_BIN" "$C3_BIN" "$C4_BIN" "$C5_BIN"; do
+            echo "--- $B"
+            LD_LIBRARY_PATH="$B" "$B/llama-server" --version 2>&1 | head -3
+          done | tee "$AMD_CI_WORK/out/builds.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch Qwen3-Coder-Next Q4_K_M, 45.1 GiB over four shards
+        timeout-minutes: 240
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003 00004; do
+            F="Qwen3-Coder-Next-Q4_K_M-$N-of-00004.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$CODER_REPO" \
+              --file "$CODER_DIR/$F" --revision "$CODER_REV" --as-name "$F" \
+              --local-dir "$M/ctl" --out "$AMD_CI_WORK/out/model_$N.json"
+          done
+          # Hardlinks, not copies: the criteria module gates on both states
+          # holding byte-identical shards, and a second 45 GiB copy would only be
+          # a way of getting that wrong.
+          mkdir -p "$M/uma1"
+          for F in "$M"/ctl/*.gguf; do ln -f "$F" "$M/uma1/$(basename "$F")"; done
+          # `-NAME` is a real unset. ggml tests getenv(...) != nullptr, so `NAME=0`
+          # would enable exactly what the control is controlling for.
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file "$CODER_HEAD" \
+            --path "base=$M/ctl" --path "head=$M/uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: C1 - b10631, 2026-08-26, ROCm 7.14 (positive control)
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_C1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/C1" \
+            --title "C1 Qwen3-Coder-Next Q4_K_M, upstream b10631 (2026-08-26, ROCm 7.14), unset vs =1, gfx1151" \
+            -- --bin-dir "$C1_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          cat "$AMD_CI_WORK/out/C1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C1"
+
+      - name: C2 - b8500, 2026-03-24, ROCm 7.2 (oldest release that loads this arch)
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/C2" \
+            --title "C2 same file, upstream b8500 (2026-03-24, ROCm 7.2), unset vs =1, gfx1151" \
+            -- --bin-dir "$C2_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          cat "$AMD_CI_WORK/out/C2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C2"
+
+      - name: C3 - b9500, 2026-06-04, ROCm 7.2
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/C3" \
+            --title "C3 same file, upstream b9500 (2026-06-04, ROCm 7.2), unset vs =1, gfx1151" \
+            -- --bin-dir "$C3_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          cat "$AMD_CI_WORK/out/C3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C3"
+
+      - name: C4 - b9000, 2026-05-02, ROCm 7.2
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/C4" \
+            --title "C4 same file, upstream b9000 (2026-05-02, ROCm 7.2), unset vs =1, gfx1151" \
+            -- --bin-dir "$C4_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          cat "$AMD_CI_WORK/out/C4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C4"
+
+      - name: C5 - b10000, 2026-07-14, ROCm 7.2
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/C5" \
+            --title "C5 same file, upstream b10000 (2026-07-14, ROCm 7.2), unset vs =1, gfx1151" \
+            -- --bin-dir "$C5_BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_C5_after.txt"
+          cat "$AMD_CI_WORK/out/C5/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C5"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uma-bisect-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
