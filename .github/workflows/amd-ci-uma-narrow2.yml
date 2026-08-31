@@ -77,7 +77,29 @@ jobs:
             --out "$AMD_CI_WORK/out/host.json"
           { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
           { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
           df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Refuse to start on a memory-starved host
+        run: |
+          set -eu
+          # Run 33339076027 produced 18 uninterpretable cells because it landed
+          # on a host still holding 31 GB of shared memory from the sweep before
+          # it: 27 GB available against a 45.1 GiB model, so every load thrashed
+          # and hit the timeout. "ephemeral" describes the runner process, not
+          # the machine's page cache.
+          #
+          # A longer timeout does not fix that, it only fails more slowly. Check
+          # the precondition instead and fail in seconds with the numbers, so the
+          # answer is "the host was busy", not three hours of empty verdicts.
+          AVAIL=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+          NEED=52
+          echo "available=${AVAIL} GiB, required=${NEED} GiB (45.1 GiB model plus headroom)"
+          free -g
+          if [ "$AVAIL" -lt "$NEED" ]; then
+            echo "::error::Host has ${AVAIL} GiB available, need ${NEED} GiB. A previous job has not released memory. Re-run when the host is idle; do not raise the load timeout to work around this."
+            exit 1
+          fi
 
       - name: Fetch Qwen3-Coder-Next Q4_K_M, 45.1 GiB over four shards
         timeout-minutes: 240
