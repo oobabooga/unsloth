@@ -81,6 +81,7 @@ jobs:
           df -h "$AMD_CI_WORK" | tail -1
 
       - name: Refuse to start on a memory-starved host
+        id: memgate
         run: |
           set -eu
           # Run 33339076027 produced 18 uninterpretable cells because it landed
@@ -93,7 +94,15 @@ jobs:
           # the precondition instead and fail in seconds with the numbers, so the
           # answer is "the host was busy", not three hours of empty verdicts.
           AVAIL=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-          NEED=52
+          # Calibration, from three observed runs on this host:
+          #   58 GiB available -> 20/20 cells certified
+          #   48 GiB available -> untested, model is 45.1 GiB so it should fit
+          #   27 GiB available -> 0/18, every load thrashed past the timeout
+          # 47 leaves ~2 GiB over the model for compute buffers and KV. The first
+          # threshold was 52, which refused a host with 48 GiB that would very
+          # likely have worked. If 47 turns out to be too tight the failure is
+          # cheap and unambiguous: cells time out on load and say so.
+          NEED=47
           echo "available=${AVAIL} GiB, required=${NEED} GiB (45.1 GiB model plus headroom)"
           free -g
           if [ "$AVAIL" -lt "$NEED" ]; then
@@ -123,7 +132,7 @@ jobs:
           df -h "$AMD_CI_WORK" | tail -1
 
       - name: "P1 - b9810"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -147,7 +156,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P1_b9810" || true
 
       - name: "P2 - b9811"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -171,7 +180,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P2_b9811" || true
 
       - name: "P3 - b9813"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -195,7 +204,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P3_b9813" || true
 
       - name: "P4 - b9814"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -219,7 +228,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P4_b9814" || true
 
       - name: "P5 - b9816"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -251,7 +260,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "P6 - b9817"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -275,7 +284,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P6_b9817" || true
 
       - name: "P7 - b9820"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -299,7 +308,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P7_b9820" || true
 
       - name: "P8 - b9821"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -323,7 +332,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P8_b9821" || true
 
       - name: "P9 - b9822"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -347,7 +356,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P9_b9822" || true
 
       - name: "P10 - b9823"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -379,7 +388,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "P11 - b9824"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -403,7 +412,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P11_b9824" || true
 
       - name: "P12 - b9825"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -427,7 +436,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P12_b9825" || true
 
       - name: "P13 - b9826"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -451,7 +460,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P13_b9826" || true
 
       - name: "P14 - b9827"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -475,7 +484,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P14_b9827" || true
 
       - name: "P15 - b9828"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -507,7 +516,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "P16 - b9829"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -531,7 +540,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P16_b9829" || true
 
       - name: "P17 - b9830"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
@@ -555,7 +564,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/P17_b9830" || true
 
       - name: "P18 - b9831"
-        if: always()
+        if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
