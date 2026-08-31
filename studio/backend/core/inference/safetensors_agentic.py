@@ -25,8 +25,8 @@ from loggers import get_logger
 
 from core.inference.tool_call_parser import (
     _GEMMA_BARE_TC_PREFIX_RE,
-    _GEMMA_BARE_TC_RE,
     _balanced_brace_end,
+    leading_bare_gemma_call_is_promotable,
     _strip_mistral_reasoning,
     strip_segment as _parser_strip_segment,
     BUDGET_EXHAUSTED_NUDGE,
@@ -47,6 +47,8 @@ from core.inference.tool_call_parser import (
 )
 
 from core.tool_healing import (
+    EXECUTION_CLASS_TOOL_NAMES,
+    _markerless_promotable,
     _THINK_CLOSE_RE,
     _think_spans_outside_tool_markup,
     strip_outside_think,
@@ -115,12 +117,24 @@ def _is_rehearsal_prefix(
 ) -> bool:
     """True if ``stripped`` is a (possibly partial) prefix of a ``NAME[ARGS]``
     rehearsal split across chunks (``web_search`` then ``[ARGS]{...}``). A space
-    means prose. Unrestricted mode accepts any identifier; else NAME must be active."""
+    means prose. Unrestricted mode accepts any identifier; else NAME must be active.
+    Either way NAME must be markerless-promotable, so a bare execution-class name the
+    parser will never promote streams as prose instead of being held."""
     if not stripped or any(ch.isspace() for ch in stripped):
         return False
     if unrestricted:
-        return _UNRESTRICTED_REHEARSAL_RE.fullmatch(stripped) is not None
+        if _UNRESTRICTED_REHEARSAL_RE.fullmatch(stripped) is None:
+            return False
+        name, bracket, _ = stripped.partition("[")
+        # Until the ``[`` lands the name is still open: ``terminal`` may yet become
+        # ``terminal_logs``, which IS promotable, so releasing it now would leak the first
+        # half of a real call as prose. Hold it and decide once the shape is settled.
+        return not bracket or _markerless_promotable(name, None)
     for name in _active_tool_names(active_tools):
+        # Active by construction, so only the class is left to check, and it must stay an
+        # O(1) set test: this loop runs per streamed chunk over the whole catalog.
+        if name in EXECUTION_CLASS_TOOL_NAMES:
+            continue
         if stripped == name or f"{name}[ARGS]".startswith(stripped):
             return True
     return False
@@ -155,14 +169,16 @@ def _rehearsal_name_start(
 ) -> int:
     """For an ``[ARGS]`` signal at ``signal_pos``, return the start of the preceding
     bare tool-name token (``NAME[ARGS]``), else ``signal_pos`` unchanged when the
-    signal is not ``[ARGS]`` or NAME is not an active tool (restricted mode)."""
+    signal is not ``[ARGS]`` or NAME is not markerless-promotable -- not an active tool
+    (restricted mode), or execution-class, which the parser never promotes from a bare
+    span, so draining on it would withhold the turn for a call that never comes."""
     if not candidate.startswith("[ARGS]", signal_pos):
         return signal_pos
     j = signal_pos
     while j > 0 and (candidate[j - 1].isalnum() or candidate[j - 1] in "_-"):
         j -= 1
-    if j < signal_pos and (
-        unrestricted or candidate[j:signal_pos] in _active_tool_names(active_tools)
+    if j < signal_pos and _markerless_promotable(
+        candidate[j:signal_pos], None if unrestricted else _active_tool_names(active_tools)
     ):
         return j
     return signal_pos
@@ -903,6 +919,9 @@ def run_safetensors_tool_loop(
             # Gemma wrapper-less ``call:NAME{...}`` has no tool_xml_signals entry:
             # buffer it here or it streams raw until the end-of-turn safety net.
             # ``(?<!\w)`` keeps "recall:" out; the prefix regex is whitespace-tolerant.
+            # The completed shape takes the parser's gate: a name it will not promote falls
+            # through and streams instead of draining the whole turn.
+            _gemma_lead = leading_bare_gemma_call_is_promotable(stripped, _enabled_tool_names)
             if (
                 not is_match
                 and not is_prefix
@@ -910,10 +929,10 @@ def run_safetensors_tool_loop(
                 and (
                     "call:".startswith(stripped)
                     or _GEMMA_BARE_TC_PREFIX_RE.match(stripped) is not None
-                    or _GEMMA_BARE_TC_RE.match(stripped) is not None
+                    or _gemma_lead
                 )
             ):
-                if _GEMMA_BARE_TC_RE.match(stripped):
+                if _gemma_lead:
                     detect_state = _state_draining
                     continue
                 # A ``call:`` / ``call:partial_name`` prefix with no ``{`` yet: keep

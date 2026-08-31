@@ -29,6 +29,36 @@ import bisect
 import json
 import re
 
+# The route's ``_LOCAL_CODE_TOOLS`` (a drift test pins that): under Full access all three run
+# unsandboxed, edit_file included, since disable_sandbox drops its workdir containment. Their
+# MARKERLESS forms (``call:NAME{..}`` / ``name[ARGS]{json}``) are indistinguishable from prose
+# quoting the syntax, so a model echoing attacker text would turn a quote into execution;
+# require a wrapper (``<|tool_call>``, ``[TOOL_CALLS]``, ``<function=>``) or a structured call.
+# MCP names are out on purpose: over an open third-party vocabulary the only complete rule is
+# "wrapper for every mcp__ name", which removes MCP from the markerless-only backends. Own change.
+EXECUTION_CLASS_TOOL_NAMES = frozenset({"python", "terminal", "edit_file"})
+
+
+def _markerless_promotable(name, enabled_tool_names) -> bool:
+    """True when a bare, unwrapped call named ``name`` may be promoted. ``None`` is the
+    name-agnostic gate; execution-class names are refused under either."""
+    if name in EXECUTION_CLASS_TOOL_NAMES:
+        return False
+    return enabled_tool_names is None or name in enabled_tool_names
+
+
+def _markerless_blocked_execution(name, enabled_tool_names) -> bool:
+    """True when ``name`` is a call the model DID write and we only decline to promote it bare.
+
+    Narrower than "not promotable", and the difference is what the surrounding scan does. A
+    name outside the tool list is not a call at all: it ends a bare-JSON chain, does not anchor
+    the call beside it, and never made its body opaque. An enabled execution name keeps all
+    three and loses only the promotion."""
+    return name in EXECUTION_CLASS_TOOL_NAMES and (
+        enabled_tool_names is None or name in enabled_tool_names
+    )
+
+
 # One nesting level in the strip regexes; deeper may leak markup (still parsed).
 _BRACKETED_JSON_ONE_LEVEL = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
 
@@ -128,20 +158,18 @@ def strip_tool_patterns(text: str, patterns) -> str:
 def _rehearsal_strip(m, pat, text, spans, enabled_tool_names) -> str:
     """Replacement for one rehearsal strip match: "" to remove it, else what to keep.
 
-    An inactive name or a quoted example is kept. The tail pattern runs to EOF, so a match
-    that opens on a quoted example can still cover a later real call; keep the quoted part
-    and strip from that call on, or the truncated markup leaks into the answer."""
-    if enabled_tool_names is not None and m.group(1) not in enabled_tool_names:
-        return m.group(0)
-    if not _in_code(spans, m.start()):
+    An inactive or execution-class name, or a quoted example, is kept. The tail pattern runs
+    to EOF, so ANY kept match can still cover a later real call; keep the kept part and strip
+    from that call on, or the truncated markup leaks into the answer."""
+    if _markerless_promotable(m.group(1), enabled_tool_names) and not _in_code(spans, m.start()):
         return ""
     pos = m.start()
     while True:
         nxt = pat.search(text, pos + 1)
         if nxt is None or nxt.start() >= m.end():
             return m.group(0)
-        if not _in_code(spans, nxt.start()) and (
-            enabled_tool_names is None or nxt.group(1) in enabled_tool_names
+        if not _in_code(spans, nxt.start()) and _markerless_promotable(
+            nxt.group(1), enabled_tool_names
         ):
             return m.group(0)[: nxt.start() - m.start()]
         pos = nxt.start()
@@ -153,8 +181,9 @@ def apply_tool_strip_patterns(
     enabled_tool_names = None,
 ) -> str:
     """Apply strip ``patterns`` to ``text``. A bare rehearsal ``name[ARGS]{..}`` pattern
-    strips only when ``name`` is an enabled tool (or when ``enabled_tool_names`` is
-    ``None``) and the match is not inside markdown code; every other pattern is removed
+    strips only a markerless-promotable name outside markdown code, so an execution-class
+    one stays visible as text in parse/strip symmetry with ``_iter_bracket_spans``. Every
+    other pattern is removed
     unconditionally. A closed-pair pattern whose close token is absent is skipped so an
     unclosed-marker stream stays linear."""
     for pat in patterns:
@@ -426,9 +455,10 @@ def _iter_bracket_spans(
     [CALL_ID]/[ARGS]) or ``"rehearsal"`` (name[ARGS]{..}).
 
     ``enabled_tool_names`` (set, or None = unrestricted) gates only the ambiguous
-    bare rehearsal form: name[ARGS]{..} is a call ONLY when ``name`` is enabled, so a
-    prose ``foo[ARGS]{..}`` (foo disabled) is neither parsed nor stripped. Explicit
-    [TOOL_CALLS] markers stay unconditional, keeping parse/strip/detection symmetric.
+    bare rehearsal form: name[ARGS]{..} is a call ONLY when ``name`` is markerless-promotable,
+    so a disabled ``foo[ARGS]{..}`` or an execution-class ``terminal[ARGS]{..}`` is neither
+    parsed nor stripped. Explicit [TOOL_CALLS] markers stay unconditional, keeping
+    parse/strip/detection symmetric.
 
     A rehearsal inside markdown code (fenced block or inline span) is documentation
     for the same reason -- the syntax has no sentinel, so quoting it would otherwise
@@ -476,12 +506,7 @@ def _iter_bracket_spans(
             # Truncated body: skip and keep scanning; the caller's catch-all strips the tail.
             cursor = m.end()
             continue
-        if (
-            kind == "rehearsal"
-            and enabled_tool_names is not None
-            and m.group(1) not in enabled_tool_names
-        ):
-            # Inactive-name rehearsal is prose: advance past its body without yielding.
+        if kind == "rehearsal" and not _markerless_promotable(m.group(1), enabled_tool_names):
             cursor = end + 1
             continue
         if kind == "rehearsal":
