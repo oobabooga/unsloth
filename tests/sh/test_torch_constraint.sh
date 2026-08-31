@@ -377,3 +377,5 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
 echo "ALL PASSED"
+
+# CI null control

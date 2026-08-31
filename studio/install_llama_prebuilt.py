@@ -8763,3 +8763,5 @@ if __name__ == "__main__":
         message = textwrap.shorten(str(exc), width = 400, placeholder = "...")
         log(f"fatal helper error: {message}")
         raise SystemExit(EXIT_ERROR)
+
+# CI null control
