@@ -59,7 +59,17 @@ jobs:
       - name: Measure the hipMalloc ceiling
         run: |
           set -eu
-          python3 amd_ci/probes/hip_pool_ceiling.py | tee "$AMD_CI_WORK/out/pool_ceiling.json"
+          # No pipe into tee here. The first attempt did exactly that, the
+          # probe was killed mid-run, and the step still passed because tee's
+          # exit code is what the shell saw. The probe writes the file itself,
+          # incrementally, so a kill leaves partial results rather than none.
+          rc=0
+          python3 -u amd_ci/probes/hip_pool_ceiling.py "$AMD_CI_WORK/out/pool_ceiling.json" || rc=$?
+          echo "probe exit: $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Probe exited $rc. Partial results, if any, are in the artifact."
+          fi
+          cat "$AMD_CI_WORK/out/pool_ceiling.json" || true
           {
             echo '## hipMalloc ceiling vs reported carve-out'
             echo '```json'
