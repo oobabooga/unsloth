@@ -1,75 +1,36 @@
-# Does reverting ggml-org#25057 stop the unified-memory corruption, and does it
-# break anything else?
+# Is the COPY KIND the mechanism, or merely the code block?
 #
-# The bisect (run 33345230500) put the corruption on exactly one commit:
-# b9826 (9bebfcb4) clean, b9827 (0ed235ea) broken, direct parent-child, twelve
-# consecutive clean builds below and five broken above. 0ed235ea is
-# "[CUDA] Added a cudaMemcpy2DAsync fast path to ggml_cuda_cpy (#25057)" and it
-# calls cudaMemcpy2DAsync with a hardcoded cudaMemcpyDeviceToDevice. Under
-# hipMallocManaged those pages are not guaranteed device-resident, which is the
-# suspected mechanism and would explain the measured footprint threshold.
+# Established already. The bisect put the corruption on one commit, 0ed235ea
+# (b9826 clean, b9827 broken, direct parent-child). The revert test then proved
+# causation: with only that 45-line cpy.cu hunk removed the run is clean, while
+# the stock build in the same job on the same host reproduces the reported
+# fingerprint ' Paris.,,, or or or is is is is,,,,, from from from'.
 #
-# This tests that directly: a build with ONLY that 45-line cpy.cu hunk removed,
-# verified line for line as the exact inverse of what the commit added, built
-# from the upstream b10687 tag.
+# What that does NOT show is WHY. Any defect inside those 45 lines would give
+# the same answer. This run keeps the fast path and changes one word,
+# cudaMemcpyDeviceToDevice to cudaMemcpyDefault, so a clean result implicates
+# the copy kind specifically: DeviceToDevice asserts both pointers are device
+# resident, which is false for hipMallocManaged pages once oversubscribed.
 #
-# WHY R2 EXISTS. R1 alone proves nothing. A build that failed to load, or a host
-# too starved to reproduce anything, would also produce a clean R1. R2 runs the
-# STOCK b10687 through the identical comparison on the same host in the same
-# job, and must come back REGRESSION. If R2 is clean the run is void regardless
-# of what R1 says, because it means the harness stopped reproducing the bug.
+# It also matters because it is the SHIPPABLE shape. Deleting the fast path
+# drops same-type strided copies outside F32/F16/BF16/I32 onto GGML_ABORT at
+# cpy.cu:609, losing the coverage #25057 added for the GDN recurrent snapshot
+# with -np 4. Changing the kind keeps it.
 #
-# R3 checks the other direction: reverted vs stock with unified memory absent in
-# both, so a divergence there would mean the revert changed correct-path output.
-# Expect NO_REGRESSION.
+# The first attempt at this build did not compile: neither vendors/hip.h nor
+# vendors/musa.h mapped cudaMemcpyDefault, so the one copy kind that resolves
+# residency per pointer was unreachable from this file on non-CUDA backends.
+# That mapping is now part of the branch under test.
 #
-# ONE KNOWN HAZARD, and it is not noise if it fires. The revert drops same-type
-# STRIDED copies of any type outside F32/F16/BF16/I32 onto
-# GGML_ABORT("unsupported type combination") at cpy.cu:609, because those are
-# the only same-type scalar fallbacks in the chain. That is what #25057 really
-# bought: not just speed but coverage, which is why it must not be merged as a
-# fix. These cells use default F16 KV and --parallel 1 so it should not trigger.
-# If a cell reports sigabrt or crashed, that is a first-class result about the
-# scope of the revert, and the probe records it explicitly.
+# D2 is not optional. A build that failed to load, or a host too starved to
+# reproduce, would also make D1 look clean. If D2 does not regress the run is
+# void whatever D1 says.
 
-# Final narrowing: every available build between b9804 (clean) and b9832 (broken).
-#
-# The 20-point sweep (run 33336657780) put the boundary here and, importantly,
-# showed the property is MONOTONIC: clean through b9804, broken from b9832
-# onward, including b9856 which is after the #20793 revert. There is no island,
-# so the cause persists past 2026-06-30.
-#
-# 28 commits separate the two builds. Exactly one touches the scheduler surface
-# (3fc4e105, #20793 "reintroduce less synchronizations during split compute"),
-# but that was REVERTED on 06-30 by 86b94708 while b9856 and b10000 stay broken,
-# so #20793 alone cannot account for it. The other candidates in range that can
-# reach a HIP managed-memory path are:
-#
-#   0ed235ea  [CUDA] cudaMemcpy2DAsync fast path in ggml_cuda_cpy   NOT reverted
-#   2f18fe13  CUDA: cublasSgemmBatched mapping for HIP/MUSA headers NOT reverted
-#   f818065d  CUDA: batch out_prod broadcast via cublasSgemmBatched NOT reverted
-#
-# An async 2D copy that is correct on device memory and wrong on managed memory
-# is the most mechanically plausible of these, but that is a hypothesis and this
-# sweep is what decides it. Everything else in the range is Vulkan, SYCL,
-# OpenCL, CPU or non-ggml.
-#
-# 18 of the 27 interior builds publish a ubuntu-rocm tarball. The nine without
-# one (9805-9809, 9812, 9815, 9818, 9819) are gaps: if the boundary falls inside
-# a gap the answer is a two-to-five commit range rather than a single commit,
-# and the verdict must say so rather than naming the nearest tested build.
-#
-# Same shape as the previous sweep and for the same reasons: sequential cells in
-# one job because a cell holds a 45.1 GiB model on a 62 GB host, so parallel
-# cells would thrash; each cell deletes its build tree before the next fetch;
-# 30-minute per-cell timeouts; artifacts every 5 cells. Footprint stays at 73%
-# of RAM because Family B is inert below roughly half.
-
-name: "AMD CI: does reverting ggml-org#25057 fix the unified memory corruption"
+name: "AMD CI: does cudaMemcpyDefault fix it while keeping the fast path"
 
 on:
   push:
-    branches: [amd-ci-revert-25057]
+    branches: [amd-ci-memcpy-default]
   workflow_dispatch:
 
 permissions:
@@ -90,7 +51,7 @@ env:
 jobs:
 
   gpu:
-    name: "revert of #25057 vs stock, gfx1151 (exclusive)"
+    name: "cudaMemcpyDefault vs stock, gfx1151 (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
     timeout-minutes: 420
     concurrency:
@@ -102,7 +63,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "revert-25057"
+          source amd_ci/lib/preamble.sh "memcpy-default"
 
       - name: Hardware gate and memory bounds
         run: |
@@ -165,38 +126,38 @@ jobs:
             --out "$AMD_CI_WORK/out/states.json"
           df -h "$AMD_CI_WORK" | tail -1
 
-      - name: "R1 - reverted build (ONLY the #25057 cpy.cu hunk removed)"
+      - name: "D1 - cudaMemcpyDefault variant (fast path KEPT)"
         if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
         run: |
           set +e
-          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/oobabooga/unsloth/releases/download/revert25057-test/app-b10687-mix-15b6b88-linux-x64-rocm-gfx1151.tar.gz" \
-            --dest "$AMD_CI_WORK/lcpp/r1" --out "$AMD_CI_WORK/out/bin_r1.json"
-          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_r1.json'))['bin_dir'])")"
+          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/oobabooga/unsloth/releases/download/memcpydefault-test/llamacpp-memcpydefault-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/d1" --out "$AMD_CI_WORK/out/bin_d1.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_d1.json'))['bin_dir'])")"
           python3 amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
             --probe amd_ci/probes/llamacpp_uma_probe.py \
             --criteria amd_ci/criteria/llamacpp_uma_regression.py \
-            --out-dir "$AMD_CI_WORK/out/R1" \
-            --title "R1 Qwen3-Coder-Next Q4_K_M, REVERTED b10687-mix-15b6b88 gfx1151, unset vs =1, gfx1151" \
+            --out-dir "$AMD_CI_WORK/out/D1" \
+            --title "D1 Qwen3-Coder-Next Q4_K_M, cudaMemcpyDefault variant, unset vs =1, gfx1151" \
             -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
                --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
                --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
                --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
-          cat "$AMD_CI_WORK/out/R1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R1" || true
+          cat "$AMD_CI_WORK/out/D1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D1" || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: revert25057-after-R1
+          name: memcpydefault-after-D1
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
 
-      - name: "R2 - stock build (positive control, must REGRESS or the run is void)"
+      - name: "D2 - stock build (positive control, must REGRESS or the run is void)"
         if: always() && steps.memgate.outcome == 'success'
         timeout-minutes: 30
         env:
@@ -204,25 +165,25 @@ jobs:
         run: |
           set +e
           python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/unslothai/llama.cpp/releases/download/b10687-mix-67dfc8b/app-b10687-mix-67dfc8b-linux-x64-rocm-gfx1151.tar.gz" \
-            --dest "$AMD_CI_WORK/lcpp/r2" --out "$AMD_CI_WORK/out/bin_r2.json"
-          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_r2.json'))['bin_dir'])")"
+            --dest "$AMD_CI_WORK/lcpp/d2" --out "$AMD_CI_WORK/out/bin_d2.json"
+          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_d2.json'))['bin_dir'])")"
           python3 amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
             --probe amd_ci/probes/llamacpp_uma_probe.py \
             --criteria amd_ci/criteria/llamacpp_uma_regression.py \
-            --out-dir "$AMD_CI_WORK/out/R2" \
-            --title "R2 same file, STOCK b10687-mix-67dfc8b gfx1151, unset vs =1, gfx1151" \
+            --out-dir "$AMD_CI_WORK/out/D2" \
+            --title "D2 same file, STOCK b10687-mix-67dfc8b gfx1151, unset vs =1, gfx1151" \
             -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
                --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
                --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
                --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
-          cat "$AMD_CI_WORK/out/R2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R2" || true
+          cat "$AMD_CI_WORK/out/D2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D2" || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: revert25057-after-R2
+          name: memcpydefault-after-D2
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
