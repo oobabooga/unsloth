@@ -1,57 +1,57 @@
-# Is the COPY KIND the mechanism, or merely the code block?
+# Does GGML_CUDA_ENABLE_UNIFIED_MEMORY buy CAPACITY on Strix Halo?
 #
-# Established already. The bisect put the corruption on one commit, 0ed235ea
-# (b9826 clean, b9827 broken, direct parent-child). The revert test then proved
-# causation: with only that 45-line cpy.cu hunk removed the run is clean, while
-# the stock build in the same job on the same host reproduces the reported
-# fingerprint ' Paris.,,, or or or is is is is,,,,, from from from'.
+# The corruption work is finished and is not what this asks. This asks whether
+# the flag is worth having at all, which the previous run made doubtful: with the
+# flag unset a 45.1 GiB model sat in 49.3 GB of "VRAM" and ran 15% FASTER than
+# with it set, because rocminfo reports a 64 GiB GPU pool against 62 GiB of
+# system RAM. Those are the same DRAM. There is no bus to avoid.
 #
-# What that does NOT show is WHY. Any defect inside those 45 lines would give
-# the same answer. This run keeps the fast path and changes one word,
-# cudaMemcpyDeviceToDevice to cudaMemcpyDefault, so a clean result implicates
-# the copy kind specifically: DeviceToDevice asserts both pointers are device
-# resident, which is false for hipMallocManaged pages once oversubscribed.
+# But "no speed benefit at 45 GiB" is not "no benefit". The flag's real claim is
+# capacity: hipMallocManaged instead of hipMalloc, so allocation is not bounded
+# by the GTT carveout. That claim is untested here, and the honest way to test it
+# is a model that plainly does not fit.
 #
-# It also matters because it is the SHIPPABLE shape. Deleting the fast path
-# drops same-type strided copies outside F32/F16/BF16/I32 onto GGML_ABORT at
-# cpy.cu:609, losing the coverage #25057 added for the GDN recurrent snapshot
-# with -np 4. Changing the kind keeps it.
+# Qwen3.8-Flash-Next UD-Q4_K_XL is 103.7 GiB against 62 GiB of RAM with zero
+# swap. If the flag extends capacity in any usable way, the =1 state loads and
+# the unset state does not. If neither loads, the flag cannot conjure memory that
+# is not there, and its value on this class of machine is limited to whatever
+# band sits between the GTT limit and total RAM.
 #
-# The first attempt at this build did not compile: neither vendors/hip.h nor
-# vendors/musa.h mapped cudaMemcpyDefault, so the one copy kind that resolves
-# residency per pointer was unreachable from this file on non-CUDA backends.
-# That mapping is now part of the branch under test.
+# Prediction, recorded before the run so it can be wrong: BOTH states fail to
+# load. Managed memory needs physical backing and this host has no swap, so
+# oversubscription has nowhere to go. A single load failure in the =1 state is
+# the result that would refute the "flag is redundant here" reading.
 #
-# D2 is not optional. A build that failed to load, or a host too starved to
-# reproduce, would also make D1 look clean. If D2 does not regress the run is
-# void whatever D1 says.
+# Unlike the corruption cells there is no positive control, because the question
+# is not differential. The trust condition is different: the run is only
+# interpretable if the fetch completed and both states used the same shards.
 
-name: "AMD CI: does cudaMemcpyDefault fix it while keeping the fast path"
+name: "AMD CI: does unified memory buy capacity for a model larger than RAM"
 
 on:
   push:
-    branches: [amd-ci-memcpy-default]
+    branches: [amd-ci-uma-capacity]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  CODER_REPO: "Qwen/Qwen3-Coder-Next-GGUF"
-  CODER_REV: "b82fb7382639d97b38fa7672e526c760c2fb358e"
-  CODER_DIR: "Qwen3-Coder-Next-Q4_K_M"
-  CODER_HEAD: "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  CODER_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  CODER_REV: "c8b5954a88c2775c546b92593eda40ea041d3176"
+  CODER_DIR: "UD-Q4_K_XL"
+  CODER_HEAD: "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
   CTX: "8192"
   NPREDICT: "30"
   REPEATS: "3"
   NGL: "999"
-  LOAD_TIMEOUT: "900"
+  LOAD_TIMEOUT: "1800"
   REQ_TIMEOUT: "420"
 
 jobs:
 
   gpu:
-    name: "cudaMemcpyDefault vs stock, gfx1151 (exclusive)"
+    name: "103.7 GiB model on a 62 GiB host, gfx1151 (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, ephemeral]
     timeout-minutes: 420
     concurrency:
@@ -63,7 +63,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "memcpy-default"
+          source amd_ci/lib/preamble.sh "uma-capacity"
 
       - name: Hardware gate and memory bounds
         run: |
@@ -97,21 +97,21 @@ jobs:
           # threshold was 52, which refused a host with 48 GiB that would very
           # likely have worked. If 47 turns out to be too tight the failure is
           # cheap and unambiguous: cells time out on load and say so.
-          NEED=47
-          echo "available=${AVAIL} GiB, required=${NEED} GiB (45.1 GiB model plus headroom)"
+          NEED=55
+          echo "available=${AVAIL} GiB, required=${NEED} GiB (quiet-host check; the 103.7 GiB model exceeds RAM BY DESIGN)"
           free -g
           if [ "$AVAIL" -lt "$NEED" ]; then
             echo "::error::Host has ${AVAIL} GiB available, need ${NEED} GiB. A previous job has not released memory. Re-run when the host is idle; do not raise the load timeout to work around this."
             exit 1
           fi
 
-      - name: Fetch Qwen3-Coder-Next Q4_K_M, 45.1 GiB over four shards
+      - name: Fetch Qwen3.8-Flash-Next UD-Q4_K_XL, 103.7 GiB over four shards
         timeout-minutes: 240
         run: |
           set -eu
           M="$AMD_CI_WORK/models"
           for N in 00001 00002 00003 00004; do
-            F="Qwen3-Coder-Next-Q4_K_M-$N-of-00004.gguf"
+            F="Qwen3.8-Flash-Next-UD-Q4_K_XL-$N-of-00004.gguf"
             python3 amd_ci/lib/fetch_gguf.py --repo "$CODER_REPO" \
               --file "$CODER_DIR/$F" --revision "$CODER_REV" --as-name "$F" \
               --local-dir "$M/ctl" --out "$AMD_CI_WORK/out/model_$N.json"
@@ -126,9 +126,9 @@ jobs:
             --out "$AMD_CI_WORK/out/states.json"
           df -h "$AMD_CI_WORK" | tail -1
 
-      - name: "D1 - cudaMemcpyDefault variant (fast path KEPT)"
+      - name: "C1 - 103.7 GiB model, UMA unset vs =1 (fixed binary)"
         if: always() && steps.memgate.outcome == 'success'
-        timeout-minutes: 30
+        timeout-minutes: 75
         env:
           AMD_CI_EXPECT_DEVICE: ROCm
         run: |
@@ -140,50 +140,19 @@ jobs:
             --states "$AMD_CI_WORK/out/states.json" \
             --probe amd_ci/probes/llamacpp_uma_probe.py \
             --criteria amd_ci/criteria/llamacpp_uma_regression.py \
-            --out-dir "$AMD_CI_WORK/out/D1" \
-            --title "D1 Qwen3-Coder-Next Q4_K_M, cudaMemcpyDefault variant, unset vs =1, gfx1151" \
+            --out-dir "$AMD_CI_WORK/out/C1" \
+            --title "C1 Qwen3.8-Flash-Next UD-Q4_K_XL 103.7 GiB on a 62 GiB host, unset vs =1, gfx1151" \
             -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
                --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
                --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
                --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
-          cat "$AMD_CI_WORK/out/D1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D1" || true
+          cat "$AMD_CI_WORK/out/C1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/C1" || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: memcpydefault-after-D1
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: "D2 - stock build (positive control, must REGRESS or the run is void)"
-        if: always() && steps.memgate.outcome == 'success'
-        timeout-minutes: 30
-        env:
-          AMD_CI_EXPECT_DEVICE: ROCm
-        run: |
-          set +e
-          python3 amd_ci/lib/fetch_llamacpp.py --url "https://github.com/unslothai/llama.cpp/releases/download/b10687-mix-67dfc8b/app-b10687-mix-67dfc8b-linux-x64-rocm-gfx1151.tar.gz" \
-            --dest "$AMD_CI_WORK/lcpp/d2" --out "$AMD_CI_WORK/out/bin_d2.json"
-          BIN="$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/bin_d2.json'))['bin_dir'])")"
-          python3 amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/llamacpp_uma_probe.py \
-            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
-            --out-dir "$AMD_CI_WORK/out/D2" \
-            --title "D2 same file, STOCK b10687-mix-67dfc8b gfx1151, unset vs =1, gfx1151" \
-            -- --bin-dir "$BIN" --gguf "$CODER_HEAD" --ngl "$NGL" \
-               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
-               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
-               --load-timeout "$LOAD_TIMEOUT" --request-timeout "$REQ_TIMEOUT"
-          cat "$AMD_CI_WORK/out/D2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D2" || true
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: memcpydefault-after-D2
+          name: umacapacity-C1
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
