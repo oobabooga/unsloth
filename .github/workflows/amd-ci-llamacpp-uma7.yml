@@ -1,0 +1,183 @@
+name: "AMD CI: verify the b10715 nightly fixes the unified-memory corruption (gfx1151)"
+
+# RELEASE VERIFICATION, not investigation. The corruption chain is closed:
+#
+#   trigger   GGML_CUDA_ENABLE_UNIFIED_MEMORY=1, set by Studio on Strix APUs
+#             (HF Qwen3.8-Flash-Next-GGUF discussion #30, adi-0)
+#   repro     runs 33220532522 / 33221943818 on this pool: Qwen3-Coder-Next
+#             Q4_K_M, 45.1 GiB, greedy, corrupt at token 2 with the variable set,
+#             three independent cells, all gates green
+#   cause     unslothai/llama.cpp#157: the 2D copy fast path (upstream #25057,
+#             commit 0ed235ea) copies with cudaMemcpyDeviceToDevice, an assertion
+#             of device residency that hipMallocManaged pages past a footprint
+#             threshold no longer satisfy. Fix: cudaMemcpyDefault.
+#   pinned    #160/#162, and release b10715-mix-86bd2d3 (2026-08-31) lists #157,
+#             #158 and #149 in its notes.
+#
+# Daniel's D1/D2 on the PR proved the BRANCH. This proves the RELEASE, which is
+# what every reporter thread will be pointed at. Two cells, same model, same
+# flags, one job, one host:
+#
+#   Z1  b10715-mix-86bd2d3  unset vs =1   expect NO_REGRESSION, clean text both
+#   Z2  b10639-mix-f6f92fe  unset vs =1   expect REGRESSION, the ' Paris.,,,'
+#                                         fingerprint
+#
+# Z2 is the load-bearing control: a host too healthy to reproduce (or a cell
+# quietly broken) would make Z1's clean result meaningless. Only the pair reads
+# as a verification. If Z2 comes back NO_REGRESSION, this run proves nothing and
+# must be reported as such.
+#
+# uma5 (X1/X2 BF16 size cells) is retired: two identical runner-lost-communication
+# deaths mid-download of the 56.9 GiB BF16, and the size question those cells
+# chased is answered by the mechanism (residency threshold), so no more download
+# budget goes there.
+#
+# BOUNDS. One gfx1151, Linux, 62 GB RAM, 64 GiB pool. Says nothing about Windows,
+# discrete cards, or the 128 GB hosts. The reporters' own confirmation on their
+# hardware is still wanted after this and is step 4 of the game plan.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-uma7]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FIXED_TAG: "b10715-mix-86bd2d3"
+  BROKEN_TAG: "b10639-mix-f6f92fe"
+  CODER_REPO: "Qwen/Qwen3-Coder-Next-GGUF"
+  CODER_REV: "b82fb7382639d97b38fa7672e526c760c2fb358e"
+  CODER_DIR: "Qwen3-Coder-Next-Q4_K_M"
+  CODER_HEAD: "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  CTX: "8192"
+  NPREDICT: "30"
+  REPEATS: "3"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "b10715 verification against the b10639 control, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 400
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-uma7"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+
+      - name: Fetch both llama.cpp builds
+        timeout-minutes: 45
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$FIXED_TAG/app-$FIXED_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/fixed" --out "$AMD_CI_WORK/out/bin_fixed.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$BROKEN_TAG/app-$BROKEN_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/broken" --out "$AMD_CI_WORK/out/bin_broken.json"
+          # Confirm per binary, not per assumption: the whole point of Z1/Z2 is
+          # which build ran, so record both version strings into the artifact.
+          for B in fixed broken; do
+            LD_LIBRARY_PATH="$AMD_CI_WORK/lcpp/$B" "$AMD_CI_WORK/lcpp/$B/llama-completion" --version \
+              > "$AMD_CI_WORK/out/version_$B.txt" 2>&1 || true
+            cat "$AMD_CI_WORK/out/version_$B.txt"
+          done
+
+      - name: Fetch Qwen3-Coder-Next
+        timeout-minutes: 180
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003 00004; do
+            F="Qwen3-Coder-Next-Q4_K_M-$N-of-00004.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$CODER_REPO" \
+              --file "$CODER_DIR/$F" --revision "$CODER_REV" --as-name "$F" \
+              --local-dir "$M/ctl" --out "$AMD_CI_WORK/out/model_$N.json"
+          done
+          mkdir -p "$M/uma1"
+          for F in "$M"/ctl/*.gguf; do ln -f "$F" "$M/uma1/$(basename "$F")"; done
+          printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/ctl/env"
+          printf '%s\n' 'GGML_CUDA_ENABLE_UNIFIED_MEMORY=1' > "$M/uma1/env"
+          python3 amd_ci/lib/write_states.py --require-file "$CODER_HEAD" \
+            --path "base=$M/ctl" --path "head=$M/uma1" \
+            --label "base=unset" --label "head==1" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Z1 - the b10715 nightly, unset vs =1
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_Z1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/Z1" \
+            --title "Z1 Coder-Next Q4_K_M on b10715-mix-86bd2d3 (carries #157), unset vs =1, gfx1151" \
+            -- --bin-dir "$AMD_CI_WORK/lcpp/fixed" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 2400
+          free -g > "$AMD_CI_WORK/out/free_Z1_after.txt"
+          cat "$AMD_CI_WORK/out/Z1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/Z1"
+
+      - name: Z2 - the b10639 control, unset vs =1
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+        run: |
+          set +e
+          # This cell is EXPECTED to find the corruption; it exists so a clean Z1
+          # cannot be explained by the host or the cell having gone quiet.
+          # announce.py will fail the step on the REGRESSION it is supposed to
+          # find; that red is the control working, and the summary says so.
+          free -g > "$AMD_CI_WORK/out/free_Z2_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_uma_probe.py \
+            --criteria amd_ci/criteria/llamacpp_uma_regression.py \
+            --out-dir "$AMD_CI_WORK/out/Z2" \
+            --title "Z2 Coder-Next Q4_K_M on b10639-mix-f6f92fe (pre-fix control), unset vs =1, gfx1151" \
+            -- --bin-dir "$AMD_CI_WORK/lcpp/broken" --gguf "$CODER_HEAD" --ngl "$NGL" \
+               --ctx-size "$CTX" --n-predict "$NPREDICT" --repeats "$REPEATS" \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off \
+               --load-timeout 3600 --request-timeout 2400
+          free -g > "$AMD_CI_WORK/out/free_Z2_after.txt"
+          cat "$AMD_CI_WORK/out/Z2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "Reading the pair: Z1 NO_REGRESSION + Z2 REGRESSION = release verified."
+            echo "Z2 NO_REGRESSION would mean the cell lost its teeth and Z1 proves nothing."
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/Z2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-uma7-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
