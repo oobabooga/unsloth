@@ -1,0 +1,76 @@
+# Is the VRAM carve-out really the hipMalloc ceiling?
+#
+# unsloth#9884 enables GGML_CUDA_ENABLE_UNIFIED_MEMORY when available host RAM
+# exceeds the carve-out, on the premise that plain allocation draws the carve-out
+# and managed allocation draws host RAM.
+#
+# lemonade-sdk/lemonade#3377 puts that in doubt. Four Strix Halo reporters give
+# carve-outs of 0.5 to 4 GB against 100 to 120 GB of GTT, and say models needing
+# 16 GB resident RUN once lemonade's filter is bypassed. If hipMalloc reaches GTT
+# then the carve-out is not the ceiling, the gate compares the wrong number, and
+# it would turn managed allocation ON for the majority configuration, which is
+# both slower (measured 15%) and the corrupting path.
+#
+# This host cannot settle the small-carve-out case: its own carve-out is large.
+# What it CAN do is measure the ceiling rather than assume it, and report the
+# driver's own figures next to it. A ceiling that lands inside the carve-out
+# supports the premise here; one that overshoots refutes it outright.
+#
+# Cheap and safe: no model, no download, seconds of allocation probing, and
+# hipMalloc fails cleanly by returning an error rather than disturbing the host.
+
+name: "AMD CI: is the VRAM carve-out really the hipMalloc ceiling"
+
+on:
+  push:
+    branches: [amd-ci-pool-ceiling]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "pool ceiling, gfx1151"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 20
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: source amd_ci/lib/preamble.sh "pool-ceiling"
+
+      - name: What the driver and the OS report
+        run: |
+          set -eu
+          echo "--- /proc/meminfo ---"; grep -E "MemTotal|MemAvailable" /proc/meminfo
+          echo "--- free -g ---"; free -g
+          echo "--- amdgpu sysfs ---"
+          for f in /sys/class/drm/card*/device/mem_info_*; do
+            [ -r "$f" ] && echo "$f = $(cat "$f")"
+          done || true
+          echo "--- rocm-smi ---"
+          { rocm-smi --showmeminfo all || true; } 2>&1 | head -30
+
+      - name: Measure the hipMalloc ceiling
+        run: |
+          set -eu
+          python3 amd_ci/probes/hip_pool_ceiling.py | tee "$AMD_CI_WORK/out/pool_ceiling.json"
+          {
+            echo '## hipMalloc ceiling vs reported carve-out'
+            echo '```json'
+            cat "$AMD_CI_WORK/out/pool_ceiling.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pool-ceiling
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
