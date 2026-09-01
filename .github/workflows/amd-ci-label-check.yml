@@ -15,7 +15,7 @@ name: "AMD CI: validate PR 9152"
 
 on:
   push:
-    branches: [amd-ci-label-check]
+    branches: [amd-ci-label-control]
   workflow_dispatch:
 
 permissions:
