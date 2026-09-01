@@ -1,0 +1,155 @@
+# AMD CI
+
+A reusable harness for validating changes on the AMD CI runner (Strix Halo
+gfx1151, Linux, ROCm).
+
+It exists because of a measured observation: across 19 CI runs, **zero** failed
+because of the platform. All seven failures were harness authoring: an errexit
+that swallowed an exit code, a `pkill -f` that matched its own shell, a detector
+that read the wrong field, a glob that failed under `pipefail`. The runner is
+reliable; writing correct one-off workflows is not. So this toolkit standardises
+the plumbing and encodes each of those mistakes as a lint rule or a default.
+
+## The one rule
+
+> In differential mode, if the base state does not exhibit the defect, the
+> verdict is **VOID**. Not a pass.
+
+A green head leg with no demonstrated base failure shows only that the harness
+ran. This is enforced in `lib/differential.py` and is deliberately not a
+per-probe option: a reusable harness whose pass criteria are negotiable becomes
+a green-tick generator, and then none of its results mean anything.
+
+## Shape
+
+A **probe** observes and never judges. A **criteria** module judges and never
+observes. Keeping them apart is what stops a probe being written so it always
+passes.
+
+```
+lib/preamble.sh       isolation: sudo shim, roots under $RUNNER_TEMP, set +e
+lib/gate.py           hardware gate; FAILS rather than skips
+lib/capability.py     what this host can and cannot answer
+lib/states.py         base / head / merge (or merge commit + parent) as worktrees
+lib/differential.py   run probe per state, apply gates, decide, render
+lib/lint_workflow.py  catch the bugs that cost real runs, before spending one
+lib/announce.py       annotate the verdict; fail the job on a NON-result
+probes/               pytest_probe.py, plus your own
+criteria/             pytest_no_regression.py, plus your own
+templates/workflow.yml, scaffold.py, selftest.py
+```
+
+## Use
+
+Most PRs need nothing written at all:
+
+```bash
+python amd_ci/scaffold.py --pr 9487 --out ci_pr9487 \
+    --tests tests/test_sd_cpp_install.py
+```
+
+For a PR already merged, compare the merge commit to its parent:
+
+```bash
+python amd_ci/scaffold.py --pr 9315 --merged --out ci_pr9315 --no-gpu --tests tests/
+```
+
+Scaffolding lints the generated workflow and refuses to print the push command
+while error-level findings remain.
+
+For anything the generic pytest probe cannot express, write a probe that emits
+JSON and a criteria module with `MODE`, `gates()`, `table()` and either
+`base_shows_defect`/`head_is_fixed` (differential) or `head_is_worse`
+(regression). See `criteria/pytest_no_regression.py`.
+
+### Fixtures
+
+When the condition being measured has to hold across *every* state's probe, use
+a fixture. The motivating case is "another process is holding VRAM": that must
+be equally true for the base and head readings or they are not comparable, and
+a per-state probe cannot arrange it.
+
+```bash
+python amd_ci/lib/differential.py \
+  --states .../states.json \
+  --probe amd_ci/probes/gpu_summary_probe.py \
+  --criteria amd_ci/criteria/gpu_summary_sees_others.py \
+  --fixture amd_ci/probes/vram_holder_fixture.py \
+  --fixture-arg=--gib --fixture-arg=4 \
+  --out-dir out/
+```
+
+A fixture prints one JSON line containing `"status": "READY"` when it is up;
+the runner polls for that rather than sleeping. It is stopped by PID, never by
+`pkill -f`. If it never becomes ready the verdict is **INCONCLUSIVE**, because a
+differential measured against a condition that was never established is no
+result rather than a failing one.
+
+Its READY payload lands in the observations as `_fixture`, which criteria read
+for non-vacuity gates (for example "the holder really held >= 2 GiB").
+
+## Lint rules, and the run each one cost
+
+| code | catches |
+|---|---|
+| E000 | `bash -n` syntax error in a `run:` block |
+| E001 | `rc=$?` with no `set +e`; GitHub's shell is `bash -e`, so the step aborts first |
+| E002 | `pkill -f` whose pattern matches the calling shell, so the step kills itself |
+| E003 | heredoc closed by an indented terminator without `<<-` |
+| E004 | parsing a program's stdout as JSON; import banners corrupt it |
+| E005 | glob or pipeline under `pipefail`; `2>/dev/null` hides the message, not the status |
+| E006 | `nohup ... &` backgrounding the work out of the step's shell |
+| E007 | a relative `amd_ci/...` path in a step that has `cd`'d away from the checkout |
+| W101 | a GPU-measuring job with no concurrency group |
+| W102 | `exit 0` when hardware is absent, which misreports a miss as nothing to see |
+
+Verified against git history: E001 fires on the two revisions whose runs it cost,
+E005 on the revision whose run it cost.
+
+## What the hardware can and cannot answer
+
+`lib/capability.py` holds this, and every report auto-appends a "Not tested here"
+section from it. Do not hand-write that section and do not omit it: on this host
+Windows/WDDM, NVIDIA UUID masks, MIG, multi-GPU, XPU and MLX are all unreachable,
+and a report that stays silent about them overstates its reach.
+
+**The gaps are computed, but `NEEDS` is authored.** `untested_section` renders
+`NEEDS` minus what the host has, so an under-declared `NEEDS` yields no gaps.
+A Windows-only PR whose criteria declared only `["rocm"]` produced a report with
+no bounds at all. So the section is now rendered even when nothing is missing,
+saying explicitly that it is a claim about the declaration, and `differential.py`
+emits a `::warning::` for that case. Writing a criteria module still means
+listing every capability the change touches, not only the ones the host has.
+
+This is the part that does **not** generalise. The harness runs anywhere; the
+*claims* are bounded by one integrated GPU, on Linux, under RADV.
+
+## A green tick is not a result
+
+Both Differential steps deliberately survive an unwelcome finding, so job status
+reports the plumbing. A run that selects zero tests and returns INCONCLUSIVE in
+90 seconds used to show a tick. `lib/announce.py` now closes each Differential
+step: it annotates the verdict, and **fails the job on VOID or INCONCLUSIVE**,
+which are non-results and belong with a failed hardware gate. Real findings
+(CONFIRMED, FIX_INCOMPLETE, NO_REGRESSION) keep the job green. Read the verdict
+from the artifact regardless.
+
+## Runner facts worth knowing
+
+- Four slots (`d01`-`d04`) in the `devlab-dispatch` pool on **one** machine sharing **one** GPU,
+  ~62 GiB RAM, one 1.7 T disk. Measured: 4 jobs held concurrently for 5 minutes.
+- A fifth queued job waits; slot turnaround is about 20 s.
+- `$RUNNER_TEMP` is wiped between jobs (19-20 G baseline observed across runs,
+  against 69 G at the end of a heavy one). The OS is persistent.
+- No root. Nothing can break system packages. The `sudo` shim makes that
+  checkable rather than assumed.
+- Nothing is cached: every run re-downloads. That is a cost, not a risk.
+
+## Self-test
+
+```bash
+python amd_ci/selftest.py
+```
+
+Covers the VOID rule, the added-tests-are-not-a-regression rule, absent-test
+handling, and that the lint rules fire on the shapes that caused real failures.
