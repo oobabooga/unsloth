@@ -1,0 +1,84 @@
+name: "AMD CI: validate PR 9152 (top-level reroute, spoofed Fedora host)"
+
+# Generated from amd_ci/templates/workflow.yml, then reduced to the one differential this
+# run is for. The stock suites job installs torch and runs pytest; nothing here needs
+# either. What is measured is which torch index install.sh's TOP-LEVEL reroute resolves,
+# at the PR's base and at its head, on a real ROCm gfx1151 host.
+#
+# One job, and it does take the GPU concurrency group: the probe shells out to the real
+# rocminfo and amd-smi for its `real_host` control, which opens the KFD. It allocates no
+# VRAM and installs nothing.
+
+on:
+  push:
+    branches: [amd-ci-9152-toplevel-spoof]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "9152"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  MERGED: "0"
+
+jobs:
+
+  route:
+    name: "PR 9152 top-level reroute, base vs head"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 45
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr9152-toplevel"
+
+      - name: What this host really is
+        run: |
+          set +e
+          uname -a
+          echo "--- version sources actually present:"
+          for c in rocminfo amd-smi hipconfig rpm dpkg-query nvidia-smi lspci dash bash; do
+            printf '%-12s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo '(absent)')"
+          done
+          echo "--- AMD kernel interfaces actually present:"
+          ls -ld /dev/kfd /sys/class/kfd /sys/bus/pci/devices /opt/rocm
+          echo "--- what rocminfo really reports:"
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing' | head -20
+          echo "--- what amd-smi really reports:"
+          amd-smi version 2>/dev/null | head -3
+          exit 0
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Differential
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/rocm_toplevel_reroute_probe.py \
+            --criteria amd_ci/criteria/rocm_toplevel_reroute_fixed.py \
+            --out-dir "$AMD_CI_WORK/out/route"
+          cat "$AMD_CI_WORK/out/route/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/route"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9152-toplevel
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
