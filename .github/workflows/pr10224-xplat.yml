@@ -49,8 +49,8 @@ jobs:
       - name: Routing probe, base vs head
         run: |
           . "$RUNNER_TEMP/venv/bin/activate"
-          python probe.py base/studio/backend base  > base.json
-          python probe.py head/studio/backend head  > head.json
+          python probe.py base/studio/backend base base.json
+          python probe.py head/studio/backend head head.json
           echo "--- base ---"; cat base.json
           echo "--- head ---"; cat head.json
           echo "--- diff ---"; python diff_probe.py base.json head.json
@@ -91,8 +91,8 @@ jobs:
         shell: pwsh
         run: |
           $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
-          & $py probe.py base/studio/backend base | Out-File -Encoding utf8 base.json
-          & $py probe.py head/studio/backend head | Out-File -Encoding utf8 head.json
+          & $py probe.py base/studio/backend base base.json
+          & $py probe.py head/studio/backend head head.json
           Get-Content base.json
           Get-Content head.json
           & $py diff_probe.py base.json head.json
@@ -132,8 +132,8 @@ jobs:
           . /tmp/venv/bin/activate
           pip install -q --upgrade pip
           pip install -q psutil structlog
-          python probe.py base/studio/backend base > base.json
-          python probe.py head/studio/backend head > head.json
+          python probe.py base/studio/backend base base.json
+          python probe.py head/studio/backend head head.json
           cat base.json; cat head.json
           python diff_probe.py base.json head.json
           '@

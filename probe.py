@@ -7,7 +7,7 @@ Apple unified-memory numbers.
 """
 import json, os, platform, sys
 
-root, label = sys.argv[1], sys.argv[2]
+root, label, outfile = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, root)
 os.chdir(root)
 
@@ -38,4 +38,5 @@ safe("video_capability", lambda: hw.video_capability())
 safe("visible_gpu_count", lambda: hw.get_visible_gpu_count())
 safe("physical_gpu_count", lambda: hw.get_physical_gpu_count())
 
-print(json.dumps(out, sort_keys=True, default=str))
+open(outfile, "w").write(json.dumps(out, sort_keys=True, default=str))
+print(f"wrote {outfile}")
