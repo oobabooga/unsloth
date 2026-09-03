@@ -1,0 +1,82 @@
+# Disposable cross-platform gate for unslothai/unsloth#9906. Not for merge.
+
+name: "staging 9906 cross-platform"
+
+on:
+  push:
+    branches: [pr-9906-xplat-ci]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-9906-xplat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: "frontend gates (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      # The PR adds a key to all 12 catalogs. This is the gate that was red
+      # before the fix, so it must be exercised on every OS.
+      - name: Locale parity (strict)
+        run: npm run i18n:check:strict
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build and bundle budget
+        run: |
+          npm run build
+          npm run bundle:check
+
+      # The diff carries Arabic, Hindi, Japanese, Korean, Russian and Chinese
+      # text. .gitattributes normalises studio/frontend/** to LF, but a Windows
+      # or macOS checkout is where an encoding or line-ending regression would
+      # actually surface, so assert the decoded strings byte-for-byte here.
+      - name: Locale encoding integrity
+        run: node --experimental-strip-types --no-warnings --test ../../.github/scripts/pr9906_encoding.ts
+
+  routing:
+    name: "deterministic routing checks"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The diff may not touch install, backend, Tauri, update or routing trees
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin main
+          BASE=$(git merge-base HEAD origin/main)
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "$CHANGED"
+          FORBIDDEN='^(unsloth/|unsloth_zoo|setup|scripts/|studio/backend/|studio/src-tauri/|pyproject|MANIFEST)'
+          if echo "$CHANGED" | grep -qE "$FORBIDDEN"; then
+            echo "::error::diff reaches a Studio-sensitive tree"
+            exit 1
+          fi
+          echo "ok: frontend UI and i18n only"
