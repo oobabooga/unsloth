@@ -1,0 +1,120 @@
+name: AMD DevLab Windows probe
+
+on:
+  push:
+    branches: [amd-devlab-win-ci]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Basics (cmd)
+        shell: cmd
+        run: |
+          echo ==== ver ====
+          ver
+          echo ==== hostname ====
+          hostname
+          echo ==== whoami ====
+          whoami
+          echo ==== cwd ====
+          cd
+          echo ==== env RUNNER ====
+          set RUNNER
+          echo ==== env HIP/ROCM ====
+          set HIP
+          set ROCM
+
+      - name: OS and CPU
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          "Caption      : $($os.Caption)"
+          "Version      : $($os.Version)"
+          "BuildNumber  : $($os.BuildNumber)"
+          "Architecture : $($os.OSArchitecture)"
+          "TotalRAM_GB  : $([math]::Round($os.TotalVisibleMemorySize/1MB,1))"
+          "FreeRAM_GB   : $([math]::Round($os.FreePhysicalMemory/1MB,1))"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+
+      - name: GPU and NPU devices
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          "==== Win32_VideoController ===="
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterRAM, DriverVersion, DriverDate, VideoProcessor |
+            Format-List
+          "==== PnP display / compute devices ===="
+          Get-PnpDevice -PresentOnly |
+            Where-Object { $_.Class -in @('Display','ComputeAccelerator','SoftwareComponent','System') -and
+                           $_.FriendlyName -match 'AMD|Radeon|NPU|AI|Accelerator' } |
+            Select-Object Status, Class, FriendlyName, InstanceId |
+            Format-Table -AutoSize | Out-String -Width 300
+
+      - name: Disks
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, @{n='Used_GB';e={[math]::Round($_.Used/1GB,1)}},
+                                @{n='Free_GB';e={[math]::Round($_.Free/1GB,1)}}, Root |
+            Format-Table -AutoSize | Out-String -Width 200
+          "RUNNER_TEMP      = $env:RUNNER_TEMP"
+          "GITHUB_WORKSPACE = $env:GITHUB_WORKSPACE"
+          "TEMP             = $env:TEMP"
+
+      - name: Toolchain inventory
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($t in 'python','python3','py','pip','git','cmake','ninja','uv','cl','clang','gcc',
+                         'msbuild','docker','node','hipcc','hipInfo','rocm-smi','rocminfo','amdsmi',
+                         'nvidia-smi','clinfo','wsl') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            if ($c) {
+              $v = ''
+              try { $v = (& $t --version 2>&1 | Select-Object -First 1) } catch { $v = '(no --version)' }
+              "{0,-12} {1}`n             {2}" -f $t, $c.Source, $v
+            } else {
+              "{0,-12} MISSING" -f $t
+            }
+          }
+
+      - name: ROCm / HIP install locations
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($p in 'C:\Program Files\AMD','C:\Program Files\AMD\ROCm','C:\AMD') {
+            if (Test-Path $p) { "==== $p ===="; Get-ChildItem $p -Depth 1 -ErrorAction SilentlyContinue |
+              Select-Object -First 40 FullName | Format-Table -AutoSize | Out-String -Width 200 }
+            else { "$p : absent" }
+          }
+
+      - name: Python and torch smoke
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $py = Get-Command python -ErrorAction SilentlyContinue
+          if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+          if (-not $py) { "no python on PATH"; exit 0 }
+          & $py.Source -c "import sys, platform; print(sys.version); print(platform.platform())"
+          & $py.Source -c "import torch; print('torch', torch.__version__); print('cuda avail', torch.cuda.is_available()); print('hip', getattr(torch.version,'hip',None))" 2>&1 |
+            Out-String
+
+      - name: Network egress
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($u in 'https://github.com','https://pypi.org/simple/','https://huggingface.co') {
+            try {
+              $r = Invoke-WebRequest -Uri $u -Method Head -TimeoutSec 20 -UseBasicParsing
+              "OK  $u -> $($r.StatusCode)"
+            } catch { "FAIL $u -> $($_.Exception.Message)" }
+          }
