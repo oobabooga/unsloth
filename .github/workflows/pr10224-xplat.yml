@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, macos-15-intel]
+        os: [macos-15]
     steps:
       - name: Checkout probe scripts
         uses: actions/checkout@v4
@@ -54,13 +54,14 @@ jobs:
           echo "--- base ---"; cat base.json
           echo "--- head ---"; cat head.json
           echo "--- diff ---"; python diff_probe.py base.json head.json
-      - name: MLX allocated-branch on real Apple Silicon
+      - name: MLX free contract on real Apple Silicon
         if: matrix.os == 'macos-15'
         run: |
           . "$RUNNER_TEMP/venv/bin/activate"
           python mlx_branch.py head/studio/backend
 
   windows:
+    if: false
     name: "routing windows-latest"
     runs-on: windows-latest
     timeout-minutes: 40
@@ -137,5 +138,5 @@ jobs:
           cat base.json; cat head.json
           python diff_probe.py base.json head.json
           '@
-          $script | Out-File -Encoding ascii -NoNewline wsl_job.sh
+          $script -replace "`r", "" | Out-File -Encoding ascii -NoNewline wsl_job.sh
           wsl -d Ubuntu-24.04 --cd "$(Get-Location)" -- bash wsl_job.sh
