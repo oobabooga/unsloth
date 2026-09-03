@@ -1,0 +1,137 @@
+name: "PR 10224 macOS free-memory probe"
+
+on:
+  push:
+    branches: [pr10224-macos-probe]
+
+permissions: {}
+
+concurrency:
+  group: pr10224-macos-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Host
+        run: |
+          uname -a
+          sysctl -n hw.model
+          python3 -VV
+          echo "memsize: $(sysctl -n hw.memsize)"
+
+      - name: Clone PR 10224 head
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git repo
+          git -C repo fetch --depth 1 origin refs/pull/10224/head
+          git -C repo checkout -q FETCH_HEAD
+          git -C repo log --oneline -1
+
+      - name: Install probe deps
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q psutil structlog mlx
+          python -c "import mlx.core as mx; print(mx.device_info())"
+
+      - name: Live probe of the Apple free-memory path
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python - <<'PY'
+          import json, sys
+
+          sys.path.insert(0, "repo/studio/backend")
+
+          import psutil
+          import mlx.core as mx
+          from utils.hardware import hardware as hw
+          from utils.hardware.hardware import DeviceType
+
+          # Detection needs the full mlx/mlx-lm/mlx-vlm stack, which is not what this
+          # probe is about: pin the branch and read the real numbers behind it.
+          hw.get_device = lambda: DeviceType.MLX
+
+          GB = 1024**3
+          info = mx.device_info()
+          rec = int(info.get("max_recommended_working_set_size") or 0)
+          agx = hw._read_apple_gpu_stats()
+          allocated = (agx or {}).get("vram_used_bytes", 0) or 0
+
+          before = psutil.virtual_memory().available
+          mem = hw.get_gpu_memory_info()
+          util = hw.get_visible_gpu_utilization()
+          after = psutil.virtual_memory().available
+          avail_gb = max(before, after) / GB
+
+          print("device_info keys:", sorted(info.keys()))
+          print(f"recommended working set = {rec / GB:.3f} GB")
+          print(f"agx stats               = {agx}")
+          print(f"agx in-use              = {allocated / GB:.3f} GB")
+          print(f"psutil total            = {psutil.virtual_memory().total / GB:.3f} GB")
+          print(f"psutil available        = {avail_gb:.3f} GB")
+          print("get_gpu_memory_info:", json.dumps(mem, default=str, indent=2))
+          print("get_visible_gpu_utilization[0]:", json.dumps(util.get("devices", [{}])[0], default=str, indent=2))
+
+          free_gb = mem.get("free_gb")
+          headroom_gb = max(0.0, (rec - allocated) / GB)
+          slack = 0.5
+          fail = []
+
+          if rec <= 0:
+              fail.append("mx.device_info() has no positive max_recommended_working_set_size")
+          if not mem.get("available"):
+              fail.append(f"get_gpu_memory_info reported unavailable: {mem.get('error')}")
+          if not isinstance(free_gb, (int, float)):
+              fail.append(f"free_gb is not a number: {free_gb!r}")
+          else:
+              if free_gb < 0:
+                  fail.append(f"free_gb is negative: {free_gb}")
+              if free_gb <= 0:
+                  fail.append("free_gb collapsed to 0 on an idle runner")
+              if free_gb > avail_gb + slack:
+                  fail.append(f"free_gb {free_gb:.3f} exceeds host available {avail_gb:.3f}")
+              if rec > 0 and free_gb > headroom_gb + slack:
+                  fail.append(f"free_gb {free_gb:.3f} exceeds working-set headroom {headroom_gb:.3f}")
+
+          dev = (util.get("devices") or [{}])[0]
+          dev_free = dev.get("vram_free_gb")
+          if not isinstance(dev_free, (int, float)):
+              fail.append(f"utilization device has no numeric vram_free_gb: {dev_free!r}")
+          elif isinstance(free_gb, (int, float)) and abs(dev_free - round(free_gb, 2)) > 0.05:
+              fail.append(f"utilization vram_free_gb {dev_free} disagrees with summary {free_gb:.3f}")
+
+          if fail:
+              print("PROBE FAIL")
+              for f in fail:
+                  print(" -", f)
+              sys.exit(1)
+          print(f"PROBE OK: free {free_gb:.3f} GB, host available {avail_gb:.3f} GB, headroom {headroom_gb:.3f} GB")
+          PY
+
+      - name: Pre-fix comparison
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python - <<'PY'
+          import sys
+
+          sys.path.insert(0, "repo/studio/backend")
+
+          import psutil
+          import mlx.core as mx
+          from utils.hardware import hardware as hw
+
+          GB = 1024**3
+          rec = int(mx.device_info().get("max_recommended_working_set_size") or 0)
+          allocated = (hw._read_apple_gpu_stats() or {}).get("vram_used_bytes", 0) or 0
+          vm = psutil.virtual_memory()
+
+          on_main = (vm.total - allocated) / GB
+          pre_fix = min(vm.available, rec) / GB
+          after = hw._apple_unified_free_bytes(vm.available, allocated, {"max_recommended_working_set_size": rec}) / GB
+          print(f"main (total - allocated)      = {on_main:.3f} GB")
+          print(f"PR before e74ef625a           = {pre_fix:.3f} GB")
+          print(f"PR at head                    = {after:.3f} GB")
+          PY
