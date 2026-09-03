@@ -129,6 +129,84 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 from importlib.metadata import version as importlib_version
 from importlib.metadata import PackageNotFoundError
 
+
+def _nvidia_smi_gpu_name():
+    """The first GPU nvidia-smi reports, or None if it cannot answer. Returns rather than
+    raises: a raise here chains the probe's error on, and CPU-only hosts read that first."""
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output = True,
+            text = True,
+            timeout = 5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if smi.returncode != 0 or not smi.stdout.strip():
+        return None
+    return smi.stdout.strip().splitlines()[0].strip()
+
+
+def _cuda_visible_devices_hides_nvidia():
+    """CUDA_VISIBLE_DEVICES of "" or "-1" hides every device on purpose (install.sh
+    `_cvd_hides_nvidia`); nvidia-smi ignores it, so the mask reads as a broken build."""
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if mask is None:
+        return False
+    mask = "".join(mask.split())
+    return mask in ("", "-1")
+
+
+def _reraise_device_type_error_with_gpu_hint(exception):
+    """Re-raise zoo's "you need a GPU" with the real remedy when nvidia-smi sees a GPU this
+    torch cannot use: on DGX Spark GB10 and other aarch64 hosts that is a torch built for
+    the wrong CUDA (#4446, #3553). Message only; the exception type is preserved."""
+    # Match "ROCm", not "AMD": zoo's generic message names AMD as a supported vendor
+    # ("... only works on NVIDIA, AMD and Intel GPUs."), and that is the one raised on any
+    # torch without `torch.accelerator` (2.6+), the very case this hint exists for.
+    if "ROCm" in str(exception):
+        raise exception
+    if _cuda_visible_devices_hides_nvidia():
+        raise exception
+    gpu_name = _nvidia_smi_gpu_name()
+    if gpu_name is None:
+        raise exception
+    try:
+        import torch as _torch
+        torch_cuda_build = getattr(getattr(_torch, "version", None), "cuda", None) or "unknown"
+    except Exception:
+        torch_cuda_build = "unknown"
+    # Name the mask, do not resolve it: CUDA drops everything from the first invalid entry,
+    # so `1` on a single-GPU host exposes nothing, but reimplementing that parse invites bugs.
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    mask_note = ""
+    if mask is not None:
+        mask_note = (
+            f"Note: CUDA_VISIBLE_DEVICES is set to {mask!r}. If that mask selects no "
+            f"installed GPU, it alone explains this and no torch reinstall will help.\n"
+        )
+    # Diagnosis here, remedy in the install docs. Every copy-pasteable repair line tried broke
+    # somewhere: stale companion wheels and xformers, `--upgrade` past unsloth's ceiling,
+    # pre-Turing GPUs misrouted by both a fixed cuXXX and uv's driver-only
+    # `--torch-backend=auto`, `uv pip` targeting the CWD venv, sys.executable needing shell
+    # quoting, and `unsloth` carrying no torch dependency to reinstall.
+    raise NotImplementedError(
+        f"Unsloth: an NVIDIA GPU ({gpu_name}) is present -- nvidia-smi sees it -- but this "
+        f"PyTorch build cannot use it (torch.cuda.is_available() is False).\n"
+        f"This usually means the installed PyTorch does not match the system's CUDA driver "
+        f"or platform, which is common on DGX Spark GB10 and other aarch64 hosts.\n"
+        f"PyTorch was compiled with CUDA: {torch_cuda_build}.\n"
+        f"{mask_note}"
+        f"Fix: replace this PyTorch with a build that matches this machine, in the "
+        f"environment that raised the error ({sys.executable}). Follow the install "
+        f"instructions for your GPU:\n"
+        f"    https://github.com/unslothai/unsloth#-install\n"
+        f"Picking the wheels by hand is what install.sh and install.ps1 exist to compute: "
+        f"the newest CUDA family drops pre-Turing GPUs, and torchvision, torchaudio and "
+        f"xformers have to be replaced together with torch."
+    ) from exception
+
+
 # Try importing PyTorch and check version
 try:
     unsloth_zoo_version = importlib_version("unsloth_zoo")
@@ -142,6 +220,8 @@ except PackageNotFoundError:
     raise ImportError(
         f"Unsloth: Please install unsloth_zoo via `pip install unsloth_zoo` then retry!"
     )
+except NotImplementedError as device_type_error:
+    _reraise_device_type_error_with_gpu_hint(device_type_error)
 except:
     raise
 del PackageNotFoundError, importlib_version
@@ -156,15 +236,31 @@ except ModuleNotFoundError:
 except:
     raise
 
-from unsloth_zoo.device_type import (
-    is_hip,
-    get_device_type,
-    DEVICE_TYPE,
-    DEVICE_TYPE_TORCH,
-    DEVICE_COUNT,
-    ALLOW_PREQUANTIZED_MODELS,
+try:
+    from unsloth_zoo.device_type import (
+        is_hip,
+        get_device_type,
+        DEVICE_TYPE,
+        DEVICE_TYPE_TORCH,
+        DEVICE_COUNT,
+        ALLOW_PREQUANTIZED_MODELS,
+    )
+except NotImplementedError as device_type_error:
+    _reraise_device_type_error_with_gpu_hint(device_type_error)
+
+# Third raise site, and the only one left once zoo has answered: unsloth's own
+# device_type.py repeats zoo's detection without zoo's UNSLOTH_ZOO_DISABLE_GPU_INIT
+# branch, so on a host with no usable accelerator zoo returns "cpu" and this one still
+# raises. Reached from studio's hf_xet_fallback, which sets that variable process-wide.
+try:
+    from .device_type import arch_lacks_bf16, hip_visible_archs
+except NotImplementedError as device_type_error:
+    _reraise_device_type_error_with_gpu_hint(device_type_error)
+del (
+    _reraise_device_type_error_with_gpu_hint,
+    _nvidia_smi_gpu_name,
+    _cuda_visible_devices_hides_nvidia,
 )
-from .device_type import arch_lacks_bf16, hip_visible_archs
 
 from .import_fixes import (
     fix_transformers5_bare_annotation_configs,
