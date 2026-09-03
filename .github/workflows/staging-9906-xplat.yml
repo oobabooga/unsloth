@@ -61,6 +61,26 @@ jobs:
       - name: Locale encoding integrity
         run: node --experimental-strip-types --no-warnings --test ../../.github/scripts/pr9906_encoding.ts
 
+  # WebKit is Safari's engine and the one behind the Tauri WKWebView on macOS. It
+  # could not be launched on the Linux box used for the Chromium and Firefox runs,
+  # so the engine behaviours the fix depends on are checked here instead.
+  webkit:
+    name: "WebKit capability (macOS)"
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright WebKit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install webkit
+      - name: Run the capability check
+        run: python .github/scripts/pr9906_webkit_capability.py
+
   routing:
     name: "deterministic routing checks"
     runs-on: ubuntu-latest
