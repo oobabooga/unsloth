@@ -7,7 +7,7 @@ Apple unified-memory numbers.
 """
 import json, os, platform, sys
 
-root, label, outfile = sys.argv[1], sys.argv[2], sys.argv[3]
+root, label, outfile = os.path.abspath(sys.argv[1]), sys.argv[2], os.path.abspath(sys.argv[3])
 sys.path.insert(0, root)
 os.chdir(root)
 
