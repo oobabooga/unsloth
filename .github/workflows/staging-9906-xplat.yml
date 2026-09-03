@@ -66,12 +66,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # Full history: actions/checkout defaults to depth 1, and merge-base against
+      # a shallow origin/main exits 1 with no common ancestor.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: The diff may not touch install, backend, Tauri, update or routing trees
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=200 origin main
-          BASE=$(git merge-base HEAD origin/main)
+          git fetch --no-tags origin main
+          BASE=$(git merge-base HEAD FETCH_HEAD)
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           echo "$CHANGED"
           FORBIDDEN='^(unsloth/|unsloth_zoo|setup|scripts/|studio/backend/|studio/src-tauri/|pyproject|MANIFEST)'
