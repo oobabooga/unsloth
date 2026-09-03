@@ -1,0 +1,45 @@
+name: "PR 10224 Mac allocation truth test"
+
+on:
+  push:
+    branches: [pr10224-mac-truth]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr10224-mac-truth
+  cancel-in-progress: true
+
+jobs:
+  mac:
+    name: "allocation truth ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host
+        run: |
+          uname -a
+          sysctl -n hw.model hw.memsize
+          system_profiler SPDisplaysDataType 2>/dev/null | head -20 || true
+      - name: Clone PR head
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git head
+          git -C head fetch -q --depth 1 origin refs/pull/10224/head
+          git -C head checkout -q FETCH_HEAD
+          git -C head log --oneline -1
+      - name: Deps
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q psutil structlog mlx torch
+      - name: Allocation truth test
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python mac_truth.py head/studio/backend
