@@ -1,0 +1,134 @@
+name: "PR 10224 cross-platform"
+
+on:
+  push:
+    branches: [pr10224-xplat]
+
+permissions: {}
+
+concurrency:
+  group: pr10224-xplat
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: 2ed0da03e34e5cb0bb2b86d4ea06018180ed37b5
+  HEAD_REF: refs/pull/10224/head
+
+jobs:
+  posix:
+    name: "routing ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, macos-15-intel]
+    steps:
+      - name: Host
+        run: uname -a; python3 -VV
+      - name: Fetch both trees
+        run: |
+          for t in base head; do
+            git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git $t
+          done
+          git -C base fetch -q --depth 1 origin "$BASE_SHA"
+          git -C base checkout -q "$BASE_SHA"
+          git -C head fetch -q --depth 1 origin "$HEAD_REF"
+          git -C head checkout -q FETCH_HEAD
+          echo "base $(git -C base rev-parse --short HEAD)  head $(git -C head rev-parse --short HEAD)"
+      - name: Deps
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q psutil structlog
+          if [ "${{ matrix.os }}" = "macos-15" ]; then python -m pip install -q mlx; fi
+      - name: Routing probe, base vs head
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python probe.py base/studio/backend base  > base.json
+          python probe.py head/studio/backend head  > head.json
+          echo "--- base ---"; cat base.json
+          echo "--- head ---"; cat head.json
+          echo "--- diff ---"; python diff_probe.py base.json head.json
+      - name: MLX allocated-branch on real Apple Silicon
+        if: matrix.os == 'macos-15'
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python mlx_branch.py head/studio/backend
+
+  windows:
+    name: "routing windows-latest"
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Host
+        shell: pwsh
+        run: systeminfo | Select-String "^OS Name","^OS Version"; python -VV
+      - name: Fetch both trees
+        shell: pwsh
+        run: |
+          foreach ($t in @("base","head")) {
+            git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git $t
+          }
+          git -C base fetch -q --depth 1 origin $env:BASE_SHA
+          git -C base checkout -q $env:BASE_SHA
+          git -C head fetch -q --depth 1 origin $env:HEAD_REF
+          git -C head checkout -q FETCH_HEAD
+          Write-Host "base $(git -C base rev-parse --short HEAD)  head $(git -C head rev-parse --short HEAD)"
+      - name: Deps
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\venv"
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" -m pip install -q --upgrade pip
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" -m pip install -q psutil structlog
+      - name: Routing probe, base vs head
+        shell: pwsh
+        run: |
+          $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
+          & $py probe.py base/studio/backend base | Out-File -Encoding utf8 base.json
+          & $py probe.py head/studio/backend head | Out-File -Encoding utf8 head.json
+          Get-Content base.json
+          Get-Content head.json
+          & $py diff_probe.py base.json head.json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  wsl:
+    name: "routing WSL (Ubuntu on windows-latest)"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Enable WSL
+        shell: pwsh
+        run: |
+          wsl --version
+          wsl --install --no-launch -d Ubuntu-24.04
+          wsl --set-default-version 2
+          wsl -l -v
+      - name: Probe inside WSL
+        shell: pwsh
+        run: |
+          $script = @'
+          set -e
+          uname -a
+          cat /proc/version
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv git
+          for t in base head; do
+            git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git $t
+          done
+          git -C base fetch -q --depth 1 origin 2ed0da03e34e5cb0bb2b86d4ea06018180ed37b5
+          git -C base checkout -q 2ed0da03e34e5cb0bb2b86d4ea06018180ed37b5
+          git -C head fetch -q --depth 1 origin refs/pull/10224/head
+          git -C head checkout -q FETCH_HEAD
+          python3 -m venv /tmp/venv
+          . /tmp/venv/bin/activate
+          pip install -q --upgrade pip
+          pip install -q psutil structlog
+          python probe.py base/studio/backend base > base.json
+          python probe.py head/studio/backend head > head.json
+          cat base.json; cat head.json
+          python diff_probe.py base.json head.json
+          '@
+          $script | Out-File -Encoding ascii -NoNewline wsl_job.sh
+          wsl -d Ubuntu-24.04 --cd "$(Get-Location)" -- bash wsl_job.sh
