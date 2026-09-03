@@ -38,5 +38,22 @@ safe("video_capability", lambda: hw.video_capability())
 safe("visible_gpu_count", lambda: hw.get_visible_gpu_count())
 safe("physical_gpu_count", lambda: hw.get_physical_gpu_count())
 
+def scrub(o):
+    """Strip anything that names WHICH tree this is: an exception carrying a path,
+    a cwd, or the label itself would otherwise read as a base-vs-head difference."""
+    if isinstance(o, dict):
+        return {k: scrub(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [scrub(v) for v in o]
+    if isinstance(o, str):
+        for needle in (os.path.abspath(root), root, os.getcwd(), f"/{label}/", f"\\{label}\\"):
+            if needle:
+                o = o.replace(needle, "<TREE>")
+        return o
+    return o
+
+
+out = scrub(out)
+out["label"] = label
 open(outfile, "w").write(json.dumps(out, sort_keys=True, default=str))
 print(f"wrote {outfile}")
