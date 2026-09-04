@@ -30,7 +30,7 @@ jobs:
           exit /b 0
 
       - name: OS and CPU
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
@@ -45,7 +45,7 @@ jobs:
             Format-List
 
       - name: GPU and NPU devices
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           "==== Win32_VideoController ===="
@@ -60,7 +60,7 @@ jobs:
             Format-Table -AutoSize | Out-String -Width 300
 
       - name: Disks
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           Get-PSDrive -PSProvider FileSystem |
@@ -72,7 +72,7 @@ jobs:
           "TEMP             = $env:TEMP"
 
       - name: Toolchain inventory
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           foreach ($t in 'python','python3','py','pip','git','cmake','ninja','uv','cl','clang','gcc',
@@ -89,17 +89,17 @@ jobs:
           }
 
       - name: ROCm / HIP install locations
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           foreach ($p in 'C:\Program Files\AMD','C:\Program Files\AMD\ROCm','C:\AMD') {
-            if (Test-Path $p) { "==== $p ===="; Get-ChildItem $p -Depth 1 -ErrorAction SilentlyContinue |
+            if (Test-Path $p) { "==== $p ===="; Get-ChildItem $p -Recurse -Depth 1 -ErrorAction SilentlyContinue |
               Select-Object -First 40 FullName | Format-Table -AutoSize | Out-String -Width 200 }
             else { "$p : absent" }
           }
 
       - name: Python and torch smoke
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           $py = Get-Command python -ErrorAction SilentlyContinue
@@ -110,7 +110,7 @@ jobs:
             Out-String
 
       - name: Network egress
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           foreach ($u in 'https://github.com','https://pypi.org/simple/','https://huggingface.co') {
