@@ -5,16 +5,19 @@ name: "AMD CI: does the Windows selector match a runner"
 # probe. Linted with amd_ci/lib/lint_workflow.py.
 #
 # A label matching no runner does not fail the job, it queues it forever, and a
-# stalled queue looks exactly like a busy pool. So this workflow carries TWO
-# jobs that differ ONLY in the OS label:
+# stalled queue looks exactly like a busy pool. So this workflow carries jobs
+# that differ ONLY in the OS label:
 #
 #   linux-control  [self-hosted, Linux,   strix-halo, devlab-dispatch]
 #   windows        [self-hosted, Windows, strix-halo, devlab-dispatch]
 #
-# linux-control picking up a runner while windows stays queued is the evidence
-# that the Windows label matches nothing, rather than the pool being busy.
+# Round 1 result: the Windows label DID match, on machine X2-LA01-S04-D02, and
+# the pwsh step died with "pwsh: command not found" in three seconds. That is a
+# Linux shaped error, so windows-bash re-asks the same selector with bash and
+# prints RUNNER_OS and uname, to establish whether the label is attached to a
+# Linux runner rather than to a Windows host.
 #
-# Neither job touches the GPU, so neither takes the amd-ci-gfx1151-gpu group.
+# No job touches the GPU, so none takes the amd-ci-gfx1151-gpu group.
 
 on:
   push:
@@ -42,30 +45,38 @@ jobs:
           uname -a
           date -Is
 
-  windows:
-    name: "subject: Windows label"
+  windows-bash:
+    name: "subject: Windows label, bash shell"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 30
     env:
       HIP_VISIBLE_DEVICES: ""
       ROCR_VISIBLE_DEVICES: ""
     steps:
-      - name: Identify
-        shell: pwsh
+      - name: Identify with bash
+        shell: bash
         run: |
-          echo "runner_name=$env:RUNNER_NAME runner_os=$env:RUNNER_OS arch=$env:RUNNER_ARCH"
-          Get-Date
-          [System.Environment]::OSVersion.VersionString
+          set +e
+          set -uo pipefail
+          echo "runner_name=${RUNNER_NAME:-?} runner_os=${RUNNER_OS:-?} arch=${RUNNER_ARCH:-?}"
+          echo "OS=${OS:-unset} COMSPEC=${COMSPEC:-unset}"
+          uname -a
+          cat /proc/version
+          command -v pwsh powershell cmd.exe docker
+          ls -l /dev/kfd /dev/dri
+          date -Is
 
-      - name: Host recon
-        shell: pwsh
+  windows-default-shell:
+    name: "subject: Windows label, default shell"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 30
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Identify with the runner default shell
         continue-on-error: true
         run: |
-          Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoProcessor
-          Get-Command docker -ErrorAction SilentlyContinue | Format-List Source, Version
-          docker version
-          docker info
-          Get-Command hipInfo -ErrorAction SilentlyContinue | Format-List Source
-          Get-Command rocm-smi -ErrorAction SilentlyContinue | Format-List Source
-          Get-Command amd-smi -ErrorAction SilentlyContinue | Format-List Source
-          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+          echo "default shell reached"
+          echo "runner_os=${RUNNER_OS:-?}"
+          uname -a
