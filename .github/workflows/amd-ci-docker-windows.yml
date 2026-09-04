@@ -1,0 +1,71 @@
+name: "AMD CI: does the Windows selector match a runner"
+
+# Hand written, NOT scaffolded, for the same reason as the Linux branch:
+# scaffold.py emits a PR base-vs-head differential and this is a capability
+# probe. Linted with amd_ci/lib/lint_workflow.py.
+#
+# A label matching no runner does not fail the job, it queues it forever, and a
+# stalled queue looks exactly like a busy pool. So this workflow carries TWO
+# jobs that differ ONLY in the OS label:
+#
+#   linux-control  [self-hosted, Linux,   strix-halo, devlab-dispatch]
+#   windows        [self-hosted, Windows, strix-halo, devlab-dispatch]
+#
+# linux-control picking up a runner while windows stays queued is the evidence
+# that the Windows label matches nothing, rather than the pool being busy.
+#
+# Neither job touches the GPU, so neither takes the amd-ci-gfx1151-gpu group.
+
+on:
+  push:
+    branches: [amd-ci-docker-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  linux-control:
+    name: "control: Linux label"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 20
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Identify
+        run: |
+          set +e
+          set -uo pipefail
+          echo "runner_name=${RUNNER_NAME:-?} runner_os=${RUNNER_OS:-?} arch=${RUNNER_ARCH:-?}"
+          uname -a
+          date -Is
+
+  windows:
+    name: "subject: Windows label"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 30
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Identify
+        shell: pwsh
+        run: |
+          echo "runner_name=$env:RUNNER_NAME runner_os=$env:RUNNER_OS arch=$env:RUNNER_ARCH"
+          Get-Date
+          [System.Environment]::OSVersion.VersionString
+
+      - name: Host recon
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoProcessor
+          Get-Command docker -ErrorAction SilentlyContinue | Format-List Source, Version
+          docker version
+          docker info
+          Get-Command hipInfo -ErrorAction SilentlyContinue | Format-List Source
+          Get-Command rocm-smi -ErrorAction SilentlyContinue | Format-List Source
+          Get-Command amd-smi -ErrorAction SilentlyContinue | Format-List Source
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
