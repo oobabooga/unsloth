@@ -8,7 +8,7 @@ permissions: {}
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 15
     steps:
       - name: Control
