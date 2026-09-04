@@ -27,6 +27,7 @@ jobs:
           echo ==== env HIP/ROCM ====
           set HIP
           set ROCM
+          exit /b 0
 
       - name: OS and CPU
         shell: pwsh
