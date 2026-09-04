@@ -1,0 +1,360 @@
+name: "AMD CI: Unsloth Docker image on gfx1151"
+
+# Hand written, NOT scaffolded. scaffold.py only emits a base-vs-head
+# differential for a PR, and this is a capability probe of a published
+# artifact: there is no base state that exhibits a defect, so forcing it into
+# differential mode would mean fabricating one. Linted with
+# amd_ci/lib/lint_workflow.py instead.
+#
+# Question: does the published Unsloth Docker image (docker.io/unsloth/unsloth,
+# a CUDA 12.8 image) run on the Strix Halo gfx1151 ROCm runner, and if not,
+# exactly where does it stop?
+#
+# Two jobs, because the pool is four slots on ONE machine sharing ONE GPU:
+#   pull   masks the GPU and does the 14 GB image pull, so the GPU group is
+#          not held for the download
+#   probe  is the only job allowed near /dev/kfd, and is serialised against
+#          every other GPU measurement
+
+on:
+  push:
+    branches: [amd-ci-docker-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: "docker.io/unsloth/unsloth:latest"
+
+jobs:
+
+  pull:
+    name: "Host recon and image pull (GPU masked)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "docker-linux-pull"
+
+      - name: Host recon
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          mkdir -p "$OUT"
+          {
+            echo "== uname"; uname -a
+            echo "== id"; id
+            echo "== os-release"; cat /etc/os-release
+            echo "== dev kfd/dri"; ls -l /dev/kfd /dev/dri
+            echo "== kfd topology"
+            grep -h -E "gfx_target_version|^ *simd_count" /sys/class/kfd/kfd/topology/nodes/*/properties
+            echo "== docker binary"; command -v docker; command -v podman
+            echo "== docker version"; docker version
+            echo "== docker info"; docker info
+            echo "== docker runtimes"; docker info --format '{{json .Runtimes}}'
+            echo "== nvidia container tooling"
+            command -v nvidia-container-runtime; command -v nvidia-container-cli; command -v nvidia-smi
+            echo "== rocm tooling"; command -v rocm-smi; command -v amd-smi; command -v rocminfo
+            echo "== rocminfo agents"; rocminfo 2>&1 | grep -E "Name:|gfx" | head -30
+            echo "== opt rocm"; ls -d /opt/rocm*
+            echo "== disk"; df -h "$RUNNER_TEMP" /var/lib/docker /
+            echo "== mem"; free -g
+          } > "$OUT/host-recon.txt" 2>&1
+          cat "$OUT/host-recon.txt"
+
+      - name: Docker availability gate
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          docker version > "$OUT/docker-version.txt" 2>&1
+          rc=$?
+          echo "docker version exit=$rc"
+          cat "$OUT/docker-version.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "GATE FAILED: no usable docker on this runner."
+            echo "This is a failure, not a skip: the subject of the run is a Docker image."
+            exit 1
+          fi
+          docker run --rm hello-world > "$OUT/docker-hello.txt" 2>&1
+          rc=$?
+          echo "hello-world exit=$rc"
+          cat "$OUT/docker-hello.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "GATE FAILED: docker present but cannot run a container."
+            exit 1
+          fi
+
+      - name: Pull the Unsloth image
+        timeout-minutes: 120
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          echo "start $(date -Is)"
+          docker pull "$IMAGE" > "$OUT/pull.txt" 2>&1
+          rc=$?
+          echo "end   $(date -Is)"
+          echo "pull exit=$rc"
+          tail -40 "$OUT/pull.txt"
+          docker image inspect "$IMAGE" \
+            --format '{{.Id}} {{.Architecture}}/{{.Os}} size={{.Size}} entrypoint={{json .Config.Entrypoint}} user={{.Config.User}}' \
+            > "$OUT/image-inspect.txt" 2>&1
+          cat "$OUT/image-inspect.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "the image could not be pulled; the probe job has nothing to run"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-linux-pull
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  probe:
+    name: "Run the image against gfx1151 (exclusive)"
+    needs: pull
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "docker-linux-probe"
+
+      - name: Hardware gate
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          mkdir -p "$OUT"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch \
+            --out "$OUT/host.json" > "$OUT/gate.txt" 2>&1
+          cat "$OUT/gate.txt"
+          # gate.py reads the GPU through torch, which the runner's system python
+          # does not have, so its --expect-arch check cannot fire here. Gate on the
+          # host instead: a KFD node reporting gfx1151 (gfx_target_version 110511).
+          # This FAILS, it does not skip.
+          FOUND=no
+          rocminfo 2>&1 | grep -q gfx1151 && FOUND=yes
+          grep -R -q "gfx_target_version 110511" /sys/class/kfd/kfd/topology/nodes/ && FOUND=yes
+          echo "gfx1151 present: $FOUND"
+          ls -l /dev/kfd /dev/dri
+          if [ "$FOUND" != "yes" ]; then
+            echo "GATE FAILED: this is not the gfx1151 host the run asked for."
+            exit 1
+          fi
+
+      - name: Write in-container probes
+        run: |
+          set +e
+          set -uo pipefail
+          S="$AMD_CI_WORK/scripts"
+          mkdir -p "$S"
+          cat > "$S/probe_torch.py" <<'PY'
+          import json, os, sys
+
+          r = {"python": sys.version.split()[0]}
+
+          d = {}
+          d["/dev/kfd"] = os.path.exists("/dev/kfd")
+          d["/dev/dri"] = sorted(os.listdir("/dev/dri")) if os.path.isdir("/dev/dri") else None
+          d["nvidia_nodes"] = sorted(x for x in os.listdir("/dev") if x.startswith("nvidia"))
+          d["/opt/rocm"] = os.path.isdir("/opt/rocm")
+          r["devices"] = d
+
+          try:
+              import torch
+          except Exception as e:
+              r["import_torch_error"] = "%s: %s" % (type(e).__name__, e)
+              print(json.dumps(r, indent = 2))
+              sys.exit(0)
+
+          r["torch"] = torch.__version__
+          r["torch_built_for_cuda"] = torch.version.cuda
+          r["torch_built_for_hip"] = torch.version.hip
+
+          cases = [
+              ("cuda_is_available", lambda: torch.cuda.is_available()),
+              ("cuda_device_count", lambda: torch.cuda.device_count()),
+              ("cpu_matmul", lambda: float((torch.randn(64, 64) @ torch.randn(64, 64)).sum())),
+              ("cuda_alloc", lambda: str(torch.zeros(4, device = "cuda"))),
+          ]
+          for name, fn in cases:
+              try:
+                  r[name] = fn()
+              except BaseException as e:
+                  r[name + "_error"] = "%s: %s" % (type(e).__name__, e)
+
+          print(json.dumps(r, indent = 2))
+          PY
+          cat > "$S/probe_unsloth.py" <<'PY'
+          import json, traceback
+
+          r = {}
+          try:
+              import unsloth
+              r["unsloth"] = getattr(unsloth, "__version__", "imported")
+          except BaseException as e:
+              r["import_unsloth_error"] = "%s: %s" % (type(e).__name__, e)
+              r["traceback_tail"] = traceback.format_exc()[-4000:]
+          print(json.dumps(r, indent = 2))
+          PY
+          ls -l "$S"
+
+      - name: Docker ladder
+        timeout-minutes: 75
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          S="$AMD_CI_WORK/scripts"
+          mkdir -p "$OUT/cases"
+          SUM="$OUT/LADDER.md"
+          : > "$SUM"
+
+          # numeric GIDs, because --group-add with a name is resolved INSIDE the
+          # container and those groups need not exist there
+          VG=$(getent group video | cut -d: -f3)
+          RG=$(getent group render | cut -d: -f3)
+          echo "host video gid=$VG render gid=$RG" | tee -a "$SUM"
+          GA=""
+          [ -n "$VG" ] && GA="$GA --group-add $VG"
+          [ -n "$RG" ] && GA="$GA --group-add $RG"
+
+          run_case() {
+            n="$1"; shift
+            f="$OUT/cases/$n.txt"
+            printf '$ %s\n\n' "$*" > "$f"
+            timeout 900 "$@" >> "$f" 2>&1
+            rc=$?
+            printf '\nEXIT=%s\n' "$rc" >> "$f"
+            echo "- \`$n\` exit=$rc" >> "$SUM"
+            echo "===== $n exit=$rc"
+            cat "$f"
+          }
+
+          run_py() {
+            n="$1"; py="$2"; shift 2
+            f="$OUT/cases/$n.txt"
+            printf '$ %s  < %s\n\n' "$*" "$py" > "$f"
+            timeout 900 "$@" < "$py" >> "$f" 2>&1
+            rc=$?
+            printf '\nEXIT=%s\n' "$rc" >> "$f"
+            echo "- \`$n\` exit=$rc" >> "$SUM"
+            echo "===== $n exit=$rc"
+            cat "$f"
+          }
+
+          docker image inspect "$IMAGE" > "$OUT/inspect.txt" 2>&1
+          if [ $? -ne 0 ]; then
+            echo "image absent in this job, pulling again"
+            docker pull "$IMAGE" >> "$OUT/inspect.txt" 2>&1
+          fi
+
+          # 1. does the image start at all, entrypoint bypassed, no devices
+          run_case 01-container-starts \
+            docker run --rm --entrypoint /bin/bash "$IMAGE" \
+              -c 'echo CONTAINER_OK; id; uname -m; head -2 /etc/os-release; ls /usr/local/cuda/lib64 | head -5'
+
+          # 2. torch, CPU only, no devices mapped
+          run_py 02-torch-cpu-only "$S/probe_torch.py" \
+            docker run --rm -i --entrypoint /opt/venv/bin/python "$IMAGE" -
+
+          # 3. torch with the AMD devices handed to the container
+          run_py 03-torch-with-kfd-dri "$S/probe_torch.py" \
+            docker run --rm -i --entrypoint /opt/venv/bin/python \
+              --device /dev/kfd --device /dev/dri $GA \
+              --security-opt seccomp=unconfined \
+              "$IMAGE" -
+
+          # 4. what the README tells users to run: --gpus all
+          run_case 04-gpus-all \
+            docker run --rm --gpus all --entrypoint /bin/bash "$IMAGE" -c 'echo STARTED'
+
+          # 5. is there any ROCm inside the image
+          run_case 05-rocm-inside-image \
+            docker run --rm --entrypoint /bin/bash "$IMAGE" -c \
+              'ls -d /opt/rocm* ; echo "--- hip/rocm libs:"; find / -xdev \( -name "libamdhip64*" -o -name "librocblas*" -o -name "libhsa-runtime*" \) -print 2>/dev/null | head; echo "--- torch libs:"; ls /opt/venv/lib/python3.12/site-packages/torch/lib | head -40; echo "--- packages:"; /opt/venv/bin/pip list 2>&1 | grep -iE "^torch|rocm|triton|vllm|unsloth|xformers|bitsandbytes|flash"'
+
+          # 6. import unsloth, CPU only
+          run_py 06-import-unsloth-cpu "$S/probe_unsloth.py" \
+            docker run --rm -i --entrypoint /opt/venv/bin/python "$IMAGE" -
+
+          # 7. import unsloth with the AMD devices mapped
+          run_py 07-import-unsloth-kfd "$S/probe_unsloth.py" \
+            docker run --rm -i --entrypoint /opt/venv/bin/python \
+              --device /dev/kfd --device /dev/dri $GA \
+              "$IMAGE" -
+
+          cat "$SUM" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Default entrypoint, the documented invocation
+        timeout-minutes: 20
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$AMD_CI_WORK/out"
+          mkdir -p "$OUT/cases"
+          VG=$(getent group video | cut -d: -f3)
+          RG=$(getent group render | cut -d: -f3)
+          GA=""
+          [ -n "$VG" ] && GA="$GA --group-add $VG"
+          [ -n "$RG" ] && GA="$GA --group-add $RG"
+          CID=$(docker run -d -e JUPYTER_PASSWORD="amdci-not-a-secret" \
+                  --device /dev/kfd --device /dev/dri $GA \
+                  "$IMAGE")
+          rc=$?
+          echo "docker run -d exit=$rc cid=$CID"
+          if [ "$rc" -ne 0 ] || [ -z "$CID" ]; then
+            echo "container would not start, exit=$rc" > "$OUT/cases/08-entrypoint.txt"
+            exit 0
+          fi
+          sleep 150
+          {
+            echo "== status"; docker ps -a --filter "id=$CID" --format '{{.Status}}'
+            echo "== state"; docker inspect "$CID" --format '{{json .State}}'
+            echo "== logs"; docker logs "$CID" 2>&1 | tail -250
+          } > "$OUT/cases/08-entrypoint.txt" 2>&1
+          cat "$OUT/cases/08-entrypoint.txt"
+          # stopped by recorded id, never by a pattern match
+          docker rm -f "$CID"
+
+      - name: Clean up
+        if: always()
+        run: |
+          set +e
+          set -uo pipefail
+          docker ps -a --filter "ancestor=$IMAGE" --format '{{.ID}}' > /tmp/amdci_cids.txt
+          while read -r c; do
+            [ -n "$c" ] && docker rm -f "$c"
+          done < /tmp/amdci_cids.txt
+          docker rmi -f "$IMAGE"
+          echo "rmi exit=$?"
+          docker image prune -f
+          df -h /var/lib/docker /
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-linux-probe
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
