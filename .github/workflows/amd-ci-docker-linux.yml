@@ -1,24 +1,17 @@
-name: "AMD CI: Unsloth Docker image on gfx1151, round 2"
+name: "AMD CI: remove the Unsloth image pulled by the earlier rounds"
 
-# Hand written, NOT scaffolded. scaffold.py only emits a base-vs-head
-# differential for a PR, and this is a capability probe of a published
-# artifact: there is no base state that exhibits a defect, so forcing it into
-# differential mode would mean fabricating one. Linted with
-# amd_ci/lib/lint_workflow.py instead.
+# Hand written, NOT scaffolded: this is housekeeping, not a differential.
+# Linted with amd_ci/lib/lint_workflow.py.
 #
-# Round 1 (same branch, previous commit) established:
-#   - docker.io/unsloth/unsloth:latest pulls and starts on the gfx1151 host
-#   - torch is 2.10.0+cu128, torch.version.hip is None, cuda_is_available False
-#   - a cuda allocation dies "Found no NVIDIA driver on your system"
-#   - the documented `--gpus all` dies at the daemon, exit 125
-#   - `import unsloth` raises, differently with and without /dev/kfd mapped
-#   - the DEFAULT entrypoint nonetheless came up and supervisord started
-#     jupyter, sshd and studio
+# Rounds 1 and 2 pulled docker.io/unsloth/unsloth:latest (14 GB) onto the AMD
+# pool. Round 1's probe job removed it from the machine it ran on, and round 2
+# removed it from its own, but round 1's PULL job ran on a different machine
+# (X2-LA01-S01-D06) and had no removal step, so a 14 GB image is still sitting
+# there. Slots are handed out by the orchestrator and cannot be addressed by
+# name, so this sprays a cheap removal across many slots and prints the
+# hostname each one landed on, which is also the coverage record.
 #
-# Round 2 asks only the question round 1 left open: is that surviving container
-# a usable CPU-only mode, or a process tree that is up but serving nothing. So
-# it runs the README's own invocation, publishes the ports on high host ports
-# to avoid colliding with a co-tenant, and asks the services for an HTTP status.
+# No GPU is touched, so no job takes the amd-ci-gfx1151-gpu group.
 
 on:
   push:
@@ -29,181 +22,35 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "docker.io/unsloth/unsloth:latest"
+  IMAGE: "unsloth/unsloth:latest"
 
 jobs:
 
-  entrypoint:
-    name: "Documented invocation on gfx1151 (exclusive)"
+  reclaim:
+    name: "reclaim"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 120
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+               13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
     steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "docker-linux-r2"
-
-      - name: Hardware gate
+      - name: Remove the image if this machine has it
         run: |
           set +e
           set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          mkdir -p "$OUT"
-          # gate.py reads the GPU through torch, which the runner's system python
-          # does not have, so its --expect-arch check cannot fire. Gate on the host
-          # instead. gfx1151 encodes as gfx_target_version 110501 (round 1 read
-          # 110501 out of the KFD topology on this machine). FAILS, does not skip.
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch \
-            --out "$OUT/host.json" > "$OUT/gate.txt" 2>&1
-          FOUND=no
-          rocminfo 2>&1 | grep -q gfx1151 && FOUND=yes
-          grep -R -q -E "gfx_target_version (110501|110511)" /sys/class/kfd/kfd/topology/nodes/ && FOUND=yes
-          echo "gfx1151 present: $FOUND"
-          rocminfo 2>&1 | grep -E "^ *Name:|gfx" | head -20
-          ls -l /dev/kfd /dev/dri
-          if [ "$FOUND" != "yes" ]; then
-            echo "GATE FAILED: this is not the gfx1151 host the run asked for."
-            exit 1
-          fi
-
-      - name: Pull the image
-        timeout-minutes: 90
-        run: |
-          set +e
-          set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          echo "start $(date -Is)"
-          docker pull "$IMAGE" > "$OUT/pull.txt" 2>&1
+          echo "slot=${{ matrix.slot }} host=$(hostname) runner=${RUNNER_NAME:-?}"
+          docker image inspect "$IMAGE" --format 'present size={{.Size}}'
           rc=$?
-          echo "end   $(date -Is) exit=$rc"
-          tail -5 "$OUT/pull.txt"
-          if [ "$rc" -ne 0 ]; then
-            echo "the image could not be pulled"
-            exit 1
+          if [ "$rc" -eq 0 ]; then
+            docker rmi -f "$IMAGE"
+            echo "removed, rmi exit=$?"
+          else
+            echo "not present on this machine"
           fi
-
-      - name: The README invocation, verbatim
-        run: |
-          set +e
-          set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          mkdir -p "$OUT"
-          # README: docker run -d -e JUPYTER_PASSWORD=... -p 8888 -p 8000 -p 2222:22
-          #         -v work --gpus all unsloth/unsloth
-          docker run -d -e JUPYTER_PASSWORD="amdci-not-a-secret" \
-            -p 18888:8888 -p 18000:8000 -p 12222:22 \
-            -v "$AMD_CI_WORK/work":/workspace/work \
-            --gpus all \
-            "$IMAGE" > "$OUT/readme-invocation.txt" 2>&1
-          rc=$?
-          echo "EXIT=$rc" >> "$OUT/readme-invocation.txt"
-          cat "$OUT/readme-invocation.txt"
-          CID=$(head -1 "$OUT/readme-invocation.txt")
-          if [ "$rc" -eq 0 ] && [ -n "$CID" ]; then
-            echo "unexpected: it started. removing $CID"
-            docker rm -f "$CID"
-          fi
-
-      - name: Same invocation without --gpus all
-        timeout-minutes: 45
-        run: |
-          set +e
-          set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          VG=$(getent group video | cut -d: -f3)
-          RG=$(getent group render | cut -d: -f3)
-          GA=""
-          [ -n "$VG" ] && GA="$GA --group-add $VG"
-          [ -n "$RG" ] && GA="$GA --group-add $RG"
-          CID=$(docker run -d -e JUPYTER_PASSWORD="amdci-not-a-secret" \
-            -p 18888:8888 -p 18000:8000 -p 12222:22 \
-            -v "$AMD_CI_WORK/work":/workspace/work \
-            --device /dev/kfd --device /dev/dri $GA \
-            "$IMAGE")
-          rc=$?
-          echo "docker run -d exit=$rc cid=$CID"
-          echo "$CID" > "$AMD_CI_WORK/cid.txt"
-          if [ "$rc" -ne 0 ] || [ -z "$CID" ]; then
-            echo "GATE FAILED: the container did not start without --gpus all either"
-            exit 1
-          fi
-          # poll for the services rather than sleeping on them
-          J=000
-          S=000
-          i=0
-          while [ "$i" -lt 60 ]; do
-            i=$((i + 1))
-            J=$(curl -s -o "$AMD_CI_WORK/jupyter.body" -w '%{http_code}' -m 5 http://127.0.0.1:18888/)
-            S=$(curl -s -o "$AMD_CI_WORK/studio.body" -w '%{http_code}' -m 5 http://127.0.0.1:18000/)
-            echo "poll $i jupyter=$J studio=$S $(date -Is)"
-            if [ "$J" != "000" ] && [ "$S" != "000" ]; then break; fi
-            RUNNING=$(docker inspect "$CID" --format '{{.State.Running}}')
-            if [ "$RUNNING" != "true" ]; then echo "container exited early"; break; fi
-            sleep 15
-          done
-          {
-            echo "== http status: jupyter=$J studio=$S"
-            echo "== jupyter body head"; head -c 600 "$AMD_CI_WORK/jupyter.body"
-            echo; echo "== studio body head"; head -c 600 "$AMD_CI_WORK/studio.body"
-            echo; echo "== state"; docker inspect "$CID" --format '{{json .State}}'
-          } > "$OUT/services.txt" 2>&1
-          cat "$OUT/services.txt"
-
-      - name: Inside the running container
-        timeout-minutes: 20
-        run: |
-          set +e
-          set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          CID=$(cat "$AMD_CI_WORK/cid.txt")
-          {
-            echo "== supervisorctl"; docker exec "$CID" supervisorctl status
-            echo "== processes"; docker exec "$CID" ps -eo pid,comm --no-headers
-            echo "== torch inside the live container"
-            docker exec "$CID" /opt/venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.version.hip, torch.cuda.is_available())'
-            echo "== unsloth cli"; docker exec "$CID" bash -lc 'unsloth --version; unsloth studio --help | head -5'
-            echo "== studio api"; docker exec "$CID" bash -lc 'curl -s -m 5 -o /tmp/api.json -w "%{http_code}\n" http://127.0.0.1:8000/api/health; head -c 400 /tmp/api.json'
-          } > "$OUT/inside.txt" 2>&1
-          cat "$OUT/inside.txt"
-
-      - name: Full container log
-        if: always()
-        run: |
-          set +e
-          set -uo pipefail
-          OUT="$AMD_CI_WORK/out"
-          CID=$(cat "$AMD_CI_WORK/cid.txt")
-          docker logs "$CID" > "$OUT/container-full.log" 2>&1
-          echo "== head"
-          head -120 "$OUT/container-full.log"
-          echo "== gpu detection lines"
-          grep -n -iE "gpu|cuda|nvidia|blackwell|rocm|hip|accelerator" "$OUT/container-full.log" | head -60
-
-      - name: Clean up
-        if: always()
-        run: |
-          set +e
-          set -uo pipefail
-          CID=$(cat "$AMD_CI_WORK/cid.txt")
-          docker rm -f "$CID"
-          docker ps -a --filter "ancestor=$IMAGE" --format '{{.ID}}' > "$AMD_CI_WORK/cids.txt"
-          while read -r c; do
-            [ -n "$c" ] && docker rm -f "$c"
-          done < "$AMD_CI_WORK/cids.txt"
-          docker rmi -f "$IMAGE"
-          echo "rmi exit=$?"
-          docker image prune -f
-          df -h /mnt/scratch /
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: docker-linux-r2
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+          df -h /mnt/scratch
