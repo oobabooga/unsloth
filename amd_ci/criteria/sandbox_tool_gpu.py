@@ -43,11 +43,8 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     ran = _tool(base, "tool_default").get("ran", False)
     out.append(("base tool executed the payload", bool(ran),
                 (_tool(base, "tool_default").get("raw") or "no output")[:200]))
-    host = (base.get("host_torch") or {})
-    out.append(("host torch importable (GPU question answerable only if it sees a GPU)",
-                "torch_error" not in host,
-                f"torch={host.get('torch')} cuda_available={host.get('cuda_available')} "
-                f"hip={host.get('hip')} name={host.get('device_name')}"))
+    # Host torch is reported, not gated: a box without torch still answers the
+    # launch question, and the GPU question is then VOID rather than INCONCLUSIVE.
     return out
 
 

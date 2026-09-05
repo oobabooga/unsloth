@@ -127,6 +127,12 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q structlog python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth requests "numpy<3" httpx "transformers>=4.51,<5.5"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
           # --require rocm gpu --expect-arch gfx1151. The gate EXITS 1 when it is
