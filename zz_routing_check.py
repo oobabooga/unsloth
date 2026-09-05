@@ -61,6 +61,30 @@ check("_whole_doc_budget(2048 ctx, 1024 headroom)",
 # 5. No module-level import side effect touched anything platform-specific.
 check("module still exposes build_rag_autoinject", callable(tools.build_rag_autoinject), True)
 
+# 6. THE PLATFORM GATE. `rag_autoinject_reaches_retrieval` consults
+#    rag_db.rag_available(); where sqlite-vec's vec0 cannot load (a Python without
+#    loadable sqlite extensions, or a venv missing the native library -- the common
+#    macOS case per storage/rag_db.RagExtensionUnavailable) the whole feature is off
+#    and none of the changed code is reachable. Assert that gate directly, on this OS.
+import sqlite3  # noqa: E402
+
+loadable = hasattr(sqlite3.connect(":memory:"), "enable_load_extension")
+print(f"  [ - ] this interpreter supports loadable sqlite extensions: {loadable}")
+try:
+    from storage import rag_db
+    available = rag_db.rag_available()
+except Exception as exc:
+    available = f"raised {type(exc).__name__}"
+print(f"  [ - ] rag_db.rag_available() on this platform: {available}")
+
+if available is False:
+    scope = {"thread_id": "t1", "project_id": "p1", "context_length": 8192}
+    check("RAG off => build_rag_autoinject returns None (changed code unreachable)",
+          tools.build_rag_autoinject([{"role": "user", "content": "hi"}], scope), None)
+    check("RAG off => the gate itself says so",
+          tools.rag_autoinject_reaches_retrieval([{"role": "user", "content": "hi"}], scope),
+          (False, False))
+
 if failures:
     print(f"\nROUTING CHECK FAILED: {failures}")
     sys.exit(1)
