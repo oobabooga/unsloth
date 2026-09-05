@@ -49,7 +49,7 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 420
     concurrency:
-      group: amd-ci-gfx1151-gpu
+      group: amd-ci-gfx1151-gpu-qwen4exp-backends
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
