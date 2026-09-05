@@ -64,7 +64,11 @@ jobs:
             tests/test_conversation_recall_injection.py \
             tests/test_tool_result_fits_window.py
 
+      # always(): test_tool_result_fits_window has 5 pre-existing POSIX-primitive
+      # failures on native Windows (os.mkfifo, symlink utime) that are identical on
+      # upstream main; they must not hide the routing assertion.
       - name: Deterministic routing assertion
+        if: always()
         shell: bash
         working-directory: studio/backend
         run: python ../../zz_routing_check.py
