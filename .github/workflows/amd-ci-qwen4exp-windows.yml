@@ -1,0 +1,218 @@
+name: "AMD CI (Windows): qwen4exp UD-IQ1_S on ROCm and Vulkan prebuilts, Strix Halo"
+
+# The Windows leg of the qwen4exp backend matrix, on the devlab Strix Halo
+# boxes. Same cells as the Linux run (c1 single segment, c2 the #27797
+# multi-segment prompts, c3 the #10330 four-slot --kv-unified replica), same
+# three prebuilt cohorts, Windows ROCm gfx1151 and Windows Vulkan zips.
+#
+# Plus the one cell unsloth#9792 could never run: Qwen3.8-27B V2 vs V3
+# UD-Q4_K_XL under Vulkan with context checkpoints on, on Windows. This is an
+# integrated gfx1151, not the reporters' discrete R9700, so a pass bounds
+# nothing about RDNA4; a crash would be the first reproduction off their
+# machines.
+
+on:
+  push:
+    branches: [amd-ci-qwen4exp-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REL: "https://github.com/unslothai/llama.cpp/releases/download"
+  TAG_OLD: "b10687-mix-67dfc8b"
+  TAG_BASE: "b10715-mix-86bd2d3"
+  TAG_HEAD: "b10798-mix-659e406"
+  MODEL_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  MODEL_REV: "38bb39ee97821de2c9009abb7e93950eec396e66"
+  SHARD1: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  SHARD2: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf"
+  SHARD3: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf"
+  SMALL_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  SMALL_REV: "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+  SMALL_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  GGUF_REPO_27B: "unsloth/Qwen3.8-27B-GGUF"
+  REV_V2: "408fcc1807ab264d8cd644a7c4c0f58fbd32eebc"
+  REV_V3: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  FILE_27B: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+
+jobs:
+
+  windows:
+    name: "qwen4exp on Windows Strix Halo, ROCm and Vulkan prebuilts"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        shell: powershell
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "qwen4exp-windows"
+
+      - name: Locate the system Python
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate and facts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM | Format-List | Out-File "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-File "$env:AMD_CI_WORK\out\ram.txt"
+          Get-PSDrive -PSProvider FileSystem | Out-File "$env:AMD_CI_WORK\out\disk.txt"
+          Get-Content "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-PSDrive -PSProvider FileSystem
+          $drive = (Get-Item $env:AMD_CI_WORK).PSDrive
+          $freeGB = [math]::Round($drive.Free / 1GB)
+          Write-Host "free on $($drive.Name): $freeGB GB"
+          if ($freeGB -lt 150) {
+            Write-Host "FATAL: need about 150 GB free for the 72.5 GB model plus the two 17.5 GB 27B files and the zips; not substituting a smaller quant."
+            exit 1
+          }
+
+      - name: Fetch the prebuilts
+        timeout-minutes: 40
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_llamacpp.py --url "$env:REL/$env:TAG_BASE/app-$env:TAG_BASE-windows-x64-rocm-gfx1151.zip" --dest "$env:AMD_CI_WORK\lcpp\rocm_base" --out "$O\bin_rocm_base.json"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_llamacpp.py --url "$env:REL/$env:TAG_HEAD/app-$env:TAG_HEAD-windows-x64-rocm-gfx1151.zip" --dest "$env:AMD_CI_WORK\lcpp\rocm_head" --out "$O\bin_rocm_head.json"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_llamacpp.py --url "$env:REL/$env:TAG_OLD/app-$env:TAG_OLD-windows-x64-rocm-gfx1151.zip" --dest "$env:AMD_CI_WORK\lcpp\rocm_old" --out "$O\bin_rocm_old.json"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_llamacpp.py --url "$env:REL/$env:TAG_HEAD/app-$env:TAG_HEAD-windows-x64-vulkan.zip" --dest "$env:AMD_CI_WORK\lcpp\vulkan_head" --out "$O\bin_vulkan_head.json"
+          & $env:AMD_CI_PY amd_ci\lib\emit_bin_env.py "$O" | Add-Content -Path $env:GITHUB_ENV
+          & $env:AMD_CI_PY amd_ci\lib\emit_bin_env.py "$O"
+
+      - name: Fetch the sentinel model and the wikitext prompts
+        timeout-minutes: 20
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_gguf.py --repo "$env:SMALL_REPO" --file "$env:SMALL_FILE" --revision "$env:SMALL_REV" --as-name sentinel.gguf --local-dir "$env:AMD_CI_WORK\models\small" --out "$env:AMD_CI_WORK\out\model_small.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\data" | Out-Null
+          & $env:AMD_CI_PY amd_ci\lib\fetch_wikitext.py --out "$env:AMD_CI_WORK\data\wikitext2_test.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fetch UD-IQ1_S (72.5 GB, three shards)
+        timeout-minutes: 180
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $M = "$env:AMD_CI_WORK\models\iq1s"
+          foreach ($i in 1, 2, 3) {
+            $f = [Environment]::GetEnvironmentVariable("SHARD$i")
+            & $env:AMD_CI_PY amd_ci\lib\fetch_gguf.py --repo "$env:MODEL_REPO" --file "$f" --revision "$env:MODEL_REV" --local-dir "$M" --out "$env:AMD_CI_WORK\out\model_shard$i.json"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Get-ChildItem $M
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL=$M\Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+          Add-Content -Path $env:GITHUB_ENV -Value "SENTINEL=$env:AMD_CI_WORK\models\small\sentinel.gguf"
+          Add-Content -Path $env:GITHUB_ENV -Value "WIKI=$env:AMD_CI_WORK\data\wikitext2_test.txt"
+
+      - name: Resolve states (prebuilt directories)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY amd_ci\lib\write_states.py --require-file llama-server.exe `
+            --path "base=$env:ROCM_BASE_BIN" --path "head=$env:ROCM_HEAD_BIN" `
+            --label "base=$env:TAG_BASE windows rocm-gfx1151" --label "head=$env:TAG_HEAD windows rocm-gfx1151" `
+            --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: D1 - base vs head, Windows ROCm, GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY amd_ci\lib\differential.py `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe amd_ci\probes\qwen4exp_backend_probe.py `
+            --criteria amd_ci\criteria\qwen4exp_backends.py `
+            --out-dir "$env:AMD_CI_WORK\out\D1" --python "$env:AMD_CI_PY" `
+            --title "D1 $env:TAG_BASE vs $env:TAG_HEAD, windows rocm-gfx1151, GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" `
+            -- --model "$env:MODEL" --sentinel-model "$env:SENTINEL" --wikitext "$env:WIKI" `
+               --env GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 --gpu-var NONE --load-timeout 2400
+          Get-Content "$env:AMD_CI_WORK\out\D1\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\D1"
+
+      - name: K1-K4 - controls (env absent, env =0, Vulkan, oldest ROCm build)
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\controls"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          function Run-Arm($n, $b, $extra) {
+            & $env:AMD_CI_PY amd_ci\probes\qwen4exp_backend_probe.py --state $n --checkout $b `
+              --out "$O\obs_$n.json" --model "$env:MODEL" --sentinel-model "$env:SENTINEL" --wikitext "$env:WIKI" `
+              --gpu-var NONE --load-timeout 2400 @extra *> "$O\probe_$n.log"
+            Write-Host "$n rc=$LASTEXITCODE"
+          }
+          Run-Arm "K1_head_rocm_env_absent" $env:ROCM_HEAD_BIN   @("--unset-env", "GGML_CUDA_ENABLE_UNIFIED_MEMORY")
+          Run-Arm "K2_head_rocm_env_zero"   $env:ROCM_HEAD_BIN   @("--env", "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
+          Run-Arm "K3_head_vulkan"          $env:VULKAN_HEAD_BIN @("--unset-env", "GGML_CUDA_ENABLE_UNIFIED_MEMORY")
+          Run-Arm "K4_old_rocm_env_set"     $env:ROCM_OLD_BIN    @("--env", "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1")
+
+      - name: Fetch Qwen3.8-27B UD-Q4_K_XL at V2 and V3 (unsloth#9792)
+        if: always()
+        timeout-minutes: 90
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $M = "$env:AMD_CI_WORK\models"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_gguf.py --repo "$env:GGUF_REPO_27B" --file "$env:FILE_27B" --revision "$env:REV_V2" --as-name model.gguf --local-dir "$M\v2_q4" --out "$env:AMD_CI_WORK\out\model_v2_q4.json"
+          & $env:AMD_CI_PY amd_ci\lib\fetch_gguf.py --repo "$env:GGUF_REPO_27B" --file "$env:FILE_27B" --revision "$env:REV_V3" --as-name model.gguf --local-dir "$M\v3_q4" --out "$env:AMD_CI_WORK\out\model_v3_q4.json"
+          & $env:AMD_CI_PY amd_ci\lib\write_states.py --require-file model.gguf `
+            --path "base=$M\v2_q4" --path "head=$M\v3_q4" `
+            --label "base=V2 408fcc180" --label "head=V3 4ca720788" `
+            --out "$env:AMD_CI_WORK\out\states_27b.json"
+
+      - name: W9792 - 27B V2 vs V3, Windows Vulkan, context checkpoints on, -lv 5
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY amd_ci\lib\differential.py `
+            --states "$env:AMD_CI_WORK\out\states_27b.json" `
+            --probe amd_ci\probes\llamacpp_mtp_probe.py `
+            --criteria amd_ci\criteria\llamacpp_mtp_regression.py `
+            --out-dir "$env:AMD_CI_WORK\out\W9792" --python "$env:AMD_CI_PY" `
+            --title "W9792 27B V2 vs V3, windows vulkan, checkpoints on" `
+            -- --bin-dir "$env:VULKAN_HEAD_BIN" --gguf model.gguf --ctx-size 8192 `
+               --prompt-tokens 4096 --n-predict 64 --extra-arg=-lv --extra-arg=5
+          Get-Content "$env:AMD_CI_WORK\out\W9792\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\W9792"
+
+      - name: Summary of every arm
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY amd_ci\lib\summarize_arms.py "$env:AMD_CI_WORK\out" amd_ci\criteria\qwen4exp_backends.py | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen4exp-backends-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
