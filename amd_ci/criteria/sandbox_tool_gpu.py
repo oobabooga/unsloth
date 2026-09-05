@@ -40,14 +40,11 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name} probe imported the backend", "import_error" not in o and "error" not in o,
                     (o.get("import_error") or o.get("error") or "ok")[:200]))
     base = obs.get("base") or {}
-    ran = _tool(base, "tool_default").get("ran", False)
-    out.append(("base tool executed the payload", bool(ran),
-                (_tool(base, "tool_default").get("raw") or "no output")[:200]))
-    host = (base.get("host_torch") or {})
-    out.append(("host torch importable (GPU question answerable only if it sees a GPU)",
-                "torch_error" not in host,
-                f"torch={host.get('torch')} cuda_available={host.get('cuda_available')} "
-                f"hip={host.get('hip')} name={host.get('device_name')}"))
+    ran = _tool(base, "tool_plain").get("ran", False)
+    out.append(("base tool executed a trivial payload", bool(ran),
+                (_tool(base, "tool_plain").get("raw") or "no output")[:200]))
+    # Host torch is reported, not gated: a box without torch still answers the
+    # launch question, and the GPU question is then VOID rather than INCONCLUSIVE.
     return out
 
 
@@ -61,13 +58,16 @@ def table(obs: dict) -> str:
         cap = o.get("capability") or {}
         cap_s = (f"{cap.get('backend')} / {cap.get('protection_state')} / env={cap.get('environment')}"
                  if cap else "n/a (no os_sandbox module)")
-        d = _tool(o, "tool_default")
+        d = _tool(o, "tool_plain")
+        g = _tool(o, "tool_default")
         if d.get("ran"):
             d_s = "ran"
         elif d.get("fail_closed"):
             d_s = "FAIL-CLOSED"
         else:
             d_s = "did not run"
+        if d.get("ran") and not g.get("ran"):
+            d_s += "; torch payload crashed: " + (g.get("raw") or "")[-60:].replace("\n", " ").replace("|", "/")
         rows.append(f"| {name} | {cap_s} | {d_s} | {_gpu(o, 'tool_default')} | {_gpu(o, 'tool_full')} "
                     f"| {(o.get('host_torch') or {}).get('cuda_available')} | {d.get('seconds')} |")
     head = obs.get("head") or {}
@@ -86,7 +86,7 @@ def table(obs: dict) -> str:
 
 
 def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
-    bd, hd = _tool(base, "tool_default"), _tool(head, "tool_default")
+    bd, hd = _tool(base, "tool_plain"), _tool(head, "tool_plain")
     if bd.get("ran") and not hd.get("ran"):
         why = "fail-closed (Required mode refused to launch)" if hd.get("fail_closed") else "did not run"
         reason = ((head.get("capability") or {}).get("reason") or hd.get("exception") or hd.get("raw") or "")

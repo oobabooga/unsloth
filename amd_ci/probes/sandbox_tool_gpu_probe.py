@@ -147,10 +147,12 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             obs["capability_error"] = traceback.format_exc()[-2000:]
 
-    for label, kwargs in (("tool_default", {}), ("tool_full", {"disable_sandbox": True})):
+    plain = "print('PROBE_JSON=' + __import__('json').dumps({'plain': True}))"
+    for label, code, kwargs in (("tool_plain", plain, {}), ("tool_default", TOOL_CODE, {}),
+                                ("tool_full", TOOL_CODE, {"disable_sandbox": True})):
         t0 = time.time()
         try:
-            text = tools._python_exec(TOOL_CODE, session_id = f"amd-ci-{args.state}",
+            text = tools._python_exec(code, session_id = f"amd-ci-{args.state}",
                                       timeout = args.tool_timeout, **kwargs)
             obs[label] = _parse_tool(str(text))
         except Exception as exc:  # noqa: BLE001
