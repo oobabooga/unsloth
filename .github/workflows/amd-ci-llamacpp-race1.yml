@@ -1,0 +1,228 @@
+name: "AMD CI: does the HIP host-buffer race produce the //// on Qwen3.8-27B? b10698 vs b10715 (gfx1151)"
+
+# The question. Strix Halo users report Qwen models degenerating into `////` on
+# ROCm. One named cause is the HIP integrated-GPU host-buffer race from upstream
+# commit c7d87229 (ggml-org#24233): the scheduler computes straight out of pinned
+# host memory, and the host overwrites the prompt-token buffer while the device
+# is still reading it. Reports tied to that commit: ggml-org#25992 (cross-slot
+# answers), ggml-org#27506 (perplexity 7.7 to 3024), lemonade#3160 (our own
+# Qwen3.8-27B UD-Q4_K_XL emitting //////// under 8 concurrent requests).
+#
+# The fix is ggml-org#25863, carried into our fork as unslothai/llama.cpp#158 and
+# pinned into the nightly from b10715-mix-86bd2d3 (2026-08-31). Nobody on our side
+# has watched the //// appear and disappear across that boundary. This job does
+# that, with the BINARY as the only variable:
+#
+#   base  b10698-mix-67dfc8b   carries c7d87229, predates the #158 pin
+#   head  b10715-mix-86bd2d3   carries #158 (and #157, #149, which need the
+#                              unified-memory variable and are inert here: the
+#                              variable is ABSENT in both states, asserted)
+#
+# Cells, same model, same flags, one host, one job:
+#
+#   R1  8 concurrent requests, --parallel 8 --kv-unified, chunked prompts
+#       (lemonade#3160's shape and Studio's flag family). Each request carries a
+#       unique code; the code coming back is the oracle.
+#   R2  one request at a time, --parallel 1, same chunked prompt. Separates the
+#       chunking mechanism (n_ubatch < n_batch) from concurrency.
+#   R3  llama-perplexity at -ub 512 on both builds, plus -ub 4096 on the broken
+#       one as the single-ubatch control. alexpooley's table on ggml-org#25863:
+#       one ubatch clean, eight ubatches PPL 49142 vs 9.16. A number, not prose.
+#
+# READ THE RULE. R1/R2 are differential: if the b10698 base does not degenerate,
+# the verdict is VOID and the step is red, and that is the honest answer ("this
+# host did not provoke the race today"), not a failure of the fix.
+#
+# BOUNDS. One gfx1151, Linux, 62 GB RAM, integrated GPU. The race is
+# integrated-only by construction (prop.integrated), so this says nothing about
+# discrete cards (the 3x V620 report is NOT this bug), Windows, or CUDA.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-race1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BROKEN_TAG: "b10698-mix-67dfc8b"
+  FIXED_TAG: "b10715-mix-86bd2d3"
+  MODEL_REPO: "unsloth/Qwen3.8-27B-GGUF"
+  MODEL_REV: "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+  MODEL_FILE: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  NGL: "999"
+  WIKI_URL: "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+
+jobs:
+
+  gpu:
+    name: "27B, b10698 vs b10715, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-race1"
+
+      - name: Hardware gate
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          nproc
+
+      - name: Fetch both llama.cpp builds
+        timeout-minutes: 45
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$BROKEN_TAG/app-$BROKEN_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/broken" --out "$AMD_CI_WORK/out/bin_broken.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$FIXED_TAG/app-$FIXED_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/fixed" --out "$AMD_CI_WORK/out/bin_fixed.json"
+          # Which build ran is the whole point; record both version strings.
+          for B in broken fixed; do
+            LD_LIBRARY_PATH="$AMD_CI_WORK/lcpp/$B" "$AMD_CI_WORK/lcpp/$B/llama-server" --version \
+              > "$AMD_CI_WORK/out/version_$B.txt" 2>&1 || true
+            cat "$AMD_CI_WORK/out/version_$B.txt"
+          done
+
+      - name: Fetch Qwen3.8-27B UD-Q4_K_XL and lay out the two states
+        timeout-minutes: 90
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          python3 amd_ci/lib/fetch_gguf.py --repo "$MODEL_REPO" --file "$MODEL_FILE" \
+            --revision "$MODEL_REV" --as-name "$MODEL_FILE" --local-dir "$M/src" \
+            --out "$AMD_CI_WORK/out/model.json"
+          # Same bytes in both state dirs (hard links), the variable is the `bin`
+          # file, and the unified-memory name is unset in BOTH so #157's bug
+          # cannot be what moves.
+          for S in base head; do
+            mkdir -p "$M/ab_$S"
+            ln -f "$M/src/$MODEL_FILE" "$M/ab_$S/$MODEL_FILE"
+            printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/ab_$S/env"
+          done
+          printf '%s\n' "$AMD_CI_WORK/lcpp/broken" > "$M/ab_base/bin"
+          printf '%s\n' "$AMD_CI_WORK/lcpp/fixed" > "$M/ab_head/bin"
+          python3 amd_ci/lib/write_states.py --require-file "$MODEL_FILE" \
+            --path "base=$M/ab_base" --path "head=$M/ab_head" \
+            --label "base=$BROKEN_TAG (has the race)" --label "head=$FIXED_TAG (carries #158)" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: R1 - eight concurrent requests, --parallel 8 --kv-unified (lemonade#3160 shape)
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+          AMD_CI_AB_NONCE_REQUIRED: "1"
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_R1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ab_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ab_differential.py \
+            --out-dir "$AMD_CI_WORK/out/R1" \
+            --title "R1 Qwen3.8-27B UD-Q4_K_XL, 8 concurrent coded prompts, --parallel 8 --kv-unified -b 2048 -ub 512, b10698 vs b10715, gfx1151" \
+            -- --gguf "$MODEL_FILE" --ngl "$NGL" --ctx-size 32768 \
+               --mode nonce --concurrent 8 --repeats 3 --filler-words 1400 --n-predict 48 \
+               --thinking off \
+               --extra-arg=--parallel --extra-arg=8 --extra-arg=--kv-unified \
+               --extra-arg=-b --extra-arg=2048 --extra-arg=-ub --extra-arg=512 \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--jinja \
+               --load-timeout 1800 --request-timeout 1800
+          free -g > "$AMD_CI_WORK/out/free_R1_after.txt"
+          cat "$AMD_CI_WORK/out/R1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R1"
+
+      - name: R2 - one request at a time, --parallel 1, chunked prompt only
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+          AMD_CI_AB_NONCE_REQUIRED: "1"
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_R2_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ab_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ab_differential.py \
+            --out-dir "$AMD_CI_WORK/out/R2" \
+            --title "R2 Qwen3.8-27B UD-Q4_K_XL, sequential coded prompts, --parallel 1 -b 2048 -ub 512, b10698 vs b10715, gfx1151" \
+            -- --gguf "$MODEL_FILE" --ngl "$NGL" --ctx-size 8192 \
+               --mode nonce --concurrent 0 --repeats 4 --filler-words 1400 --n-predict 48 \
+               --thinking off \
+               --extra-arg=--parallel --extra-arg=1 \
+               --extra-arg=-b --extra-arg=2048 --extra-arg=-ub --extra-arg=512 \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--jinja \
+               --load-timeout 1800 --request-timeout 1800
+          free -g > "$AMD_CI_WORK/out/free_R2_after.txt"
+          cat "$AMD_CI_WORK/out/R2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/R2"
+
+      - name: R3 - perplexity at -ub 512 on both builds, -ub 4096 control on the broken one
+        if: always()
+        timeout-minutes: 90
+        run: |
+          set +e
+          W="$AMD_CI_WORK/wiki"
+          mkdir -p "$W"
+          python3 - "$WIKI_URL" "$W" <<'PY'
+          import io, sys, urllib.request, zipfile
+          url, dest = sys.argv[1], sys.argv[2]
+          data = urllib.request.urlopen(url, timeout = 600).read()
+          zipfile.ZipFile(io.BytesIO(data)).extractall(dest)
+          print("wikitext bytes:", len(data))
+          PY
+          F=$(find "$W" -name "wiki.test.raw" | head -1)
+          echo "corpus: $F"
+          M="$AMD_CI_WORK/models/src/$MODEL_FILE"
+          run_ppl() {
+            NAME="$1"; BIN="$2"; UB="$3"
+            OUT="$AMD_CI_WORK/out/ppl_$NAME.txt"
+            LD_LIBRARY_PATH="$BIN" timeout 2400 "$BIN/llama-perplexity" -m "$M" -f "$F" \
+              -c 4096 -b 4096 -ub "$UB" --chunks 6 -ngl "$NGL" -fa on -t 8 > "$OUT" 2>&1
+            RC=$?
+            EST=$(grep -o "Final estimate: PPL = [0-9.]*" "$OUT" | head -1)
+            echo "$NAME rc=$RC ${EST:-no estimate}"
+            echo "| $NAME | $(basename "$BIN") | $UB | ${EST#Final estimate: PPL = } | $RC |" >> "$AMD_CI_WORK/out/ppl_table.md"
+          }
+          {
+            echo "## R3 perplexity, wikitext-2, -c 4096 -b 4096 --chunks 6, ngl $NGL"
+            echo ""
+            echo "| cell | build | -ub | PPL | rc |"
+            echo "|---|---|---|---|---|"
+          } > "$AMD_CI_WORK/out/ppl_table.md"
+          run_ppl broken_ub512  "$AMD_CI_WORK/lcpp/broken" 512
+          run_ppl fixed_ub512   "$AMD_CI_WORK/lcpp/fixed"  512
+          run_ppl broken_ub4096 "$AMD_CI_WORK/lcpp/broken" 4096
+          {
+            echo ""
+            echo "Reading: broken_ub512 high and fixed_ub512 sane, with broken_ub4096 sane, is the race"
+            echo "(one ubatch cannot race). All three sane means this host did not provoke it."
+            echo "Empty PPL means the run died; read ppl_*.txt in the artifact."
+          } >> "$AMD_CI_WORK/out/ppl_table.md"
+          cat "$AMD_CI_WORK/out/ppl_table.md"
+          cat "$AMD_CI_WORK/out/ppl_table.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-race1-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn

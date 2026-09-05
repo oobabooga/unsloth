@@ -1,0 +1,18 @@
+[
+  {
+    "name": "single_segment_control",
+    "prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "name": "multi_turn_bob",
+    "prompt": "<|im_start|>user\nMy name is Bob.<|im_end|>\n<|im_start|>assistant\nNoted!<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "name": "preamble_then_one_segment",
+    "prompt": "Previous conversation: user said hi, assistant replied hello.\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "name": "system_plus_user",
+    "prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  }
+]
