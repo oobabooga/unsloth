@@ -30,6 +30,7 @@ name: Cross-platform parity
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.sh'
       - 'install.ps1'
       - 'unsloth_cli/__init__.py'
@@ -93,6 +94,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.sh'
       - 'install.ps1'
       - 'unsloth_cli/__init__.py'

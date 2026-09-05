@@ -24,6 +24,7 @@ on:
   # merge.
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - '.github/workflows/desktop-app-clean-machine-ci.yml'
       - '.github/scripts/retry-with-apt-lock.sh'
 

@@ -33,6 +33,7 @@ on:
     # is just as much a compat regression risk as one added in
     # unsloth/models/rl.py.
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'unsloth/**'
       - 'tests/vllm_compat/**'
       - 'tests/version_compat/**'

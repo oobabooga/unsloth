@@ -19,6 +19,7 @@ name: Interrupted install recovery
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.sh'
       - 'install.ps1'
       - 'studio/setup.sh'

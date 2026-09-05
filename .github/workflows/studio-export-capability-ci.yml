@@ -14,6 +14,7 @@ name: Unsloth export capability
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'studio/backend/utils/hardware/hardware.py'
       - 'studio/backend/core/export/export.py'
       - 'studio/backend/routes/export.py'

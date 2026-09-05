@@ -40,6 +40,7 @@ name: Clean machine install
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.sh'
       - 'install.ps1'
       - 'studio/setup.sh'
@@ -73,6 +74,7 @@ on:
     # Same list as the PR filter: without it a direct push to main touching any of
     # these skipped the workflow and the post-merge backstop never happened.
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.sh'
       - 'install.ps1'
       - 'studio/setup.sh'

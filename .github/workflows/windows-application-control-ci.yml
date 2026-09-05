@@ -42,6 +42,7 @@ name: Windows Application Control CI
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'install.ps1'
       - 'scripts/uninstall.ps1'
       - 'studio/setup.ps1'

@@ -11,6 +11,7 @@ name: Mac Unsloth Install Matrix CI
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'studio/install_llama_prebuilt.py'
       - 'studio/setup.sh'
       - 'install.sh'
@@ -47,6 +48,7 @@ on:
     # this workflow tests has nothing here to back up.
     # clean-machine-install-ci.yml and mlx-ci.yml already do exactly this.
     paths:
+      - 'studio/backend/core/inference/tools.py'
       - 'studio/install_llama_prebuilt.py'
       - 'studio/setup.sh'
       - 'install.sh'
