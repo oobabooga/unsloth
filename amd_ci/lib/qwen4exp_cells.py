@@ -125,6 +125,8 @@ def main():
     ap.add_argument("--n-predict", type=int, default=128)
     ap.add_argument("--gpu-var", action="append", default=None, help="env var(s) that pin the GPU; NONE to skip")
     ap.add_argument("--sentinel-model", default="", help="small known-good GGUF run before and after the cells")
+    ap.add_argument("--c3-order", default="", help="arrival order of the four c3 prompts, e.g. 1,0,2,3")
+    ap.add_argument("--c3-stagger", type=float, default=0.0, help="seconds between c3 request starts")
     a = ap.parse_args()
     if a.gpu_var is None: a.gpu_var = ["CUDA_VISIBLE_DEVICES"]
     a.bin = str(Path(a.bin).resolve()); a.model = str(Path(a.model).resolve())
@@ -165,8 +167,18 @@ def main():
                 results = [None] * 4
                 def run(i):
                     results[i] = completion(a.port, prompts[i], a.n_predict)
-                th = [threading.Thread(target=run, args=(i,)) for i in range(4)]
-                [t.start() for t in th]; [t.join() for t in th]
+                # Arrival order decides which slot each prompt lands on (llama-server
+                # hands the first arrival slot 3 by LRU) and so how the prompts'
+                # prefill chunks are packed into batches. The Windows Strix Halo run
+                # saw the short prompt arrive second and return EOS as its first
+                # token; --c3-order replays a given arrival order, --c3-stagger
+                # spaces the starts so the order is the one asked for.
+                order = [int(x) for x in a.c3_order.split(",")] if a.c3_order else list(range(4))
+                th = {i: threading.Thread(target=run, args=(i,)) for i in range(4)}
+                for k, i in enumerate(order):
+                    if k and a.c3_stagger > 0: time.sleep(a.c3_stagger)
+                    th[i].start()
+                [th[i].join() for i in range(4)]
                 cross = []
                 for i in range(4):
                     for j in range(i + 1, 4):
@@ -174,7 +186,7 @@ def main():
                         if len(ti) > 80 and len(tj) > 80:
                             for k in range(0, len(ti) - 60, 20):
                                 if ti[k:k + 60] in tj: cross.append([i, j, ti[k:k + 60]]); break
-                res["cells"]["c3"] = {"prompts": results, "cross_slot_shared_60char": cross, **s.log_hits()}
+                res["cells"]["c3"] = {"prompts": results, "cross_slot_shared_60char": cross, "order": order, "stagger": a.c3_stagger, **s.log_hits()}
     except Exception as e:  # noqa: BLE001
         res["error"] = f"{type(e).__name__}: {e}"
     sentinel("post")
