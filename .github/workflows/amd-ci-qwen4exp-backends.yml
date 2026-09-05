@@ -1,0 +1,193 @@
+name: "AMD CI: qwen4exp UD-IQ1_S on ROCm and Vulkan prebuilts, gfx1151"
+
+# Which shipped unslothai/llama.cpp prebuilt, under which environment, corrupts
+# Qwen3.8-Flash-Next on a Strix Halo. Every reporter on HF #30, ggml #27797 and
+# unsloth #10330 is on this hardware; the CUDA arms of the same cells were run
+# elsewhere and are clean on all three builds.
+#
+#   D1  differential  base b10715 rocm (ROCm fixes #149/#157/#158 + 27941) vs
+#                     head b10798 rocm (same + merged upstream 27941), both with
+#                     GGML_CUDA_ENABLE_UNIFIED_MEMORY=1, which is what Studio sets
+#   K1  control       b10798 rocm, env absent
+#   K2  control       b10798 rocm, env "=0" (PR #149 must make this off)
+#   K3  control       b10798 vulkan (never reads the env)
+#   K4  control       b10687 rocm, env set (no ROCm fixes at all)
+#
+# Cells per arm: c1 single segment (negative control), c2 the three #27797
+# multi-segment prompts, c3 the #10330 replica (-np 4 --kv-unified, four
+# concurrent 1.4k-3.7k token prompts, -b 2048 -ub 512). A known-good 0.6B
+# sentinel runs before and after each arm: after an OOM-kill this GPU answers
+# "/" to everything until reset (#27797), and that must not read as a finding.
+
+on:
+  push:
+    branches: [amd-ci-qwen4exp-backends]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REL: "https://github.com/unslothai/llama.cpp/releases/download"
+  TAG_OLD: "b10687-mix-67dfc8b"
+  TAG_BASE: "b10715-mix-86bd2d3"
+  TAG_HEAD: "b10798-mix-659e406"
+  MODEL_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  MODEL_REV: "38bb39ee97821de2c9009abb7e93950eec396e66"
+  SHARD1: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  SHARD2: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf"
+  SHARD3: "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf"
+  SMALL_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  SMALL_REV: "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+  SMALL_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  WIKITEXT_URL: "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+
+jobs:
+
+  gpu:
+    name: "qwen4exp UD-IQ1_S, ROCm and Vulkan prebuilts (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 420
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "qwen4exp-backends"
+
+      - name: Hardware gate and host facts
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free.txt" 2>&1
+          { uname -a; cat /etc/os-release; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { rocm-smi --showmeminfo vram gtt || true; } > "$AMD_CI_WORK/out/rocm-smi.txt" 2>&1
+          free -g; df -h "$AMD_CI_WORK" | tail -1
+          grep -E "gfx[0-9]+" "$AMD_CI_WORK/out/rocminfo.txt" | head -3
+
+      - name: Fetch the four prebuilts
+        timeout-minutes: 40
+        run: |
+          set -eu
+          O="$AMD_CI_WORK/out"
+          python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/$TAG_BASE/app-$TAG_BASE-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm_base" --out "$O/bin_rocm_base.json"
+          python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/$TAG_HEAD/app-$TAG_HEAD-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm_head" --out "$O/bin_rocm_head.json"
+          python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/$TAG_OLD/app-$TAG_OLD-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/rocm_old" --out "$O/bin_rocm_old.json"
+          python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/$TAG_HEAD/app-$TAG_HEAD-linux-x64-vulkan.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/vulkan_head" --out "$O/bin_vulkan_head.json"
+          python3 amd_ci/lib/emit_bin_env.py "$O" >> "$GITHUB_ENV"
+          python3 amd_ci/lib/emit_bin_env.py "$O"
+
+      - name: Fetch the sentinel model and the wikitext prompts
+        timeout-minutes: 20
+        run: |
+          set -eu
+          python3 amd_ci/lib/fetch_gguf.py --repo "$SMALL_REPO" --file "$SMALL_FILE" \
+            --revision "$SMALL_REV" --as-name sentinel.gguf \
+            --local-dir "$AMD_CI_WORK/models/small" --out "$AMD_CI_WORK/out/model_small.json"
+          mkdir -p "$AMD_CI_WORK/data"
+          python3 - "$AMD_CI_WORK/data" <<'PY'
+          import io, sys, urllib.request, zipfile
+          from pathlib import Path
+          url = "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+          data = urllib.request.urlopen(url, timeout=300).read()
+          with zipfile.ZipFile(io.BytesIO(data)) as z:
+              name = [n for n in z.namelist() if n.endswith("wiki.test.raw")][0]
+              Path(sys.argv[1], "wikitext2_test.txt").write_bytes(z.read(name))
+          print("wikitext ok", Path(sys.argv[1], "wikitext2_test.txt").stat().st_size)
+          PY
+
+      - name: Fetch UD-IQ1_S (72.5 GB, three shards)
+        timeout-minutes: 150
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models/iq1s"
+          for i in 1 2 3; do
+            v="SHARD$i"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$MODEL_REPO" --file "${!v}" \
+              --revision "$MODEL_REV" --local-dir "$M" --out "$AMD_CI_WORK/out/model_shard$i.json"
+          done
+          ls -la "$M"; df -h "$AMD_CI_WORK" | tail -1
+          echo "MODEL=$M/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf" >> "$GITHUB_ENV"
+          echo "SENTINEL=$AMD_CI_WORK/models/small/sentinel.gguf" >> "$GITHUB_ENV"
+          echo "WIKI=$AMD_CI_WORK/data/wikitext2_test.txt" >> "$GITHUB_ENV"
+
+      - name: Resolve states (prebuilt directories, not source trees)
+        run: |
+          set -eu
+          python3 amd_ci/lib/write_states.py --require-file llama-server \
+            --path "base=$ROCM_BASE_BIN" --path "head=$ROCM_HEAD_BIN" \
+            --label "base=$TAG_BASE rocm-gfx1151" --label "head=$TAG_HEAD rocm-gfx1151" \
+            --out "$AMD_CI_WORK/out/states.json"
+
+      - name: D1 - base vs head, ROCm, GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 (Studio's launch env)
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/qwen4exp_backend_probe.py \
+            --criteria amd_ci/criteria/qwen4exp_backends.py \
+            --out-dir "$AMD_CI_WORK/out/D1" \
+            --title "D1 $TAG_BASE vs $TAG_HEAD, rocm-gfx1151, GGML_CUDA_ENABLE_UNIFIED_MEMORY=1" \
+            -- --model "$MODEL" --sentinel-model "$SENTINEL" --wikitext "$WIKI" \
+               --env GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 --gpu-var NONE --load-timeout 2400
+          cat "$AMD_CI_WORK/out/D1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D1"
+
+      - name: K1-K4 - controls (env absent, env =0, Vulkan, oldest ROCm build)
+        if: always()
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/controls"; mkdir -p "$O"
+          run() { # name bin extra...
+            n="$1"; b="$2"; shift 2
+            python3 amd_ci/probes/qwen4exp_backend_probe.py --state "$n" --checkout "$b" \
+              --out "$O/obs_$n.json" --model "$MODEL" --sentinel-model "$SENTINEL" --wikitext "$WIKI" \
+              --gpu-var NONE --load-timeout 2400 "$@" > "$O/probe_$n.log" 2>&1
+            echo "$n rc=$?"
+          }
+          run K1_head_rocm_env_absent "$ROCM_HEAD_BIN" --unset-env GGML_CUDA_ENABLE_UNIFIED_MEMORY
+          run K2_head_rocm_env_zero   "$ROCM_HEAD_BIN" --env GGML_CUDA_ENABLE_UNIFIED_MEMORY=0
+          run K3_head_vulkan          "$VULKAN_HEAD_BIN" --unset-env GGML_CUDA_ENABLE_UNIFIED_MEMORY
+          run K4_old_rocm_env_set     "$ROCM_OLD_BIN" --env GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+
+      - name: Summary of every arm
+        if: always()
+        run: |
+          set +e
+          python3 - "$AMD_CI_WORK/out" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys, glob, importlib.util
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("crit", "amd_ci/criteria/qwen4exp_backends.py")
+          crit = importlib.util.module_from_spec(spec); spec.loader.exec_module(crit)
+          obs = {}
+          for f in sorted(glob.glob(str(root / "D1" / "obs_*.json"))) + sorted(glob.glob(str(root / "controls" / "obs_*.json"))):
+              try:
+                  d = json.loads(Path(f).read_text()); obs[d.get("state") or Path(f).stem] = d
+              except Exception as e:
+                  obs[Path(f).stem] = {"setup_error": f"unreadable: {e}"}
+          print("## Every arm, one table\n")
+          print(crit.table(obs) if obs else "(no observations)")
+          print("\nfingerprints:\n")
+          for n, d in obs.items():
+              fp = d.get("fingerprint") or {}
+              print(f"- {n}: sha256 {str(fp.get('llama-server_sha256','?'))[:16]}; " + "; ".join(f"{k}: {v[:3]}" for k, v in fp.items() if k != "llama-server_sha256"))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen4exp-backends-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
