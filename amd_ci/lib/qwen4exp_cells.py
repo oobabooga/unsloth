@@ -10,8 +10,14 @@ Cells:
   c3  the #10330 replica: -np 4 --kv-unified, four concurrent prompts of
       6k..12k chars, -b 2048 -ub 512 so every prompt spans several ubatches
 """
-import argparse, json, os, re, signal, subprocess, sys, threading, time, urllib.request
+import argparse, json, os, re, shutil, signal, subprocess, sys, threading, time, urllib.request
 from pathlib import Path
+
+def server_exe(bin_dir):
+    for n in ("llama-server", "llama-server.exe"):
+        for d in (Path(bin_dir), Path(bin_dir) / "build" / "bin"):
+            if (d / n).is_file(): return str(d / n)
+    return str(Path(bin_dir) / "llama-server")
 
 SIGS = {
     "slash_run":   re.compile(r"/{6,}"),
@@ -53,12 +59,14 @@ def completion(port, prompt, n, timeout=1800):
 def fingerprint(bin_dir):
     import hashlib
     fp = {}
-    exe = Path(bin_dir) / "llama-server"
+    exe = Path(server_exe(bin_dir))
     if exe.is_file():
         fp["llama-server_sha256"] = hashlib.sha256(exe.read_bytes()).hexdigest()
-    for lib in ("libggml-hip.so", "libggml-cuda.so", "libggml-vulkan.so"):
+    for lib in ("libggml-hip.so", "libggml-cuda.so", "libggml-vulkan.so", "ggml-hip.dll", "ggml-cuda.dll", "ggml-vulkan.dll"):
         for cand in (Path(bin_dir) / lib, Path(bin_dir) / "build" / "bin" / lib):
             if cand.is_file():
+                fp.setdefault("backend_libs", []).append(lib)
+                if not shutil.which("ldd"): continue
                 r = subprocess.run(["ldd", str(cand)], capture_output=True, text=True)
                 fp[lib] = [l.strip() for l in r.stdout.splitlines() if any(k in l for k in ("hip", "roc", "cuda", "vulkan", "not found"))][:12]
     return fp
@@ -76,7 +84,7 @@ class Server:
             k, _, v = kv.partition("="); env[k] = v
         for k in self.a.unset_env:
             env.pop(k, None)
-        cmd = [f"{self.a.bin}/llama-server", "-m", self.a.model, "--host", "127.0.0.1", "--port", str(self.a.port),
+        cmd = [server_exe(self.a.bin), "-m", self.a.model, "--host", "127.0.0.1", "--port", str(self.a.port),
                "-ngl", "999", "--fit", "off", "-fa", "on", "--no-warmup", *self.extra, *self.a.server_arg]
         self.fh = open(self.log, "w")
         self.fh.write("CMD: " + " ".join(cmd) + "\nENV_UMA: " + repr(env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY")) + "\n"); self.fh.flush()
@@ -93,7 +101,7 @@ class Server:
         raise RuntimeError("server load timeout")
     def __exit__(self, *_):
         if self.p and self.p.poll() is None:
-            self.p.send_signal(signal.SIGINT)
+            self.p.send_signal(signal.SIGINT if os.name != "nt" else signal.SIGTERM)
             try: self.p.wait(30)
             except subprocess.TimeoutExpired: self.p.kill(); self.p.wait()
         self.fh.close()
@@ -117,12 +125,14 @@ def main():
     ap.add_argument("--n-predict", type=int, default=128)
     ap.add_argument("--gpu-var", action="append", default=None, help="env var(s) that pin the GPU; NONE to skip")
     ap.add_argument("--sentinel-model", default="", help="small known-good GGUF run before and after the cells")
+    ap.add_argument("--c3-order", default="", help="arrival order of the four c3 prompts, e.g. 1,0,2,3")
+    ap.add_argument("--c3-stagger", type=float, default=0.0, help="seconds between c3 request starts")
     a = ap.parse_args()
     if a.gpu_var is None: a.gpu_var = ["CUDA_VISIBLE_DEVICES"]
     a.bin = str(Path(a.bin).resolve()); a.model = str(Path(a.model).resolve())
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     res = {"label": a.label, "bin": a.bin, "gpu": a.gpu, "env": a.env, "unset_env": a.unset_env, "cells": {}}
-    ver = subprocess.run([f"{a.bin}/llama-server", "--version"], capture_output=True, text=True,
+    ver = subprocess.run([server_exe(a.bin), "--version"], capture_output=True, text=True,
                          env={**os.environ, "LD_LIBRARY_PATH": f"{a.bin}:{a.bin}/build/bin"})
     res["version"] = (ver.stdout + ver.stderr).strip().splitlines()[:2]
     res["fingerprint"] = fingerprint(a.bin)
@@ -157,8 +167,18 @@ def main():
                 results = [None] * 4
                 def run(i):
                     results[i] = completion(a.port, prompts[i], a.n_predict)
-                th = [threading.Thread(target=run, args=(i,)) for i in range(4)]
-                [t.start() for t in th]; [t.join() for t in th]
+                # Arrival order decides which slot each prompt lands on (llama-server
+                # hands the first arrival slot 3 by LRU) and so how the prompts'
+                # prefill chunks are packed into batches. The Windows Strix Halo run
+                # saw the short prompt arrive second and return EOS as its first
+                # token; --c3-order replays a given arrival order, --c3-stagger
+                # spaces the starts so the order is the one asked for.
+                order = [int(x) for x in a.c3_order.split(",")] if a.c3_order else list(range(4))
+                th = {i: threading.Thread(target=run, args=(i,)) for i in range(4)}
+                for k, i in enumerate(order):
+                    if k and a.c3_stagger > 0: time.sleep(a.c3_stagger)
+                    th[i].start()
+                [th[i].join() for i in range(4)]
                 cross = []
                 for i in range(4):
                     for j in range(i + 1, 4):
@@ -166,7 +186,7 @@ def main():
                         if len(ti) > 80 and len(tj) > 80:
                             for k in range(0, len(ti) - 60, 20):
                                 if ti[k:k + 60] in tj: cross.append([i, j, ti[k:k + 60]]); break
-                res["cells"]["c3"] = {"prompts": results, "cross_slot_shared_60char": cross, **s.log_hits()}
+                res["cells"]["c3"] = {"prompts": results, "cross_slot_shared_60char": cross, "order": order, "stagger": a.c3_stagger, **s.log_hits()}
     except Exception as e:  # noqa: BLE001
         res["error"] = f"{type(e).__name__}: {e}"
     sentinel("post")

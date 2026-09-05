@@ -25,6 +25,7 @@ import zipfile
 from pathlib import Path
 
 MARKER = "llama-server"
+MARKERS = ("llama-server", "llama-server.exe")
 
 
 def download(url: str, dest: Path) -> Path:
@@ -53,11 +54,17 @@ def extract(archive: Path, into: Path) -> None:
 
 def find_bin_dir(root: Path) -> Path | None:
     """The directory holding llama-server, shallowest first."""
-    hits = sorted(root.rglob(MARKER), key = lambda p: len(p.parts))
+    hits = sorted((h for m in MARKERS for h in root.rglob(m)), key = lambda p: len(p.parts))
     for h in hits:
         if h.is_file():
             return h.parent
     return None
+
+def server_path(bin_dir: Path) -> Path:
+    for m in MARKERS:
+        if (bin_dir / m).is_file():
+            return bin_dir / m
+    return bin_dir / MARKER
 
 
 def main() -> int:
@@ -91,7 +98,7 @@ def main() -> int:
         info["has_test_backend_ops"] = (bin_dir / "test-backend-ops").is_file()
         env = {"LD_LIBRARY_PATH": str(bin_dir)}
         try:
-            p = subprocess.run([str(bin_dir / MARKER), "--version"], capture_output = True,
+            p = subprocess.run([str(server_path(bin_dir)), "--version"], capture_output = True,
                                text = True, timeout = 300, env = env)
             info["version"] = ((p.stdout or "") + (p.stderr or "")).strip()[:400]
         except Exception as e:  # noqa: BLE001

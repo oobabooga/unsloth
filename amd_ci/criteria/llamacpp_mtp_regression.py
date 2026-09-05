@@ -43,6 +43,19 @@ EXPECT_ARCH = "gfx1151"
 _CTX: dict = {"mtp_requested": False}
 
 
+def _gfx(v: dict) -> str:
+    """The probe reads the arch from rocminfo, which Windows does not have. The
+    device line llama-server prints names the part instead, and the 8060S is
+    the only gfx1151 sold, so accept that spelling rather than fail the gate
+    on a host that has no way to say 'gfx1151' in the expected place."""
+    if v.get("gfx"):
+        return str(v["gfx"])
+    text = str(v.get("list_devices") or "")
+    if "gfx1151" in text or "8060S" in text or "Strix Halo" in text:
+        return "gfx1151 (from the device name)"
+    return "?"
+
+
 def _states(obs: dict) -> dict:
     return {k: v for k, v in obs.items() if not k.startswith("_")}
 
@@ -86,7 +99,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 "; ".join(f"{n}={states[n].get('layers_by_device') or states[n].get('devices')}"
                           for n in states)))
 
-    archs = {n: (v.get("gfx") or "?") for n, v in states.items()}
+    archs = {n: _gfx(v) for n, v in states.items()}
     right_arch = all(EXPECT_ARCH in a for a in archs.values())
     out.append((f"host is {EXPECT_ARCH}", right_arch,
                 ", ".join(f"{n}={a}" for n, a in archs.items())))

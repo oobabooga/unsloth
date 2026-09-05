@@ -249,6 +249,8 @@ def main() -> int:
         return 0
 
     server = args.bin_dir / "llama-server"
+    if not server.is_file() and (args.bin_dir / "llama-server.exe").is_file():
+        server = args.bin_dir / "llama-server.exe"
     gguf = args.checkout / args.gguf
     obs["server_binary"] = str(server)
     obs["gguf"] = str(gguf)

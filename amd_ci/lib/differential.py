@@ -222,6 +222,15 @@ def main() -> int:
     return 0
 
 
+def _truth(v) -> bool:
+    """Criteria return either a bool or a (bool, reason) pair. A pair is a
+    non-empty tuple and therefore always truthy, which turned a head that still
+    showed the defect into CONFIRMED; unwrap before testing."""
+    if isinstance(v, tuple):
+        return bool(v[0])
+    return bool(v)
+
+
 def _decide(crit, obs: dict, gates: list) -> tuple[str, str]:
     if any(not ok for _, ok, _ in gates):
         return "INCONCLUSIVE", "a gate failed"
@@ -231,16 +240,16 @@ def _decide(crit, obs: dict, gates: list) -> tuple[str, str]:
         return "VOID", "a required state is missing, so no comparison exists"
 
     if crit.MODE == "differential":
-        shown = crit.base_shows_defect(base)
+        shown = _truth(crit.base_shows_defect(base))
         if not shown:
             # The rule. Not overridable.
             return "VOID", (
                 "the base state did not exhibit the defect, so this run did not reproduce "
                 "the problem and cannot speak to whether the change fixes it")
-        fixed = crit.head_is_fixed(head)
+        fixed = _truth(crit.head_is_fixed(head))
         # Underscore keys are harness metadata (fixtures), not states.
         extra = [n for n in obs if n not in ("base", "head") and not n.startswith("_")]
-        others = all(crit.head_is_fixed(obs[n]) for n in extra) if extra else True
+        others = all(_truth(crit.head_is_fixed(obs[n])) for n in extra) if extra else True
         if fixed and others:
             return "CONFIRMED", "the defect reproduces at the base and is absent at the head"
         return "FIX_INCOMPLETE", "the base reproduced the defect but the head did not clear it"

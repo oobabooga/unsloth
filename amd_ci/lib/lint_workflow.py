@@ -40,12 +40,22 @@ import yaml
 Finding = tuple[str, str, str]  # (code, where, message)
 
 
+def _step_shell(job: dict, step: dict) -> str:
+    """The shell a step actually runs under: the step's own `shell:`, else the
+    job's `defaults.run.shell`, else GitHub's default of bash."""
+    own = step.get("shell")
+    if own:
+        return str(own).split()[0].lower()
+    dflt = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+    return str(dflt).split()[0].lower() if dflt else "bash"
+
+
 def _steps(doc: dict):
     for job_name, job in (doc.get("jobs") or {}).items():
         for i, step in enumerate(job.get("steps") or []):
             if isinstance(step, dict) and "run" in step:
                 label = step.get("name") or f"step[{i}]"
-                yield job_name, job, f"{job_name}/{label}", step["run"]
+                yield job_name, job, f"{job_name}/{label}", step["run"], _step_shell(job, step)
 
 
 def lint_text(where: str, body: str) -> list[Finding]:
@@ -143,13 +153,40 @@ def lint_shell_syntax(where: str, body: str) -> list[Finding]:
     return []
 
 
+def lint_powershell_syntax(where: str, body: str) -> list[Finding]:
+    """No PowerShell on this host, so the check is structural: balanced braces
+    and parentheses outside strings, which catches a cut-off `function {` or a
+    stray `)` without pretending to parse the language."""
+    scrubbed = re.sub(r"\$\{\{[^}]*\}\}", "PLACEHOLDER", body)
+    scrubbed = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', "", scrubbed)
+    scrubbed = re.sub(r"#[^\n]*", "", scrubbed)
+    depth = {"{": 0, "(": 0}
+    for ch in scrubbed:
+        if ch in "{(":
+            depth[ch] += 1
+        elif ch == "}":
+            depth["{"] -= 1
+        elif ch == ")":
+            depth["("] -= 1
+        if depth["{"] < 0 or depth["("] < 0:
+            return [("E000", where, "powershell: closing bracket without an opener")]
+    if depth["{"] or depth["("]:
+        return [("E000", where, f"powershell: unbalanced brackets (braces {depth['{']}, parens {depth['(']})")]
+    return []
+
+
 def lint_workflow(path: Path) -> list[Finding]:
     doc = yaml.safe_load(path.read_text())
     findings: list[Finding] = []
     gpu_jobs: set[str] = set()
-    for job_name, job, where, body in _steps(doc):
+    for job_name, job, where, body, shell in _steps(doc):
         findings += lint_text(where, body)
-        findings += lint_shell_syntax(where, body)
+        # `bash -n` only means something for a bash step; a PowerShell body is
+        # not bash and would fail on its first `&` or `$env:` for no reason.
+        if shell in ("powershell", "pwsh"):
+            findings += lint_powershell_syntax(where, body)
+        else:
+            findings += lint_shell_syntax(where, body)
         if re.search(r"mem_get_info|memory_allocated|rocm-smi|nvidia-smi|torch\.cuda", body):
             env = {**(doc.get("env") or {}), **(job.get("env") or {})}
             masked = env.get("HIP_VISIBLE_DEVICES") == "" or \
