@@ -1,0 +1,222 @@
+name: "AMD CI: does Qwen3.8-Flash-Next emit //// on ROCm without the unified-memory variable? b10698 vs b10715 (gfx1151)"
+
+# The question. Two Strix Halo reports show Qwen3.8-Flash-Next degenerating into
+# `////` on ROCm with NO Studio in the loop and NO GGML_CUDA_ENABLE_UNIFIED_MEMORY:
+# ranxianglei's original ggml-org#27797 (self-built, /completion, multi-segment
+# prompts) and auf1r2 on HF discussion #38 (self-built b10666, thinking output
+# turns to slashes until the context fills). k-mktr's A/B on the same issue pins
+# THEIR slashes on the variable instead. So the variable is one trigger, and the
+# open question is whether the other known APU bug, the HIP host-buffer race from
+# upstream c7d87229 (fixed by ggml-org#25863, carried as unslothai/llama.cpp#158),
+# is what the no-variable reporters are seeing.
+#
+# This job holds the variable ABSENT in both states (asserted by a gate) and
+# varies only the binary:
+#
+#   base  b10698-mix-67dfc8b   carries the race, predates the #158 pin
+#   head  b10715-mix-86bd2d3   carries #158
+#
+# Cells, same model, same flags, one host, one job:
+#
+#   F1  27797's exact prompts over /completion: single segment (the reporter's
+#       clean control), multi-turn, preamble + one segment, system + user.
+#       Reporter's flags: -c 8192 --parallel 1 -fa off --jinja. The reporter also
+#       needed LLAMA_ATTN_ROT_DISABLE=1 on a pre-merge PR build; that knob does
+#       not exist in the merged code and is not set here.
+#   F2  Studio-shaped chat with THINKING ON: --parallel 4 --kv-unified -b 2048
+#       -ub 512 -fa on, 4 concurrent coded prompts then 2 sequential. The user
+#       screenshots are thinking blocks full of `/`, so the reasoning text is
+#       where the counters look. The code is NOT required to come back here: a
+#       160-token budget can be spent entirely thinking, and that is not a defect.
+#   F3  Same server flags, thinking OFF, code required. The arithmetic oracle.
+#
+# PARTIAL OFFLOAD, read the gate. UD-IQ1_S is 67.6 GiB on a 62 GB host; uma6's Y1
+# base leg placed 41.4 GiB on the GPU and 27.5 GiB on the CPU and generated
+# coherently at 24.7 tok/s. The placement gate demands both builds split the
+# model identically; if their fitters disagree, the cell is INCONCLUSIVE and the
+# summary says so rather than comparing two different placements.
+#
+# WHAT THIS CANNOT SAY. Nothing about the variable half (#157) on Flash-Next:
+# uma6 showed that with the variable set this host hangs at load on IQ1_S and
+# OOMs on IQ4_XS. That instance needs a 128 GB Strix box, which is the reporters'
+# hardware and not ours. Nothing about discrete cards either: the race is
+# integrated-only by construction.
+#
+# READ THE RULE. F1-F3 are differential: a b10698 base that does not degenerate
+# gives VOID and a red step. That is the honest reading ("the race did not fire
+# on Flash-Next in this shape today"), not a failure of the fix.
+
+on:
+  push:
+    branches: [amd-ci-llamacpp-race2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BROKEN_TAG: "b10698-mix-67dfc8b"
+  FIXED_TAG: "b10715-mix-86bd2d3"
+  FN_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  FN_REV: "c8b5954a88c2775c546b92593eda40ea041d3176"
+  SMALL_DIR: "UD-IQ1_S"
+  SMALL_HEAD: "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  NGL: "999"
+
+jobs:
+
+  gpu:
+    name: "Flash-Next UD-IQ1_S, b10698 vs b10715, gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 480
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamacpp-race2"
+
+      - name: Hardware gate and memory bounds
+        run: |
+          set -eu
+          python3 amd_ci/lib/gate.py --no-torch --require linux \
+            --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo || true; } > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          { uname -a; } > "$AMD_CI_WORK/out/uname.txt" 2>&1
+          { free -g; } > "$AMD_CI_WORK/out/free_start.txt" 2>&1
+          cat "$AMD_CI_WORK/out/free_start.txt"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: Fetch both llama.cpp builds and confirm each knows qwen4exp
+        timeout-minutes: 45
+        run: |
+          set -eu
+          R="https://github.com/unslothai/llama.cpp/releases/download"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$BROKEN_TAG/app-$BROKEN_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/broken" --out "$AMD_CI_WORK/out/bin_broken.json"
+          python3 amd_ci/lib/fetch_llamacpp.py \
+            --url "$R/$FIXED_TAG/app-$FIXED_TAG-linux-x64-rocm-gfx1151.tar.gz" \
+            --dest "$AMD_CI_WORK/lcpp/fixed" --out "$AMD_CI_WORK/out/bin_fixed.json"
+          for B in broken fixed; do
+            LD_LIBRARY_PATH="$AMD_CI_WORK/lcpp/$B" "$AMD_CI_WORK/lcpp/$B/llama-server" --version \
+              > "$AMD_CI_WORK/out/version_$B.txt" 2>&1 || true
+            cat "$AMD_CI_WORK/out/version_$B.txt"
+            # uma1 burned a run on a binary that could not load this architecture.
+            if LD_LIBRARY_PATH="$AMD_CI_WORK/lcpp/$B" strings "$AMD_CI_WORK/lcpp/$B"/libllama*.so 2>/dev/null | grep -q "qwen4exp"; then
+              echo "$B: knows qwen4exp"
+            else
+              echo "::warning::$B: no 'qwen4exp' string found in libllama; the load step will tell"
+            fi
+          done
+
+      - name: Fetch Flash-Next UD-IQ1_S, 67.6 GiB, and lay out the two states
+        timeout-minutes: 240
+        run: |
+          set -eu
+          M="$AMD_CI_WORK/models"
+          for N in 00001 00002 00003; do
+            F="Qwen3.8-Flash-Next-UD-IQ1_S-$N-of-00003.gguf"
+            python3 amd_ci/lib/fetch_gguf.py --repo "$FN_REPO" \
+              --file "$SMALL_DIR/$F" --revision "$FN_REV" --as-name "$F" \
+              --local-dir "$M/src" --out "$AMD_CI_WORK/out/model_$N.json"
+          done
+          # Same bytes in both state dirs; the `bin` file is the variable; the
+          # unified-memory name is unset in BOTH so #157's bug cannot be what moves.
+          for S in base head; do
+            mkdir -p "$M/fn_$S"
+            for F in "$M"/src/*.gguf; do ln -f "$F" "$M/fn_$S/$(basename "$F")"; done
+            printf '%s\n' '-GGML_CUDA_ENABLE_UNIFIED_MEMORY' > "$M/fn_$S/env"
+          done
+          printf '%s\n' "$AMD_CI_WORK/lcpp/broken" > "$M/fn_base/bin"
+          printf '%s\n' "$AMD_CI_WORK/lcpp/fixed" > "$M/fn_head/bin"
+          python3 amd_ci/lib/write_states.py --require-file "$SMALL_HEAD" \
+            --path "base=$M/fn_base" --path "head=$M/fn_head" \
+            --label "base=$BROKEN_TAG (has the race)" --label "head=$FIXED_TAG (carries #158)" \
+            --out "$AMD_CI_WORK/out/states.json"
+          df -h "$AMD_CI_WORK" | tail -1
+
+      - name: F1 - 27797's exact prompts over /completion, reporter's flags
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+          AMD_CI_AB_NONCE_REQUIRED: "0"
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_F1_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ab_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ab_differential.py \
+            --out-dir "$AMD_CI_WORK/out/F1" \
+            --title "F1 Flash-Next UD-IQ1_S, ggml-org#27797's four prompts, /completion greedy, -c 8192 --parallel 1 -fa off, b10698 vs b10715, gfx1151" \
+            -- --gguf "$SMALL_HEAD" --ngl "$NGL" --ctx-size 8192 \
+               --mode raw --raw-prompts-file "$GITHUB_WORKSPACE/amd_ci/data/qwen4exp_27797_prompts.json" \
+               --repeats 2 --n-predict 40 \
+               --extra-arg=--parallel --extra-arg=1 --extra-arg=-fa --extra-arg=off --extra-arg=--jinja \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_F1_after.txt"
+          cat "$AMD_CI_WORK/out/F1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/F1"
+
+      - name: F2 - Studio-shaped chat, thinking ON, 4 concurrent then 2 sequential
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+          AMD_CI_AB_NONCE_REQUIRED: "0"
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_F2_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ab_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ab_differential.py \
+            --out-dir "$AMD_CI_WORK/out/F2" \
+            --title "F2 Flash-Next UD-IQ1_S, chat with thinking ON, 4 concurrent + 2 sequential coded prompts, --parallel 4 --kv-unified -b 2048 -ub 512, b10698 vs b10715, gfx1151" \
+            -- --gguf "$SMALL_HEAD" --ngl "$NGL" --ctx-size 16384 \
+               --mode nonce --concurrent 4 --repeats 2 --filler-words 1400 --n-predict 160 \
+               --thinking on \
+               --extra-arg=--parallel --extra-arg=4 --extra-arg=--kv-unified \
+               --extra-arg=-b --extra-arg=2048 --extra-arg=-ub --extra-arg=512 \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--jinja \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_F2_after.txt"
+          cat "$AMD_CI_WORK/out/F2/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/F2"
+
+      - name: F3 - same server, thinking OFF, code required
+        if: always()
+        env:
+          AMD_CI_EXPECT_DEVICE: ROCm
+          AMD_CI_AB_NONCE_REQUIRED: "1"
+        run: |
+          set +e
+          free -g > "$AMD_CI_WORK/out/free_F3_before.txt"
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llamacpp_ab_probe.py \
+            --criteria amd_ci/criteria/llamacpp_ab_differential.py \
+            --out-dir "$AMD_CI_WORK/out/F3" \
+            --title "F3 Flash-Next UD-IQ1_S, chat with thinking OFF, 4 concurrent + 2 sequential coded prompts, --parallel 4 --kv-unified -b 2048 -ub 512, b10698 vs b10715, gfx1151" \
+            -- --gguf "$SMALL_HEAD" --ngl "$NGL" --ctx-size 16384 \
+               --mode nonce --concurrent 4 --repeats 2 --filler-words 1400 --n-predict 48 \
+               --thinking off \
+               --extra-arg=--parallel --extra-arg=4 --extra-arg=--kv-unified \
+               --extra-arg=-b --extra-arg=2048 --extra-arg=-ub --extra-arg=512 \
+               --extra-arg=-fa --extra-arg=on --extra-arg=--jinja \
+               --load-timeout 3600 --request-timeout 3600
+          free -g > "$AMD_CI_WORK/out/free_F3_after.txt"
+          cat "$AMD_CI_WORK/out/F3/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/F3"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamacpp-race2-gfx1151
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
