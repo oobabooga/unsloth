@@ -1,0 +1,41 @@
+name: PR9906 frontend cross-platform
+
+on:
+  push:
+    branches: [pr9906-frontend-ci]
+
+permissions: {}
+
+jobs:
+  frontend:
+    name: "frontend checks (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Runner identity
+        run: node -e "console.log(process.platform, process.arch, process.version)"
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Locale parity (strict) -- the PR adds a key to 12 locales
+        run: npm run i18n:check:strict
+      - name: Typecheck
+        run: npm run typecheck
+      - name: The PR's own test file
+        run: node --experimental-strip-types --test tests/key-reveal-card.test.ts
+      - name: Full frontend unit suite
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Bundle budget
+        run: npm run bundle:check
