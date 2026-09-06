@@ -51,8 +51,14 @@ jobs:
       - name: Hardware gate
         run: |
           set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          # NOT `--require rocm gpu`: those are read out of torch, and under
+          # --no-torch they are False on a machine that plainly has both, so the
+          # gate would fail for the harness's reason rather than the host's.
+          # amd-smi, rocm-smi and the radeon Vulkan ICD are read from the system
+          # and identify the AMD box without importing anything.
+          python3 amd_ci/lib/gate.py --no-torch \
+            --require linux vulkan amd_smi rocm_smi \
+            --out "$AMD_CI_WORK/out/host.json"
 
       - name: Resolve states
         run: |
@@ -104,8 +110,11 @@ jobs:
           # An AMD GPU with no usable ROCm cannot be reached on this host any
           # other way, since every variable that hides ROCm is either ignored by
           # the code under test or documented as suppressing the new route.
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu docker \
-            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          # rocm and gpu are torch-derived and stay False under --no-torch, so the
+          # AMD box is identified from amd-smi, rocm-smi and the radeon Vulkan ICD.
+          python3 amd_ci/lib/gate.py --no-torch \
+            --require linux vulkan amd_smi rocm_smi docker \
+            --out "$AMD_CI_WORK/out/host.json"
 
       - name: Resolve states
         run: |
@@ -168,8 +177,14 @@ jobs:
       - name: Hardware gate
         run: |
           set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          # NOT `--require rocm gpu`: those are read out of torch, and under
+          # --no-torch they are False on a machine that plainly has both, so the
+          # gate would fail for the harness's reason rather than the host's.
+          # amd-smi, rocm-smi and the radeon Vulkan ICD are read from the system
+          # and identify the AMD box without importing anything.
+          python3 amd_ci/lib/gate.py --no-torch \
+            --require linux vulkan amd_smi rocm_smi \
+            --out "$AMD_CI_WORK/out/host.json"
 
       - name: Resolve states
         run: |
