@@ -1,0 +1,213 @@
+name: "AMD CI: validate PR 8412"
+
+# Scaffolded from amd_ci/templates/workflow.yml, then specialised. Three jobs,
+# each answering one question PR 8412 makes:
+#
+#   installer-fixes  do the three test scripts the PR ADDS fail against the OLD
+#                    install.sh? They are absent at the base, so the probe ports
+#                    them in and runs them there. Absent tests prove nothing.
+#   routing          on an AMD GPU with no usable ROCm, does the base hand
+#                    llama.cpp the CPU bundle where the head picks Vulkan?
+#   suites           does any Studio install test that passed at the base fail
+#                    at the head?
+#
+# None of the three masks the GPU, which departs from the template on purpose.
+# The masks exist so a non-measuring job cannot perturb a measurement beside it,
+# and nothing here allocates VRAM: two jobs read sysfs vendor ids and run bash,
+# the third runs unit tests. Setting them would instead change the code under
+# test -- `ROCR_VISIBLE_DEVICES` being SET is documented in this very PR as
+# suppressing the automatic Vulkan route, so masking would fake a null result.
+#
+# The Windows half of this validation is a separate workflow (amd-ci-pr8412w),
+# because Docker is not installed on any Windows runner in the pool.
+
+on:
+  push:
+    branches: [amd-ci-pr8412]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "8412"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  MERGED: "0"
+
+jobs:
+
+  installer-fixes:
+    name: "PR 8412 install.sh fixes, asserted against the old implementation"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr8412-installer"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Differential
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/shell_suite_probe.py \
+            --criteria amd_ci/criteria/installer_fixes_land.py \
+            --out-dir "$AMD_CI_WORK/out/installer" \
+            -- --tests tests/sh/test_rocm_bad_arch_gate.sh \
+                       tests/sh/test_shell_rc_path_append.sh \
+                       tests/sh/test_uv_cache_colocation.sh \
+               --scripts-from "$AMD_CI_WORK/states/head"
+          cat "$AMD_CI_WORK/out/installer/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/installer"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr8412-installer
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  routing:
+    name: "PR 8412 llama.cpp routing on AMD without ROCm"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr8412-routing"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          # docker is required, not optional: the container IS the measurement.
+          # An AMD GPU with no usable ROCm cannot be reached on this host any
+          # other way, since every variable that hides ROCm is either ignored by
+          # the code under test or documented as suppressing the new route.
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu docker \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Show what the host sees before containerising
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+          echo "--- sysfs vendor ids on the host"
+          for f in /sys/class/drm/card*/device/vendor; do echo "$f = $(cat "$f")"; done
+          echo "--- ROCm on the host (expected PRESENT here, ABSENT in the container)"
+          command -v rocminfo; command -v amd-smi; ls -d /opt/rocm 2>&1
+          echo "--- device nodes the container will be given"
+          ls -l /dev/kfd /dev/dri 2>&1
+
+      - name: Pull the probe image
+        run: |
+          set -euo pipefail
+          # In THIS job: the pool is many machines with no shared image cache, so
+          # pulling anywhere else would silently re-pull here.
+          docker pull python:3.12-slim
+
+      - name: Differential
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llama_backend_routing_probe.py \
+            --criteria amd_ci/criteria/amd_no_rocm_uses_vulkan.py \
+            --out-dir "$AMD_CI_WORK/out/routing" \
+            -- --container python:3.12-slim
+          cat "$AMD_CI_WORK/out/routing/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/routing"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr8412-routing
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  suites:
+    name: "PR 8412 Studio install suites, base vs head"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr8412-suites"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Test environment
+        run: |
+          set -euo pipefail
+          # A plain venv, not install.sh: these suites are unit tests of the
+          # installer's decision functions and import no torch, so the hour the
+          # full Studio install costs would buy nothing.
+          python3 -m venv "$AMD_CI_WORK/venv"
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q --upgrade pip
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+          echo "AMD_CI_PY=$AMD_CI_WORK/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Differential
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/suites" \
+            --python "$AMD_CI_PY" \
+            -- --subdir . --tests tests/studio/install \
+                                  tests/studio/test_amd_no_rocm_vulkan_routing.py
+          cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr8412-suites
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
