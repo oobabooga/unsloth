@@ -1,0 +1,165 @@
+name: "AMD CI (Windows): __TITLE__"
+
+# Generated from amd_ci/templates/workflow_prebuilt_windows.yml by
+# scaffold.py --prebuilt --windows.
+#
+# The Windows leg of a prebuilt-release differential: the same probe and
+# criteria as the Linux template, on the Windows zips, run by the system Python
+# (stdlib only). `shell: powershell` only; no bash, no docker, no shared disk.
+# No concurrency group by default: four boxes, four GPUs, and the labels cannot
+# pin one.
+
+on:
+  push:
+    branches: [__BRANCH__]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REL: "__REL__"
+  MODEL_REPO: "__MODEL_REPO__"
+  MODEL_REV: "__MODEL_REV__"
+  SENTINEL_REPO: "__SENTINEL_REPO__"
+  SENTINEL_REV: "__SENTINEL_REV__"
+  SENTINEL_FILE: "__SENTINEL_FILE__"
+
+jobs:
+
+  windows:
+    name: "__TITLE__ on Windows"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: __TIMEOUT__
+    # concurrency:
+    #   group: amd-ci-strix-halo-windows-gpu
+    #   cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "__SLUG__"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate and facts
+        run: |
+          $ErrorActionPreference = "Continue"
+          # No rocminfo on Windows; the arch comes from the video controller name. Exits 1 on a miss.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --expect-arch gfx1151 --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM | Format-List | Out-File "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-File "$env:AMD_CI_WORK\out\ram.txt"
+          Get-Content "$env:AMD_CI_WORK\out\gpu.txt"
+          $drive = (Get-Item $env:AMD_CI_WORK).PSDrive
+          $freeGB = [math]::Round($drive.Free / 1GB)
+          Write-Host "free on $($drive.Name): $freeGB GB"
+          if ($freeGB -lt __MIN_FREE_GB__) {
+            Write-Host "FATAL: need about __MIN_FREE_GB__ GB free for the model, the sentinel and the archives."
+            Write-Host "Not substituting a smaller model: the model named is the measurement."
+            exit 1
+          }
+
+      - name: Fetch the prebuilt releases
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out"
+__FETCH_PREBUILTS__
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\emit_bin_env.py" "$O" | Add-Content -Path $env:GITHUB_ENV
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\emit_bin_env.py" "$O"
+
+      - name: Fetch the sentinel model and the prompts
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_gguf.py" --repo "$env:SENTINEL_REPO" --file "$env:SENTINEL_FILE" --revision "$env:SENTINEL_REV" --as-name sentinel.gguf --local-dir "$env:AMD_CI_WORK\models\sentinel" --out "$env:AMD_CI_WORK\out\model_sentinel.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_wikitext.py" --out "$env:AMD_CI_WORK\data\wikitext2_test.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "SENTINEL=$env:AMD_CI_WORK\models\sentinel\sentinel.gguf"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROMPTS=$env:AMD_CI_WORK\data\wikitext2_test.txt"
+
+      - name: Fetch the model (__MODEL_DESC__)
+        timeout-minutes: __MODEL_TIMEOUT__
+        run: |
+          $ErrorActionPreference = "Continue"
+          $M = "$env:AMD_CI_WORK\models\model"
+__FETCH_MODEL__
+          Get-ChildItem $M
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL=$M\__MODEL_ENTRY__"
+
+      - name: Resolve states (prebuilt directories, not source trees)
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\write_states.py" --require-file llama-server.exe `
+            --path "base=$env:BASE_BIN" --path "head=$env:HEAD_BIN" `
+            --label "base=__BASE_LABEL__" --label "head=__HEAD_LABEL__" `
+            --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: D1 - base vs head
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/__PROBE__" `
+            --criteria "$env:GITHUB_WORKSPACE/__CRITERIA__" `
+            --out-dir "$env:AMD_CI_WORK\out\D1" --python "$env:AMD_CI_PY" `
+            --title "__D1_TITLE__" `
+            -- --model "$env:MODEL" --sentinel-model "$env:SENTINEL" --prompts "$env:PROMPTS" `
+               __PROBE_COMMON__ __D1_ARGS__
+          Get-Content "$env:AMD_CI_WORK\out\D1\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\D1"
+
+      - name: Controls
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\controls"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          function Run-Arm($n, $b, $extra) {
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE/__PROBE__" --state $n --checkout $b `
+              --out "$O\obs_$n.json" --model "$env:MODEL" --sentinel-model "$env:SENTINEL" --prompts "$env:PROMPTS" `
+              __PROBE_COMMON__ @extra *> "$O\probe_$n.log"
+            Write-Host "$n rc=$LASTEXITCODE"
+          }
+__CONTROLS__
+
+      - name: Summary of every arm
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\summarize_arms.py" "$env:AMD_CI_WORK\out" "$env:GITHUB_WORKSPACE/__CRITERIA__" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\summarize_arms.py" "$env:AMD_CI_WORK\out" "$env:GITHUB_WORKSPACE/__CRITERIA__"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: __SLUG__
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn

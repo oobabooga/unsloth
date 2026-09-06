@@ -1,0 +1,380 @@
+name: "AMD CI (Windows): Strix Halo memory reporting, the HIP allocation cap and the Vulkan/ROCm gap"
+
+# Scaffolded from amd_ci/templates/workflow_prebuilt_windows.yml, then extended
+# with the cells this question needs (W0-W6). Answers, on the devlab Strix Halo:
+#
+#   W0  what the OS says this machine has (registry carve-out, RAM, page file)
+#   W1  what every layer reports as the GPU's memory, side by side
+#   W2  the largest single hipMalloc that survives a write and a read back
+#   W3  whether a model whose device buffer exceeds that cap loads at all
+#   W4  ROCm against Vulkan on a model all arms can load
+#   W5  how prefill time grows with prompt length, and whether the server emits
+#       the progress a renewable first-token deadline would renew on
+#   W6  what Unsloth Studio's own Vulkan probe returns here, verbatim
+#
+# The differential variable in W2 and W3 is the HIP runtime, not the llama.cpp
+# build: `base` is the amdhip64_7.dll the release ships and `head` is the one
+# supplied through `patched_dll_url`. Without that input the patched arms do not
+# run and the report says which arms are missing rather than implying a result.
+#
+# `shell: powershell` only (PowerShell 5.1); no bash, no docker, no admin.
+# No concurrency group: four Windows boxes, four GPUs, and the labels cannot pin
+# one, so a group would serialise unrelated machines.
+
+on:
+  push:
+    branches: [amd-ci-strix-halo-memory]
+  workflow_dispatch:
+    inputs:
+      patched_dll_url:
+        description: "URL of the HIP runtime under test (amdhip64_7.dll). Empty: the patched arms do not run."
+        required: false
+        default: ""
+      patched_dll_sha256:
+        description: "sha256 the download must match, so the arm names a known artifact"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  REL: "https://github.com/unslothai/llama.cpp/releases/download"
+  TAG_HEAD: "b10798-mix-659e406"
+  TAG_BASE: "b10715-mix-86bd2d3"
+  MODEL_REPO: "unsloth/Qwen3.8-Flash-Next-GGUF"
+  MODEL_REV: "38bb39ee97821de2c9009abb7e93950eec396e66"
+  SENTINEL_REPO: "unsloth/Qwen3-0.6B-GGUF"
+  SENTINEL_REV: "50968a4468ef4233ed78cd7c3de230dd1d61a56b"
+  SENTINEL_FILE: "Qwen3-0.6B-Q4_K_M.gguf"
+  # UD-IQ1_S: about 40 GiB on the device, so every arm can load it.
+  SMALL_DIR: "UD-IQ1_S"
+  SMALL_ENTRY: "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf"
+  # UD-Q4_K_XL: about 77 GiB on the device once the PLE table stays host-side,
+  # which is above the 64 GiB clamp and below the pool the fix credits. This is
+  # also the model in the user's own logs.
+  BIG_DIR: "UD-Q4_K_XL"
+  BIG_ENTRY: "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+
+jobs:
+
+  windows:
+    name: "Strix Halo memory, allocation cap and backends on Windows"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "amd-ci-strix-halo-memory"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: W0 - host gate and facts
+        run: |
+          $ErrorActionPreference = "Continue"
+          # No rocminfo on Windows; the arch comes from the video controller name. Exits 1 on a miss.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --expect-arch gfx1151 --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM | Format-List | Out-File "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-File "$env:AMD_CI_WORK\out\ram.txt"
+          Get-CimInstance Win32_PageFileUsage | Format-List | Out-File "$env:AMD_CI_WORK\out\pagefile.txt"
+          Get-Content "$env:AMD_CI_WORK\out\gpu.txt"
+          # The registry carve-out is the number the rest of this run is read against:
+          # AdapterRAM above is uint32 and saturates at 4 GiB, so it cannot be used.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
+            --state w0 --sections host --out "$env:AMD_CI_WORK\out\W0_host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $drive = (Get-Item $env:AMD_CI_WORK).PSDrive
+          $freeGB = [math]::Round($drive.Free / 1GB)
+          Write-Host "free on $($drive.Name): $freeGB GB"
+          if ($freeGB -lt 300) {
+            Write-Host "FATAL: need about 300 GB free for two models, the sentinel and the archives."
+            Write-Host "Not substituting smaller models: the crossing model is the measurement."
+            exit 1
+          }
+
+      - name: Fetch the prebuilt releases
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_llamacpp.py" --url "$env:REL/$env:TAG_HEAD/app-$env:TAG_HEAD-windows-x64-rocm-gfx1151.zip" --dest "$env:AMD_CI_WORK\lcpp\rocm" --out "$O\bin_rocm.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_llamacpp.py" --url "$env:REL/$env:TAG_HEAD/app-$env:TAG_HEAD-windows-x64-vulkan.zip" --dest "$env:AMD_CI_WORK\lcpp\vulkan" --out "$O\bin_vulkan.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_llamacpp.py" --url "$env:REL/$env:TAG_BASE/app-$env:TAG_BASE-windows-x64-rocm-gfx1151.zip" --dest "$env:AMD_CI_WORK\lcpp\rocm_old" --out "$O\bin_rocm_old.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rocm = (Get-Content "$O\bin_rocm.json" | ConvertFrom-Json).bin_dir
+          $vulkan = (Get-Content "$O\bin_vulkan.json" | ConvertFrom-Json).bin_dir
+          $rocmOld = (Get-Content "$O\bin_rocm_old.json" | ConvertFrom-Json).bin_dir
+          Add-Content -Path $env:GITHUB_ENV -Value "ROCM_BIN=$rocm"
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_BIN=$vulkan"
+          Add-Content -Path $env:GITHUB_ENV -Value "ROCM_OLD_BIN=$rocmOld"
+          Write-Host "rocm=$rocm vulkan=$vulkan rocm_old=$rocmOld"
+
+      - name: Stage the HIP runtime under test, when one was supplied
+        run: |
+          $ErrorActionPreference = "Continue"
+          $url = "${{ github.event.inputs.patched_dll_url }}"
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            Write-Host "No patched HIP runtime supplied."
+            Write-Host "The stock arms run and the patched arms do not; the report states which."
+            Add-Content -Path $env:GITHUB_ENV -Value "ROCM_PATCHED_BIN="
+            exit 0
+          }
+          # A copy of the release, with only the runtime replaced: one variable.
+          $dst = "$env:AMD_CI_WORK\lcpp\rocm_patched"
+          Copy-Item -Recurse -Force -LiteralPath $env:ROCM_BIN -Destination $dst
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_url.py" --url "$url" `
+            --dest "$dst\amdhip64_7.dll" --expect-sha256 "${{ github.event.inputs.patched_dll_sha256 }}" `
+            --out "$env:AMD_CI_WORK\out\patched_dll.json"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "FATAL: the runtime under test did not download, or did not match its hash."
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "ROCM_PATCHED_BIN=$dst"
+
+      - name: Fetch the sentinel model and the prompts
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_gguf.py" --repo "$env:SENTINEL_REPO" --file "$env:SENTINEL_FILE" --revision "$env:SENTINEL_REV" --as-name sentinel.gguf --local-dir "$env:AMD_CI_WORK\models\sentinel" --out "$env:AMD_CI_WORK\out\model_sentinel.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_wikitext.py" --out "$env:AMD_CI_WORK\data\wikitext2_test.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "SENTINEL=$env:AMD_CI_WORK\models\sentinel\sentinel.gguf"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROMPTS=$env:AMD_CI_WORK\data\wikitext2_test.txt"
+
+      - name: Fetch the small model (UD-IQ1_S, 67.6 GiB, 3 shards)
+        timeout-minutes: 180
+        run: |
+          $ErrorActionPreference = "Continue"
+          $M = "$env:AMD_CI_WORK\models\small"
+          foreach ($n in @("00001", "00002", "00003")) {
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_gguf.py" --repo "$env:MODEL_REPO" --file "$env:SMALL_DIR/Qwen3.8-Flash-Next-UD-IQ1_S-$n-of-00003.gguf" --revision "$env:MODEL_REV" --local-dir "$M" --out "$env:AMD_CI_WORK\out\model_small_$n.json"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Get-ChildItem $M
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL_SMALL=$M\$env:SMALL_ENTRY"
+
+      - name: Fetch the crossing model (UD-Q4_K_XL, 103.7 GiB, 4 shards)
+        timeout-minutes: 240
+        run: |
+          $ErrorActionPreference = "Continue"
+          $M = "$env:AMD_CI_WORK\models\big"
+          foreach ($n in @("00001", "00002", "00003", "00004")) {
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_gguf.py" --repo "$env:MODEL_REPO" --file "$env:BIG_DIR/Qwen3.8-Flash-Next-UD-Q4_K_XL-$n-of-00004.gguf" --revision "$env:MODEL_REV" --local-dir "$M" --out "$env:AMD_CI_WORK\out\model_big_$n.json"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Get-ChildItem $M
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL_BIG=$M\$env:BIG_ENTRY"
+
+      - name: W1 - what every layer reports as this GPU's memory
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W1"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
+            --state rocm_stock --checkout "$env:ROCM_BIN" --vulkan-dir "$env:VULKAN_BIN" `
+            --fit-model "$env:MODEL_SMALL" --sections host,hip,vulkan_raw,ggml_vulkan,fit `
+            --out "$O\memreport_rocm_stock.json" *> "$O\probe_rocm_stock.log"
+          Write-Host "rocm stock rc=$LASTEXITCODE"
+          Get-Content "$O\probe_rocm_stock.log" -Tail 40
+          if (-not [string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
+              --state rocm_patched --checkout "$env:ROCM_PATCHED_BIN" --vulkan-dir "$env:VULKAN_BIN" `
+              --fit-model "$env:MODEL_SMALL" --sections host,hip,vulkan_raw,ggml_vulkan,fit `
+              --out "$O\memreport_rocm_patched.json" *> "$O\probe_rocm_patched.log"
+            Write-Host "rocm patched rc=$LASTEXITCODE"
+          }
+          # A statement that cannot be decided is a missing reading, and exits 1.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\memory_report_summary.py" `
+            (Get-ChildItem "$O\memreport_*.json" | ForEach-Object { "$($_.BaseName.Replace('memreport_',''))=$($_.FullName)" }) `
+            --require over_report,sums_heaps,hip_is_vgm_only | Tee-Object -FilePath "$O\summary.md"
+          $rc = $LASTEXITCODE
+          Get-Content "$O\summary.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { exit $rc }
+
+      - name: W2 - the largest single allocation the HIP runtime allows
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W2"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          if ([string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
+            Write-Host "One runtime only: measuring the stock cap, with no differential to draw."
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
+              --state rocm_stock --checkout "$env:ROCM_BIN" --sections host,hip,alloc_cap `
+              --alloc-lo-gib 1 --alloc-hi-gib 200 --alloc-resolution-gib 0.5 --alloc-reps 2 `
+              --out "$O\obs_rocm_stock.json"
+            $rc = $LASTEXITCODE
+            $cap = (Get-Content "$O\obs_rocm_stock.json" | ConvertFrom-Json).sections.alloc_cap.max_ok_gib
+            "## W2 allocation cap (stock runtime only)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            "Largest single hipMalloc that also wrote and read back: **$cap GiB**." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            "No runtime under test was supplied, so this is one reading and not a differential." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            if ($rc -ne 0) { exit $rc }
+            exit 0
+          }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\write_states.py" --require-file llama-server.exe `
+            --path "base=$env:ROCM_BIN" --path "head=$env:ROCM_PATCHED_BIN" `
+            --label "base=$env:TAG_HEAD shipped amdhip64_7.dll" --label "head=$env:TAG_HEAD with the runtime under test" `
+            --out "$O\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$O\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/gpu_memory_report_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/llamacpp_alloc_cap.py" `
+            --out-dir "$O" --python "$env:AMD_CI_PY" `
+            --title "W2 single-allocation cap: shipped HIP runtime vs the one under test" `
+            -- --sections host,hip,alloc_cap --alloc-lo-gib 1 --alloc-hi-gib 200 `
+               --alloc-resolution-gib 0.5 --alloc-reps 2
+          Get-Content "$O\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$O"
+
+      - name: W3 - does a model above the cap load
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W3"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          $common = @("--model", "$env:MODEL_BIG", "--sentinel-model", "$env:SENTINEL",
+                      "--cells", "single", "--ctx-single", "8192", "--n-predict", "64",
+                      "--load-timeout", "2400", "--port", "8661")
+          if ([string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
+            Write-Host "One runtime only: does the shipped one load the crossing model at all?"
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE/amd_ci/probes/llamacpp_server_probe.py" `
+              --state rocm_stock --checkout "$env:ROCM_BIN" --out "$O\obs_rocm_stock.json" @common `
+              *> "$O\probe_rocm_stock.log"
+            Write-Host "rocm stock rc=$LASTEXITCODE"
+            Get-Content "$O\probe_rocm_stock.log" -Tail 40
+            # A Vulkan arm on the same model, so a refusal can be attributed to the
+            # runtime rather than to the machine not holding the model at all.
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE/amd_ci/probes/llamacpp_server_probe.py" `
+              --state vulkan --checkout "$env:VULKAN_BIN" --out "$O\obs_vulkan.json" @common `
+              *> "$O\probe_vulkan.log"
+            Write-Host "vulkan rc=$LASTEXITCODE"
+            exit 0
+          }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\write_states.py" --require-file llama-server.exe `
+            --path "base=$env:ROCM_BIN" --path "head=$env:ROCM_PATCHED_BIN" `
+            --label "base=$env:TAG_HEAD shipped amdhip64_7.dll" --label "head=$env:TAG_HEAD with the runtime under test" `
+            --out "$O\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$O\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/llamacpp_server_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/llamacpp_model_load_cap.py" `
+            --out-dir "$O" --python "$env:AMD_CI_PY" `
+            --title "W3 loading UD-Q4_K_XL, whose device buffer is above the stock cap" `
+            -- @common
+          Get-Content "$O\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$O"
+
+      - name: W4 - ROCm against Vulkan, arms alternated
+        if: always()
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W4"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          $arms = @("--arm", "rocm_stock=$env:ROCM_BIN", "--arm", "vulkan=$env:VULKAN_BIN")
+          if (-not [string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
+            $arms += @("--arm", "rocm_patched=$env:ROCM_PATCHED_BIN")
+          }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\bench_arms.py" @arms `
+            --model "$env:MODEL_SMALL" --cycles 3 `
+            --bench-arg=-p --bench-arg=512 --bench-arg=-n --bench-arg=128 `
+            --bench-arg=-r --bench-arg=2 --bench-arg=-ngl --bench-arg=999 `
+            --out "$O\bench.json" --log-dir "$O" | Tee-Object -FilePath "$O\bench.md"
+          $rc = $LASTEXITCODE
+          Get-Content "$O\bench.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { Write-Host "an arm produced no rows; see bench.json" }
+
+      - name: W5 - how prefill time grows, and whether progress is reported
+        if: always()
+        timeout-minutes: 180
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W5"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          # Vulkan, because that is the backend Studio installs on this hardware
+          # and the one the reported prefill ran on.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\prefill_scaling.py" `
+            --bin "$env:VULKAN_BIN" --model "$env:MODEL_SMALL" --text "$env:PROMPTS" `
+            --lengths 8192,32768,65536,131072 --ctx 140000 --port 8671 `
+            --out "$O\prefill.json" --log-dir "$O" | Tee-Object -FilePath "$O\prefill.md"
+          $rc = $LASTEXITCODE
+          "## W5 prefill scaling (Vulkan)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          Get-Content "$O\prefill.md" -Tail 40 | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($rc -eq 2) {
+            "**No prompt_progress events arrived.** A first-token deadline renewed on progress has nothing to renew on here." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: W6 - what Studio's own Vulkan probe returns here
+        if: always()
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          $O = "$env:AMD_CI_WORK\out\W6"
+          New-Item -ItemType Directory -Force -Path $O | Out-Null
+          # Studio's probe verbatim at a pinned commit: the point is what Studio
+          # sees, so a local re-implementation would answer a different question.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_url.py" `
+            --url "https://raw.githubusercontent.com/unslothai/unsloth/ca42c015f/studio/backend/core/inference/_vulkan_probe.py" `
+            --dest "$O\_vulkan_probe.py" --out "$O\probe_source.json"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Studio's probe could not be fetched; W6 has no reading."
+            exit 0
+          }
+          & $env:AMD_CI_PY "$O\_vulkan_probe.py" "$env:VULKAN_BIN" *> "$O\studio_vulkan_probe.txt"
+          Write-Host "studio probe rc=$LASTEXITCODE"
+          Get-Content "$O\studio_vulkan_probe.txt"
+          "## W6 Studio's Vulkan probe (index, free, is_igpu, total, name)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "``````" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          Get-Content "$O\studio_vulkan_probe.txt" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "``````" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Which arms ran
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          "## Arms" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ([string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
+            "No HIP runtime under test was supplied, so W2, W3 and W4 ran their stock arms only." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            "The cap and the crossing load are measured; whether a different runtime lifts them is not." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          } else {
+            $d = Get-Content "$env:AMD_CI_WORK\out\patched_dll.json" | ConvertFrom-Json
+            "Runtime under test: sha256 ``$($d.sha256)``, $($d.bytes) bytes." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+          "This host carves out its own share of a 128 GB pool; a 96 GiB carve-out, a discrete RDNA4 card and WDDM on a discrete GPU are all out of reach here." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strix-halo-memory-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn

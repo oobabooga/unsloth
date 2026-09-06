@@ -1,0 +1,142 @@
+name: "AMD CI: __TITLE__"
+
+# Generated from amd_ci/templates/workflow_prebuilt.yml by scaffold.py --prebuilt.
+#
+# A differential over two PREBUILT llama.cpp releases: nothing is compiled, the
+# states are the archives users download, the probe is llama-server over HTTP,
+# and the verdict is VOID unless the base build shows the defect. Control arms
+# run after the differential and share its summary table.
+#
+# One job, since the runners share no disk; it sits in the shared GPU group.
+# `pending` for longer than a download means the group is held by a run that
+# cannot start (lint E107); `queued` means the pool is busy.
+
+on:
+  push:
+    branches: [__BRANCH__]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REL: "__REL__"
+  MODEL_REPO: "__MODEL_REPO__"
+  MODEL_REV: "__MODEL_REV__"
+  SENTINEL_REPO: "__SENTINEL_REPO__"
+  SENTINEL_REV: "__SENTINEL_REV__"
+  SENTINEL_FILE: "__SENTINEL_FILE__"
+
+jobs:
+
+  gpu:
+    name: "__TITLE__ (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: __TIMEOUT__
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "__SLUG__"
+
+      - name: Hardware gate and host facts
+        run: |
+          set -euo pipefail
+          # No torch on the system Python; the arch comes from rocminfo. Exits 1 on a miss.
+          python3 amd_ci/lib/gate.py --no-torch --require linux gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          { rocminfo 2>&1 | grep -E "Name:|Marketing|Compute Unit|Size:" ; } > "$AMD_CI_WORK/out/rocminfo.txt" || true
+          { free -g; uname -a; } | tee "$AMD_CI_WORK/out/host.txt"
+          rocm-smi --showmeminfo vram > "$AMD_CI_WORK/out/rocm-smi.txt" 2>&1 || true
+          avail_gb=$(df -BG --output=avail "$AMD_CI_WORK" | tail -1 | tr -dc '0-9')
+          echo "free on the work root: ${avail_gb:-?} GB"
+          if [ "${avail_gb:-0}" -lt __MIN_FREE_GB__ ]; then
+            echo "FATAL: need about __MIN_FREE_GB__ GB free for the model, the sentinel and the archives."
+            echo "Not substituting a smaller model: the model named is the measurement."
+            exit 1
+          fi
+
+      - name: Fetch the prebuilt releases
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          O="$AMD_CI_WORK/out"
+__FETCH_PREBUILTS__
+          python3 amd_ci/lib/emit_bin_env.py "$O" | tee -a "$GITHUB_ENV"
+
+      - name: Fetch the sentinel model and the prompts
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/fetch_gguf.py --repo "$SENTINEL_REPO" --file "$SENTINEL_FILE" \
+            --revision "$SENTINEL_REV" --as-name sentinel.gguf \
+            --local-dir "$AMD_CI_WORK/models/sentinel" --out "$AMD_CI_WORK/out/model_sentinel.json"
+          python3 amd_ci/lib/fetch_wikitext.py --out "$AMD_CI_WORK/data/wikitext2_test.txt"
+          echo "SENTINEL=$AMD_CI_WORK/models/sentinel/sentinel.gguf" >> "$GITHUB_ENV"
+          echo "PROMPTS=$AMD_CI_WORK/data/wikitext2_test.txt" >> "$GITHUB_ENV"
+
+      - name: Fetch the model (__MODEL_DESC__)
+        timeout-minutes: __MODEL_TIMEOUT__
+        run: |
+          set -euo pipefail
+          M="$AMD_CI_WORK/models/model"
+__FETCH_MODEL__
+          ls -la "$M"
+          df -h "$AMD_CI_WORK" | tail -1
+          echo "MODEL=$M/__MODEL_ENTRY__" >> "$GITHUB_ENV"
+
+      - name: Resolve states (prebuilt directories, not source trees)
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/write_states.py --require-file llama-server \
+            --path "base=$BASE_BIN" --path "head=$HEAD_BIN" \
+            --label "base=__BASE_LABEL__" --label "head=__HEAD_LABEL__" \
+            --out "$AMD_CI_WORK/out/states.json"
+
+      - name: D1 - base vs head
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe __PROBE__ \
+            --criteria __CRITERIA__ \
+            --out-dir "$AMD_CI_WORK/out/D1" \
+            --title "__D1_TITLE__" \
+            -- --model "$MODEL" --sentinel-model "$SENTINEL" --prompts "$PROMPTS" \
+               __PROBE_COMMON__ __D1_ARGS__
+          cat "$AMD_CI_WORK/out/D1/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/D1"
+
+      - name: Controls
+        if: always()
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/controls"; mkdir -p "$O"
+          run() { # name bin extra...
+            n="$1"; b="$2"; shift 2
+            python3 __PROBE__ --state "$n" --checkout "$b" \
+              --out "$O/obs_$n.json" --model "$MODEL" --sentinel-model "$SENTINEL" --prompts "$PROMPTS" \
+              __PROBE_COMMON__ "$@" > "$O/probe_$n.log" 2>&1
+            echo "$n rc=$?"
+          }
+__CONTROLS__
+
+      - name: Summary of every arm
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/lib/summarize_arms.py "$AMD_CI_WORK/out" __CRITERIA__ | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: __SLUG__
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
