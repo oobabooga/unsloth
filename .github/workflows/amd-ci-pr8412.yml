@@ -202,7 +202,10 @@ jobs:
           # full Studio install costs would buy nothing.
           python3 -m venv "$AMD_CI_WORK/venv"
           "$AMD_CI_WORK/venv/bin/python" -m pip install -q --upgrade pip
-          "$AMD_CI_WORK/venv/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+          # typer: tests/studio/install/test_studio_deps_cli.py imports it at module
+          # scope, and one uncollectable module interrupts the whole run (pytest exit 2),
+          # so its absence read as INCONCLUSIVE rather than as a missing dependency.
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout typer
           echo "AMD_CI_PY=$AMD_CI_WORK/venv/bin/python" >> "$GITHUB_ENV"
 
       - name: Differential
