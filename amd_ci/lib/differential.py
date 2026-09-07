@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import json
 import re
 import subprocess
@@ -37,6 +38,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from capability import TORCH_DERIVED, detect, untested_section  # noqa: E402
+
+
+def _fixed(crit, state: dict, base: dict) -> bool:
+    """Ask a criterion whether one arm is fixed, handing it the base when it wants it.
+
+    Some defects are only visible as a CHANGE: a cap that moved, a rate that rose.
+    A criterion judging such an arm on its own has to hard-code a threshold, and a
+    base that already sits past that threshold then reads as fixed however inert
+    the head is. Declaring a second parameter opts into the comparison; one
+    parameter keeps working unchanged.
+    """
+    try:
+        wants_base = len(inspect.signature(crit.head_is_fixed).parameters) >= 2
+    except (TypeError, ValueError):
+        wants_base = False
+    return _truth(crit.head_is_fixed(state, base) if wants_base else crit.head_is_fixed(state))
 
 
 def _truth(value) -> bool:
@@ -248,10 +265,10 @@ def _decide(crit, obs: dict, gates: list) -> tuple[str, str]:
             return "VOID", (
                 "the base state did not exhibit the defect, so this run did not reproduce "
                 "the problem and cannot speak to whether the change fixes it")
-        fixed = _truth(crit.head_is_fixed(head))
+        fixed = _fixed(crit, head, base)
         # Underscore keys are harness metadata (fixtures), not states.
         extra = [n for n in obs if n not in ("base", "head") and not n.startswith("_")]
-        others = all(_truth(crit.head_is_fixed(obs[n])) for n in extra) if extra else True
+        others = all(_fixed(crit, obs[n], base) for n in extra) if extra else True
         if fixed and others:
             return "CONFIRMED", "the defect reproduces at the base and is absent at the head"
         return "FIX_INCOMPLETE", "the base reproduced the defect but the head did not clear it"

@@ -897,8 +897,72 @@ def test_alloc_cap_criteria() -> None:
     unstable = state(92.0, "b" * 64, stable = False)
     fixed, why = crit.head_is_fixed(unstable)
     check("an unstable head boundary is not a fix", fixed is False and "reproduce" in why, why)
+
+    # A cap is a change, so the arm has to be judged against the base. On a host
+    # whose stock cap already clears the clamp, judging the head alone reads an
+    # inert runtime as a fix; this is the case that says so.
+    high_base, inert = state(110.2, "a" * 64), state(110.2, "b" * 64)
+    fixed, why = crit.head_is_fixed(inert, high_base)
+    check("a head that did not move is not a fix, even far above the clamp",
+          fixed is False and "nothing moved" in why, why)
+    check("and judged alone it would have read as one",
+          crit.head_is_fixed(inert)[0] is True)
+    v, _ = diff._decide(crit, {"base": high_base, "head": inert},
+                        crit.gates({"base": high_base, "head": inert}))
+    check("so the differential refuses it", v == "FIX_INCOMPLETE", v)
+    moved = state(117.0, "b" * 64)
+    check("a head that allocated past the base is a fix",
+          crit.head_is_fixed(moved, high_base)[0] is True)
+
+    # The search stops below the machine on purpose: an arm that clears the whole
+    # range demonstrated no cap, and a base like that cannot be reproduced against.
+    cleared = {**state(117.4, "a" * 64)}
+    cleared["sections"]["alloc_cap"]["capped"] = False
+    shown, why = crit.base_shows_defect(cleared)
+    check("a base that cleared the bounded range shows no defect",
+          shown is False and "refused nothing" in why, why)
+    check("and a head that cleared it is the fix showing",
+          crit.head_is_fixed({**cleared, "hip_dll_file": {"sha256": "b" * 64}}, high_base)[0] is True)
     check("the table names the runtime, not just the state",
           "HIP dll" in crit.table({"base": base, "head": head}))
+
+
+def test_fetch_url_takes_a_library_out_of_an_archive() -> None:
+    print("\nfetch_url: an archive is a shape, not a different artifact")
+    import subprocess, sys, tempfile, zipfile, hashlib
+    fetch = ROOT / "lib" / "fetch_url.py"
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        payload = b"MZ" + b"\x00" * 4096
+        digest = hashlib.sha256(payload).hexdigest()
+        archive = td / "pkg.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("README.txt", "notes")
+            zf.writestr("amdhip64_7.dll", payload)
+        url = archive.as_uri()
+
+        def run(*extra, dest = "out.dll"):
+            return subprocess.run([sys.executable, str(fetch), "--url", url,
+                                   "--dest", str(td / dest), *extra],
+                                  capture_output = True, text = True)
+
+        r = run("--zip-member", "amdhip64_7.dll", "--expect-sha256", digest)
+        check("the member is extracted and hashed, not the archive",
+              r.returncode == 0 and (td / "out.dll").read_bytes() == payload, r.stdout + r.stderr)
+        check("and the archive is not left behind beside it",
+              not (td / "out.dll.download").exists())
+        r = run("--zip-member", "amdhip64_7.dll", "--expect-sha256", "00" * 32, dest = "bad.dll")
+        check("a member that is not the one asked for fails",
+              r.returncode == 1 and "expected sha256" in r.stdout, r.stdout)
+        r = run("--zip-member", "nosuch.dll", dest = "missing.dll")
+        check("a member that is not there fails rather than writing nothing quietly",
+              r.returncode == 1 and "exactly one member" in r.stdout, r.stdout)
+        # The same URL without --zip-member: the archive itself is the artifact,
+        # which is the pre-existing behaviour and must be untouched.
+        r = run(dest = "raw.zip")
+        check("without --zip-member the download is written as it arrived",
+              r.returncode == 0 and (td / "raw.zip").read_bytes() == archive.read_bytes(),
+              r.stdout + r.stderr)
 
 
 def test_memory_report_statements() -> None:
@@ -987,6 +1051,7 @@ def main() -> int:
     test_rocminfo_arch_fallback()
     test_alloc_cap_bisection()
     test_alloc_cap_criteria()
+    test_fetch_url_takes_a_library_out_of_an_archive()
     test_memory_report_statements()
     print()
     if FAILURES:

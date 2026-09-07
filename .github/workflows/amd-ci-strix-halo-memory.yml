@@ -27,11 +27,11 @@ on:
   workflow_dispatch:
     inputs:
       patched_dll_url:
-        description: "URL of the HIP runtime under test (amdhip64_7.dll). Empty: the patched arms do not run."
+        description: "URL of the HIP runtime under test: amdhip64_7.dll, or a .zip holding it. Empty: the patched arms do not run."
         required: false
         default: ""
       patched_dll_sha256:
-        description: "sha256 the download must match, so the arm names a known artifact"
+        description: "sha256 of the DLL itself, so the arm names a known artifact even when the archive around it is re-made"
         required: false
         default: ""
 
@@ -147,8 +147,13 @@ jobs:
           # A copy of the release, with only the runtime replaced: one variable.
           $dst = "$env:AMD_CI_WORK\lcpp\rocm_patched"
           Copy-Item -Recurse -Force -LiteralPath $env:ROCM_BIN -Destination $dst
+          # A .zip is the shape the runtime is distributed in; the hash is checked
+          # against the DLL either way, since that is what gets loaded.
+          $member = ""
+          if ($url -match "\.zip($|\?)") { $member = "amdhip64_7.dll" }
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\fetch_url.py" --url "$url" `
             --dest "$dst\amdhip64_7.dll" --expect-sha256 "${{ github.event.inputs.patched_dll_sha256 }}" `
+            --zip-member "$member" `
             --out "$env:AMD_CI_WORK\out\patched_dll.json"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "FATAL: the runtime under test did not download, or did not match its hash."
@@ -224,11 +229,24 @@ jobs:
           $ErrorActionPreference = "Continue"
           $O = "$env:AMD_CI_WORK\out\W2"
           New-Item -ItemType Directory -Force -Path $O | Out-Null
+          # The vendor's own note warns that an allocation committed near 100% of
+          # usable RAM can hang the machine or bugcheck it (0x19C). The question is
+          # not "what is the new cap" but "does an allocation the stock runtime
+          # refused now succeed", so the search stops at 92% of the machine and a
+          # head that clears it is reported as uncapped rather than pushed further.
+          $h = Get-Content "$env:AMD_CI_WORK\out\W1\memreport_rocm_stock.json" | ConvertFrom-Json
+          $poolBytes = [double]$h.sections.host.total_phys_bytes
+          foreach ($ad in $h.sections.host.adapters) {
+            if ($ad.qw_memory_size) { $poolBytes += [double]$ad.qw_memory_size; break }
+          }
+          $ceil = [math]::Round(($poolBytes / 1GB) * 0.92, 1)
+          if ($ceil -lt 8) { $ceil = 200 }   # unreadable host: fall back to the old ceiling
+          Write-Host "allocation search ceiling: $ceil GiB (92% of the machine)"
           if ([string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
             Write-Host "One runtime only: measuring the stock cap, with no differential to draw."
             & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
               --state rocm_stock --checkout "$env:ROCM_BIN" --sections host,hip,alloc_cap `
-              --alloc-lo-gib 1 --alloc-hi-gib 200 --alloc-resolution-gib 0.5 --alloc-reps 2 `
+              --alloc-lo-gib 1 --alloc-hi-gib $ceil --alloc-resolution-gib 0.5 --alloc-reps 2 `
               --out "$O\obs_rocm_stock.json"
             $rc = $LASTEXITCODE
             $cap = (Get-Content "$O\obs_rocm_stock.json" | ConvertFrom-Json).sections.alloc_cap.max_ok_gib
@@ -249,8 +267,12 @@ jobs:
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/llamacpp_alloc_cap.py" `
             --out-dir "$O" --python "$env:AMD_CI_PY" `
             --title "W2 single-allocation cap: shipped HIP runtime vs the one under test" `
-            -- --sections host,hip,alloc_cap --alloc-lo-gib 1 --alloc-hi-gib 200 `
+            -- --sections host,hip,alloc_cap --alloc-lo-gib 1 --alloc-hi-gib $ceil `
                --alloc-resolution-gib 0.5 --alloc-reps 2
+          "" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "The allocation search stopped at **$ceil GiB**, 92% of this machine, because the" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "runtime's own note warns that committing near all of RAM can bugcheck the host." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "An arm that clears it is reported as uncapped within the range, not chased higher." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           Get-Content "$O\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$O"
 

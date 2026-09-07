@@ -6,22 +6,28 @@ Pairs with probes/gpu_memory_report_probe.py. The states are two HIP runtimes,
 not two llama.cpp builds: `base` loads the shipped amdhip64_7.dll and `head`
 loads the one under test.
 
-The defect is PAL reporting a constant rather than a measurement. ROCm/rocm-systems
-Sep 4 2026 (`fix(clr): report the full unified memory pool on large-memory APUs`)
-clamps `maxAllocSize_` at 64 GiB and derives the pool from the largest single
-heap; the fix raises the clamp and credits the aperture as
-`gart - min(gart / 4, 4 GiB)`. So on an APU whose unified pool exceeds 64 GiB,
-the stock runtime refuses an allocation the hardware can hold.
+The defect is PAL refusing an allocation the pool can hold. The rule the stock
+runtime applies is a formula, not a constant:
 
-Two things this is careful about:
+    stock:    max(dedicated_VRAM_heap, 0.75 x shared_GART_heap)
+    patched:  max(dedicated_VRAM_heap, 1.00 x shared_GART_heap)
 
-  * A cap is only a defect if there is memory beyond it. On a machine whose
-    carve-out IS 64 GiB the clamp is invisible, and calling that a pass would be
-    reading a coincidence as a fix. `gates` therefore requires a pool larger
-    than the clamp before any comparison is shown.
+so the factor only bites where the GART branch wins, i.e. a small carve-out
+against a large aperture. An earlier version of this file asserted a flat 64 GiB
+clamp; the devlab box measured 110.2 GiB, which is the GART branch, and the
+constant is what a fixed number would have hidden.
+
+Three things this is careful about:
+
+  * A cap is only a defect if there is memory beyond it. `gates` requires a pool
+    larger than the clamp before any comparison is shown.
   * A hipMalloc that returns a pointer is not evidence the memory exists; the
     probe writes and reads back every candidate, and a state whose confirmation
     passes were unstable is reported rather than averaged away.
+  * The search is deliberately bounded below the machine, because committing
+    near all of RAM can bugcheck the host. A state that clears the whole range
+    demonstrates no cap, so a base that clears it makes the run VOID rather
+    than CONFIRMED, and a head that clears it is the fix showing.
 """
 
 from __future__ import annotations
@@ -108,6 +114,9 @@ def base_shows_defect(base: dict) -> tuple[bool, str]:
     cap = _cap(base)
     if cap is None:
         return False, "the base cap search produced no boundary"
+    if _sec(base, "alloc_cap").get("capped") is False:
+        return False, (f"the base allocated the whole {cap} GiB search range, so it refused "
+                       f"nothing and there is no cap here to lift")
     pool = _host_pool_gib(base)
     if pool and cap >= pool - CLAMP_TOL_GIB:
         return False, (f"the base allocated {cap} GiB against a {pool} GiB pool, so nothing "
@@ -120,18 +129,35 @@ def base_shows_defect(base: dict) -> tuple[bool, str]:
                   f"number is the finding")
 
 
-def head_is_fixed(head: dict) -> tuple[bool, str]:
-    """Judged on its own, because the engine applies this to every non-base arm,
-    including controls, and an arm is only "fixed" if it clears the clamp itself."""
+def head_is_fixed(head: dict, base: dict | None = None) -> tuple[bool, str]:
+    """A lifted cap is a CHANGE, so this reads the base when the engine offers it.
+
+    Judging an arm against a fixed clamp alone is wrong on a host whose stock cap
+    already sits above that clamp: the devlab box refuses at 110.2 GiB, so an
+    inert runtime would clear a 64 GiB bar and read as fixed. The clamp rule is
+    kept for the single-arm call, where there is nothing better to compare to.
+    """
     h = _cap(head)
     if h is None:
         return False, "the cap search produced no boundary"
+    pool = _host_pool_gib(head)
+    # The search stops short of the machine on purpose, so clearing the range is
+    # the strongest statement available and the one the bound was chosen to make.
+    if _sec(head, "alloc_cap").get("capped") is False:
+        return True, (f"allocated the whole {h} GiB search range without being refused, on a "
+                      f"{pool} GiB host; the range stops below the machine deliberately")
     if not _stable(head):
         return False, (f"reached {h} GiB, but the boundary did not reproduce in both directions, "
                        f"so it is a fragmentation reading rather than a cap")
+    b = _cap(base) if base else None
+    if b is not None:
+        step = float(_sec(head, "alloc_cap").get("resolution_gib") or 0.5)
+        if h > b + step:
+            return True, f"allocated {h} GiB where the shipped runtime refused past {b} GiB"
+        return False, (f"capped at {h} GiB against the shipped runtime's {b} GiB, which is "
+                       f"inside the {step} GiB search resolution: nothing moved")
     if h <= CLAMP_GIB + CLAMP_TOL_GIB:
         return False, f"still capped at {h} GiB, at or below the {CLAMP_GIB} GiB clamp"
-    pool = _host_pool_gib(head)
     return True, f"allocated {h} GiB, past the {CLAMP_GIB} GiB clamp, on a {pool} GiB host"
 
 
