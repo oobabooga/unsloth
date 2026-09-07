@@ -83,6 +83,25 @@ jobs:
           cat "$AMD_CI_WORK/out/installer/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/installer"
 
+      - name: Trace which gate branch answers on an AMD host
+        if: always()
+        run: |
+          set +e
+          # The two failing assertions redirect the gate's stderr to /dev/null, so the
+          # WARN text that names the branch never reaches the probe's output. `set -x`
+          # recovers it: the trace records the echo that ran, which distinguishes
+          # "arch unreadable" from "declared arch accepted" from "spoof refused"
+          # without replicating the test's own funcs.sh extraction.
+          cd "$AMD_CI_WORK/states/head"
+          bash -x tests/sh/test_rocm_bad_arch_gate.sh \
+            > "$AMD_CI_WORK/out/gate_trace.log" 2>&1
+          echo "trace exit: $?  lines: $(wc -l < "$AMD_CI_WORK/out/gate_trace.log")"
+          echo "--- the WARN echoes that actually ran"
+          grep -oE "\+* echo \[WARN\][^\"]*" "$AMD_CI_WORK/out/gate_trace.log" \
+            | sort | uniq -c | sort -rn | head -20
+          echo "--- assertion results"
+          grep -E "^  (PASS|FAIL):" "$AMD_CI_WORK/out/gate_trace.log" | grep FAIL
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
