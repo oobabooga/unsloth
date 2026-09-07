@@ -34,6 +34,10 @@ on:
         description: "sha256 of the DLL itself, so the arm names a known artifact even when the archive around it is re-made"
         required: false
         default: ""
+      alloc_probe_gib:
+        description: "W2 single-probe size in GiB, just above the shipped runtime's refusal (measured 110.2 ok / 110.6 refused). Never searched past it."
+        required: false
+        default: "111.0"
 
 permissions:
   contents: read
@@ -230,10 +234,17 @@ jobs:
           $O = "$env:AMD_CI_WORK\out\W2"
           New-Item -ItemType Directory -Force -Path $O | Out-Null
           # The vendor's own note warns that an allocation committed near 100% of
-          # usable RAM can hang the machine or bugcheck it (0x19C). The question is
-          # not "what is the new cap" but "does an allocation the stock runtime
-          # refused now succeed", so the search stops at 92% of the machine and a
-          # head that clears it is reported as uncapped rather than pushed further.
+          # usable RAM can hang the machine or bugcheck it (0x19C), and run
+          # 34085137194 lost this host proving it: a bisecting search tries its own
+          # ceiling second, the runtime under test SUCCEEDED at 92% of the machine,
+          # and Windows was left with nothing.
+          #
+          # The question was never "what is the new cap" but "does an allocation the
+          # shipped runtime refused now succeed", so the patched arm asks exactly
+          # that, once, at a size just above the measured refusal (110.2 GiB ok,
+          # 110.6 GiB refused) and allocates nothing larger. The stock-only arm keeps
+          # the search, since a runtime that refuses past 110 GiB cannot commit near
+          # the machine, and the probe clamps it to 90% either way.
           $h = Get-Content "$env:AMD_CI_WORK\out\W1\memreport_rocm_stock.json" | ConvertFrom-Json
           $poolBytes = [double]$h.sections.host.total_phys_bytes
           foreach ($ad in $h.sections.host.adapters) {
@@ -242,6 +253,12 @@ jobs:
           $ceil = [math]::Round(($poolBytes / 1GB) * 0.92, 1)
           if ($ceil -lt 8) { $ceil = 200 }   # unreadable host: fall back to the old ceiling
           Write-Host "allocation search ceiling: $ceil GiB (92% of the machine)"
+          $probe = [double]("${{ github.event.inputs.alloc_probe_gib }}")
+          if ($probe -le 0) { $probe = 111.0 }
+          if ($ceil -gt 8 -and $probe -gt $ceil) {
+            Write-Host "::error::probe $probe GiB is above the $ceil GiB safe ceiling for this host"
+            exit 1
+          }
           if ([string]::IsNullOrWhiteSpace($env:ROCM_PATCHED_BIN)) {
             Write-Host "One runtime only: measuring the stock cap, with no differential to draw."
             & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\gpu_memory_report_probe.py" `
@@ -267,12 +284,13 @@ jobs:
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/llamacpp_alloc_cap.py" `
             --out-dir "$O" --python "$env:AMD_CI_PY" `
             --title "W2 single-allocation cap: shipped HIP runtime vs the one under test" `
-            -- --sections host,hip,alloc_cap --alloc-lo-gib 1 --alloc-hi-gib $ceil `
-               --alloc-resolution-gib 0.5 --alloc-reps 2
+            -- --sections host,hip,alloc_cap --alloc-lo-gib 1 --alloc-probe-gib $probe `
+               --alloc-reps 2
           "" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          "The allocation search stopped at **$ceil GiB**, 92% of this machine, because the" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          "runtime's own note warns that committing near all of RAM can bugcheck the host." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          "An arm that clears it is reported as uncapped within the range, not chased higher." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "Both arms attempted **$probe GiB once** and nothing larger. That is just above the" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "shipped runtime's measured refusal (110.2 GiB allocated, 110.6 GiB refused), so a" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "success is decisive, and it is far enough below the $ceil GiB the machine holds that" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "the OS is never starved. A search was what lost this host on run 34085137194." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           Get-Content "$O\VERDICT.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$O"
 

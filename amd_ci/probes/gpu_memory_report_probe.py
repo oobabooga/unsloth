@@ -680,6 +680,44 @@ def alloc_once_subprocess(hip_dir: Path | None, nbytes: int, device: int,
                 "error": f"rc={r.get('rc')} {(r.get('stderr') or '')[-400:]}"}
 
 
+def probe_alloc_at(hip_dir: Path | None, gib: float, reps: int, device: int,
+                   attempt_timeout: int = 900, floor_gib: float = 1.0) -> dict:
+    """Ask one question -- does an allocation of this exact size succeed -- and
+    never allocate anything larger.
+
+    The bisecting search below is unsafe on a runtime that lifts the cap: it
+    tries its own ceiling second, and an allocation that SUCCEEDS near the whole
+    machine starves the OS (AMD's own note warns of a 0x19C bugcheck, and one
+    devlab run lost the host that way). Where the stock boundary is already
+    known, the decisive reading is a single attempt just above it, at a size the
+    host has been seen to survive.
+    """
+    attempts: list[dict] = []
+
+    def attempt(size_gib: float) -> bool:
+        res = alloc_once_subprocess(hip_dir, int(size_gib * GIB), device, attempt_timeout)
+        res["gib"] = round(size_gib, 3)
+        attempts.append(res)
+        return bool(res.get("ok"))
+
+    out: dict = {"hip_dir": str(hip_dir) if hip_dir else None, "device": device,
+                 "mode": "single_probe", "probe_gib": round(gib, 3),
+                 "attempt_timeout_s": attempt_timeout}
+    # The floor is the negative control: a runtime that cannot allocate 1 GiB is
+    # broken, and its refusal above says nothing about a cap.
+    if not attempt(floor_gib):
+        out["error"] = f"the {floor_gib} GiB floor already fails: a broken runtime, not a cap"
+        out["attempts"] = attempts
+        return out
+    oks = [attempt(gib) for _ in range(max(1, reps))]
+    out["ok"] = all(oks)
+    out["any_ok"] = any(oks)
+    out["reps"] = len(oks)
+    out["stable"] = all(oks) or not any(oks)
+    out["attempts"] = attempts
+    return out
+
+
 def read_alloc_cap(hip_dir: Path | None, lo_gib: float, hi_gib: float,
                    reps: int, device: int, resolution_gib: float,
                    attempt_timeout: int = 900) -> dict:
@@ -735,6 +773,34 @@ def read_alloc_cap(hip_dir: Path | None, lo_gib: float, hi_gib: float,
 
 # --------------------------------------------------------------------------- main
 
+def _machine_gib() -> float:
+    """Carve-out plus visible RAM, i.e. what an allocation could be backed by."""
+    host = read_host()
+    vram = max([a.get("qw_memory_size") or 0 for a in host.get("adapters") or []] or [0])
+    ram = host.get("total_phys_bytes") or host.get("memtotal_bytes") or 0
+    return (vram + ram) / GIB
+
+
+def _alloc_cap_section(a, hip_dir: Path | None) -> dict:
+    """Single probe when one was named, the bisecting search otherwise.
+
+    Either way nothing above --alloc-max-fraction of the machine is attempted:
+    an allocation that succeeds there leaves the OS nothing, which is how a
+    devlab host was lost, and the reading it would buy is not worth a bugcheck.
+    """
+    limit = _machine_gib() * max(0.0, min(1.0, a.alloc_max_fraction))
+    if a.alloc_probe_gib > 0:
+        if limit > 8 and a.alloc_probe_gib > limit:
+            return {"error": f"refusing to attempt {a.alloc_probe_gib} GiB: above "
+                             f"{round(limit, 1)} GiB, the safe fraction of this machine",
+                    "mode": "single_probe", "probe_gib": a.alloc_probe_gib}
+        return probe_alloc_at(hip_dir, a.alloc_probe_gib, a.alloc_reps, a.alloc_device,
+                              a.alloc_attempt_timeout, a.alloc_lo_gib)
+    hi = min(a.alloc_hi_gib, limit) if limit > 8 else a.alloc_hi_gib
+    return read_alloc_cap(hip_dir, a.alloc_lo_gib, hi, a.alloc_reps, a.alloc_device,
+                          a.alloc_resolution_gib, a.alloc_attempt_timeout)
+
+
 SECTIONS = ("host", "hip", "vulkan_raw", "ggml_vulkan", "fit", "alloc_cap")
 
 
@@ -754,6 +820,10 @@ def main() -> int:
     ap.add_argument("--alloc-resolution-gib", type = float, default = 0.5)
     ap.add_argument("--alloc-reps", type = int, default = 2)
     ap.add_argument("--alloc-device", type = int, default = 0)
+    ap.add_argument("--alloc-probe-gib", type = float, default = 0.0,
+                    help = "single-probe mode: attempt exactly this size and nothing larger")
+    ap.add_argument("--alloc-max-fraction", type = float, default = 0.90,
+                    help = "refuse to attempt more than this fraction of the machine")
     ap.add_argument("--alloc-attempt-timeout", type = int, default = 900,
                     help = "seconds one candidate allocation may take before it is a failure")
     ap.add_argument("--try-alloc", type = int, default = 0,
@@ -796,9 +866,7 @@ def main() -> int:
         "vulkan_raw": lambda: read_vulkan_raw(),
         "ggml_vulkan": lambda: read_ggml_vulkan(vulkan_dir or checkout),
         "fit": lambda: read_fit(checkout, a.fit_model or None),
-        "alloc_cap": lambda: read_alloc_cap(hip_dir, a.alloc_lo_gib, a.alloc_hi_gib,
-                                            a.alloc_reps, a.alloc_device, a.alloc_resolution_gib,
-                                            a.alloc_attempt_timeout),
+        "alloc_cap": lambda: _alloc_cap_section(a, hip_dir),
     }
     for name in wanted:
         if name in ("ggml_vulkan", "fit") and not (vulkan_dir or checkout):

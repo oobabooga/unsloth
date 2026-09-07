@@ -53,6 +53,18 @@ def _cap(state: dict) -> float | None:
     return float(v) if v is not None else None
 
 
+def _single(state: dict) -> dict | None:
+    """The single-probe reading, when the run asked one question instead of searching.
+
+    A bisecting search tries its own ceiling, and on a runtime that lifts the cap that
+    attempt SUCCEEDS near the whole machine and starves the OS -- one devlab host was
+    lost that way. Where the stock boundary is already known, one attempt just above it
+    answers the same question and allocates nothing larger.
+    """
+    cap = _sec(state, "alloc_cap")
+    return cap if cap.get("mode") == "single_probe" else None
+
+
 def _hip_total_gib(state: dict) -> float | None:
     devices = _sec(state, "hip").get("devices") or []
     if not devices:
@@ -91,9 +103,15 @@ def gates(obs: dict) -> list:
     for name in ("base", "head"):
         st = obs.get(name) or {}
         cap = _sec(st, "alloc_cap")
-        out.append((f"{name}: the cap search completed",
-                    cap.get("max_ok_gib") is not None,
-                    cap.get("error") or f"max_ok_gib={cap.get('max_ok_gib')}"))
+        one = _single(st)
+        if one is not None:
+            out.append((f"{name}: the probe ran and its 1 GiB floor passed",
+                        one.get("ok") is not None and not one.get("error"),
+                        one.get("error") or f"{one.get('probe_gib')} GiB ok={one.get('ok')}"))
+        else:
+            out.append((f"{name}: the cap search completed",
+                        cap.get("max_ok_gib") is not None,
+                        cap.get("error") or f"max_ok_gib={cap.get('max_ok_gib')}"))
         out.append((f"{name}: HIP reported a device",
                     bool(_sec(st, "hip").get("devices")),
                     _sec(st, "hip").get("error", "no devices")))
@@ -111,6 +129,17 @@ def gates(obs: dict) -> list:
 
 
 def base_shows_defect(base: dict) -> tuple[bool, str]:
+    one = _single(base)
+    if one is not None:
+        # The refusal IS the defect: the shipped runtime turning down memory the
+        # machine holds. A base that succeeds has nothing for the head to lift.
+        if one.get("error"):
+            return False, str(one["error"])
+        if one.get("any_ok"):
+            return False, (f"the shipped runtime allocated {one.get('probe_gib')} GiB, so it "
+                           f"refuses nothing here and there is no cap to lift")
+        return True, (f"the shipped runtime refused {one.get('probe_gib')} GiB on a "
+                      f"{_host_pool_gib(base)} GiB host, over {one.get('reps')} attempts")
     cap = _cap(base)
     if cap is None:
         return False, "the base cap search produced no boundary"
@@ -137,6 +166,17 @@ def head_is_fixed(head: dict, base: dict | None = None) -> tuple[bool, str]:
     inert runtime would clear a 64 GiB bar and read as fixed. The clamp rule is
     kept for the single-arm call, where there is nothing better to compare to.
     """
+    one = _single(head)
+    if one is not None:
+        if one.get("error"):
+            return False, str(one["error"])
+        if not one.get("stable"):
+            return False, (f"{one.get('probe_gib')} GiB succeeded on some attempts and not "
+                           f"others, which is fragmentation rather than a lifted cap")
+        if one.get("ok"):
+            return True, (f"allocated {one.get('probe_gib')} GiB, which the shipped runtime "
+                          f"refused, on every one of {one.get('reps')} attempts")
+        return False, f"still refused {one.get('probe_gib')} GiB, so the cap did not move"
     h = _cap(head)
     if h is None:
         return False, "the cap search produced no boundary"
@@ -162,14 +202,23 @@ def head_is_fixed(head: dict, base: dict | None = None) -> tuple[bool, str]:
 
 
 def table(obs: dict) -> str:
-    rows = ["| state | HIP dll | HIP total | registry VRAM + RAM | max single alloc | stable |",
+    rows = ["| state | HIP dll | HIP total | registry VRAM + RAM | single allocation | stable |",
             "|---|---|---|---|---|---|"]
     for name in ("base", "head", *[k for k in obs if k not in ("base", "head")
                                    and not k.startswith("_")]):
         st = obs.get(name)
         if not isinstance(st, dict):
             continue
+        one = _single(st)
+        if one is not None:
+            verdict = "refused" if not one.get("any_ok") else (
+                "ok" if one.get("ok") else "ok on some attempts")
+            reading = f"{one.get('probe_gib')} GiB {verdict}"
+            stable = one.get("stable", False)
+        else:
+            reading = f"{_cap(st)} GiB max"
+            stable = _stable(st)
         rows.append(f"| {name} | `{_dll(st)}` | {_hip_total_gib(st)} GiB | "
-                    f"{_host_pool_gib(st)} GiB | {_cap(st)} GiB | "
-                    f"{'yes' if _stable(st) else 'NO'} |")
+                    f"{_host_pool_gib(st)} GiB | {reading} | "
+                    f"{'yes' if stable else 'NO'} |")
     return "\n".join(rows)
