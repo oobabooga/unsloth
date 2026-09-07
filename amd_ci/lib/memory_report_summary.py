@@ -7,9 +7,10 @@ and prints markdown. The statements are checked, not narrated:
 
   over_report      the number llama.cpp places against exceeds the machine's
                    physical RAM, which no single device can hold.
-  sums_heaps       that number equals the sum of the device-local heaps rather
-                   than the largest one, which is how the over-report arises on
-                   an integrated part where several heaps alias the same RAM.
+  sums_heaps       that number equals the heaps added together rather than the
+                   largest one, which is how the over-report arises on an
+                   integrated part where several heaps alias the same RAM. ggml
+                   adds EVERY heap, not only the device-local ones.
   hip_is_vgm_only  the HIP total equals the carve-out the registry records, so
                    the two backends disagree because they are answering
                    different questions, not because one is broken.
@@ -110,13 +111,21 @@ def statements(name: str, doc: dict) -> list[tuple[str, bool | None, str]]:
 
     local_sum = gib((vk_raw or {}).get("device_local_sum_bytes"))
     local_max = gib((vk_raw or {}).get("device_local_max_bytes"))
+    all_sum = gib((vk_raw or {}).get("all_heaps_sum_bytes"))
     if ggml_total is None or local_sum is None:
         out.append((f"{name}: sums_heaps", None, "no raw Vulkan heaps or no ggml total"))
     else:
-        out.append((f"{name}: sums_heaps", close(ggml_total, local_sum)
-                    and not close(local_sum, local_max),
-                    f"ggml {ggml_total} GiB against heap sum {local_sum} GiB and "
-                    f"largest heap {local_max} GiB"))
+        # ggml adds EVERY heap on an integrated device, not only the device-local
+        # ones, and on Strix Halo the host-visible aperture is its own heap. An
+        # earlier version compared against the device-local sum alone and so
+        # answered NO on a machine where the summation was the whole mechanism.
+        which = ("all heaps" if close(ggml_total, all_sum)
+                 else "the device-local heaps" if close(ggml_total, local_sum) else None)
+        out.append((f"{name}: sums_heaps",
+                    bool(which) and not close(ggml_total, local_max),
+                    f"ggml {ggml_total} GiB against {all_sum} GiB over all heaps, "
+                    f"{local_sum} GiB device-local and {local_max} GiB largest"
+                    + (f": it is {which}" if which else ": it matches none of them")))
 
     hip_total = gib((hip or {}).get("total_bytes") or (hip or {}).get("device_total_bytes"))
     if hip_total is None or h["registry_vram_gib"] is None:
