@@ -22,13 +22,16 @@ jobs:
       - name: Hardware and Vulkan registrations
         shell: powershell
         run: |
+          # reg.exe writes "key not found" to stderr, which PowerShell turns into a
+          # terminating error record; an absent key is the finding here, not a failure.
+          $ErrorActionPreference = "Continue"
           Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List
           "--- Khronos legacy key ---"
-          reg query "HKLM\SOFTWARE\Khronos\Vulkan\Drivers" 2>&1
+          cmd /c 'reg query "HKLM\SOFTWARE\Khronos\Vulkan\Drivers" 2>&1'
           "--- Display adapter class ---"
-          reg query "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" /s /v VulkanDriverName 2>&1
+          cmd /c 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" /s /v VulkanDriverName 2>&1'
           "--- SoftwareComponent class ---"
-          reg query "HKLM\SYSTEM\CurrentControlSet\Control\Class\{5c4c3332-344d-483c-8739-259e934c9cc8}" /s /v VulkanDriverName 2>&1
+          cmd /c 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Class\{5c4c3332-344d-483c-8739-259e934c9cc8}" /s /v VulkanDriverName 2>&1'
           exit 0
 
       - name: Clone ${{ matrix.ref }}
