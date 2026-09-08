@@ -79,10 +79,14 @@ jobs:
         env:
           UNSLOTH_ROCM_GFX_REMEMBERED: gfx1151
         run: |
+          # The resolver logs its routing decision to stderr; PowerShell would turn that
+          # into a terminating error, so redirect inside cmd and read the file back.
+          $ErrorActionPreference = "Continue"
           $src = Join-Path $env:RUNNER_TEMP "src"
           $raw = Join-Path $env:RUNNER_TEMP "resolve.txt"
-          python (Join-Path $src "studio\install_llama_prebuilt.py") `
-            --resolve-backends latest --output-format json 2>&1 | Tee-Object -FilePath $raw
+          $script = Join-Path $src "studio\install_llama_prebuilt.py"
+          cmd /c "python `"$script`" --resolve-backends latest --output-format json > `"$raw`" 2>&1"
+          Get-Content $raw
           $pick = Join-Path $env:RUNNER_TEMP "pick.py"
           @'
           import json, sys
