@@ -25,6 +25,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/desktop-app-clean-machine-ci.yml'
+      - 'studio/frontend/**'
       - '.github/scripts/retry-with-apt-lock.sh'
 
       - '.github/scripts/resolve-desktop-release.py'
