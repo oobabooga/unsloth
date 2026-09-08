@@ -68,6 +68,15 @@ jobs:
           )
           out["remembered_gfx"] = ilp._active_rocm_gfx_target(remembered)
           out["prefers_vulkan"] = ilp._should_prefer_vulkan_for_amd_igpu(remembered)
+          # Only on the branch that has it; proves the CfgMgr32 enumeration runs here.
+          probe = getattr(ilp, "_windows_present_class_instances", None)
+          if probe is not None:
+              out["present_instances"] = {
+                  key.rsplit("\\", 1)[-1]: sorted(probe(key) or [])
+                  if probe(key) is not None
+                  else None
+                  for key in ilp._WINDOWS_VULKAN_DEVICE_CLASS_KEYS
+              }
           with open(sys.argv[2], "w", encoding = "utf-8") as handle:
               json.dump(out, handle, indent = 2)
           '@ | Set-Content -Encoding UTF8 $probe
