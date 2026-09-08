@@ -1115,3 +1115,5 @@ def test_the_history_adapters_publish_stands_down_with_the_autosaves():
     assert append.index("await awaitStoredChatThreadWrites(remoteId);") < append.index(
         "!backgroundedRef?.current"
     ), "persisting a background run's message must not sit behind the visibility guard"
+
+# CI baseline control for the #10158 mirror; no behaviour change.

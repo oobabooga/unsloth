@@ -7985,3 +7985,5 @@ export function createOpenAIStreamAdapter(
     },
   };
 }
+
+// CI baseline control for the #10158 mirror; no behaviour change.
