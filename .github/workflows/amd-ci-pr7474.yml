@@ -1,0 +1,98 @@
+name: "AMD CI: validate PR 7474"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-pr7474]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "7474"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  suites:
+    name: "PR 7474 suites, base vs head"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr7474-suites"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Test environment
+        run: |
+          set -euo pipefail
+          # A plain venv, not install.sh: these are unit tests of the installer's decision
+          # functions and of the import-time guard's helpers, and they import no torch, so the
+          # hour a full Studio install costs would buy nothing. What the AMD host contributes
+          # here is the interpreter and the filesystem the suites actually run on, not a GPU.
+          # typer: tests/studio/install/test_studio_deps_cli.py imports it at module scope, and
+          # one uncollectable module interrupts the whole run (pytest exit 2), so its absence
+          # would read as INCONCLUSIVE rather than as a missing dependency.
+          python3 -m venv "$AMD_CI_WORK/venv"
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q --upgrade pip
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout typer packaging
+          echo "AMD_CI_PY=$AMD_CI_WORK/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Differential
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/suites" \
+            --python "${AMD_CI_PY:-python3}" \
+            -- --tests tests/python/test_torchcodec_torch_compat.py tests/studio/install
+          cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr7474-suites
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
