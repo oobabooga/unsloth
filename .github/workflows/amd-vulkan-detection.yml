@@ -35,6 +35,7 @@ jobs:
           import sys
           import winreg
           from unittest.mock import patch
+          from types import SimpleNamespace
 
           source = pathlib.Path(os.environ['RUNNER_TEMP']) / 'unsloth-source'
           sys.path.insert(0, str(source / 'studio'))
@@ -114,8 +115,47 @@ jobs:
               print('DEVICE_PATHS_PREFER_VULKAN', corrected_preference, flush=True)
               print('DEVICE_PATHS_ROUTED_HOST', json.dumps(dataclasses.asdict(routed)), 'persist=', persist, flush=True)
           print('RESULT', json.dumps({'original_present': m._amd_vulkan_icd_present(), 'device_paths_present': corrected_present, 'original_preference': m._should_prefer_vulkan_for_amd_igpu(host), 'device_paths_preference': corrected_preference, 'live_amd_vulkan_device': any(d['vendor_id'] == '0x1002' for d in devices_seen)}), flush=True)
+          # Exercise the existing-install path separately from a clean Python install.
+          args = SimpleNamespace(published_repo=m.DEFAULT_PUBLISHED_REPO, published_release_tag='b10840-mix-d5c17a0', has_rocm=False, rocm_gfx=None)
+          with patch.dict(os.environ, {'UNSLOTH_ROCM_GFX_REMEMBERED': 'gfx1151'}):
+              remembered_host = m._apply_host_overrides(host)
+              print('REMEMBERED_HOST', json.dumps(dataclasses.asdict(remembered_host)), flush=True)
+              original_payload = m.resolve_backends_payload('latest', args=args)
+              print('REMEMBERED_ORIGINAL_RESOLVER', json.dumps(original_payload), flush=True)
+              with patch.object(m, '_amd_vulkan_icd_manifest_paths', return_value=list(dict.fromkeys(original_paths + device_paths))):
+                  corrected_payload = m.resolve_backends_payload('latest', args=args)
+                  print('REMEMBERED_DEVICE_PATHS_RESOLVER', json.dumps(corrected_payload), flush=True)
           '@
           $path = Join-Path $env:RUNNER_TEMP 'vulkan-detection-probe.py'
           [IO.File]::WriteAllText($path, $probe)
           python -B $path
           if ($LASTEXITCODE -ne 0) { throw 'Probe failed' }
+      - name: Enumerate the GPU with the published Vulkan llama.cpp bundle
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = @'
+          import os
+          import pathlib
+          import subprocess
+          import urllib.request
+          import zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'llama-vulkan-smoke'
+          root.mkdir()
+          url = 'https://github.com/unslothai/llama.cpp/releases/download/b10840-mix-d5c17a0/app-b10840-mix-d5c17a0-windows-x64-vulkan.zip'
+          archive = root / 'bundle.zip'
+          print('BUNDLE', url, flush=True)
+          urllib.request.urlretrieve(url, archive)
+          with zipfile.ZipFile(archive) as bundle:
+              bundle.extractall(root)
+          server = next(root.rglob('llama-server.exe'))
+          result = subprocess.run([str(server), '--list-devices'], cwd=server.parent, text=True, capture_output=True, timeout=120)
+          print('LLAMA_EXIT', result.returncode, flush=True)
+          print(result.stdout, flush=True)
+          print(result.stderr, flush=True)
+          assert result.returncode == 0
+          assert '8060S' in result.stdout + result.stderr
+          '@
+          $path = Join-Path $env:RUNNER_TEMP 'llama-vulkan-smoke.py'
+          [IO.File]::WriteAllText($path, $probe)
+          python -B $path
+          if ($LASTEXITCODE -ne 0) { throw 'llama.cpp smoke failed' }
