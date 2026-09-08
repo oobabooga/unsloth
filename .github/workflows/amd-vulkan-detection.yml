@@ -1,0 +1,121 @@
+name: Windows AMD Vulkan detection probe
+
+on:
+  push:
+    branches: [amd-vulkan-detection-probe]
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Hardware and released source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-CimInstance Win32_Processor | Select-Object Name
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, PNPDeviceID
+          $source = Join-Path $env:RUNNER_TEMP 'unsloth-source'
+          git clone --depth 1 --branch v0.1.807-beta https://github.com/unslothai/unsloth.git $source
+          if ($LASTEXITCODE -ne 0) { throw 'Clone failed' }
+          git -C $source rev-parse HEAD
+      - name: Compare registry discovery with live Vulkan enumeration
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = @'
+          import ctypes as c
+          import dataclasses
+          import json
+          import os
+          import pathlib
+          import sys
+          import winreg
+          from unittest.mock import patch
+
+          source = pathlib.Path(os.environ['RUNNER_TEMP']) / 'unsloth-source'
+          sys.path.insert(0, str(source / 'studio'))
+          import install_llama_prebuilt as m
+
+          host = m.detect_host()
+          print('DETECTED_HOST', json.dumps(dataclasses.asdict(host)), flush=True)
+          original_paths = m._amd_vulkan_icd_manifest_paths()
+          print('ORIGINAL_MANIFEST_PATHS', original_paths, flush=True)
+          print('ORIGINAL_AMD_VULKAN_PRESENT', m._amd_vulkan_icd_present(), flush=True)
+          print('ORIGINAL_PREFER_VULKAN', m._should_prefer_vulkan_for_amd_igpu(host), flush=True)
+
+          device_paths = []
+          for guid in ('{4d36e968-e325-11ce-bfc1-08002be10318}', '{5c4c3332-344d-483c-8739-259e934c9cc8}'):
+              base = 'SYSTEM\\CurrentControlSet\\Control\\Class\\' + guid
+              try:
+                  with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+                      names = [winreg.EnumKey(root, i) for i in range(winreg.QueryInfoKey(root)[0])]
+              except OSError:
+                  continue
+              for name in names:
+                  try:
+                      with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base + '\\' + name) as key:
+                          value, kind = winreg.QueryValueEx(key, 'VulkanDriverName')
+                      print('DEVICE_REGISTRATION', base + '\\' + name, value, kind, flush=True)
+                      device_paths.extend(value if isinstance(value, list) else [value])
+                  except OSError:
+                      pass
+          device_paths = list(dict.fromkeys(device_paths))
+          for path in device_paths:
+              print('DEVICE_MANIFEST', path, 'exists=', os.path.isfile(path), 'usable=', m._amd_vulkan_icd_usable(path), flush=True)
+              if os.path.isfile(path):
+                  print(pathlib.Path(path).read_text(encoding='utf-8'), flush=True)
+
+          # Direct Vulkan API calls use the installed loader and driver.
+          vk = c.WinDLL('vulkan-1.dll')
+          class InstanceInfo(c.Structure):
+              _fields_ = [('sType', c.c_uint32), ('pNext', c.c_void_p), ('flags', c.c_uint32),
+                          ('pApplicationInfo', c.c_void_p), ('enabledLayerCount', c.c_uint32),
+                          ('ppEnabledLayerNames', c.c_void_p), ('enabledExtensionCount', c.c_uint32),
+                          ('ppEnabledExtensionNames', c.c_void_p)]
+          vk.vkCreateInstance.argtypes = [c.POINTER(InstanceInfo), c.c_void_p, c.POINTER(c.c_void_p)]
+          vk.vkCreateInstance.restype = c.c_int32
+          vk.vkEnumeratePhysicalDevices.argtypes = [c.c_void_p, c.POINTER(c.c_uint32), c.POINTER(c.c_void_p)]
+          vk.vkEnumeratePhysicalDevices.restype = c.c_int32
+          vk.vkGetPhysicalDeviceProperties.argtypes = [c.c_void_p, c.c_void_p]
+          vk.vkGetPhysicalDeviceProperties.restype = None
+          vk.vkDestroyInstance.argtypes = [c.c_void_p, c.c_void_p]
+          vk.vkDestroyInstance.restype = None
+          instance = c.c_void_p()
+          rc = vk.vkCreateInstance(c.byref(InstanceInfo(sType=1)), None, c.byref(instance))
+          print('VK_CREATE_INSTANCE', rc, flush=True)
+          assert rc == 0, rc
+          devices_seen = []
+          try:
+              count = c.c_uint32()
+              assert vk.vkEnumeratePhysicalDevices(instance, c.byref(count), None) == 0
+              devices = (c.c_void_p * count.value)()
+              assert vk.vkEnumeratePhysicalDevices(instance, c.byref(count), devices) == 0
+              for device in devices:
+                  props = c.create_string_buffer(4096)
+                  vk.vkGetPhysicalDeviceProperties(device, props)
+                  header = (c.c_uint32 * 5).from_buffer_copy(props.raw[:20])
+                  name = props.raw[20:276].split(b'\0')[0].decode('utf-8', errors='replace')
+                  entry = {'name': name, 'vendor_id': hex(header[2]), 'device_id': hex(header[3]), 'type': header[4]}
+                  devices_seen.append(entry)
+                  print('VULKAN_DEVICE', json.dumps(entry), flush=True)
+          finally:
+              vk.vkDestroyInstance(instance, None)
+
+          # Diagnostic control only: preserve the detected host and all routing guards.
+          with patch.object(m, '_amd_vulkan_icd_manifest_paths', return_value=list(dict.fromkeys(original_paths + device_paths))):
+              corrected_present = m._amd_vulkan_icd_present()
+              corrected_preference = m._should_prefer_vulkan_for_amd_igpu(host)
+              routed, _, _, persist = m._route_to_vulkan_prebuilt(host, m.DEFAULT_PUBLISHED_REPO, 'latest', force_cpu=False, llama_backend='auto')
+              print('DEVICE_PATHS_AMD_VULKAN_PRESENT', corrected_present, flush=True)
+              print('DEVICE_PATHS_PREFER_VULKAN', corrected_preference, flush=True)
+              print('DEVICE_PATHS_ROUTED_HOST', json.dumps(dataclasses.asdict(routed)), 'persist=', persist, flush=True)
+          print('RESULT', json.dumps({'original_present': m._amd_vulkan_icd_present(), 'device_paths_present': corrected_present, 'original_preference': m._should_prefer_vulkan_for_amd_igpu(host), 'device_paths_preference': corrected_preference, 'live_amd_vulkan_device': any(d['vendor_id'] == '0x1002' for d in devices_seen)}), flush=True)
+          '@
+          $path = Join-Path $env:RUNNER_TEMP 'vulkan-detection-probe.py'
+          [IO.File]::WriteAllText($path, $probe)
+          python -B $path
+          if ($LASTEXITCODE -ne 0) { throw 'Probe failed' }
