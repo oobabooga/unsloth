@@ -116,4 +116,11 @@ test("the chat adapter sends compaction fields through the shared helper", () =>
     "utf8",
   );
   assert.match(adapter, /ggufCompactionRequestFields\(/);
+  // Through isServedByLlamaCpp, not a catalog row: /api/models/list can replace the row a
+  // load minted, and the panel that shows these settings asks the same owner.
+  assert.match(adapter, /isGguf: isGgufForCompaction/);
+  assert.match(adapter, /loadedIsGguf: runtime\.loadedIsGguf/);
+  assert.match(adapter, /isServedByLlamaCpp\(/);
+  // One request object for both streams, so a media turn cannot lose these fields.
+  assert.match(adapter, /image_base64: imageBase64/);
 });
