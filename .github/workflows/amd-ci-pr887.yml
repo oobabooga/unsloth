@@ -85,13 +85,31 @@ jobs:
           # probe needs both come from unsloth, cloned separately here; the zoo states
           # are handed to the probe as checkouts and are never pip-installed, so the
           # base/head axis stays the zoo commit and nothing else moves with it.
+          # Report what this host actually has before relying on any of it. The first
+          # attempt died in 9s because install.sh could not download uv from astral.sh
+          # ("could not download uv, and none is installed"), so uv is fetched via pip
+          # here as a fallback and the diagnostics are printed either way.
+          echo "== runner environment =="
+          echo "python3 : $(command -v python3) $(python3 -V 2>&1)"
+          echo "uv      : $(command -v uv || echo MISSING)"
+          echo "pip     : $(python3 -m pip --version 2>&1 | head -1)"
+          ls -d /opt/rocm* 2>/dev/null || echo "rocm    : no /opt/rocm"
+          python3 -c "import torch; print('torch   :', torch.__version__, 'hip', getattr(torch.version, 'hip', None), 'avail', torch.cuda.is_available())" || echo "torch   : not importable"
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv missing; trying pip"
+            python3 -m pip install --user -q uv || echo "pip install uv failed too"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "PATH=$PATH" >> "$GITHUB_ENV"
+          fi
+          echo "uv now  : $(command -v uv || echo STILL MISSING)"
+
           git clone -q --filter=blob:none \
             https://github.com/unslothai/unsloth.git "$AMD_CI_WORK/unsloth"
           cd "$AMD_CI_WORK/unsloth"
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
           set +e
-          bash install.sh --local 2>&1 | tail -15
+          bash install.sh --local 2>&1 | tail -40
           rc=${PIPESTATUS[0]}
           set -e
           [ "$rc" -eq 0 ] || exit "$rc"
