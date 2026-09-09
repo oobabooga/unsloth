@@ -340,8 +340,25 @@ def main() -> int:
         obs["venv_bytes"] = sum(f.stat().st_size for f in venv.rglob("*") if f.is_file())
     except OSError:
         pass
+    _keep_harness_output(out_dir, args.out.parent / f"harness_{args.state}")
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
+
+
+def _keep_harness_output(out_dir: Path, dest: Path) -> None:
+    """Copy the harness's per-step evidence (logs, summaries, proxy records, snapshots)
+    next to the observation so the artifact carries the WHY, not only the numbers.
+    Snapshot payloads can be large; only the small evidence files travel."""
+    keep = {"summary.json", "log.txt", "proxy.jsonl", "steps.json", "idempotency.json",
+            "extra.json", "state_before.json", "state_after.json", "diff.json", "pr_wheel.json"}
+    try:
+        for f in out_dir.rglob("*"):
+            if f.is_file() and f.name in keep:
+                rel = f.relative_to(out_dir)
+                (dest / rel).parent.mkdir(parents = True, exist_ok = True)
+                shutil.copy2(f, dest / rel)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

@@ -166,7 +166,11 @@ jobs:
           Write-Host "head venv python: $py"
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --min-gpus 1 `
             --out "$env:AMD_CI_WORK\out\host_head_venv.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $gate = $LASTEXITCODE
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\redecide.py" --dir "$env:AMD_CI_WORK\out\windows" `
+            --criteria "$env:GITHUB_WORKSPACE\amd_ci\criteria\studio_update_idempotent.py"
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT_redecided.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($gate -ne 0) { exit $gate }
 
       - uses: actions/upload-artifact@v4
         if: always()
