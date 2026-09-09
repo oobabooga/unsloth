@@ -1,0 +1,177 @@
+name: "AMD CI (Windows): validate PR 10579"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-prB-update-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "10579"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  linux-control:
+    name: "PR 10579 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows"
+          echo "selector matched no runner. If BOTH stay queued, the pool is busy."
+
+  windows:
+    name: "PR 10579 on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    # Uncomment when the job actually measures the GPU. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    # concurrency:
+    #   group: amd-ci-strix-halo-windows-gpu
+    #   cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr10579-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Not a PR yet: fork branches holding workflow-free snapshots of the PR B tree and
+          # of the origin/main commit it branched from.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" `
+            --state "base=https://github.com/oobabooga/unsloth#amd-ci-prB-src-base" `
+            --state "head=https://github.com/oobabooga/unsloth#amd-ci-prB-src-head" `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tools
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          # The probe installs Studio itself per state (install.ps1 under Windows PowerShell
+          # 5.1, exactly as the desktop does) into an isolated USERPROFILE under AMD_CI_WORK.
+          # Here: a venv whose python drives the stdlib harness, and uv to build each wheel.
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py --version
+          & $py -m pip install -q --upgrade pip uv
+          & "$env:AMD_CI_WORK\venv\Scripts\uv.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & git --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          # What Windows sees of the GPU before any install, for the record.
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-Table -AutoSize | Out-String | Write-Host
+          Get-PSDrive -Name ($env:AMD_CI_WORK.Substring(0,1)) | Select-Object Name, @{n="FreeGB";e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Differential
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/studio_update_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/studio_update_idempotent.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows" `
+            --python "$env:AMD_CI_PY" -- --harness "$env:GITHUB_WORKSPACE/amd_ci/vendor/bisect" --work "$env:AMD_CI_WORK\p" --uv "$env:AMD_CI_WORK\venv\Scripts\uv.exe"
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
+            "$env:AMD_CI_WORK\out\windows"
+
+      - name: Real gate on the head install
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Whether these boxes get a ROCm torch from install.ps1 is unmeasured until now;
+          # --require rocm gpu FAILS if the head venv's torch is not one, on purpose.
+          $obs = Get-Content -LiteralPath "$env:AMD_CI_WORK\out\windows\obs_head.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $py = $obs.venv_python
+          Write-Host "head venv python: $py"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --min-gpus 1 `
+            --out "$env:AMD_CI_WORK\out\host_head_venv.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr10579-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
