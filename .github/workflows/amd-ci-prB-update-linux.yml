@@ -122,6 +122,11 @@ jobs:
           PY=$(python3 -c "import json;print(json.load(open('$AMD_CI_WORK/out/gpu/obs_head.json'))['venv_python'])")
           "$PY" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host_head_venv.json"
+          # Re-render the verdict under the venv python: differential.py ran under the system
+          # python3, which has no torch, so its "Not tested here" section read UNDETERMINED.
+          "$PY" "$GITHUB_WORKSPACE/amd_ci/lib/redecide.py" --dir "$AMD_CI_WORK/out/gpu" \
+            --criteria "$GITHUB_WORKSPACE/amd_ci/criteria/studio_update_idempotent.py"
+          cat "$AMD_CI_WORK/out/gpu/VERDICT_redecided.md" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
