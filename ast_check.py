@@ -47,9 +47,13 @@ total = sum(1 for n in ast.walk(tree)
 print("total .contiguous() call sites in module:", total)
 assert total == 2, total
 
+import os
 url = "https://api.github.com/repos/unslothai/unsloth/pulls/10617/files?per_page=100"
-req = urllib.request.Request(url, headers = {"Accept": "application/vnd.github+json",
-                                             "User-Agent": "pr10617-probe"})
+headers = {"Accept": "application/vnd.github+json", "User-Agent": "pr10617-probe"}
+tok = os.environ.get("GITHUB_TOKEN")
+if tok:
+    headers["Authorization"] = f"Bearer {tok}"
+req = urllib.request.Request(url, headers = headers)
 files = [f["filename"] for f in json.load(urllib.request.urlopen(req, timeout = 60))]
 print("PR files:", files)
 FORBIDDEN = ("studio/", ".github/", "pyproject.toml", "setup.py", "setup.cfg",
