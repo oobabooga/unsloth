@@ -9,9 +9,8 @@ The PR's own test file exists only at the head, so the generic pytest probe woul
 collect nothing at the base and the differential would be VOID. This probe carries
 its own reproducer instead, so the SAME measurement runs at every state.
 
-moe_utils.py is loaded standalone via importlib rather than by importing the
-unsloth_zoo package, so an old checkout does not have to satisfy the whole package's
-import chain on this host.
+moe_utils.py is loaded from the checkout via importlib rather than by importing the
+installed unsloth_zoo, so the SAME file the state actually contains is what runs.
 """
 
 from __future__ import annotations
@@ -45,6 +44,19 @@ def measure(checkout: str) -> dict:
     if not path.is_file():
         obs["error"] = f"no moe_utils.py at {path}"
         return obs
+
+    # Import unsloth BEFORE the checkout's moe_utils. moe_utils pulls in the
+    # unsloth_zoo package, whose __init__ raises "Please install Unsloth via
+    # `pip install unsloth`!" unless UNSLOTH_IS_PRESENT is set - and only
+    # importing unsloth sets it. Importing it afterwards is too late.
+    try:
+        import unsloth  # noqa: F401
+        from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+            KernelConfigBackward_dW, KernelConfigBackward_dX, KernelConfigForward)
+    except Exception as e:
+        obs["error"] = f"unsloth MoE kernels unavailable: {type(e).__name__}: {e}"
+        return obs
+
     sys.path.insert(0, checkout)
     spec = importlib.util.spec_from_file_location("probe_moe_utils", path)
     mu = importlib.util.module_from_spec(spec)
@@ -53,13 +65,6 @@ def measure(checkout: str) -> dict:
         spec.loader.exec_module(mu)
     except Exception as e:
         obs["error"] = f"could not load moe_utils: {type(e).__name__}: {e}"
-        return obs
-
-    try:
-        from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
-            KernelConfigBackward_dW, KernelConfigBackward_dX, KernelConfigForward)
-    except Exception as e:
-        obs["error"] = f"unsloth MoE kernels unavailable: {type(e).__name__}: {e}"
         return obs
 
     dev, dt = "cuda", torch.bfloat16
