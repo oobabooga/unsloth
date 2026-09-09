@@ -124,6 +124,31 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
+      - name: Ensure unsloth is importable in the measurement venv
+        run: |
+          set -euo pipefail
+          echo "== measurement venv: $AMD_CI_PY =="
+          "$AMD_CI_PY" -m pip list 2>&1 | grep -iE "unsloth|^torch|transformers|peft|trl|triton|bitsandbytes" \
+            || echo "(nothing matched)"
+          # The zoo's __init__ refuses to import without unsloth, and the probe needs
+          # unsloth.kernels.moe.grouped_gemm for the Triton MoE kernels. --no-deps so a
+          # resolver cannot pull a CUDA torch over this ROCm one.
+          set +e
+          "$AMD_CI_PY" -c "import unsloth" > "$AMD_CI_WORK/imp1.log" 2>&1
+          rc=$?
+          set -e
+          echo "import unsloth rc=$rc"; tail -4 "$AMD_CI_WORK/imp1.log" || true
+          if [ "$rc" -ne 0 ]; then
+            "$AMD_CI_PY" -m pip install -q --no-deps unsloth unsloth_zoo || \
+              echo "pip install --no-deps unsloth failed"
+          fi
+          set +e
+          "$AMD_CI_PY" -c "import unsloth; from unsloth.kernels.moe.grouped_gemm.kernels.tuning import KernelConfigForward; print('KERNELS OK', unsloth.__version__)" \
+            > "$AMD_CI_WORK/imp2.log" 2>&1
+          rc2=$?
+          set -e
+          echo "kernels import rc=$rc2"; tail -12 "$AMD_CI_WORK/imp2.log" || true
+
       - name: Differential
         run: |
           set +e
