@@ -125,6 +125,78 @@ def _torch_facts(py: Path, timeout: int = 240) -> dict:
         return {"present": False, "error": repr(exc)}
 
 
+_AUDIT_SCRIPT = r"""
+import glob, json, os, platform, sys, time
+from pathlib import Path
+sp = "Lib/site-packages" if os.name == "nt" else "lib/python*/site-packages"
+studio = next(iter(glob.glob(str(Path(sys.prefix) / sp / "studio"))), None)
+out = {"studio_dir": studio}
+if studio is None:
+    print(json.dumps(out)); raise SystemExit(0)
+sys.path.insert(0, studio)
+import install_manifest as im
+m = im.read_manifest() or {}
+out["manifest"] = {k: m.get(k) for k in ("schema", "python", "platform", "no_torch", "expected_torch_tag",
+                                         "expected_torch_tag_pinned", "pip_check_ok", "bnb_rocm", "completed_at_ms")}
+out["manifest_step_results"] = m.get("step_results")
+out["manifest_has_pass_inputs"] = isinstance(m.get("pass_inputs"), dict)
+out["live"] = {"python": platform.python_version(), "platform": f"{sys.platform}-{platform.machine()}",
+               "expected_torch_tag_env": os.environ.get("UNSLOTH_EXPECTED_TORCH_TAG")}
+t = time.time()
+try:
+    v = im.verify_install(deep = True)
+    out["verify_deep"] = json.loads(json.dumps(v, default = str))[:1] if isinstance(v, list) else json.loads(json.dumps(v, default = str))
+except Exception as exc:
+    out["verify_deep"] = {"error": repr(exc)}
+out["verify_deep_seconds"] = round(time.time() - t, 1)
+try:
+    out["bnb_damaged"] = im.damaged_payload_files("bitsandbytes", limit = 5)
+except Exception as exc:
+    out["bnb_damaged"] = {"error": repr(exc)}
+req_root = im.requirements_root(Path(studio))
+try:
+    idx = im.installed_dependency_index()
+    out["index_size"] = None if idx is None else len(idx)
+except Exception as exc:
+    idx = None; out["index_error"] = repr(exc)
+files = {}
+for rel in ("base.txt", "no-torch-runtime.txt", "extras.txt", "extras-no-deps.txt", "studio.txt",
+            "diffusers-pin.txt", "triton-kernels.txt", "single-env/data-designer-deps.txt", "single-env/data-designer.txt"):
+    f = req_root / rel
+    if not f.is_file():
+        continue
+    e = {}
+    try: e["missing"] = im.missing_requirements(f)
+    except Exception as exc: e["missing"] = repr(exc)
+    try: e["closure_unmet"] = im.unsatisfied_closure_requirement(f, idx)
+    except Exception as exc: e["closure_unmet"] = repr(exc)
+    files[rel] = e
+out["requirements"] = files
+try:
+    out["violated_constraints"] = im.violated_constraints(req_root / "single-env" / "constraints.txt")
+except Exception as exc:
+    out["violated_constraints"] = repr(exc)
+print(json.dumps(out, default = str))
+"""
+
+
+def _manifest_audit(py: Path, timeout: int = 600) -> dict:
+    """What the installer's evidence gate would see, computed with the venv's own
+    install_manifest: manifest identity fields against the live interpreter, the deep
+    verify, bitsandbytes payload damage, and per-file missing / closure / constraint
+    answers. Every one of these refuses the evidence silently in the installer."""
+    if not py.is_file():
+        return {"error": "no venv python"}
+    try:
+        p = subprocess.run([str(py), "-I", "-c", _AUDIT_SCRIPT], capture_output = True, text = True, timeout = timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": repr(exc)}
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {"rc": p.returncode, "stdout_tail": (p.stdout or "")[-1500:], "stderr_tail": (p.stderr or "")[-1500:]}
+
+
 def _torch_record_mtime(venv: Path) -> float | None:
     pattern = "Lib/site-packages/torch-*.dist-info/RECORD" if IS_WINDOWS \
         else "lib/python*/site-packages/torch-*.dist-info/RECORD"
@@ -361,6 +433,7 @@ def main() -> int:
     obs["steps"]["settle"] = step(settle_argv, args.update_timeout)
     obs["settle"] = _step_summary(out_dir, "noop-update-settle")
     obs["torch_record_mtime_after_settle"] = _torch_record_mtime(venv)
+    obs["manifest_audit_after_settle"] = _manifest_audit(py)
 
     obs["steps"]["noop"] = step(noop_argv, args.update_timeout)
     obs["noop"] = _step_summary(out_dir, "noop-update-second")
@@ -369,6 +442,7 @@ def main() -> int:
     obs["amd_escape_after_noop"] = _amd_escape(venv, py)
     obs["pip_check_after_noop"] = _pip_check(py)
     obs["bitsandbytes_after_noop"] = _dist_facts(venv, "bitsandbytes")
+    obs["manifest_audit_after_noop"] = _manifest_audit(py)
 
     obs["steps"]["offline"] = step(offline_argv, args.update_timeout)
     off_name = "noop-update-third-offline" if (out_dir / "noop-update-third-offline").is_dir() else "noop-update-third"
