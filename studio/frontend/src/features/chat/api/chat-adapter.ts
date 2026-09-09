@@ -256,6 +256,7 @@ import {
   budgetImpliesTruncation,
   CONTINUE_INSTRUCTION,
   createContinuationMerger,
+  incompleteLabel,
   type IncompleteReason,
   readIncompleteInfo,
   resolveIncompleteReason,
@@ -1430,7 +1431,10 @@ function toOpenAIMessages(
   }
 
   if (message.role === "assistant") {
-    return serializeAssistantReplayMessages(message, includeReasoningContent);
+    return fillStoppedAssistantReplay(
+      message,
+      serializeAssistantReplayMessages(message, includeReasoningContent),
+    );
   }
 
   const textContent = collectTextParts(message).join("\n");
@@ -1467,6 +1471,47 @@ function assistantTurnEndedEarly(message: RunMessage): boolean {
     message.status?.type === "incomplete" ||
     readIncompleteInfo((message as { metadata?: unknown }).metadata) !== null
   );
+}
+
+/** A Stop with no output serialises empty, so pruneOutboundHistory would drop the user
+ *  prompt once a later turn follows it (#10428 after #10445). Nothing was yielded, so
+ *  `status` is the only record left, and only `cancelled` there is a deliberate Stop. */
+function stoppedAssistantReplayText(message: RunMessage): string {
+  const info = readIncompleteInfo(
+    (message as { metadata?: unknown }).metadata,
+  );
+  const status = message.status;
+  const fromStatus: IncompleteReason =
+    status?.type !== "incomplete" || status.reason === "cancelled"
+      ? "cancelled"
+      : status.reason === "length"
+        ? "length"
+        : "interrupted";
+  return incompleteLabel(info?.reason ?? fromStatus);
+}
+
+function fillStoppedAssistantReplay(
+  message: RunMessage,
+  serialized: SerializedMessage[],
+): SerializedMessage[] {
+  if (!assistantTurnEndedEarly(message)) {
+    return serialized;
+  }
+  if (serialized.length === 0) {
+    return [{ role: "assistant", content: stoppedAssistantReplayText(message) }];
+  }
+  const [only, ...rest] = serialized;
+  if (rest.length !== 0 || only?.role !== "assistant") {
+    return serialized;
+  }
+  if (
+    hasReplayContent(only.content) ||
+    only.tool_calls ||
+    only.reasoning_content
+  ) {
+    return serialized;
+  }
+  return [{ ...only, content: stoppedAssistantReplayText(message) }];
 }
 
 /** A Stop before the turn produced anything serialises to a lone empty assistant message,
@@ -2068,7 +2113,9 @@ function waitForModelReady(abortSignal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const check = () => {
       if (abortSignal?.aborted) {
-        reject(new Error("Aborted"));
+        // The real reason, not a bare Error: this rejection leaves the adapter uncaught, and a
+        // Stop that does not arrive as an AbortError is filed as a failed turn (#10428 review).
+        reject(abortSignal.reason ?? new DOMException("Aborted", "AbortError"));
         return;
       }
       if (!useChatRuntimeStore.getState().modelLoading) {
