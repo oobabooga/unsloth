@@ -154,6 +154,41 @@ def _amd_escape(venv: Path, py: Path, timeout: int = 200) -> dict:
         return {"applicable": True, "error": repr(exc)}
 
 
+def _pip_check(py: Path, timeout: int = 300) -> dict:
+    """`pip check` on the venv: the installer records its verdict in the manifest and the
+    evidence gate reads it, so a failing check on one platform explains a pass that never skips."""
+    if not py.is_file():
+        return {"error": "no venv python"}
+    try:
+        p = subprocess.run([str(py), "-m", "pip", "check"], capture_output = True, text = True, timeout = timeout)
+        return {"rc": p.returncode, "out": (p.stdout or "")[-3000:], "err": (p.stderr or "")[-800:]}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": repr(exc)}
+
+
+def _dist_facts(venv: Path, name: str) -> dict:
+    """dist-info directory name, METADATA version and direct_url.json of one distribution."""
+    sp = "Lib/site-packages" if IS_WINDOWS else "lib/python*/site-packages"
+    out: dict = {"dist_infos": []}
+    for d in glob.glob(str(venv / sp / f"{name}-*.dist-info")):
+        entry = {"dir": os.path.basename(d)}
+        try:
+            for line in open(os.path.join(d, "METADATA"), encoding = "utf-8", errors = "replace"):
+                if line.startswith("Version:"):
+                    entry["metadata_version"] = line.split(":", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+        du = os.path.join(d, "direct_url.json")
+        if os.path.isfile(du):
+            try:
+                entry["direct_url"] = json.load(open(du, encoding = "utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                entry["direct_url_error"] = repr(exc)
+        out["dist_infos"].append(entry)
+    return out
+
+
 def _step_summary(out_dir: Path, name: str) -> dict:
     """Fold one harness step's summary.json into the fields the criteria read."""
     d = out_dir / name
@@ -270,6 +305,9 @@ def main() -> int:
         "PR_PIN_BASE": args.pin_base, "BISECT_DIR": str(harness), "GEN_PINS": str(work / "pins_gen"),
         "EXPECT_IDEMPOTENT": "0",   # record, never abort: the base is EXPECTED to fail this
         "PY3": args.python,
+        # The installer names WHY a step could not be skipped only under verbose, and that
+        # reason is the whole diagnosis when a no-op still does work on one platform.
+        "UNSLOTH_VERBOSE": "1",
     })
     if IS_WINDOWS:
         henv["USERPROFILE"] = str(home)
@@ -329,6 +367,8 @@ def main() -> int:
     obs["torch_record_mtime_after_noop"] = _torch_record_mtime(venv)
     obs["torch_after_noop"] = _torch_facts(py)
     obs["amd_escape_after_noop"] = _amd_escape(venv, py)
+    obs["pip_check_after_noop"] = _pip_check(py)
+    obs["bitsandbytes_after_noop"] = _dist_facts(venv, "bitsandbytes")
 
     obs["steps"]["offline"] = step(offline_argv, args.update_timeout)
     off_name = "noop-update-third-offline" if (out_dir / "noop-update-third-offline").is_dir() else "noop-update-third"
