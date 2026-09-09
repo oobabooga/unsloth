@@ -1,0 +1,100 @@
+name: PR10617 Studio impact
+
+on:
+  push:
+    branches: [pr10617-studio-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: linux,        heavy: 'yes' }
+          - { os: macos-15,       label: macos-arm-mlx, heavy: 'no' }
+          - { os: windows-latest, label: windows,      heavy: 'no' }
+    name: probe-${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the PR head into repo/
+        shell: bash
+        run: |
+          git init repo
+          cd repo
+          git remote add origin https://github.com/unslothai/unsloth
+          git fetch --depth 50 origin refs/pull/10617/head
+          git checkout FETCH_HEAD
+          git log --oneline -1
+
+      - name: Platform facts
+        shell: bash
+        run: python -c "import platform,sys; print(platform.platform()); print(platform.machine()); print(sys.version)"
+
+      - name: AST - exactly two statements changed, no imports or studio/ or packaging
+        shell: bash
+        working-directory: repo
+        run: python ../ast_check.py
+
+      - name: Routing - is the changed module reachable on this platform at all
+        shell: bash
+        working-directory: repo
+        run: python ../routing_check.py
+
+      - name: Studio entrypoints must not import unsloth at module scope
+        shell: bash
+        working-directory: repo
+        run: python ../studio_import_check.py
+
+      - name: Packaging - tests/ is not a shipped package
+        shell: bash
+        working-directory: repo
+        run: python ../packaging_check.py
+
+      - name: Linux only - real import with torch+triton, and a built wheel
+        if: matrix.heavy == 'yes'
+        shell: bash
+        working-directory: repo
+        run: |
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python -c "import triton, torch; print('triton', triton.__version__, 'torch', torch.__version__)" || echo "no triton"
+          python ../routing_check.py
+          python -m pip install -q build setuptools wheel
+          python ../wheel_check.py
+
+  wsl:
+    name: probe-wsl
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-24.04
+      - name: Probe inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq git python3 > /dev/null
+          git init repo && cd repo
+          git remote add origin https://github.com/unslothai/unsloth
+          git fetch --depth 50 origin refs/pull/10617/head
+          git checkout FETCH_HEAD
+          git log --oneline -1
+          python3 -c "import platform; print('WSL', platform.platform(), platform.machine())"
+          cp ../ast_check.py ../routing_check.py ../studio_import_check.py ../packaging_check.py .
+          git fetch --depth 50 origin main
+          python3 ast_check.py
+          python3 routing_check.py
+          python3 studio_import_check.py
+          python3 packaging_check.py
