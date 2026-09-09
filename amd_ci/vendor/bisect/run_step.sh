@@ -79,12 +79,31 @@ try: print(m.version('$1'))
 except Exception: print('')" 2>/dev/null
 }
 
+
+# curl when present, else the harness Python: one of the self-hosted AMD Linux boxes ships
+# without curl, and the tag installers and the health probe are the only fetches here.
+_http_get() {
+    local url="$1" dest="$2" timeout="${3:-60}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -m "$timeout" "$url" -o "$dest" 2>/dev/null
+    else
+        "${PY3:-python3}" - "$url" "$dest" "$timeout" <<'PYEOF'
+import sys, urllib.request
+url, dest, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    with urllib.request.urlopen(url, timeout = timeout) as r, open(dest, "wb") as f:
+        f.write(r.read())
+except Exception:
+    sys.exit(1)
+PYEOF
+    fi
+}
 fetch_tag_script() {  # fetch_tag_script <N> <install.sh|install.ps1|uninstall.sh>
     local n=$1 name=$2 dest="$SCRIPTS_DIR/$1" path key
     mkdir -p "$dest"
     case "$name" in uninstall.*) path="scripts/$name"; key="" ;; *) path="$name"; key="${name//./_}_blob" ;; esac
     if [ ! -s "$dest/$name" ]; then
-        curl -fsSL "https://raw.githubusercontent.com/unslothai/unsloth/v0.1.$n-beta/$path" -o "$dest/$name" || return 1
+        _http_get "https://raw.githubusercontent.com/unslothai/unsloth/v0.1.$n-beta/$path" "$dest/$name" || return 1
     fi
     if [ -n "$key" ]; then
         local want got
@@ -644,7 +663,7 @@ cmd_launch() {
     ( cd "$FAKE_HOME" && eval "exec $(child_env "$pins_target" UNSLOTH_TAURI_UPDATE=1) $(printf '%q ' "${launch_cmd[@]}")" ) > "$d/server.log" 2>&1 &
     local spid=$! healthy="" i
     for i in $(seq 1 "$secs"); do
-        if curl -fsS -m 2 "http://127.0.0.1:$port/api/health" > "$d/health.json" 2>/dev/null; then healthy=$("$PY3" -c "print(round($(now_s)-$t0,1))"); break; fi
+        if _http_get "http://127.0.0.1:$port/api/health" "$d/health.json" 2; then healthy=$("$PY3" -c "print(round($(now_s)-$t0,1))"); break; fi
         kill -0 "$spid" 2>/dev/null || break
         sleep 1
     done
