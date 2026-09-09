@@ -24,6 +24,8 @@ if have_triton:
         print("both call sites carry .contiguous(): True")
     except Exception as exc:
         print("import failed:", type(exc).__name__, exc)
+        if os.environ.get("PR10617_REQUIRE_IMPORT") == "1":
+            raise
 else:
     print("no triton on this platform -> unsloth.kernels.rms_layernorm is unreachable here")
 print("ROUTING CHECK OK")
