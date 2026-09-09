@@ -89,8 +89,10 @@ jobs:
           # runs is stdlib Python 3 plus bash, curl and (optionally) perl.
           python3 --version
           command -v perl >/dev/null && echo "perl: present" || echo "perl: absent (python timestamp filter will be used)"
-          command -v curl >/dev/null || { echo "FATAL: curl missing"; exit 1; }
-          curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$AMD_CI_WORK/bin" UV_NO_MODIFY_PATH=1 sh
+          # No curl on every box in the pool: bootstrap uv through pip into a private venv.
+          python3 -m venv "$AMD_CI_WORK/uvenv"
+          "$AMD_CI_WORK/uvenv/bin/python" -m pip install -q --disable-pip-version-check uv
+          ln -sf "$AMD_CI_WORK/uvenv/bin/uv" "$AMD_CI_WORK/bin/uv"
           "$AMD_CI_WORK/bin/uv" --version
           echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
           # amd-smi / KFD view of the host before any install, for the record.
