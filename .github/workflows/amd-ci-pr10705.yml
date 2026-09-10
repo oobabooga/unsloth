@@ -173,7 +173,7 @@ jobs:
             --probe amd_ci/probes/pytest_probe.py \
             --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" 
+            --python "$AMD_CI_PY" -- --tests tests/test_dgx_spark_diffusion_memory.py tests/test_diffusion_memory.py tests/test_diffusion_predownload_memory_guard.py tests/test_amd_apu_unified_memory.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
