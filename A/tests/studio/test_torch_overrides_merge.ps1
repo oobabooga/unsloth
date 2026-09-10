@@ -107,29 +107,30 @@ try {
     Check "returns null under --no-torch" ($null -eq (New-UnslothTorchOverridesFile -PythonExe $fakePy))
     $SkipTorch = $false
 
-    # ── a path with a space never reaches uv (#10722) ─────────────────────────────
-    # uv splits an --overrides value on spaces, so C:\Users\John Doe\... arrived as two files.
+    # ── a temp path with a space never reaches uv (#10722) ────────────────────────
+    # uv splits an --overrides value on spaces, so C:\Users\John Doe\...\tmp1.tmp arrived as two
+    # files. UV_OVERRIDE is itself space-separated, so the spaced path to cover is %TEMP%'s.
     if ($onWindows) {
-        $spacedDir = Join-Path $work "John Doe"
-        New-Item -ItemType Directory -Path $spacedDir -Force | Out-Null
-        $spacedOv = Join-Path $spacedDir "over.txt"
-        Set-Content -LiteralPath $spacedOv -Value "plainpkg==2.0" -Encoding ascii
+        $spacedTemp = Join-Path $work "John Doe"
+        New-Item -ItemType Directory -Path $spacedTemp -Force | Out-Null
         $dirShort = $null
-        try { $dirShort = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($spacedDir).ShortPath } catch { }
+        try { $dirShort = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($spacedTemp).ShortPath } catch { }
         # The no-8.3 fallback warns through the installer's substep.
         $script:substepCalls = @()
         function substep { param($Message, $Color) $script:substepCalls += $Message }
-        $env:UV_OVERRIDE = $spacedOv
-        $spaced = New-UnslothTorchOverridesFile -PythonExe $fakePy
+        Remove-Item Env:UV_OVERRIDE -ErrorAction SilentlyContinue
+        $savedTmp = $env:TMP
+        $env:TMP = $spacedTemp   # GetTempPath reads TMP first
+        try { $spaced = New-UnslothTorchOverridesFile -PythonExe $fakePy }
+        finally { $env:TMP = $savedTmp }
         $made += $spaced
         if ($dirShort -and -not $dirShort.Contains(" ")) {
-            Check "a spaced overrides path comes back without a space" ($spaced -and -not $spaced.Contains(" "))
-            Check "the short path still sits beside the caller's override" (
-                $spaced -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $spaced) "over.txt")))
+            Check "a spaced temp path comes back without a space" ($spaced -and -not $spaced.Contains(" "))
+            Check "the short path names a file in that same temp directory" (
+                $spaced -and (Test-Path -LiteralPath $spaced) -and ((Split-Path -Parent $spaced) -eq $dirShort))
         } else {
             Check "no 8.3 name: no overrides file is returned" ($null -eq $spaced)
-            Check "no 8.3 name: the file it created is removed" (
-                @(Get-ChildItem -LiteralPath $spacedDir -Filter "unsloth-torch-overrides-*").Count -eq 0)
+            Check "no 8.3 name: the file it created is removed" (@(Get-ChildItem -LiteralPath $spacedTemp).Count -eq 0)
             Check "no 8.3 name: the fallback is announced" ($script:substepCalls.Count -gt 0)
         }
     } else {
