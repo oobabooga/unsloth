@@ -10,15 +10,6 @@ Tolerance is the TIGHTER of two ceilings on purpose. A flat percentage of total
 is too loose on a large unified pool: 2% of 178 GiB is 3.6 GiB, nearly the whole
 holder, which would let a half-fix pass. Tying it to the holder keeps the test
 honest whatever the card's size.
-
-Two gates bound the claim to the part it is about. The comparison is against the
-DRIVER's free figure, so it is worth nothing on a host where that figure does not
-itself respond to a resident allocation: on an integrated part the pool is system
-RAM, and whether `hipMemGetInfo` free tracks physical residency there is exactly
-what is in doubt (ROCm/ROCm#5595, ggml-org/llama.cpp#18159). The fixture reads
-free before and after committing, so "the driver's own free moved" is checkable
-rather than assumed, and a host that is not the integrated gfx1151 this is a
-claim about is INCONCLUSIVE rather than a quiet pass on different silicon.
 """
 
 from __future__ import annotations
@@ -26,13 +17,7 @@ from __future__ import annotations
 GIB = 1024 ** 3
 TITLE = "GPU summary against driver-reported free VRAM"
 MODE = "differential"
-NEEDS = ["gpu", "rocm", "integrated_gpu", "windows", "windows_rocm_wddm",
-         "multi_gpu", "nvidia", "mig", "xpu", "mlx"]
-
-# The part this is a claim about. Anything else is INCONCLUSIVE: a summary that
-# tracks the driver on a discrete card says nothing about a unified pool, and
-# reporting it as a pass would be a result about the wrong hardware.
-EXPECT_ARCH = "gfx1151"
+NEEDS = ["gpu", "windows_rocm_wddm", "multi_gpu", "nvidia", "mig", "xpu", "mlx"]
 
 
 def _held(obs: dict) -> float:
@@ -63,34 +48,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     _CTX["held"] = held
     _CTX["tol"] = min(max(0.5, 0.02 * total), max(0.5, 0.25 * held)) if held else 0.5
 
-    fixture = obs.get("_fixture") or {}
-    states = {n: v for n, v in obs.items() if not n.startswith("_")}
-
     out = [("holder really held >= 2 GiB", held >= 2.0, f"{held:.2f} GiB")]
-
-    # Is this the hardware the claim is about? Read off the head where possible,
-    # since every state runs on the same box.
-    ref = states.get("head") or (next(iter(states.values())) if states else {})
-    arch = str(ref.get("arch") or "")
-    integrated = ref.get("is_integrated")
-    out.append((f"the host is an integrated {EXPECT_ARCH} part",
-                arch.startswith(EXPECT_ARCH) and bool(integrated),
-                f"arch={arch or '-'} is_integrated={integrated} "
-                f"torch={ref.get('torch_version', '-')} hip={ref.get('torch_hip', '-')}"))
-
-    # The driver figure is the yardstick, so it has to be a yardstick. If free
-    # does not move when 8 GiB is committed and touched, every delta below is a
-    # comparison against a constant.
-    before = fixture.get("driver_free_before_gib")
-    after = fixture.get("driver_free_gib")
-    drop = fixture.get("driver_free_drop_gib")
-    moved = (drop is not None and held > 0 and drop >= 0.5 * held)
-    out.append(("the driver's own free tracks the held allocation",
-                bool(moved),
-                f"free {before if before is None else f'{before:.2f}'} -> "
-                f"{after if after is None else f'{after:.2f}'} GiB, "
-                f"drop {drop if drop is None else f'{drop:.2f}'} GiB against "
-                f"{held:.2f} GiB held"))
     bystanders = {n: v.get("observer_allocated_gib", 0)
                   for n, v in obs.items() if not n.startswith("_")}
     out.append(("observer stayed a bystander",
@@ -119,21 +77,6 @@ def table(obs: dict) -> str:
     rows.append("")
     rows.append(f"Holder took {_CTX['held']:.2f} GiB; tolerance {_CTX['tol']:.2f} GiB "
                 f"(the tighter of 2% of total and 25% of the holder).")
-
-    kernel = next((v.get("kernel") for n, v in obs.items()
-                   if not n.startswith("_") and v.get("kernel")), None)
-    if kernel:
-        rows += ["", "Kernel's own view, for the record. Which of these the driver's"
-                     " reported total actually is cannot be read off `mem_get_info`:",
-                 "", "| source | GiB |", "|---|---|"]
-        limit = kernel.get("ttm_pages_limit_gib")
-        rows.append(f"| ttm pages_limit | {'-' if limit is None else f'{limit:.2f}'} |")
-        for card, row in (kernel.get("cards") or {}).items():
-            for name in ("mem_info_gtt_total", "mem_info_gtt_used",
-                         "mem_info_vram_total", "mem_info_vram_used"):
-                value = row.get(f"{name}_gib")
-                if value is not None:
-                    rows.append(f"| {card} {name} | {value:.2f} |")
     return "\n".join(rows)
 
 

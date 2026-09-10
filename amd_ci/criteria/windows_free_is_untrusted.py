@@ -16,9 +16,19 @@ So the two halves of the question are asked separately.
                      problem the cap exists for, and the run is VOID: nothing about
                      the cap can be concluded from a host that never over-reports.
 
-  head_is_fixed      the GUARD. Is the figure a guard in this checkout is handed
-                     bounded by what the card can still hold, `total - held`,
+  head_is_fixed      the GUARD, graded on the figure a llama-server placement is
+                     actually budgeted with. `trusted_mem_get_info` is not that
+                     figure and does not claim to be: its own docstring calls it
+                     a ceiling that "still cannot see another process". The
+                     launch path applies a second cap on a shared pool,
+                     `min(free, _available_system_memory_mib())` before the host
+                     reserve, so `_get_gpu_memory` is what decides a placement
+                     and what this grades. Is it bounded by `total - held`,
                      within tolerance?
+
+The primitive is still measured and still reported, because "the cap did nothing"
+and "the launch path was unguarded" are different findings and collapsing them
+would either excuse the first or overstate the second.
 
 Tolerance follows the Linux criteria: the tighter of 2% of total and 25% of the
 holder, so a large unified pool cannot make a half-cap look like a cap.
@@ -58,6 +68,26 @@ def _states(obs: dict) -> dict:
     return {n: v for n, v in obs.items() if not n.startswith("_")}
 
 
+def _fmt(value) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def _planner(state: dict) -> dict:
+    return state.get("planner") or {}
+
+
+def _planner_free_gib(state: dict) -> float | None:
+    """The largest free budget `_get_gpu_memory` offers, in GiB.
+
+    The largest, not the first: it is the one an over-commit would be built on,
+    and taking a smaller row would flatter the result on a multi-device answer.
+    """
+    planner = _planner(state)
+    rows = planner.get("get_gpu_memory_for_llama_server") or planner.get("get_gpu_memory") or []
+    frees = [row[1] for row in rows if isinstance(row, (list, tuple)) and len(row) >= 2]
+    return max(frees) / 1024.0 if frees else None
+
+
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
     held = _held(obs)
     states = _states(obs)
@@ -92,8 +122,24 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
 
     readable = all(v.get("raw_free_gib") is not None and v.get("guard_free_gib") is not None
                    for v in states.values())
+    # The evidence carries the numbers, not just a yes: a later gate can fail and
+    # suppress the table, and these are the readings the run exists for.
     out.append(("every state produced a raw and a guard-facing reading", readable,
-                "" if readable else "a state failed to read one of the two"))
+                ", ".join(f"{n}: raw={_fmt(v.get('raw_free_gib'))} "
+                          f"guard={_fmt(v.get('guard_free_gib'))}"
+                          for n, v in states.items())))
+
+    # The figure a placement is budgeted with has to exist before it can be
+    # graded. Absent, the run says nothing about the launch path rather than
+    # passing it by default.
+    planner = _planner(ref)
+    rows = planner.get("get_gpu_memory_for_llama_server") or planner.get("get_gpu_memory") or []
+    out.append(("the planner's own memory probe answered for a device",
+                bool(rows),
+                f"_get_gpu_memory -> {rows or '[]'} "
+                f"unified_ids={planner.get('unified_ids')} "
+                f"avail_system_mib={planner.get('available_system_memory_mib')} "
+                f"error={planner.get('error') or planner.get('get_gpu_memory_error') or '-'}"))
 
     bystanders = {n: v.get("observer_allocated_gib", 0) for n, v in states.items()}
     out.append(("the probe stayed a bystander",
@@ -139,6 +185,19 @@ def table(obs: dict) -> str:
         rows.append(f"| carve-out advice would read | "
                     f"{carve['igpu_dedicated_memory_gib']:.2f} |")
 
+    rows += ["", "The figure a llama-server placement is budgeted with, which is what "
+                 "the verdict grades:", "",
+             "| state | _get_gpu_memory (idx, free MiB, total MiB) | free GiB | unified ids | "
+             "avail system MiB | context-free unified free GiB |", "|---|---|---|---|---|---|"]
+    for name, v in _states(obs).items():
+        planner = _planner(v)
+        got = planner.get("get_gpu_memory_for_llama_server") or planner.get("get_gpu_memory")
+        rows.append(
+            f"| {name} | {got if got else 'none: ' + str(planner.get('error') or planner.get('get_gpu_memory_error') or 'empty')} | "
+            f"{_fmt(_planner_free_gib(v))} | {planner.get('unified_ids')} | "
+            f"{planner.get('available_system_memory_mib')} | "
+            f"{_fmt(planner.get('context_free_unified_gib'))} |")
+
     self_rows = [(n, v["selfcheck"]) for n, v in _states(obs).items() if v.get("selfcheck")]
     if self_rows:
         rows += ["", "With the allocation in the probe's OWN process instead of the "
@@ -164,8 +223,13 @@ def base_shows_defect(base: dict) -> bool:
 
 
 def head_is_fixed(head: dict) -> bool:
-    """Is the guard-facing figure bounded by what the card can still hold?"""
-    guard, total = head.get("guard_free_gib"), head.get("raw_total_gib")
-    if guard is None or not total:
+    """Is the figure a placement is budgeted with bounded by what the card holds?
+
+    Graded on `_get_gpu_memory`, not on `trusted_mem_get_info`. The primitive is
+    documented as a ceiling that cannot see another process, so grading it would
+    be grading something against a claim it never made.
+    """
+    planner_free, total = _planner_free_gib(head), head.get("raw_total_gib")
+    if planner_free is None or not total:
         return False
-    return guard <= (total - _CTX["held"]) + _CTX["tol"]
+    return planner_free <= (total - _CTX["held"]) + _CTX["tol"]
