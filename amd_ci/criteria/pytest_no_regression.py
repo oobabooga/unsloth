@@ -47,18 +47,30 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name} suite collected tests", collected > 0,
                     f"{collected} collected (passed {o.get('n_passed', 0)}, "
                     f"failed {o.get('n_failed', 0)}, skipped {o.get('n_skipped', 0)})"))
+
+        # Collected is not judged. A test that errors at setup is neither passed
+        # nor failed, and a module whose every test errors still "collects" its
+        # skips. 6 skipped plus 2435 setup errors satisfied the gate above and
+        # read as no regression; nothing had been compared. Require at least one
+        # verdict, and name the error count so the cause is on the report.
+        judged = (o.get("n_passed", 0) or 0) + (o.get("n_failed", 0) or 0)
+        n_err = o.get("n_errors", 0) or 0
+        out.append((f"{name} suite judged tests", judged > 0,
+                    f"{judged} judged (passed {o.get('n_passed', 0)}, "
+                    f"failed {o.get('n_failed', 0)}), {n_err} errored at setup or collection"))
     return out
 
 
 def table(obs: dict) -> str:
-    rows = ["| state | passed | failed | skipped | failing tests |", "|---|---|---|---|---|"]
+    rows = ["| state | passed | failed | skipped | errors | failing tests |",
+            "|---|---|---|---|---|---|"]
     for name in ("base", "head", "merge"):
         o = obs.get(name)
         if not o:
             continue
         failed = ", ".join(f"`{f.split('::')[-1]}`" for f in o.get("failed", [])) or "none"
         rows.append(f"| {name} | {o.get('n_passed', 0)} | {o.get('n_failed', 0)} "
-                    f"| {o.get('n_skipped', 0)} | {failed} |")
+                    f"| {o.get('n_skipped', 0)} | {o.get('n_errors', 0)} | {failed} |")
     note = ""
     absent = (obs.get("base") or {}).get("absent_at_this_state") or []
     if absent:

@@ -88,6 +88,14 @@ def main() -> int:
     obs["n_passed"] = int(m.group(1)) if m else 0
     m = re.search(r"(\d+) skipped", tail)
     obs["n_skipped"] = int(m.group(1)) if m else 0
+    # Setup and collection errors are not failures: pytest reports them on
+    # their own counter and lists them as "ERROR at setup of <test>", and with
+    # thousands of them the per-test lines scroll out of the captured tail. A
+    # run with 6 skipped and 2435 errors was graded NO_REGRESSION because only
+    # the three counters above were read. Observed on the Windows pool with a
+    # venv that lacked huggingface_hub.
+    m = re.search(r"(\d+) errors?\b", tail)
+    obs["n_errors"] = int(m.group(1)) if m else 0
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
 
