@@ -105,7 +105,7 @@ jobs:
           "$AMD_CI_PY" amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
             --probe amd_ci/probes/gpu_summary_probe.py \
-            --criteria amd_ci/criteria/gpu_summary_sees_others.py \
+            --criteria amd_ci/criteria/gpu_free_tracks_residency_gfx1151.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
             --python "$AMD_CI_PY" --fixture "$GITHUB_WORKSPACE/amd_ci/probes/vram_holder_fixture.py" --fixture-arg=--gib --fixture-arg=8 --fixture-arg=--max-seconds --fixture-arg=3600 --fixture-timeout 600
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"

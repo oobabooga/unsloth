@@ -123,6 +123,85 @@ def carveout_reading(checkout: Path) -> dict:
     return out
 
 
+def planner_readings(hw, total_bytes: int | None) -> dict:
+    """The figures the LAUNCH path budgets with, not the primitive underneath it.
+
+    `trusted_mem_get_info` says in its own docstring that it cannot see another
+    process, so it is a ceiling rather than a measurement. What decides a
+    llama-server placement is `_get_gpu_memory`, which on a device the ROCm branch
+    calls unified applies a SECOND cap: `min(free, _available_system_memory_mib())`
+    before the host reserve comes off. Recording only the primitive would grade
+    the wrong number.
+
+    Every entry is separate and separately failable, because which branch of
+    `_get_gpu_memory` answered is itself an observation: amd-smi runs before the
+    torch fallback and does not need a HIP context, so on a box with amd-smi.exe
+    on PATH the ROCm torch branch may never be reached.
+    """
+    out: dict = {}
+    try:
+        from core.inference.llama_cpp import LlamaCppBackend  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    def record(name, fn):
+        try:
+            out[name] = fn()
+        except Exception as e:  # noqa: BLE001
+            out[f"{name}_error"] = f"{type(e).__name__}: {e}"
+
+    # As the planner consumes it. for_llama_server=True is the placement caller's
+    # spelling, so both are recorded rather than assuming they agree.
+    record("get_gpu_memory", lambda: [list(row) for row in LlamaCppBackend._get_gpu_memory()])
+    record("get_gpu_memory_for_llama_server",
+           lambda: [list(row) for row in
+                    LlamaCppBackend._get_gpu_memory(for_llama_server = True)])
+    record("get_gpu_memory_amd_smi",
+           lambda: [list(row) for row in
+                    LlamaCppBackend._get_gpu_memory_amd_smi(None, for_llama_server = True)])
+    record("unified_ids", lambda: sorted(LlamaCppBackend._rocm_unified_memory_gpu_ids()))
+    record("available_system_memory_mib", LlamaCppBackend._available_system_memory_mib)
+    record("llama_server_binary", LlamaCppBackend._find_llama_server_binary)
+
+    # The reading get_gpu_summary uses on a Windows unified part: WDDM performance
+    # counters, out of process, which is the one path here that can see another
+    # process's residency at all.
+    if total_bytes:
+        record("context_free_unified_bytes",
+               lambda: hw._context_free_cuda_memory_info(0, int(total_bytes), unified = True))
+        out["context_free_unified_gib"] = (
+            None if out.get("context_free_unified_bytes") is None
+            else out["context_free_unified_bytes"] / GIB)
+    record("rocm_windows_unified_used_bytes", hw._rocm_windows_unified_used_bytes)
+    return out
+
+
+def self_allocation_check(hw, gib: float = 2.0) -> dict:
+    """Read raw and trusted again with an allocation in THIS process.
+
+    Observation, not judgement: it records what the cap does when the memory it
+    can see is its own. Whether that is the same protection as against another
+    process is the criteria module's question, not the probe's.
+    """
+    out: dict = {"requested_gib": gib}
+    try:
+        import torch  # noqa: PLC0415
+        block = torch.empty(int(gib * GIB), dtype = torch.uint8, device = "cuda")
+        block.fill_(1)
+        torch.cuda.synchronize()
+        free_b, total_b = torch.cuda.mem_get_info()
+        out["raw_free_gib"] = free_b / GIB
+        out["raw_total_gib"] = total_b / GIB
+        out["allocated_gib"] = torch.cuda.memory_allocated() / GIB
+        out["reserved_gib"] = torch.cuda.memory_reserved() / GIB
+        t_free, _t_total = hw.trusted_mem_get_info()
+        out["trusted_free_gib"] = t_free / GIB
+        del block
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -157,6 +236,16 @@ def main() -> int:
     try:
         hw = import_hardware(args.checkout)
         obs["hardware_file"] = hw.__file__
+        # `IS_ROCM` is a module global that only `detect_hardware()` sets, and
+        # `rocm_windows_free_is_untrusted()` reads it. A probe that imports the
+        # module and asks straight away gets the False it was initialised with and
+        # reports the cap as inactive on a host where the app would have it active.
+        # The app runs detection at startup, so the probe runs it too, and records
+        # the flag on both sides of that call so the artifact shows the difference
+        # rather than hiding it.
+        obs["is_rocm_before_detect"] = getattr(hw, "IS_ROCM", None)
+        obs["detected_device"] = str(hw.detect_hardware())
+        obs["is_rocm_after_detect"] = getattr(hw, "IS_ROCM", None)
         obs["has_untrusted_predicate"] = hasattr(hw, "rocm_windows_free_is_untrusted")
         obs["has_trusted_mem_get_info"] = hasattr(hw, "trusted_mem_get_info")
         if obs["has_untrusted_predicate"]:
@@ -183,6 +272,18 @@ def main() -> int:
 
     obs["directx"] = directx_adapters()
     obs["carveout"] = carveout_reading(args.checkout)
+    if hw is not None:
+        total_gib = obs.get("raw_total_gib")
+        obs["planner"] = planner_readings(
+            hw, None if total_gib is None else int(total_gib * GIB))
+
+    # LAST, and under its own key prefix. Everything above is a bystander reading,
+    # which is what the comparison uses; this allocates in the probe's OWN process
+    # to show what the cap does when it has something to cap against. The two are
+    # not interchangeable: `trusted_mem_get_info` bounds free by what THIS process
+    # has reserved, so an allocation here moves it and another process's does not.
+    if hw is not None and obs.get("raw_free_gib") is not None:
+        obs["selfcheck"] = self_allocation_check(hw)
 
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
