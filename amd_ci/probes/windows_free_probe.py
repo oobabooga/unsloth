@@ -159,6 +159,17 @@ def planner_readings(hw, total_bytes: int | None) -> dict:
     record("get_gpu_memory_amd_smi",
            lambda: [list(row) for row in
                     LlamaCppBackend._get_gpu_memory_amd_smi(None, for_llama_server = True)])
+    # WHICH branch answered, measured rather than inferred. `_get_gpu_memory`
+    # tries the Vulkan probe, then nvidia-smi, then amd-smi, then the ROCm torch
+    # fallback, and only that last branch carries the shared-pool
+    # min(free, available_system_memory) cap. A figure larger than the ROCm pool
+    # total is the signature of the Vulkan reading, but the signature is not the
+    # measurement.
+    record("is_vulkan_backend", lambda: bool(LlamaCppBackend._is_vulkan_backend()))
+    record("vulkan_probe", LlamaCppBackend._run_vulkan_probe)
+    record("get_gpu_free_memory_vulkan",
+           lambda: [list(row) for row in LlamaCppBackend._get_gpu_free_memory_vulkan()])
+    record("total_system_memory_mib", LlamaCppBackend._total_system_memory_mib)
     record("unified_ids", lambda: sorted(LlamaCppBackend._rocm_unified_memory_gpu_ids()))
     record("available_system_memory_mib", LlamaCppBackend._available_system_memory_mib)
     record("llama_server_binary", LlamaCppBackend._find_llama_server_binary)

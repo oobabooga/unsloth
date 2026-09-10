@@ -76,6 +76,22 @@ def _planner(state: dict) -> dict:
     return state.get("planner") or {}
 
 
+def _branch(state: dict) -> str:
+    """Which source `_get_gpu_memory` answered from, from what was observed.
+
+    Named rather than inferred from the size of the number: the ROCm torch
+    fallback is the only branch that applies the shared-pool
+    min(free, available_system_memory) cap, so "was that cap even reached" is
+    the question, and answering it from a magnitude would be a guess.
+    """
+    planner = _planner(state)
+    if planner.get("is_vulkan_backend"):
+        return "the ggml Vulkan probe (Vulkan build; the ROCm cap is not reached)"
+    if planner.get("get_gpu_memory_amd_smi"):
+        return "amd-smi (the ROCm torch cap is not reached)"
+    return "the ROCm torch fallback, where the shared-pool cap applies"
+
+
 def _planner_free_gib(state: dict) -> float | None:
     """The largest free budget `_get_gpu_memory` offers, in GiB.
 
@@ -136,9 +152,9 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     rows = planner.get("get_gpu_memory_for_llama_server") or planner.get("get_gpu_memory") or []
     out.append(("the planner's own memory probe answered for a device",
                 bool(rows),
-                f"_get_gpu_memory -> {rows or '[]'} "
-                f"unified_ids={planner.get('unified_ids')} "
-                f"avail_system_mib={planner.get('available_system_memory_mib')} "
+                f"_get_gpu_memory -> {rows or '[]'} via "
+                f"{_branch(ref)}, unified_ids={planner.get('unified_ids')}, "
+                f"avail_system_mib={planner.get('available_system_memory_mib')}, "
                 f"error={planner.get('error') or planner.get('get_gpu_memory_error') or '-'}"))
 
     bystanders = {n: v.get("observer_allocated_gib", 0) for n, v in states.items()}
@@ -187,14 +203,15 @@ def table(obs: dict) -> str:
 
     rows += ["", "The figure a llama-server placement is budgeted with, which is what "
                  "the verdict grades:", "",
-             "| state | _get_gpu_memory (idx, free MiB, total MiB) | free GiB | unified ids | "
-             "avail system MiB | context-free unified free GiB |", "|---|---|---|---|---|---|"]
+             "| state | _get_gpu_memory (idx, free MiB, total MiB) | free GiB | answered by | "
+             "unified ids | avail system MiB | context-free unified free GiB |",
+             "|---|---|---|---|---|---|---|"]
     for name, v in _states(obs).items():
         planner = _planner(v)
         got = planner.get("get_gpu_memory_for_llama_server") or planner.get("get_gpu_memory")
         rows.append(
             f"| {name} | {got if got else 'none: ' + str(planner.get('error') or planner.get('get_gpu_memory_error') or 'empty')} | "
-            f"{_fmt(_planner_free_gib(v))} | {planner.get('unified_ids')} | "
+            f"{_fmt(_planner_free_gib(v))} | {_branch(v)} | {planner.get('unified_ids')} | "
             f"{planner.get('available_system_memory_mib')} | "
             f"{_fmt(planner.get('context_free_unified_gib'))} |")
 
