@@ -79,10 +79,16 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 f"platform={ref.get('platform') or '-'} torch={ref.get('torch_version', '-')} "
                 f"hip={hip or 'none'} error={ref.get('torch_error', '-')}"))
 
+    # After detection, because IS_ROCM is a global that only detect_hardware() sets;
+    # the flag on both sides of that call is recorded so a False here is a fact
+    # about the host rather than about the order the probe did things in.
     untrusted = ref.get("free_is_untrusted")
     out.append(("the checkout's own predicate says free is untrusted here",
                 untrusted is True,
-                f"rocm_windows_free_is_untrusted()={untrusted} IS_ROCM={ref.get('is_rocm_flag')}"))
+                f"rocm_windows_free_is_untrusted()={untrusted} IS_ROCM={ref.get('is_rocm_flag')} "
+                f"(before detect={ref.get('is_rocm_before_detect')}, "
+                f"after={ref.get('is_rocm_after_detect')}, "
+                f"device={ref.get('detected_device')})"))
 
     readable = all(v.get("raw_free_gib") is not None and v.get("guard_free_gib") is not None
                    for v in states.values())
@@ -132,6 +138,20 @@ def table(obs: dict) -> str:
     if carve and carve.get("igpu_dedicated_memory_gib") is not None:
         rows.append(f"| carve-out advice would read | "
                     f"{carve['igpu_dedicated_memory_gib']:.2f} |")
+
+    self_rows = [(n, v["selfcheck"]) for n, v in _states(obs).items() if v.get("selfcheck")]
+    if self_rows:
+        rows += ["", "With the allocation in the probe's OWN process instead of the "
+                     "holder's, which is the only kind the cap can see:",
+                 "", "| state | self-allocated | raw free | guard-facing free |",
+                 "|---|---|---|---|"]
+        for name, sc in self_rows:
+            if sc.get("raw_free_gib") is None:
+                rows.append(f"| {name} | error: {sc.get('error')} | | |")
+                continue
+            rows.append(f"| {name} | {sc.get('reserved_gib', 0):.2f} | "
+                        f"{sc['raw_free_gib']:.2f} | "
+                        f"{sc.get('trusted_free_gib', float('nan')):.2f} |")
     return "\n".join(rows)
 
 
