@@ -5,18 +5,79 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DENSE_QUANT_PRECISION_CHIP,
   classifyHost,
   curatedArtifactIsOfferable,
+  denseQuantPrecisionChip,
   h3PerfSuffix,
+  hostIsAccelerated,
+  hostRunsDenseQuant,
 } from "../src/features/model-picker/components/model-selector/host-artifact-policy.ts";
 
 test("the backends that can place a diffusion pipeline are accelerated", () => {
   for (const deviceBackend of ["cuda", "rocm", "xpu"]) {
     assert.equal(
-      classifyHost({ deviceBackend, budgetKnown: true }),
-      "accelerated",
+      hostIsAccelerated(classifyHost({ deviceBackend, budgetKnown: true })),
+      true,
       deviceBackend,
     );
+  }
+});
+
+// Dense quant follows backend capability rather than the backend name.
+test("the dense-quant class follows the backend's capability answer, not its name", () => {
+  assert.equal(
+    classifyHost({ deviceBackend: "cuda", budgetKnown: true, denseQuantSupported: true }),
+    "dense-quant",
+  );
+  assert.equal(hostRunsDenseQuant("dense-quant"), true);
+  const preAmpere = classifyHost({
+    deviceBackend: "cuda",
+    budgetKnown: true,
+    denseQuantSupported: false,
+  });
+  assert.equal(preAmpere, "accelerated");
+  assert.equal(hostIsAccelerated(preAmpere), true);
+  assert.equal(hostRunsDenseQuant(preAmpere), false);
+  // Missing capability is conservative for older or unresolved backends.
+  assert.equal(classifyHost({ deviceBackend: "cuda", budgetKnown: true }), "accelerated");
+  for (const deviceBackend of ["rocm", "xpu"]) {
+    const host = classifyHost({ deviceBackend, budgetKnown: true });
+    assert.equal(host, "accelerated", deviceBackend);
+    assert.equal(hostRunsDenseQuant(host), false, deviceBackend);
+  }
+  for (const host of ["gguf-only", "unknown"] as const) {
+    assert.equal(hostRunsDenseQuant(host), false, host);
+  }
+  assert.equal(
+    classifyHost({
+      deviceType: "mac",
+      deviceBackend: "cuda",
+      budgetKnown: true,
+      denseQuantSupported: true,
+    }),
+    "gguf-only",
+  );
+});
+
+// The chip has to answer for the request, not only for the host.
+test("the precision chip names what the request will run", () => {
+  // Auto is the default and the only case where the ladder picks between the two.
+  for (const auto of [undefined, null, "auto", "", "  AUTO  "]) {
+    assert.equal(denseQuantPrecisionChip(auto), DENSE_QUANT_PRECISION_CHIP, String(auto));
+  }
+  // Precision=Off runs the checkpoint as-is, so there is no runtime precision to name.
+  for (const off of ["none", "off", "None", " OFF "]) {
+    assert.equal(denseQuantPrecisionChip(off), null, off);
+  }
+  // An explicit scheme names itself; "FP8 / INT8" would be wrong for all four.
+  for (const [scheme, chip] of [
+    ["fp8", "FP8"],
+    ["int8", "INT8"],
+    ["nvfp4", "NVFP4"],
+    ["mxfp8", "MXFP8"],
+  ] as const) {
+    assert.equal(denseQuantPrecisionChip(scheme), chip, scheme);
   }
 });
 
@@ -98,8 +159,17 @@ test("a gguf-only host keeps every non-GGUF row the backend can still load", () 
 });
 
 test("the speed suffixes name the two H3 rows on an accelerated host", () => {
-  assert.equal(h3PerfSuffix("MiniMaxAI/MiniMax-H3", "accelerated"), "Fast FP8");
+  assert.equal(h3PerfSuffix("MiniMaxAI/MiniMax-H3", "accelerated"), "Fast");
   assert.equal(h3PerfSuffix("unsloth/MiniMax-H3-GGUF", "accelerated"), "Slow");
+});
+
+// The qualifier promises ordering without predicting a precision.
+test("the fast row promises an ordering, not a precision", () => {
+  const suffix = h3PerfSuffix("MiniMaxAI/MiniMax-H3", "accelerated");
+  assert.ok(suffix, "the pipeline row still earns a qualifier");
+  for (const scheme of ["fp8", "int8", "bf16", "nvfp4", "mxfp8"]) {
+    assert.equal(suffix.toLowerCase().includes(scheme), false, scheme);
+  }
 });
 
 test("no other model claims a speed it was never measured at", () => {
