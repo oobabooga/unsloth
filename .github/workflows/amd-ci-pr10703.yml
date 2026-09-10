@@ -127,23 +127,28 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # The backend's own runtime deps, without which every test that imports the
-          # app dies at collection on structlog or fastapi and the differential reports
-          # INCONCLUSIVE rather than an answer. The Linux half reuses the runner's
-          # Studio venv, which already carries these; these boxes have no such venv, so
-          # the requirements file is the only source that stays in step with the repo.
-          # requirements/studio.txt is the torch-free half: pinning it here keeps the
-          # job to a small install and leaves --require rocm as the gate for anything
-          # that actually needs a device.
-          $reqs = Join-Path $env:GITHUB_WORKSPACE "amd_ci\requirements-windows.txt"
-          if (Test-Path -LiteralPath $reqs) {
-            & $py -m pip install -q -r $reqs
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "FATAL: the backend requirements did not install."
-              Write-Host "Not continuing: every app-importing test would fail to collect,"
-              Write-Host "and a differential over zero tests is not a result."
-              exit $LASTEXITCODE
-            }
+          # The backend's own runtime deps. Without them every test that imports the app
+          # dies at collection (structlog, fastapi, jwt), and tests/conftest.py imports
+          # huggingface_hub at session scope, so ONE missing name errors every test in
+          # the run. The differential then reports INCONCLUSIVE rather than an answer.
+          #
+          # Read from the repo's own requirements/studio.txt in the base state rather
+          # than a list maintained here: a hand-kept list drifts silently and the symptom
+          # is a vacuous green. That file is the torch-free half of the stack, so this
+          # stays a small install and --require rocm remains the gate for a device.
+          $states = Join-Path $env:AMD_CI_WORK "out\states.json"
+          $basePath = (Get-Content -LiteralPath $states -Raw | ConvertFrom-Json).paths.base
+          $reqs = Join-Path $basePath "studio\backend\requirements\studio.txt"
+          if (-not (Test-Path -LiteralPath $reqs)) {
+            Write-Host "FATAL: no requirements/studio.txt under the base state."
+            Write-Host "Not continuing: without the backend deps every test fails to"
+            Write-Host "collect, and a differential over zero tests is not a result."
+            exit 1
+          }
+          & $py -m pip install -q -r $reqs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "FATAL: the backend requirements did not install."
+            exit $LASTEXITCODE
           }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
