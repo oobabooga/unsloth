@@ -11,8 +11,11 @@ import {
 } from "../../../../lib/gguf-fit.ts";
 import {
   type HostClass,
+  type RequestedPrecision,
   curatedArtifactIsOfferable,
+  denseQuantPrecisionChip,
   h3PerfSuffix,
+  hostRunsDenseQuant,
 } from "./host-artifact-policy.ts";
 import type { ModelCapabilities } from "./model-capabilities";
 import type { ModelOption } from "./types";
@@ -27,8 +30,10 @@ export interface ModelArtifact {
   loadKind: LoadKind;
   /** single_file loads name their exact checkpoint inside the repo. */
   filename?: string;
-  /** Second-level row label ("GGUF", "FP8", "BF16 (official)", "BF16 - 720p"). */
+  /** Second-level row label ("GGUF", "FP8", "BF16", "BF16 - 720p"). */
   label: string;
+  /** Whether this bf16 pipeline exposes a transformer eligible for dense quantisation. */
+  denseQuantable?: boolean;
   /** Curated resident-size estimate for routing. Omitted = unknown: never auto-picked unless
    *  downloaded. GGUF omits it too, since its quant ladder self-fits via pickDefaultQuant. */
   approxSizeGb?: number;
@@ -66,7 +71,15 @@ export interface CatalogGroup {
    *  `detectCapabilities` reads tags then repo-name keywords and a name like "MiniMax-H3-GGUF"
    *  says nothing about the audio track the model emits. */
   capabilities?: Partial<ModelCapabilities>;
+  /** Quant schemes the backend refuses for this model's FAMILY whatever the GPU, mirroring
+   *  `_FAMILY_SCHEME_DENY` in diffusion_transformer_quant.py. An explicit request for one of these
+   *  is refused at load, so the row must not advertise it. Absent means nothing is denied. */
+  deniedQuantSchemes?: readonly string[];
 }
+
+// The two families `_FAMILY_SCHEME_DENY` covers: both render out of bar on the same DiT. Keep in
+// step with that table; it is short, and it has changed before (fp8 was denied and then was not).
+const QWEN_DENIED_QUANT_SCHEMES = ["mxfp8", "nvfp4"] as const;
 
 
 const gguf = (repoId: string, extra?: Partial<ModelArtifact>): ModelArtifact => ({
@@ -114,9 +127,10 @@ const bf16Pipeline = (
   repoId,
   format: "bf16",
   loadKind: "pipeline",
-  label: "BF16 (official)",
+  label: "BF16",
   approxSizeGb,
   keywords: ["bf16", "safetensors", "full precision"],
+  denseQuantable: true,
   ...extra,
 });
 
@@ -132,9 +146,10 @@ const bf16Single = (
   format: "bf16",
   loadKind: "single_file",
   filename,
-  label: "BF16 (official)",
+  label: "BF16",
   approxSizeGb,
   keywords: ["bf16", "safetensors", "full precision"],
+  denseQuantable: true,
   ...extra,
 });
 
@@ -162,6 +177,7 @@ export const IMAGE_CATALOG: CatalogGroup[] = [
   },
   {
     canonicalId: "unsloth/Qwen-Image-2512",
+    deniedQuantSchemes: QWEN_DENIED_QUANT_SCHEMES,
     displayName: "Qwen-Image 2512",
     description: "Text-to-image",
     scope: "image",
@@ -238,6 +254,7 @@ export const IMAGE_CATALOG: CatalogGroup[] = [
   },
   {
     canonicalId: "unsloth/Qwen-Image-Edit-2511",
+    deniedQuantSchemes: QWEN_DENIED_QUANT_SCHEMES,
     displayName: "Qwen-Image-Edit 2511",
     description: "Image editing",
     scope: "image",
@@ -335,7 +352,14 @@ export const IMAGE_CATALOG: CatalogGroup[] = [
     displayName: "SDXL Turbo",
     description: "Text-to-image",
     scope: "image",
-    artifacts: [bf16Pipeline("stabilityai/sdxl-turbo", 8, { label: "Safetensors", totalParams: 2567463684 })],
+    artifacts: [
+      // SDXL uses a UNet rather than a transformer.
+      bf16Pipeline("stabilityai/sdxl-turbo", 8, {
+        label: "Safetensors",
+        totalParams: 2567463684,
+        denseQuantable: false,
+      }),
+    ],
   },
   {
     canonicalId: "stabilityai/stable-diffusion-xl-base-1.0",
@@ -343,9 +367,11 @@ export const IMAGE_CATALOG: CatalogGroup[] = [
     description: "Text-to-image",
     scope: "image",
     artifacts: [
+      // SDXL uses a UNet rather than a transformer.
       bf16Pipeline("stabilityai/stable-diffusion-xl-base-1.0", 8, {
         label: "Safetensors",
         totalParams: 2567463684,
+        denseQuantable: false,
       }),
     ],
   },
@@ -809,14 +835,15 @@ export function curatedDisplayNameFor(
   repoId: string,
   catalog: CatalogGroup[],
   host: HostClass = "unknown",
+  precision?: RequestedPrecision,
 ): string | null {
   const hit = artifactForRepoId(repoId, catalog);
   if (!hit) return null;
   // A row that earns a speed qualifier must read the same closed as open: this helper names the
   // trigger and curatedRowLabelFor names the row, so a divergence would rename the model as
   // the popover opens.
-  if (h3PerfSuffix(repoId, host)) {
-    return curatedRowLabelFor(repoId, catalog, host)?.name ?? hit.group.displayName;
+  if (curatedPerfSuffix(hit, host, precision)) {
+    return curatedRowLabelFor(repoId, catalog, host, precision)?.name ?? hit.group.displayName;
   }
   return hit.group.artifacts.length > 1
     ? `${hit.group.displayName} (${hit.artifact.label})`
@@ -827,33 +854,100 @@ export function curatedDisplayNameFor(
 // resolution qualifier are chips; anything else stays in the name, since it is the only thing
 // telling two rows of one group apart.
 const LABEL_PART_SEPARATOR = " - ";
-const OFFICIAL_SUFFIX_RE = /\s*\(official\)$/i;
 const GGUF_SUFFIX_RE = /-gguf$/i;
 const RESOLUTION_RE = /^\d{3,4}p$/i;
 
+/** Whether this model's family refuses the requested scheme outright. The deny list is per family
+ *  and holds on every GPU, so no host capability can express it. */
+function groupDeniesPrecision(group: CatalogGroup, precision: RequestedPrecision): boolean {
+  const value = (precision ?? "").trim().toLowerCase();
+  return Boolean(value) && (group.deniedQuantSchemes?.includes(value) ?? false);
+}
+
+/** Whether a known artifact can accept transformer quantisation. Unknown ids defer to the backend. */
+export function curatedArtifactTakesDenseQuant(
+  repoId: string,
+  catalog: CatalogGroup[],
+): boolean | undefined {
+  const hit = artifactForRepoId(repoId, catalog);
+  if (!hit) return undefined;
+  // GGUF reaches quantisation through dense base-weight substitution.
+  if (hit.artifact.format === "gguf") return true;
+  // Other artifacts must contain a dense bf16 transformer.
+  return (
+    hit.artifact.format === "bf16" &&
+    hit.artifact.loadKind === "pipeline" &&
+    hit.artifact.denseQuantable === true
+  );
+}
+
+/** The runtime-precision chip for this row, or null when it will not be dense-quantised. Reads the
+ *  requested precision as well as the host: Precision=Off runs the released bf16 weights, so a row
+ *  claiming the fast path there would point the user away from the row they actually want. */
+function artifactDenseQuantChip(
+  group: CatalogGroup,
+  artifact: ModelArtifact,
+  host: HostClass,
+  precision: RequestedPrecision,
+): string | null {
+  if (
+    !(
+      hostRunsDenseQuant(host) &&
+      !groupDeniesPrecision(group, precision) &&
+      group.scope === "image" &&
+      artifact.format === "bf16" &&
+      artifact.loadKind === "pipeline" &&
+      artifact.denseQuantable === true
+    )
+  ) {
+    return null;
+  }
+  return denseQuantPrecisionChip(precision);
+}
+
+/** Speed qualifier from the dense-quant path or an artifact-specific rule. */
+function curatedPerfSuffix(
+  hit: { group: CatalogGroup; artifact: ModelArtifact },
+  host: HostClass,
+  precision: RequestedPrecision,
+): string | null {
+  if (artifactDenseQuantChip(hit.group, hit.artifact, host, precision)) return "Fast";
+  return h3PerfSuffix(hit.artifact.repoId, host);
+}
+
 /** A curated row as name plus chips. The name used to carry the artifact inside brackets ("MiniMax
- *  H3 (BF16 (official))"), which pushed the part a user scans for behind the part they do
+ *  H3 (BF16)"), which pushed the part a user scans for behind the part they do
  *  not. Null for ids outside the catalog. */
 export function curatedRowLabelFor(
   repoId: string,
   catalog: CatalogGroup[],
   host: HostClass = "unknown",
+  precision?: RequestedPrecision,
 ): { name: string; tags: string[] } | null {
   const hit = artifactForRepoId(repoId, catalog);
   if (!hit) return null;
   // Only where the host can run both rows, so the qualifier compares things the user can pick
   // between rather than advertising a speed they cannot have.
-  const perf = h3PerfSuffix(repoId, host);
-  const qualify = (name: string) => (perf ? `${name} (${perf})` : name);
+  const perf = curatedPerfSuffix(hit, host, precision);
+  // Avoid duplicating variant names such as "Fast (distilled)".
+  const qualify = (name: string) =>
+    perf && !new RegExp(`\\b${perf}\\b`, "i").test(name) ? `${name} (${perf})` : name;
   // GGUF reads like a text model's row: the repo name already ends in -GGUF, so a chip would only repeat the suffix.
   if (hit.artifact.format === "gguf") {
     const leaf = hit.artifact.repoId.split("/").pop() ?? hit.artifact.repoId;
     return { name: qualify(GGUF_SUFFIX_RE.test(leaf) ? leaf : `${leaf}-GGUF`), tags: [] };
   }
-  // A group with one artifact has nothing to distinguish, so it stays bare.
-  if (hit.group.artifacts.length <= 1) return { name: qualify(hit.group.displayName), tags: [] };
+  // Single-artifact groups omit format chips but retain the runtime precision chip.
+  const denseQuantChip = artifactDenseQuantChip(hit.group, hit.artifact, host, precision);
+  if (hit.group.artifacts.length <= 1) {
+    return {
+      name: qualify(hit.group.displayName),
+      tags: denseQuantChip ? [denseQuantChip] : [],
+    };
+  }
   const [format, ...rest] = hit.artifact.label.split(LABEL_PART_SEPARATOR);
-  const tags = [format.replace(OFFICIAL_SUFFIX_RE, "").trim()].filter(Boolean);
+  // Show runtime precision for dense-quant rows and stored precision otherwise.
+  const tags = [denseQuantChip ?? format.trim()].filter(Boolean);
   const kept: string[] = [];
   for (const part of rest) {
     if (RESOLUTION_RE.test(part.trim())) tags.push(part.trim());
@@ -870,6 +964,7 @@ export function curatedRowLabelFor(
 export function catalogToModelOptions(
   catalog: CatalogGroup[],
   host: HostClass = "unknown",
+  precision?: RequestedPrecision,
 ): ModelOption[] {
   const options: ModelOption[] = [];
   for (const group of catalog) {
@@ -880,7 +975,9 @@ export function catalogToModelOptions(
       if (!curatedArtifactIsOfferable(artifact.repoId, host)) continue;
       options.push({
         id: artifact.repoId,
-        name: curatedDisplayNameFor(artifact.repoId, catalog, host) ?? group.displayName,
+        name:
+          curatedDisplayNameFor(artifact.repoId, catalog, host, precision) ??
+          group.displayName,
         description: `${group.description} - ${artifact.label}`,
         isGguf: artifact.format === "gguf",
         deviceQuant: artifact.deviceQuant,

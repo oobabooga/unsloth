@@ -22,6 +22,8 @@ from core.inference.diffusion_transformer_quant import (
     TQ_INT8,
     TQ_MXFP8,
     TQ_NVFP4,
+    dense_quant_supported_kind,
+    dense_quant_unsupported_kind_reason,
     dense_transformer_supported,
     make_filter_fn,
     normalize_transformer_quant,
@@ -1598,3 +1600,281 @@ def test_real_torchao_configs_carry_set_inductor_config_false():
         assert cfg.set_inductor_config is False, scheme
     if ic is not None:
         assert getattr(ic, "coordinate_descent_tuning", None) == before
+
+
+# Load-kind eligibility.
+
+
+def test_the_dense_quant_kinds_are_gguf_and_pipeline():
+    """GGUF and pipeline loads can reach dense quantisation; single files cannot."""
+    assert tq.DENSE_QUANT_KINDS == ("gguf", "pipeline")
+    assert dense_quant_supported_kind("gguf") is True
+    assert dense_quant_supported_kind("pipeline") is True
+    assert dense_quant_supported_kind("single_file") is False
+    assert dense_quant_supported_kind(" PIPELINE ") is True
+    assert dense_quant_supported_kind(None) is False
+    assert dense_quant_supported_kind("") is False
+
+
+def test_the_unsupported_kind_reason_names_the_kind_and_the_two_that_work():
+    """The refusal identifies both the rejected kind and supported alternatives."""
+    reason = dense_quant_unsupported_kind_reason("single_file")
+    assert "single_file" in reason
+    assert "GGUF and pipeline" in reason
+    assert "the precision its checkpoint carries" in reason
+
+
+# Built-pipeline eligibility.
+
+
+class _Denoiser:
+    """A module as the gate reads one: parameters that report a dtype."""
+
+    def __init__(
+        self,
+        dtype = "torch.bfloat16",
+        **attrs,
+    ) -> None:
+        self._params = [types.SimpleNamespace(dtype = dtype)]
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+    def parameters(self, recurse = True):
+        return iter(self._params)
+
+
+def test_a_dense_bf16_pipeline_is_the_one_shape_that_passes():
+    pipe = types.SimpleNamespace(transformer = _Denoiser())
+    assert tq.dense_quant_blocker(pipe) is None
+    assert [attr for attr, _m in tq.denoiser_modules(pipe)] == ["transformer"]
+
+
+def test_a_unet_pipeline_is_blocked_by_having_no_transformer():
+    """UNet pipelines are blocked because they expose no transformer."""
+    blocker = tq.dense_quant_blocker(types.SimpleNamespace(unet = _Denoiser()))
+    assert blocker is not None and "UNet" in blocker
+
+
+@pytest.mark.parametrize(
+    "dtype", ["torch.uint8", "torch.float8_e4m3fn", "torch.float16", "torch.int8"]
+)
+def test_a_pre_quantised_pipeline_is_blocked_by_its_parameter_dtypes(dtype):
+    """Non-dense parameter dtypes block repeated quantisation."""
+    blocker = tq.dense_quant_blocker(types.SimpleNamespace(transformer = _Denoiser(dtype)))
+    assert blocker is not None and dtype.split(".")[-1] in blocker
+
+
+@pytest.mark.parametrize(
+    ("attrs", "expected"),
+    [
+        ({"_unsloth_runtime_quant": "int8"}, "already quantised"),
+        ({"is_loaded_in_4bit": True}, "4-bit"),
+        ({"is_loaded_in_8bit": True}, "8-bit"),
+        ({"config": types.SimpleNamespace(quantization_config = object())}, "quantization_config"),
+    ],
+)
+def test_a_declared_quantisation_blocks_it_too(attrs, expected):
+    """Explicit quantisation markers block repeated quantisation."""
+    blocker = tq.dense_quant_blocker(types.SimpleNamespace(transformer = _Denoiser(**attrs)))
+    assert blocker is not None and expected in blocker
+
+
+def test_the_second_denoiser_is_enumerated_and_judged():
+    """Every denoiser in a multi-branch pipeline is checked."""
+    pipe = types.SimpleNamespace(
+        transformer = _Denoiser(), unconditional_transformer = _Denoiser("torch.float8_e4m3fn")
+    )
+    assert [attr for attr, _m in tq.denoiser_modules(pipe)] == [
+        "transformer",
+        "unconditional_transformer",
+    ]
+    blocker = tq.dense_quant_blocker(pipe)
+    assert blocker is not None and "unconditional_transformer" in blocker
+
+
+def test_the_denoiser_view_presents_an_arbitrary_attribute_as_the_transformer():
+    """Denoiser views expose alternate branches through ``transformer``."""
+    second = _Denoiser()
+    pipe = types.SimpleNamespace(transformer = _Denoiser(), unconditional_transformer = second, vae = "v")
+    view = tq.DenoiserView(pipe, "unconditional_transformer")
+    assert view.transformer is second
+    assert view.vae == "v"  # everything else reads through
+
+
+def test_a_pipeline_that_cannot_be_walked_is_not_called_quantised():
+    """An inspection failure is not evidence of prior quantisation."""
+
+    class _Unwalkable:
+        def parameters(self, recurse = True):
+            raise RuntimeError("no")
+
+    assert tq.dense_quant_blocker(types.SimpleNamespace(transformer = _Unwalkable())) is None
+
+
+def test_a_dequantised_source_blocks_the_quant_even_though_its_tensors_are_bf16():
+    """A widened quantised source remains ineligible despite its bf16 tensors."""
+    widened = _Denoiser()  # bf16 tensors, exactly as the loader leaves them
+    assert tq.dense_quant_blocker(types.SimpleNamespace(transformer = widened)) is None
+    tq.mark_source_precision(widened, "fp8")
+    blocker = tq.dense_quant_blocker(types.SimpleNamespace(transformer = widened))
+    assert blocker is not None
+    assert "fp8" in blocker and "widened to bf16" in blocker
+
+
+def test_the_source_marker_is_best_effort_and_returns_the_module():
+    """Source-precision markers are chainable and best effort."""
+    module = _Denoiser()
+    assert tq.mark_source_precision(module, "fp8") is module
+
+    class _Frozen:
+        __slots__ = ()
+
+    frozen = _Frozen()
+    assert tq.mark_source_precision(frozen, "fp8") is frozen
+    assert getattr(frozen, tq.SOURCE_PRECISION_ATTR, None) is None
+
+
+def test_the_ideogram_fp8_loader_stamps_what_it_widened():
+    """The Ideogram FP8 loader records its widened source precision."""
+    import pathlib
+
+    import core.inference.diffusion_ideogram4 as ideo
+
+    source = pathlib.Path(ideo.__file__).read_text(encoding = "utf-8")
+    assert 'mark_source_precision(model, "fp8")' in source
+
+
+# Advertised host capability.
+
+
+def _capable_host(monkeypatch, *, torchao_reason = None):
+    """A CUDA host past the arch floor, with torchao's import verdict pinned."""
+    monkeypatch.setattr(tq, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(tq, "_capability", lambda: (9, 0))
+    monkeypatch.setattr(tq, "_TORCHAO_UNAVAILABLE", (torchao_reason,))
+
+
+def test_a_capable_host_advertises_dense_quant(monkeypatch):
+    _capable_host(monkeypatch)
+    assert tq.dense_quant_host_capable(_target()) is True
+
+
+def test_a_host_whose_torchao_cannot_import_advertises_nothing(monkeypatch):
+    """An unimportable torchao makes every scheme decline, so the capability must be false.
+
+    dense_transformer_supported only catches the Windows-ROCm stub, and _capability reads the
+    card; without this the picker would label rows Fast while every load fell back to bf16.
+    """
+    _capable_host(monkeypatch, torchao_reason = "ImportError: cannot import name 'ScalingType'")
+    assert tq.dense_quant_host_capable(_target()) is False
+
+
+def test_a_host_below_the_arch_floor_advertises_nothing(monkeypatch):
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "_capability", lambda: (7, 0))
+    assert tq.dense_quant_host_capable(_target()) is False
+
+
+def test_an_unsupported_device_advertises_nothing(monkeypatch):
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "dense_transformer_supported", lambda target: False)
+    assert tq.dense_quant_host_capable(_target(device = "cpu")) is False
+
+
+def test_the_scheme_list_narrows_with_the_arch(monkeypatch):
+    """One capability bit cannot separate an Ampere host from an Ada one."""
+    _capable_host(monkeypatch)
+    for cap, expected in [
+        ((8, 0), (TQ_INT8,)),
+        ((8, 6), (TQ_INT8,)),
+        ((8, 9), (TQ_INT8, TQ_FP8)),
+        ((9, 0), (TQ_INT8, TQ_FP8)),
+        ((10, 0), (TQ_INT8, TQ_FP8, TQ_NVFP4, TQ_MXFP8)),
+    ]:
+        monkeypatch.setattr(tq, "_capability", lambda _c = cap: _c)
+        assert tq.dense_quant_host_schemes(_target()) == expected, cap
+        # The bit and the list must never disagree.
+        assert tq.dense_quant_host_capable(_target()) is bool(expected), cap
+
+
+def test_an_explicit_nvfp4_is_advertised_even_though_auto_never_picks_it(monkeypatch):
+    """nvfp4 is out of the auto ladder by choice, but an explicit request is still honoured."""
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "_capability", lambda: (10, 0))
+    assert TQ_NVFP4 in tq.dense_quant_host_schemes(_target())
+    assert not any(TQ_NVFP4 in schemes for _floor, schemes in tq._AUTO_LADDER)
+
+
+def test_a_host_that_cannot_quantise_advertises_no_schemes(monkeypatch):
+    _capable_host(monkeypatch, torchao_reason = "ImportError: no torchao")
+    assert tq.dense_quant_host_schemes(_target()) == ()
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "dense_transformer_supported", lambda target: False)
+    assert tq.dense_quant_host_schemes(_target(device = "cpu")) == ()
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "_capability", lambda: None)
+    assert tq.dense_quant_host_schemes(_target()) == ()
+
+
+def test_a_cached_smoke_verdict_narrows_the_advertised_schemes(monkeypatch):
+    """The arch floor is necessary, not sufficient: a probed failure must not stay advertised."""
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "_capability", lambda: (10, 0))
+    monkeypatch.setattr(tq, "_smoke_cache_device_key", lambda device: "cuda:0")
+    monkeypatch.setattr(tq, "_SMOKE_CACHE", {})
+    # Cold: nothing probed yet, so the arch floor is the answer, exactly as before.
+    assert tq.dense_quant_probed_schemes(_target()) == tq.dense_quant_host_schemes(_target())
+    # The load path has since proved the prototype kernels are missing on this card.
+    tq._SMOKE_CACHE.update({(TQ_NVFP4, "cuda:0"): False, (TQ_MXFP8, "cuda:0"): False})
+    assert tq.dense_quant_probed_schemes(_target()) == (TQ_INT8, TQ_FP8)
+    # A positive verdict keeps its scheme.
+    tq._SMOKE_CACHE[(TQ_NVFP4, "cuda:0")] = True
+    assert TQ_NVFP4 in tq.dense_quant_probed_schemes(_target())
+
+
+def test_the_advertised_schemes_never_probe(monkeypatch):
+    """A status route must not buy the CUDA context the in-process probe leaks."""
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "_capability", lambda: (10, 0))
+    monkeypatch.setattr(tq, "_SMOKE_CACHE", {})
+    monkeypatch.setattr(
+        tq, "_smoke_probe", lambda *a, **k: pytest.fail("the status path probed in-process")
+    )
+    monkeypatch.setattr(
+        tq, "_child_probe_table", lambda device: pytest.fail("the status path spawned a child")
+    )
+    assert tq.dense_quant_probed_schemes(_target())
+
+
+def test_a_card_with_no_arch_support_advertises_nothing_whatever_the_cache_says(monkeypatch):
+    _capable_host(monkeypatch)
+    monkeypatch.setattr(tq, "dense_transformer_supported", lambda target: False)
+    monkeypatch.setattr(tq, "_SMOKE_CACHE", {(TQ_FP8, "cuda:0"): True})
+    assert tq.dense_quant_probed_schemes(_target(device = "cpu")) == ()
+
+
+def test_the_picker_mirrors_the_family_deny_list():
+    """The catalog carries `_FAMILY_SCHEME_DENY` so a denied scheme is never labelled fast.
+
+    The deny list is per FAMILY and holds on every GPU, so no host capability can express it and
+    the picker has to know it. Two copies of a fact drift; this is the guard. It has drifted
+    before -- fp8 was denied for qwen-image and then was not.
+    """
+    import pathlib
+    import re
+
+    catalog = (
+        pathlib.Path(tq.__file__).resolve().parents[3]
+        / "frontend/src/features/model-picker/components/model-selector/model-catalog.ts"
+    ).read_text(encoding = "utf-8")
+    mirrored = re.search(r"const QWEN_DENIED_QUANT_SCHEMES = \[([^\]]*)\]", catalog)
+    assert mirrored is not None, "the catalog no longer declares the mirrored deny list"
+    schemes = set(re.findall(r'"([^"]+)"', mirrored.group(1)))
+    denied = {scheme for schemes_ in tq._FAMILY_SCHEME_DENY.values() for scheme in schemes_}
+    assert schemes == denied, (schemes, denied)
+    # One catalog group per denied family, so a newly denied family cannot be forgotten.
+    assert catalog.count("deniedQuantSchemes: QWEN_DENIED_QUANT_SCHEMES") == len(
+        tq._FAMILY_SCHEME_DENY
+    )
+    # Every denied family is one of the two qwen DiTs the mirror names.
+    assert set(tq._FAMILY_SCHEME_DENY) == {"qwen-image", "qwen-image-edit"}
