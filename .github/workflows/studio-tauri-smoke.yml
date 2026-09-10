@@ -19,6 +19,8 @@ name: Unsloth Tauri CI
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/core/inference/providers.py'
       - 'studio/frontend/**'
       - 'studio/src-tauri/**'
       # CLI rename / signature change can break Tauri's spawned
@@ -42,6 +44,8 @@ on:
     # this workflow tests has nothing here to back up.
     # clean-machine-install-ci.yml and mlx-ci.yml already do exactly this.
     paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/core/inference/providers.py'
       - 'studio/frontend/**'
       - 'studio/src-tauri/**'
       # CLI rename / signature change can break Tauri's spawned

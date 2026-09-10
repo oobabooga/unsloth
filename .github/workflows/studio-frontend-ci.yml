@@ -14,6 +14,8 @@ name: Frontend CI
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/core/inference/providers.py'
       - 'studio/frontend/**'
       - 'scripts/check_frontend_dep_removal.py'
       - 'tests/studio/test_frontend_dep_removal.py'
