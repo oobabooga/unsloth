@@ -56,13 +56,18 @@ import { useScrollFades } from "@/hooks/use-scroll-fades";
 import { ModelSelector } from "@/features/model-picker/components/model-selector";
 import { IMAGE_GEN_TASKS } from "@/features/model-picker/components/model-selector/pickers";
 import { PillTabs } from "@/features/model-picker/components/model-selector/pill-tabs";
-import type { HostClass } from "@/features/model-picker/components/model-selector/host-artifact-policy";
+import {
+  type HostClass,
+  type RequestedPrecision,
+  effectiveRowPrecision,
+} from "@/features/model-picker/components/model-selector/host-artifact-policy";
 import {
   IMAGE_CATALOG,
   catalogToModelOptions,
+  curatedArtifactTakesDenseQuant,
   loadSpecFor,
 } from "@/features/model-picker/components/model-selector/model-catalog";
-import { useHostClass } from "@/hooks/use-host-class";
+import { useDenseQuantSchemes, useHostClass } from "@/hooks/use-host-class";
 import type {
   ModelOption,
   ModelSelectorChangeMeta,
@@ -118,6 +123,7 @@ import {
   denseTransformerBuildLabel,
   isNativeEngineStatus,
   formatResolvedValue,
+  isDenseQuantKind,
   isPrecisionRefusal,
   memoryRecipeValue,
   resolvedBadge,
@@ -173,11 +179,22 @@ import {
   type TrainFamilyOption,
 } from "./train/train-base-selector";
 
+/** Whether this pick may receive a transformer precision request. Unknown repos defer to the backend. */
+function sendsTransformerQuant(kind: string | null | undefined, repoId: string): boolean {
+  return (
+    isDenseQuantKind(kind) &&
+    curatedArtifactTakesDenseQuant(repoId, IMAGE_CATALOG) !== false
+  );
+}
+
 // Curated models come from the shared catalog, one group per model with its artifacts as data and
 // the load kind per artifact from loadSpecFor. Built per render, since a host that can only run
 // the native engine is not offered pipeline rows.
-function useImageModels(host: HostClass): ModelOption[] {
-  return useMemo(() => catalogToModelOptions(IMAGE_CATALOG, host), [host]);
+function useImageModels(host: HostClass, precision: RequestedPrecision): ModelOption[] {
+  return useMemo(
+    () => catalogToModelOptions(IMAGE_CATALOG, host, precision),
+    [host, precision],
+  );
 }
 
 // Workflow tabs. `requires` is the backend workflow id (status.workflows) the model must
@@ -1170,7 +1187,7 @@ export function ImagesPage({
   const initialReadySent = useRef(false);
   const { isMobile, pinned } = useSidebar();
   const hostClass = useHostClass();
-  const imageModels = useImageModels(hostClass);
+  const denseQuantSchemes = useDenseQuantSchemes();
   const [quant, setQuant] = useState<string | null>(galleryCache.quant);
   const [prompt, setPrompt] = useState(
     "Cinematic wide shot of a whimsical Alice in Wonderland tea party in an overgrown Victorian garden. Exactly three figures at a long white lace-draped table: a tall eccentric gentleman in an oversized emerald velvet top hat pouring tea from a silver pot mid-motion; a young woman in a pale blue Victorian dress seated left, holding a porcelain teacup with both hands, looking up and laughing; an older woman in deep burgundy seated right in profile, reaching for a tiered cake stand. Detailed embroidered fabrics, realistic skin texture, natural expressions. The table holds mismatched porcelain, antique silverware, towering pastel cakes, and wildflowers. Giant red-capped mushrooms rise behind the table, with ancient trees overhead and golden sunlight streaming through leaves. Shot on 85mm, f/2.8, focus on the gentleman, soft background falloff. Photorealistic, saturated storybook color, warm amber and deep green palette.",
@@ -1277,6 +1294,15 @@ export function ImagesPage({
   const [transformerQuant, setTransformerQuant] = useState<
     "none" | "auto" | "int8" | "fp8" | "nvfp4" | "mxfp8"
   >("auto");
+  // What the next load will ask the transformer to run at, as the picker must describe it. Speed=Off
+  // is bit-exact, so the backend rewrites an auto quant to off for it; a row promising the fast path
+  // there would send the user to the wrong one. An explicit scheme this host cannot run reads the
+  // same way, since that click is refused rather than loaded.
+  const requestedPrecision: RequestedPrecision = effectiveRowPrecision(
+    speedMode === "off" && transformerQuant === "auto" ? "none" : transformerQuant,
+    denseQuantSchemes,
+  );
+  const imageModels = useImageModels(hostClass, requestedPrecision);
   const [attentionBackend, setAttentionBackend] = useState<"auto" | "native" | "cudnn" | "flash3" | "sage">(
     "auto",
   );
@@ -2454,10 +2480,10 @@ export function ImagesPage({
           hf_token: hfApiToken(getHfToken()),
           cpu_offload: advanced.cpu_offload,
           speed_mode: advanced.speed_mode,
-          // GGUF picks only: the dense fast path replaces a GGUF transformer, and every other kind runs
-          // its checkpoint's own precision. The control is hidden there but the state persists across
-          // picks, so a stale scheme would reach a load that can only decline it.
-          transformer_quant: opts.kind === "gguf" ? advanced.transformer_quant : undefined,
+          // Do not carry a saved precision into a known incompatible artifact.
+          transformer_quant: sendsTransformerQuant(opts.kind, repoId)
+            ? advanced.transformer_quant
+            : undefined,
           attention_backend: advanced.attention_backend,
           memory_mode: advanced.memory_mode,
           transformer_cache: advanced.transformer_cache,
@@ -2591,8 +2617,10 @@ export function ImagesPage({
         hf_token: hfApiToken(getHfToken()),
         cpu_offload: advanced.cpu_offload,
         speed_mode: advanced.speed_mode,
-        // Non-GGUF loads ignore this control; the plan must describe the same request as handleLoad.
-        transformer_quant: opts.kind === "gguf" ? advanced.transformer_quant : undefined,
+        // Keep the planned precision identical to the load request.
+        transformer_quant: sendsTransformerQuant(opts.kind, repoId)
+          ? advanced.transformer_quant
+          : undefined,
         memory_mode: advanced.memory_mode,
         // The backend prefetch decision reads the adapter selection too: a baked LoRA always runs the
         // dense build path, and omitting it staged too little.
@@ -3428,18 +3456,18 @@ export function ImagesPage({
           ["max", "Max"],
         ]}
       />
-      {/* The dense transformer_quant fast path engages only on the GGUF kind, so gate the control to
-          GGUF (or nothing loaded) and otherwise say why it is unavailable. */}
-      {!status?.loaded || status.model_kind === "gguf" ? (
+      {/* Use the same precision eligibility rule as the load request. */}
+      {!status?.loaded ||
+      sendsTransformerQuant(status.model_kind, status.repo_id ?? "") ? (
         <AdvancedSelect
           label="Precision"
-          hint="How the model computes. Auto picks the fastest precision the hardware supports (at least INT8 on a capable GPU; FP8 on data-center cards) by loading the FULL base model and quantising its transformer onto low-precision tensor cores, and falls back to running the GGUF as-is when the device, VRAM or disk can't take it. Off always runs the GGUF as-is."
+          hint="How the model computes. Auto picks the fastest precision the hardware supports (at least INT8 on a capable GPU; FP8 on data-center cards) and quantises the transformer onto low-precision tensor cores. A GGUF pick reaches it by loading the FULL base model instead of the GGUF, and falls back to the GGUF as-is when the device, VRAM or disk can't take it; an official pipeline is already dense and is quantised in place, falling back to plain BF16. Off runs the checkpoint as-is."
           badge={<ResolvedBadge status={status} controlKey="transformer_quant" />}
           value={transformerQuant}
           onValueChange={(v) => setTransformerQuant(v as typeof transformerQuant)}
           options={[
             ["auto", "Auto (fastest for GPU)"],
-            ["none", "Off (run the GGUF)"],
+            ["none", "Off (run the checkpoint as-is)"],
             ["fp8", "FP8"],
             ["int8", "INT8"],
             ["nvfp4", "NVFP4 (Blackwell)"],
@@ -3451,7 +3479,9 @@ export function ImagesPage({
           <span className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
             Precision
           </span>
-          <span className="text-xs text-muted-foreground/60">GGUF models only</span>
+          <span className="text-xs text-muted-foreground/60">
+            Runs this checkpoint's own precision
+          </span>
         </div>
       )}
       <AdvancedSelect
@@ -3582,6 +3612,7 @@ export function ImagesPage({
                 triggerLabelClassName="text-ui-14 @[68rem]:text-ui-16"
                 task={IMAGE_GEN_TASKS}
                 catalog={IMAGE_CATALOG}
+                requestedPrecision={requestedPrecision}
                 placeholder="Select image model"
                 open={active && selectorOpen}
                 onOpenChange={(o) => setSelectorOpen(active && o)}

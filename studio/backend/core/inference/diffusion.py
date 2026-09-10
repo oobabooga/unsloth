@@ -168,6 +168,7 @@ from .diffusion_auto_policy import (
     RESOLVED_UNSUPPORTED,
     base_repo_bf16_components_gb,
     build_resolved_record,
+    estimate_dense_quant,
     family_bf16_components_gb,
     precision_fallback_allowed,
     precision_refusal_message,
@@ -177,12 +178,18 @@ from .diffusion_auto_policy import (
 from .diffusion_transformer_quant import (
     TQ_AUTO,
     DEFAULT_MIN_LINEAR_FEATURES,
+    DenoiserView as _DenoiserView,
+    dense_quant_blocker,
+    dense_quant_supported_kind,
+    dense_quant_unsupported_kind_reason,
     dense_transformer_supported,
     dense_transformer_unsupported_reason,
+    denoiser_modules,
     explain_unusable_scheme,
     normalize_transformer_quant,
     quantize_transformer,
     select_transformer_quant_scheme,
+    transformer_is_quantised,
 )
 from utils.paths.path_utils import (
     any_not_appledouble_metadata,
@@ -1414,11 +1421,8 @@ class DiffusionBackend:
         """The body of ``assert_precision_available``, run with the selected card current."""
         if pinned is not None and pinned != TQ_AUTO:
             reason = None
-            if model_kind != "gguf":
-                reason = (
-                    f"the dense transformer-quant path applies to GGUF picks only, and this is a "
-                    f"'{model_kind}' load, which runs the precision its checkpoint carries"
-                )
+            if not dense_quant_supported_kind(model_kind):
+                reason = dense_quant_unsupported_kind_reason(model_kind)
             elif _memory_request_forces_offload(memory_mode, cpu_offload):
                 # Not a measurement: balanced and low_vram name their policy outright, and the legacy flag forces model
                 # offload. Offload hooks move modules with Module.to(), which torchao tensors do not survive, so the
@@ -3578,11 +3582,8 @@ class DiffusionBackend:
                 # visible, and into the refusal so it is actionable.
                 transformer_quant_decline: Optional[str] = None
                 transformer_quant_decline_status = RESOLVED_FELL_BACK
-                if transformer_quant_pinned is not None and kind != "gguf":
-                    transformer_quant_decline = (
-                        f"the dense transformer-quant path applies to GGUF picks only, and this is "
-                        f"a '{kind}' load, which runs the precision its checkpoint carries"
-                    )
+                if transformer_quant_pinned is not None and not dense_quant_supported_kind(kind):
+                    transformer_quant_decline = dense_quant_unsupported_kind_reason(kind)
                     transformer_quant_decline_status = RESOLVED_UNSUPPORTED
                 elif transformer_quant_pinned is not None and not dense_transformer_supported(
                     target
@@ -4155,15 +4156,8 @@ class DiffusionBackend:
                         "adapters, free VRAM, or pick a smaller model."
                     )
 
-                # Fail closed on a declined EXPLICIT precision. Loading the GGUF here produced a perfectly good image at
-                # a precision the caller never asked for, and nothing in the response said so, which is why a successful
-                # render could not be taken as proof the requested precision ran. `auto` is untouched: falling down the
-                # ladder is what it asks for.
-                if (
-                    pipe is None
-                    and transformer_quant_pinned is not None
-                    and not precision_fallback_allowed()
-                ):
+                # GGUF reaches its verdict here; pipeline quantisation is attempted after assembly.
+                def _refuse_pinned_precision() -> None:
                     raise RuntimeError(
                         precision_refusal_message(
                             "transformer_quant",
@@ -4173,6 +4167,14 @@ class DiffusionBackend:
                             off_label = "Off to run the checkpoint as-is",
                         )
                     )
+
+                if (
+                    transformer_quant_pinned is not None
+                    and not precision_fallback_allowed()
+                    # Refuse known failures before downloading a pipeline.
+                    and (transformer_quant_decline is not None or (pipe is None and kind == "gguf"))
+                ):
+                    _refuse_pinned_precision()
 
                 if pipe is None:
                     if kind == "pipeline":
@@ -4336,6 +4338,157 @@ class DiffusionBackend:
                             pipe = pipeline_cls.from_pretrained(
                                 _base_local_dir or fetch_base, **pipe_kwargs
                             )
+
+                # Quantise dense bf16 pipeline denoisers in place. The blocker excludes UNet and
+                # pre-quantised pipelines; offloaded plans remain dense because torchao tensors cannot move.
+                # The pipeline is still on the CPU here, unlike the GGUF path, which quantises after _assemble_pipe
+                # places it. Both orders are safe and give bit-identical output: apply_memory_plan's resident
+                # `pipe.to(placement)` is a one-shot device move, which the tensor subclasses do survive (measured on
+                # sm_89, fp8 and int8, max|diff| 0.0). Only the per-forward offload hooks are the ones they reject.
+                if (
+                    pipe is not None
+                    and kind == "pipeline"
+                    and transformer_quant_engaged is None
+                    and normalize_transformer_quant(transformer_quant) is not None
+                    and dense_transformer_supported(target)
+                ):
+                    pipeline_quant_blocker = dense_quant_blocker(pipe)
+                    if pipeline_quant_blocker is not None:
+                        logger.info(
+                            "diffusion.transformer_quant: skipped (%s)", pipeline_quant_blocker
+                        )
+                        transformer_quant_decline = pipeline_quant_blocker
+                        transformer_quant_decline_status = RESOLVED_UNSUPPORTED
+                    else:
+                        # Re-plan against the quantised steady size. The build peak remains bf16.
+                        bf16_plan = plan
+                        if plan.offload_policy != OFFLOAD_NONE:
+                            preview_scheme = select_transformer_quant_scheme(
+                                target, transformer_quant, family = getattr(fam, "name", None)
+                            )
+                            # This in-memory rewrite needs no cache-space or hosted-checkpoint checks.
+                            estimate = (
+                                estimate_dense_quant(fam, preview_scheme, base_repo = base)
+                                if preview_scheme is not None
+                                else None
+                            )
+                            if estimate is not None:
+                                replanned = self._plan_memory(
+                                    target,
+                                    single_file_path,
+                                    base,
+                                    fam,
+                                    memory_mode,
+                                    cpu_offload,
+                                    kind = kind,
+                                    repo_id = repo_id,
+                                    fetch_base = fetch_base,
+                                    base_local_dir = _base_local_dir,
+                                    transformer_resident_override_mib = (
+                                        estimate.steady_transformer_mib
+                                    ),
+                                    companion_override_mib = estimate.companions_mib,
+                                    text_encoder_override_mib = estimate.text_encoders_mib,
+                                )
+                                if replanned.offload_policy == OFFLOAD_NONE:
+                                    logger.info(
+                                        "diffusion.transformer_quant: %s fits resident (%d MiB "
+                                        "steady); dropping the bf16 plan's '%s' offload",
+                                        preview_scheme,
+                                        estimate.steady_transformer_mib,
+                                        plan.offload_policy,
+                                    )
+                                    plan = replanned
+                        if plan.offload_policy != OFFLOAD_NONE:
+                            logger.info(
+                                "diffusion.transformer_quant: skipped (the memory plan picked '%s' "
+                                "offload, which moves the transformer via Module.to())",
+                                plan.offload_policy,
+                            )
+                            transformer_quant_decline = (
+                                f"the memory plan picked '{plan.offload_policy}' offload, which moves "
+                                "the transformer via Module.to(); torchao quantised tensors reject "
+                                "that. Pin a resident memory mode to combine the two"
+                            )
+                        else:
+                            if _has_active_lora(loras):
+                                # PEFT must wrap dense Linears before torchao converts their base layers.
+                                baked = self._resolve_lora_set(
+                                    [(i, w) for (i, w) in loras if w != 0],
+                                    family = getattr(fam, "name", None),
+                                    hf_token = hf_token,
+                                )
+                                for name, path, _weight in baked:
+                                    pipe.load_lora_weights(path, adapter_name = name)
+                                pipe.set_adapters(
+                                    [n for (n, _p, _w) in baked],
+                                    adapter_weights = [w for (_n, _p, w) in baked],
+                                )
+                                pipe._unsloth_loras = baked
+                                pipe._unsloth_loras_baked = True
+                                logger.info(
+                                    "diffusion.lora_bake: %d adapter(s) attached before the pipeline "
+                                    "quantize",
+                                    len(baked),
+                                )
+                            # Convert every denoiser so multi-branch pipelines use one precision.
+                            denoisers = denoiser_modules(pipe)
+                            engaged: list[str] = []
+                            for attr, _module in denoisers:
+                                scheme = quantize_transformer(
+                                    pipe if attr == "transformer" else _DenoiserView(pipe, attr),
+                                    target,
+                                    mode = transformer_quant,
+                                    family = getattr(fam, "name", None),
+                                    fast_accum = transformer_quant_fast_accum,
+                                    logger = logger,
+                                )
+                                if scheme is None:
+                                    break
+                                engaged.append(scheme)
+                            if engaged and len(engaged) == len(denoisers):
+                                transformer_quant_engaged = engaged[0]
+                            else:
+                                # A clean decline can remain bf16; a partial in-place conversion is unusable.
+                                dirty = [
+                                    attr
+                                    for attr, module in denoisers
+                                    if transformer_is_quantised(module)
+                                ]
+                                if dirty:
+                                    del pipe
+                                    try:
+                                        clear_gpu_cache()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    raise RuntimeError(
+                                        f"transformer_quant='{transformer_quant}' converted "
+                                        f"{', '.join(dirty)} and then failed, leaving the "
+                                        "transformer neither dense nor usable. Reload with "
+                                        "Precision set to Off to run the checkpoint as-is."
+                                    )
+                                transformer_quant_decline = (
+                                    f"'{transformer_quant}' did not engage on family "
+                                    f"'{getattr(fam, 'name', None)}' with this GPU (the scheme is "
+                                    "unsupported here, or the family's measured deny list rules it "
+                                    "out); see the server log"
+                                )
+                                transformer_quant_decline_status = RESOLVED_UNSUPPORTED
+                        if plan is not bf16_plan and transformer_quant_engaged is None:
+                            # The quant-sized placement was only ever valid for the quantised build.
+                            plan = bf16_plan
+                    # Pinned schemes fail closed, including blocker declines that skipped conversion.
+                    if (
+                        transformer_quant_engaged is None
+                        and transformer_quant_pinned is not None
+                        and not precision_fallback_allowed()
+                    ):
+                        del pipe
+                        try:
+                            clear_gpu_cache()
+                        except Exception:  # noqa: BLE001 -- the refusal matters more than the sweep
+                            pass
+                        _refuse_pinned_precision()
 
                 # Effective speed: GGUF defaults to `default` (~2.2x, below the quant noise floor); dense stays
                 # bit-identical `off`.
@@ -5190,7 +5343,9 @@ class DiffusionBackend:
         top of transformer_resident_override_mib (a double-count of the transformer);
         ``text_encoder_override_mib`` carries that override's TEXT-ENCODER share, which the
         planner needs to price the streamed-text-encoder group tier. Both come from the same
-        family component table, so they cannot disagree about what the companions are.
+        family component table, so they cannot disagree about what the companions are. The three
+        apply to EVERY kind: a pipeline re-plans against the same estimate when its loaded bf16
+        denoisers are about to be quantised in place.
 
         ``base_local_dir`` is the snapshot the load will actually read, carried into the size lookups
         as an extra source alongside the cache roots. A prefetch split across roots hands back no
@@ -5204,7 +5359,14 @@ class DiffusionBackend:
         family/variant checks."""
         # Settled (max-over-reads) on cuda: a transient foreign allocation would make an empty card look full
         device_memory = settled_snapshot_device_memory(target)
-        if kind == "pipeline":
+        if kind == "pipeline" and transformer_resident_override_mib is not None:
+            # Re-planning an assembled pipeline against its dense-quant candidate. The family estimate already splits
+            # transformer from companions, and the cache scan below prices the bf16 transformer this re-plan replaces,
+            # so reading it would size the candidate at the footprint it is meant to shrink.
+            companion_mib = companion_override_mib
+            text_encoder_mib = text_encoder_override_mib
+            model_dense_mib = transformer_resident_override_mib + (companion_mib or 0)
+        elif kind == "pipeline":
             # The whole repo is one cached download, so cached bytes are the resident estimate; a LOCAL path is not
             # cached, so sum its on-disk weights.
             local_repo = Path(repo_id).expanduser() if repo_id else None
