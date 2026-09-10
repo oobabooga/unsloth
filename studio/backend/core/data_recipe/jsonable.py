@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import io
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -59,12 +60,30 @@ def _to_pil_from_hf_image_dict(value: Any) -> Any | None:
     return None
 
 
+def _is_pandas_missing(value: Any) -> bool:
+    """pandas' own missing sentinels. Identity rather than ``pd.isna``, which answers element-wise
+    for a list or an array; these two are singletons."""
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError:  # pragma: no cover
+        return False
+    return value is pd.NA or value is pd.NaT
+
+
 def to_jsonable(value: Any) -> Any:
     """Convert numpy/pandas-ish values into plain JSON-safe values."""
     try:
         import numpy as np  # type: ignore
     except ImportError:  # pragma: no cover
         np = None  # type: ignore
+
+    # Ahead of everything below: NaT isoformat()s to "NaT" and NA hits the str() fallback.
+    if _is_pandas_missing(value):
+        return None
+
+    # DuckDB hands a DECIMAL back as a float and pyarrow as a Decimal: 1.2 against "1.20".
+    if isinstance(value, Decimal):
+        return float(value)
 
     if np is not None:
         if isinstance(value, np.ndarray):
