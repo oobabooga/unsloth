@@ -1,0 +1,149 @@
+name: Windows spaced TEMP A/B (throwaway)
+
+# A = origin/main install.ps1, B = the fix. Spaced legs point the user TEMP/TMP at
+# C:\Users\John Doe\AppData\Local\Temp, the shape from unslothai/unsloth#10722.
+
+on:
+  push:
+    branches: [windows-spaced-temp-ab]
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  unit-windows:
+    name: unit tests (windows, 8.3 ${{ matrix.short83 }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        short83: ['on', 'off']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set 8.3 name creation
+        shell: pwsh
+        run: |
+          $mode = if ('${{ matrix.short83 }}' -eq 'on') { 0 } else { 1 }
+          # System-wide 0/1, so a per-volume override cannot mask the setting.
+          fsutil 8dot3name set $mode
+          fsutil 8dot3name query C:
+          exit 0
+      - name: Overrides tests against A and B, pwsh 7 and PowerShell 5.1
+        shell: pwsh
+        run: |
+          $rows = @()
+          foreach ($v in 'A', 'B') {
+            foreach ($sh in 'pwsh', 'powershell') {
+              foreach ($t in 'test_torch_overrides_merge.ps1', 'test_unsloth_torch_override.ps1') {
+                Write-Host "::group::$v | $sh | $t"
+                & $sh -NoProfile -ExecutionPolicy Bypass -File "$v\tests\studio\$t"
+                $rc = $LASTEXITCODE
+                Write-Host "::endgroup::"
+                $rows += "| $v | $sh | $t | $rc |"
+              }
+            }
+          }
+          $table = @("| variant | shell | test | exit |", "| --- | --- | --- | --- |") + $rows
+          $table | ForEach-Object { Write-Host $_ }
+          "### 8.3 ${{ matrix.short83 }}" | Out-File -Append $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          $table | Out-File -Append $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          exit 0
+
+  unit-linux:
+    name: unit tests (ubuntu pwsh, B)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Overrides merge test (B)
+        shell: pwsh
+        run: pwsh -NoProfile -File B/tests/studio/test_torch_overrides_merge.ps1
+
+  install:
+    name: install ${{ matrix.leg }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: a-spaced,      variant: A, temp: spaced, short83: 'on' }
+          - { leg: b-spaced,      variant: B, temp: spaced, short83: 'on' }
+          - { leg: b-spaced-no83, variant: B, temp: spaced, short83: 'off' }
+          - { leg: a-plain,       variant: A, temp: plain,  short83: 'on' }
+          - { leg: b-plain,       variant: B, temp: plain,  short83: 'on' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Point the user temp at a spaced profile path
+        if: matrix.temp == 'spaced'
+        shell: pwsh
+        run: |
+          $mode = if ('${{ matrix.short83 }}' -eq 'on') { 0 } else { 1 }
+          # System-wide 0/1, so a per-volume override cannot mask the setting.
+          fsutil 8dot3name set $mode
+          fsutil 8dot3name query C:
+          $spaced = 'C:\Users\John Doe\AppData\Local\Temp'
+          New-Item -ItemType Directory -Force -Path $spaced | Out-Null
+          $fso = New-Object -ComObject Scripting.FileSystemObject
+          Write-Host "short form of $spaced : $($fso.GetFolder($spaced).ShortPath)"
+          foreach ($v in 'TEMP', 'TMP') {
+            [Environment]::SetEnvironmentVariable($v, $spaced, 'User')
+            "$v=$spaced" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          exit 0
+      - name: Run install.ps1 --tauri
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "GetTempPath=$([System.IO.Path]::GetTempPath())"
+          $ps1 = Join-Path $env:GITHUB_WORKSPACE '${{ matrix.variant }}\install.ps1'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File $ps1 --tauri *>&1 | Tee-Object -FilePath logs/install.log
+          $rc = $LASTEXITCODE
+          Write-Host "installer exit: $rc"
+          "INSTALL_RC=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          exit 0
+      - name: Inspect
+        if: always()
+        shell: pwsh
+        run: |
+          $log = 'logs/install.log'
+          $lines = @()
+          if (Test-Path $log) {
+            $lines = @(Select-String -Path $log -Pattern 'TAURI:STEP|install unsloth|Requirements file|File not found|torch overrides|8\.3 short|without freezing|Failed to install|TAURI:ERROR_DEFAULT' |
+                       ForEach-Object { $_.Line.Trim() })
+          }
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $pkgs = 'no venv'
+          if (Test-Path $py) {
+            $pkgs = (& $py -c "import importlib.metadata as m`nfor p in ('torch','torchvision','torchaudio','unsloth','unsloth_zoo'):`n    try: print(p, m.version(p))`n    except Exception as e: print(p, 'MISSING')" 2>&1 | Out-String).Trim()
+          }
+          $left = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Filter 'tmp*.tmp' -ErrorAction SilentlyContinue |
+                    Where-Object { (Get-Content -LiteralPath $_.FullName -TotalCount 1 -ErrorAction SilentlyContinue) -match '^torch==' })
+          $summary = @(
+            "### ${{ matrix.leg }} (variant ${{ matrix.variant }}, temp ${{ matrix.temp }}, 8.3 ${{ matrix.short83 }})",
+            "installer exit: $env:INSTALL_RC",
+            "leftover torch overrides files in temp: $($left.Count)",
+            '```', $pkgs, '```', '```') + $lines + @('```')
+          $summary | ForEach-Object { Write-Host $_ }
+          $summary | Out-File -Append $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: install-${{ matrix.leg }}
+          path: logs/
+      - name: Verdict
+        shell: pwsh
+        run: exit ([int]$env:INSTALL_RC)
