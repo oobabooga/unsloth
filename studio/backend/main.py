@@ -1997,6 +1997,38 @@ def _get_cached_system_gpu_info(
         return combined_info
 
 
+def _dense_quant_supported() -> bool:
+    """Whether an ``auto`` request could engage a dense quant on EVERY visible card.
+
+    The picker cannot see which card a load will land on, so a mixed host answers for the least
+    capable one.
+
+    Deliberately NOT cached: the answer sharpens. ``dense_quant_host_capable`` treats an unprobed
+    scheme as usable, so the first poll on a cold backend can say yes and the first real load can
+    then record a kernel failure in ``_SMOKE_CACHE``. A process-lifetime cache would pin the
+    optimistic answer and keep labelling rows fast on a host where every load falls back to bf16.
+    Each call is a capability read plus dict lookups; nothing here probes or allocates."""
+    try:
+        from core.inference.diffusion_device import (
+            diffusion_device_scope,
+            resolve_diffusion_device_target,
+        )
+        from core.inference.diffusion_transformer_quant import dense_quant_host_capable
+
+        import torch
+
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if count <= 1:
+            return bool(dense_quant_host_capable(resolve_diffusion_device_target()))
+        for ordinal in range(count):
+            with diffusion_device_scope(ordinal):
+                if not dense_quant_host_capable(resolve_diffusion_device_target(ordinal = ordinal)):
+                    return False
+        return True
+    except Exception:  # noqa: BLE001 -- a capability probe must never fail a status request
+        return False
+
+
 @app.get("/api/system")
 def get_system_info(
     current_subject: str = Depends(get_current_subject), refresh_memory: bool = False
@@ -2092,6 +2124,9 @@ def get_system_info(
         **export_capability(),
         # Video capability + reason, same shape. Additive: older clients ignore the extra keys.
         **video_capability(),
+        # Device backend alone cannot distinguish unsupported CUDA cards, and one bit cannot tell an
+        # Ampere host (int8 only) from an Ada one, so the picker gets the scheme list too.
+        "dense_quant_supported": _dense_quant_supported(),
     }
 
 
