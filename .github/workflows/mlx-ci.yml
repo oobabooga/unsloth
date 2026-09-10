@@ -74,6 +74,8 @@ name: MLX CI on Mac M1
 on:
   pull_request:
     paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/core/inference/providers.py'
       - 'unsloth/__init__.py'
       - 'unsloth/_gpu_init.py'
       - 'studio/backend/utils/hardware/**'
@@ -105,6 +107,8 @@ on:
   push:
     branches: [main]
     paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/core/inference/providers.py'
       - 'unsloth/__init__.py'
       - 'unsloth/_gpu_init.py'
       - 'studio/backend/utils/hardware/**'
