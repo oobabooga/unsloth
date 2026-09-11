@@ -27,10 +27,18 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0 AND AGPL-3.0-only
       - name: Compare
         run: |
-          echo "=== before"; echo '${{ steps.before.outputs.labels }}' | grep -i licenses
-          echo "=== after";  echo '${{ steps.after.outputs.labels }}'  | grep -i licenses
-          # the label reaches the image the same way build-push-action applies it
-          printf 'FROM alpine\n' > Dockerfile.probe
-          docker build -q -t label-probe -f Dockerfile.probe \
-            $(echo '${{ steps.after.outputs.labels }}' | sed 's/^/--label /' | tr '\n' ' ') . >/dev/null
-          docker image inspect label-probe --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}'
+          echo '${{ steps.before.outputs.labels }}' > before.txt
+          echo '${{ steps.after.outputs.labels }}' > after.txt
+          echo "=== before"; grep -i licenses before.txt
+          echo "=== after";  grep -i licenses after.txt
+      - name: The label as build-push-action would apply it
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./probe/Dockerfile
+          push: false
+          load: true
+          tags: label-probe:latest
+          labels: ${{ steps.after.outputs.labels }}
+      - name: Read it back from the image
+        run: docker image inspect label-probe:latest --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}'
