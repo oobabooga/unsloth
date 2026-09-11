@@ -22142,7 +22142,7 @@ async def produce_openai_chat_completions(
                     top_p = payload.top_p,
                     top_k = payload.top_k,
                     min_p = payload.min_p,
-                    max_new_tokens = _effective_max_tokens(payload) or 2048,
+                    max_new_tokens = _effective_max_tokens(payload),
                     repetition_penalty = payload.repetition_penalty,
                     # Compare sends audio_base64 and use_adapter in one body.
                     use_adapter = payload.use_adapter,
@@ -24979,7 +24979,7 @@ async def produce_openai_chat_completions(
         top_p = payload.top_p,
         top_k = payload.top_k,
         min_p = payload.min_p,
-        max_new_tokens = effective_max_tokens or 2048,
+        max_new_tokens = effective_max_tokens,
         repetition_penalty = payload.repetition_penalty,
         presence_penalty = payload.presence_penalty,
         seed = payload.seed,
@@ -29808,6 +29808,17 @@ async def openai_responses(
     internally, and returns a response matching the Responses API schema
     (output array, input_tokens/output_tokens, named SSE events for streaming).
     """
+    for history_param in ("previous_response_id", "conversation"):
+        if getattr(payload, history_param, None) is not None:
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    f"'{history_param}' is not supported. Send the full conversation history in 'input'.",
+                    status = 400,
+                    code = "unsupported_parameter",
+                    param = history_param,
+                ),
+            )
     messages = _normalise_responses_input(payload)
     if not messages:
         raise HTTPException(status_code = 400, detail = "No input provided.")
