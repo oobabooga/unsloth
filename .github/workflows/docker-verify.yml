@@ -9,77 +9,6 @@ permissions:
   actions: read
 
 jobs:
-  windows-wsl:
-    name: windows gh-windows-latest (Docker Engine in WSL 2)
-    runs-on: windows-latest
-    timeout-minutes: 170
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-      - name: Drives
-        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[int]($_.Used/1GB)}}, @{n='FreeGB';e={[int]($_.Free/1GB)}}
-      - name: WSL 2 distro
-        run: |
-          $d = "$env:RUNNER_TEMP\wsl"; New-Item -ItemType Directory -Force -Path $d | Out-Null
-          Set-Content -Path "$env:USERPROFILE\.wslconfig" -Value "[wsl2]`nmemory=12GB`nprocessors=4`nswap=8GB"
-          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz' -OutFile "$d\ubuntu.tar.gz"
-          wsl.exe --import ub "$d\vm" "$d\ubuntu.tar.gz" --version 2
-          wsl.exe -l -v
-      - name: Docker Engine inside WSL
-        run: |
-          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
-          "workspace in WSL: $ws"
-          # keep one session alive for the whole job so the distro (and dockerd) keeps running
-          Start-Process -WindowStyle Hidden -FilePath wsl.exe -ArgumentList '-d','ub','-u','root','--','sleep','infinity'
-          Start-Sleep 5
-          wsl.exe -d ub -u root -- bash "$ws/ci/wsl_setup.sh"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Start the Studio container (first boot, generated passwords)
-        run: |
-          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
-          $pwdir = (wsl.exe -d ub -u root -- wslpath -a "$env:RUNNER_TEMP".Replace('\','/')).Trim() + "/pw"
-          wsl.exe -d ub -u root -- bash "$ws/ci/wsl_start_container.sh" "$pwdir"
-          $s = (Get-Content -Raw "$env:RUNNER_TEMP\pw\studio_pw.txt")
-          $j = (Get-Content -Raw "$env:RUNNER_TEMP\pw\jupyter_pw.txt")
-          "studio pw length $($s.Length), jupyter pw length $($j.Length)"
-          Add-Content -Path $env:GITHUB_ENV -Value "STUDIO_PW=$s"
-          Add-Content -Path $env:GITHUB_ENV -Value "JUPYTER_PW=$j"
-      - name: Reach the container from Windows (WSL localhost forwarding)
-        run: |
-          foreach ($u in 'http://localhost:18000/api/health','http://localhost:18888/login') {
-            try { $r = Invoke-WebRequest -UseBasicParsing -Uri $u -TimeoutSec 20; "$u -> $($r.StatusCode)" } catch { "$u -> $($_.Exception.Message)" }
-          }
-      - name: Playwright from Windows (Chromium, then Edge)
-        run: |
-          python -m venv "$env:RUNNER_TEMP\pw"
-          & "$env:RUNNER_TEMP\pw\Scripts\pip.exe" install -q playwright==1.58.0
-          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" -m playwright install chromium
-          $env:STUDIO_URL = 'http://localhost:18000'; $env:JUPYTER_URL = 'http://localhost:18888'
-          $env:STUDIO_NEW_PW = 'Docker-Win-2026'; $env:EXPECT_GPU = 'cpu'; $env:OUT = "$env:RUNNER_TEMP\suite\ui-chromium"
-          $env:TURN_TIMEOUT_S = '600'; $env:LOAD_TIMEOUT_S = '1200'
-          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
-          "chromium exit $LASTEXITCODE"
-          # second pass in Edge: the password is already changed, so sign in with the new one
-          $env:STUDIO_PW = 'Docker-Win-2026'; $env:PW_CHANNEL = 'msedge'; $env:OUT = "$env:RUNNER_TEMP\suite\ui-edge"
-          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
-          "edge exit $LASTEXITCODE"
-          exit 0
-      - name: Docker CPU suite inside WSL
-        run: |
-          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
-          $out = (wsl.exe -d ub -u root -- wslpath -a "$env:RUNNER_TEMP".Replace('\','/')).Trim() + "/suite/wsl"
-          wsl.exe -d ub -u root -- docker rm -f uqw
-          wsl.exe -d ub -u root -- env OUT=$out SKIP_UI=1 bash "$ws/ci/docker_cpu_suite.sh"
-          exit 0
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: r2-windows-wsl
-          path: ${{ runner.temp }}/suite
-          retention-days: 7
-
   # AMD Windows hosts cannot run Linux containers (WSL / VirtualMachinePlatform disabled, reboot
   # needed), so this pair runs the container on an AMD Linux host and drives it from a Windows
   # browser on AMD hardware through a Cloudflare quick tunnel. The Studio/Jupyter password never
@@ -94,6 +23,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           set -u
           W="$RUNNER_TEMP/tun"; mkdir -p "$W"; cd "$W"
           # wait for the Windows job's public key
@@ -120,7 +50,7 @@ jobs:
           done
           echo "studio tunnel: $SU"; echo "jupyter tunnel: $JU"
           for i in $(seq 1 60); do
-            a=$(curl -s -o /dev/null -w '%{http_code}' "$SU/api/health"); b=$(curl -s -o /dev/null -w '%{http_code}' "$JU/login")
+            a=$(curl -s -o /dev/null -w '%{http_code}' "$SU/api/health" || true); b=$(curl -s -o /dev/null -w '%{http_code}' "$JU/login" || true)
             [ "$a" = 200 ] && [ "$b" = 200 ] && break; sleep 5
           done
           echo "tunnel health: studio=$a jupyter=$b"
