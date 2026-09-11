@@ -11,6 +11,14 @@ $rc = (Get-Content -LiteralPath (Join-Path $OutDir 'done.txt') -Raw -ErrorAction
 if ($null -ne $rc) { $rc = $rc.Trim() }
 $interesting = @($log | Select-String -Pattern 'install unsloth|File not found|8\.3 short|without freezing|Failed to install|\[ERROR\]|Setup Complete|torch ' | ForEach-Object { $_.Line.Trim() })
 $summary = @("### $env:LEG", '```', $envTxt, "installer exit: $rc", $pkgs, $left, '```', '```') + $interesting + @('```')
+$extra = @()
+foreach ($f in 'elapsed.txt', 'cli.txt', 'hung-descendants.txt', 'hung-threads.txt') {
+    $fp = Join-Path $OutDir $f
+    if (Test-Path -LiteralPath $fp) { $extra += "--- $f ---"; $extra += @(Get-Content -LiteralPath $fp) }
+}
+$err = Join-Path $OutDir 'install.err.log'
+if (Test-Path -LiteralPath $err) { $extra += '--- install.err.log (last 15) ---'; $extra += @(Get-Content -LiteralPath $err | Select-Object -Last 15) }
+$summary += @('```') + $extra + @('```')
 $summary | ForEach-Object { Write-Host $_ }
 if ($env:GITHUB_STEP_SUMMARY) { $summary | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 }
 Write-Host '--- install.log tail ---'
