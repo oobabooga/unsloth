@@ -88,6 +88,7 @@ from core.inference.llama_server_args import (
     apply_model_memory_policy,
     resolve_ctx_checkpoints,
     extra_args_disable_mmproj,
+    extra_args_mmproj_auto,
     extra_args_select_load_mode,
     fit_is_enabled_in,
     force_pageable_load,
@@ -4291,6 +4292,21 @@ def _strip_flag_pairs(args: Iterable[str], flags: frozenset[str]) -> list[str]:
 # common_params defaults in the bundled llama.cpp runtime.
 _DEFAULT_LLAMA_N_BATCH = 2048
 _DEFAULT_LLAMA_N_UBATCH = 512
+# mtmd cuts an image into chunks of min(n_batch, its tokens) and asserts n_ubatch >=
+# the chunk while attention is non-causal (llama-context.cpp:1749): 862 against 512 on
+# Gemma 4 12B, and the server aborts. A bound, not a guess: clip.cpp caps one Gemma 4
+# image at set_limit_image_tokens(70, 1120). Only a hand-raised --image-max-tokens gets
+# past it, and that flag documents raising -ub alongside.
+_MMPROJ_DEFAULT_N_BATCH_UBATCH = 2048
+# Which projectors reach that assert. mtmd_decode_use_non_causal is True for exactly
+# gemma4v (outside E2B/E4B, told apart by the TEXT n_embd), gemma4uv, gemma3 and
+# deepseek4v; of those only the Gemma 4 towers exceed 512 tokens per image, gemma3
+# being capped at 256 and deepseek4v at 384. Everything else decodes causally at any
+# image size. Raising for them anyway is not free: _estimate_compute_buffer_bytes
+# scales with the ubatch and feeds model_size_fit, so a blanket raise costs ~5 GiB on a
+# four-slot default and spills a Qwen3-VL onto the CPU for an assert it cannot hit.
+_MMPROJ_NON_CAUSAL_OVER_UBATCH = frozenset({"gemma4v", "gemma4uv"})
+_GEMMA4V_CAUSAL_TEXT_N_EMBD = frozenset({1536, 2560})  # E2B and E4B
 _LLAMA_ARG_TRUE_VALUES = frozenset({"on", "enabled", "true", "1"})
 _LLAMA_ARG_FALSE_VALUES = frozenset({"off", "disabled", "false", "0"})
 _LLAMA_ARG_AUTO_VALUES = frozenset({"auto", "-1"})
@@ -5716,26 +5732,26 @@ def _extra_args_n_parallel(
     return found
 
 
-def _extra_args_n_ubatch(
+def _named_batch_sizes(
     extra_args: Optional[Iterable[str]],
     env: Optional[Mapping[str, str]] = None,
-    n_ctx: Optional[int] = None,
-    *,
     n_batch: Optional[int] = None,
     n_ubatch: Optional[int] = None,
-) -> Optional[int]:
-    """Effective ubatch after llama.cpp normalizes it, or None at defaults.
+) -> tuple[int, int, bool, bool]:
+    """``(batch, ubatch, batch_named, ubatch_named)`` for the launch these describe.
 
     Precedence mirrors the launched command line: env, then the first-class
     n_batch / n_ubatch fields (emitted as flags, so they beat env), then user
-    extra_args (appended last, so they last-wins-override the emitted flags).
+    extra_args (appended last, so they last-wins-override the emitted flags). The
+    ``named`` flags say whether anything set that half at all, which is what separates
+    a size the user chose from the llama.cpp default.
     """
     values = {
         "batch": _DEFAULT_LLAMA_N_BATCH,
         "ubatch": _DEFAULT_LLAMA_N_UBATCH,
     }
+    named = {"batch": False, "ubatch": False}
     source_env = os.environ if env is None else env
-    overridden = False
     for key, env_name in (
         ("batch", "LLAMA_ARG_BATCH"),
         ("ubatch", "LLAMA_ARG_UBATCH"),
@@ -5744,16 +5760,16 @@ def _extra_args_n_ubatch(
         if raw:
             try:
                 values[key] = int(raw)
-                overridden = True
+                named[key] = True
             except (TypeError, ValueError):
                 pass
 
     if n_batch is not None:
         values["batch"] = int(n_batch)
-        overridden = True
+        named["batch"] = True
     if n_ubatch is not None:
         values["ubatch"] = int(n_ubatch)
-        overridden = True
+        named["ubatch"] = True
 
     args = [str(a) for a in extra_args] if extra_args else []
     flags = {
@@ -5771,10 +5787,26 @@ def _extra_args_n_ubatch(
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
         try:
             values[key] = int(value)
-            overridden = True
+            named[key] = True
         except (TypeError, ValueError):
             continue
-    if not overridden:
+    return values["batch"], values["ubatch"], named["batch"], named["ubatch"]
+
+
+def _extra_args_n_ubatch(
+    extra_args: Optional[Iterable[str]],
+    env: Optional[Mapping[str, str]] = None,
+    n_ctx: Optional[int] = None,
+    *,
+    n_batch: Optional[int] = None,
+    n_ubatch: Optional[int] = None,
+) -> Optional[int]:
+    """Effective ubatch after llama.cpp normalizes it, or None at defaults."""
+    _batch, _ubatch, _batch_named, _ubatch_named = _named_batch_sizes(
+        extra_args, env, n_batch, n_ubatch
+    )
+    values = {"batch": _batch, "ubatch": _ubatch}
+    if not (_batch_named or _ubatch_named):
         return None
 
     # common_params stores signed values, then llama_context_params converts
@@ -5787,6 +5819,137 @@ def _extra_args_n_ubatch(
     if n_ctx is not None and n_ctx > 0:
         effective = min(effective, n_ctx)
     return effective
+
+
+def _read_gguf_embedding_length(path: Optional[str]) -> Optional[int]:
+    """``{arch}.embedding_length``, cached, or None. Thin import-local wrapper."""
+    if not path:
+        return None
+    try:
+        from utils.models.gguf_metadata import read_gguf_embedding_length
+        return read_gguf_embedding_length(str(path))
+    except Exception as e:
+        logger.debug(f"embedding length read failed: {e}")
+        return None
+
+
+def _mmproj_emits_oversized_chunks(
+    mmproj_path: Optional[str], n_embd_text: Optional[int] = None
+) -> bool:
+    """Whether the projector at *mmproj_path* can emit an image chunk over 512 tokens.
+
+    Keyed on ``clip.vision.projector_type``, not ``is_vision``: ModelConfig sets that
+    flag for ANY discovered mmproj, so an audio-only encoder (ultravox, Voxtral,
+    Qwen3-ASR) reads as vision while producing no image chunk. An unreadable family
+    stays oversized, since being wrong that way is a crash rather than a smaller
+    offload.
+    """
+    if not mmproj_path:
+        return False
+    try:
+        from utils.models.gguf_metadata import (
+            mmproj_accepts_image,
+            read_mmproj_vision_projector_type,
+        )
+        if not mmproj_accepts_image(mmproj_path):
+            return False
+        family = (read_mmproj_vision_projector_type(mmproj_path) or "").strip().lower()
+    except Exception as e:
+        logger.debug(f"mmproj capability read failed: {e}")
+        return True
+    if not family:
+        return True
+    if family == "gemma4v":
+        return n_embd_text not in _GEMMA4V_CAUSAL_TEXT_N_EMBD
+    return family in _MMPROJ_NON_CAUSAL_OVER_UBATCH
+
+
+def _launch_needs_bigger_ubatch(
+    mmproj_path: Optional[str],
+    n_embd_text: Optional[int] = None,
+    extra_args: Optional[Iterable[str]] = None,
+    *,
+    is_vision: bool = True,
+    vision_off: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Whether this launch can hand llama.cpp an image chunk the 512 default aborts on.
+
+    One question with one answer, asked with the same arguments by ``load_model`` and
+    by the estimators that price what it launches.
+
+    Deliberately "can ANY projector in play do this", not "which one would llama.cpp
+    keep". Modelling that precedence -- a URL download overwriting mmproj.path after
+    argv, a pass-through --mmproj appended after the managed flags, an inherited
+    LLAMA_ARG_MMPROJ filling a gap under --no-mmproj -- is a second copy of llama.cpp's
+    argument handling to keep correct, and it changes no answer worth having: the only
+    case where the winner differs from the union is a user replacing one image tower
+    with another, where the union merely over-reserves.
+    """
+    sources: list[str] = []
+    unknown = False
+
+    # Appended after the managed flags, and stripped by neither the vision switch nor
+    # --no-mmproj, so it opens an image tower whatever else the request says.
+    override = _extra_args_device(extra_args, {"--mmproj", "-mm"})
+    if override:
+        sources.append(str(override))
+
+    if not vision_off:
+        # The switch scrubs this pair. Without it they open whatever they name even
+        # under --no-mmproj, which empties the command line without clearing
+        # mmproj.path. A URL names a download that has not happened, so it is unknown.
+        source_env = os.environ if env is None else env
+        if (source_env.get("LLAMA_ARG_MMPROJ_URL") or "").strip():
+            unknown = True
+        inherited = (source_env.get("LLAMA_ARG_MMPROJ") or "").strip()
+        if inherited:
+            sources.append(inherited)
+
+    if is_vision and not vision_off and not extra_args_disable_mmproj(extra_args):
+        if mmproj_path:
+            sources.append(str(mmproj_path))
+        elif extra_args_mmproj_auto(extra_args):
+            # --mmproj-auto leaves llama-server discovering an adjacent projector
+            # this process was never told about.
+            unknown = True
+
+    if unknown:
+        return True
+    return any(_mmproj_emits_oversized_chunks(p, n_embd_text) for p in sources)
+
+
+def _batch_ubatch_for_mmproj(
+    opens_vision_mmproj: bool,
+    n_batch: Optional[int],
+    n_ubatch: Optional[int],
+    extra_args: Optional[Iterable[str]],
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[Optional[int], Optional[int]]:
+    """Raise the default batch/ubatch for a launch that opens an image projector.
+
+    See ``_MMPROJ_DEFAULT_N_BATCH_UBATCH`` for why the chunk has to fit the ubatch.
+
+    Only the micro-batch aborts, so only it is raised, and only while nobody has named
+    one. A named BATCH caps the raise rather than cancelling it, since it also caps the
+    chunk mtmd cuts: at ``-b 256`` the chunk is 256 and the default 512 holds it.
+    """
+    if not opens_vision_mmproj:
+        return n_batch, n_ubatch
+    batch, ubatch, batch_named, ubatch_named = _named_batch_sizes(
+        extra_args, env, n_batch, n_ubatch
+    )
+    if ubatch_named:
+        return n_batch, n_ubatch
+    # The uint32_t round-trip llama_context_params applies, which _extra_args_n_ubatch
+    # already mirrors: common_params stores the batch signed, so "-b -1" reaches the
+    # child as 4294967295. Comparing the raw -1 would read as a batch below the ubatch
+    # and skip the raise.
+    batch &= 0xFFFFFFFF
+    target = min(_MMPROJ_DEFAULT_N_BATCH_UBATCH, batch)
+    if target <= ubatch:
+        return n_batch, n_ubatch
+    return (n_batch if batch_named else _MMPROJ_DEFAULT_N_BATCH_UBATCH), target
 
 
 def _build_ngram_mod_flags(
@@ -19917,6 +20080,32 @@ class LlamaCppBackend:
             if _load_cancelled():
                 logger.info("Load cancelled after download phase")
                 return False
+
+            # Here, not at the intent unpack: a Hub load carries no mmproj_path of its
+            # own until the companion download above, and Phase 3's fit has to price the
+            # micro-batch the child launches with.
+            n_batch, n_ubatch = _batch_ubatch_for_mmproj(
+                _launch_needs_bigger_ubatch(
+                    None
+                    if (disable_vision or not is_vision)
+                    else self._resolve_launch_mmproj_path(
+                        model_path = model_path,
+                        mmproj_path = mmproj_path,
+                    ),
+                    # The order-independent read the estimators use: GGUF does not
+                    # guarantee KV order, and _read_gguf_metadata only matches
+                    # arch-namespaced keys once general.architecture has gone past, so a
+                    # file writing embedding_length first would leave it unset here and
+                    # split the two sides on E2B and E4B.
+                    _read_gguf_embedding_length(model_path),
+                    extra_args,
+                    is_vision = is_vision,
+                    vision_off = disable_vision,
+                ),
+                n_batch,
+                n_ubatch,
+                extra_args,
+            )
 
             # Backstop for everything the pre-teardown probes fail open on: refuse from the
             # header rather than watching llama-server die as "failed to start".

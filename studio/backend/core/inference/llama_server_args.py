@@ -992,6 +992,25 @@ def extra_args_disable_mmproj(args: Optional[Iterable[str]]) -> bool:
     return disabled
 
 
+def extra_args_mmproj_auto(args: Optional[Iterable[str]]) -> bool:
+    """True when pass-through args leave llama-server discovering a projector itself.
+
+    The last-wins boolean :func:`extra_args_disable_mmproj` reads, asked the other way:
+    a winning ``--mmproj-auto`` makes the child look for an adjacent mmproj Unsloth
+    never put on the command line, so a caller sizing the launch must assume one.
+    """
+    if not args:
+        return False
+    enabled = False
+    for raw in args:
+        flag = _flag_name(str(raw))
+        if flag in _MMPROJ_ENABLE_FLAGS:
+            enabled = True
+        elif flag in _MMPROJ_DISABLE_FLAGS:
+            enabled = False
+    return enabled
+
+
 def strip_shadowing_flags(
     args: Iterable[str],
     *,
