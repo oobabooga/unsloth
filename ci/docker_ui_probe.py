@@ -42,6 +42,7 @@ OUT = Path(os.environ.get("OUT", "ui_out"))
 TURN_TIMEOUT_S = float(os.environ.get("TURN_TIMEOUT_S", "300"))
 LOAD_TIMEOUT_S = float(os.environ.get("LOAD_TIMEOUT_S", "900"))
 OUT.mkdir(parents = True, exist_ok = True)
+PW_CHANNEL = os.environ.get("PW_CHANNEL") or None
 
 RESULTS = {}
 _shot_n = [0]
@@ -211,7 +212,7 @@ def studio_chat(page, prompt, idx):
 
 
 def run_studio(p):
-    browser = p.chromium.launch()
+    browser = p.chromium.launch(channel = PW_CHANNEL)
     ctx = browser.new_context(viewport = {"width": 1440, "height": 900}, locale = "en-US")
     page = ctx.new_page()
     page.set_default_timeout(60_000)
@@ -245,7 +246,7 @@ def run_studio(p):
 
 
 def run_jupyter(p):
-    browser = p.chromium.launch()
+    browser = p.chromium.launch(channel = PW_CHANNEL)
     ctx = browser.new_context(viewport = {"width": 1440, "height": 900}, locale = "en-US")
     page = ctx.new_page()
     page.set_default_timeout(60_000)
@@ -278,6 +279,16 @@ def run_jupyter(p):
             sel.first.click()
         cell = page.locator(".jp-Notebook .jp-Cell .cm-content").first
         cell.wait_for(timeout = 120_000)
+        # A user waits for the kernel indicator to settle before running anything.
+        t_k = time.time()
+        kstat = ""
+        while time.time() - t_k < 240:
+            kstat = page.locator(".jp-StatusBar-Component, .jp-StatusBar-TextItem").all_inner_texts()
+            kstat = " | ".join(t.strip() for t in kstat if t.strip())
+            if re.search(r"\bIdle\b", kstat):
+                break
+            page.wait_for_timeout(2000)
+        log(f"kernel status after {time.time() - t_k:.0f}s: {kstat[:200]!r}")
         cell.click()
         code = ("import torch, platform, subprocess\n"
                 "print('TORCH', torch.__version__, 'CUDA', torch.cuda.is_available(), "
@@ -286,11 +297,27 @@ def run_jupyter(p):
         page.keyboard.type(code)
         shoot(page, "jupyter-cell-typed")
         page.keyboard.press("Shift+Enter")
-        out = page.locator(".jp-OutputArea-output").first
-        out.wait_for(timeout = 300_000)
-        page.wait_for_function(
-            "() => [...document.querySelectorAll('.jp-OutputArea-output')].some(e => /ARCH/.test(e.innerText))",
-            timeout = 300_000)
+        got = False
+        for attempt in range(3):
+            try:
+                page.wait_for_function(
+                    "() => [...document.querySelectorAll('.jp-OutputArea-output')].some(e => /ARCH|Error/.test(e.innerText))",
+                    timeout = 120_000)
+                got = True
+                break
+            except Exception:
+                kstat = " | ".join(t.strip() for t in page.locator(".jp-StatusBar-Component, .jp-StatusBar-TextItem").all_inner_texts() if t.strip())
+                prompt = page.locator(".jp-InputPrompt").first.inner_text()
+                log(f"no output after attempt {attempt + 1}; prompt={prompt!r} kernel={kstat[:200]!r}")
+                shoot(page, f"jupyter-no-output-{attempt + 1}")
+                RESULTS.setdefault("jupyter_retries", {"ok": True, "detail": ""})["detail"] += f"attempt{attempt + 1}: prompt={prompt!r} kernel={kstat[:120]!r}; "
+                # re-run the first cell the way a user would: click it, Run menu
+                page.locator(".jp-Notebook .jp-Cell").first.click()
+                page.locator('li.lm-MenuBar-item:has-text("Run")').first.click()
+                page.wait_for_timeout(300)
+                page.locator('li.lm-Menu-item[data-command="notebook:run-cell"]').first.click()
+        if not got:
+            raise AssertionError("cell never produced output after 3 attempts")
         text = page.locator(".jp-OutputArea-output").first.inner_text()
         shoot(page, "jupyter-cell-output")
         ok = "TORCH" in text

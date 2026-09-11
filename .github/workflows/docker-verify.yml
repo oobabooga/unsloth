@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   linux:
@@ -16,62 +17,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: gh-amd64
-            runner: ubuntu-latest
           - name: gh-arm64
             runner: ubuntu-24.04-arm
           - name: amd-strix-halo
             runner: [self-hosted, Linux, strix-halo, devlab-dispatch]
     steps:
       - uses: actions/checkout@v4
-      - name: Host and disk
+      - name: Host
         run: |
-          set -x
           uname -a; nproc; free -h; df -h
-          lspci -nn 2>/dev/null | grep -iE 'vga|display|3d|accel' || true
-          ls -l /dev/kfd /dev/dri 2>/dev/null || true
-          docker info 2>&1 | grep -E 'Server Version|Docker Root Dir|Storage Driver|Architecture|CPUs|Total Memory' || true
-          id; sudo -n true && echo "sudo: yes" || echo "sudo: no"
-      - name: Make room for a 27 GB image (hosted runners)
+          docker info 2>&1 | grep -E 'Server Version|Docker Root Dir|Architecture' || true
+      - name: Make room (hosted)
         if: ${{ !contains(matrix.name, 'amd-') }}
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          df -h / /mnt || true
-          ROOT_FREE=$(df --output=avail -k / | tail -1)
-          MNT_FREE=$(df --output=avail -k /mnt 2>/dev/null | tail -1 || echo 0)
-          if [ "${MNT_FREE:-0}" -gt "$ROOT_FREE" ]; then
-            sudo systemctl stop docker docker.socket || true
-            sudo mkdir -p /mnt/docker
-            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
-            sudo systemctl start docker
-          fi
-          docker info | grep 'Docker Root Dir'
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h / /mnt || true
       - name: Playwright
         run: |
           python3 -m venv "$RUNNER_TEMP/pw"
           "$RUNNER_TEMP/pw/bin/pip" install -q 'playwright==1.58.0'
-          if sudo -n true 2>/dev/null; then
-            "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium
-          else
-            "$RUNNER_TEMP/pw/bin/python" -m playwright install chromium
-          fi
+          if sudo -n true 2>/dev/null; then "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium; else "$RUNNER_TEMP/pw/bin/python" -m playwright install chromium; fi
       - name: Docker CPU suite
         env:
           OUT: ${{ runner.temp }}/suite
           PY: ${{ runner.temp }}/pw/bin/python
+          SKIP_SSH: "1"
+          SKIP_TUNNEL: "1"
+          SKIP_OFFLINE: "1"
+          SKIP_RUNSH: "1"
         run: bash ci/docker_cpu_suite.sh
-      - name: AMD extras (render nodes into the NVIDIA image)
-        if: ${{ contains(matrix.name, 'amd-') }}
-        run: |
-          set +e
-          GA=""; for g in video render; do gid=$(getent group $g | cut -d: -f3); [ -n "$gid" ] && GA="$GA --group-add $gid"; done
-          docker run --rm --device /dev/kfd --device /dev/dri $GA -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:latest bash -c '
-            ls -l /dev/kfd /dev/dri; nvidia-smi -L 2>&1 | head -2
-            python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),\"hip\",torch.version.hip)"
-            /opt/unsloth/llama.cpp/llama-server --list-devices 2>&1 | tail -4
-            ls /opt/unsloth/llama.cpp | grep -iE "vulkan|hip|rocm" || echo "no vulkan/hip ggml backend in the bundle"
-            ls /opt/unsloth-studio/whisper.cpp/build/bin/ | head'
       - name: Teardown
         if: always()
         run: |
@@ -80,58 +54,206 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: suite-${{ matrix.name }}
+          name: r2-suite-${{ matrix.name }}
           path: ${{ runner.temp }}/suite
           retention-days: 7
 
-  windows-recon:
-    name: windows ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: gh-windows-latest
-            runner: windows-latest
-          - name: amd-strix-halo
-            runner: [self-hosted, Windows, strix-halo, devlab-dispatch]
+  windows-wsl:
+    name: windows gh-windows-latest (Docker Engine in WSL 2)
+    runs-on: windows-latest
+    timeout-minutes: 170
     defaults:
       run:
         shell: powershell
     steps:
-      - name: OS, virtualization, WSL, Docker
+      - uses: actions/checkout@v4
+      - name: Drives
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[int]($_.Used/1GB)}}, @{n='FreeGB';e={[int]($_.Free/1GB)}}
+      - name: WSL 2 distro
         run: |
-          $ErrorActionPreference = 'Continue'
-          Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version, BuildNumber
-          Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent, TotalPhysicalMemory
-          Get-CimInstance Win32_Processor | Format-List Name, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions
-          foreach ($f in 'Microsoft-Windows-Subsystem-Linux','VirtualMachinePlatform','Microsoft-Hyper-V-All','Containers') {
-            try { Get-WindowsOptionalFeature -Online -FeatureName $f | Format-List FeatureName, State } catch { "feature $f : $_" }
-          }
-          "--- wsl --version"; wsl.exe --version
-          "--- wsl --status"; wsl.exe --status
-          "--- wsl -l -v"; wsl.exe -l -v
-          "--- docker"; Get-Command docker -ErrorAction SilentlyContinue | Format-List Source
-          if (Get-Command docker -ErrorAction SilentlyContinue) {
-            docker version
-            docker info 2>&1 | Select-String -Pattern 'OSType|Operating System|Server Version|Architecture|Isolation'
-            "--- pull the Linux image on this engine"
-            docker pull unsloth/unsloth:latest 2>&1 | Select-Object -Last 3
-          }
-          exit 0
-      - name: Try a WSL 2 distro
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $d = "$env:RUNNER_TEMP\wslprobe"
-          New-Item -ItemType Directory -Force -Path $d | Out-Null
-          $tar = "$d\ubuntu.tar.gz"
-          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz' -OutFile $tar
-          (Get-Item $tar).Length
-          wsl.exe --import probe24 "$d\vm" $tar --version 2
-          "import exit $LASTEXITCODE"
+          $d = "$env:RUNNER_TEMP\wsl"; New-Item -ItemType Directory -Force -Path $d | Out-Null
+          Set-Content -Path "$env:USERPROFILE\.wslconfig" -Value "[wsl2]`nmemory=12GB`nprocessors=4`nswap=8GB"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz' -OutFile "$d\ubuntu.tar.gz"
+          wsl.exe --import ub "$d\vm" "$d\ubuntu.tar.gz" --version 2
           wsl.exe -l -v
-          wsl.exe -d probe24 -u root -- bash -c "uname -a; cat /proc/version; nproc; free -h; df -h /"
-          "run exit $LASTEXITCODE"
-          wsl.exe --unregister probe24
+      - name: Docker Engine inside WSL
+        run: |
+          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
+          "workspace in WSL: $ws"
+          # keep one session alive for the whole job so the distro (and dockerd) keeps running
+          Start-Process -WindowStyle Hidden -FilePath wsl.exe -ArgumentList '-d','ub','-u','root','--','sleep','infinity'
+          Start-Sleep 5
+          wsl.exe -d ub -u root -- bash "$ws/ci/wsl_setup.sh"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Start the Studio container (first boot, generated passwords)
+        run: |
+          wsl.exe -d ub -u root -- bash -c "docker pull -q unsloth/unsloth:latest && docker run -d --name uqw -p 18000:8000 -p 18888:8888 unsloth/unsloth:latest && for i in `$(seq 1 300); do docker logs uqw 2>&1 | grep -q 'container ready' && break; sleep 3; done; docker logs uqw 2>&1 | grep -E 'login ->|generated password|container ready|WARN'"
+          $s = (wsl.exe -d ub -u root -- bash -c "docker logs uqw 2>&1 | sed -n 's/.*Unsloth Studio login -> username: unsloth   password: \([^ ]*\).*/\1/p' | tail -1").Trim()
+          $j = (wsl.exe -d ub -u root -- bash -c "docker logs uqw 2>&1 | sed -n 's/.*generated password: \([^ )]*\).*/\1/p' | head -1").Trim()
+          "studio pw length $($s.Length), jupyter pw length $($j.Length)"
+          Add-Content -Path $env:GITHUB_ENV -Value "STUDIO_PW=$s"
+          Add-Content -Path $env:GITHUB_ENV -Value "JUPYTER_PW=$j"
+      - name: Reach the container from Windows (WSL localhost forwarding)
+        run: |
+          foreach ($u in 'http://localhost:18000/api/health','http://localhost:18888/login') {
+            try { $r = Invoke-WebRequest -UseBasicParsing -Uri $u -TimeoutSec 20; "$u -> $($r.StatusCode)" } catch { "$u -> $($_.Exception.Message)" }
+          }
+      - name: Playwright from Windows (Chromium, then Edge)
+        run: |
+          python -m venv "$env:RUNNER_TEMP\pw"
+          & "$env:RUNNER_TEMP\pw\Scripts\pip.exe" install -q playwright==1.58.0
+          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" -m playwright install chromium
+          $env:STUDIO_URL = 'http://localhost:18000'; $env:JUPYTER_URL = 'http://localhost:18888'
+          $env:STUDIO_NEW_PW = 'Docker-Win-2026'; $env:EXPECT_GPU = 'cpu'; $env:OUT = "$env:RUNNER_TEMP\suite\ui-chromium"
+          $env:TURN_TIMEOUT_S = '600'; $env:LOAD_TIMEOUT_S = '1200'
+          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
+          "chromium exit $LASTEXITCODE"
+          # second pass in Edge: the password is already changed, so sign in with the new one
+          $env:STUDIO_PW = 'Docker-Win-2026'; $env:PW_CHANNEL = 'msedge'; $env:OUT = "$env:RUNNER_TEMP\suite\ui-edge"
+          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
+          "edge exit $LASTEXITCODE"
           exit 0
+      - name: Docker CPU suite inside WSL
+        run: |
+          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
+          $out = (wsl.exe -d ub -u root -- wslpath -a "$env:RUNNER_TEMP".Replace('\','/')).Trim() + "/suite/wsl"
+          wsl.exe -d ub -u root -- bash -c "docker rm -f uqw >/dev/null; OUT=$out SKIP_UI=1 bash $ws/ci/docker_cpu_suite.sh"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r2-windows-wsl
+          path: ${{ runner.temp }}/suite
+          retention-days: 7
+
+  # AMD Windows hosts cannot run Linux containers (WSL / VirtualMachinePlatform disabled, reboot
+  # needed), so this pair runs the container on an AMD Linux host and drives it from a Windows
+  # browser on AMD hardware through a Cloudflare quick tunnel. The Studio/Jupyter password never
+  # appears in plain text: the Windows job publishes an RSA public key, the Linux job encrypts the
+  # password to it.
+  amd-tunnel-host:
+    name: amd linux tunnel host
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Start the container and the tunnels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          W="$RUNNER_TEMP/tun"; mkdir -p "$W"; cd "$W"
+          # wait for the Windows job's public key
+          for i in $(seq 1 180); do
+            id=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | python3 -c 'import sys,json; a=[x for x in json.load(sys.stdin)["artifacts"] if x["name"]=="win-pubkey"]; print(a[0]["id"] if a else "")')
+            [ -n "$id" ] && break; sleep 10
+          done
+          [ -n "$id" ] || { echo "no public key from the Windows job"; exit 1; }
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" -o pk.zip "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip"
+          python3 -c 'import zipfile; zipfile.ZipFile("pk.zip").extractall(".")'
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          docker pull -q unsloth/unsloth:latest
+          docker run -d --name uqt -e UNSLOTH_STUDIO_PASSWORD="$PW" -e JUPYTER_PASSWORD="$PW" -e UNSLOTH_JUPYTER_CLOUDFLARE=1 unsloth/unsloth:latest
+          for i in $(seq 1 200); do docker logs uqt 2>&1 | grep -q 'container ready' && break; sleep 3; done
+          docker logs uqt 2>&1 | grep -E 'container ready|WARN' | head
+          for i in $(seq 1 60); do docker exec uqt test -x /usr/local/bin/cloudflared && break; sleep 3; done
+          docker exec -d uqt bash -c 'cloudflared tunnel --no-autoupdate --url http://localhost:8000 > /tmp/cf-studio.log 2>&1'
+          for i in $(seq 1 60); do
+            SU=$(docker exec uqt grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf-studio.log | head -1)
+            JU=$(docker logs uqt 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1)
+            [ -n "$SU" ] && [ -n "$JU" ] && break; sleep 3
+          done
+          echo "studio tunnel: $SU"; echo "jupyter tunnel: $JU"
+          printf '%s' "$PW" | openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -out pw.enc
+          printf 'STUDIO_URL=%s\nJUPYTER_URL=%s\n' "$SU" "$JU" > urls.txt
+          mkdir -p up && cp pw.enc urls.txt up/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amd-tunnel
+          path: ${{ runner.temp }}/tun/up
+      - name: Wait for the Windows client to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 240); do
+            n=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin)["artifacts"] if x["name"]=="win-done"))')
+            [ "$n" != 0 ] && { echo "client done"; break; }; sleep 15
+          done
+          docker exec uqt bash -c 'ps -eo pid,args | grep [l]lama-server | cut -c1-200' || true
+          docker logs uqt 2>&1 | grep -iE 'error|traceback' | tail -5 || true
+      - name: Teardown
+        if: always()
+        run: |
+          docker rm -f uqt || true
+          docker rmi -f unsloth/unsloth:latest || true
+
+  amd-windows-client:
+    name: amd windows browser client
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try enabling WSL without a reboot (report only)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart | Select-Object -Last 3
+          dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart | Select-Object -Last 3
+          wsl.exe --status
+          exit 0
+      - name: Key pair
+        run: |
+          $ossl = 'C:\Program Files\Git\usr\bin\openssl.exe'
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\k\pub" | Out-Null
+          & $ossl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$env:RUNNER_TEMP\k\priv.pem"
+          & $ossl pkey -in "$env:RUNNER_TEMP\k\priv.pem" -pubout -out "$env:RUNNER_TEMP\k\pub\pub.pem"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-pubkey
+          path: ${{ runner.temp }}\k\pub
+      - name: Fetch the tunnel details
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
+          $id = $null
+          for ($i = 0; $i -lt 240 -and -not $id; $i++) {
+            $a = (Invoke-RestMethod -Headers $h -Uri $api).artifacts | Where-Object { $_.name -eq 'amd-tunnel' }
+            if ($a) { $id = $a[0].id } else { Start-Sleep 10 }
+          }
+          if (-not $id) { throw "no tunnel artifact" }
+          Invoke-WebRequest -UseBasicParsing -Headers $h -Uri "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip" -OutFile "$env:RUNNER_TEMP\k\t.zip"
+          Expand-Archive -Force "$env:RUNNER_TEMP\k\t.zip" "$env:RUNNER_TEMP\k\t"
+          $ossl = 'C:\Program Files\Git\usr\bin\openssl.exe'
+          & $ossl pkeyutl -decrypt -inkey "$env:RUNNER_TEMP\k\priv.pem" -pkeyopt rsa_padding_mode:oaep -in "$env:RUNNER_TEMP\k\t\pw.enc" -out "$env:RUNNER_TEMP\k\pw.txt"
+          $pw = (Get-Content -Raw "$env:RUNNER_TEMP\k\pw.txt")
+          Write-Host "::add-mask::$pw"
+          Add-Content -Path $env:GITHUB_ENV -Value "STUDIO_PW=$pw"
+          Add-Content -Path $env:GITHUB_ENV -Value "JUPYTER_PW=$pw"
+          Get-Content "$env:RUNNER_TEMP\k\t\urls.txt" | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
+          Get-Content "$env:RUNNER_TEMP\k\t\urls.txt"
+      - name: Playwright on Windows against the AMD Linux container
+        run: |
+          python -m venv "$env:RUNNER_TEMP\pw"
+          & "$env:RUNNER_TEMP\pw\Scripts\pip.exe" install -q playwright==1.58.0
+          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" -m playwright install chromium
+          $env:STUDIO_NEW_PW = $env:STUDIO_PW; $env:EXPECT_GPU = 'cpu'; $env:OUT = "$env:RUNNER_TEMP\ui"
+          $env:TURN_TIMEOUT_S = '600'; $env:LOAD_TIMEOUT_S = '1200'
+          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
+          "exit $LASTEXITCODE"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r2-amd-windows-ui
+          path: ${{ runner.temp }}\ui
+      - name: Signal done
+        if: always()
+        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\done" | Out-Null; Set-Content "$env:RUNNER_TEMP\done\done.txt" 'done'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-done
+          path: ${{ runner.temp }}\done

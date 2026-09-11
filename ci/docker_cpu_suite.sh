@@ -147,6 +147,7 @@ rc=$?
 grep -E 'PASS |FAIL |SUMMARY' "$OUT/ui.log"
 [ $rc -eq 0 ] && result ui_probe PASS "$(grep SUMMARY "$OUT/ui.log")" || result ui_probe FAIL "$(grep -E 'FAIL|SUMMARY' "$OUT/ui.log" | tail -4 | tr '\n' ' ' | head -c 900)"
 docker exec uq bash -c 'ps -eo pid,pcpu,rss,args | grep -E "[l]lama-server" | cut -c1-250' > "$OUT/llama_server_ps.txt" 2>&1
+docker logs uq > "$OUT/latest_after_ui.log" 2>&1
 result llama_server_process INFO "$(head -c 300 "$OUT/llama_server_ps.txt")"
 endsection
 NEWPW="Docker-Suite-2026"
@@ -168,6 +169,11 @@ if [ -n "$NEWPW" ]; then
     grep -q 'password set on an earlier boot' "$OUT/latest_restart.log" && [ "$code" = 200 ] && result restart_keeps_password PASS "login=$code after restart ${st}s" || result restart_keeps_password FAIL "login=$code $(grep -E 'Studio  ' "$OUT/latest_restart.log")"
 fi
 grep -q 'existing jupyter config reused' "$OUT/latest_restart.log" && result restart_keeps_jupyter_pw PASS "" || result restart_keeps_jupyter_pw FAIL "$(grep JupyterLab "$OUT/latest_restart.log" | head -2)"
+endsection
+
+section "headless kernel start with the image IPython profile"
+docker exec -i uq bash < "$HERE/kernel_check.sh" > "$OUT/kernel_nbconvert.log" 2>&1
+grep -q KERNEL_OK "$OUT/kernel_nbconvert.log" && result kernel_nbconvert PASS "$(grep -E 'KERNEL_OK|rc=' "$OUT/kernel_nbconvert.log" | tr '\n' ' ')" || result kernel_nbconvert FAIL "$(tail -c 600 "$OUT/kernel_nbconvert.log" | tr '\n' ' ')"
 endsection
 
 section "in-container tools"
