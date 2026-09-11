@@ -1,6 +1,6 @@
 name: PR 10765 verification (throwaway)
 
-# main = ffb5539d2f (the PR's merge base), pr = edd4f0dc1d (PR head).
+# main = ffb5539d2f (the PR's merge base), pr = edd4f0dc1d (PR head), old = v0.1.806-beta (before #7256).
 
 on:
   push:
@@ -11,60 +11,200 @@ permissions: {}
 env:
   MAIN_SHA: ffb5539d2f07b7a978511d70c0243bf100a500fe
   PR_SHA: edd4f0dc1d550e0efbae88605bab47b5a4f4224c
+  OLD_REF: v0.1.806-beta
+  E2E: C:\Users\Public\e2e
 
 jobs:
-  realuser:
-    name: real account "${{ matrix.account }}", default install (pr)
-    runs-on: windows-latest
-    timeout-minutes: 80
+  routing:
+    name: AST + routing (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        account: ['John Doe', 'JohnDoe']
-    env:
-      LEG: real account ${{ matrix.account }}, default install, pr
-      ACCOUNT: ${{ matrix.account }}
+        include:
+          - { os: ubuntu-latest, shell: pwsh }
+          - { os: windows-latest, shell: powershell }
+          - { os: windows-latest, shell: pwsh }
     steps:
-      - name: Fetch scripts and installer; 8.3 names on
+      - name: Fetch
         shell: pwsh
         run: |
-          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
-          New-Item -ItemType Directory -Force -Path C:\Users\Public\e2e | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\h\*.ps1" C:\Users\Public\e2e\
-          curl.exe -fsSL -o C:\Users\Public\e2e\install.ps1 "https://raw.githubusercontent.com/oobabooga/unsloth/$env:PR_SHA/install.ps1"
-          if ($LASTEXITCODE) { throw "download failed" }
-          fsutil 8dot3name set 0
+          $W = Join-Path $env:RUNNER_TEMP 'w'
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth (Join-Path $env:RUNNER_TEMP 'h')
+          foreach ($v in @(@{ n = 'main'; s = $env:MAIN_SHA }, @{ n = 'pr'; s = $env:PR_SHA })) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $W $v.n) | Out-Null
+            curl -fsSL -o (Join-Path (Join-Path $W $v.n) 'install.ps1') "https://raw.githubusercontent.com/oobabooga/unsloth/$($v.s)/install.ps1"
+            if ($LASTEXITCODE) { throw 'download failed' }
+          }
+          if (-not ($IsLinux -or $IsMacOS)) { fsutil 8dot3name set 0 | Out-Null }
           exit 0
-      - name: Create the account and run the installer as it
+      - name: Checks
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File (Join-Path (Join-Path $env:RUNNER_TEMP 'h') 'routing.ps1') -WorkRoot (Join-Path $env:RUNNER_TEMP 'w')
+          exit $LASTEXITCODE
+
+  desktop:
+    name: Desktop install (--tauri) + login + shortcuts-only, real account "John Doe"
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      ACCOUNT: John Doe
+      LEG: Desktop --tauri install, real account John Doe, pr
+    steps:
+      - name: Prepare
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          $pw = 'Aa1!' + [guid]::NewGuid().ToString('N')
-          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
-          New-LocalUser -Name $env:ACCOUNT -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
-          Add-LocalGroupMember -Group 'Administrators' -Member $env:ACCOUNT
-          icacls C:\Users\Public\e2e /grant '*S-1-1-0:(OI)(CI)M' | Out-Null
-          $arg = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Users\Public\e2e\run_install.ps1 -Installer C:\Users\Public\e2e\install.ps1 -OutDir C:\Users\Public\e2e\out -TimeoutMinutes 45'
-          $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-          Register-ScheduledTask -TaskName 'unsloth-e2e' -Action $action -Settings $settings -User $env:ACCOUNT -Password $pw -RunLevel Highest | Out-Null
-          Start-ScheduledTask -TaskName 'unsloth-e2e'
-          $ErrorActionPreference = 'Continue'
-          $deadline = (Get-Date).AddMinutes(60)
-          $done = 'C:\Users\Public\e2e\out\done.txt'
-          while (-not (Test-Path $done)) {
-            if ((Get-Date) -gt $deadline) { Write-Host '::error::timed out waiting for run_install'; break }
-            Start-Sleep -Seconds 60
-            $st = (Get-ScheduledTask -TaskName 'unsloth-e2e').State
-            $tail = Get-Content C:\Users\Public\e2e\out\install.log -Tail 1 -ErrorAction SilentlyContinue
-            Write-Host "[$(Get-Date -Format HH:mm:ss)] task=$st :: $tail"
-            if ("$st" -eq 'Ready' -and -not (Test-Path $done)) {
-              Start-Sleep -Seconds 15
-              if (-not (Test-Path $done)) { Write-Host '::error::task stopped without finishing'; break }
-            }
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          & "$env:RUNNER_TEMP\h\prep.ps1" -Installers "pr=$env:PR_SHA" -Account $env:ACCOUNT
+      - name: install.ps1 --tauri as John Doe
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\run_install.ps1" -ScriptArgs "-Installer $env:E2E\pr.ps1 -OutDir $env:E2E\tauri -InstallArgs tauri" -DoneFile "$env:E2E\tauri\done.txt" -TimeoutMinutes 45
+          pwsh -NoProfile -File "$env:E2E\check_install.ps1" -OutDir "$env:E2E\tauri" -Expect success
+          $rc = $LASTEXITCODE
+          $tauriErr = @(Select-String -Path "$env:E2E\tauri\install.log" -Pattern 'TAURI:ERROR_DEFAULT').Count
+          Write-Host "TAURI:ERROR_DEFAULT lines: $tauriErr"
+          Select-String -Path "$env:E2E\tauri\install.log" -Pattern 'TAURI:STEP' | ForEach-Object { $_.Line.Trim() }
+          if ($tauriErr -gt 0) { exit 1 }
+          exit $rc
+      - name: Studio boot + desktop login + web page as John Doe
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\studio_probe.ps1" -ScriptArgs "-OutFile $env:E2E\probe1.txt -Provision" -DoneFile "$env:E2E\probe1.txt.done" -TimeoutMinutes 15
+          exit $LASTEXITCODE
+      - name: install.ps1 --shortcuts-only and --tauri --shortcuts-only as John Doe
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\run_install.ps1" -ScriptArgs "-Installer $env:E2E\pr.ps1 -OutDir $env:E2E\so1 -InstallArgs shortcuts-only" -DoneFile "$env:E2E\so1\done.txt" -TimeoutMinutes 15
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\run_install.ps1" -ScriptArgs "-Installer $env:E2E\pr.ps1 -OutDir $env:E2E\so2 -InstallArgs tauri,shortcuts-only" -DoneFile "$env:E2E\so2\done.txt" -TimeoutMinutes 15
+          foreach ($d in 'so1', 'so2') {
+            $rc = (Get-Content "$env:E2E\$d\done.txt" -Raw).Trim()
+            $el = (Get-Content "$env:E2E\$d\elapsed.txt" -Raw).Trim()
+            $inst = @(Select-String -Path "$env:E2E\$d\install.log" -Pattern 'installing unsloth|installing PyTorch|overrides').Count
+            Write-Host "$d : rc=$rc $el package-install lines=$inst"
+            Get-Content "$env:E2E\$d\install.log" | Select-Object -Last 12
+            if ($rc -ne '0' -or $inst -ne 0) { Write-Host "::error::$d changed packages or failed"; exit 1 }
           }
           exit 0
-      - name: Check
+      - name: Studio boot + login again after shortcuts-only
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\studio_probe.ps1" -ScriptArgs "-OutFile $env:E2E\probe2.txt" -DoneFile "$env:E2E\probe2.txt.done" -TimeoutMinutes 15
+          exit $LASTEXITCODE
+      - name: Verdict
         if: always()
         shell: pwsh
-        run: pwsh -NoProfile -File C:\Users\Public\e2e\check_install.ps1 -OutDir C:\Users\Public\e2e\out -Expect success
+        run: |
+          & "$env:E2E\verdict.ps1" -Spec 'probe1,probe2|ok=healthy,login,authed_status_call,page_has_root|same=freeze_sha,secret_sha'
+          $rc = $LASTEXITCODE
+          $d = Compare-Object (Get-Content "$env:E2E\probe1.txt.freeze.txt") (Get-Content "$env:E2E\probe2.txt.freeze.txt")
+          if ($d) { $d | Format-Table | Out-String | Write-Host }
+          exit $rc
+
+  upgrade-old:
+    name: upgrade from ${{ 'v0.1.806-beta' }} as "John Doe" (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: pr, expect: success }
+          - { variant: main, expect: repro }
+    env:
+      ACCOUNT: John Doe
+      LEG: upgrade v0.1.806-beta -> ${{ matrix.variant }}, real account John Doe
+    steps:
+      - name: Prepare
+        shell: powershell
+        run: |
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          $new = if ('${{ matrix.variant }}' -eq 'pr') { $env:PR_SHA } else { $env:MAIN_SHA }
+          & "$env:RUNNER_TEMP\h\prep.ps1" -Installers "old=$env:OLD_REF;new=$new" -Account $env:ACCOUNT
+      - name: Install v0.1.806-beta as John Doe
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\run_install.ps1" -ScriptArgs "-Installer $env:E2E\old.ps1 -OutDir $env:E2E\A" -DoneFile "$env:E2E\A\done.txt" -TimeoutMinutes 45
+          pwsh -NoProfile -File "$env:E2E\check_install.ps1" -OutDir "$env:E2E\A" -Expect success
+          exit $LASTEXITCODE
+      - name: Studio boot + login on the old install
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\studio_probe.ps1" -ScriptArgs "-OutFile $env:E2E\probeA.txt -Provision" -DoneFile "$env:E2E\probeA.txt.done" -TimeoutMinutes 15
+          exit $LASTEXITCODE
+      - name: Re-run the ${{ matrix.variant }} installer over it
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\run_install.ps1" -ScriptArgs "-Installer $env:E2E\new.ps1 -OutDir $env:E2E\B" -DoneFile "$env:E2E\B\done.txt" -TimeoutMinutes 45
+          pwsh -NoProfile -File "$env:E2E\check_install.ps1" -OutDir "$env:E2E\B" -Expect ${{ matrix.expect }}
+          exit $LASTEXITCODE
+      - name: Studio boot + login with the pre-upgrade secret
+        if: always()
+        shell: powershell
+        run: |
+          & "$env:E2E\runas_task.ps1" -Account $env:ACCOUNT -PasswordFile "$env:RUNNER_TEMP\pw.txt" -Script "$env:E2E\studio_probe.ps1" -ScriptArgs "-OutFile $env:E2E\probeB.txt" -DoneFile "$env:E2E\probeB.txt.done" -TimeoutMinutes 15
+          exit 0
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ matrix.variant }}' -eq 'pr') {
+            & "$env:E2E\verdict.ps1" -Spec 'probeA,probeB|ok=healthy,login,authed_status_call,page_has_root|same=secret_sha'
+          } else {
+            & "$env:E2E\verdict.ps1" -Spec 'probeA,probeB|ok=healthy'
+            Write-Host '(main leg: informational; the control is the failed re-run above)'
+            exit 0
+          }
+          exit $LASTEXITCODE
+
+  upgrade-plain:
+    name: existing no-space install, main -> PR -> shortcuts-only (runneradmin)
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      LEG: existing install main -> pr, runneradmin
+    steps:
+      - name: Prepare
+        shell: powershell
+        run: |
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          & "$env:RUNNER_TEMP\h\prep.ps1" -Installers "main=$env:MAIN_SHA;pr=$env:PR_SHA"
+      - name: Install main
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File "$env:E2E\run_install.ps1" -Installer "$env:E2E\main.ps1" -OutDir "$env:E2E\A"
+          pwsh -NoProfile -File "$env:E2E\check_install.ps1" -OutDir "$env:E2E\A" -Expect success
+          exit $LASTEXITCODE
+      - name: Probe A
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "$env:E2E\studio_probe.ps1" -OutFile "$env:E2E\probeA.txt" -Provision
+      - name: Re-run with the PR installer
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File "$env:E2E\run_install.ps1" -Installer "$env:E2E\pr.ps1" -OutDir "$env:E2E\B"
+          pwsh -NoProfile -File "$env:E2E\check_install.ps1" -OutDir "$env:E2E\B" -Expect success
+          exit $LASTEXITCODE
+      - name: Probe B
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "$env:E2E\studio_probe.ps1" -OutFile "$env:E2E\probeB.txt"
+      - name: PR --shortcuts-only
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File "$env:E2E\run_install.ps1" -Installer "$env:E2E\pr.ps1" -OutDir "$env:E2E\C" -InstallArgs shortcuts-only
+          $rc = (Get-Content "$env:E2E\C\done.txt" -Raw).Trim()
+          Get-Content "$env:E2E\C\install.log" | Select-Object -Last 10
+          if ($rc -ne '0') { exit 1 }
+      - name: Probe C
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "$env:E2E\studio_probe.ps1" -OutFile "$env:E2E\probeC.txt"
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          & "$env:E2E\verdict.ps1" -Spec 'probeA,probeB,probeC|ok=healthy,login,authed_status_call,page_has_root|same=freeze_sha,secret_sha'
+          $rc = $LASTEXITCODE
+          $d = Compare-Object (Get-Content "$env:E2E\probeA.txt.freeze.txt") (Get-Content "$env:E2E\probeB.txt.freeze.txt")
+          if ($d) { $d | Format-Table | Out-String | Write-Host }
+          exit $rc

@@ -23,7 +23,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $env:UNSLOTH_SKIP_AUTOSTART = '1'
 $env:UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK = '1'
 $argv = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Installer)
-if ($InstallArgs) { $argv += @($InstallArgs -split ' ') }
+if ($InstallArgs) { $argv += @($InstallArgs -split ',' | ForEach-Object { "--$_" }) }
 $started = Get-Date
 $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argv -NoNewWindow -PassThru `
     -RedirectStandardOutput (Join-Path $OutDir 'install.log') -RedirectStandardError (Join-Path $OutDir 'install.err.log')
