@@ -12,7 +12,7 @@ if ($null -ne $rc) { $rc = $rc.Trim() }
 $interesting = @($log | Select-String -Pattern 'install unsloth|File not found|8\.3 short|without freezing|Failed to install|\[ERROR\]|Setup Complete|torch ' | ForEach-Object { $_.Line.Trim() })
 $summary = @("### $env:LEG", '```', $envTxt, "installer exit: $rc", $pkgs, $left, '```', '```') + $interesting + @('```')
 $extra = @()
-foreach ($f in 'elapsed.txt', 'cli.txt', 'hung-descendants.txt', 'hung-threads.txt') {
+foreach ($f in 'elapsed.txt', 'cli.txt', 'hung-descendants.txt', 'hung-threads.txt', 'surviving-descendants.txt') {
     $fp = Join-Path $OutDir $f
     if (Test-Path -LiteralPath $fp) { $extra += "--- $f ---"; $extra += @(Get-Content -LiteralPath $fp) }
 }

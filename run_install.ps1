@@ -30,8 +30,21 @@ $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argv -NoNewWindow -
 $null = $p.Handle
 $finished = $p.WaitForExit($TimeoutMinutes * 60 * 1000)
 $elapsed = [int]((Get-Date) - $started).TotalSeconds
+Start-Sleep -Seconds 20
 $procs = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine
 $procs | Format-Table -AutoSize -Wrap | Out-String -Width 400 | Out-File -FilePath (Join-Path $OutDir 'processes.txt') -Encoding utf8
+# Descendants of the installer still alive after it exited: whatever holds an inherited stdout.
+$alive = New-Object System.Collections.ArrayList
+$frontier0 = @($p.Id)
+while ($frontier0.Count) {
+    $next0 = @()
+    foreach ($id in $frontier0) {
+        foreach ($c in @($procs | Where-Object { $_.ParentProcessId -eq $id -and $_.CreationDate -ge $started })) { [void]$alive.Add($c); $next0 += $c.ProcessId }
+    }
+    $frontier0 = $next0
+}
+$alive | Format-List | Out-String -Width 400 | Out-File -FilePath (Join-Path $OutDir 'surviving-descendants.txt') -Encoding utf8
+"surviving descendants: $($alive.Count)" | Out-File -Append -FilePath (Join-Path $OutDir 'surviving-descendants.txt') -Encoding utf8
 if ($finished) {
     $rc = $p.ExitCode
 } else {
