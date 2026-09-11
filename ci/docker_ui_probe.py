@@ -44,6 +44,36 @@ LOAD_TIMEOUT_S = float(os.environ.get("LOAD_TIMEOUT_S", "900"))
 OUT.mkdir(parents = True, exist_ok = True)
 PW_CHANNEL = os.environ.get("PW_CHANNEL") or None
 
+
+def _doh_rules():
+    """With PW_RESOLVE_VIA_DOH=1, resolve the tunnel hostnames over DNS-over-HTTPS and pin them
+    in Chromium, for networks whose resolver has not picked up a fresh trycloudflare name."""
+    if os.environ.get("PW_RESOLVE_VIA_DOH") != "1":
+        return []
+    import urllib.parse as up
+    rules = []
+    for url in (STUDIO_URL, JUPYTER_URL):
+        host = up.urlparse(url).hostname if url else None
+        if not host:
+            continue
+        for _ in range(30):
+            try:
+                req = urllib.request.Request(f"https://1.1.1.1/dns-query?name={host}&type=A",
+                                             headers = {"accept": "application/dns-json"})
+                ans = json.load(urllib.request.urlopen(req, timeout = 10)).get("Answer") or []
+                ips = [a["data"] for a in ans if a.get("type") == 1]
+                if ips:
+                    rules.append(f"MAP {host} {ips[0]}")
+                    break
+            except Exception as e:
+                log(f"DoH lookup for {host} failed: {e}")
+            time.sleep(5)
+    log(f"host resolver rules: {rules}")
+    return [f"--host-resolver-rules={', '.join(rules)}"] if rules else []
+
+
+PW_ARGS = None
+
 RESULTS = {}
 _shot_n = [0]
 
@@ -212,7 +242,7 @@ def studio_chat(page, prompt, idx):
 
 
 def run_studio(p):
-    browser = p.chromium.launch(channel = PW_CHANNEL)
+    browser = p.chromium.launch(channel = PW_CHANNEL, args = PW_ARGS)
     ctx = browser.new_context(viewport = {"width": 1440, "height": 900}, locale = "en-US")
     page = ctx.new_page()
     page.set_default_timeout(60_000)
@@ -246,7 +276,7 @@ def run_studio(p):
 
 
 def run_jupyter(p):
-    browser = p.chromium.launch(channel = PW_CHANNEL)
+    browser = p.chromium.launch(channel = PW_CHANNEL, args = PW_ARGS)
     ctx = browser.new_context(viewport = {"width": 1440, "height": 900}, locale = "en-US")
     page = ctx.new_page()
     page.set_default_timeout(60_000)
@@ -347,6 +377,8 @@ def run_jupyter(p):
 
 
 def main():
+    global PW_ARGS
+    PW_ARGS = _doh_rules()
     with sync_playwright() as p:
         if STUDIO_URL:
             run_studio(p)
