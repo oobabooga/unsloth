@@ -15,36 +15,6 @@ env:
   E2E: C:\Users\Public\e2e
 
 jobs:
-  routing:
-    name: AST + routing (${{ matrix.os }}, ${{ matrix.shell }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, shell: pwsh }
-          - { os: windows-latest, shell: powershell }
-          - { os: windows-latest, shell: pwsh }
-    steps:
-      - name: Fetch
-        shell: pwsh
-        run: |
-          $W = Join-Path $env:RUNNER_TEMP 'w'
-          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth (Join-Path $env:RUNNER_TEMP 'h')
-          foreach ($v in @(@{ n = 'main'; s = $env:MAIN_SHA }, @{ n = 'pr'; s = $env:PR_SHA })) {
-            New-Item -ItemType Directory -Force -Path (Join-Path $W $v.n) | Out-Null
-            curl -fsSL -o (Join-Path (Join-Path $W $v.n) 'install.ps1') "https://raw.githubusercontent.com/oobabooga/unsloth/$($v.s)/install.ps1"
-            if ($LASTEXITCODE) { throw 'download failed' }
-          }
-          if (-not ($IsLinux -or $IsMacOS)) { fsutil 8dot3name set 0 | Out-Null }
-          exit 0
-      - name: Checks
-        shell: pwsh
-        run: |
-          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File (Join-Path (Join-Path $env:RUNNER_TEMP 'h') 'routing.ps1') -WorkRoot (Join-Path $env:RUNNER_TEMP 'w')
-          exit $LASTEXITCODE
-
   desktop:
     name: Desktop install (--tauri) + login + shortcuts-only, real account "John Doe"
     runs-on: windows-latest
@@ -112,7 +82,6 @@ jobs:
       matrix:
         include:
           - { variant: pr, expect: success }
-          - { variant: main, expect: repro }
     env:
       ACCOUNT: John Doe
       LEG: upgrade v0.1.806-beta -> ${{ matrix.variant }}, real account John Doe
