@@ -1,0 +1,156 @@
+name: PR 10765 verification (throwaway)
+
+# main = ffb5539d2f (the PR's merge base), pr = edd4f0dc1d (PR head).
+
+on:
+  push:
+    branches: [pr10765-verify]
+
+permissions: {}
+
+env:
+  MAIN_SHA: ffb5539d2f07b7a978511d70c0243bf100a500fe
+  PR_SHA: edd4f0dc1d550e0efbae88605bab47b5a4f4224c
+
+jobs:
+  helper:
+    name: helper matrix (${{ matrix.shell }}, 8.3 ${{ matrix.short83 }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+        short83: ['on', 'off']
+    steps:
+      - name: Prepare
+        shell: pwsh
+        run: |
+          $mode = if ('${{ matrix.short83 }}' -eq 'on') { 0 } else { 1 }
+          fsutil 8dot3name set $mode
+          fsutil 8dot3name query C:
+          $W = "$env:RUNNER_TEMP\w"
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          foreach ($v in @(@{ n = 'main'; s = $env:MAIN_SHA }, @{ n = 'pr'; s = $env:PR_SHA })) {
+            New-Item -ItemType Directory -Force -Path "$W\$($v.n)\tests\studio" | Out-Null
+            curl.exe -fsSL -o "$W\$($v.n)\install.ps1" "https://raw.githubusercontent.com/oobabooga/unsloth/$($v.s)/install.ps1"
+            if ($LASTEXITCODE) { throw "download failed" }
+          }
+          curl.exe -fsSL -o "$W\pr\tests\studio\test_torch_overrides_merge.ps1" "https://raw.githubusercontent.com/oobabooga/unsloth/$env:PR_SHA/tests/studio/test_torch_overrides_merge.ps1"
+          if ($LASTEXITCODE) { throw "download failed" }
+          python -m venv "$W\tools"
+          & "$W\tools\Scripts\python.exe" -m pip install -q uv
+          & "$W\tools\Scripts\uv.exe" venv -q "$W\venv" --python 3.12
+          if ($LASTEXITCODE) { throw "venv failed" }
+          exit 0
+      - name: Harness (main vs PR, real uv)
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\h\harness.ps1" -WorkRoot "$env:RUNNER_TEMP\w" -Short83 ${{ matrix.short83 }} -Uv "$env:RUNNER_TEMP\w\tools\Scripts\uv.exe"
+          exit $LASTEXITCODE
+      - name: PR's own test file under the same shell
+        if: always()
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\w\pr\tests\studio\test_torch_overrides_merge.ps1"
+          exit $LASTEXITCODE
+
+  realuser:
+    name: real account "John Doe", default install (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: pr, expect: success }
+          - { variant: main, expect: repro }
+    env:
+      LEG: real account John Doe, default install, ${{ matrix.variant }}
+    steps:
+      - name: Fetch scripts and installer; 8.3 names on
+        shell: pwsh
+        run: |
+          $sha = if ('${{ matrix.variant }}' -eq 'pr') { $env:PR_SHA } else { $env:MAIN_SHA }
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          New-Item -ItemType Directory -Force -Path C:\Users\Public\e2e | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\h\*.ps1" C:\Users\Public\e2e\
+          curl.exe -fsSL -o C:\Users\Public\e2e\install.ps1 "https://raw.githubusercontent.com/oobabooga/unsloth/$sha/install.ps1"
+          if ($LASTEXITCODE) { throw "download failed" }
+          fsutil 8dot3name set 0
+          fsutil 8dot3name query C:
+          exit 0
+      - name: Create the account and run the installer as it
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pw = 'Aa1!' + [guid]::NewGuid().ToString('N')
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name 'John Doe' -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Administrators' -Member 'John Doe'
+          icacls C:\Users\Public\e2e /grant '*S-1-1-0:(OI)(CI)M' | Out-Null
+          $arg = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Users\Public\e2e\run_install.ps1 -Installer C:\Users\Public\e2e\install.ps1 -OutDir C:\Users\Public\e2e\out'
+          $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+          Register-ScheduledTask -TaskName 'unsloth-e2e' -Action $action -Settings $settings -User 'John Doe' -Password $pw -RunLevel Highest | Out-Null
+          Start-ScheduledTask -TaskName 'unsloth-e2e'
+          $ErrorActionPreference = 'Continue'
+          $deadline = (Get-Date).AddMinutes(100)
+          $done = 'C:\Users\Public\e2e\out\done.txt'
+          $sawRunning = $false
+          while (-not (Test-Path $done)) {
+            if ((Get-Date) -gt $deadline) { Write-Host '::error::timed out waiting for the installer'; break }
+            Start-Sleep -Seconds 60
+            $st = (Get-ScheduledTask -TaskName 'unsloth-e2e').State
+            $info = Get-ScheduledTaskInfo -TaskName 'unsloth-e2e'
+            if ("$st" -eq 'Running') { $sawRunning = $true }
+            $tail = Get-Content C:\Users\Public\e2e\out\install.log -Tail 1 -ErrorAction SilentlyContinue
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] task=$st result=$($info.LastTaskResult) :: $tail"
+            if ("$st" -eq 'Ready' -and -not (Test-Path $done)) {
+              Start-Sleep -Seconds 15
+              if (-not (Test-Path $done)) { Write-Host "::error::task stopped without finishing (result $($info.LastTaskResult), sawRunning=$sawRunning)"; break }
+            }
+          }
+          Get-ChildItem 'C:\Users' | ForEach-Object { Write-Host "profile dir: $($_.FullName)" }
+          exit 0
+      - name: Check
+        if: always()
+        shell: pwsh
+        run: pwsh -NoProfile -File C:\Users\Public\e2e\check_install.ps1 -OutDir C:\Users\Public\e2e\out -Expect ${{ matrix.expect }}
+
+  local:
+    name: install.ps1 --local, spaced TEMP (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: pr, expect: success }
+          - { variant: main, expect: repro }
+    env:
+      LEG: install.ps1 --local as runneradmin with TEMP=C:\Users\John Doe\AppData\Local\Temp, ${{ matrix.variant }}
+    steps:
+      - name: Fetch scripts and repo; spaced TEMP with 8.3 names on
+        shell: pwsh
+        run: |
+          $sha = if ('${{ matrix.variant }}' -eq 'pr') { $env:PR_SHA } else { $env:MAIN_SHA }
+          git clone -q --depth 1 -b pr10765-verify https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\h"
+          git clone -q --filter=blob:none --no-checkout https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\src"
+          git -C "$env:RUNNER_TEMP\src" checkout -q $sha
+          if ($LASTEXITCODE) { throw "checkout failed" }
+          fsutil 8dot3name set 0
+          $spaced = 'C:\Users\John Doe\AppData\Local\Temp'
+          New-Item -ItemType Directory -Force -Path $spaced | Out-Null
+          Write-Host "short form: $((New-Object -ComObject Scripting.FileSystemObject).GetFolder($spaced).ShortPath)"
+          foreach ($v in 'TEMP', 'TMP') { "$v=$spaced" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          exit 0
+      - name: Install
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File "$env:RUNNER_TEMP\h\run_install.ps1" -Installer "$env:RUNNER_TEMP\src\install.ps1" -OutDir "$env:RUNNER_TEMP\out" -InstallArgs '--local'
+          exit 0
+      - name: Check
+        if: always()
+        shell: pwsh
+        run: pwsh -NoProfile -File "$env:RUNNER_TEMP\h\check_install.ps1" -OutDir "$env:RUNNER_TEMP\out" -Expect ${{ matrix.expect }}
