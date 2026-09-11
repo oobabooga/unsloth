@@ -38,9 +38,11 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Start the Studio container (first boot, generated passwords)
         run: |
-          wsl.exe -d ub -u root -- bash -c "docker pull -q unsloth/unsloth:latest && docker run -d --name uqw -p 18000:8000 -p 18888:8888 unsloth/unsloth:latest && for i in `$(seq 1 300); do docker logs uqw 2>&1 | grep -q 'container ready' && break; sleep 3; done; docker logs uqw 2>&1 | grep -E 'login ->|generated password|container ready|WARN'"
-          $s = (wsl.exe -d ub -u root -- bash -c "docker logs uqw 2>&1 | sed -n 's/.*Unsloth Studio login -> username: unsloth   password: \([^ ]*\).*/\1/p' | tail -1").Trim()
-          $j = (wsl.exe -d ub -u root -- bash -c "docker logs uqw 2>&1 | sed -n 's/.*generated password: \([^ )]*\).*/\1/p' | head -1").Trim()
+          $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
+          $pwdir = (wsl.exe -d ub -u root -- wslpath -a "$env:RUNNER_TEMP".Replace('\','/')).Trim() + "/pw"
+          wsl.exe -d ub -u root -- bash "$ws/ci/wsl_start_container.sh" "$pwdir"
+          $s = (Get-Content -Raw "$env:RUNNER_TEMP\pw\studio_pw.txt")
+          $j = (Get-Content -Raw "$env:RUNNER_TEMP\pw\jupyter_pw.txt")
           "studio pw length $($s.Length), jupyter pw length $($j.Length)"
           Add-Content -Path $env:GITHUB_ENV -Value "STUDIO_PW=$s"
           Add-Content -Path $env:GITHUB_ENV -Value "JUPYTER_PW=$j"
@@ -68,7 +70,8 @@ jobs:
         run: |
           $ws = (wsl.exe -d ub -u root -- wslpath -a "$env:GITHUB_WORKSPACE".Replace('\','/')).Trim()
           $out = (wsl.exe -d ub -u root -- wslpath -a "$env:RUNNER_TEMP".Replace('\','/')).Trim() + "/suite/wsl"
-          wsl.exe -d ub -u root -- bash -c "docker rm -f uqw >/dev/null; OUT=$out SKIP_UI=1 bash $ws/ci/docker_cpu_suite.sh"
+          wsl.exe -d ub -u root -- docker rm -f uqw
+          wsl.exe -d ub -u root -- env OUT=$out SKIP_UI=1 bash "$ws/ci/docker_cpu_suite.sh"
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
@@ -102,7 +105,7 @@ jobs:
           curl -sL -H "Authorization: Bearer $GH_TOKEN" -o pk.zip "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip"
           python3 -c 'import zipfile; zipfile.ZipFile("pk.zip").extractall(".")'
           PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
-          docker pull -q unsloth/unsloth:latest
+          for i in 1 2 3 4 5; do docker pull -q unsloth/unsloth:latest && break; sleep 20; done
           docker run -d --name uqt -p 127.0.0.1:18000:8000 -p 127.0.0.1:18888:8888 -e UNSLOTH_STUDIO_PASSWORD="$PW" -e JUPYTER_PASSWORD="$PW" unsloth/unsloth:latest
           for i in $(seq 1 200); do docker logs uqt 2>&1 | grep -q 'container ready' && break; sleep 3; done
           docker logs uqt 2>&1 | grep -E 'container ready|WARN' | head
@@ -219,25 +222,3 @@ jobs:
           name: win-done
           path: ${{ runner.temp }}\done
 
-  amd-windows-revert:
-    name: amd windows revert ${{ matrix.slot }}
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [1, 2, 3, 4, 5, 6, 7, 8]
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - name: Cancel pending WSL feature enablement if present
-        run: |
-          $ErrorActionPreference = 'Continue'
-          "host: $env:COMPUTERNAME runner: $env:RUNNER_NAME"
-          foreach ($f in 'VirtualMachinePlatform','Microsoft-Windows-Subsystem-Linux') {
-            $st = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
-            "$f state before: $st"
-            if ("$st" -ne 'Disabled') { dism.exe /online /disable-feature /featurename:$f /norestart | Select-Object -Last 2; "$f state after: $((Get-WindowsOptionalFeature -Online -FeatureName $f).State)" }
-          }
-          exit 0
