@@ -9956,6 +9956,72 @@ def _inherited_ctx_size() -> int:
         return 0
 
 
+def _launch_vision_mmproj(
+    config,
+    llama_extra_args: Optional[list[str]] = None,
+    disable_vision: bool = False,
+) -> Optional[str]:
+    """The projector this launch really opens, or None.
+
+    Resolved exactly as ``load_model`` resolves it, so the panel and the admission
+    guard price the micro-batch the child runs at: the configured projector only while
+    it is on disk and matches the family, the switch and ``--no-mmproj`` suppressing
+    that one, and a pass-through or inherited projector surviving both.
+    """
+    from core.inference.llama_cpp import _child_effective_mmproj, extra_args_disable_mmproj
+    from core.inference.llama_server_args import extra_args_mmproj_auto
+
+    own = getattr(config, "gguf_mmproj_file", None)
+    emitted = None
+    if own and getattr(config, "is_vision", False) and not disable_vision:
+        if not extra_args_disable_mmproj(llama_extra_args):
+            emitted = _probe_backend()._resolve_launch_mmproj_path(
+                model_path = str(getattr(config, "gguf_file", "") or ""),
+                mmproj_path = str(own),
+            )
+            if not emitted and extra_args_mmproj_auto(llama_extra_args):
+                # Studio's family check dropped it, but --mmproj-auto asks llama-server
+                # to rediscover the adjacent file, and discovery applies no such check.
+                emitted = str(own)
+    return _child_effective_mmproj(emitted, llama_extra_args, {} if disable_vision else None)
+
+
+def _remote_opens_vision_mmproj(
+    config,
+    llama_extra_args: Optional[list[str]] = None,
+    disable_vision: bool = False,
+) -> bool:
+    """``_launch_vision_mmproj`` for a repository nothing has downloaded yet.
+
+    Deliberately coarser than the local path, which reads the projector family and
+    raises only for the Gemma 4 towers: no file to ask here, so a vision repo is
+    charged as if its projector opens images, as ``include_mmproj`` already does. Only
+    the training-admission guard reads this -- the layer fit runs in load_model after
+    the download, off the real file -- so the cost is a conservative reserve for one
+    pre-download estimate rather than a smaller offload. Off the config, not a Hub
+    listing, because ``_gguf_resident_file_gb`` subtracts this term and pairs with it
+    on every settings change.
+    """
+    from core.inference.llama_cpp import (
+        _child_effective_mmproj,
+        _mmproj_opens_images,
+        extra_args_disable_mmproj,
+    )
+
+    emitted = None
+    if (
+        bool(getattr(config, "is_vision", False))
+        and not disable_vision
+        and not extra_args_disable_mmproj(llama_extra_args)
+    ):
+        # The download will emit one, so it takes the emitted slot. Named by its repo
+        # because nothing has fetched it, and unreadable classifies as image-capable.
+        emitted = str(getattr(config, "gguf_hf_repo", None) or getattr(config, "identifier", None))
+    return _mmproj_opens_images(
+        _child_effective_mmproj(emitted, llama_extra_args, {} if disable_vision else None)
+    )
+
+
 def _gguf_runtime_bytes(
     gguf_path: str,
     max_seq_length: int,
@@ -9970,6 +10036,8 @@ def _gguf_runtime_bytes(
     is_diffusion: bool = False,
     ctx_last_wins: bool = False,
     model_identifier: Optional[str] = None,
+    launch_vision_mmproj: Optional[str] = None,
+    launch_is_vision: bool = False,
 ) -> _GgufRuntimeBytes:
     """KV-cache and compute-buffer VRAM (bytes) at the larger of max_seq_length and
     any `--ctx-size`/`-c` override, over n_parallel slots at the effective
@@ -9985,6 +10053,10 @@ def _gguf_runtime_bytes(
     over-reserves on purpose; a panel quoting a number to a user wants the other
     one, since a smaller ``-c`` in the extras is the context the user gets."""
     try:
+        from core.inference.llama_cpp import (
+            _batch_ubatch_for_mmproj,
+            _mmproj_needs_bigger_ubatch,
+        )
         from core.inference.llama_server_args import (
             parse_ctx_override,
             resolve_ctx_checkpoints,
@@ -9994,6 +10066,22 @@ def _gguf_runtime_bytes(
         probe = _probe_backend()
         probe._model_identifier = model_identifier
         probe._read_gguf_metadata(gguf_path)
+        # load_model raises the pair for a projector that can abort the server, so price
+        # that pair here too, or the panel quotes and admission approves a micro-batch
+        # the child does not run at. After the header read: the Gemma 4 test needs this
+        # model's text n_embd to tell E2B/E4B, which decode causally, from the rest.
+        n_batch, n_ubatch = _batch_ubatch_for_mmproj(
+            not is_diffusion
+            and _mmproj_needs_bigger_ubatch(
+                launch_vision_mmproj,
+                getattr(probe, "_embedding_length", None),
+                llama_extra_args,
+                is_vision = launch_is_vision,
+            ),
+            n_batch,
+            n_ubatch,
+            llama_extra_args,
+        )
         # Carried out even when the cache cannot be sized: block_count is a separate
         # key and is usually there, and a caller that loses it prices a manual offload
         # split as fully GPU-resident (_gguf_offloaded_layer_fraction has nothing to
@@ -10273,6 +10361,8 @@ def _estimate_gguf_kv_gb(
     n_devices: int = 1,
     is_diffusion: bool = False,
     model_identifier: Optional[str] = None,
+    launch_vision_mmproj: Optional[str] = None,
+    launch_is_vision: bool = False,
 ) -> float:
     """``_gguf_runtime_bytes`` summed into GB, for the training guard.
 
@@ -10292,6 +10382,8 @@ def _estimate_gguf_kv_gb(
         n_devices = n_devices,
         is_diffusion = is_diffusion,
         model_identifier = model_identifier,
+        launch_vision_mmproj = launch_vision_mmproj,
+        launch_is_vision = launch_is_vision,
     )
     return (runtime.kv_bytes + runtime.compute_bytes) / (1024**3)
 
@@ -10305,15 +10397,28 @@ def _remote_gguf_compute_reserve_gb(
     n_devices: int = 1,
     tensor_parallel: bool = False,
     is_diffusion: bool = False,
+    opens_vision_mmproj: bool = False,
 ) -> float:
     """Compute buffers a remote GGUF will reserve, in GB.
 
     Split out of _estimate_gguf_required_gb so a caller that is pricing something
     else, a drafter for instance, can hold it at zero the way it already holds
     _estimate_gguf_kv_gb at zero. The arithmetic is unchanged.
+
+    ``opens_vision_mmproj`` is the raise load_model applies once the download finishes;
+    without it the guard admits an uncached vision load against a micro-batch four times
+    smaller than the one it launches with.
     """
     # remote dims are unreadable; only the kq mask, linear in ubatch x ctx, can be sized here
+    from core.inference.llama_cpp import _batch_ubatch_for_mmproj
     from core.inference.llama_server_args import parse_ctx_override
+
+    n_batch, n_ubatch = _batch_ubatch_for_mmproj(
+        opens_vision_mmproj and not is_diffusion,
+        n_batch,
+        n_ubatch,
+        llama_extra_args,
+    )
 
     try:
         ctx_override = parse_ctx_override(llama_extra_args) or 0
@@ -10695,6 +10800,10 @@ def _estimate_gguf_required_gb(
                 n_devices = n_devices,
                 is_diffusion = is_diffusion,
                 model_identifier = getattr(config, "identifier", None),
+                launch_vision_mmproj = _launch_vision_mmproj(
+                    config, llama_extra_args, disable_vision
+                ),
+                launch_is_vision = bool(getattr(config, "is_vision", False)) and not disable_vision,
             )
 
         repo = getattr(config, "gguf_hf_repo", None)
@@ -10749,6 +10858,9 @@ def _estimate_gguf_required_gb(
                 n_devices = n_devices,
                 tensor_parallel = tensor_parallel,
                 is_diffusion = is_diffusion,
+                opens_vision_mmproj = _remote_opens_vision_mmproj(
+                    config, llama_extra_args, disable_vision
+                ),
             )
             return total_gb
         return None
@@ -11176,11 +11288,18 @@ def _gguf_resident_file_gb(
             0,
             llama_extra_args,
             model_identifier = getattr(config, "identifier", None),
+            # Paired with the arm above: a term added at 2048 and taken away at 512
+            # would move the weights figure by the difference.
+            launch_vision_mmproj = _launch_vision_mmproj(config, llama_extra_args, disable_vision),
+            launch_is_vision = bool(getattr(config, "is_vision", False)) and not disable_vision,
         )
     else:
         context_term_gb = _remote_gguf_compute_reserve_gb(
             llama_extra_args = llama_extra_args,
             max_seq_length = 0,
+            opens_vision_mmproj = _remote_opens_vision_mmproj(
+                config, llama_extra_args, disable_vision
+            ),
         )
     files_gb = max(0.0, required_gb - context_term_gb)
     # Under the lock: the route body runs in an asyncio.to_thread worker, so two panel
@@ -11733,6 +11852,8 @@ def _gguf_memory_breakdown(
         # An embedding model is recognised from its identifier, not its header, so the
         # panel has to hand over the same one /load does or it prices a generation model.
         model_identifier = getattr(config, "identifier", None),
+        launch_vision_mmproj = _launch_vision_mmproj(config, llama_extra_args, disable_vision),
+        launch_is_vision = bool(getattr(config, "is_vision", False)) and not disable_vision,
     )
     files_gb = _gguf_resident_file_gb(
         config,
