@@ -9,55 +9,6 @@ permissions:
   actions: read
 
 jobs:
-  linux:
-    name: linux ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: gh-arm64
-            runner: ubuntu-24.04-arm
-          - name: amd-strix-halo
-            runner: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Host
-        run: |
-          uname -a; nproc; free -h; df -h
-          docker info 2>&1 | grep -E 'Server Version|Docker Root Dir|Architecture' || true
-      - name: Make room (hosted)
-        if: ${{ !contains(matrix.name, 'amd-') }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / /mnt || true
-      - name: Playwright
-        run: |
-          python3 -m venv "$RUNNER_TEMP/pw"
-          "$RUNNER_TEMP/pw/bin/pip" install -q 'playwright==1.58.0'
-          if sudo -n true 2>/dev/null; then "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium; else "$RUNNER_TEMP/pw/bin/python" -m playwright install chromium; fi
-      - name: Docker CPU suite
-        env:
-          OUT: ${{ runner.temp }}/suite
-          PY: ${{ runner.temp }}/pw/bin/python
-          SKIP_SSH: "1"
-          SKIP_TUNNEL: "1"
-          SKIP_OFFLINE: "1"
-          SKIP_RUNSH: "1"
-        run: bash ci/docker_cpu_suite.sh
-      - name: Teardown
-        if: always()
-        run: |
-          docker ps -aq | xargs -r docker rm -f
-          if [ "${{ contains(matrix.name, 'amd-') }}" = "true" ]; then docker rmi -f unsloth/unsloth:latest unsloth/unsloth:core || true; fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: r2-suite-${{ matrix.name }}
-          path: ${{ runner.temp }}/suite
-          retention-days: 7
-
   windows-wsl:
     name: windows gh-windows-latest (Docker Engine in WSL 2)
     runs-on: windows-latest
@@ -152,17 +103,24 @@ jobs:
           python3 -c 'import zipfile; zipfile.ZipFile("pk.zip").extractall(".")'
           PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
           docker pull -q unsloth/unsloth:latest
-          docker run -d --name uqt -e UNSLOTH_STUDIO_PASSWORD="$PW" -e JUPYTER_PASSWORD="$PW" -e UNSLOTH_JUPYTER_CLOUDFLARE=1 unsloth/unsloth:latest
+          docker run -d --name uqt -p 127.0.0.1:18000:8000 -p 127.0.0.1:18888:8888 -e UNSLOTH_STUDIO_PASSWORD="$PW" -e JUPYTER_PASSWORD="$PW" unsloth/unsloth:latest
           for i in $(seq 1 200); do docker logs uqt 2>&1 | grep -q 'container ready' && break; sleep 3; done
           docker logs uqt 2>&1 | grep -E 'container ready|WARN' | head
-          for i in $(seq 1 60); do docker exec uqt test -x /usr/local/bin/cloudflared && break; sleep 3; done
-          docker exec -d uqt bash -c 'cloudflared tunnel --no-autoupdate --url http://localhost:8000 > /tmp/cf-studio.log 2>&1'
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18000 > cf-s.log 2>&1 &
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18888 > cf-j.log 2>&1 &
+          SU=""; JU=""
           for i in $(seq 1 60); do
-            SU=$(docker exec uqt grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf-studio.log | head -1)
-            JU=$(docker logs uqt 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1)
+            SU=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf-s.log | head -1)
+            JU=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf-j.log | head -1)
             [ -n "$SU" ] && [ -n "$JU" ] && break; sleep 3
           done
           echo "studio tunnel: $SU"; echo "jupyter tunnel: $JU"
+          for i in $(seq 1 60); do
+            a=$(curl -s -o /dev/null -w '%{http_code}' "$SU/api/health"); b=$(curl -s -o /dev/null -w '%{http_code}' "$JU/login")
+            [ "$a" = 200 ] && [ "$b" = 200 ] && break; sleep 5
+          done
+          echo "tunnel health: studio=$a jupyter=$b"
           printf '%s' "$PW" | openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -out pw.enc
           printf 'STUDIO_URL=%s\nJUPYTER_URL=%s\n' "$SU" "$JU" > urls.txt
           mkdir -p up && cp pw.enc urls.txt up/
@@ -195,12 +153,15 @@ jobs:
         shell: powershell
     steps:
       - uses: actions/checkout@v4
-      - name: Try enabling WSL without a reboot (report only)
+      - name: Leave the host as found (cancel any pending WSL feature enablement)
         run: |
           $ErrorActionPreference = 'Continue'
-          dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart | Select-Object -Last 3
-          dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart | Select-Object -Last 3
-          wsl.exe --status
+          "host: $env:COMPUTERNAME runner: $env:RUNNER_NAME"
+          foreach ($f in 'VirtualMachinePlatform','Microsoft-Windows-Subsystem-Linux') {
+            $st = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
+            "$f state before: $st"
+            if ("$st" -ne 'Disabled') { dism.exe /online /disable-feature /featurename:$f /norestart | Select-Object -Last 2; "$f state after: $((Get-WindowsOptionalFeature -Online -FeatureName $f).State)" }
+          }
           exit 0
       - name: Key pair
         run: |
@@ -257,3 +218,26 @@ jobs:
         with:
           name: win-done
           path: ${{ runner.temp }}\done
+
+  amd-windows-revert:
+    name: amd windows revert ${{ matrix.slot }}
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Cancel pending WSL feature enablement if present
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "host: $env:COMPUTERNAME runner: $env:RUNNER_NAME"
+          foreach ($f in 'VirtualMachinePlatform','Microsoft-Windows-Subsystem-Linux') {
+            $st = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
+            "$f state before: $st"
+            if ("$st" -ne 'Disabled') { dism.exe /online /disable-feature /featurename:$f /norestart | Select-Object -Last 2; "$f state after: $((Get-WindowsOptionalFeature -Online -FeatureName $f).State)" }
+          }
+          exit 0

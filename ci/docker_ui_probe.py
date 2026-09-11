@@ -272,11 +272,19 @@ def run_jupyter(p):
         page.locator('li.lm-Menu-item:has-text("New")').first.hover()
         page.wait_for_timeout(300)
         page.locator('li.lm-Menu-item[data-command="notebook:create-new"]').first.click()
-        page.wait_for_timeout(2000)
-        # kernel picker dialog may appear
-        sel = page.locator('.jp-Dialog button.jp-mod-accept')
-        if sel.count():
-            sel.first.click()
+        # JupyterLab may ask "Select Kernel" a moment after the notebook opens (slow links make
+        # it late); accept it like a user would, for up to 60 s.
+        t_d = time.time()
+        while time.time() - t_d < 60:
+            sel = page.locator('.jp-Dialog button.jp-mod-accept')
+            if sel.count() and sel.first.is_visible():
+                shoot(page, "jupyter-kernel-dialog")
+                sel.first.click()
+                log("accepted the Select Kernel dialog")
+                break
+            if page.locator(".jp-Notebook .jp-Cell .cm-content").count() and time.time() - t_d > 8:
+                break
+            page.wait_for_timeout(1000)
         cell = page.locator(".jp-Notebook .jp-Cell .cm-content").first
         cell.wait_for(timeout = 120_000)
         # A user waits for the kernel indicator to settle before running anything.
@@ -285,6 +293,10 @@ def run_jupyter(p):
         while time.time() - t_k < 240:
             kstat = page.locator(".jp-StatusBar-Component, .jp-StatusBar-TextItem").all_inner_texts()
             kstat = " | ".join(t.strip() for t in kstat if t.strip())
+            dlg = page.locator('.jp-Dialog button.jp-mod-accept')
+            if dlg.count() and dlg.first.is_visible():
+                dlg.first.click()
+                log("accepted a late Select Kernel dialog")
             if re.search(r"\bIdle\b", kstat):
                 break
             page.wait_for_timeout(2000)
