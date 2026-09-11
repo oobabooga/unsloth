@@ -1,0 +1,137 @@
+name: Docker image verification
+
+on:
+  push:
+    branches: [docker-verify-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gh-amd64
+            runner: ubuntu-latest
+          - name: gh-arm64
+            runner: ubuntu-24.04-arm
+          - name: amd-strix-halo
+            runner: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host and disk
+        run: |
+          set -x
+          uname -a; nproc; free -h; df -h
+          lspci -nn 2>/dev/null | grep -iE 'vga|display|3d|accel' || true
+          ls -l /dev/kfd /dev/dri 2>/dev/null || true
+          docker info 2>&1 | grep -E 'Server Version|Docker Root Dir|Storage Driver|Architecture|CPUs|Total Memory' || true
+          id; sudo -n true && echo "sudo: yes" || echo "sudo: no"
+      - name: Make room for a 27 GB image (hosted runners)
+        if: ${{ !contains(matrix.name, 'amd-') }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / /mnt || true
+          ROOT_FREE=$(df --output=avail -k / | tail -1)
+          MNT_FREE=$(df --output=avail -k /mnt 2>/dev/null | tail -1 || echo 0)
+          if [ "${MNT_FREE:-0}" -gt "$ROOT_FREE" ]; then
+            sudo systemctl stop docker docker.socket || true
+            sudo mkdir -p /mnt/docker
+            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+            sudo systemctl start docker
+          fi
+          docker info | grep 'Docker Root Dir'
+          df -h / /mnt || true
+      - name: Playwright
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pw"
+          "$RUNNER_TEMP/pw/bin/pip" install -q 'playwright==1.58.0'
+          if sudo -n true 2>/dev/null; then
+            "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium
+          else
+            "$RUNNER_TEMP/pw/bin/python" -m playwright install chromium
+          fi
+      - name: Docker CPU suite
+        env:
+          OUT: ${{ runner.temp }}/suite
+          PY: ${{ runner.temp }}/pw/bin/python
+        run: bash ci/docker_cpu_suite.sh
+      - name: AMD extras (render nodes into the NVIDIA image)
+        if: ${{ contains(matrix.name, 'amd-') }}
+        run: |
+          set +e
+          GA=""; for g in video render; do gid=$(getent group $g | cut -d: -f3); [ -n "$gid" ] && GA="$GA --group-add $gid"; done
+          docker run --rm --device /dev/kfd --device /dev/dri $GA -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:latest bash -c '
+            ls -l /dev/kfd /dev/dri; nvidia-smi -L 2>&1 | head -2
+            python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),\"hip\",torch.version.hip)"
+            /opt/unsloth/llama.cpp/llama-server --list-devices 2>&1 | tail -4
+            ls /opt/unsloth/llama.cpp | grep -iE "vulkan|hip|rocm" || echo "no vulkan/hip ggml backend in the bundle"
+            ls /opt/unsloth-studio/whisper.cpp/build/bin/ | head'
+      - name: Teardown
+        if: always()
+        run: |
+          docker ps -aq | xargs -r docker rm -f
+          if [ "${{ contains(matrix.name, 'amd-') }}" = "true" ]; then docker rmi -f unsloth/unsloth:latest unsloth/unsloth:core || true; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suite-${{ matrix.name }}
+          path: ${{ runner.temp }}/suite
+          retention-days: 7
+
+  windows-recon:
+    name: windows ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gh-windows-latest
+            runner: windows-latest
+          - name: amd-strix-halo
+            runner: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: OS, virtualization, WSL, Docker
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version, BuildNumber
+          Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent, TotalPhysicalMemory
+          Get-CimInstance Win32_Processor | Format-List Name, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions
+          foreach ($f in 'Microsoft-Windows-Subsystem-Linux','VirtualMachinePlatform','Microsoft-Hyper-V-All','Containers') {
+            try { Get-WindowsOptionalFeature -Online -FeatureName $f | Format-List FeatureName, State } catch { "feature $f : $_" }
+          }
+          "--- wsl --version"; wsl.exe --version
+          "--- wsl --status"; wsl.exe --status
+          "--- wsl -l -v"; wsl.exe -l -v
+          "--- docker"; Get-Command docker -ErrorAction SilentlyContinue | Format-List Source
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            docker version
+            docker info 2>&1 | Select-String -Pattern 'OSType|Operating System|Server Version|Architecture|Isolation'
+            "--- pull the Linux image on this engine"
+            docker pull unsloth/unsloth:latest 2>&1 | Select-Object -Last 3
+          }
+          exit 0
+      - name: Try a WSL 2 distro
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $d = "$env:RUNNER_TEMP\wslprobe"
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          $tar = "$d\ubuntu.tar.gz"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz' -OutFile $tar
+          (Get-Item $tar).Length
+          wsl.exe --import probe24 "$d\vm" $tar --version 2
+          "import exit $LASTEXITCODE"
+          wsl.exe -l -v
+          wsl.exe -d probe24 -u root -- bash -c "uname -a; cat /proc/version; nproc; free -h; df -h /"
+          "run exit $LASTEXITCODE"
+          wsl.exe --unregister probe24
+          exit 0
