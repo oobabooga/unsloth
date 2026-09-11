@@ -6,149 +6,31 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  # AMD Windows hosts cannot run Linux containers (WSL / VirtualMachinePlatform disabled, reboot
-  # needed), so this pair runs the container on an AMD Linux host and drives it from a Windows
-  # browser on AMD hardware through a Cloudflare quick tunnel. The Studio/Jupyter password never
-  # appears in plain text: the Windows job publishes an RSA public key, the Linux job encrypts the
-  # password to it.
-  amd-tunnel-host:
-    name: amd linux tunnel host
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 90
+  labels:
+    name: OCI labels from docker/metadata-action
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Start the container and the tunnels
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          set -u
-          W="$RUNNER_TEMP/tun"; mkdir -p "$W"; cd "$W"
-          # wait for the Windows job's public key
-          for i in $(seq 1 180); do
-            id=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | python3 -c 'import sys,json; a=[x for x in json.load(sys.stdin)["artifacts"] if x["name"]=="win-pubkey"]; print(a[0]["id"] if a else "")')
-            [ -n "$id" ] && break; sleep 10
-          done
-          [ -n "$id" ] || { echo "no public key from the Windows job"; exit 1; }
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" -o pk.zip "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip"
-          python3 -c 'import zipfile; zipfile.ZipFile("pk.zip").extractall(".")'
-          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
-          for i in 1 2 3 4 5; do docker pull -q unsloth/unsloth:latest && break; sleep 20; done
-          docker run -d --name uqt -p 127.0.0.1:18000:8000 -p 127.0.0.1:18888:8888 -e UNSLOTH_STUDIO_PASSWORD="$PW" -e JUPYTER_PASSWORD="$PW" unsloth/unsloth:latest
-          for i in $(seq 1 200); do docker logs uqt 2>&1 | grep -q 'container ready' && break; sleep 3; done
-          docker logs uqt 2>&1 | grep -E 'container ready|WARN' | head
-          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared
-          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18000 > cf-s.log 2>&1 &
-          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18888 > cf-j.log 2>&1 &
-          SU=""; JU=""
-          for i in $(seq 1 60); do
-            SU=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf-s.log | head -1)
-            JU=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf-j.log | head -1)
-            [ -n "$SU" ] && [ -n "$JU" ] && break; sleep 3
-          done
-          echo "studio tunnel: $SU"; echo "jupyter tunnel: $JU"
-          for i in $(seq 1 60); do
-            a=$(curl -s -o /dev/null -w '%{http_code}' "$SU/api/health" || true); b=$(curl -s -o /dev/null -w '%{http_code}' "$JU/login" || true)
-            [ "$a" = 200 ] && [ "$b" = 200 ] && break; sleep 5
-          done
-          echo "tunnel health: studio=$a jupyter=$b"
-          printf '%s' "$PW" | openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -out pw.enc
-          printf 'STUDIO_URL=%s\nJUPYTER_URL=%s\n' "$SU" "$JU" > urls.txt
-          mkdir -p up && cp pw.enc urls.txt up/
-      - uses: actions/upload-artifact@v4
+      - name: Labels as the publish workflow resolves them today
+        id: before
+        uses: docker/metadata-action@v5
         with:
-          name: amd-tunnel
-          path: ${{ runner.temp }}/tun/up
-      - name: Wait for the Windows client to finish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for i in $(seq 1 240); do
-            n=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin)["artifacts"] if x["name"]=="win-done"))')
-            [ "$n" != 0 ] && { echo "client done"; break; }; sleep 15
-          done
-          docker exec uqt bash -c 'ps -eo pid,args | grep [l]lama-server | cut -c1-200' || true
-          docker logs uqt 2>&1 | grep -iE 'error|traceback' | tail -5 || true
-      - name: Teardown
-        if: always()
-        run: |
-          docker rm -f uqt || true
-          docker rmi -f unsloth/unsloth:latest || true
-
-  amd-windows-client:
-    name: amd windows browser client
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-      - name: Leave the host as found (cancel any pending WSL feature enablement)
-        run: |
-          $ErrorActionPreference = 'Continue'
-          "host: $env:COMPUTERNAME runner: $env:RUNNER_NAME"
-          foreach ($f in 'VirtualMachinePlatform','Microsoft-Windows-Subsystem-Linux') {
-            $st = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
-            "$f state before: $st"
-            if ("$st" -ne 'Disabled') { dism.exe /online /disable-feature /featurename:$f /norestart | Select-Object -Last 2; "$f state after: $((Get-WindowsOptionalFeature -Online -FeatureName $f).State)" }
-          }
-          exit 0
-      - name: Key pair
-        run: |
-          $ossl = 'C:\Program Files\Git\usr\bin\openssl.exe'
-          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\k\pub" | Out-Null
-          & $ossl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$env:RUNNER_TEMP\k\priv.pem"
-          & $ossl pkey -in "$env:RUNNER_TEMP\k\priv.pem" -pubout -out "$env:RUNNER_TEMP\k\pub\pub.pem"
-      - uses: actions/upload-artifact@v4
+          images: docker.io/unsloth/unsloth
+      - name: Labels with the license override this PR adds
+        id: after
+        uses: docker/metadata-action@v5
         with:
-          name: win-pubkey
-          path: ${{ runner.temp }}\k\pub
-      - name: Fetch the tunnel details
-        env:
-          GH_TOKEN: ${{ github.token }}
+          images: docker.io/unsloth/unsloth
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0 AND AGPL-3.0-only
+      - name: Compare
         run: |
-          $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
-          $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
-          $id = $null
-          for ($i = 0; $i -lt 240 -and -not $id; $i++) {
-            $a = (Invoke-RestMethod -Headers $h -Uri $api).artifacts | Where-Object { $_.name -eq 'amd-tunnel' }
-            if ($a) { $id = $a[0].id } else { Start-Sleep 10 }
-          }
-          if (-not $id) { throw "no tunnel artifact" }
-          Invoke-WebRequest -UseBasicParsing -Headers $h -Uri "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$id/zip" -OutFile "$env:RUNNER_TEMP\k\t.zip"
-          Expand-Archive -Force "$env:RUNNER_TEMP\k\t.zip" "$env:RUNNER_TEMP\k\t"
-          $ossl = 'C:\Program Files\Git\usr\bin\openssl.exe'
-          & $ossl pkeyutl -decrypt -inkey "$env:RUNNER_TEMP\k\priv.pem" -pkeyopt rsa_padding_mode:oaep -in "$env:RUNNER_TEMP\k\t\pw.enc" -out "$env:RUNNER_TEMP\k\pw.txt"
-          $pw = (Get-Content -Raw "$env:RUNNER_TEMP\k\pw.txt")
-          Write-Host "::add-mask::$pw"
-          Add-Content -Path $env:GITHUB_ENV -Value "STUDIO_PW=$pw"
-          Add-Content -Path $env:GITHUB_ENV -Value "JUPYTER_PW=$pw"
-          Get-Content "$env:RUNNER_TEMP\k\t\urls.txt" | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
-          Get-Content "$env:RUNNER_TEMP\k\t\urls.txt"
-      - name: Playwright on Windows against the AMD Linux container
-        run: |
-          python -m venv "$env:RUNNER_TEMP\pw"
-          & "$env:RUNNER_TEMP\pw\Scripts\pip.exe" install -q playwright==1.58.0
-          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" -m playwright install chromium
-          $env:STUDIO_NEW_PW = $env:STUDIO_PW; $env:EXPECT_GPU = 'cpu'; $env:OUT = "$env:RUNNER_TEMP\ui"; $env:PW_RESOLVE_VIA_DOH = '1'
-          $env:TURN_TIMEOUT_S = '600'; $env:LOAD_TIMEOUT_S = '1200'
-          & "$env:RUNNER_TEMP\pw\Scripts\python.exe" ci\docker_ui_probe.py
-          "exit $LASTEXITCODE"
-          exit 0
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: r2-amd-windows-ui
-          path: ${{ runner.temp }}\ui
-      - name: Signal done
-        if: always()
-        run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\done" | Out-Null; Set-Content "$env:RUNNER_TEMP\done\done.txt" 'done'
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: win-done
-          path: ${{ runner.temp }}\done
-
+          echo "=== before"; echo '${{ steps.before.outputs.labels }}' | grep -i licenses
+          echo "=== after";  echo '${{ steps.after.outputs.labels }}'  | grep -i licenses
+          # the label reaches the image the same way build-push-action applies it
+          printf 'FROM alpine\n' > Dockerfile.probe
+          docker build -q -t label-probe -f Dockerfile.probe \
+            $(echo '${{ steps.after.outputs.labels }}' | sed 's/^/--label /' | tr '\n' ' ') . >/dev/null
+          docker image inspect label-probe --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}'
