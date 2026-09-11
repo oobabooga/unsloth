@@ -1,0 +1,99 @@
+name: "PR 10734 raw-text EOS cross-platform (throwaway)"
+
+on:
+  push:
+    branches: [dataprep-mid-chunk-eos-studio-ci]
+
+permissions: {}
+
+jobs:
+  unit:
+    name: "unit + AST + routing (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest datasets transformers
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+      - name: AST check (only the two EOS conditions changed)
+        run: python ci_pr10734/ast_check.py
+      - name: Routing check (no Studio, installer, Desktop caller)
+        run: python ci_pr10734/routing_check.py
+      - name: Raw-text tests
+        run: python -m pytest tests/test_raw_text.py tests/test_raw_text_json_loading.py -q -p no:cacheprovider
+      - name: Real gpt2 tokenizer, main vs PR
+        run: python ci_pr10734/compare.py
+
+  mlx:
+    name: "real MLX raw-text training (macos-26)"
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install deps (same ladder as mlx-ci.yml)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            'python-multipart==0.0.27' \
+            'aiofiles==25.1.0' \
+            'sqlalchemy==2.0.49' \
+            'cryptography==48.0.0' \
+            'pyyaml==6.0.3' \
+            'jinja2==3.1.6' \
+            'mammoth==1.12.0' \
+            'unpdf==1.0.0' \
+            'requests==2.33.1' \
+            'typer==0.25.1' \
+            'numpy==2.4.4' \
+            'pytest==9.0.3' \
+            'pytest-asyncio==1.3.0' \
+            'httpx==0.28.1'
+          pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+            'torch==2.10.0'
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+      - name: Hardware and backend
+        run: |
+          uname -a
+          sysctl -n machdep.cpu.brand_string
+          python -c "import unsloth; print('_IS_MLX', unsloth._IS_MLX); assert unsloth._IS_MLX"
+      - name: MLX trainer input_ids, main vs PR, then train the PR
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: python ci_pr10734/mlx_raw_text.py
+      - name: Real unsloth-cli.py raw-text training on MLX
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          set -o pipefail
+          python unsloth-cli.py --model_name unsloth/gemma-3-270m-it --raw_text_file ci_pr10734/doc.txt \
+            --chunk_size 64 --stride 16 --max_seq_length 128 --max_steps 3 \
+            --output_dir ci_pr10734/cli_out --report_to none 2>&1 | tee cli.log
+          grep -q "Data is formatted and ready" cli.log
