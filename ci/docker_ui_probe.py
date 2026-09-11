@@ -282,10 +282,11 @@ def run_jupyter(p):
                 sel.first.click()
                 log("accepted the Select Kernel dialog")
                 break
-            if page.locator(".jp-Notebook .jp-Cell .cm-content").count() and time.time() - t_d > 8:
+            if page.locator(".jp-NotebookPanel:not(.lm-mod-hidden) .jp-Cell .cm-content").count() and time.time() - t_d > 8:
                 break
             page.wait_for_timeout(1000)
-        cell = page.locator(".jp-Notebook .jp-Cell .cm-content").first
+        NB = ".jp-NotebookPanel:not(.lm-mod-hidden)"
+        cell = page.locator(f"{NB} .jp-Cell .cm-content").first
         cell.wait_for(timeout = 120_000)
         # A user waits for the kernel indicator to settle before running anything.
         t_k = time.time()
@@ -313,24 +314,24 @@ def run_jupyter(p):
         for attempt in range(3):
             try:
                 page.wait_for_function(
-                    "() => [...document.querySelectorAll('.jp-OutputArea-output')].some(e => /ARCH|Error/.test(e.innerText))",
+                    "() => [...document.querySelectorAll('.jp-NotebookPanel:not(.lm-mod-hidden) .jp-OutputArea-output')].some(e => /ARCH|Error/.test(e.innerText))",
                     timeout = 120_000)
                 got = True
                 break
             except Exception:
                 kstat = " | ".join(t.strip() for t in page.locator(".jp-StatusBar-Component, .jp-StatusBar-TextItem").all_inner_texts() if t.strip())
-                prompt = page.locator(".jp-InputPrompt").first.inner_text()
+                prompt = page.locator(f"{NB} .jp-InputPrompt").first.inner_text()
                 log(f"no output after attempt {attempt + 1}; prompt={prompt!r} kernel={kstat[:200]!r}")
                 shoot(page, f"jupyter-no-output-{attempt + 1}")
                 RESULTS.setdefault("jupyter_retries", {"ok": True, "detail": ""})["detail"] += f"attempt{attempt + 1}: prompt={prompt!r} kernel={kstat[:120]!r}; "
                 # re-run the first cell the way a user would: click it, Run menu
-                page.locator(".jp-Notebook .jp-Cell").first.click()
+                page.locator(f"{NB} .jp-Cell").first.click()
                 page.locator('li.lm-MenuBar-item:has-text("Run")').first.click()
                 page.wait_for_timeout(300)
                 page.locator('li.lm-Menu-item[data-command="notebook:run-cell"]').first.click()
         if not got:
             raise AssertionError("cell never produced output after 3 attempts")
-        text = page.locator(".jp-OutputArea-output").first.inner_text()
+        text = page.locator(f"{NB} .jp-OutputArea-output").first.inner_text()
         shoot(page, "jupyter-cell-output")
         ok = "TORCH" in text
         if EXPECT_GPU == "cuda":
