@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
       - name: Labels as the publish workflow resolves them today
         id: before
         uses: docker/metadata-action@v5
