@@ -69,6 +69,7 @@
 # git URL through PyPI metadata; the audit comment in security-audit.yml
 # documents this). No new package is introduced solely by MLX CI.
 
+# unslothai/unsloth#10741 mirror: touched only so this workflow runs on the throwaway branch.
 name: MLX CI on Mac M1
 
 on:
