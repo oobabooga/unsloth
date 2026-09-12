@@ -1,0 +1,232 @@
+# Throwaway A/B for the Windows CPU-torch update repair. Not part of the PR.
+#
+# Repro, on a GPU-less windows-latest runner:
+#   1. install.ps1 --local lands torch 2.11.0+cpu, because no NVIDIA GPU answers.
+#   2. A stub nvidia-smi.exe is planted afterwards, so the host now looks like a
+#      machine with two RTX A4000s and a CUDA 12.8 driver -- the state the Discord
+#      reporter's box is in at update time: a CPU wheel in the venv, an NVIDIA GPU
+#      present, no index pin, and a DIRECT `unsloth studio update` (not install.ps1).
+#   3. `unsloth studio update --local` runs.
+#
+# baseline: setup.ps1 calls the venv stale (torch cpu != required cu128), tries to
+#           delete the venv it is running out of, and the update fails.
+# fixed:    setup.ps1 repairs in place and the venv ends on torch +cu128.
+
+name: AB Windows CPU torch repair
+
+on:
+  push:
+    branches: [win-cpu-torch-ab]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, fixed]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      UNSLOTH_SKIP_AUTOSTART: '1'
+      UNSLOTH_SKIP_WHISPER_INSTALL: '1'
+      UNSLOTH_SKIP_XFORMERS: '1'
+      # The fix under test is about torch, not llama.cpp: keep the CPU bundle the
+      # install placed so the stub GPU cannot start a second llama.cpp download.
+      UNSLOTH_LLAMA_CPP_BACKEND: cpu
+      # The commit the fix sits on top of, so the baseline job tests exactly main's code.
+      FIX_BASE: 7c63bc8c4f18c1d0b0eec5e656ae20797893b500
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Revert the fix (baseline only)
+        if: matrix.variant == 'baseline'
+        run: |
+          set -euo pipefail
+          BASE="$FIX_BASE"
+          git merge-base --is-ancestor "$BASE" HEAD
+          git checkout "$BASE" -- studio/setup.ps1 studio/install_python_stack.py
+          if git diff --quiet -- studio/setup.ps1 studio/install_python_stack.py; then
+            echo "::error::the revert changed nothing; the baseline would test the fix"
+            exit 1
+          fi
+          echo "reverted to $BASE:"
+          git diff --stat -- studio/setup.ps1 studio/install_python_stack.py
+
+      - name: Assert which variant is on disk
+        run: |
+          NEEDLE='PyTorch is CPU-only but this host has an NVIDIA GPU'
+          if grep -qF "$NEEDLE" studio/setup.ps1; then HAVE=fixed; else HAVE=baseline; fi
+          echo "variant=${{ matrix.variant }} on disk=$HAVE"
+          [ "$HAVE" = "${{ matrix.variant }}" ]
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch {}
+          }
+
+      - name: Install Unsloth (--local, CPU torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --local; exit $LASTEXITCODE'
+          pwsh -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 |
+            Tee-Object -FilePath logs/install.log | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited with code $LASTEXITCODE" }
+
+      - name: Add the Unsloth shim to PATH
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          test -f "$SHIM_DIR/unsloth.exe"
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: The install must have left a CPU wheel
+        id: before
+        run: |
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          VER=$("$PY" -c "import torch; print(torch.__version__)")
+          echo "torch before update: $VER"
+          echo "torch_before=$VER" >> "$GITHUB_OUTPUT"
+          case "$VER" in
+            *+cpu) ;;
+            *) echo "::error::expected a +cpu wheel from a GPU-less install, got $VER"; exit 1 ;;
+          esac
+          cat ~/.unsloth/studio/unsloth_studio/unsloth_install_manifest.json || true
+
+      # ProcessStartInfo with UseShellExecute=false cannot run a .cmd, and setup.ps1
+      # probes nvidia-smi through it, so the stub has to be a real executable. csc.exe
+      # ships with the .NET Framework on every Windows image.
+      - name: Plant a stub nvidia-smi (2x RTX A4000, CUDA 12.8)
+        shell: pwsh
+        run: |
+          $src = @'
+          using System;
+          class FakeSmi {
+            static int Main(string[] args) {
+              string joined = string.Join(" ", args);
+              if (joined.Contains("compute_cap")) {
+                Console.WriteLine("8.6");
+                Console.WriteLine("8.6");
+              } else if (joined.Contains("-L")) {
+                Console.WriteLine("GPU 0: NVIDIA RTX A4000 (UUID: GPU-aaaaaaaa-0000-0000-0000-000000000000)");
+                Console.WriteLine("GPU 1: NVIDIA RTX A4000 (UUID: GPU-bbbbbbbb-0000-0000-0000-000000000000)");
+              } else if (joined.Contains("--query-gpu")) {
+                Console.WriteLine("NVIDIA RTX A4000");
+                Console.WriteLine("NVIDIA RTX A4000");
+              } else {
+                Console.WriteLine("Fri Sep 11 00:00:00 2026");
+                Console.WriteLine("+-----------------------------------------------------------------------------+");
+                Console.WriteLine("| NVIDIA-SMI 572.16   Driver Version: 572.16   CUDA Version: 12.8            |");
+                Console.WriteLine("+-----------------------------------------------------------------------------+");
+                Console.WriteLine("| GPU  Name                 TCC/WDDM | Bus-Id        Disp.A | Volatile Uncorr. ECC |");
+                Console.WriteLine("|   0  NVIDIA RTX A4000        WDDM  | 00000000:01:00.0 Off |                  N/A |");
+                Console.WriteLine("|   1  NVIDIA RTX A4000        WDDM  | 00000000:02:00.0 Off |                  N/A |");
+                Console.WriteLine("+-----------------------------------------------------------------------------+");
+              }
+              return 0;
+            }
+          }
+          '@
+          $dir = Join-Path $env:USERPROFILE 'fake-nvidia'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $cs = Join-Path $dir 'FakeSmi.cs'
+          Set-Content -LiteralPath $cs -Value $src -Encoding UTF8
+          $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /out:"$dir\nvidia-smi.exe" $cs
+          if ($LASTEXITCODE -ne 0) { throw "csc.exe failed with $LASTEXITCODE" }
+          # System32 is one of the two fixed locations setup.ps1 and
+          # install_python_stack.py fall back to, so detection survives any PATH
+          # rebuild inside setup (Refresh-Environment).
+          Copy-Item "$dir\nvidia-smi.exe" "$env:SystemRoot\System32\nvidia-smi.exe" -Force
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Both probes must see the stub GPU
+        shell: pwsh
+        run: |
+          $out = & nvidia-smi -L
+          Write-Host ($out -join "`n")
+          if (-not ($out -join "`n" -match '(?m)^GPU\s+\d+:')) { throw "PowerShell probe shape is wrong" }
+          # The same question the stack asks, through the same API (UseShellExecute=false).
+          $exe = (Get-Command nvidia-smi -ErrorAction Stop).Source
+          Write-Host "resolved: $exe"
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $exe; $psi.Arguments = '-L'
+          $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+          $p = [System.Diagnostics.Process]::Start($psi)
+          $text = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+          if ($p.ExitCode -ne 0 -or -not ($text -match 'GPU 0:')) { throw "bounded probe cannot run the stub" }
+          $py = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
+          & $py -c "import sys; sys.path.insert(0, r'$env:GITHUB_WORKSPACE\studio'); import install_python_stack as s; print('python sees a usable NVIDIA GPU:', s._has_usable_nvidia_gpu()); print('index:', s._detect_cuda_torch_index_url())"
+
+      - name: unsloth studio update --local
+        id: update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          unsloth studio update --local > logs/update.log 2>&1
+          echo "exit=$?" | tee -a "$GITHUB_OUTPUT"
+          tail -120 logs/update.log
+
+      - name: Verdict
+        run: |
+          set +e
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          AFTER=$("$PY" -c "import torch; print(torch.__version__)" 2>/dev/null)
+          echo "torch after update: ${AFTER:-<unreadable>}"
+          EXIT="${{ steps.update.outputs.exit }}"
+          echo "update exit code: $EXIT"
+          grep -nE "Stale venv detected|Could not remove stale venv|Could not remove the stale environment|Virtual environment not found|PyTorch is CPU-only but this host has an NVIDIA GPU|installing PyTorch with CUDA support|PyTorch flavor mismatch" logs/update.log || true
+          FAIL=0
+          if [ "${{ matrix.variant }}" = "baseline" ]; then
+            grep -q "Stale venv detected (torch cpu != required cu128)" logs/update.log || { echo "::error::baseline did not reach the stale-venv branch"; FAIL=1; }
+            [ "$EXIT" != "0" ] || { echo "::error::baseline update reported success"; FAIL=1; }
+            case "$AFTER" in *+cu*) echo "::error::baseline ended on a CUDA wheel"; FAIL=1 ;; esac
+          else
+            grep -q "PyTorch is CPU-only but this host has an NVIDIA GPU -- reinstalling cu128 in place." logs/update.log || { echo "::error::the in-place repair never fired"; FAIL=1; }
+            grep -q "Stale venv detected" logs/update.log && { echo "::error::the venv was still called stale"; FAIL=1; }
+            [ "$EXIT" = "0" ] || { echo "::error::fixed update failed"; FAIL=1; }
+            case "$AFTER" in *+cu128) ;; *) echo "::error::expected torch +cu128, got ${AFTER:-<unreadable>}"; FAIL=1 ;; esac
+          fi
+          exit $FAIL
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ab-${{ matrix.variant }}-logs
+          path: |
+            logs/install.log
+            logs/update.log
+          retention-days: 7
