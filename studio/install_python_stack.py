@@ -4047,6 +4047,24 @@ def _torch_build_is_gpu() -> bool:
     return (not label) or _is_gpu_torch_label(label)
 
 
+def _recorded_cpu_tag_is_stale() -> bool:
+    """Whether the manifest's CPU record is describing a host that has a GPU now.
+
+    A run whose nvidia-smi probe came back empty installs the CPU wheel and records "cpu"
+    for a machine that does have an NVIDIA GPU, and that record then disarms the invariant
+    permanently: _ensure_expected_torch_flavor enforces a "cpu" expectation only for an
+    explicit pin, so every later update reads "cpu", declines, and leaves the CPU wheel in
+    place. Only an UNPINNED cpu record is set aside, and only while a GPU answers -- a
+    deliberate CPU install names itself through a pin or UNSLOTH_TORCH_BACKEND, both of
+    which are resolved before this and recorded as pinned.
+    """
+    return (
+        _RECORDED_TORCH_TAG == "cpu"
+        and not _RECORDED_TORCH_TAG_PINNED
+        and _has_usable_nvidia_gpu()
+    )
+
+
 def _expected_torch_flavor_tag() -> str:
     """The torch flavor this venv is SUPPOSED to hold, or "" when nothing can say.
 
@@ -4063,7 +4081,8 @@ def _expected_torch_flavor_tag() -> str:
          the user had just chosen.
       3. The flavor the last completed install recorded in the manifest. Read at import
          (_RECORDED_TORCH_TAG), because install_python_stack() drops the manifest before
-         the dependency pass.
+         the dependency pass. An unpinned "cpu" record loses to a GPU that answers now, or
+         it would disarm the invariant for good (_recorded_cpu_tag_is_stale).
       4. A live probe, for a run nothing set up: `python install_python_stack.py` by hand.
          Only an NVIDIA host, or an explicit pin, can expect a GPU build -- otherwise
          return "" rather than invent an expectation from an absent GPU.
@@ -4101,7 +4120,7 @@ def _expected_torch_flavor_tag() -> str:
     # the index this run actually installed from.
     if _explicit_unknown_family_torch_index_url() is not None:
         return ""
-    if _RECORDED_TORCH_TAG:
+    if _RECORDED_TORCH_TAG and not _recorded_cpu_tag_is_stale():
         return _RECORDED_TORCH_TAG
     # An absent NVIDIA GPU with no pin means no CUDA expectation exists to enforce.
     if _explicit_torch_index_url() is None and not _has_usable_nvidia_gpu():

@@ -2225,3 +2225,54 @@ def test_detect_index_url_reads_a_localized_nvidia_smi_banner(monkeypatch, tmp_p
         lambda name, *a, **k: "nvidia-smi" if name == "nvidia-smi" else None,
     )
     assert _detect_cuda_torch_index_url() == f"{stack_mod._PYTORCH_WHL_BASE}/cu130"
+
+
+class TestAnUnpinnedCpuRecordDoesNotOutrankALiveGpu:
+    """A run whose nvidia-smi probe came back empty installs the CPU wheel and records
+    "cpu" for a host that has an NVIDIA GPU. Returning that record as the expectation
+    disarms the invariant for good: a "cpu" expectation is enforced only for an explicit
+    pin, so every later update reads it, declines, and leaves the CPU wheel in place."""
+
+    def test_a_recorded_cpu_flavor_is_repaired_when_nvidia_answers(self):
+        ok, mock_pip = _run_flavor_invariant(
+            expected_env = None,
+            recorded = "cpu",
+            repaired = "2.11.0+cu124",
+            nvidia = True,
+        )
+        assert ok is True
+        assert mock_pip.call_count == 1
+
+    def test_a_recorded_cpu_flavor_stands_on_a_host_with_no_nvidia_gpu(self):
+        ok, mock_pip = _run_flavor_invariant(
+            expected_env = None,
+            recorded = "cpu",
+            nvidia = False,
+        )
+        assert ok is True
+        assert mock_pip.call_count == 0
+
+    def test_a_pinned_cpu_record_is_still_deliberate(self, monkeypatch):
+        monkeypatch.setattr(stack_mod, "_RECORDED_TORCH_TAG_PINNED", True)
+        ok, mock_pip = _run_flavor_invariant(
+            expected_env = None,
+            recorded = "cpu",
+            nvidia = True,
+        )
+        assert ok is True
+        assert mock_pip.call_count == 0
+
+    def test_a_recorded_gpu_flavor_is_untouched(self, monkeypatch):
+        # Only the cpu record is set aside; a cu124 record still names the family to enforce.
+        monkeypatch.setattr(stack_mod, "_RECORDED_TORCH_TAG", "cu124")
+        monkeypatch.setattr(stack_mod, "_RECORDED_TORCH_TAG_PINNED", False)
+        monkeypatch.setattr(stack_mod, "_has_usable_nvidia_gpu", lambda: True)
+        assert stack_mod._recorded_cpu_tag_is_stale() is False
+
+    def test_a_masked_gpu_keeps_the_cpu_record(self, monkeypatch):
+        # _has_usable_nvidia_gpu reports False for CUDA_VISIBLE_DEVICES="" / "-1", so a host
+        # steering work away from its NVIDIA card is not told its CPU wheel is wrong.
+        monkeypatch.setattr(stack_mod, "_RECORDED_TORCH_TAG", "cpu")
+        monkeypatch.setattr(stack_mod, "_RECORDED_TORCH_TAG_PINNED", False)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+        assert stack_mod._recorded_cpu_tag_is_stale() is False

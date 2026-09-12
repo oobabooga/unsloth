@@ -4346,6 +4346,23 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         $script:PinChangedForceReinstall = $true
         $shouldRebuild = $false
     }
+    # A CPU wheel on a host whose NVIDIA GPU IS answering is repaired in place too. The AMD and
+    # Intel arms above already expect "cpu" for this case, because their install arms
+    # force-reinstall over it; the CUDA arm forces nothing unless told, so the expectation stays
+    # cu* and the flag below turns its install into a replacement. Wiping is not an option here
+    # for the reason the pin arm gives: on a direct update the CLI is running out of the venv, so
+    # Remove-Item fails, setup ends at "Could not remove the stale environment", and the host
+    # keeps the CPU wheel until install.ps1 is re-run.
+    # $installedTorchTag is tested first: it is non-null only on the path that assigned
+    # $_pinnedIdx and $expectedTorchTag, which a caller's Set-StrictMode makes fatal to read
+    # otherwise. $script:PreservedInstallerTorchTag stays unset on purpose -- setting it would
+    # select $CuTag "cpu" below and reinstall the wheel this arm exists to replace.
+    if ($shouldRebuild -and $installedTorchTag -eq "cpu" -and -not $InstallerManagedSetup -and
+        -not $_pinnedIdx -and $HasNvidiaSmi -and (Test-CudaFamilyLeaf $expectedTorchTag)) {
+        substep "PyTorch is CPU-only but this host has an NVIDIA GPU -- reinstalling $expectedTorchTag in place." "Cyan"
+        $script:PinChangedForceReinstall = $true
+        $shouldRebuild = $false
+    }
     # A +xpu venv is never wiped by a DIRECT update: on a hybrid NVIDIA+Arc box the promotion
     # above is gated on -not $HasNvidiaSmi, so a later pinless update expects a cu* tag, calls the
     # working Arc venv stale and deletes it -- then exits, because only install.ps1 creates venvs.

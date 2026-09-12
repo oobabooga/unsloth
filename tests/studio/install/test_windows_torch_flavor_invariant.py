@@ -555,7 +555,7 @@ class TestAnUnknownMirrorPinNamesNoFlavor:
         body = _STACK_SRC[_STACK_SRC.index("def _expected_torch_flavor_tag(") :]
         body = body[: body.index("\ndef ", 1)]
         guard = body.index("_explicit_unknown_family_torch_index_url() is not None")
-        record = body.index("if _RECORDED_TORCH_TAG:")
+        record = body.index("if _RECORDED_TORCH_TAG and not _recorded_cpu_tag_is_stale():")
         assert guard < record, (
             "the guard has to run BEFORE the manifest fallback, or the stale tag is "
             "returned as `resolved` and _recordable_torch_flavor_tag's own guard, which "
@@ -607,3 +607,60 @@ class TestPinProvenanceMustBeABoolean:
             encoding = "utf-8",
         )
         assert install_manifest.recorded_torch_flavor_was_pinned(tmp_path) is True
+
+
+class TestSetupPs1RepairsACpuWheelOnAnNvidiaHost:
+    """The AMD and Intel arms of the expectation chain already expect "cpu" for an
+    installed CPU wheel, because their install arms force-reinstall over it. The CUDA arm
+    forces nothing unless told, so that shape would keep the CPU wheel; the expectation
+    stays cu* and the in-place arm raises the force flag instead. Wiping cannot work here:
+    a direct update runs out of the venv it would delete."""
+
+    _NEEDLE = "PyTorch is CPU-only but this host has an NVIDIA GPU"
+
+    def _arm_condition(self) -> str:
+        start = _SETUP_SRC.index(
+            'if ($shouldRebuild -and $installedTorchTag -eq "cpu" -and -not $InstallerManagedSetup'
+        )
+        return _SETUP_SRC[start : _SETUP_SRC.index("{", start)]
+
+    def test_the_arm_sits_ahead_of_the_wipe(self):
+        arm = _line_of(_SETUP_SRC, self._NEEDLE)
+        stale = _line_of(_SETUP_SRC, "Stale venv detected ($reason) -- rebuilding...")
+        wipe = _line_of(_SETUP_SRC, "Remove-Item -LiteralPath $VenvDir -Recurse -Force")
+        assert arm < stale < wipe
+
+    def test_the_arm_cancels_the_rebuild_and_forces_the_reinstall(self):
+        body = _SETUP_SRC[_SETUP_SRC.index(self._NEEDLE) :][:400]
+        assert "$script:PinChangedForceReinstall = $true" in body
+        assert "$shouldRebuild = $false" in body
+        # Setting it would select $CuTag "cpu" in the index selection below and reinstall the
+        # very wheel this arm exists to replace.
+        assert "$script:PreservedInstallerTorchTag" not in body
+
+    def test_the_arm_is_narrow(self):
+        condition = self._arm_condition()
+        for clause in (
+            '$installedTorchTag -eq "cpu"',  # only a CPU wheel
+            "-not $InstallerManagedSetup",  # install.ps1 has its own in-place repair
+            "-not $_pinnedIdx",  # a deliberate index pin still rebuilds
+            "$HasNvidiaSmi",  # only when the GPU is actually answering
+            "Test-CudaFamilyLeaf $expectedTorchTag",  # ... and a CUDA family is expected
+        ):
+            assert clause in condition, f"the arm must be gated on {clause!r}"
+
+    def test_the_installed_tag_is_tested_before_the_variables_it_implies(self):
+        # $_pinnedIdx and $expectedTorchTag are assigned only inside `if (-not $shouldRebuild)`,
+        # which a non-null $installedTorchTag is the proof of; under Set-StrictMode the other
+        # order is a fatal read.
+        condition = self._arm_condition()
+        assert condition.index("$installedTorchTag") < condition.index("$_pinnedIdx")
+        assert condition.index("$installedTorchTag") < condition.index("$expectedTorchTag")
+
+    def test_the_force_flag_reaches_the_cuda_install_arm(self):
+        # The flag is the whole mechanism: uv keeps a +cpu wheel that satisfies `torch`.
+        arm = _SETUP_SRC.index('substep "installing PyTorch with CUDA support ($CuTag)..."')
+        body = _SETUP_SRC[arm:][:600]
+        assert "$cudaForce = @()" in body
+        assert "$script:PinChangedForceReinstall" in body
+        assert "--force-reinstall" in body
