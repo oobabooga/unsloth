@@ -1,0 +1,59 @@
+# Throwaway: run every PowerShell test that reads studio/setup.ps1, on both variants.
+# Source-only, so it costs about a minute. Not part of the PR.
+
+name: PS setup tests AB
+
+on:
+  push:
+    branches: [win-cpu-torch-pstests]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ps:
+    name: ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, fixed]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      FIX_BASE: 7c63bc8c4f18c1d0b0eec5e656ae20797893b500
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Revert the fix (baseline only)
+        if: matrix.variant == 'baseline'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$FIX_BASE" HEAD
+          git checkout "$FIX_BASE" -- studio/setup.ps1 studio/install_python_stack.py
+          if git diff --quiet HEAD -- studio/setup.ps1 studio/install_python_stack.py; then
+            echo "::error::the revert changed nothing"
+            exit 1
+          fi
+
+      - name: Run every PowerShell test that reads setup.ps1
+        shell: pwsh
+        run: |
+          $files = Select-String -Path tests/studio/*.ps1 -Pattern 'setup\.ps1' -List |
+            Select-Object -ExpandProperty Path | Sort-Object
+          Write-Host "$($files.Count) suites"
+          $failed = @()
+          foreach ($f in $files) {
+            Write-Host "=== $(Split-Path $f -Leaf)"
+            pwsh -NoProfile -File $f *>&1 | Select-Object -Last 6 | Out-Host
+            if ($LASTEXITCODE -ne 0) { $failed += "$(Split-Path $f -Leaf) (exit $LASTEXITCODE)" }
+          }
+          if ($failed.Count) {
+            Write-Host "::error::failed: $($failed -join ', ')"
+            exit 1
+          }
+          Write-Host "all $($files.Count) suites passed"
