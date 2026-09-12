@@ -58,12 +58,14 @@ jobs:
           BASE="$FIX_BASE"
           git merge-base --is-ancestor "$BASE" HEAD
           git checkout "$BASE" -- studio/setup.ps1 studio/install_python_stack.py
-          if git diff --quiet -- studio/setup.ps1 studio/install_python_stack.py; then
+          # Against HEAD, not the index: `git checkout <sha> -- <paths>` writes both, so a
+          # plain `git diff` compares the reverted tree with the reverted index and is empty.
+          if git diff --quiet HEAD -- studio/setup.ps1 studio/install_python_stack.py; then
             echo "::error::the revert changed nothing; the baseline would test the fix"
             exit 1
           fi
           echo "reverted to $BASE:"
-          git diff --stat -- studio/setup.ps1 studio/install_python_stack.py
+          git diff --stat HEAD -- studio/setup.ps1 studio/install_python_stack.py
 
       - name: Assert which variant is on disk
         run: |
