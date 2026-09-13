@@ -47,6 +47,27 @@ def _amd_smi() -> dict:
         return {"present": True, "error": repr(e)}
 
 
+def _video_controllers() -> dict:
+    """What Windows itself says is in the box.
+
+    Needed because the two signals the rest of this probe reads are BOTH absent
+    on exactly the host that matters: there is no ROCm torch on Windows, and
+    amd-smi is present but answers `Error LoadLibraryA` there. Without a third
+    source the run cannot corroborate that it is talking about an APU, which is
+    the gate the criteria refuses to pass on faith.
+
+    Reuses the toolkit's own mapping rather than a second copy of it.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+        import capability  # type: ignore[import-not-found]
+
+        names = capability.windows_video_controllers()
+        return {"names": names, "archs": capability.archs_from_windows_video_controllers(names)}
+    except Exception as e:  # noqa: BLE001
+        return {"error": repr(e)}
+
+
 def _torch_facts() -> dict:
     out: dict = {"importable": False}
     try:
@@ -88,6 +109,7 @@ def main() -> int:
         "assumed_device_ids": ASSUMED_DEVICE_IDS,
     }
     obs["amd_smi"] = _amd_smi()
+    obs["video_controllers"] = _video_controllers()
     obs["torch"] = _torch_facts()
 
     backend_root = Path(args.checkout) / args.subdir

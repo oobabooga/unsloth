@@ -28,14 +28,21 @@ NEEDS = ["gpu", "windows"]
 def _is_strix_halo(o: dict) -> bool:
     """Corroborate the host from anything that names the part.
 
-    amd-smi is the authority here and is present on both halves of the pool;
-    torch's device name only exists where a ROCm torch does, which on Windows is
-    exactly nowhere, so it cannot be required.
+    Three sources, because on the host that matters two of them are silent:
+    torch's device name exists only where a ROCm torch does, which on Windows is
+    nowhere, and amd-smi is installed on the Windows boxes but answers
+    `Error LoadLibraryA`. The Windows video controller name is what is left, and
+    it is read through the toolkit's own mapping rather than a second copy.
     """
     blob = str(o.get("amd_smi", {}).get("stdout_head", "")).lower()
     names = " ".join(o.get("torch", {}).get("device_names", []) or []).lower()
-    markers = ("gfx1151", "strix", "8060s", "radeon 8060s")
-    return any(m in blob or m in names for m in markers)
+    vc = o.get("video_controllers") or {}
+    controllers = " ".join(vc.get("names") or []).lower()
+    archs = [a.lower() for a in (vc.get("archs") or [])]
+    markers = ("gfx1151", "strix", "8060s", "8050s")
+    if "gfx1151" in archs:
+        return True
+    return any(m in blob or m in names or m in controllers for m in markers)
 
 
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
@@ -64,10 +71,12 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out.append((
         "the host is a unified-memory AMD APU",
         _is_strix_halo(head) or _is_strix_halo(base),
-        "amd-smi or torch names a gfx1151 / Strix Halo / Radeon 8060S part"
+        "amd-smi, torch or the Windows video controller names a gfx1151 / Strix "
+        "Halo / Radeon 8060S part"
         if (_is_strix_halo(head) or _is_strix_halo(base))
-        else "could not corroborate the part from amd-smi or torch; a verdict about "
-             "APU handling on a host that may not be an APU says nothing",
+        else "could not corroborate the part from amd-smi, torch or the video "
+             "controller; a verdict about APU handling on a host that may not be "
+             "an APU says nothing",
     ))
 
     # The whole point is what happens when the classifier CANNOT answer. If it
@@ -95,6 +104,7 @@ def table(obs: dict) -> str:
         ("platform", "platform"),
         ("torch importable", "torch_importable"),
         ("torch is ROCm", "torch_is_rocm"),
+        ("Windows video controller", "video_controller_names"),
         ("`_rocm_unified_memory_gpu_ids()`", "rocm_unified_memory_gpu_ids"),
         ("`_rocm_classification_answered()`", "rocm_classification_answered"),
         ("`_amd_apu_wants_unified_memory([0])`", "amd_apu_wants_unified_memory"),
@@ -110,6 +120,8 @@ def table(obs: dict) -> str:
                 v = (o.get("torch") or {}).get("importable")
             elif key == "torch_is_rocm":
                 v = bool((o.get("torch") or {}).get("hip_version"))
+            elif key == "video_controller_names":
+                v = ", ".join((o.get("video_controllers") or {}).get("names") or []) or "none"
             else:
                 v = o.get(key, "absent")
             cells.append(f"`{v}`")
