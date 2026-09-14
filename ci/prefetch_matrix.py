@@ -48,7 +48,7 @@ cli_deps = ["typer", "pyyaml", "pydantic", "click"]
 
 if MODE == "torch":
     # Windows: PyPI's own torch wheel is the CPU build, and the cpu backend index lacks the xformers unsloth needs.
-    extra = [] if platform.system() in ("Darwin", "Windows") else ["--torch-backend", "cpu"]
+    extra = []  # PyPI's default torch: the cpu backend index lacks the xformers unsloth needs.
     # Under Studio's constraints, as a real install is: otherwise the core plan carries constraint
     # downgrades and the not-behind guard (correctly) withholds the pins.
     constraints = REPO / "studio" / "backend" / "requirements" / "single-env" / "constraints.txt"
