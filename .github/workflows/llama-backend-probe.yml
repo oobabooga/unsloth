@@ -101,7 +101,10 @@ jobs:
           Write-Host "machine: $env:COMPUTERNAME"
           Write-Host "RUNNER_OS='$env:RUNNER_OS'"   # observed EMPTY here; echo before branching
           & amd-smi.exe list 2>&1 | Select-Object -First 20
+          Write-Host "amd-smi exit code: $LASTEXITCODE"
           Write-Host "HIP_PATH='$env:HIP_PATH'  ROCM_PATH='$env:ROCM_PATH'"
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Resolve the llama.cpp bundle at each ref
         run: |
@@ -136,6 +139,7 @@ jobs:
             }
           }
           Pop-Location
+          $global:LASTEXITCODE = 0
           exit $rc
 
   linux-control:
