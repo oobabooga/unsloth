@@ -4,6 +4,7 @@ offline swap of the installer's core step, and control without pins.
 usage: prefetch_matrix.py <repo checkout> <mode: torch|no-torch|auto> [--mlx]
 """
 import json, os, platform, shutil, subprocess, sys, tempfile, textwrap, time
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
 REPO = Path(sys.argv[1]).resolve()
@@ -46,7 +47,8 @@ run(["uv", "venv", "--python", "3.12", VENV])
 cli_deps = ["typer", "pyyaml", "pydantic", "click"]
 
 if MODE == "torch":
-    extra = [] if platform.system() == "Darwin" else ["--torch-backend", "cpu"]
+    # Windows: PyPI's own torch wheel is the CPU build, and the cpu backend index lacks the xformers unsloth needs.
+    extra = [] if platform.system() in ("Darwin", "Windows") else ["--torch-backend", "cpu"]
     # Under Studio's constraints, as a real install is: otherwise the core plan carries constraint
     # downgrades and the not-behind guard (correctly) withholds the pins.
     constraints = REPO / "studio" / "backend" / "requirements" / "single-env" / "constraints.txt"
