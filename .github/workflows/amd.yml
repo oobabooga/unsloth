@@ -1,0 +1,61 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci-10902]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | head -15; free -h
+          lspci -nn | grep -iE 'vga|display' || true
+          ls -l /dev/kfd /dev/dri 2>/dev/null || true
+          cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | grep gfx_target_version || true
+      - name: Per-arch ROCm torch install, base vs head, with and without an only-binary policy
+        run: |
+          set -u
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{tmp,cache/uv,home}
+          export TMPDIR="$WORK_ROOT/tmp" UV_CACHE_DIR="$WORK_ROOT/cache/uv"
+          python3 -m pip install -q --user uv 2>/dev/null || python3 -m pip install -q --break-system-packages --user uv
+          export PATH="$HOME/.local/bin:$PATH"; uv --version
+          for spec in base:5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d head:90faa93706643f214cd3f3e5f6f500982c8dad31; do
+            n=${spec%%:*}; sha=${spec#*:}
+            git init -q "$WORK_ROOT/$n" && git -C "$WORK_ROOT/$n" fetch -q --depth 1 https://github.com/unslothai/unsloth "$sha" && git -C "$WORK_ROOT/$n" checkout -q FETCH_HEAD
+          done
+          cat > "$WORK_ROOT/drive.py" <<'PY'
+          import os, sys, io, contextlib
+          sys.path.insert(0, os.path.join(sys.argv[1], "studio"))
+          import install_python_stack as ips
+          ips.USE_UV = True
+          idx = "https://repo.amd.com/rocm/whl/gfx1151/"
+          spec = ("torch>=2.11.0,<2.12.0", "torchvision>=0.26.0,<0.27.0", "torchaudio>=2.11.0,<2.12.0")
+          cmd, env = ips._uv_cmd_and_env(ips._build_uv_cmd(("--force-reinstall", *spec, "--index-url", idx))) if hasattr(ips, "_uv_cmd_and_env") else (ips._build_uv_cmd(("--force-reinstall", *spec, "--index-url", idx)), None)
+          print("uv argv tail:", cmd[-4:])
+          buf = io.StringIO()
+          try:
+              with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                  ips.pip_install("ROCm torch (AMD per-gfx index, gfx1151)", "--force-reinstall", "--no-cache-dir", *spec, "--index-url", idx, constrain=False)
+              print("RESULT installed")
+          except SystemExit as e:
+              print("RESULT exit", e.code)
+          print("\n".join(l for l in buf.getvalue().splitlines() if any(k in l for k in ("rocm", "wheels", "ERROR", "error", "Because", "Built", "Building")))[-1500:])
+          PY
+          probe='import torch; print("torch", torch.__version__, "hip", torch.version.hip, "gpu", torch.cuda.is_available()); a=torch.randn(2048,2048,device="cuda"); print("matmul ok", bool((a@a).abs().mean()>0))'
+          run_case() { # label tree policy
+            label=$1 tree=$2 policy=$3
+            rm -rf "$WORK_ROOT/v"; uv venv -q -p 3.12 "$WORK_ROOT/v"; uv pip install -q --python "$WORK_ROOT/v/bin/python" pip==26.2.1
+            [ "$policy" = on ] && printf '[global]\nonly-binary = :all:\n' > "$WORK_ROOT/v/pip.conf"
+            echo "===== $label ($tree, policy=$policy)"
+            env -i PATH="$PATH" HOME="$WORK_ROOT/home" TMPDIR="$TMPDIR" UV_CACHE_DIR="$UV_CACHE_DIR" "$WORK_ROOT/v/bin/python" "$WORK_ROOT/drive.py" "$WORK_ROOT/$tree"
+            env -i PATH="$PATH" HOME="$WORK_ROOT/home" "$WORK_ROOT/v/bin/python" -c "$probe" 2>&1 | grep -v Warning | tail -3 || true
+          }
+          run_case A base on
+          run_case B head on
+          run_case C head off
