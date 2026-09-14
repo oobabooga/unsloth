@@ -72,13 +72,27 @@ def main() -> int:
             obs["setup_error"] = f"venv: {(r.stderr or r.stdout)[-400:]}"
             raise SystemExit(0)
 
-        # The state install.ps1 hands over: ROCm torch from the AMD index, and an
-        # accelerate 1.15.0 that was resolved with no constraints file in sight.
+        # The state install.ps1 hands over, and every part of it matters:
+        #
+        #   ROCm torch      installed FIRST, from the AMD index, so the later steps see a
+        #                   satisfying torch and leave it alone. install.ps1 does the same.
+        #   unsloth + zoo   install.ps1 installs both before the handoff, and #10053 added
+        #                   a gate that refuses when a managed distribution is missing.
+        #                   Without them the installer runs its core-payload repair, which
+        #                   reinstalls unsloth WITH deps and drags a PyPI torch over the
+        #                   ROCm build. Measured: that alone replaced 2.9.1+rocm7.13.0 with
+        #                   2.14.0+cpu and then failed the Windows torch-flavor invariant,
+        #                   in the base state as much as the head. A seed that provokes
+        #                   that is measuring the seed, not the change.
+        #   accelerate      pinned to 1.15.0 explicitly. The install above lands it anyway
+        #                   today, but "whatever PyPI serves" is not a fixed starting state.
         for step, cmd in (
             ("pip", [str(py), "-m", "pip", "install", "-q", "--upgrade", "pip"]),
             ("torch", [str(py), "-m", "pip", "install", "-q", "--index-url", ROCM_INDEX,
                        "--extra-index-url", "https://pypi.org/simple", ROCM_TORCH]),
-            ("accelerate", [str(py), "-m", "pip", "install", "-q", "accelerate==1.15.0"]),
+            ("core", [str(py), "-m", "pip", "install", "-q", "unsloth", "unsloth-zoo"]),
+            ("accelerate", [str(py), "-m", "pip", "install", "-q", "--no-deps",
+                            "accelerate==1.15.0"]),
         ):
             r = _run(cmd)
             if r.returncode != 0:
@@ -102,7 +116,8 @@ def main() -> int:
                    UNSLOTH_VERBOSE = "1")
         r = _run([str(py), str(stack)], env = env)
         obs["installer_rc"] = r.returncode
-        obs["installer_tail"] = (r.stdout or r.stderr or "")[-1500:]
+        obs["installer_tail"] = (r.stdout or "")[-4000:]
+        obs["installer_stderr"] = (r.stderr or "")[-1500:]
         obs["final_accelerate"] = _version(py, "accelerate")
         obs["final_torch"] = _version(py, "torch")
     except SystemExit:
