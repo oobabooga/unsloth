@@ -1,0 +1,29 @@
+name: AMD DevLab Windows CI
+
+on:
+  push:
+    branches: [amd-devlab-win-10902]
+
+permissions: {}
+
+jobs:
+  amd-windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - name: Hardware
+        shell: cmd
+        run: |
+          ver
+          wmic path win32_videocontroller get name,driverversion
+          python --version
+          uv --version
+          git --version
+          exit /b 0
+      - name: Fetch the orchestrator
+        shell: powershell
+        run: |
+          Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/amd-devlab-win-10902/orchestrate.py" -OutFile "$env:RUNNER_TEMP\orchestrate.py"
+      - name: Base vs head through _ensure_rocm_torch on Windows AMD
+        shell: cmd
+        run: python "%RUNNER_TEMP%\orchestrate.py"
