@@ -60,6 +60,40 @@ jobs:
           python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
 
+      - name: Provide missing build deps without root
+        run: |
+          set -u
+          # No root here. The PR-era install.sh treats the libcurl dev headers as
+          # REQUIRED and escalates for them; the preamble's privilege shim refuses,
+          # so the job dies over a package nothing in this run uses -- the installer
+          # downloads a PREBUILT llama.cpp and never compiles it. Only some machines
+          # in the pool carry curl-config, which is why the two jobs of the first run
+          # disagreed: suites installed fine on s01-d06 and gpu died on s02-d01.
+          # Unpack the REAL package into the work root rather than stubbing
+          # curl-config: a stub would also silence a genuinely broken toolchain.
+          for tool in curl-config cmake gcc git; do
+            echo "$tool: $(command -v "$tool" || echo MISSING)"
+          done
+          if command -v curl-config > /dev/null 2>&1; then
+            echo "curl-config already present; nothing to do"
+            exit 0
+          fi
+          mkdir -p "$AMD_CI_WORK/deb" "$AMD_CI_WORK/root"
+          cd "$AMD_CI_WORK/deb"
+          if ! apt-get download libcurl4-openssl-dev; then
+            echo "apt-get download failed; install.sh will fail on the same dep as before"
+            exit 0
+          fi
+          for f in "$AMD_CI_WORK/deb"/*.deb; do
+            if [ -e "$f" ]; then dpkg -x "$f" "$AMD_CI_WORK/root"; fi
+          done
+          if [ -x "$AMD_CI_WORK/root/usr/bin/curl-config" ]; then
+            echo "$AMD_CI_WORK/root/usr/bin" >> "$GITHUB_PATH"
+            "$AMD_CI_WORK/root/usr/bin/curl-config" --version
+          else
+            echo "unpacked but no curl-config binary; install.sh will fail as before"
+          fi
+
       - name: Environment
         timeout-minutes: 60
         run: |
@@ -141,6 +175,40 @@ jobs:
           [ "$MERGED" = "1" ] && ARGS="--merged"
           python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Provide missing build deps without root
+        run: |
+          set -u
+          # No root here. The PR-era install.sh treats the libcurl dev headers as
+          # REQUIRED and escalates for them; the preamble's privilege shim refuses,
+          # so the job dies over a package nothing in this run uses -- the installer
+          # downloads a PREBUILT llama.cpp and never compiles it. Only some machines
+          # in the pool carry curl-config, which is why the two jobs of the first run
+          # disagreed: suites installed fine on s01-d06 and gpu died on s02-d01.
+          # Unpack the REAL package into the work root rather than stubbing
+          # curl-config: a stub would also silence a genuinely broken toolchain.
+          for tool in curl-config cmake gcc git; do
+            echo "$tool: $(command -v "$tool" || echo MISSING)"
+          done
+          if command -v curl-config > /dev/null 2>&1; then
+            echo "curl-config already present; nothing to do"
+            exit 0
+          fi
+          mkdir -p "$AMD_CI_WORK/deb" "$AMD_CI_WORK/root"
+          cd "$AMD_CI_WORK/deb"
+          if ! apt-get download libcurl4-openssl-dev; then
+            echo "apt-get download failed; install.sh will fail on the same dep as before"
+            exit 0
+          fi
+          for f in "$AMD_CI_WORK/deb"/*.deb; do
+            if [ -e "$f" ]; then dpkg -x "$f" "$AMD_CI_WORK/root"; fi
+          done
+          if [ -x "$AMD_CI_WORK/root/usr/bin/curl-config" ]; then
+            echo "$AMD_CI_WORK/root/usr/bin" >> "$GITHUB_PATH"
+            "$AMD_CI_WORK/root/usr/bin/curl-config" --version
+          else
+            echo "unpacked but no curl-config binary; install.sh will fail as before"
+          fi
 
       - name: Environment and real gate
         timeout-minutes: 60
