@@ -1,0 +1,150 @@
+name: "AMD CI: validate PR 9672"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-pr9672-install]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "9672"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  suites:
+    name: "PR 9672 suites, base vs head"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    # 120 was the template default and is not enough here: the Environment step is
+    # allowed 60 on its own, and the differential now runs two states with a
+    # 1800 s ceiling each, so the worst case the ceilings permit exceeds 120.
+    # A job timeout cancels with no artifact, which is the one failure mode that
+    # yields nothing at all to read.
+    timeout-minutes: 180
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr9672-suites"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Heavy, and only needed if the suites import torch. Delete otherwise.
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      - name: Test dependencies present
+        run: |
+          set +e
+          # tests/conftest.py and tests/studio/install/* import these at MODULE
+          # scope, so a missing one is a collection ERROR, not a failure: the suite
+          # then reports "0 failed" for tests whose bodies never ran. The last
+          # Windows run lost 23 of 25 tests exactly that way.
+          #
+          # Installed only when absent, never upgraded: this is the Studio venv
+          # `install.sh --local` just built, and re-resolving a pin in it would
+          # measure a different stack from the one the change ships.
+          for m in typer packaging huggingface_hub structlog yaml pytest_asyncio; do
+            "$AMD_CI_PY" -c "import $m" 2>/dev/null && { echo "have  $m"; continue; }
+            echo "adding $m"
+            case "$m" in
+              yaml) "$AMD_CI_PY" -m pip install -q pyyaml ;;
+              pytest_asyncio) "$AMD_CI_PY" -m pip install -q pytest-asyncio ;;
+              *) "$AMD_CI_PY" -m pip install -q "$m" ;;
+            esac
+          done
+          # Collection is the cheap half of the run and the half that errors, so
+          # do it at BOTH states before spending 2x6 minutes running bodies. This
+          # is a diagnostic: it must not decide anything, so it never exits non-zero.
+          for S in base head; do
+            echo "== collect $S"
+            ( cd "$AMD_CI_WORK/states/$S" && \
+              "$AMD_CI_PY" -m pytest -q --collect-only tests/studio/install 2>&1 | tail -6 )
+          done
+          exit 0
+
+      - name: Differential
+        run: |
+          set +e
+          # --subdir . because THIS PR touches install.sh, studio/setup.sh and
+          # studio/install_python_stack.py, none of which the studio/backend suite
+          # covers. The probe's default subdir is studio/backend, and the previous
+          # attempt ran `pytest tests/` from there: 900 s was not enough, both
+          # states hit TimeoutExpired ~9% in with failed=[] and errors=[], and the
+          # verdict was INCONCLUSIVE because there was no comparison to make.
+          # tests/studio/install is the selection that covers these files, exists
+          # at BOTH states, and is ~4090 tests in about six minutes.
+          #
+          # --timeout 1800 as well, on top of the probe default now being 1800:
+          # stated here so the ceiling is visible beside the selection it bounds.
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression_pr9672.py \
+            --out-dir "$AMD_CI_WORK/out/suites" \
+            --python "${AMD_CI_PY:-python3}" \
+            -- --tests tests/studio/install --subdir . --timeout 1800
+          cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9672-suites
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
