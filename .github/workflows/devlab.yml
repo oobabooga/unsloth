@@ -1,0 +1,79 @@
+name: AMD DevLab Windows codex tty A/B
+
+on:
+  push:
+    branches: [amd-devlab-10699-codex-tty]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      AB_MODEL: unsloth/gemma-3-270m-it-GGUF:Q8_0
+      CODEX_VERSION: 0.153.4
+    steps:
+      - name: Environment
+        shell: powershell
+        run: |
+          [Environment]::OSVersion.VersionString
+          $PSVersionTable.PSVersion.ToString()
+          python --version
+          node --version
+          Write-Host "RUNNER_TEMP=$env:RUNNER_TEMP"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_HOME=$env:RUNNER_TEMP\studio-home`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_SKIP_AUTOSTART=1`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK=1`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "HF_HOME=$env:RUNNER_TEMP\hf`n")
+          [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\npm-global`n")
+          exit 0
+
+      - name: Fetch harness, pywinpty, codex, pwsh
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git clone --depth 1 -b amd-devlab-10699-codex-tty https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\harness"
+          python -m venv "$env:RUNNER_TEMP\abvenv"
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" -m pip install -q pywinpty==3.0.5
+          npm install -g --prefix "$env:RUNNER_TEMP\npm-global" "@openai/codex@$env:CODEX_VERSION"
+          Get-ChildItem "$env:RUNNER_TEMP\npm-global" | Format-Table Name | Out-String | Write-Host
+          try {
+            $rel = Invoke-RestMethod -UseBasicParsing https://api.github.com/repos/PowerShell/PowerShell/releases/latest
+            $asset = $rel.assets | Where-Object { $_.name -like 'PowerShell-*-win-x64.zip' } | Select-Object -First 1
+            Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\pwsh.zip"
+            Expand-Archive "$env:RUNNER_TEMP\pwsh.zip" "$env:RUNNER_TEMP\pwsh"
+            [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\pwsh`n")
+            Write-Host "pwsh $($rel.tag_name)"
+          } catch { Write-Host "pwsh download failed: $_" }
+          exit 0
+
+      - name: Phase A (codex alone)
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_a.py"
+          exit 0
+
+      - name: Install Unsloth (released wheel, --no-torch)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/unslothai/unsloth/main/install.ps1 -OutFile "$env:RUNNER_TEMP\install.ps1"
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\install.ps1" --no-torch *>&1 | Out-File -Encoding utf8 "$env:RUNNER_TEMP\install.log"
+          Write-Host "install exit $LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s"
+          Get-Content "$env:RUNNER_TEMP\install.log" -Tail 60
+          exit 0
+
+      - name: Phase B (unsloth start codex)
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py"
+          exit 0
+
+      - name: Summary
+        if: always()
+        shell: powershell
+        run: |
+          Get-Content "$env:RUNNER_TEMP\ab\summary.jsonl" -ErrorAction SilentlyContinue
+          exit 0
