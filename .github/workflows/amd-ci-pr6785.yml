@@ -65,12 +65,14 @@ jobs:
           set -u
           # No root here. The PR-era install.sh treats the libcurl dev headers as
           # REQUIRED and escalates for them; the preamble's privilege shim refuses,
-          # so the job dies over a package nothing in this run uses -- the installer
-          # downloads a PREBUILT llama.cpp and never compiles it. Only some machines
-          # in the pool carry curl-config, which is why the two jobs of the first run
-          # disagreed: suites installed fine on s01-d06 and gpu died on s02-d01.
+          # so the job dies over a package nothing in this run uses. MOST of the pool
+          # lacks curl-config -- the first run's suites leg passing on s01-d06 was
+          # luck, not a property of that machine.
           # Unpack the REAL package into the work root rather than stubbing
           # curl-config: a stub would also silence a genuinely broken toolchain.
+          # The runner's apt index is STALE against the proxy mirror at
+          # 10.255.100.254:8000, which 404s the exact pinned version, so try every
+          # version apt knows and then whatever the pool directory actually holds.
           for tool in curl-config cmake gcc git; do
             echo "$tool: $(command -v "$tool" || echo MISSING)"
           done
@@ -78,15 +80,44 @@ jobs:
             echo "curl-config already present; nothing to do"
             exit 0
           fi
+          PKG=libcurl4-openssl-dev
+          POOL=http://archive.ubuntu.com/ubuntu/pool/main/c/curl/
           mkdir -p "$AMD_CI_WORK/deb" "$AMD_CI_WORK/root"
           cd "$AMD_CI_WORK/deb"
-          if ! apt-get download libcurl4-openssl-dev; then
-            echo "apt-get download failed; install.sh will fail on the same dep as before"
+
+          echo "--- versions apt believes exist"
+          apt-cache policy "$PKG" || echo "apt-cache policy unavailable"
+          VERSIONS=$(apt-cache madison "$PKG" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}')
+          echo "candidates: ${VERSIONS:-none}"
+          for v in $VERSIONS; do
+            echo "--- trying $PKG=$v"
+            if apt-get download "$PKG=$v"; then break; fi
+          done
+
+          if ! ls "$AMD_CI_WORK/deb"/*.deb > /dev/null 2>&1; then
+            echo "--- apt could not fetch any indexed version; reading the pool directory"
+            curl -fsS "$POOL" -o "$AMD_CI_WORK/deb/index.html" || echo "pool listing unreachable"
+            if [ -f "$AMD_CI_WORK/deb/index.html" ]; then
+              FILES=$(grep -oE 'libcurl4-openssl-dev_[0-9A-Za-z.~+:-]+_amd64\.deb' "$AMD_CI_WORK/deb/index.html" | sort -u)
+              echo "pool offers: ${FILES:-none}"
+              for f in $FILES; do
+                echo "--- trying $POOL$f"
+                if curl -fsS "$POOL$f" -o "$AMD_CI_WORK/deb/$f"; then break; fi
+              done
+            fi
+          fi
+
+          FOUND=0
+          for f in "$AMD_CI_WORK/deb"/*.deb; do
+            if [ -e "$f" ]; then
+              echo "--- unpacking $f"
+              dpkg -x "$f" "$AMD_CI_WORK/root" && FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "could not obtain $PKG; install.sh will fail on the same dep as before"
             exit 0
           fi
-          for f in "$AMD_CI_WORK/deb"/*.deb; do
-            if [ -e "$f" ]; then dpkg -x "$f" "$AMD_CI_WORK/root"; fi
-          done
           if [ -x "$AMD_CI_WORK/root/usr/bin/curl-config" ]; then
             echo "$AMD_CI_WORK/root/usr/bin" >> "$GITHUB_PATH"
             "$AMD_CI_WORK/root/usr/bin/curl-config" --version
@@ -181,12 +212,14 @@ jobs:
           set -u
           # No root here. The PR-era install.sh treats the libcurl dev headers as
           # REQUIRED and escalates for them; the preamble's privilege shim refuses,
-          # so the job dies over a package nothing in this run uses -- the installer
-          # downloads a PREBUILT llama.cpp and never compiles it. Only some machines
-          # in the pool carry curl-config, which is why the two jobs of the first run
-          # disagreed: suites installed fine on s01-d06 and gpu died on s02-d01.
+          # so the job dies over a package nothing in this run uses. MOST of the pool
+          # lacks curl-config -- the first run's suites leg passing on s01-d06 was
+          # luck, not a property of that machine.
           # Unpack the REAL package into the work root rather than stubbing
           # curl-config: a stub would also silence a genuinely broken toolchain.
+          # The runner's apt index is STALE against the proxy mirror at
+          # 10.255.100.254:8000, which 404s the exact pinned version, so try every
+          # version apt knows and then whatever the pool directory actually holds.
           for tool in curl-config cmake gcc git; do
             echo "$tool: $(command -v "$tool" || echo MISSING)"
           done
@@ -194,15 +227,44 @@ jobs:
             echo "curl-config already present; nothing to do"
             exit 0
           fi
+          PKG=libcurl4-openssl-dev
+          POOL=http://archive.ubuntu.com/ubuntu/pool/main/c/curl/
           mkdir -p "$AMD_CI_WORK/deb" "$AMD_CI_WORK/root"
           cd "$AMD_CI_WORK/deb"
-          if ! apt-get download libcurl4-openssl-dev; then
-            echo "apt-get download failed; install.sh will fail on the same dep as before"
+
+          echo "--- versions apt believes exist"
+          apt-cache policy "$PKG" || echo "apt-cache policy unavailable"
+          VERSIONS=$(apt-cache madison "$PKG" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}')
+          echo "candidates: ${VERSIONS:-none}"
+          for v in $VERSIONS; do
+            echo "--- trying $PKG=$v"
+            if apt-get download "$PKG=$v"; then break; fi
+          done
+
+          if ! ls "$AMD_CI_WORK/deb"/*.deb > /dev/null 2>&1; then
+            echo "--- apt could not fetch any indexed version; reading the pool directory"
+            curl -fsS "$POOL" -o "$AMD_CI_WORK/deb/index.html" || echo "pool listing unreachable"
+            if [ -f "$AMD_CI_WORK/deb/index.html" ]; then
+              FILES=$(grep -oE 'libcurl4-openssl-dev_[0-9A-Za-z.~+:-]+_amd64\.deb' "$AMD_CI_WORK/deb/index.html" | sort -u)
+              echo "pool offers: ${FILES:-none}"
+              for f in $FILES; do
+                echo "--- trying $POOL$f"
+                if curl -fsS "$POOL$f" -o "$AMD_CI_WORK/deb/$f"; then break; fi
+              done
+            fi
+          fi
+
+          FOUND=0
+          for f in "$AMD_CI_WORK/deb"/*.deb; do
+            if [ -e "$f" ]; then
+              echo "--- unpacking $f"
+              dpkg -x "$f" "$AMD_CI_WORK/root" && FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "could not obtain $PKG; install.sh will fail on the same dep as before"
             exit 0
           fi
-          for f in "$AMD_CI_WORK/deb"/*.deb; do
-            if [ -e "$f" ]; then dpkg -x "$f" "$AMD_CI_WORK/root"; fi
-          done
           if [ -x "$AMD_CI_WORK/root/usr/bin/curl-config" ]; then
             echo "$AMD_CI_WORK/root/usr/bin" >> "$GITHUB_PATH"
             "$AMD_CI_WORK/root/usr/bin/curl-config" --version
