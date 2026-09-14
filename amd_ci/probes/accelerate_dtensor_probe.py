@@ -52,8 +52,17 @@ print(json.dumps(out))
 """
 
 
+# A Windows console is cp1252, and pip prints accelerate's summary, which carries a
+# hugging-face emoji. pip then dies inside its own progress writer with UnicodeEncodeError
+# and exits 2, which reads as "the resolution failed" rather than "the probe could not
+# read it". Force UTF-8 on both ends: the child's streams, and this side's decode.
+_UTF8_ENV = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+
 def _run(cmd, **kw):
-    return subprocess.run(cmd, capture_output = True, text = True, timeout = 1800, **kw)
+    env = dict(kw.pop("env", None) or os.environ, **_UTF8_ENV)
+    return subprocess.run(cmd, capture_output = True, timeout = 1800, env = env,
+                          encoding = "utf-8", errors = "replace", **kw)
 
 
 def describe_torch() -> dict:
@@ -83,14 +92,19 @@ def describe_torch() -> dict:
         return {"torch_probe_error": (r.stderr or r.stdout or "no output")[-400:]}
 
 
-def resolve_accelerate(constraints: Path) -> tuple[str | None, str | None]:
-    """What version does pip pick for `accelerate` under this checkout's constraints?"""
+def resolve_accelerate(constraints: Path, report_path: Path) -> tuple[str | None, str | None]:
+    """What version does pip pick for `accelerate` under this checkout's constraints?
+
+    The report goes to a FILE, never stdout. pip is free to print warnings there and a
+    single version-check notice would make the JSON unparseable (toolkit rule E004).
+    """
     r = _run([sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed",
-              "-q", "--report", "-", "-c", str(constraints), "accelerate"])
+              "-q", "--disable-pip-version-check", "--no-input", "--no-color",
+              "--report", str(report_path), "-c", str(constraints), "accelerate"])
     if r.returncode != 0:
         return None, f"pip exit {r.returncode}: {(r.stderr or r.stdout)[-400:]}"
     try:
-        report = json.loads(r.stdout)
+        report = json.loads(report_path.read_text(encoding = "utf-8"))
     except Exception as e:  # noqa: BLE001
         return None, f"unparseable report: {type(e).__name__}: {e}"
     for item in report.get("install", []):
@@ -117,7 +131,7 @@ def main() -> int:
         obs["constraint_line"] = next(
             (ln.strip() for ln in cfile.read_text(encoding = "utf-8").splitlines()
              if ln.strip().startswith("accelerate")), "")
-        version, err = resolve_accelerate(cfile)
+        version, err = resolve_accelerate(cfile, args.out.parent / f"pipreport_{args.state}.json")
         obs["selected_accelerate"] = version
         if err:
             obs["resolve_error"] = err
@@ -129,6 +143,7 @@ def main() -> int:
         # A private --target per state, so neither reading can see the other's install.
         target = Path(os.environ.get("RUNNER_TEMP", ".")) / f"acc_{args.state}_{version}"
         inst = _run([sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+                     "--disable-pip-version-check", "--no-input", "--no-color",
                      "--target", str(target), f"accelerate=={version}"])
         if inst.returncode != 0:
             obs["install_error"] = f"pip exit {inst.returncode}: {(inst.stderr or inst.stdout)[-400:]}"
