@@ -1,0 +1,170 @@
+name: "AMD CI: PR 9672 environment evidence"
+
+# NOT a verdict run. There is no differential and no announce step here, on
+# purpose: this workflow OBSERVES the environment the two verdict runs
+# (amd-ci-pr9672-install, amd-ci-pr9672-unmasked) executed in, and a green tick
+# on it means only that the observations were collected.
+#
+# It exists because those two runs came back byte-identical -- 3510 passed /
+# 4 failed / 525 skipped at the base and 3561 / 6 / 525 at the head, in BOTH --
+# even though one masked the GPU and the other did not. Two readings that agree
+# perfectly across a variable are either evidence the variable does not matter or
+# evidence the variable never changed, and neither run recorded enough to tell
+# those apart. A CPU-only torch in the Studio venv would make a HIP mask a no-op,
+# and then the "control" varied nothing.
+#
+# The two jobs differ ONLY in the two env lines.
+
+on:
+  push:
+    branches: [amd-ci-pr9672-diag]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "9672"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  MERGED: "0"
+
+jobs:
+
+  masked:
+    name: "PR 9672 evidence (GPU masked)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr9672-diag-masked"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          set +e
+          bash install.sh --local 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      - name: Evidence
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out"
+          echo "== what the Studio venv's torch IS, and what it SEES"
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/torch_visibility_probe.py" \
+            --state head --checkout "$AMD_CI_WORK/states/head" \
+            --out "$AMD_CI_WORK/out/visibility.json"
+          echo
+          echo "== the two failures in full, at the head"
+          ( cd "$AMD_CI_WORK/states/head" && "$AMD_CI_PY" -m pytest -vv --tb=long \
+              "tests/studio/install/test_rocm_support.py::TestGfx1102Rocm64Floor" \
+              2>&1 | tail -140 )
+          echo
+          echo "== why 525 tests skip here when 6 skip on an x86 dev box"
+          ( cd "$AMD_CI_WORK/states/head" && "$AMD_CI_PY" -m pytest -q -rs \
+              tests/studio/install 2>&1 | grep "^SKIPPED" \
+              | sed -E 's|^SKIPPED \[[0-9]+\] [^ ]+: ||' | sort | uniq -c | sort -rn | head -25 )
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9672-diag-masked
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  unmasked:
+    name: "PR 9672 evidence (GPU visible)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    # No HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES. That is the whole delta from
+    # the job above. Nothing here allocates: the suite is unit tests over
+    # install.sh with subprocess.run mocked, and the torch probe only reads
+    # properties.
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr9672-diag-unmasked"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          set +e
+          bash install.sh --local 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      - name: Evidence
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out"
+          echo "== what the Studio venv's torch IS, and what it SEES"
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/torch_visibility_probe.py" \
+            --state head --checkout "$AMD_CI_WORK/states/head" \
+            --out "$AMD_CI_WORK/out/visibility.json"
+          echo
+          echo "== the two failures in full, at the head"
+          ( cd "$AMD_CI_WORK/states/head" && "$AMD_CI_PY" -m pytest -vv --tb=long \
+              "tests/studio/install/test_rocm_support.py::TestGfx1102Rocm64Floor" \
+              2>&1 | tail -140 )
+          echo
+          echo "== why 525 tests skip here when 6 skip on an x86 dev box"
+          ( cd "$AMD_CI_WORK/states/head" && "$AMD_CI_PY" -m pytest -q -rs \
+              tests/studio/install 2>&1 | grep "^SKIPPED" \
+              | sed -E 's|^SKIPPED \[[0-9]+\] [^ ]+: ||' | sort | uniq -c | sort -rn | head -25 )
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9672-diag-unmasked
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
