@@ -34,13 +34,18 @@ trees = {"main": tree(BASE_SHA, "base"), "head": tree(HEAD_SHA, "head")}
 
 # Local index: an sdist-only package, a wheel package, and the build backend.
 index = WORK / "index" / "simple"
-for name, kind in (("probe_sdist", "--sdist"), ("probe_wheel", "--wheel")):
+for name, kind, deps in (
+    ("probe_sdist", "--sdist", ""),
+    ("probe_wheel", "--wheel", ""),
+    ("rocm", "--sdist", ""),  # AMD publishes rocm as an sdist alone
+    ("probe_torch", "--wheel", 'dependencies = ["rocm==1.0"]\n'),
+):
     src = WORK / "src" / name
     (src / name).mkdir(parents=True)
     (src / name / "__init__.py").write_text("")
     (src / "pyproject.toml").write_text(
         '[build-system]\nrequires = ["setuptools>=61"]\nbuild-backend = "setuptools.build_meta"\n'
-        f'[project]\nname = "{name.replace("_", "-")}"\nversion = "1.0"\n'
+        f'[project]\nname = "{name.replace("_", "-")}"\nversion = "1.0"\n{deps}'
     )
     out = index / name.replace("_", "-")
     sh([UV, "build", "-q", kind, "-o", str(out)], cwd=src)
@@ -61,6 +66,7 @@ SCENARIOS = {
     "S1_file_hardened": ("[global]\nonly-binary = :all:\nrequire-hashes = true\nno-index = true\n", {}),
     "S2_env_hardened": ("", {"PIP_ONLY_BINARY": ":all:", "PIP_REQUIRE_HASHES": "1"}),
     "S3_sections": ("[global]\nonly-binary = :all:\n[install]\nonly-binary = :none:\n    probe-wheel\n", {}),
+    "S5_names_rocm": ("[global]\nonly-binary = :all:,rocm\n", {}),
     "S4_hashes_nonpinned": ("[global]\nrequire-hashes = true\n", {"PIP_INDEX_URL": URL, "UV_INDEX_URL": URL}),
 }
 
@@ -104,10 +110,13 @@ def run(script, scen, pipv, *args, keep=None):
 
 # Expected (res, installed) per (scenario, fn, pinned, pkg) for main and head.
 def expect(scen, fn, pinned, pkg):
-    ok = (True, [pkg])
+    ok = (True, sorted([pkg, "rocm"]) if pkg == "probe-torch" else [pkg])
     refused = ("exit" if fn == "full" else False, [])
-    if scen in ("S1_file_hardened", "S2_env_hardened") and pinned == "1" and pkg == "probe-sdist":
+    hardened = scen in ("S1_file_hardened", "S2_env_hardened", "S5_names_rocm") and pinned == "1"
+    if hardened and pkg == "probe-sdist":
         return ok, refused
+    if pkg == "probe-torch" and scen == "S5_names_rocm":
+        return ok, refused  # the operator named rocm, so no exemption
     return ok, ok
 
 
@@ -119,6 +128,10 @@ for pipv in PIP_VERSIONS:
         for leg in ("uv", "pip"):
             for pkg in ("probe-sdist", "probe-wheel"):
                 cases.append((pipv, scen, leg, "try", "1", pkg))
+    for scen in ("S0_clean", "S1_file_hardened", "S2_env_hardened", "S5_names_rocm"):
+        for leg in ("uv", "pip"):
+            cases.append((pipv, scen, leg, "try", "1", "probe-torch"))
+        cases.append((pipv, scen, "uv", "full", "1", "probe-torch"))
     for leg in ("uv", "pip"):
         cases.append((pipv, "S4_hashes_nonpinned", leg, "try", "0", "probe-sdist"))
     cases.append((pipv, "S1_file_hardened", "uv", "full", "1", "probe-sdist"))

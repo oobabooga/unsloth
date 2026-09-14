@@ -6,6 +6,8 @@ P = "https://download.pytorch.org/whl/cu128"
 shapes = {
  "uv_pinned": ips._build_uv_cmd(("torch", "--index-url", P)),
  "uv_plain": ips._build_uv_cmd(("torch",)),
+ "uv_pinned_amd": ips._build_uv_cmd(("--force-reinstall", "torch>=2.11.0,<2.12.0", "--index-url", "https://repo.amd.com/rocm/whl/gfx1151/")),
+ "pip_pinned_amd": ips._build_pip_cmd(("--force-reinstall", "torch>=2.11.0,<2.12.0", "--index-url", "https://repo.amd.com/rocm/whl/gfx1151/")),
  "pip_pinned_install": ips._build_pip_cmd(("torch", "--index-url", P)),
  "pip_plain_install": ips._build_pip_cmd(("torch",)),
  "pip_pinned_download": [py, "-m", "pip", "download", "--no-deps", "--only-binary=:all:", "-d", "t", "x", "--index-url", P],
@@ -17,7 +19,9 @@ shapes = {
 }
 out = {}
 for k, cmd in shapes.items():
-    if hasattr(ips, "_uv_cmd_and_env") and cmd[:1] == ["uv"]:
+    if hasattr(ips, "_pinned_cmd_and_env"):
+        cmd, env = ips._pinned_cmd_and_env(cmd)
+    elif hasattr(ips, "_uv_cmd_and_env") and cmd[:1] == ["uv"]:
         cmd, env = ips._uv_cmd_and_env(cmd)
     else:
         env = ips._install_env_for_cmd(cmd)

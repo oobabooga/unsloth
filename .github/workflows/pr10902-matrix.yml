@@ -9,7 +9,7 @@ permissions:
 
 env:
   BASE_SHA: 5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d
-  HEAD_SHA: 90faa93706643f214cd3f3e5f6f500982c8dad31
+  HEAD_SHA: 9eabf23cf071a27eee3ee0bc98cb202c58e19f5a
 
 jobs:
   native:
@@ -18,7 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { os: ubuntu-latest, py: "3.12", pips: "26.2.1,23.3.2" }
+          - { os: ubuntu-24.04-arm, py: "3.13", pips: "26.2.1" }
+          - { os: windows-latest, py: "3.12", pips: "26.2.1,23.3.2" }
+          - { os: windows-11-arm, py: "3.12", pips: "26.2.1" }
           - { os: macos-15, py: "3.13", pips: "26.2.1,23.3.2" }
+          - { os: macos-15-intel, py: "3.12", pips: "26.2.1" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -42,3 +47,24 @@ jobs:
           python -m pip install -q pytest
           cd "$RUNNER_TEMP/pr10902/head"
           python -m pytest -q -p no:cacheprovider tests/python/test_install_python_stack.py tests/python/test_cross_platform_parity.py tests/studio/test_xpu_triton_swap.py 2>&1 | tail -15
+
+  wsl:
+    name: "WSL Ubuntu-24.04 pip 26.2.1"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: python3 python3-venv python3-pip git curl ca-certificates
+      - name: Base vs head differential inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -e
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uname -a; grep -i microsoft /proc/version
+          uv venv -p 3.12 "$HOME/hv" && . "$HOME/hv/bin/activate" && uv pip install pip
+          export RUNNER_TEMP="$HOME/rt"; mkdir -p "$RUNNER_TEMP"
+          python harness/run.py 5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d 9eabf23cf071a27eee3ee0bc98cb202c58e19f5a 26.2.1

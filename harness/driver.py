@@ -5,7 +5,7 @@ import install_python_stack as ips
 ips.USE_UV = leg == "uv"
 ips.VERBOSE = True
 URL = os.environ["DRIVER_URL"]
-args = [pkg, "--no-cache-dir", "--no-deps"]
+args = [pkg, "--no-cache-dir"] + ([] if pkg == "probe-torch" else ["--no-deps"])
 if pinned == "1":
     args += ["--index-url", URL]
 buf = io.StringIO()
@@ -18,5 +18,5 @@ with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
     except SystemExit as e:
         res = "exit"
 importlib.invalidate_caches()
-inst = sorted(d.metadata["Name"] for d in md.distributions() if (d.metadata["Name"] or "").startswith("probe"))
+inst = sorted(d.metadata["Name"] for d in md.distributions() if (d.metadata["Name"] or "").startswith(("probe", "rocm")))
 print("RESULT " + json.dumps({"res": res, "installed": inst, "tail": buf.getvalue().strip().splitlines()[-2:]}))
