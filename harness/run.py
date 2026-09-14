@@ -67,6 +67,7 @@ SCENARIOS = {
     "S2_env_hardened": ("", {"PIP_ONLY_BINARY": ":all:", "PIP_REQUIRE_HASHES": "1"}),
     "S3_sections": ("[global]\nonly-binary = :all:\n[install]\nonly-binary = :none:\n    probe-wheel\n", {}),
     "S5_names_rocm": ("[global]\nonly-binary = :all:,rocm\n", {}),
+    "S6_file_and_env": ("[global]\nonly-binary = probe-sdist\n", {"PIP_ONLY_BINARY": "probe-wheel"}),
     "S4_hashes_nonpinned": ("[global]\nrequire-hashes = true\n", {"PIP_INDEX_URL": URL, "UV_INDEX_URL": URL}),
 }
 
@@ -112,7 +113,7 @@ def run(script, scen, pipv, *args, keep=None):
 def expect(scen, fn, pinned, pkg):
     ok = (True, sorted([pkg, "rocm"]) if pkg == "probe-torch" else [pkg])
     refused = ("exit" if fn == "full" else False, [])
-    hardened = scen in ("S1_file_hardened", "S2_env_hardened", "S5_names_rocm") and pinned == "1"
+    hardened = scen in ("S1_file_hardened", "S2_env_hardened", "S5_names_rocm", "S6_file_and_env") and pinned == "1"
     if hardened and pkg == "probe-sdist":
         return ok, refused
     if pkg == "probe-torch" and scen == "S5_names_rocm":
@@ -128,6 +129,8 @@ for pipv in PIP_VERSIONS:
         for leg in ("uv", "pip"):
             for pkg in ("probe-sdist", "probe-wheel"):
                 cases.append((pipv, scen, leg, "try", "1", pkg))
+    for leg in ("uv", "pip"):
+        cases.append((pipv, "S6_file_and_env", leg, "try", "1", "probe-sdist"))
     for scen in ("S0_clean", "S1_file_hardened", "S2_env_hardened", "S5_names_rocm"):
         for leg in ("uv", "pip"):
             cases.append((pipv, scen, leg, "try", "1", "probe-torch"))
