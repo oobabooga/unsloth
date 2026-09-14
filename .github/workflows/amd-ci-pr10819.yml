@@ -138,6 +138,13 @@ jobs:
           & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ `
             --extra-index-url https://pypi.org/simple "torch==2.9.1+rocm7.13.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # accelerate's own imports, minus torch, which must stay the ROCm build above.
+          # The probe installs accelerate itself with --no-deps into a per-state --target,
+          # so these have to be present in the venv or every state dies on `import numpy`
+          # before reaching prepare_model, and the run is VOID for the wrong reason.
+          & $py -m pip install -q numpy packaging psutil pyyaml huggingface_hub safetensors
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -c "import torch,numpy;print('torch',torch.__version__,'numpy',numpy.__version__)"
 
       - name: Re-gate on the ROCm torch
         run: |
