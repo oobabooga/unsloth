@@ -90,13 +90,19 @@ def main() -> int:
             ("pip", [str(py), "-m", "pip", "install", "-q", "--upgrade", "pip"]),
             ("torch", [str(py), "-m", "pip", "install", "-q", "--index-url", ROCM_INDEX,
                        "--extra-index-url", "https://pypi.org/simple", ROCM_TORCH]),
-            ("core", [str(py), "-m", "pip", "install", "-q", "unsloth", "unsloth-zoo"]),
+            ("uv", [str(py), "-m", "pip", "install", "-q", "uv"]),
+            # uv, not pip, and for the reason install.ps1 uses uv here too. pip's
+            # backtracking resolver cannot reconcile unsloth's requirements against a
+            # local-version torch (2.9.1+rocm7.13.0 matches no PyPI candidate) and dies
+            # with RecursionError out of resolvelib. Measured on this runner.
+            ("core", [str(py), "-m", "uv", "pip", "install", "-q", "--python", str(py),
+                      "unsloth", "unsloth-zoo"]),
             ("accelerate", [str(py), "-m", "pip", "install", "-q", "--no-deps",
                             "accelerate==1.15.0"]),
         ):
             r = _run(cmd)
             if r.returncode != 0:
-                obs["setup_error"] = f"{step}: {(r.stderr or r.stdout)[-500:]}"
+                obs["setup_error"] = f"{step}: {(r.stderr or r.stdout)[-600:]}"
                 raise SystemExit(0)
 
         obs["seeded_torch"] = _version(py, "torch")
