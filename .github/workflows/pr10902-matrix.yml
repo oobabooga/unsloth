@@ -9,7 +9,7 @@ permissions:
 
 env:
   BASE_SHA: 5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d
-  HEAD_SHA: 5c9a6d45108681bac5e7283f0b75f45ca50542a1
+  HEAD_SHA: 1a0417e4d9d85f69d1596bf80588667303765b57
 
 jobs:
   native:
@@ -67,4 +67,4 @@ jobs:
           uname -a; grep -i microsoft /proc/version
           uv venv -p 3.12 "$HOME/hv" && . "$HOME/hv/bin/activate" && uv pip install pip
           export RUNNER_TEMP="$HOME/rt"; mkdir -p "$RUNNER_TEMP"
-          python harness/run.py 5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d 5c9a6d45108681bac5e7283f0b75f45ca50542a1 26.2.1
+          python harness/run.py 5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d 1a0417e4d9d85f69d1596bf80588667303765b57 26.2.1

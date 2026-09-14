@@ -56,6 +56,7 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+shutil.copytree(index, WORK / "index" / "gfx1151")  # the leaf every AMD per-arch index has
 handler = functools.partial(Quiet, directory=str(WORK / "index"))
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -80,6 +81,7 @@ def clean_env(home, extra):
     env["UV_CACHE_DIR"] = str(home / "uvc")
     env["PIP_NO_CACHE_DIR"] = "1"
     env["DRIVER_URL"] = URL
+    env["DRIVER_AMD_URL"] = URL.rsplit("/", 1)[0] + "/gfx1151"
     env.update(extra)
     return env
 
@@ -111,6 +113,11 @@ def run(script, scen, pipv, *args, keep=None):
 
 # Expected (res, installed) per (scenario, fn, pinned, pkg) for main and head.
 def expect(scen, fn, pinned, pkg):
+    if pkg == "probe-torch@simple":
+        ok = (True, ["probe-torch", "rocm"])
+        refused = ("exit" if fn == "full" else False, [])
+        hardened = scen in ("S1_file_hardened", "S2_env_hardened") and pinned == "1"
+        return ok, (refused if hardened else ok)  # no exemption off an AMD per-arch index
     ok = (True, sorted([pkg, "rocm"]) if pkg == "probe-torch" else [pkg])
     refused = ("exit" if fn == "full" else False, [])
     hardened = scen in ("S1_file_hardened", "S2_env_hardened", "S5_names_rocm", "S6_file_and_env") and pinned == "1"
@@ -135,6 +142,9 @@ for pipv in PIP_VERSIONS:
         for leg in ("uv", "pip"):
             cases.append((pipv, scen, leg, "try", "1", "probe-torch"))
         cases.append((pipv, scen, "uv", "full", "1", "probe-torch"))
+    for scen in ("S0_clean", "S1_file_hardened"):
+        for leg in ("uv", "pip"):
+            cases.append((pipv, scen, leg, "try", "1", "probe-torch@simple"))
     for leg in ("uv", "pip"):
         cases.append((pipv, "S4_hashes_nonpinned", leg, "try", "0", "probe-sdist"))
     cases.append((pipv, "S1_file_hardened", "uv", "full", "1", "probe-sdist"))

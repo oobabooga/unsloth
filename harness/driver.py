@@ -4,7 +4,8 @@ sys.path.insert(0, os.path.join(tree, "studio"))
 import install_python_stack as ips
 ips.USE_UV = leg == "uv"
 ips.VERBOSE = True
-URL = os.environ["DRIVER_URL"]
+URL = os.environ["DRIVER_AMD_URL"] if pkg == "probe-torch" else os.environ["DRIVER_URL"]
+pkg = pkg.split("@")[0]
 args = [pkg, "--no-cache-dir"] + ([] if pkg == "probe-torch" else ["--no-deps"])
 if pinned == "1":
     args += ["--index-url", URL]
