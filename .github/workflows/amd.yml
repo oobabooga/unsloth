@@ -25,7 +25,7 @@ jobs:
           export TMPDIR="$WORK_ROOT/tmp" UV_CACHE_DIR="$WORK_ROOT/cache/uv"
           python3 -m pip install -q --user uv 2>/dev/null || python3 -m pip install -q --break-system-packages --user uv
           export PATH="$HOME/.local/bin:$PATH"; uv --version
-          for spec in base:5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d head:90faa93706643f214cd3f3e5f6f500982c8dad31; do
+          for spec in base:5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d head:9eabf23cf071a27eee3ee0bc98cb202c58e19f5a; do
             n=${spec%%:*}; sha=${spec#*:}
             git init -q "$WORK_ROOT/$n" && git -C "$WORK_ROOT/$n" fetch -q --depth 1 https://github.com/unslothai/unsloth "$sha" && git -C "$WORK_ROOT/$n" checkout -q FETCH_HEAD
           done
@@ -52,6 +52,7 @@ jobs:
             label=$1 tree=$2 policy=$3
             rm -rf "$WORK_ROOT/v"; uv venv -q -p 3.12 "$WORK_ROOT/v"; uv pip install -q --python "$WORK_ROOT/v/bin/python" pip==26.2.1
             [ "$policy" = on ] && printf '[global]\nonly-binary = :all:\n' > "$WORK_ROOT/v/pip.conf"
+            [ "$policy" = rocm ] && printf '[global]\nonly-binary = :all:,rocm\n' > "$WORK_ROOT/v/pip.conf"
             echo "===== $label ($tree, policy=$policy)"
             env -i PATH="$PATH" HOME="$WORK_ROOT/home" TMPDIR="$TMPDIR" UV_CACHE_DIR="$UV_CACHE_DIR" "$WORK_ROOT/v/bin/python" "$WORK_ROOT/drive.py" "$WORK_ROOT/$tree"
             env -i PATH="$PATH" HOME="$WORK_ROOT/home" "$WORK_ROOT/v/bin/python" -c "$probe" 2>&1 | grep -v Warning | tail -3 || true
@@ -59,3 +60,4 @@ jobs:
           run_case A base on
           run_case B head on
           run_case C head off
+          run_case D head rocm
