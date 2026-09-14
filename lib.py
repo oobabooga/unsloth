@@ -7,6 +7,9 @@ import sys
 import threading
 import time
 
+for _s in (sys.stdout, sys.stderr):
+    _s.reconfigure(encoding="utf-8", errors="replace")
+
 T = os.environ["RUNNER_TEMP"]
 AB = os.path.join(T, "ab")
 SUMMARY = os.path.join(AB, "summary.jsonl")
