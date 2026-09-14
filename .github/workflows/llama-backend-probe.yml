@@ -1,0 +1,151 @@
+name: "llama.cpp backend probe on gfx1151"
+
+# CAPABILITY probe, not a differential. There is no base/head comparison here:
+# the question is simply whether Unsloth's installer selects a GPU llama.cpp
+# bundle on real Strix Halo hardware, on both halves of the pool. A host that
+# resolves `cpu` is the regression under investigation (unslothai/unsloth#9255,
+# #5941, #7485).
+#
+# The probe only READS the GPU (rocminfo / amd-smi); it allocates no VRAM, so it
+# does not take the shared measurement group.
+
+on:
+  push:
+    branches: [amd-ci-llama-backend-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  REFS: "v0.1.804-beta v0.1.808-beta main"
+
+jobs:
+
+  linux:
+    name: "gfx1151 Linux: which llama.cpp bundle is selected"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: source amd_ci/lib/preamble.sh "llama-backend-probe-linux"
+
+      - name: Report hardware
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+          echo "--- rocminfo gfx targets ---"
+          (rocminfo || /opt/rocm/bin/rocminfo) 2>/dev/null | grep -Eo 'gfx[0-9a-z]+' | sort -u
+          echo "--- amd-smi ---"
+          amd-smi list 2>/dev/null | head -20
+          echo "--- KFD gfx_target_version ---"
+          cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | grep -i gfx_target_version | sort -u
+
+      - name: Gate on real AMD hardware (FAILS, never skips)
+        run: |
+          set -euo pipefail
+          if ! (rocminfo || /opt/rocm/bin/rocminfo) 2>/dev/null | grep -q 'gfx1151'; then
+            echo "::error::gfx1151 not visible on this runner; refusing to report a result"
+            exit 1
+          fi
+
+      - name: Resolve the llama.cpp bundle at each ref
+        run: |
+          set -euo pipefail
+          git clone --quiet "$UPSTREAM" "$AMD_CI_WORK/unsloth"
+          cd "$AMD_CI_WORK/unsloth"
+          git fetch --quiet --tags
+          rc=0
+          for ref in $REFS; do
+            echo "=================== $ref ==================="
+            git checkout --quiet "$ref"
+            out="$AMD_CI_WORK/resolve-$ref.txt"
+            set +e
+            python3 studio/install_llama_prebuilt.py --resolve-prebuilt \
+              --install-dir "$AMD_CI_WORK/llamaprobe" --output-format json > "$out" 2>&1
+            set -e
+            grep -E 'selection:|falling back|no published|rocm|vulkan' "$out" | tail -15 || true
+            json="$(grep '^{' "$out" | tail -1 || true)"
+            echo "RESULT $ref: $json"
+            case "$json" in
+              *'"backend": "rocm"'*|*'"backend": "vulkan"'*) echo "  -> GPU backend OK" ;;
+              *) echo "::error::$ref resolved a NON-GPU backend on gfx1151: $json"; rc=1 ;;
+            esac
+          done
+          exit $rc
+
+  windows:
+    name: "gfx1151 Windows: which llama.cpp bundle is selected"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: . .\amd_ci\lib\preamble.ps1 "llama-backend-probe-windows"
+
+      - name: Report hardware
+        run: |
+          Write-Host "machine: $env:COMPUTERNAME"
+          Write-Host "RUNNER_OS='$env:RUNNER_OS'"   # observed EMPTY here; echo before branching
+          & amd-smi.exe list 2>&1 | Select-Object -First 20
+          Write-Host "HIP_PATH='$env:HIP_PATH'  ROCM_PATH='$env:ROCM_PATH'"
+
+      - name: Resolve the llama.cpp bundle at each ref
+        run: |
+          $ErrorActionPreference = "Continue"
+          $work = Join-Path $env:RUNNER_TEMP "llama-probe"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $repo = Join-Path $work "unsloth"
+          & git clone --quiet $env:UPSTREAM $repo
+          Push-Location $repo
+          & git fetch --quiet --tags
+          $py = "C:\Program Files\Python312\python.exe"
+          $rc = 0
+          foreach ($ref in $env:REFS.Split(" ")) {
+            Write-Host "=================== $ref ==================="
+            & git checkout --quiet $ref
+            $out = Join-Path $work "resolve-$ref.txt"
+            & $py studio/install_llama_prebuilt.py --resolve-prebuilt `
+                --install-dir (Join-Path $work "llamaprobe") --output-format json `
+                *> $out
+            # Name the encoding on every text read: the default here is cp1252.
+            $text = Get-Content -Path $out -Encoding utf8 -Raw
+            $lines = $text -split "`n"
+            $lines | Select-String -Pattern 'selection:|falling back|no published|rocm|vulkan' |
+              Select-Object -Last 15 | ForEach-Object { Write-Host $_ }
+            $json = ($lines | Where-Object { $_.StartsWith("{") } | Select-Object -Last 1)
+            Write-Host "RESULT $ref : $json"
+            if ($json -match '"backend": "(rocm|vulkan)"') {
+              Write-Host "  -> GPU backend OK"
+            } else {
+              Write-Host "::error::$ref resolved a NON-GPU backend on gfx1151 Windows: $json"
+              $rc = 1
+            }
+          }
+          Pop-Location
+          exit $rc
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this runs and the windows job stays queued, the Windows selector matched nothing."
+          echo "If BOTH stay queued, the pool is busy."
