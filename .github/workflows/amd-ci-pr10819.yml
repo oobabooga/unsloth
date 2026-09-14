@@ -116,19 +116,11 @@ jobs:
             --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Drop the merge state for THIS probe only. Each state here is a complete
-          # Studio dependency install, so a third one buys a repeat of the head answer at
-          # the price of another half hour. merge is already covered against the same
+          # Drop the merge state for THIS probe only: each state below is a complete
+          # Studio dependency install, and merge is already covered against the same
           # hardware by the constraints-resolution run on branch amd-ci-pr10819.
-          & $env:AMD_CI_PY -c @"
-import json, sys
-p = sys.argv[1]
-d = json.load(open(p, encoding='utf-8'))
-for k in ('commits', 'paths'):
-    d[k] = {s: v for s, v in d[k].items() if s in ('base', 'head')}
-json.dump(d, open(p, 'w', encoding='utf-8'), indent=2)
-print('states kept:', list(d['paths']))
-"@ "$env:AMD_CI_WORK\out\states.json"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\keep_base_and_head.py" `
+            "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test environment
