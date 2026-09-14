@@ -22,4 +22,9 @@ for k, cmd in shapes.items():
     else:
         env = ips._install_env_for_cmd(cmd)
     out[k] = {"argv": cmd, "env": env}
-print("RESULT " + json.dumps(out, sort_keys=True))
+root = os.path.abspath(sys.argv[1])
+text = json.dumps(out, sort_keys=True)
+# The module points UV_OVERRIDE (macOS arm64) at files inside its own checkout; compare trees, not their paths.
+for spelling in {root, root.replace("\\", "/"), json.dumps(root)[1:-1]}:
+    text = text.replace(spelling, "<TREE>")
+print("RESULT " + text)
