@@ -239,6 +239,35 @@ def _files_naming_gate(checkout: Path) -> list:
     return [found, scripts]
 
 
+def _torch_facts(python: str) -> dict:
+    """Whether the test environment has a torch at all, and whether it is a ROCm one.
+
+    The kernel-selection half of this PR is only reachable through a ROCm torch. Recording
+    the absence explicitly is what lets the verdict say UNMEASURABLE instead of silently
+    reporting the half it could measure as the whole answer.
+    """
+    code = ("import json, sys\n"
+            "out = {}\n"
+            "try:\n"
+            "    import torch\n"
+            "    out['version'] = torch.__version__\n"
+            "    out['hip'] = getattr(torch.version, 'hip', None)\n"
+            "    out['cuda'] = getattr(torch.version, 'cuda', None)\n"
+            "    out['cuda_available'] = bool(torch.cuda.is_available())\n"
+            "except Exception as e:\n"
+            "    out['error'] = '%s: %s' % (type(e).__name__, e)\n"
+            "sys.stdout.write(json.dumps(out))\n")
+    try:
+        r = subprocess.run([python, "-c", code], capture_output = True, text = True,
+                           encoding = "utf-8", errors = "replace", timeout = 600)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+    try:
+        return json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "stdout_tail": (r.stdout or "")[-300:]}
+
+
 def _run_pr_own_tests(python: str, checkout: Path, out_dir: Path, timeout: int) -> dict:
     """The PR's own guard tests, executed on Windows.
 
@@ -355,6 +384,7 @@ def main() -> int:
             runs[key] = record
     obs["runs"] = runs
 
+    obs["torch_in_test_environment"] = _torch_facts(args.python)
     obs["pr_own_tests"] = _run_pr_own_tests(args.python, checkout, work, args.timeout)
 
     args.out.write_text(json.dumps(obs, indent = 2, sort_keys = True), encoding = "utf-8")

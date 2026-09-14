@@ -19,6 +19,33 @@ import sys
 from pathlib import Path
 
 
+def _summary_ids(out: str, kind: str) -> list[str]:
+    """Node ids from pytest's short summary, for `FAILED` or `ERROR` lines.
+
+    `^FAILED\\s+(\\S+)` is wrong and was wrong in a way that looked right. A
+    parametrized id may contain SPACES -- `test_decision_matches_python[gfx1030-
+    gfx1100-gfx1030-11.0.0--not corroborated]` is a real one in this repo -- so
+    `\\S+` stops at the first space, truncating the id and, when several ids share
+    a prefix, collapsing them into one after `set()`. Measured on the Windows
+    gfx1151 runner: 75 failures at the base and 116 at the head both reduced to
+    the SAME 70 strings, which `head_is_worse` read as an unchanged failure set.
+
+    The line is `FAILED <nodeid>` optionally followed by ` - <reason>`, so split on
+    the first such separator and keep everything to its left.
+    """
+    ids: list[str] = []
+    for line in (out or "").splitlines():
+        if not line.startswith(kind + " "):
+            continue
+        body = line[len(kind) + 1:].strip()
+        # The reason is separated by " - "; a nodeid cannot contain that sequence
+        # because pytest renders it from the module path and the param id.
+        nodeid = body.split(" - ", 1)[0].rstrip()
+        if nodeid:
+            ids.append(nodeid)
+    return sorted(set(ids))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -72,7 +99,12 @@ def main() -> int:
     # conftest import of huggingface_hub errored 23 of 25 selected tests and the
     # observation recorded "0 failed" -- which a regression criteria reads as a
     # clean suite.
-    cmd = [args.python, "-m", "pytest", "-q", "-rf", "-rE"]
+    # ONE -r, with both characters. pytest's -r is `store`, not `append`, so a
+    # second -r REPLACES the first: `-rf -rE` asks for the error summary only, and
+    # a run with failures but no errors then prints no short summary at all. That
+    # left n_failed=56 beside an EMPTY failed-id list on the Windows gfx1151 runner
+    # (run 34821272189), and comparing two empty sets reads as no regression.
+    cmd = [args.python, "-m", "pytest", "-q", "-rfE"]
     if have_timeout:
         cmd += ["--timeout", str(args.timeout)]
     cmd += present
@@ -92,8 +124,11 @@ def main() -> int:
     # stderr is where pytest writes usage errors. Not capturing it is what made
     # this failure invisible.
     obs["stderr_tail"] = (err or "")[-2000:]
-    obs["failed"] = sorted(set(re.findall(r"^FAILED\s+(\S+)", tail, re.M)))
-    obs["errors"] = sorted(set(re.findall(r"^ERROR\s+(\S+)", tail, re.M)))
+    # Ids come out of the WHOLE stdout, not the 20 kB tail: 116 failures of
+    # parametrized tests overflow it, and the criteria then compares two id sets
+    # that were silently truncated at different points.
+    obs["failed"] = _summary_ids(out, "FAILED")
+    obs["errors"] = _summary_ids(out, "ERROR")
     m = re.search(r"(\d+) failed", tail)
     obs["n_failed"] = int(m.group(1)) if m else 0
     m = re.search(r"(\d+) passed", tail)

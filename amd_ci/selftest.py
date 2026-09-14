@@ -333,9 +333,28 @@ def test_a_pytest_run_that_never_ran_is_not_a_pass() -> None:
     check("a real run still passes", not failed, str(failed))
 
     # rc=1 is tests failing, which IS a run and must be judged, not discarded.
-    ran = {"rc": 1, "n_passed": 40, "n_failed": 7, "n_skipped": 0}
+    ran = {"rc": 1, "n_passed": 40, "n_failed": 7, "n_skipped": 0,
+           "failed": [f"tests/t.py::test_{i}" for i in range(7)]}
     failed = [n for n, ok, _ in crit.gates({"base": dict(ran), "head": dict(ran)}) if not ok]
     check("failing tests still count as having run", not failed, str(failed))
+
+    # A COUNT with no IDS is not a comparison. head_is_worse subtracts id SETS, so
+    # a missing short summary makes any number of failures read as a clean suite.
+    # Observed for real: `-rf -rE` in the probe asked pytest for the error summary
+    # only (its -r is `store`, not `append`), and run 34821272189 on the Windows
+    # gfx1151 runner reported 56 failed at both states with zero ids, which the
+    # criteria called NO_REGRESSION.
+    countless = {"rc": 1, "n_passed": 1523, "n_failed": 56, "n_skipped": 129,
+                 "failed": [], "errors": []}
+    failed = [n for n, ok, _ in
+              crit.gates({"base": dict(countless), "head": dict(countless)}) if not ok]
+    check("a failure count with no failing ids is not a comparison",
+          any("identified by id" in n for n in failed), str(failed))
+    check("and it is caught at BOTH states, not just one",
+          len([n for n in failed if "identified by id" in n]) == 2, str(failed))
+    worse, _why = crit.head_is_worse(dict(countless), dict(countless))
+    check("the id comparison alone would have called it clean", worse is False,
+          "this is why the gate above has to exist")
 
 
 def test_windows_is_reachable_but_docker_on_windows_is_not() -> None:

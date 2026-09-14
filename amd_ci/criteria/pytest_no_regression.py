@@ -58,6 +58,25 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name} suite ran without setup errors", n_err == 0,
                     f"{n_err} test(s) errored before their body ran"
                     + (f": {', '.join(o.get('errors', [])[:5])}" if o.get("errors") else "")))
+
+        # A COUNT with no IDS is not a comparison. head_is_worse works on id sets,
+        # so whenever the short summary is missing it compares two empty sets and
+        # reports a clean suite no matter how much is red. Observed on the Windows
+        # gfx1151 runner (run 34821272189): `-rf -rE` in the probe asked pytest for
+        # the error summary ONLY -- its -r is `store`, not `append` -- so 56 failures
+        # arrived with zero ids and the verdict was a vacuous NO_REGRESSION.
+        # EVERY one of them, not merely one of them. The first version of this gate
+        # asked only `n_ids > 0`, and the very next run on the same box reported 75
+        # failures at the base and 116 at the head reduced to the SAME 70 ids, because
+        # `\S+` truncated every parametrized id at its first space. Two truncated sets
+        # that happen to agree are not evidence that the failures agree.
+        n_ids = len(o.get("failed", []) or []) + len(o.get("errors", []) or [])
+        n_bad = (o.get("n_failed", 0) or 0) + n_err
+        out.append((f"{name} failing tests were all identified by id",
+                    n_bad == 0 or n_ids >= n_bad,
+                    f"{n_bad} failed/errored, {n_ids} id(s) captured"
+                    + ("; ids were lost, so the sets compared are not the failures"
+                       if n_bad and n_ids < n_bad else "")))
     return out
 
 

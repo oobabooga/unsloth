@@ -125,6 +125,16 @@ def gates(obs):
     return out
 
 
+def _torch_summary(state):
+    facts = state.get("torch_in_test_environment") or {}
+    if not facts:
+        return "-"
+    if facts.get("error"):
+        return f"ABSENT ({facts['error'][:60]})"
+    return (f"{facts.get('version')} hip={facts.get('hip')} cuda={facts.get('cuda')} "
+            f"available={facts.get('cuda_available')}")
+
+
 def _rows(obs, names):
     rows = []
     for entry in ENTRIES:
@@ -172,6 +182,8 @@ def table(obs):
         lines.append(f"| {label} | "
                      + " | ".join(str((obs.get(n) or {}).get(key, "-")) for n in names)
                      + " |")
+    lines.append("| torch in the test environment | "
+                 + " | ".join(_torch_summary(obs.get(n) or {}) for n in names) + " |")
 
     # How far each entry point's module body ran. The gate sits near the top of both
     # files, so "the import failed" and "the gate never executed" are different claims.
@@ -206,6 +218,18 @@ def table(obs):
             continue
         ok, why = head_is_fixed(obs.get(name) or {})
         lines.append(f"- {name}: {'clears' if ok else 'does NOT clear'} it - {why}")
+
+    # Said in the body, not only in the auto-appended gap list, because the difference
+    # between "the gate is set" and "the gate changes which SDPA kernel runs" is exactly
+    # what a Windows-only reading could be mistaken for.
+    facts = (obs.get("head") or {}).get("torch_in_test_environment") or {}
+    if facts.get("error") or not facts.get("hip"):
+        lines.append(
+            "- UNMEASURABLE here: whether opening the gate changes ROCm SDPA backend "
+            "selection, and whether the experimental kernels are numerically correct. "
+            "Torch reads this variable inside `#if USE_ROCM` during a capability probe, "
+            f"and torch in this job's environment is `{_torch_summary(obs.get('head') or {})}`. "
+            "That half is the Linux/ROCm leg's to answer.")
     return "\n".join(lines)
 
 
