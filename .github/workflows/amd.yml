@@ -25,7 +25,7 @@ jobs:
           export TMPDIR="$WORK_ROOT/tmp" UV_CACHE_DIR="$WORK_ROOT/cache/uv"
           python3 -m pip install -q --user uv 2>/dev/null || python3 -m pip install -q --break-system-packages --user uv
           export PATH="$HOME/.local/bin:$PATH"; uv --version
-          for spec in base:5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d head:9eabf23cf071a27eee3ee0bc98cb202c58e19f5a; do
+          for spec in base:5c04ec19305ecb5f0153c5b4d806a9d7e6e4422d head:5c9a6d45108681bac5e7283f0b75f45ca50542a1; do
             n=${spec%%:*}; sha=${spec#*:}
             git init -q "$WORK_ROOT/$n" && git -C "$WORK_ROOT/$n" fetch -q --depth 1 https://github.com/unslothai/unsloth "$sha" && git -C "$WORK_ROOT/$n" checkout -q FETCH_HEAD
           done
