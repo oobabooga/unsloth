@@ -47,7 +47,10 @@ cli_deps = ["typer", "pyyaml", "pydantic", "click"]
 
 if MODE == "torch":
     extra = [] if platform.system() == "Darwin" else ["--torch-backend", "cpu"]
-    run(["uv", "pip", "install", "--python", PY, *extra, f"unsloth=={OLD}", f"unsloth-zoo=={OLD}", *cli_deps], timeout=5400)
+    # Under Studio's constraints, as a real install is: otherwise the core plan carries constraint
+    # downgrades and the not-behind guard (correctly) withholds the pins.
+    constraints = REPO / "studio" / "backend" / "requirements" / "single-env" / "constraints.txt"
+    run(["uv", "pip", "install", "--python", PY, *extra, f"unsloth=={OLD}", f"unsloth-zoo=={OLD}", *cli_deps, "-c", constraints], timeout=5400)
 else:
     run(["uv", "pip", "install", "--python", PY, "--no-deps", f"unsloth=={OLD}", f"unsloth-zoo=={OLD}"])
     run(["uv", "pip", "install", "--python", PY, *cli_deps])
