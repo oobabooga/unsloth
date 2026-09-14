@@ -5640,6 +5640,52 @@ def _emitted_n_batch(n_batch: Optional[int], n_parallel: int) -> Optional[int]:
     return max(int(n_batch), max(2, int(n_parallel or 1)))
 
 
+# Image and audio encoders are non-causal, so llama.cpp asserts n_ubatch >= n_tokens
+# per chunk (ggml-org/llama.cpp#18757, #21816). 2048 covers Gemma 4's 1120 visual
+# tokens and the 600-token audio chunk.
+_MMPROJ_NON_CAUSAL_MIN_BATCH = 2048
+# Shared by the floor, the recovery gate and the text-only strip so they agree.
+_MMPROJ_PATH_FLAGS = frozenset({"--mmproj", "-mm"})
+
+
+def _mmproj_batch_floor(
+    n_batch: Optional[int],
+    n_ubatch: Optional[int],
+    env: Optional[Mapping[str, str]] = None,
+    floor: int = _MMPROJ_NON_CAUSAL_MIN_BATCH,
+) -> tuple[int, int]:
+    """The (batch, ubatch) a projector launch emits; shared by the loader and estimators.
+
+    A floor, not a setting: a larger field or LLAMA_ARG_BATCH / _UBATCH survives. The
+    field beats the env (it is emitted as a flag). llama.cpp's normalizations (ubatch 0
+    means batch, ubatch = min(batch, ubatch)) apply before flooring, and the batch is
+    carried up so the clamp cannot undo the raise.
+    """
+    source_env = os.environ if env is None else env
+
+    def _requested(value: Optional[int], env_name: str) -> Optional[int]:
+        if value is not None:
+            return int(value)
+        raw = source_env.get(env_name)
+        if raw:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass  # llama.cpp ignores it too
+        return None
+
+    batch = _requested(n_batch, "LLAMA_ARG_BATCH")
+    ubatch = _requested(n_ubatch, "LLAMA_ARG_UBATCH")
+    if batch is None:
+        batch = _DEFAULT_LLAMA_N_BATCH
+    if ubatch is None:
+        ubatch = _DEFAULT_LLAMA_N_UBATCH
+    if ubatch == 0:
+        ubatch = batch
+    ubatch = max(floor, min(batch, ubatch))
+    return max(batch, ubatch), ubatch
+
+
 def _extra_args_split_mode(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> Optional[str]:
@@ -19909,9 +19955,39 @@ class LlamaCppBackend:
         return env.pop("LLAMA_ARG_N_PARALLEL", None) is not None or dropped
 
     @staticmethod
+    def _restore_batch_args(
+        cmd: list[str], n_batch: Optional[int], n_ubatch: Optional[int], n_parallel: int
+    ) -> list[str]:
+        """Put the requested batch pair back on the text-only retry, which has no projector.
+
+        ``None`` removes the flag. Only the first occurrence is rewritten, in place: the
+        managed flags precede the extras, so later ones are the user's and must still win.
+        """
+        emitted = {
+            "--batch-size": _emitted_n_batch(n_batch, n_parallel),
+            "--ubatch-size": n_ubatch,
+        }
+        seen: set[str] = set()
+        out: list[str] = []
+        skip_value = False
+        for tok in cmd:
+            if skip_value:
+                skip_value = False
+                continue
+            if tok in emitted and tok not in seen:
+                seen.add(tok)
+                skip_value = True
+                value = emitted[tok]
+                if value is not None:
+                    out.extend([tok, str(value)])
+                continue
+            out.append(tok)
+        return out
+
+    @staticmethod
     def _strip_mmproj_args(cmd: list[str]) -> list[str]:
-        """Return cmd without the '--mmproj <path>' pair (text-only retry).
-        Every other flag is preserved; a no-op when --mmproj is absent.
+        """Return cmd without any --mmproj / -mm projector path (text-only retry).
+        Both the split and the `=` spellings go; every other flag is preserved.
         """
         out: list[str] = []
         skip_value = False
@@ -19919,8 +19995,8 @@ class LlamaCppBackend:
             if skip_value:
                 skip_value = False
                 continue
-            if tok == "--mmproj":
-                skip_value = True
+            if _flag_name(str(tok)) in _MMPROJ_PATH_FLAGS:
+                skip_value = "=" not in str(tok)
                 continue
             out.append(tok)
         return out
@@ -21588,6 +21664,34 @@ class LlamaCppBackend:
                         "Vision-capable GGUF loaded without a usable mmproj; "
                         "image input will be disabled for this session"
                     )
+                # Raise past the non-causal micro-batch assert (#10559) for any projector,
+                # audio included (ggml-org/llama.cpp#21816). An extras --mmproj counts even
+                # beside --no-mmproj: server-context.cpp loads any non-empty mmproj.path.
+                _extras_mmproj = _extra_args_device(extra_args, _MMPROJ_PATH_FLAGS)
+                _launch_opens_projector = bool(effective_is_vision) or bool(
+                    _extras_mmproj and os.path.isfile(_extras_mmproj)
+                )
+                # Inherited LLAMA_ARG_MMPROJ(_URL) and --mmproj-auto are NOT floored: the
+                # recovery gate reads only argv, so a 4x compute buffer there would OOM
+                # with no fallback. Applied before every sizing consumer.
+                _requested_batch_pair = (n_batch, n_ubatch)
+                _requested_effective_ubatch = _effective_ubatch
+                if _launch_opens_projector:
+                    _floor_from = (n_batch, n_ubatch)
+                    n_batch, n_ubatch = _mmproj_batch_floor(n_batch, n_ubatch)
+                    if _floor_from != (n_batch, n_ubatch):
+                        logger.info(
+                            "Raising batch to %d and micro-batch to %d for the projector: "
+                            "its encoder runs non-causal and llama.cpp aborts when a "
+                            "micro-batch cannot hold one whole image or audio chunk.",
+                            n_batch,
+                            n_ubatch,
+                        )
+                    _effective_ubatch = _ubatch_for_slots(n_parallel)
+                # Restored by the CPU replay of the vision argv.
+                _floored_batch_pair = (n_batch, n_ubatch)
+                # Effective micro-batch, so only a real raise counts as VRAM text-only frees.
+                _projector_floor_raised = _effective_ubatch != _requested_effective_ubatch
                 # Seed before the try: the except (GPU-selection failure ->
                 # --fit on) falls through to the launch which reads this, and the
                 # probe that assigns it may throw first. Captured before manual
@@ -26285,7 +26389,7 @@ class LlamaCppBackend:
                 self._record_load_warning(_offload_msg)
 
                 # Captured before any text-only fallback strips it from cmd.
-                launched_with_mmproj = "--mmproj" in cmd
+                launched_with_mmproj = _extra_args_set_any_flag(cmd, _MMPROJ_PATH_FLAGS)
 
                 # One-shot --fit off retry: recent llama.cpp runs a "fitting
                 # params to device memory" step by default (--fit defaults to
@@ -27801,9 +27905,13 @@ class LlamaCppBackend:
                                     return False
                                 if self._is_projector_incompatibility(_cpu_projector_out):
                                     _projector_msg = True
-                                elif self._is_gpu_memory_start_failure(_cpu_projector_out):
+                                elif (
+                                    self._is_gpu_memory_start_failure(_cpu_projector_out)
+                                    and not _projector_floor_raised
+                                ):
                                     # The projector was already off the GPU, so removing it
                                     # cannot repair this allocation failure; keep the real error.
+                                    # A raised floor is the exception: text-only drops it.
                                     _raise_terminal_load_failure(
                                         self._classify_llama_start_failure(
                                             _cpu_projector_out,
@@ -27816,7 +27924,11 @@ class LlamaCppBackend:
                                             self._extra_args,
                                         )
                                     )
-                        elif _projector_memory and _paravirtual_mmproj_pinnable(server_caps):
+                        elif (
+                            _projector_memory
+                            and _paravirtual_mmproj_pinnable(server_caps)
+                            and not _projector_floor_raised
+                        ):
                             # An env/argv pin already put mmproj on CPU. Text-only
                             # cannot free additional GPU memory, so surface the OOM.
                             _raise_terminal_load_failure(
@@ -27849,7 +27961,14 @@ class LlamaCppBackend:
                                     "session; check memory, GPU/driver logs, or update Unsloth."
                                 )
                                 self._mmproj_fallback_reason = "projector_startup_failure"
-                            cmd = self._strip_mmproj_args(_vision_gpu_cmd)
+                            # The fields too: the post-launch record reads them.
+                            n_batch, n_ubatch = _requested_batch_pair
+                            cmd = self._restore_batch_args(
+                                self._strip_mmproj_args(_vision_gpu_cmd),
+                                n_batch,
+                                n_ubatch,
+                                n_parallel,
+                            )
                             _unified_withdraw_if_unneeded(cmd, why = "The text-only retry")
                             # This retry bypasses _spawn_and_wait, so refresh the
                             # launched-argv snapshot itself -- the zero-offload
@@ -27911,6 +28030,8 @@ class LlamaCppBackend:
                                         # vision argv supersedes the text-only diagnosis.
                                         if not _projector_msg:
                                             self._mmproj_fallback_reason = None
+                                            # That argv carries the floor again.
+                                            n_batch, n_ubatch = _floored_batch_pair
                                     else:
                                         if _finish_cancelled_health_wait(
                                             "Load cancelled during the CPU replay health wait"

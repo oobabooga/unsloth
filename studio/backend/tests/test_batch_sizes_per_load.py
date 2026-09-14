@@ -648,8 +648,9 @@ def test_the_recorded_micro_batch_is_derived_from_the_slots_that_launched():
         and isinstance(node.func, ast.Name)
         and node.func.id == "_ubatch_for_slots"
     ]
-    # sizing pass, embedding slot clamp, fit-time reduction, then the post-launch record
-    assert len(calls) == 4, f"expected four re-derivations, found {len(calls)}"
+    # sizing pass, embedding slot clamp, projector batch floor, fit-time reduction,
+    # then the post-launch record
+    assert len(calls) == 5, f"expected five re-derivations, found {len(calls)}"
     # the record must not reuse the sizing pass's value
     compact = "".join(src.split())
     assert "self._n_ubatch=max(0,int(self._DEFAULT_N_UBATCHif_launched_ubatchisNone" in compact
@@ -734,3 +735,19 @@ def test_the_remote_guard_charges_the_flat_output_buffer():
     assert layer_2 - layer_1 < 30.0
     # tensor mode replicates the whole buffer on every card, so it does roughly double
     assert tensor_2 > tensor_1 * 1.8
+
+
+def test_the_text_only_retry_unwinds_the_projector_floor_in_the_fields_too():
+    """The text-only retry restores the requested fields, which the post-launch record reads."""
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(LlamaCppBackend.load_model))
+    compact = "".join(src.split())
+    assert "n_batch,n_ubatch=_requested_batch_pair" in compact
+    assert compact.index("n_batch,n_ubatch=_requested_batch_pair") < compact.index(
+        "self._restore_batch_args("
+    )
+    assert compact.index("_requested_batch_pair=(n_batch,n_ubatch)") < compact.index(
+        "n_batch,n_ubatch=_mmproj_batch_floor("
+    )

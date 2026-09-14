@@ -3242,3 +3242,106 @@ class TestFourMoreLaunchNormalizations:
         )
         out = ri._gguf_memory_breakdown(config, gguf, n_ctx = 8192, n_parallel = 4)
         assert out.n_parallel == 4
+
+
+class TestTheProjectorBatchFloorIsPricedNotJustLaunched:
+    """The panel and the training guard price the projector batch floor the loader emits."""
+
+    @pytest.fixture
+    def vision(self, tmp_path):
+        weight = _write_gguf(
+            tmp_path,
+            "qwen3",
+            {**_GQA_FIELDS, "context_length": 262144},
+            name = "model-Q4_K_M.gguf",
+        )
+        projector = _write_gguf(tmp_path, "clip", {"block_count": 2}, name = "mmproj-F16.gguf")
+        config = SimpleNamespace(
+            identifier = "local/vision",
+            gguf_file = weight,
+            is_gguf = True,
+            is_vision = True,
+            gguf_variant = None,
+            gguf_mmproj_file = projector,
+            gguf_mtp_file = None,
+            gguf_dspark_file = None,
+            gguf_dflash_file = None,
+        )
+        return weight, config
+
+    @pytest.fixture(autouse = True)
+    def _no_inherited_batch(self, monkeypatch):
+        for name in ("LLAMA_ARG_BATCH", "LLAMA_ARG_UBATCH", "LLAMA_ARG_MMPROJ"):
+            monkeypatch.delenv(name, raising = False)
+
+    def test_the_panel_prices_the_raised_micro_batch(self, vision):
+        weight, config = vision
+        priced = ri._gguf_memory_breakdown(config, weight, n_ctx = 8192)
+        pinned = ri._gguf_memory_breakdown(config, weight, n_ctx = 8192, n_batch = 2048, n_ubatch = 2048)
+        assert priced.compute_bytes == pinned.compute_bytes
+
+    def test_a_text_only_load_still_prices_the_llama_cpp_default(self, vision):
+        weight, config = vision
+        text_only = SimpleNamespace(
+            **{**vars(config), "is_vision": False, "gguf_mmproj_file": None}
+        )
+        priced = ri._gguf_memory_breakdown(text_only, weight, n_ctx = 8192)
+        floored = ri._gguf_memory_breakdown(
+            text_only, weight, n_ctx = 8192, n_batch = 2048, n_ubatch = 2048
+        )
+        assert priced.compute_bytes < floored.compute_bytes
+
+    def test_the_training_guard_charges_the_raised_micro_batch(self, vision):
+        weight, config = vision
+        charged = ri._estimate_gguf_required_gb(config, max_seq_length = 8192)
+        pinned = ri._estimate_gguf_required_gb(
+            config, max_seq_length = 8192, n_batch = 2048, n_ubatch = 2048
+        )
+        assert charged == pytest.approx(pinned)
+
+    def test_no_mmproj_in_the_extras_prices_no_floor(self, vision):
+        weight, config = vision
+        suppressed = ri._gguf_memory_breakdown(
+            config, weight, n_ctx = 8192, llama_extra_args = ["--no-mmproj"]
+        )
+        floored = ri._gguf_memory_breakdown(
+            config,
+            weight,
+            n_ctx = 8192,
+            n_batch = 2048,
+            n_ubatch = 2048,
+            llama_extra_args = ["--no-mmproj"],
+        )
+        assert suppressed.compute_bytes < floored.compute_bytes
+
+    def test_the_resident_files_figure_does_not_absorb_the_raised_buffers(self, vision):
+        """Both halves of the files subtraction are priced at the floored batch."""
+        weight, config = vision
+        files_gb = ri._gguf_resident_file_gb(config)
+        on_disk = (
+            Path(weight).stat().st_size + Path(config.gguf_mmproj_file).stat().st_size
+        ) / 1024**3
+        assert files_gb == pytest.approx(on_disk, abs = 0.2)
+
+    def test_a_family_mismatched_projector_is_not_priced_at_the_floor(self, tmp_path):
+        """The loader launches a family-mismatched projector text-only, so it gets no floor."""
+        weight = _write_gguf(tmp_path, "qwen3", _GQA_FIELDS, name = "gemma-3-12b-Q4_K_M.gguf")
+        matching = _write_gguf(tmp_path, "clip", {"block_count": 2}, name = "mmproj-gemma-3-F16.gguf")
+        stranger = _write_gguf(tmp_path, "clip", {"block_count": 2}, name = "mmproj-qwen3vl-F16.gguf")
+        base = dict(
+            identifier = "local/vision",
+            gguf_file = weight,
+            is_gguf = True,
+            is_vision = True,
+            gguf_variant = None,
+            gguf_mtp_file = None,
+            gguf_dspark_file = None,
+            gguf_dflash_file = None,
+        )
+
+        ok = SimpleNamespace(**base, gguf_mmproj_file = matching)
+        mismatched = SimpleNamespace(**base, gguf_mmproj_file = stranger)
+
+        assert Path(stranger).is_file()
+        assert ri._launch_raises_projector_batch(ok, None, False) is True
+        assert ri._launch_raises_projector_batch(mismatched, None, False) is False

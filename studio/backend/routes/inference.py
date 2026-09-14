@@ -10737,6 +10737,11 @@ def _estimate_gguf_required_gb(
             extra_args_disable_mmproj,
         )
 
+        # Price the batch the launch emits: load_model floors a projector load to 2048.
+        if _launch_raises_projector_batch(config, llama_extra_args, disable_vision):
+            from core.inference.llama_cpp import _mmproj_batch_floor
+            n_batch, n_ubatch = _mmproj_batch_floor(n_batch, n_ubatch)
+
         _spec_mode = _canonicalize_spec_mode(speculative_type) or "auto"
         _extra_args_own_spec = _extra_args_set_spec_type(llama_extra_args)
         # Extras owning --spec-type end _build_speculative_flags before any mode
@@ -11029,6 +11034,10 @@ def _estimate_gguf_required_gb(
             main_bytes = selected.size_bytes if selected is not None else None
             if main_bytes is None:
                 return None
+            # Nothing is on disk for the predicate above; the listing says a projector ships.
+            if has_vision and not extra_args_disable_mmproj(llama_extra_args):
+                from core.inference.llama_cpp import _mmproj_batch_floor
+                n_batch, n_ubatch = _mmproj_batch_floor(n_batch, n_ubatch)
             companions = _remote_gguf_companion_bytes(
                 repo,
                 hf_token = hf_token,
@@ -11490,6 +11499,11 @@ def _gguf_resident_file_gb(
     required_gb = _estimate_gguf_required_gb(config, max_seq_length = 0, **priced)
     if required_gb is None:
         return None  # deliberately not cached: usually a download still in flight
+    # Subtract at the batch the required-GB arm priced, or the floor reads as files.
+    _term_batch, _term_ubatch = (None, None)
+    if _launch_raises_projector_batch(config, llama_extra_args, disable_vision):
+        from core.inference.llama_cpp import _mmproj_batch_floor
+        _term_batch, _term_ubatch = _mmproj_batch_floor(None, None)
     if local_arm:
         # Same identifier the required-GB arm classifies with, or the two halves of the
         # subtraction below stop being paired and the weights figure moves with context.
@@ -11497,12 +11511,16 @@ def _gguf_resident_file_gb(
             str(main),
             0,
             llama_extra_args,
+            n_batch = _term_batch,
+            n_ubatch = _term_ubatch,
             model_identifier = getattr(config, "identifier", None),
         )
     else:
         context_term_gb = _remote_gguf_compute_reserve_gb(
             llama_extra_args = llama_extra_args,
             max_seq_length = 0,
+            n_batch = _term_batch,
+            n_ubatch = _term_ubatch,
         )
     files_gb = max(0.0, required_gb - context_term_gb)
     # Under the lock: the route body runs in an asyncio.to_thread worker, so two panel
@@ -11635,6 +11653,51 @@ def _tensor_split_possible(requested_gpu_ids: Optional[list[int]]) -> bool:
         return LlamaCppBackend._effective_gpu_count(None) >= 2
     except Exception:
         return True
+
+
+def _launch_raises_projector_batch(
+    config: ModelConfig, extras: Optional[list[str]], disable_vision: bool
+) -> bool:
+    """Whether load_model applies the projector batch floor (#10559) to this launch.
+
+    Mirrors the loader: an extras --mmproj, or Studio's resolved projector for a vision config.
+    """
+    from core.inference.llama_cpp import (
+        _MMPROJ_PATH_FLAGS,
+        _extra_args_device,
+        extra_args_disable_mmproj,
+    )
+
+    # An explicitly named projector opens even under --no-mmproj, which only stops the
+    # resolve and the auto-download; server-context.cpp gates on a non-empty mmproj.path.
+    override = _extra_args_device(extras, _MMPROJ_PATH_FLAGS)
+    if override and Path(override).is_file():
+        return True
+    # Inherited LLAMA_ARG_MMPROJ(_URL) and --mmproj-auto are not floored by the loader either.
+    if extra_args_disable_mmproj(extras):
+        return False
+    if not getattr(config, "is_vision", False):
+        return False
+    resolved = getattr(config, "gguf_mmproj_file", None)
+    if not resolved or not Path(str(resolved)).is_file():
+        return False
+    # The loader launches text-only when the projector does not match the model family.
+    main = getattr(config, "gguf_file", None)
+    if main:
+        try:
+            from utils.models.model_config import mmproj_matches_model_family
+            if not mmproj_matches_model_family(str(main), str(resolved)):
+                return False
+        except Exception:
+            pass
+    if disable_vision:
+        # The vision switch keeps an audio-only projector, which still launches.
+        try:
+            from utils.models.gguf_metadata import mmproj_accepts_image
+            return not mmproj_accepts_image(str(resolved))
+        except Exception:
+            return False
+    return True
 
 
 def _charged_projector_bytes(
@@ -11994,6 +12057,11 @@ def _gguf_memory_breakdown(
         parse_gpu_layers_override,
         strip_shadowing_flags,
     )
+
+    # Price the floored batch the launch will run (see _launch_raises_projector_batch).
+    if _launch_raises_projector_batch(config, llama_extra_args, disable_vision):
+        from core.inference.llama_cpp import _mmproj_batch_floor
+        n_batch, n_ubatch = _mmproj_batch_floor(n_batch, n_ubatch)
 
     # Manual owns the offload flags: /load translates the last -ngl into the field and
     # then strips the raw flags, so the launch carries neither. Price that same list,
