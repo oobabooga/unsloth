@@ -32,10 +32,7 @@ jobs:
         python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests ''numpy<3''
         pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
     - name: Run PR regression suites
-      run: python -m pytest studio/backend/tests/test_account_tool_confinement.py studio/backend/tests/test_bypass_permissions.py
-        studio/backend/tests/test_sandbox_files_and_storage_roots.py studio/backend/tests/test_sandbox_linux.py
-        studio/backend/tests/test_sandbox_macos.py studio/backend/tests/test_sandbox_probe.py studio/backend/tests/test_tool_output_streaming.py
-        studio/backend/tests/test_tool_sandbox_wiring.py -q --tb=short --timeout=120 -p no:cacheprovider
+      run: python .github/scripts/compare-sandbox-regressions.py
 'on':
   push:
     branches:
