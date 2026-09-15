@@ -125,7 +125,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout huggingface_hub
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout huggingface_hub soundfile av
           # main's backend conftest imports the backend stack at fixture setup, so the
           # backend suites need the Studio requirements even for a no-torch selection.
           & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
@@ -145,7 +145,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/test_setup_torchcodec_probe.py
+            --python "$env:AMD_CI_PY" -- --tests tests/test_setup_torchcodec_probe.py tests/test_audio_dataset_decode.py ../../tests/test_datasets_audio_fallback.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
