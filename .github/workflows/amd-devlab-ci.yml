@@ -21,15 +21,14 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
           $work = Join-Path $env:RUNNER_TEMP "faults"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
           python -m venv (Join-Path $work "venv")
           & (Join-Path $work "venv\Scripts\python.exe") -m pip install -q psutil
           Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/$env:GITHUB_SHA/fault_probe.py" -OutFile (Join-Path $work "fault_probe.py")
-          $rel = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-          $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
-          Write-Host "llama.cpp $($rel.tag_name) $($asset.name)"
-          Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile (Join-Path $work "llama.zip")
+          $zip = "https://github.com/ggml-org/llama.cpp/releases/download/b10988/llama-b10988-bin-win-cpu-x64.zip"
+          Invoke-WebRequest -UseBasicParsing $zip -OutFile (Join-Path $work "llama.zip")
           Expand-Archive (Join-Path $work "llama.zip") -DestinationPath (Join-Path $work "llama") -Force
           Invoke-WebRequest -UseBasicParsing "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf" -OutFile (Join-Path $work "Qwen3-0.6B-Q4_K_M.gguf")
       - name: mmap page-ins
