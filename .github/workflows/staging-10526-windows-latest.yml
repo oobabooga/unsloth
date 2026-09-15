@@ -1,6 +1,6 @@
 name: staging-10526 windows-latest
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-routing-completion
   cancel-in-progress: true
 permissions:
   contents: read
@@ -38,8 +38,8 @@ jobs:
 
         python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests
         ''numpy<3'' pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
-    - name: Check Studio lifecycle and compatibility
-      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved"
+    - name: Complete Studio platform routing checks
+      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved" routing os_gpu_routing
       if: always()
 'on':
   push:

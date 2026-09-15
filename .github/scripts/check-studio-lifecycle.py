@@ -36,7 +36,8 @@ GROUPS = {
         "studio/backend/tests/test_gpu_selection_sandbox.py",
         "studio/backend/tests/test_mlx_inference_backend.py",
     ],
-    "routing": ["tests/studio/test_mlx_context_platform_matrix.py", "tests/studio/test_is_mlx_dispatch_gate.py"],
+    "routing": ["tests/studio/test_hardware_dispatch_matrix.py", "tests/studio/test_is_mlx_dispatch_gate.py"],
+    "os_gpu_routing": ["studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py"],
 }
 
 def run(root, group, report):
@@ -59,7 +60,10 @@ with tempfile.TemporaryDirectory(prefix="studio-lifecycle-", dir=os.environ["RUN
     scratch = Path(tmp)
     baseline = scratch / "baseline"
     novel = set()
-    for group in GROUPS:
+    selected = sys.argv[2:] or list(GROUPS)
+    if set(selected) - GROUPS.keys():
+        raise ValueError(f"Unknown groups: {selected}")
+    for group in selected:
         failed = run(ROOT, group, scratch / f"{group}-head.xml")
         if not failed:
             print(group, "PASS", flush=True)

@@ -1,6 +1,6 @@
 name: staging-10526 ubuntu-24.04
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-routing-completion
   cancel-in-progress: true
 permissions:
   contents: read
@@ -50,8 +50,8 @@ jobs:
     - name: Require live OS isolation
       run: python -c "from core.inference.os_sandbox import capability_snapshot; c=capability_snapshot(); print(c);
         assert c.available, c.reason"
-    - name: Check Studio lifecycle and compatibility
-      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved"
+    - name: Complete Studio platform routing checks
+      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved" routing os_gpu_routing
       if: always()
     - name: Check Python tool images in Chromium
       run: 'python -m pip install playwright
