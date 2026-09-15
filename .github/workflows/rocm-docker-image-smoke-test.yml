@@ -2,7 +2,7 @@ name: AMD DevLab CI
 
 on:
   push:
-    branches: [amd-devlab-ci]
+    branches: [rocm-docker-image-smoke-test]
 
 permissions: {}
 
@@ -51,12 +51,12 @@ jobs:
               gid="$(getent group "$g" | cut -d: -f3)" || gid=""
               [ -n "$gid" ] && FLAGS+=(--group-add "$gid")
           done
-          docker run --rm "${FLAGS[@]}" --ipc=host "$IMAGE" python -c '
-import torch
-print("torch", torch.__version__, "hip", torch.version.hip)
-for i in range(torch.cuda.device_count()):
-    p = torch.cuda.get_device_properties(i)
-    print(i, repr(p))
-    print("  gcnArchName:", repr(getattr(p, "gcnArchName", None)))
-    print("  total_memory:", p.total_memory)
-'
+          docker run --rm -i "${FLAGS[@]}" --ipc=host "$IMAGE" python - <<'PY'
+          import torch
+          print("torch", torch.__version__, "hip", torch.version.hip)
+          for i in range(torch.cuda.device_count()):
+              p = torch.cuda.get_device_properties(i)
+              print(i, repr(p))
+              print("  gcnArchName:", repr(getattr(p, "gcnArchName", None)))
+              print("  total_memory:", p.total_memory)
+          PY
