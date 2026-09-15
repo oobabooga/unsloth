@@ -1,0 +1,62 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci]
+
+permissions: {}
+
+env:
+  IMAGE: unsloth/unsloth-rocm:latest
+
+jobs:
+  rocm-image-smoke:
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 45
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu
+          free -h
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -40 || true
+          rocm-smi 2>/dev/null || true
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          getent group video render || true
+          docker version || true
+
+      - name: Pull the published ROCm image
+        run: |
+          docker pull "$IMAGE"
+          docker image inspect "$IMAGE" \
+            --format 'digest={{index .RepoDigests 0}} created={{.Created}} size={{.Size}}'
+          # What the build recorded: wheel index, torch spec, gfx, ROCm version.
+          docker run --rm --entrypoint cat "$IMAGE" /etc/unsloth-rocm-build
+
+      - name: Smoke test on the GPU
+        run: |
+          FLAGS=(--device /dev/kfd --device /dev/dri)
+          for g in video render; do
+              gid="$(getent group "$g" | cut -d: -f3)" || gid=""
+              [ -n "$gid" ] && FLAGS+=(--group-add "$gid")
+          done
+          docker run --rm "${FLAGS[@]}" --ipc=host "$IMAGE" \
+            python /workspace/smoke_test_rocm.py
+
+      - name: Real device properties, unmocked
+        run: |
+          FLAGS=(--device /dev/kfd --device /dev/dri)
+          for g in video render; do
+              gid="$(getent group "$g" | cut -d: -f3)" || gid=""
+              [ -n "$gid" ] && FLAGS+=(--group-add "$gid")
+          done
+          docker run --rm "${FLAGS[@]}" --ipc=host "$IMAGE" python -c '
+import torch
+print("torch", torch.__version__, "hip", torch.version.hip)
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(i, repr(p))
+    print("  gcnArchName:", repr(getattr(p, "gcnArchName", None)))
+    print("  total_memory:", p.total_memory)
+'
