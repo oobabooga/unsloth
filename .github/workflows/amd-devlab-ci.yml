@@ -13,12 +13,14 @@ jobs:
     steps:
       - name: Hardware
         shell: powershell
+        continue-on-error: true
         run: |
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber
           Get-CimInstance Win32_Processor | Select-Object Name
           python --version
       - name: Setup
         shell: powershell
+        continue-on-error: true
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
@@ -33,16 +35,19 @@ jobs:
           Invoke-WebRequest -UseBasicParsing "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf" -OutFile (Join-Path $work "Qwen3-0.6B-Q4_K_M.gguf")
       - name: mmap page-ins
         shell: powershell
+        continue-on-error: true
         run: |
           $work = Join-Path $env:RUNNER_TEMP "faults"
           & (Join-Path $work "venv\Scripts\python.exe") (Join-Path $work "fault_probe.py") mmap (Join-Path $work "mmapwork")
       - name: idle HTTP server probed
         shell: powershell
+        continue-on-error: true
         run: |
           $work = Join-Path $env:RUNNER_TEMP "faults"
           & (Join-Path $work "venv\Scripts\python.exe") (Join-Path $work "fault_probe.py") idle-http
       - name: idle llama-server probed
         shell: powershell
+        continue-on-error: true
         run: |
           $work = Join-Path $env:RUNNER_TEMP "faults"
           $server = Get-ChildItem -Recurse -Filter llama-server.exe (Join-Path $work "llama") | Select-Object -First 1

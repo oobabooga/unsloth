@@ -97,7 +97,11 @@ def make_cold_file(path, size):
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     os.close(fd)
     if sys.platform == "win32":
-        print("purge standby list:", purge_windows_standby(), flush=True)
+        try:
+            result = purge_windows_standby()
+        except Exception as e:
+            result = repr(e)
+        print("purge standby list:", result, flush=True)
 
 
 def purge_windows_standby():
@@ -115,6 +119,12 @@ def purge_windows_standby():
 
     token = wintypes.HANDLE()
     kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p
+    ]
+    ntdll.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    ntdll.NtSetSystemInformation.restype = ctypes.c_long
     if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x20 | 0x8, ctypes.byref(token)):
         return "OpenProcessToken failed"
     luid = LUID()
