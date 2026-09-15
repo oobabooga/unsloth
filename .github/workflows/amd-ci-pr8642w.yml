@@ -125,7 +125,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout huggingface_hub soundfile av
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout huggingface_hub soundfile av librosa
           # main's backend conftest imports the backend stack at fixture setup, so the
           # backend suites need the Studio requirements even for a no-torch selection.
           & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
