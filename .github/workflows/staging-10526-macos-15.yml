@@ -21,6 +21,13 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+    - name: Prepare exact approved source
+      run: 'git fetch --no-tags https://github.com/unslothai/unsloth.git 842c826a95e99a5fd31a4e546604e3d42265fd32
+        73eb6fb29d3a3a013d4c730ea092f384ab2eaa74
+
+        git worktree add --detach "$RUNNER_TEMP/studio-approved" 842c826a95e99a5fd31a4e546604e3d42265fd32
+
+        python .github/scripts/check-studio-scope.py'
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12'
@@ -29,17 +36,24 @@ jobs:
     - name: Install test dependencies
       run: 'python -m pip install -r studio/backend/requirements/studio.txt
 
-        python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests ''numpy<3''
-        pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
+        python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests
+        ''numpy<3'' pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
     - name: Check runtime hard links
       run: python .github/scripts/check-sandbox-hardlinks.py
     - name: Require live OS isolation
       if: always()
       run: python -c "from core.inference.os_sandbox import capability_snapshot; c=capability_snapshot(); print(c);
         assert c.available, c.reason"
-    - name: Run PR regression suites
+    - name: Check Studio lifecycle and compatibility
       if: always()
-      run: python .github/scripts/compare-sandbox-regressions.py
+      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved"
+    - name: Check native MLX parent across isolated tool
+      if: always()
+      run: 'python -m pip install mlx
+
+        cd "$RUNNER_TEMP/studio-approved"
+
+        python "$GITHUB_WORKSPACE/.github/scripts/check-mlx-parent.py"'
 'on':
   push:
     branches:

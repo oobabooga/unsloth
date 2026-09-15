@@ -21,6 +21,13 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+    - name: Prepare exact approved source
+      run: 'git fetch --no-tags https://github.com/unslothai/unsloth.git 842c826a95e99a5fd31a4e546604e3d42265fd32
+        73eb6fb29d3a3a013d4c730ea092f384ab2eaa74
+
+        git worktree add --detach "$RUNNER_TEMP/studio-approved" 842c826a95e99a5fd31a4e546604e3d42265fd32
+
+        python .github/scripts/check-studio-scope.py'
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12'
@@ -38,22 +45,23 @@ jobs:
     - name: Install test dependencies
       run: 'python -m pip install -r studio/backend/requirements/studio.txt
 
-        python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests ''numpy<3''
-        pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
+        python -m pip install python-multipart aiofiles sqlalchemy psutil pyyaml jinja2 mammoth unpdf requests
+        ''numpy<3'' pytest pytest-asyncio pytest-timeout httpx peft ''transformers>=4.51,<5.5'''
     - name: Require live OS isolation
       run: python -c "from core.inference.os_sandbox import capability_snapshot; c=capability_snapshot(); print(c);
         assert c.available, c.reason"
-    - name: Run PR regression suites
-      run: python -m pytest studio/backend/tests/test_account_tool_confinement.py studio/backend/tests/test_bypass_permissions.py
-        studio/backend/tests/test_sandbox_files_and_storage_roots.py studio/backend/tests/test_sandbox_linux.py
-        studio/backend/tests/test_sandbox_macos.py studio/backend/tests/test_sandbox_probe.py studio/backend/tests/test_tool_output_streaming.py
-        studio/backend/tests/test_tool_sandbox_wiring.py -q --tb=short --timeout=120 -p no:cacheprovider
+    - name: Check Studio lifecycle and compatibility
+      run: python .github/scripts/check-studio-lifecycle.py "$RUNNER_TEMP/studio-approved"
+      if: always()
     - name: Check Python tool images in Chromium
       run: 'python -m pip install playwright
 
         python -m playwright install chromium
 
+        cd "$RUNNER_TEMP/studio-approved"
+
         python tests/studio/playwright_tauri_python_tool_images.py'
+      if: always()
 'on':
   push:
     branches:

@@ -1,0 +1,33 @@
+name: staging-10526 WSL availability and routing
+on:
+  push:
+    branches: [pr-10526-review-20260915-ci]
+permissions:
+  contents: read
+jobs:
+  wsl:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe native WSL availability
+        shell: pwsh
+        run: |
+          if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            Write-Output "UNVERIFIED: WSL executable absent from hosted Windows image"
+            exit 0
+          }
+          wsl.exe --status
+          $distros = @(wsl.exe --list --quiet 2>$null | ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
+          if ($LASTEXITCODE -ne 0 -or $distros.Count -eq 0) {
+            Write-Output "UNVERIFIED: no runnable WSL distribution on this hosted Windows image"
+            exit 0
+          }
+          $distro = $distros[0]
+          wsl.exe --distribution $distro --user root -- uname -a
+          if ($LASTEXITCODE -ne 0) { throw "Installed WSL distribution did not start" }
+          wsl.exe --distribution $distro --user root -- python3 -c "import sys, platform; print(sys.platform, platform.release()); assert sys.platform == 'linux'"
+          if ($LASTEXITCODE -ne 0) { throw "WSL Python routing probe failed" }
+          Write-Output "WSL native Linux routing confirmed; detailed sandbox cases run on Linux and in the deterministic WSL matrix"
