@@ -33,6 +33,7 @@ jobs:
           Invoke-WebRequest -UseBasicParsing $zip -OutFile (Join-Path $work "llama.zip")
           Expand-Archive (Join-Path $work "llama.zip") -DestinationPath (Join-Path $work "llama") -Force
           Invoke-WebRequest -UseBasicParsing "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf" -OutFile (Join-Path $work "Qwen3-0.6B-Q4_K_M.gguf")
+          Invoke-WebRequest -UseBasicParsing "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf" -OutFile (Join-Path $work "Qwen3-8B-Q4_K_M.gguf")
       - name: mmap page-ins
         shell: powershell
         continue-on-error: true
@@ -53,3 +54,23 @@ jobs:
           $server = Get-ChildItem -Recurse -Filter llama-server.exe (Join-Path $work "llama") | Select-Object -First 1
           & (Join-Path $work "venv\Scripts\python.exe") (Join-Path $work "fault_probe.py") llama $server.FullName (Join-Path $work "Qwen3-0.6B-Q4_K_M.gguf") $work
           Get-Content (Join-Path $work "llama.log") -Tail 5
+      - name: cold llama-server load
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "faults"
+          $server = Get-ChildItem -Recurse -Filter llama-server.exe (Join-Path $work "llama") | Select-Object -First 1
+          & (Join-Path $work "venv\Scripts\python.exe") (Join-Path $work "fault_probe.py") llama-load $server.FullName (Join-Path $work "Qwen3-8B-Q4_K_M.gguf") $work
+      - name: PR stall tests
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+          $work = Join-Path $env:RUNNER_TEMP "faults"
+          $py = Join-Path $work "venv\Scripts\python.exe"
+          & $py -m pip install -q pytest httpx huggingface_hub
+          Invoke-WebRequest -UseBasicParsing "https://codeload.github.com/oobabooga/unsloth/zip/$env:GITHUB_SHA" -OutFile (Join-Path $work "src.zip")
+          Expand-Archive (Join-Path $work "src.zip") -DestinationPath (Join-Path $work "src") -Force
+          $backend = Get-ChildItem -Directory (Join-Path $work "src") | Select-Object -First 1
+          Set-Location (Join-Path $backend.FullName "studio\backend")
+          & $py -m pytest -q tests/test_llama_cpp_wait_for_health.py -k TestHealthWaitMeasuresStalls -p no:cacheprovider

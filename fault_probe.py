@@ -19,6 +19,8 @@ import psutil
 
 MiB = 1 << 20
 SAMPLE_S = 5.0
+# A Windows venv python.exe is a launcher that runs the interpreter as its child.
+CHILD_PY = getattr(sys, "_base_executable", sys.executable)
 
 
 def proc_stat_faults(pid):
@@ -56,12 +58,12 @@ def counters(ps):
     return out
 
 
-def monitor(label, ps, seconds, stop=None):
+def monitor(label, ps, seconds, stop=None, sample_s=SAMPLE_S):
     prev = counters(ps)
     peak = prev["rss"]
     end = time.monotonic() + seconds
     while time.monotonic() < end and not (stop and stop.is_set()):
-        time.sleep(SAMPLE_S)
+        time.sleep(sample_s)
         try:
             cur = counters(ps)
         except psutil.Error:
@@ -186,7 +188,7 @@ def main():
         path = os.path.join(work, "probe.bin")
         for release in ("keep", "release"):
             make_cold_file(path, 256 * MiB)
-            child = subprocess.Popen([sys.executable, "-c", CHILD_MMAP, path, release])
+            child = subprocess.Popen([CHILD_PY, "-c", CHILD_MMAP, path, release])
             time.sleep(1)
             monitor(f"mmap-{release}", psutil.Process(child.pid), 15)
             child.kill()
@@ -195,14 +197,14 @@ def main():
     elif mode == "mmap-existing":
         path = sys.argv[2]
         for release in ("keep", "release"):
-            child = subprocess.Popen([sys.executable, "-c", CHILD_MMAP, path, release])
+            child = subprocess.Popen([CHILD_PY, "-c", CHILD_MMAP, path, release])
             time.sleep(1)
             monitor(f"mmap-existing-{release}", psutil.Process(child.pid), 15)
             child.kill()
             child.wait()
     elif mode == "idle-http":
         port = 18655
-        child = subprocess.Popen([sys.executable, "-c", CHILD_HTTP, str(port)])
+        child = subprocess.Popen([CHILD_PY, "-c", CHILD_HTTP, str(port)])
         time.sleep(2)
         stop = threading.Event()
         threading.Thread(target=prober, args=(f"http://127.0.0.1:{port}/health", stop), daemon=True).start()
@@ -229,6 +231,38 @@ def main():
         os.remove(pause)
         child.kill()
         child.wait()
+    elif mode == "llama-load":
+        binary, gguf, work = sys.argv[2], sys.argv[3], sys.argv[4]
+        if sys.platform == "win32":
+            print("purge standby list:", purge_windows_standby(), flush=True)
+        elif hasattr(os, "posix_fadvise"):
+            fd = os.open(gguf, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+        port = 18658
+        log = open(os.path.join(work, "llama-load.log"), "w")
+        child = subprocess.Popen(
+            [binary, "-m", gguf, "--port", str(port), "-c", "2048", "-ngl", "0"],
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+        ps = psutil.Process(child.pid)
+        stop = threading.Event()
+
+        def until_healthy():
+            while True:
+                try:
+                    if urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).status == 200:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            print("llama-load healthy", flush=True)
+            stop.set()
+
+        threading.Thread(target=until_healthy, daemon=True).start()
+        monitor("llama-load", ps, 120, stop=stop, sample_s=0.5)
+        child.kill()
+        child.wait()
     elif mode == "llama":
         binary, gguf, work = sys.argv[2], sys.argv[3], sys.argv[4]
         port = 18656
@@ -249,7 +283,8 @@ def main():
                 pass
             time.sleep(0.2)
         print("llama healthy after", round(time.monotonic() - t0, 1), "s", flush=True)
-        monitor("llama-healthy-probed", ps, 30)
+        time.sleep(20)
+        monitor("llama-healthy-probed", ps, 40)
         stop.set()
         child.kill()
         child.wait()
