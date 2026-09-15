@@ -19,7 +19,7 @@ permissions:
 
 env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
-  REFS: "v0.1.804-beta v0.1.808-beta main"
+  REFS: "v0.1.808-beta main keep-gpu-prebuilt-over-cpu-source-fallback windows-masked-nvidia-selects-cuda nvidia-library-probe"
 
 jobs:
 
