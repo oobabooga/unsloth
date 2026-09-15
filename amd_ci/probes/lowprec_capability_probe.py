@@ -378,12 +378,31 @@ def probe_studio(checkout: Path) -> dict:
     q = loaded["value"]
     out["module_file"] = q.__file__
 
-    # A bf16 tensor on cuda is what the selector is really given: it gates on
-    # dtype is bfloat16 and reads .device off the target.
-    target = torch.zeros(8, 8, device = "cuda", dtype = torch.bfloat16)
+    # The target must be SHAPED LIKE THE CALLER'S or the answer is about the
+    # probe. dense_transformer_supported does `getattr(target, "device", None)
+    # != "cuda"`, a comparison against the STRING "cuda": a real tensor's
+    # .device is a torch.device, which is never string-equal, so a tensor target
+    # fails at the first line and every downstream None would be an artefact of
+    # the probe rather than a fact about the GPU. The loader passes an object
+    # carrying a device string and a dtype, so that is what is passed here. The
+    # tensor is kept alongside precisely to show the two answers differ.
+    from types import SimpleNamespace
+    target = SimpleNamespace(device = "cuda", dtype = torch.bfloat16)
+    tensor_target = torch.zeros(8, 8, device = "cuda", dtype = torch.bfloat16)
 
     out["dense_transformer_supported"] = attempt(
         lambda: bool(q.dense_transformer_supported(target)))
+    out["dense_transformer_supported[tensor target]"] = attempt(
+        lambda: bool(q.dense_transformer_supported(tensor_target)))
+    # Which of the three early returns fired. This is the whole explanation for
+    # every None below, and without it the inventory says "nothing works" without
+    # saying whether that is the hardware, the platform policy or a stub.
+    out["torch_is_rocm"] = attempt(lambda: bool(q.torch_is_rocm()))
+    out["is_stubbed_torchao"] = attempt(lambda: bool(q.is_stubbed("torchao")))
+    # The specific, correct AMD message. Recorded because it is what a user
+    # SHOULD see; whether any caller actually surfaces it is a separate question.
+    out["dense_transformer_unsupported_reason"] = attempt(
+        lambda: q.dense_transformer_unsupported_reason(target))
     out["torchao_unavailable_reason"] = attempt(q.torchao_unavailable_reason)
     out["capability_tuple"] = attempt(lambda: list(q._capability() or []))
     out["is_consumer_gpu"] = attempt(lambda: bool(q._is_consumer_gpu("cuda")))

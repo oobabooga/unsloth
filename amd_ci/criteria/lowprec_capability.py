@@ -255,7 +255,11 @@ def table(obs: dict) -> str:
         e = rec.get("error") or {}
         return f"**RAISED** {e.get('type')}: {str(e.get('message'))[:120]}"
 
-    keys = ["dense_transformer_supported", "capability_tuple", "is_consumer_gpu",
+    keys = ["torch_is_rocm", "is_stubbed_torchao",
+            "dense_transformer_supported",
+            "dense_transformer_supported[tensor target]",
+            "dense_transformer_unsupported_reason",
+            "capability_tuple", "is_consumer_gpu",
             "auto_ladder", "torchao_unavailable_reason",
             "auto_scheme[no-family]", "auto_candidates[no-family]",
             "auto_scheme[qwen-image]", "auto_scheme[z-image]",
