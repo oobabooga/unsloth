@@ -141,7 +141,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/studio/install/test_rocm_support.py
+            --python "$env:AMD_CI_PY" -- --tests tests/studio/install/test_rocm_support.py --subdir .
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
