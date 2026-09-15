@@ -6,55 +6,56 @@ on:
 
 permissions: {}
 
-jobs:
-  windows:
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 120
-    env:
-      AB_MODEL: unsloth/gemma-3-270m-it-GGUF:Q8_0
-      CODEX_VERSION: 0.153.4
-    steps:
-      - name: Environment
-        shell: powershell
-        run: |
-          [Environment]::OSVersion.VersionString
-          $PSVersionTable.PSVersion.ToString()
-          python --version
-          node --version
-          Write-Host "RUNNER_TEMP=$env:RUNNER_TEMP"
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_HOME=$env:RUNNER_TEMP\studio-home`n")
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_SKIP_AUTOSTART=1`n")
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK=1`n")
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "HF_HOME=$env:RUNNER_TEMP\hf`n")
-          [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\npm-global`n")
-          exit 0
+env:
+  AB_MODEL: unsloth/gemma-3-270m-it-GGUF:Q8_0
+  CODEX_VERSION: 0.153.4
 
-      - name: Fetch harness, pywinpty, codex, pwsh
+jobs:
+  codex-alone:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - &setup
+        name: Setup
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_HOME=$env:RUNNER_TEMP\studio-home-$env:GITHUB_JOB`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_SKIP_AUTOSTART=1`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK=1`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "UNSLOTH_STUDIO_URL=http://127.0.0.1:18917`n")
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "HF_HOME=$env:RUNNER_TEMP\hf`n")
+          [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\npm-global`n")
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\harness", "$env:RUNNER_TEMP\ab" -ErrorAction SilentlyContinue
           git clone --depth 1 -b amd-devlab-10699-codex-tty https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\harness"
           python -m venv "$env:RUNNER_TEMP\abvenv"
           & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" -m pip install -q pywinpty==3.0.5
           npm install -g --prefix "$env:RUNNER_TEMP\npm-global" "@openai/codex@$env:CODEX_VERSION"
-          Get-ChildItem "$env:RUNNER_TEMP\npm-global" | Format-Table Name | Out-String | Write-Host
-          try {
-            $rel = Invoke-RestMethod -UseBasicParsing https://api.github.com/repos/PowerShell/PowerShell/releases/latest
-            $asset = $rel.assets | Where-Object { $_.name -like 'PowerShell-*-win-x64.zip' } | Select-Object -First 1
-            Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\pwsh.zip"
-            Expand-Archive "$env:RUNNER_TEMP\pwsh.zip" "$env:RUNNER_TEMP\pwsh"
-            [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\pwsh`n")
-            Write-Host "pwsh $($rel.tag_name)"
-          } catch { Write-Host "pwsh download failed: $_" }
+          if (-not (Test-Path "$env:RUNNER_TEMP\pwsh\pwsh.exe")) {
+            try {
+              $rel = Invoke-RestMethod -UseBasicParsing https://api.github.com/repos/PowerShell/PowerShell/releases/latest
+              $asset = $rel.assets | Where-Object { $_.name -like 'PowerShell-*-win-x64.zip' } | Select-Object -First 1
+              Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\pwsh.zip"
+              Expand-Archive -Force "$env:RUNNER_TEMP\pwsh.zip" "$env:RUNNER_TEMP\pwsh"
+            } catch { Write-Host "pwsh download failed: $_" }
+          }
+          [IO.File]::AppendAllText($env:GITHUB_PATH, "$env:RUNNER_TEMP\pwsh`n")
           exit 0
-
       - name: Phase A (codex alone)
         shell: powershell
         run: |
           & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_a.py"
           exit 0
 
-      - name: Install Unsloth (released wheel, --no-torch)
+  launch-no-server:
+    needs: codex-alone
+    if: always()
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - *setup
+      - &install
+        name: Install Unsloth (released wheel, --no-torch)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -62,18 +63,45 @@ jobs:
           $sw = [Diagnostics.Stopwatch]::StartNew()
           & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\install.ps1" --no-torch *>&1 | Out-File -Encoding utf8 "$env:RUNNER_TEMP\install.log"
           Write-Host "install exit $LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s"
-          Get-Content "$env:RUNNER_TEMP\install.log" -Tail 60
+          Get-Content "$env:RUNNER_TEMP\install.log" -Tail 25
           exit 0
-
-      - name: Phase B (unsloth start codex)
+      - name: _launch without a server
         shell: powershell
         run: |
-          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py"
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" launch
           exit 0
 
-      - name: Summary
+  start-codex:
+    needs: launch-no-server
+    if: always()
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - *setup
+      - *install
+      - name: Start Studio server
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" server-start
+          exit 0
+      - name: Preload GGUF (start codex --no-launch)
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" preload
+          exit 0
+      - name: Key case (bin unsloth.exe start codex, ConPTY)
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" key
+          exit 0
+      - name: Entry point and shell variants
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" variants
+          exit 0
+      - name: Stop Studio server
         if: always()
         shell: powershell
         run: |
-          Get-Content "$env:RUNNER_TEMP\ab\summary.jsonl" -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP\abvenv\Scripts\python.exe" "$env:RUNNER_TEMP\harness\phase_b.py" server-stop
           exit 0
