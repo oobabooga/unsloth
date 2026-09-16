@@ -1,0 +1,56 @@
+name: PR 10182 Windows ACL matrix
+
+on:
+  push:
+    branches: [amd-win-10182-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-acl-matrix:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the test harness
+        uses: actions/checkout@v4
+
+      - name: Host
+        shell: powershell
+        run: |
+          systeminfo | Select-String "OS Name","OS Version","System Type"
+          whoami
+          python --version
+          Write-Host "RUNNER_TEMP=$env:RUNNER_TEMP"
+          fsutil fsinfo volumeinfo C:
+
+      - name: Clone the PR head and main
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($pair in @(@("pr10182-src", "refs/pull/10182/head"), @("main-src", "main"))) {
+            $work = Join-Path $env:RUNNER_TEMP $pair[0]
+            if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+            git init $work
+            Push-Location $work
+            git remote add origin https://github.com/unslothai/unsloth.git
+            git -c protocol.version=2 fetch --depth 1 origin $pair[1]
+            git checkout FETCH_HEAD
+            Write-Host "$($pair[0]) -> $(git log --oneline -1)"
+            Pop-Location
+          }
+
+      - name: CONTROL - what main does with the same real failure
+        shell: powershell
+        run: |
+          $env:PYTHONIOENCODING = "utf-8"
+          python "$env:GITHUB_WORKSPACE\winacl_matrix.py" "$env:RUNNER_TEMP\main-src" --control
+          Write-Host "control exit: $LASTEXITCODE"
+          exit 0
+
+      - name: MATRIX - the PR head
+        shell: powershell
+        run: |
+          $env:PYTHONIOENCODING = "utf-8"
+          python "$env:GITHUB_WORKSPACE\winacl_matrix.py" "$env:RUNNER_TEMP\pr10182-src"
+          exit $LASTEXITCODE
