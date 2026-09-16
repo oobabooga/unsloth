@@ -69,6 +69,27 @@ jobs:
           $sec  = ConvertTo-SecureString $P -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential($U, $sec)
 
+          # Task Scheduler reported 267011 (SCHED_S_TASK_HAS_NOT_RUN) because the
+          # account has no SeBatchLogonRight. schtasks does not always grant it, so
+          # grant it explicitly.
+          $sid = (New-Object System.Security.Principal.NTAccount($U)).Translate(
+                   [System.Security.Principal.SecurityIdentifier]).Value
+          Write-Host "probe user SID: $sid"
+          $cfg = "$env:TEMP\secpol.cfg"
+          secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+          $lines = Get-Content $cfg
+          if ($lines -match "^SeBatchLogonRight") {
+            $lines = $lines -replace "^(SeBatchLogonRight\s*=\s*.*)$", "`$1,*$sid"
+          } else {
+            $lines += "SeBatchLogonRight = *$sid"
+          }
+          $lines | Set-Content $cfg
+          secedit /configure /db "$env:TEMP\secedit.sdb" /cfg $cfg /areas USER_RIGHTS |
+            Select-Object -Last 2
+          Write-Host "batch logon right now: $((Get-Content $cfg | Select-String 'SeBatchLogonRight'))"
+          net user $U /passwordchg:no 2>&1 | Out-Null
+          wmic useraccount where "Name='$U'" set PasswordExpires=FALSE 2>&1 | Out-Null
+
           $py   = (Get-Command python).Source
           $sc   = "C:\pr10182work\acl_user_matrix.py"
           $work = "C:\pr10182work"
