@@ -127,6 +127,10 @@ jobs:
           Get-CimInstance Win32_VideoController |
             Select-Object Name, DriverVersion, AdapterRAM, Status | Format-List
           & amd-smi.exe static -g 0 2>&1 | Select-Object -First 40
+          # Diagnostic only, and amd-smi.exe exits 1 with "Error LoadLibraryA" on
+          # these boxes. The job's verdict comes from the Differential step; a
+          # report that cannot fail a run must not fail one.
+          exit 0
 
       - name: Differential
         run: |
