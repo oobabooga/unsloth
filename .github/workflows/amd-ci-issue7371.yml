@@ -1,0 +1,108 @@
+name: "AMD CI: validate PR 7371"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-issue7371]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "7371"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  gpu:
+    name: "PR 7371 GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr7371-gpu"
+
+      # No torch here on purpose. The thing being measured is a self-contained
+      # llama.cpp bundle that ships its own ROCm userland, so `install.sh --local`
+      # would spend an hour building an environment the probe never imports. The
+      # arch therefore comes from the amdgpu KFD (capability.linux_kfd_gfx_targets),
+      # which is the kernel's own device list, and the gate FAILS on a miss.
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch \
+            --expect-arch gfx1151 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      # The states are RELEASE TAGS, not commits: b10069 and b10079 carry the
+      # identical Unsloth patch mix (fb3d4ca either side), so there is no tree
+      # difference for states.py to find and a worktree differential could only
+      # ever answer NO_REGRESSION.
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/tag_states.py \
+            --state base=b10079-mix-fb3d4ca \
+            --state head=b10909-mix-bea84f7 \
+            --checkout "$GITHUB_WORKSPACE" \
+            --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Differential
+        timeout-minutes: 100
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llama_prebuilt_throughput_probe.py \
+            --criteria amd_ci/criteria/llama_prebuilt_slowdown.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python python3 -- --tag-map base=b10079-mix-fb3d4ca,head=b10909-mix-bea84f7 --reference-tag b10069-mix-fb3d4ca --sweep-tags b10068-mix-fb3d4ca,b10107-mix-1911198,b10173-mix-2c8b9c1,b10265-mix-89aa77b,b10360-mix-87da1a2,b10472-mix-4b653db,b10639-mix-f6f92fe --model-repo unsloth/Qwen3-4B-Instruct-2507-GGUF --model-file Qwen3-4B-Instruct-2507-Q4_K_M.gguf --repeats 3 --gen-repeats 3 --n-prompt 512 --n-gen 128 --threads 8 --timeout 1800
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr7371-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
