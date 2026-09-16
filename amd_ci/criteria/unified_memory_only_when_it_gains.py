@@ -40,7 +40,20 @@ def _decision(state: dict, gib: float):
 
 
 def _pool_mib(state: dict):
-    return (state.get("rocm_selected_pool_mib") or {}).get("value")
+    """The GPU pool this state can see, in MiB.
+
+    `_rocm_selected_pool_mib` was ADDED by #9884, so at the base state it does not
+    exist and asking for it answers None. The gate below is about whether the
+    carve-out is a readable number on this host at all, which it is either way:
+    the helper reads `torch.cuda.get_device_properties().total_memory` and the
+    probe records that separately. Requiring the helper made the base leg fail a
+    gate for carrying the code the differential exists to compare against, and
+    turned a real CONFIRMED into an INCONCLUSIVE.
+    """
+    value = (state.get("rocm_selected_pool_mib") or {}).get("value")
+    if value:
+        return value
+    return _device(state).get("total_mib") or None
 
 
 def _host_mib(state: dict):
@@ -72,8 +85,10 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         # Without a readable carve-out every decision below is False by default
         # rather than by judgement, and "no flag set" would mean nothing.
         out.append((f"{name} the carve-out is readable", bool(_pool_mib(st)),
-                    f"_rocm_selected_pool_mib([0]) = {_pool_mib(st)} MiB; "
-                    f"HIP total_memory = {dev.get('total_mib')} MiB"))
+                    f"pool = {_pool_mib(st)} MiB "
+                    f"(_rocm_selected_pool_mib([0]) = "
+                    f"{(st.get('rocm_selected_pool_mib') or {}).get('value')}, "
+                    f"HIP total_memory = {dev.get('total_mib')} MiB)"))
         out.append((f"{name} host RAM is readable", bool(_host_mib(st)),
                     f"_available_system_memory_mib() = {_host_mib(st)} MiB"))
         small = _decision(st, SMALL_GIB)
