@@ -132,6 +132,10 @@ jobs:
           # report that cannot fail a run must not fail one.
           exit 0
 
+      # Second pass: the SAME comparison on a MIXTURE OF EXPERTS model. The
+      # report's models are both MoE, and the upstream change it names vectorises
+      # `get_rows`, which is what an MoE router drives hardest. A dense 4B showing
+      # nothing does not answer for that, so this run is Qwen3-30B-A3B.
       - name: Differential
         run: |
           $ErrorActionPreference = "Continue"
@@ -140,7 +144,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/llama_prebuilt_throughput_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/llama_prebuilt_slowdown.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tag-map base=b10079-mix-fb3d4ca,head=b10909-mix-bea84f7 --reference-tag b10069-mix-fb3d4ca --sweep-tags b10068-mix-fb3d4ca,b10107-mix-1911198,b10173-mix-2c8b9c1,b10265-mix-89aa77b,b10360-mix-87da1a2,b10472-mix-4b653db,b10639-mix-f6f92fe --model-repo unsloth/Qwen3-4B-Instruct-2507-GGUF --model-file Qwen3-4B-Instruct-2507-Q4_K_M.gguf --repeats 3 --gen-repeats 3 --n-prompt 512 --n-gen 128 --threads 8 --timeout 1800
+            --python "$env:AMD_CI_PY" -- --tag-map base=b10079-mix-fb3d4ca,head=b10909-mix-bea84f7 --reference-tag b10069-mix-fb3d4ca --sweep-tags b10068-mix-fb3d4ca,b10472-mix-4b653db --model-repo unsloth/Qwen3-30B-A3B-GGUF --model-file Qwen3-30B-A3B-Q4_K_M.gguf --repeats 3 --gen-repeats 3 --n-prompt 512 --n-gen 128 --threads 8 --timeout 1800
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
