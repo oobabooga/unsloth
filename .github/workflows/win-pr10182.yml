@@ -106,10 +106,17 @@ jobs:
             schtasks /Create /TN $tn /TR "`"$cmd`"" /SC ONCE /ST 23:59 /RU $U /RP $P /F 2>&1 |
               Select-Object -Last 1
             schtasks /Run /TN $tn 2>&1 | Select-Object -Last 1
-            for ($i = 0; $i -lt 120; $i++) {
+            # Wait on the result file, not on the task status: a freshly launched task
+            # still reads "Ready" for a moment, which ended the old loop instantly.
+            $done = $false
+            for ($i = 0; $i -lt 150; $i++) {
               Start-Sleep -Seconds 2
-              $q = schtasks /Query /TN $tn /FO LIST 2>&1 | Out-String
-              if ($q -notmatch "Running") { break }
+              if (Test-Path $rc) { $done = $true; break }
+            }
+            if (-not $done) {
+              Write-Host "  TASK DID NOT COMPLETE; verbose status follows:"
+              schtasks /Query /TN $tn /FO LIST /V 2>&1 |
+                Select-String "Status|Last Run Time|Last Result|Run As User|Task To Run"
             }
             schtasks /Delete /TN $tn /F 2>&1 | Out-Null
 
