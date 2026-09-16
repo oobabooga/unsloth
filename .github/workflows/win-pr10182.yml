@@ -70,8 +70,43 @@ jobs:
           $cred = New-Object System.Management.Automation.PSCredential($U, $sec)
 
           $py   = (Get-Command python).Source
-          $sc   = "$env:GITHUB_WORKSPACE\acl_user_matrix.py"
+          $sc   = "C:\pr10182work\acl_user_matrix.py"
           $work = "C:\pr10182work"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\acl_user_matrix.py" $sc -Force
+          Write-Host "python interpreter: $py"
+          # A standard user must be able to read the interpreter and the harness.
+          $pyRoot = Split-Path $py -Parent
+          icacls $pyRoot /grant "${U}:(OI)(CI)(RX)" /T /C 2>&1 | Select-Object -Last 1
+          icacls $sc /grant "${U}:(RX)" 2>&1 | Select-Object -Last 1
+          # Where Python lives under a profile the probe user cannot traverse, say so
+          # loudly rather than producing an empty run.
+          if ($pyRoot -like "*\Users\administrator\*") {
+            Write-Host "NOTE: the interpreter lives under the administrator profile; granting traversal"
+            icacls "C:\Users\administrator" /grant "${U}:(RX)" 2>&1 | Select-Object -Last 1
+            icacls "C:\Users\administrator\AppData" /grant "${U}:(RX)" 2>&1 | Select-Object -Last 1
+            icacls "C:\Users\administrator\AppData\Local" /grant "${U}:(RX)" 2>&1 | Select-Object -Last 1
+          }
+
+          function Invoke-AsUser($argList, $outFile, $errFile, $wd) {
+            try {
+              $p = Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
+                     -ArgumentList $argList -RedirectStandardOutput $outFile `
+                     -RedirectStandardError $errFile -Wait -PassThru -ErrorAction Stop
+              Write-Host "  (exit code $($p.ExitCode))"
+            } catch {
+              Write-Host "  START-PROCESS FAILED: $($_.Exception.Message)"
+              return
+            }
+            if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 0) {
+              Get-Content $outFile
+            } else {
+              Write-Host "  (no stdout)"
+            }
+            if ((Test-Path $errFile) -and (Get-Item $errFile).Length -gt 0) {
+              Write-Host "  --- stderr:"; Get-Content $errFile
+            }
+          }
           foreach ($v in @("pr", "main")) {
             $src = if ($v -eq "pr") { "$env:RUNNER_TEMP\pr10182-src" } else { "$env:RUNNER_TEMP\main-src" }
             $wd  = "$work\$v"
@@ -82,29 +117,20 @@ jobs:
 
             New-Item -ItemType Directory -Force -Path $wd | Out-Null
             icacls $src /grant "${U}:(OI)(CI)(RX)" /T /C 2>&1 | Out-Null
+            # Grant BEFORE setup so the deny ACEs setup adds are the last word.
+            icacls $wd /grant "${U}:(OI)(CI)(M)" /T /C 2>&1 | Select-Object -Last 1
 
             Write-Host "--- phase: setup (admin)"
             & $py $sc setup $src $wd $U
 
             Write-Host "--- phase: probe (standard user $U)"
-            $out = "$wd\probe.out"; $err = "$wd\probe.err"
-            Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
-              -ArgumentList @($sc, "probe", $src, $wd, $U) `
-              -RedirectStandardOutput $out -RedirectStandardError $err -Wait -NoNewWindow
-            if (Test-Path $out) { Get-Content $out }
-            if ((Test-Path $err) -and (Get-Item $err).Length -gt 0) {
-              Write-Host "--- probe stderr:"; Get-Content $err
-            }
+            Invoke-AsUser @($sc, "probe", $src, $wd, $U) "$wd\probe.out" "$wd\probe.err" $wd
 
             Write-Host "--- phase: repair (elevated, running exactly what was printed)"
             & $py $sc repair $src $wd $U
 
             Write-Host "--- phase: verify (standard user $U)"
-            $out2 = "$wd\verify.out"
-            Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
-              -ArgumentList @($sc, "verify", $src, $wd, $U) `
-              -RedirectStandardOutput $out2 -RedirectStandardError "$wd\verify.err" -Wait -NoNewWindow
-            if (Test-Path $out2) { Get-Content $out2 }
+            Invoke-AsUser @($sc, "verify", $src, $wd, $U) "$wd\verify.out" "$wd\verify.err" $wd
           }
 
           icacls $work /reset /T /C 2>&1 | Out-Null
