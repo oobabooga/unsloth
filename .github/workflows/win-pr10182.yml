@@ -88,23 +88,36 @@ jobs:
             icacls "C:\Users\administrator\AppData\Local" /grant "${U}:(RX)" 2>&1 | Select-Object -Last 1
           }
 
-          function Invoke-AsUser($argList, $outFile, $errFile, $wd) {
-            try {
-              $p = Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
-                     -ArgumentList $argList -RedirectStandardOutput $outFile `
-                     -RedirectStandardError $errFile -Wait -PassThru -ErrorAction Stop
-              Write-Host "  (exit code $($p.ExitCode))"
-            } catch {
-              Write-Host "  START-PROCESS FAILED: $($_.Exception.Message)"
-              return
+          # Start-Process -Credential lands the child on a window station the target
+          # user cannot open, so every run died with 0xC0000142 (STATUS_DLL_INIT_FAILED).
+          # Task Scheduler uses a batch logon instead, which has no such requirement.
+          function Invoke-AsUser($phase, $src, $wd) {
+            $cmd = "$wd\run_$phase.cmd"
+            $out = "$wd\$phase.out"; $err = "$wd\$phase.err"; $rc = "$wd\$phase.rc"
+            Remove-Item $out, $err, $rc -ErrorAction SilentlyContinue
+            @(
+              '@echo off',
+              "`"$py`" `"$sc`" $phase `"$src`" `"$wd`" $U > `"$out`" 2> `"$err`"",
+              "echo %ERRORLEVEL% > `"$rc`""
+            ) | Set-Content -Path $cmd -Encoding ASCII
+            icacls $cmd /grant "${U}:(RX)" 2>&1 | Out-Null
+
+            $tn = "pr10182_$phase"
+            schtasks /Create /TN $tn /TR "`"$cmd`"" /SC ONCE /ST 23:59 /RU $U /RP $P /F 2>&1 |
+              Select-Object -Last 1
+            schtasks /Run /TN $tn 2>&1 | Select-Object -Last 1
+            for ($i = 0; $i -lt 120; $i++) {
+              Start-Sleep -Seconds 2
+              $q = schtasks /Query /TN $tn /FO LIST 2>&1 | Out-String
+              if ($q -notmatch "Running") { break }
             }
-            if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 0) {
-              Get-Content $outFile
-            } else {
-              Write-Host "  (no stdout)"
-            }
-            if ((Test-Path $errFile) -and (Get-Item $errFile).Length -gt 0) {
-              Write-Host "  --- stderr:"; Get-Content $errFile
+            schtasks /Delete /TN $tn /F 2>&1 | Out-Null
+
+            if (Test-Path $rc) { Write-Host "  (exit code $((Get-Content $rc).Trim()))" }
+            if ((Test-Path $out) -and (Get-Item $out).Length -gt 0) { Get-Content $out }
+            else { Write-Host "  (no stdout)" }
+            if ((Test-Path $err) -and (Get-Item $err).Length -gt 0) {
+              Write-Host "  --- stderr:"; Get-Content $err
             }
           }
           foreach ($v in @("pr", "main")) {
@@ -124,13 +137,13 @@ jobs:
             & $py $sc setup $src $wd $U
 
             Write-Host "--- phase: probe (standard user $U)"
-            Invoke-AsUser @($sc, "probe", $src, $wd, $U) "$wd\probe.out" "$wd\probe.err" $wd
+            Invoke-AsUser "probe" $src $wd
 
             Write-Host "--- phase: repair (elevated, running exactly what was printed)"
             & $py $sc repair $src $wd $U
 
             Write-Host "--- phase: verify (standard user $U)"
-            Invoke-AsUser @($sc, "verify", $src, $wd, $U) "$wd\verify.out" "$wd\verify.err" $wd
+            Invoke-AsUser "verify" $src $wd
           }
 
           icacls $work /reset /T /C 2>&1 | Out-Null
