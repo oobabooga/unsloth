@@ -54,3 +54,60 @@ jobs:
           $env:PYTHONIOENCODING = "utf-8"
           python "$env:GITHUB_WORKSPACE\winacl_matrix.py" "$env:RUNNER_TEMP\pr10182-src"
           exit $LASTEXITCODE
+
+      # An elevated token bypasses deny ACEs, so the permissions case can only be
+      # reproduced as an ordinary user -- which is how #9928's reporter hit it.
+      - name: UNPRIVILEGED - the #9928 scenario end to end
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $U = "pr10182u"
+          $P = "Pr10182!" + (Get-Random -Maximum 99999)
+          net user $U $P /add /y 2>&1 | Out-Null
+          net localgroup Users $U /add 2>&1 | Out-Null
+          $sec  = ConvertTo-SecureString $P -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential($U, $sec)
+
+          $py   = (Get-Command python).Source
+          $sc   = "$env:GITHUB_WORKSPACE\acl_user_matrix.py"
+          $work = "C:\pr10182work"
+          foreach ($v in @("pr", "main")) {
+            $src = if ($v -eq "pr") { "$env:RUNNER_TEMP\pr10182-src" } else { "$env:RUNNER_TEMP\main-src" }
+            $wd  = "$work\$v"
+            Write-Host ""
+            Write-Host ("=" * 78)
+            Write-Host "### $($v.ToUpper()) -- unprivileged run"
+            Write-Host ("=" * 78)
+
+            New-Item -ItemType Directory -Force -Path $wd | Out-Null
+            icacls $src /grant "${U}:(OI)(CI)(RX)" /T /C 2>&1 | Out-Null
+
+            Write-Host "--- phase: setup (admin)"
+            & $py $sc setup $src $wd $U
+
+            Write-Host "--- phase: probe (standard user $U)"
+            $out = "$wd\probe.out"; $err = "$wd\probe.err"
+            Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
+              -ArgumentList @($sc, "probe", $src, $wd, $U) `
+              -RedirectStandardOutput $out -RedirectStandardError $err -Wait -NoNewWindow
+            if (Test-Path $out) { Get-Content $out }
+            if ((Test-Path $err) -and (Get-Item $err).Length -gt 0) {
+              Write-Host "--- probe stderr:"; Get-Content $err
+            }
+
+            Write-Host "--- phase: repair (elevated, running exactly what was printed)"
+            & $py $sc repair $src $wd $U
+
+            Write-Host "--- phase: verify (standard user $U)"
+            $out2 = "$wd\verify.out"
+            Start-Process -FilePath $py -Credential $cred -WorkingDirectory $wd `
+              -ArgumentList @($sc, "verify", $src, $wd, $U) `
+              -RedirectStandardOutput $out2 -RedirectStandardError "$wd\verify.err" -Wait -NoNewWindow
+            if (Test-Path $out2) { Get-Content $out2 }
+          }
+
+          icacls $work /reset /T /C 2>&1 | Out-Null
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          net user $U /delete 2>&1 | Out-Null
+          exit 0
