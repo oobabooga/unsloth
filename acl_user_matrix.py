@@ -112,7 +112,10 @@ def phase_probe():
     except OSError as exc:
         lst = f"RAISED {type(exc).__name__} winerror={getattr(exc, 'winerror', None)}"
     print("LSTAT: " + lst)
-    print("CONFIRMED_REPARSE_POINT: " + str(M._confirmed_reparse_point(install)))
+    # main has no such helper; keep the control run alive so both sides print.
+    probe_fn = getattr(M, "_confirmed_reparse_point", None)
+    print("CONFIRMED_REPARSE_POINT: "
+          + (str(probe_fn(install)) if probe_fn else "<absent on this revision>"))
 
     # 3. the whole installer path, capturing every line a user would see
     staging = M.create_install_staging_dir(install)

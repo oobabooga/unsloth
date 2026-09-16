@@ -193,8 +193,13 @@ def group_a(tmp: Path):
         denied[strategy] = we
         fact(f"A2 {strategy}", f"icacls_rc={rc} rename_ok={ok} winerror={we} :: {msg}")
         restore_acls(d)
-    record("A", "at least one ACL break produces WinError 5 (the PR's premise)",
-           5 in denied.values(), f"per strategy: {denied}")
+    # An elevated token bypasses deny ACEs (MoveFileEx opens directories with backup
+    # semantics), so this can only be shown unprivileged -- the workflow does that in
+    # a separate step. Elevated, record the bypass as a fact rather than a failure.
+    elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    record("A", "ACL denial blocks the rename, or the run is elevated and bypasses it",
+           (5 in denied.values()) or elevated,
+           f"elevated={elevated}; per strategy: {denied}")
     globals()["_ACL_STRATEGY"] = next((s for s, w in denied.items() if w == 5), None)
 
     # A3 -- non-empty destination. Characterized, not asserted: MOVEFILE_REPLACE_EXISTING

@@ -88,7 +88,6 @@ jobs:
             Select-Object -Last 2
           Write-Host "batch logon right now: $((Get-Content $cfg | Select-String 'SeBatchLogonRight'))"
           net user $U /passwordchg:no 2>&1 | Out-Null
-          wmic useraccount where "Name='$U'" set PasswordExpires=FALSE 2>&1 | Out-Null
 
           $py   = (Get-Command python).Source
           $sc   = "C:\pr10182work\acl_user_matrix.py"
