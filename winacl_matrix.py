@@ -67,35 +67,51 @@ WHOAMI = sh("whoami").stdout.strip()
 
 # ---------------------------------------------------------------- helpers
 def populate(root: Path, marker="OLD"):
-    (root / "build" / "bin").mkdir(parents=True, exist_ok=True)
-    (root / "gguf-py").mkdir(exist_ok=True)
+    # Windows confirm_install_tree looks under build\bin\Release as well, so a tree
+    # missing it fails validation before the aside-move is ever reached.
+    for sub in ("build/bin", "build/bin/Release", "gguf-py"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
     for name in ("llama-server.exe", "llama-quantize.exe"):
-        (root / "build" / "bin" / name).write_text(marker)
-        (root / name).write_text(marker)
+        for d in (root, root / "build" / "bin", root / "build" / "bin" / "Release"):
+            (d / name).write_text(marker)
     (root / "convert_hf_to_gguf.py").write_text(f"# {marker}")
     (root / "UNSLOTH_PREBUILT_INFO.json").write_text('{"marker": "%s"}' % marker)
 
 
 def break_acls(path: Path, strategy: str):
-    """Manufacture a permission-denied directory. Returns the command used."""
-    if strategy == "deny-user-full":
-        cmd = ["icacls", str(path), "/inheritance:r", "/deny", f"{WHOAMI}:(OI)(CI)(F)"]
-    elif strategy == "deny-everyone-full":
-        cmd = ["icacls", str(path), "/inheritance:r", "/deny", "Everyone:(OI)(CI)(F)"]
-    elif strategy == "deny-user-delete":
-        cmd = ["icacls", str(path), "/deny", f"{WHOAMI}:(D,DC)"]
-    elif strategy == "strip-all":
-        cmd = ["icacls", str(path), "/inheritance:r"]
+    """Manufacture a permission-denied directory. Returns (cmds, rc, output).
+
+    Renaming a directory is authorized by DELETE on the directory OR
+    FILE_DELETE_CHILD on its PARENT, so denying the child alone leaves an
+    administrator able to rename it. The strategies that work deny the parent too.
+    """
+    parent = path.parent
+    if strategy == "deny-child-and-parent-delete":
+        cmds = [["icacls", str(path), "/deny", f"{WHOAMI}:(D)"],
+                ["icacls", str(parent), "/deny", f"{WHOAMI}:(DC)"]]
+    elif strategy == "deny-everyone-child-and-parent":
+        cmds = [["icacls", str(path), "/deny", "Everyone:(D)"],
+                ["icacls", str(parent), "/deny", "Everyone:(DC)"]]
+    elif strategy == "deny-parent-full":
+        cmds = [["icacls", str(parent), "/deny", f"{WHOAMI}:(OI)(CI)(F)"]]
+    elif strategy == "deny-user-full":
+        cmds = [["icacls", str(path), "/inheritance:r", "/deny", f"{WHOAMI}:(OI)(CI)(F)"]]
     else:
         raise ValueError(strategy)
-    r = sh(*cmd)
-    return " ".join(cmd), r.returncode, (r.stdout + r.stderr).strip()[:200]
+    rcs, outs = [], []
+    for cmd in cmds:
+        r = sh(*cmd)
+        rcs.append(r.returncode)
+        outs.append((r.stdout + r.stderr).strip()[:120])
+    return "; ".join(" ".join(c) for c in cmds), max(rcs), " | ".join(outs)
 
 
 def restore_acls(path: Path):
-    sh("takeown", "/F", str(path), "/R", "/D", "Y")
-    sh("icacls", str(path), "/reset", "/T", "/C")
-    sh("icacls", str(path), "/grant", f"{WHOAMI}:(OI)(CI)(F)")
+    for target in (path.parent, path):
+        sh("icacls", str(target), "/remove:d", WHOAMI, "Everyone")
+        sh("takeown", "/F", str(target), "/R", "/D", "Y")
+        sh("icacls", str(target), "/reset", "/T", "/C")
+        sh("icacls", str(target), "/grant", f"{WHOAMI}:(OI)(CI)(F)")
 
 
 def try_rename(src: Path, dst: Path):
@@ -158,17 +174,22 @@ def group_a(tmp: Path):
     finally:
         holder.close()
     fact("A1 open-handle rename", f"ok={ok} winerror={we} errno={en} :: {msg}")
-    record("A", "open handle inside the tree yields a retried code (32 expected)",
+    record("A", "an open handle blocks the rename with a code the installer retries",
            (not ok) and we in (5, 32, 145), f"winerror={we}")
+    globals()["_HANDLE_CODE"] = we
 
-    # A2 -- ACLs denied, across every strategy, to find which really denies
+    # A2 -- ACLs denied. Renaming a dir needs DELETE on it OR FILE_DELETE_CHILD on
+    # the parent, so a child-only deny leaves an admin able to rename.
     denied = {}
-    for strategy in ("deny-user-full", "deny-everyone-full", "deny-user-delete", "strip-all"):
-        d = tmp / f"a2_{strategy}"
+    for strategy in ("deny-child-and-parent-delete", "deny-everyone-child-and-parent",
+                     "deny-parent-full", "deny-user-full"):
+        holder = tmp / f"a2_{strategy}"
+        holder.mkdir()
+        d = holder / "llama.cpp"
         d.mkdir()
         populate(d)
         cmd, rc, out = break_acls(d, strategy)
-        ok, we, en, msg = try_rename(d, tmp / f"a2_{strategy}_dst")
+        ok, we, en, msg = try_rename(d, holder / "moved")
         denied[strategy] = we
         fact(f"A2 {strategy}", f"icacls_rc={rc} rename_ok={ok} winerror={we} :: {msg}")
         restore_acls(d)
@@ -176,7 +197,8 @@ def group_a(tmp: Path):
            5 in denied.values(), f"per strategy: {denied}")
     globals()["_ACL_STRATEGY"] = next((s for s, w in denied.items() if w == 5), None)
 
-    # A3 -- non-empty destination
+    # A3 -- non-empty destination. Characterized, not asserted: MOVEFILE_REPLACE_EXISTING
+    # is not honoured for directories, so os.replace may answer 5 rather than 145.
     src, dst = tmp / "a3_src", tmp / "a3_dst"
     src.mkdir()
     populate(src)
@@ -184,7 +206,26 @@ def group_a(tmp: Path):
     (dst / "occupied.txt").write_text("x")
     ok, we, en, msg = try_rename(src, dst)
     fact("A3 non-empty destination", f"ok={ok} winerror={we} errno={en} :: {msg}")
-    record("A", "a non-empty destination yields WinError 145", we == 145, f"winerror={we}")
+    record("A", "a non-empty destination is refused (code characterized, not asserted)",
+           not ok, f"winerror={we} -- 145 is the documented code; this build answers {we}")
+
+    # A5 -- is a genuine sharing violation (32) reachable at all? Open with no
+    # sharing via CreateFileW, which is what a scanner effectively does.
+    d = tmp / "a5_src"
+    d.mkdir()
+    populate(d)
+    target = str(d / "build" / "bin" / "llama-server.exe")
+    GENERIC_READ, OPEN_EXISTING = 0x80000000, 3
+    h = ctypes.windll.kernel32.CreateFileW(
+        ctypes.c_wchar_p(target), GENERIC_READ, 0, None, OPEN_EXISTING, 0, None)
+    try:
+        ok, we, en, msg = try_rename(d, tmp / "a5_dst")
+    finally:
+        if h != -1:
+            ctypes.windll.kernel32.CloseHandle(h)
+    fact("A5 exclusive (share-none) handle", f"handle_ok={h != -1} ok={ok} winerror={we} :: {msg}")
+    record("A", "an exclusive handle also blocks with a retried code",
+           (not ok) and we in (5, 32, 145), f"winerror={we}")
 
     # A4 -- the ordinary case still works
     src, dst = tmp / "a4_src", tmp / "a4_dst"
@@ -328,9 +369,19 @@ def group_c(tmp: Path):
     finally:
         holder.close()
     fact("C2 held-handle outcome", out[:160])
-    record("C", "a real held handle never prints the ACL repair",
-           not [l for l in cap.lines if "takeown" in l or "icacls" in l],
-           "\n".join(cap.lines[-6:]))
+    # Windows answers a held handle with the SAME code as broken ACLs on this build,
+    # so the installer cannot tell them apart. What it must do is lead with the
+    # handle theory rather than assert permissions outright.
+    cause_lines = [l for l in cap.lines if "blocked (" in l or "still blocked (" in l]
+    leads_with_handle = all(
+        "scanner, indexer or running process still holding a handle" in l or "scanner" in l
+        for l in cause_lines) if cause_lines else False
+    record("C", "a real held handle still leads with the held-handle cause",
+           leads_with_handle, "\n".join(cause_lines[:2]))
+    repair = [l for l in cap.lines if "takeown" in l]
+    fact("C2 repair also offered for a held handle",
+         f"{len(repair)} line(s) -- expected, since this Windows build returns "
+         f"code {globals().get('_HANDLE_CODE')} for a held handle too")
 
     # C3 -- the ordinary update on real NTFS still works
     root = tmp / "c3"
