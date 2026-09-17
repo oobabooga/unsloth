@@ -287,6 +287,17 @@ def _elf_dependency_report(root: Path, python: str) -> dict:
                                 if ("(RUNPATH)" in ln or "(RPATH)" in ln) and "[" in ln]
         if "ggml-hip" in obj.name or "ggml-cuda" in obj.name or "stable-diffusion" in obj.name:
             entry["gfx"] = _gfx_targets_in(obj)
+            if ldd:
+                # The same question with LD_LIBRARY_PATH removed. A CI job inherits a
+                # prepared environment; a user double-clicking Studio does not, and
+                # "resolves only because this shell was set up for ROCm development"
+                # is a different answer from "resolves on this machine".
+                clean = dict(os.environ)
+                clean.pop("LD_LIBRARY_PATH", None)
+                r = _run([ldd, str(obj)], timeout = 180, env = clean)
+                entry["ldd_clean_env"] = r["output"][-4000:]
+                entry["ldd_clean_env_missing"] = [
+                    ln.strip() for ln in r["output"].splitlines() if "not found" in ln]
         report["files"][str(obj.relative_to(root))] = entry
 
     # The bundle-wide summary a reader wants first: which of the ROCm sonames any
@@ -334,6 +345,21 @@ def _host_rocm_facts() -> dict:
         resolved[soname] = hit
     facts["soname_resolution"] = resolved
     facts["soname_resolved_all"] = all(v for v in resolved.values())
+    # Why a soname can resolve for a process while the ldconfig CACHE does not list
+    # it: an LD_LIBRARY_PATH in the environment, or a search path the cache was
+    # never rebuilt for. Both are recorded so the two readings can be reconciled
+    # instead of one of them being declared the wrong one.
+    facts["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
+    facts["ldconfig_rocm_lines"] = [ln.strip() for ln in cache.splitlines()
+                                    if "rocm" in ln.lower()][:80]
+    confs: dict[str, str] = {}
+    for conf in sorted(Path("/etc/ld.so.conf.d").glob("*.conf")
+                       ) if Path("/etc/ld.so.conf.d").is_dir() else []:
+        try:
+            confs[conf.name] = conf.read_text(encoding = "utf-8").strip()[:500]
+        except Exception as e:  # noqa: BLE001
+            confs[conf.name] = f"unreadable: {type(e).__name__}"
+    facts["ld_so_conf_d"] = confs
     facts["kfd_gfx_target_version"] = None
     for node in sorted(Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties")
                        ) if Path("/sys/class/kfd/kfd/topology/nodes").is_dir() else []:

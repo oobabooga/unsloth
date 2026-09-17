@@ -199,6 +199,13 @@ def table(obs: dict) -> str:
         rows.append(f"| `{soname}` | {'yes' if hit else 'NO'} | `{(hit or '-')[:110]}` |")
     rows.append("")
 
+    rows.append(f"`LD_LIBRARY_PATH` in the probe's environment: "
+                f"`{host.get('LD_LIBRARY_PATH') or '(unset)'}`. ROCm lines in the ldconfig "
+                f"cache: {len(host.get('ldconfig_rocm_lines') or [])}. "
+                f"`/etc/ld.so.conf.d` entries mentioning ROCm: "
+                f"{sorted(k for k, v in (host.get('ld_so_conf_d') or {}).items() if 'rocm' in (k + v).lower()) or 'none'}.")
+    rows.append("")
+
     for accel in ("rocm", "vulkan"):
         dep = (shared.get("dependencies") or {}).get(accel) or {}
         if not dep or dep.get("error"):
@@ -219,6 +226,15 @@ def table(obs: dict) -> str:
                         f"{len(gfx['targets'])} gfx targets carrying {gfx.get('entries')} "
                         f"offload-bundle entries; of the cards at issue it carries {here}. "
                         f"Targets: {', '.join(gfx['targets'])}.")
+            rows.append(f"    `{name}` NEEDED: {entry.get('needed')}. The loader resolves "
+                        f"them to: "
+                        f"{[ln.strip() for ln in (entry.get('ldd') or '').splitlines() if any(s in ln for s in ('hipblas', 'rocblas', 'amdhip64'))]}.")
+            if "ldd_clean_env_missing" in entry:
+                clean = entry["ldd_clean_env_missing"] or [
+                    "nothing, so the resolution is a property of the MACHINE and not of "
+                    "this job's prepared environment"]
+                rows.append("    With `LD_LIBRARY_PATH` removed from the environment, "
+                            "unresolved becomes: " + "; ".join(str(x) for x in clean) + ".")
         rows.append("")
 
     rows.append("**What the real card did** "
@@ -360,17 +376,25 @@ def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
 
     host = _shared(obs).get("host_rocm") or {}
     resolved = {k: bool(v) for k, v in (host.get("soname_resolution") or {}).items()}
-    all_resolved = bool(resolved) and all(resolved.values())
-    runtime = ("every ROCm soname the archive needs resolves here"
-               if all_resolved else
-               f"the ROCm sonames the archive needs resolve as {resolved}")
-    # A build that rendered while its NEEDED sonames read unresolved is a
-    # contradiction in the observations, not a conclusion to draw quietly.
+    # Two readings of the same question, and they can legitimately disagree: the
+    # ldconfig CACHE is a host-wide index, while `ldd` is what the process actually
+    # gets. The loader's answer is the operative one; the cache line is reported
+    # beside it rather than being silently preferred either way.
+    dep = (_shared(obs).get("dependencies") or {}).get("rocm") or {}
+    loader_missing = sorted(k for k, v in (dep.get("rocm_sonames_unresolved") or {}).items() if v)
+    cache_missing = sorted(k for k, v in resolved.items() if not v)
+    all_resolved = not loader_missing
+    if all_resolved and not cache_missing:
+        runtime = "every ROCm soname the archive needs resolves here, cache and loader agreeing"
+    elif all_resolved:
+        runtime = (f"the loader resolves every ROCm soname the archive needs, though the "
+                   f"ldconfig cache does not itself list {cache_missing}")
+    else:
+        runtime = f"the loader cannot resolve {loader_missing} for the archive"
     dependency_reading = (
         "so on this host neither half of the dependency is missing and the defect the PR "
         "targets cannot reproduce" if all_resolved else
-        "which contradicts a successful render and means the soname reading, not the render, "
-        "should be distrusted here")
+        "so the host runtime, not the kernel coverage, is what is missing here")
 
     if rocm_ok:
         return False, (
