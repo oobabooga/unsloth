@@ -7,7 +7,7 @@ on:
 permissions: {}
 
 jobs:
-  ab:
+  fresh-bytes:
     strategy:
       fail-fast: false
       matrix:
@@ -15,77 +15,30 @@ jobs:
           - {name: baseline, repo: "https://github.com/unslothai/unsloth", ref: "1d5210d7a9ec3c42c5f39c12ec25748d8c5287b3"}
           - {name: patched, repo: "https://github.com/oobabooga/unsloth", ref: "mac-dyld-probe-ci"}
     runs-on: macos-15
-    name: ${{ matrix.arm.name }}
+    name: fresh-bytes ${{ matrix.arm.name }}
     timeout-minutes: 120
     env:
       UNSLOTH_SKIP_AUTOSTART: "1"
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Install the current release (what a user has today)
+      - name: Install the current release
         run: |
-          cat > "$RUNNER_TEMP/stamp.pl" <<'P'
-          $|=1; use Time::HiRes qw(time); my $t=time; while(<STDIN>){ printf "%8.2f %s", time-$t, $_ }
-          P
-          mkdir -p "$RUNNER_TEMP/sc"
-          cat > "$RUNNER_TEMP/sc/sitecustomize.py" <<'PY'
-          import os, subprocess, sys, time
-          if "install_llama_prebuilt" in " ".join(sys.argv):
-              _orig = subprocess.run
-              def _run(*a, **k):
-                  cmd = a[0] if a else k.get("args")
-                  s = " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
-                  t = time.time()
-                  try:
-                      return _orig(*a, **k)
-                  finally:
-                      d = time.time() - t
-                      if d > 0.2 or "--version" in s:
-                          sys.stderr.write(f"[subproc-timing] {d:7.2f}s {s[-110:]}\n")
-              subprocess.run = _run
-          PY
           curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/install.sh -o "$RUNNER_TEMP/install.sh"
-          bash "$RUNNER_TEMP/install.sh" </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "llama.cpp  |whisper.cpp  |Installed$" | tail -5
-          ~/.unsloth/studio/unsloth_studio/bin/python -c "import importlib.metadata as m; print('unsloth', m.version('unsloth'))"
-          python3 -c "
-          import json, pathlib
-          p = pathlib.Path.home()/'.unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json'
-          m = json.loads(p.read_text())
-          print('marker runtime_files:', len(m.get('runtime_files') or {}), 'host_profile:', bool(m.get('host_profile')), 'release:', m.get('release_tag'))"
-      - name: Checkout the arm under test
+          bash "$RUNNER_TEMP/install.sh" </dev/null 2>&1 | grep -aE "llama.cpp  |Installed$" | tail -3
+      - name: The arm under test
         run: |
           git clone --quiet --depth 50 "${{ matrix.arm.repo }}" "$RUNNER_TEMP/repo"
           git -C "$RUNNER_TEMP/repo" fetch --quiet origin "${{ matrix.arm.ref }}"
           git -C "$RUNNER_TEMP/repo" checkout --quiet FETCH_HEAD
           git -C "$RUNNER_TEMP/repo" log --oneline -1
-      - name: Update 1 (local checkout)
+      - name: Bytes the OS has never read, then the installer's own check
         run: |
-          export PYTHONPATH="$RUNNER_TEMP/sc" STUDIO_LOCAL_REPO="$RUNNER_TEMP/repo"
+          # A copy is what a new llama.cpp release leaves behind: the same install, in files
+          # macOS has not assessed. The marker (and so its digests) rides along unchanged.
+          cp -R ~/.unsloth/llama.cpp "$RUNNER_TEMP/llama-fresh"
           S=$(python3 -c 'import time;print(time.time())')
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
-          echo "UPDATE1_EXIT=${PIPESTATUS[0]} UPDATE1_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
-      - name: Update 2 (same checkout, nothing to do)
-        continue-on-error: true
-        run: |
-          export PYTHONPATH="$RUNNER_TEMP/sc" STUDIO_LOCAL_REPO="$RUNNER_TEMP/repo"
-          S=$(python3 -c 'import time;print(time.time())')
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
-          echo "UPDATE2_EXIT=${PIPESTATUS[0]} UPDATE2_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
-          echo "--- unfiltered retry"
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | tail -40
-      - name: Fresh llama.cpp bytes, then update (the release-bump case)
-        continue-on-error: true
-        run: |
-          export PYTHONPATH="$RUNNER_TEMP/sc" STUDIO_LOCAL_REPO="$RUNNER_TEMP/repo"
-          python3 - <<'PY'
-          import pathlib, shutil
-          home = pathlib.Path.home()/'.unsloth'
-          src, dst = home/'llama.cpp', home/'llama.cpp.copy'
-          shutil.rmtree(dst, ignore_errors=True)
-          shutil.copytree(src, dst, symlinks=True)
-          shutil.rmtree(src)
-          dst.rename(src)
-          print('llama.cpp re-written from a copy')
-          PY
-          S=$(python3 -c 'import time;print(time.time())')
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|Error|error|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
-          echo "UPDATE3_EXIT=${PIPESTATUS[0]} UPDATE3_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
+          (cd "$RUNNER_TEMP/repo/studio" && ~/.unsloth/studio/unsloth_studio/bin/python install_llama_prebuilt.py \
+             --install-dir "$RUNNER_TEMP/llama-fresh" --llama-tag latest \
+             --published-repo unslothai/llama.cpp > "$RUNNER_TEMP/helper.log" 2>&1)
+          echo "HELPER_EXIT=$? HELPER_WALL=$(python3 -c "import time;print(round(time.time()-$S,2))")"
+          grep -aE "skipping the dyld|already matches|existing install reused" "$RUNNER_TEMP/helper.log" | cut -c1-160
