@@ -65,6 +65,17 @@ jobs:
           # A copy is what a new llama.cpp release leaves behind: the same install, in files
           # macOS has not assessed. The marker, and so its digests, rides along unchanged.
           cp -R ~/.unsloth/llama.cpp "$RUNNER_TEMP/llama-fresh"
+          # An install made by 2026.9.4 or older recorded no host_profile, so the no-network
+          # fast path declines and the release walk runs. Every arm pays the load probe here,
+          # which leaves the walk as the only difference between them.
+          python3 - <<'PY2'
+          import json, os, pathlib
+          p = pathlib.Path(os.environ["RUNNER_TEMP"])/"llama-fresh/UNSLOTH_PREBUILT_INFO.json"
+          m = json.loads(p.read_text())
+          m.pop("host_profile", None)
+          p.write_text(json.dumps(m, indent = 2) + "\n")
+          print("host_profile removed from the marker")
+          PY2
           export PYTHONPATH="$RUNNER_TEMP/sc"
           S=$(python3 -c 'import time;print(time.time())')
           (cd "$RUNNER_TEMP/repo/studio" && ~/.unsloth/studio/unsloth_studio/bin/python install_llama_prebuilt.py \
