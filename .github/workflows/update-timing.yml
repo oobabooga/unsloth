@@ -1,0 +1,48 @@
+name: Update timing CI
+
+on:
+  push:
+    branches: [update-timing-ci]
+
+permissions: {}
+
+jobs:
+  timing:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+        pair:
+          - {name: "9.4-to-latest", commit: 191b69c12b, pin: "unsloth==2026.9.4\nunsloth-zoo==2026.9.3", update_pin: ""}
+          - {name: "9.2-to-9.4", commit: dddd2d6542, pin: "unsloth==2026.9.2\nunsloth-zoo==2026.9.1", update_pin: "unsloth==2026.9.4\nunsloth-zoo==2026.9.3"}
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} ${{ matrix.pair.name }}
+    timeout-minutes: 90
+    env:
+      UNSLOTH_SKIP_AUTOSTART: "1"
+    steps:
+      - name: Old install
+        run: |
+          cat > "$RUNNER_TEMP/stamp.pl" <<'P'
+          $|=1; use Time::HiRes qw(time); my $t=time; while(<STDIN>){ printf "%8.2f %s", time-$t, $_ }
+          P
+          curl -fsSL "https://raw.githubusercontent.com/unslothai/unsloth/${{ matrix.pair.commit }}/install.sh" -o "$RUNNER_TEMP/install_old.sh"
+          printf "${{ matrix.pair.pin }}\n" > "$RUNNER_TEMP/old.txt"
+          export UV_CONSTRAINT="$RUNNER_TEMP/old.txt"
+          S=$(date +%s); bash "$RUNNER_TEMP/install_old.sh" </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -v ' warning: .*upload date'
+          echo "INSTALL_WALL=$(( $(date +%s) - S ))"
+          ~/.unsloth/studio/unsloth_studio/bin/python -m pip --version || true
+          ~/.unsloth/studio/unsloth_studio/bin/python -c "import importlib.metadata as m; print('unsloth', m.version('unsloth'), 'zoo', m.version('unsloth-zoo'))"
+      - name: Update 1 (old to new)
+        run: |
+          if [ -n "${{ matrix.pair.update_pin }}" ]; then printf "${{ matrix.pair.update_pin }}\n" > "$RUNNER_TEMP/new.txt"; export UV_CONSTRAINT="$RUNNER_TEMP/new.txt"; fi
+          S=$(python3 -c 'import time;print(time.time())')
+          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl"
+          echo "UPDATE1_EXIT=${PIPESTATUS[0]} UPDATE1_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
+          ~/.unsloth/studio/unsloth_studio/bin/python -c "import importlib.metadata as m; print('unsloth', m.version('unsloth'), 'zoo', m.version('unsloth-zoo'))"
+      - name: Update 2 (no-op)
+        run: |
+          if [ -n "${{ matrix.pair.update_pin }}" ]; then export UV_CONSTRAINT="$RUNNER_TEMP/new.txt"; fi
+          S=$(python3 -c 'import time;print(time.time())')
+          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl"
+          echo "UPDATE2_EXIT=${PIPESTATUS[0]} UPDATE2_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
