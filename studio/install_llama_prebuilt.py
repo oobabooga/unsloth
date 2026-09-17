@@ -5802,7 +5802,11 @@ def macos_dyld_load_issues(
 
 
 def preflight_macos_installed_binaries(
-    binaries: Iterable[Path], install_dir: Path, host: HostInfo
+    binaries: Iterable[Path],
+    install_dir: Path,
+    host: HostInfo,
+    *,
+    load_probe: bool = True,
 ) -> None:
     """Reject a macos prebuilt whose minimum-OS is newer than the host, or that
     dyld will not load at all. The upstream selector pins a loadable release up
@@ -5827,6 +5831,13 @@ def preflight_macos_installed_binaries(
             raise PrebuiltFallback(
                 "macos prebuilt requires a newer macOS than this host:\n" + "\n".join(issues)
             )
+    if not load_probe:
+        # The caller holds a digest match against a record only a run that had just loaded
+        # these binaries could have written, so dyld has already answered for these exact
+        # bytes on this host. The static minos read above still runs: it is a header read,
+        # and it is the check that catches a bundle built for a newer macOS.
+        log("installed binaries match their recorded digests; skipping the dyld load probe")
+        return
     load_issues = macos_dyld_load_issues(binaries, install_dir, host)
     if load_issues:
         raise PrebuiltFallback(
@@ -7708,6 +7719,11 @@ def runtime_file_records(
     *patterns* comes from runtime_patterns_for_install_kind for the bundle being
     installed; without it only the binary tier is recorded, which is what the callers
     that have no bundle in hand (a bare re-record) can honestly say.
+
+    Both writers call this AFTER the platform preflights passed on the same bytes, which is
+    what lets preflight_macos_installed_binaries skip its `--version` spawn on a later digest
+    match. Record these digests somewhere that has not just loaded the binaries and that skip
+    starts blessing bytes nothing probed.
     """
     records: dict[str, dict[str, Any]] = {}
     runtime_dir = install_runtime_dir(install_dir, host) if host is not None else None
@@ -7744,6 +7760,35 @@ def runtime_file_records(
             return {}
         records[relative] = record
     return records
+
+
+def _macos_load_record_is_current(marker: "dict[str, Any] | None", host: HostInfo) -> bool:
+    """Whether a previous run already asked dyld about the recorded bytes on THIS host.
+
+    The byte record is only ever written by a run that had just loaded the binaries it
+    hashes (see runtime_file_records), so a digest match means the `--version` spawn would
+    re-ask a question already answered -- and on macOS that spawn costs 20-45 s the first
+    time the OS reads a newly written binary, on every update, for an install nothing has
+    touched. host_profile is required with it: it carries macos_version, so an OS move --
+    the one way a loadable bundle stops loading without a byte changing -- takes the probe
+    again. A marker with no record or no profile (every pre-#10648 install, including the
+    ones #9843 was written for) is not evidence and probes as before, as does a run with
+    UNSLOTH_PREBUILT_FULL_CHECK set.
+
+    Callers must still confirm the digests themselves; this only says the record can answer.
+    """
+    if not host.is_macos or prebuilt_full_check_requested():
+        return False
+    if not _runtime_files_are_recorded(marker):
+        return False
+    recorded_profile = (marker or {}).get("host_profile")
+    return isinstance(recorded_profile, dict) and recorded_profile == host_profile(host)
+
+
+def _runtime_files_are_recorded(marker: "dict[str, Any] | None") -> bool:
+    """Whether the marker carries a byte record at all, so _runtime_files_match can answer."""
+    recorded = (marker or {}).get("runtime_files")
+    return isinstance(recorded, dict) and bool(recorded)
 
 
 def _runtime_files_match(install_dir: Path, host: HostInfo, marker: "dict[str, Any]") -> bool:
@@ -8298,15 +8343,23 @@ def existing_install_current_without_plan(
     ]
     if not all(os.access(binary, os.X_OK) for binary in binaries):
         return False
+    # (6) the bytes are the ones that were installed. Before the preflights, not after: on
+    # macOS the loader preflight IS a `--version` spawn, and a digest match plus the recorded
+    # verdict answers the same question without paying the OS's first-launch scan again.
+    if not _runtime_files_match(install_dir, host, marker):
+        return False
     try:
         # Kept, unlike the --version spawns: a preflight answers whether the OS can LOAD the image,
-        # which a hash cannot.
+        # which a hash cannot -- except for the one case above, where a prior run already asked
+        # dyld about these exact bytes on this host.
         preflight_linux_installed_binaries(binaries, install_dir, host)
-        preflight_macos_installed_binaries(binaries, install_dir, host)
+        preflight_macos_installed_binaries(
+            binaries,
+            install_dir,
+            host,
+            load_probe = not _macos_load_record_is_current(marker, host),
+        )
     except Exception:  # noqa: BLE001
-        return False
-    # (6) and the bytes are the ones that were installed.
-    if not _runtime_files_match(install_dir, host, marker):
         return False
     # The one backfill that is not a release change, so it has to be asked separately.
     if _diffusion_visual_server_missing_for_marker(install_dir, host, marker):
@@ -8475,7 +8528,8 @@ def _existing_install_runs(install_dir: Path, host: HostInfo) -> bool:
         return False
     if not _kept_install_payload_is_healthy(install_dir, host):
         return False
-    recorded_runtime_line = (load_prebuilt_metadata(install_dir) or {}).get("runtime_line")
+    marker = load_prebuilt_metadata(install_dir) or {}
+    recorded_runtime_line = marker.get("runtime_line")
     if not isinstance(recorded_runtime_line, str):
         recorded_runtime_line = None
     runtime_dir = install_runtime_dir(install_dir, host)
@@ -8483,12 +8537,23 @@ def _existing_install_runs(install_dir: Path, host: HostInfo) -> bool:
     binaries = [runtime_dir / f"llama-{name}{ext}" for name in ("server", "quantize")]
     if not all(os.access(binary, os.X_OK) for binary in binaries):
         return False
+    # A digest match is what the spawns below are for: an image that cannot start is a
+    # truncated, replaced or non-executable file, and the recorded digests say these are the
+    # bytes a run that had just started them wrote. macOS charges 20-45 s for the first
+    # `--version` against a newly written binary, so re-asking is the whole cost of this check.
+    recorded_bytes_intact = _macos_load_record_is_current(marker, host) and _runtime_files_match(
+        install_dir, host, marker
+    )
     try:
         # Each preflight is a no-op outside its platform.
         preflight_linux_installed_binaries(binaries, install_dir, host)
-        preflight_macos_installed_binaries(binaries, install_dir, host)
+        preflight_macos_installed_binaries(
+            binaries, install_dir, host, load_probe = not recorded_bytes_intact
+        )
     except Exception:
         return False
+    if recorded_bytes_intact:
+        return True
     # Root copies first: _find_llama_server_binary reaches them first, and without a
     # symlink they can rot alone.
     probes: list[Path] = []
@@ -8545,9 +8610,11 @@ def existing_install_matches_choice(
     # Windows has no image-reading preflight, so a truncated llama-server.exe kept its fingerprint
     # match. Only a marker carrying the record is held to it.
     recorded_files = metadata.get("runtime_files")
+    runtime_files_matched = False
     if isinstance(recorded_files, dict) and recorded_files:
         if not _runtime_files_match(install_dir, host, metadata):
             return False
+        runtime_files_matched = True
     elif not (host.is_linux or host.is_macos):
         # The migration run, on the one platform with no loader preflight below: a pre-record
         # marker has no digest, so damaged bytes would become the reference they are later
@@ -8583,6 +8650,9 @@ def existing_install_matches_choice(
                 [runtime_dir / "llama-server", runtime_dir / "llama-quantize"],
                 install_dir,
                 host,
+                load_probe = not (
+                    runtime_files_matched and _macos_load_record_is_current(metadata, host)
+                ),
             )
         except Exception:
             return False
