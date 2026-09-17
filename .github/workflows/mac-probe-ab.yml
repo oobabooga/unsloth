@@ -64,12 +64,16 @@ jobs:
           ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
           echo "UPDATE1_EXIT=${PIPESTATUS[0]} UPDATE1_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
       - name: Update 2 (same checkout, nothing to do)
+        continue-on-error: true
         run: |
           export PYTHONPATH="$RUNNER_TEMP/sc" STUDIO_LOCAL_REPO="$RUNNER_TEMP/repo"
           S=$(python3 -c 'import time;print(time.time())')
           ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
           echo "UPDATE2_EXIT=${PIPESTATUS[0]} UPDATE2_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
+          echo "--- unfiltered retry"
+          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | tail -40
       - name: Fresh llama.cpp bytes, then update (the release-bump case)
+        continue-on-error: true
         run: |
           export PYTHONPATH="$RUNNER_TEMP/sc" STUDIO_LOCAL_REPO="$RUNNER_TEMP/repo"
           python3 - <<'PY'
@@ -83,5 +87,5 @@ jobs:
           print('llama.cpp re-written from a copy')
           PY
           S=$(python3 -c 'import time;print(time.time())')
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
+          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update --local -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|Error|error|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|skipping the dyld|already matches|existing install (reused|detected)" | cut -c1-200
           echo "UPDATE3_EXIT=${PIPESTATUS[0]} UPDATE3_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
