@@ -7,15 +7,17 @@ on:
 permissions: {}
 
 jobs:
-  fresh-bytes:
+  isolate:
     strategy:
       fail-fast: false
       matrix:
         arm:
-          - {name: baseline, repo: "https://github.com/unslothai/unsloth", ref: "1d5210d7a9ec3c42c5f39c12ec25748d8c5287b3"}
-          - {name: patched, repo: "https://github.com/oobabooga/unsloth", ref: "mac-dyld-probe-ci"}
+          - {name: "1-baseline", repo: "https://github.com/unslothai/unsloth", ref: "1d5210d7a9ec3c42c5f39c12ec25748d8c5287b3"}
+          - {name: "2-probe-only", repo: "https://github.com/oobabooga/unsloth", ref: "mac-probe-only-ci"}
+          - {name: "3-lazy-only", repo: "https://github.com/oobabooga/unsloth", ref: "mac-lazy-only-ci"}
+          - {name: "4-both", repo: "https://github.com/oobabooga/unsloth", ref: "mac-dyld-probe-ci"}
     runs-on: macos-15
-    name: fresh-bytes ${{ matrix.arm.name }}
+    name: ${{ matrix.arm.name }}
     timeout-minutes: 120
     env:
       UNSLOTH_SKIP_AUTOSTART: "1"
@@ -31,14 +33,43 @@ jobs:
           git -C "$RUNNER_TEMP/repo" fetch --quiet origin "${{ matrix.arm.ref }}"
           git -C "$RUNNER_TEMP/repo" checkout --quiet FETCH_HEAD
           git -C "$RUNNER_TEMP/repo" log --oneline -1
-      - name: Bytes the OS has never read, then the installer's own check
+      - name: Count what the check costs
         run: |
+          # Count every HTTP request by host, and time each subprocess the installer spawns.
+          mkdir -p "$RUNNER_TEMP/sc"
+          cat > "$RUNNER_TEMP/sc/sitecustomize.py" <<'PY'
+          import atexit, subprocess, sys, time, urllib.request
+          if "install_llama_prebuilt" in " ".join(sys.argv):
+              hosts = {}
+              _open = urllib.request.OpenerDirector.open
+              def _counted_open(self, fullurl, *a, **k):
+                  url = fullurl if isinstance(fullurl, str) else fullurl.full_url
+                  host = url.split("/")[2] if "//" in url else url
+                  hosts[host] = hosts.get(host, 0) + 1
+                  return _open(self, fullurl, *a, **k)
+              urllib.request.OpenerDirector.open = _counted_open
+              _run = subprocess.run
+              def _timed_run(*a, **k):
+                  cmd = a[0] if a else k.get("args")
+                  s = " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
+                  t = time.time()
+                  try:
+                      return _run(*a, **k)
+                  finally:
+                      d = time.time() - t
+                      if "--version" in s:
+                          sys.stderr.write(f"[spawn] {d:7.2f}s {s[-90:]}\n")
+              subprocess.run = _timed_run
+              atexit.register(lambda: sys.stderr.write(f"[requests] {sorted(hosts.items())}\n"))
+          PY
           # A copy is what a new llama.cpp release leaves behind: the same install, in files
-          # macOS has not assessed. The marker (and so its digests) rides along unchanged.
+          # macOS has not assessed. The marker, and so its digests, rides along unchanged.
           cp -R ~/.unsloth/llama.cpp "$RUNNER_TEMP/llama-fresh"
+          export PYTHONPATH="$RUNNER_TEMP/sc"
           S=$(python3 -c 'import time;print(time.time())')
           (cd "$RUNNER_TEMP/repo/studio" && ~/.unsloth/studio/unsloth_studio/bin/python install_llama_prebuilt.py \
              --install-dir "$RUNNER_TEMP/llama-fresh" --llama-tag latest \
              --published-repo unslothai/llama.cpp > "$RUNNER_TEMP/helper.log" 2>&1)
-          echo "HELPER_EXIT=$? HELPER_WALL=$(python3 -c "import time;print(round(time.time()-$S,2))")"
-          grep -aE "skipping the dyld|already matches|existing install reused" "$RUNNER_TEMP/helper.log" | cut -c1-160
+          echo "EXIT=$? WALL=$(python3 -c "import time;print(round(time.time()-$S,2))")"
+          echo "releases_resolved=$(grep -ac 'published_release: tag=' "$RUNNER_TEMP/helper.log")"
+          grep -aE "^\[spawn\]|^\[requests\]|skipping the dyld|already matches|existing install reused" "$RUNNER_TEMP/helper.log" | cut -c1-200
