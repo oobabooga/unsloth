@@ -34,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace as dataclasses_replace
 
@@ -1359,7 +1360,7 @@ def resolve_simple_install_release_plans(
     published_release_tag: str,
     *,
     max_release_fallbacks: int = DEFAULT_MAX_PREBUILT_RELEASE_FALLBACKS,
-) -> tuple[str, list[InstallReleasePlan]]:
+) -> "tuple[str, Sequence[InstallReleasePlan]]":
     repo = published_repo or DEFAULT_PUBLISHED_REPO
     # The fork (unslothai) ships a manifest describing every bundle's GPU/arch
     # coverage, so all fork hosts select from it. Upstream (ggml-org) ships no
@@ -2264,6 +2265,7 @@ def iter_resolved_published_releases(
     published_release_tag: str = "",
     *,
     allow_download_host_fast_path: bool = True,
+    continue_after_fast_path: bool = False,
 ) -> Iterable[ResolvedPublishedRelease]:
     repo = published_repo or DEFAULT_PUBLISHED_REPO
     normalized_requested = normalized_requested_llama_tag(requested_tag)
@@ -2281,9 +2283,10 @@ def iter_resolved_published_releases(
     elif normalized_requested == "latest":
         fast_path_tag = ""
 
+    fast_path_release_tag: str | None = None
     if (
         fast_path_tag is not None
-        and allow_download_host_fast_path
+        and (allow_download_host_fast_path or continue_after_fast_path)
         and repo == DEFAULT_PUBLISHED_REPO
         and _download_host_resolve_enabled()
     ):
@@ -2308,7 +2311,13 @@ def iter_resolved_published_releases(
                     f"{resolved.bundle.upstream_tag}, but requested {normalized_requested}"
                 )
             yield resolved
-            return
+            if not continue_after_fast_path:
+                return
+            # The caller may still need an older release (macOS walking past a run of
+            # too-new prebuilts). The CDN only surfaces the newest, so the API listing
+            # below supplies the rest -- and is reached only when the newest was
+            # rejected, which is what keeps an ordinary update off api.github.com.
+            fast_path_release_tag = resolved.bundle.release_tag
 
     if published_release_tag:
         bundle = pinned_published_release_bundle(repo, published_release_tag)
@@ -2324,11 +2333,14 @@ def iter_resolved_published_releases(
         )
         return
 
-    matched_any = False
+    matched_any = fast_path_release_tag is not None
     skipped_invalid = 0
-    yielded_valid = False
+    yielded_valid = fast_path_release_tag is not None
     for bundle in iter_published_release_bundles(repo):
         if not published_release_matches_request(bundle, normalized_requested):
+            continue
+        if fast_path_release_tag is not None and bundle.release_tag == fast_path_release_tag:
+            # Already yielded from the download host, and rejected by the caller.
             continue
         matched_any = True
         try:
@@ -6849,6 +6861,76 @@ def _linux_published_attempts(host: HostInfo, bundle: PublishedReleaseBundle) ->
     return attempts
 
 
+class LazyReleasePlans(Sequence):
+    """Release plans resolved one at a time, as the installer asks for them.
+
+    Every plan costs two network reads (the release's manifest and its checksum asset),
+    and all but the first are used only if the one before it is REJECTED -- a bundle that
+    downloads and then fails validation, or, on macOS, one built for a newer OS than this
+    host. Resolving the whole walk-back up front therefore spends 15 pairs of requests on
+    an ordinary update to discard them: measured at 5-19 s on macOS, where the walk is 16
+    releases deep, and it is the reason that platform took the api.github.com path at all.
+
+    The first plan is materialized by the resolver, inside the caller's transport-error
+    handling, so a rate-limited or unreachable release listing still fails exactly where
+    it did before. Only the tail is deferred.
+
+    A Sequence, not a generator, because the consumers index it, test it for emptiness and
+    re-read it; ``len()`` and negative indexing resolve the whole walk-back, so the
+    installer asks ``has_index`` instead when all it needs to know is whether one more
+    plan exists.
+    """
+
+    def __init__(self, plans: "Iterable[InstallReleasePlan]") -> None:
+        self._source: "Iterator[InstallReleasePlan] | None" = iter(plans)
+        self._resolved: list[InstallReleasePlan] = []
+
+    def _resolve_through(self, index: int) -> bool:
+        """Resolve up to and including *index*; False once the source runs out."""
+        while len(self._resolved) <= index:
+            if self._source is None:
+                return False
+            try:
+                self._resolved.append(next(self._source))
+            except StopIteration:
+                self._source = None
+                return False
+        return True
+
+    def has_index(self, index: int) -> bool:
+        """Whether a plan exists at *index*, resolving at most one more to answer."""
+        return index >= 0 and self._resolve_through(index)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice) or index < 0:
+            self._resolve_through(sys.maxsize)
+            return self._resolved[index]
+        if not self._resolve_through(index):
+            raise IndexError(index)
+        return self._resolved[index]
+
+    def __len__(self) -> int:
+        self._resolve_through(sys.maxsize)
+        return len(self._resolved)
+
+    def __iter__(self):
+        index = 0
+        while self._resolve_through(index):
+            yield self._resolved[index]
+            index += 1
+
+    def __bool__(self) -> bool:
+        return self._resolve_through(0)
+
+
+def _has_release_plan(plans: "Sequence[InstallReleasePlan]", index: int) -> bool:
+    """Whether *plans* has an entry at *index*, without resolving the rest of the walk."""
+    has_index = getattr(plans, "has_index", None)
+    if callable(has_index):
+        return bool(has_index(index))
+    return 0 <= index < len(plans)
+
+
 def _fork_manifest_release_plans(
     llama_tag: str,
     host: HostInfo,
@@ -6856,7 +6938,7 @@ def _fork_manifest_release_plans(
     published_release_tag: str,
     *,
     max_release_fallbacks: int = DEFAULT_MAX_PREBUILT_RELEASE_FALLBACKS,
-) -> tuple[str, list[InstallReleasePlan]]:
+) -> "tuple[str, Sequence[InstallReleasePlan]]":
     """Manifest-reading branch of resolve_simple_install_release_plans, used for
     every fork host: all of the fork's bundles describe their GPU/arch coverage
     in llama-prebuilt-manifest.json rather than in the asset filename (CPU,
@@ -6868,74 +6950,95 @@ def _fork_manifest_release_plans(
     # version is known; otherwise keep the default (cannot tell up front).
     if host.is_macos and allow_older_release_fallback and host.macos_version is not None:
         release_limit = max(release_limit, DEFAULT_MAX_MACOS_RELEASE_FALLBACKS)
-    plans: list[InstallReleasePlan] = []
-    last_error: PrebuiltFallback | None = None
-    # The newest release this host could not take, if the first plan is an older one.
-    skipped_newest: str | None = None
 
-    for resolved_release in iter_resolved_published_releases(
-        llama_tag,
-        published_repo,
-        published_release_tag,
-        # macOS relies on the multi-release walk-back to skip too-new prebuilts,
-        # which the single-latest download-host path cannot provide.
-        allow_download_host_fast_path = not host.is_macos,
-    ):
-        bundle = resolved_release.bundle
-        checksums = resolved_release.checksums
-        resolved_tag = bundle.upstream_tag
-        try:
-            if host.is_linux:
-                linux_attempts = _linux_published_attempts(host, bundle)
-                if not linux_attempts:
-                    raise PrebuiltFallback("no compatible Linux prebuilt asset was found")
-                attempts = apply_approved_hashes(linux_attempts, checksums)
-                if not attempts:
-                    raise PrebuiltFallback("no compatible Linux prebuilt asset was found")
-                if attempts[0].selection_log:
-                    log_lines(attempts[0].selection_log)
-            else:
-                attempts = resolve_release_asset_choice(
-                    host,
-                    resolved_tag,
-                    bundle,
-                    checksums,
+    def _plans() -> "Iterator[InstallReleasePlan]":
+        """Yield each usable release plan as it resolves.
+
+        One plan is one manifest read plus one checksum read, and everything after the
+        first is consumed only when the plan before it is rejected. Yielding keeps that
+        cost where the need is; the caller materializes the first plan eagerly.
+        """
+        resolved_count = 0
+        last_error: PrebuiltFallback | None = None
+        # The newest release this host could not take, if the first plan is an older one.
+        skipped_newest: str | None = None
+
+        for resolved_release in iter_resolved_published_releases(
+            llama_tag,
+            published_repo,
+            published_release_tag,
+            # macOS needs the multi-release walk-back to skip too-new prebuilts, which the
+            # single-latest download-host path cannot provide -- but the newest release is
+            # what it installs on every ordinary update, so take that one from the CDN and
+            # reach api.github.com only if this host cannot use it.
+            allow_download_host_fast_path = not host.is_macos,
+            continue_after_fast_path = host.is_macos,
+        ):
+            bundle = resolved_release.bundle
+            checksums = resolved_release.checksums
+            resolved_tag = bundle.upstream_tag
+            try:
+                if host.is_linux:
+                    linux_attempts = _linux_published_attempts(host, bundle)
+                    if not linux_attempts:
+                        raise PrebuiltFallback("no compatible Linux prebuilt asset was found")
+                    attempts = apply_approved_hashes(linux_attempts, checksums)
+                    if not attempts:
+                        raise PrebuiltFallback("no compatible Linux prebuilt asset was found")
+                    if attempts[0].selection_log:
+                        log_lines(attempts[0].selection_log)
+                else:
+                    attempts = resolve_release_asset_choice(
+                        host,
+                        resolved_tag,
+                        bundle,
+                        checksums,
+                    )
+                    if not attempts:
+                        raise PrebuiltFallback("no compatible prebuilt asset was found")
+                    if attempts[0].selection_log:
+                        log_lines(attempts[0].selection_log)
+            except PrebuiltFallback as exc:
+                last_error = exc
+                if not allow_older_release_fallback:
+                    raise
+                log(
+                    "published release skipped for install planning: "
+                    f"{bundle.repo}@{bundle.release_tag} upstream_tag={resolved_tag} ({exc})"
                 )
-                if not attempts:
-                    raise PrebuiltFallback("no compatible prebuilt asset was found")
-                if attempts[0].selection_log:
-                    log_lines(attempts[0].selection_log)
-        except PrebuiltFallback as exc:
-            last_error = exc
-            if not allow_older_release_fallback:
-                raise
-            log(
-                "published release skipped for install planning: "
-                f"{bundle.repo}@{bundle.release_tag} upstream_tag={resolved_tag} ({exc})"
-            )
-            if not plans and skipped_newest is None:
-                skipped_newest = bundle.release_tag
-            continue
+                if resolved_count == 0 and skipped_newest is None:
+                    skipped_newest = bundle.release_tag
+                continue
 
-        plans.append(
-            InstallReleasePlan(
+            yield InstallReleasePlan(
                 requested_tag = requested_tag,
                 llama_tag = resolved_tag,
                 release_tag = bundle.release_tag,
                 attempts = attempts,
                 approved_checksums = checksums,
-                walk_back = _core.walk_back_for(host, skipped_newest) if not plans else None,
+                walk_back = (
+                    _core.walk_back_for(host, skipped_newest) if resolved_count == 0 else None
+                ),
             )
-        )
+            resolved_count += 1
 
-        if not allow_older_release_fallback or len(plans) >= release_limit:
-            break
+            if not allow_older_release_fallback or resolved_count >= release_limit:
+                return
 
-    if plans:
-        return requested_tag, plans
-    if last_error is not None:
-        raise last_error
-    raise PrebuiltFallback("no installable published llama.cpp releases were found")
+        if resolved_count:
+            return
+        if last_error is not None:
+            raise last_error
+        raise PrebuiltFallback("no installable published llama.cpp releases were found")
+
+    plans = LazyReleasePlans(_plans())
+    # Forced here, not at first use: the caller converts a rate-limited or unreachable
+    # release listing into a source build, and it can only do that while this call is on
+    # the stack. An empty walk raises from inside the generator, as it did when this
+    # function built the whole list.
+    if not plans:
+        raise PrebuiltFallback("no installable published llama.cpp releases were found")
+    return requested_tag, plans
 
 
 def persisted_llama_backend(llama_backend: str | None, choice: AssetChoice) -> str | None:
@@ -9791,7 +9894,9 @@ class BackendSelection:
     published_repo: str
     published_release_tag: str
     requested_tag: str
-    release_plans: list[InstallReleasePlan]
+    # Lazy on the fork path (LazyReleasePlans): index it, test it, iterate it, but reach
+    # for len() only when the whole walk-back is genuinely needed.
+    release_plans: "Sequence[InstallReleasePlan]"
     persist_llama_backend: str | None
     persist_rocm_gfx: str | None
 
@@ -10226,19 +10331,7 @@ def install_prebuilt(
                     work_dir / "stories260K.gguf",
                     validation_model_cache_path(install_dir),
                 )
-                # Same reason as the per-candidate guard in validate_prebuilt_attempts,
-                # one level up: the per-release handler below also swallows
-                # PrebuiltFallback and moves to an older plan, so a probe failure raised
-                # inside it would install an older llama.cpp over a transient 429. The
-                # probe is independent of which release was picked, so resolve it once
-                # here when any plan will smoke-test.
-                if staged_validation_enabled() or any(
-                    attempt.expected_sha256 is None
-                    for release_plan in release_plans
-                    for attempt in release_plan.attempts
-                ):
-                    probe = resolve_validation_model(probe)
-                release_count = len(release_plans)
+                probe_resolved = False
                 for release_index, plan in enumerate(release_plans):
                     choice = plan.attempts[0]
                     backfill = diffusion_visual_server_backfill_needed(install_dir, host, choice)
@@ -10261,6 +10354,18 @@ def install_prebuilt(
                         f"{choice.name} ({choice.source_label}) from published release "
                         f"{plan.release_tag} for {host.system} {host.machine}"
                     )
+                    # Outside the handler below, as before: it swallows PrebuiltFallback
+                    # and moves to an older plan, so a probe failure raised inside it would
+                    # install an older llama.cpp over a transient 429. Resolved per plan
+                    # rather than for all of them up front, since asking whether a LATER
+                    # plan needs the probe would resolve that plan -- the fetch this path
+                    # exists to defer. The probe is release-independent, so once is enough.
+                    if not probe_resolved and (
+                        staged_validation_enabled()
+                        or any(attempt.expected_sha256 is None for attempt in plan.attempts)
+                    ):
+                        probe = resolve_validation_model(probe)
+                        probe_resolved = True
                     try:
                         choice, selected_staging_dir, _ = validate_prebuilt_attempts(
                             plan.attempts,
@@ -10290,7 +10395,9 @@ def install_prebuilt(
                     except PrebuiltFallback as exc:
                         if _environment_fatal_reason(exc):
                             raise
-                        if release_index == release_count - 1:
+                        # has_index, not len(): the question is whether ONE more plan
+                        # exists, and len() would resolve the entire walk-back to answer it.
+                        if not _has_release_plan(release_plans, release_index + 1):
                             raise
                         log(
                             "published release "
