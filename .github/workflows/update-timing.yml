@@ -11,10 +11,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-24.04]
-        walk: ["default", "1"]
+        os: [macos-15]
+        probe: ["on", "off", "manual"]
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.os }} walk=${{ matrix.walk }}
+    name: ${{ matrix.os }} probe=${{ matrix.probe }}
     timeout-minutes: 90
     env:
       UNSLOTH_SKIP_AUTOSTART: "1"
@@ -27,24 +27,35 @@ jobs:
           P
           curl -fsSL "https://raw.githubusercontent.com/unslothai/unsloth/191b69c12b/install.sh" -o "$RUNNER_TEMP/install_old.sh"
           printf "unsloth==2026.9.4\nunsloth-zoo==2026.9.3\n" > "$RUNNER_TEMP/old.txt"
-          UV_CONSTRAINT="$RUNNER_TEMP/old.txt" bash "$RUNNER_TEMP/install_old.sh" </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -E "llama|EXIT|Installed" | grep -v published_ | tail -8
-          cp -R ~/.unsloth "$RUNNER_TEMP/pristine"
-      - name: Helper only, 3 runs on the old install's llama.cpp
+          UV_CONSTRAINT="$RUNNER_TEMP/old.txt" bash "$RUNNER_TEMP/install_old.sh" </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -E "llama.cpp  |EXIT|Installed" | tail -4
+          mkdir -p "$RUNNER_TEMP/sc"
+          cat > "$RUNNER_TEMP/sc/sitecustomize.py" <<'PY'
+          import os, subprocess, sys, time
+          _mode = os.environ.get("PROBE_MODE", "")
+          if _mode and "install_llama_prebuilt" in " ".join(sys.argv):
+              _orig = subprocess.run
+              def _run(*a, **k):
+                  cmd = a[0] if a else k.get("args")
+                  s = " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
+                  if _mode == "off" and s.endswith("--version") and "llama.cpp" in s:
+                      sys.stderr.write(f"[subproc-timing] SKIPPED {s}\n")
+                      return subprocess.CompletedProcess(cmd, 0, "", "")
+                  t = time.time()
+                  try:
+                      return _orig(*a, **k)
+                  finally:
+                      sys.stderr.write(f"[subproc-timing] {time.time()-t:7.2f}s {s[-120:]}\n")
+              subprocess.run = _run
+          PY
+      - name: Manual --version timing
+        if: matrix.probe == 'manual'
         run: |
-          [ "${{ matrix.walk }}" = 1 ] && export UNSLOTH_LLAMA_MAX_MACOS_RELEASE_FALLBACKS=1
-          V=~/.unsloth/studio/unsloth_studio
-          pip_new="$RUNNER_TEMP/new"; mkdir -p "$pip_new"
-          "$V/bin/python" -m pip download --no-deps unsloth==2026.9.6 -d "$pip_new" -q 2>/dev/null || ~/.local/bin/uv pip download 2>/dev/null || python3 -m pip download --no-deps unsloth==2026.9.6 -d "$pip_new" -q
-          (cd "$pip_new" && unzip -q -o unsloth-2026.9.6-*.whl 'studio/*')
-          for i in 1 2 3; do
-            rm -rf "$RUNNER_TEMP/c"; cp -R "$RUNNER_TEMP/pristine/llama.cpp" "$RUNNER_TEMP/c"
-            S=$(python3 -c 'import time;print(time.time())')
-            (cd "$pip_new/studio" && "$V/bin/python" install_llama_prebuilt.py --install-dir "$RUNNER_TEMP/c" --llama-tag latest --published-repo unslothai/llama.cpp > "$RUNNER_TEMP/h$i.log" 2>&1)
-            echo "HELPER run=$i exit=$? wall=$(python3 -c "import time;print(round(time.time()-$S,2))") releases=$(grep -c 'published_release: tag=' "$RUNNER_TEMP/h$i.log") last=$(tail -1 "$RUNNER_TEMP/h$i.log" | cut -c1-120)"
-          done
+          B=~/.unsloth/llama.cpp/build/bin; ls $B | head -40
+          for r in 1 2; do for b in llama-server llama-quantize; do S=$(python3 -c 'import time;print(time.time())'); "$B/$b" --version >/dev/null 2>&1; echo "run=$r $b rc=$? wall=$(python3 -c "import time;print(round(time.time()-$S,2))")"; done; done
       - name: Update (2026.9.4 to latest)
         run: |
-          [ "${{ matrix.walk }}" = 1 ] && export UNSLOTH_LLAMA_MAX_MACOS_RELEASE_FALLBACKS=1
+          export PYTHONPATH="$RUNNER_TEMP/sc" PROBE_MODE="${{ matrix.probe }}"
+          [ "$PROBE_MODE" = manual ] && export PROBE_MODE=on
           S=$(python3 -c 'import time;print(time.time())')
-          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -vE "published_|upload date"
+          ~/.unsloth/studio/unsloth_studio/bin/unsloth studio update -v </dev/null 2>&1 | perl "$RUNNER_TEMP/stamp.pl" | grep -aE "subproc-timing|unsloth .* available|  deps +installed|installing prebuilt llama|  llama.cpp +|  whisper.cpp +|  platform|fallback"
           echo "UPDATE_EXIT=${PIPESTATUS[0]} UPDATE_WALL=$(python3 -c "import time;print(round(time.time()-$S,1))")"
