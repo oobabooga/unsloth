@@ -31,7 +31,7 @@ jobs:
           git -C "$w\repo" worktree add -q --detach "$w\after" df0d65b805f568ee688c6e80a11d9e5f50293b99
           if ($LASTEXITCODE -ne 0) { throw "after" }
           python -m venv "$w\venv"
-          & "$w\venv\Scripts\python.exe" -m pip install -q pytest filelock
+          & "$w\venv\Scripts\python.exe" -m pip install -q pytest filelock typer packaging requests pyyaml
           if ($LASTEXITCODE -ne 0) { throw "pip" }
       - name: Live matrix (auto detection)
         shell: powershell
@@ -52,7 +52,7 @@ jobs:
           foreach ($l in "before", "after") {
             Push-Location "$w\$l"
             $t0 = Get-Date
-            & "$w\venv\Scripts\python.exe" -m pytest tests/studio/install -q -p no:cacheprovider --junitxml "$w\junit-$l.xml" -o junit_family=xunit1 2>&1 | Select-Object -Last 25
+            & "$w\venv\Scripts\python.exe" -m pytest tests/studio/install -q -p no:cacheprovider --continue-on-collection-errors --junitxml "$w\junit-$l.xml" -o junit_family=xunit1 2>&1 | Select-Object -Last 25
             Write-Host "$l pytest exit=$LASTEXITCODE seconds=$([int]((Get-Date)-$t0).TotalSeconds)"
             Pop-Location
           }
