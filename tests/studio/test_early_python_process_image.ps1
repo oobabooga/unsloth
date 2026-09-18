@@ -64,6 +64,19 @@ $script:StudioEarlyPythonProbed = $false
 $script:StudioEarlyPython = $null
 $exe = Get-StudioEarlyPython
 if (-not $exe) {
+    # "No interpreter" is a real and supported state, so it is a skip. But it is also what a
+    # BROKEN EXTRACTION looks like from here: a helper this file forgot to pull out of
+    # install.ps1 makes Get-StudioEarlyPython fail, the probe finds nothing, and the suite exits 0
+    # having tested nothing. That happened once and CI recorded it as a pass. Tell the two apart.
+    $onPath = $null
+    foreach ($n in @("python3", "python")) {
+        if (-not $onPath) { $onPath = (Get-Command $n -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1) }
+    }
+    if ($onPath) {
+        Write-Host "  FAIL  Get-StudioEarlyPython found nothing, yet $($onPath.Source) is on PATH." -ForegroundColor Red
+        Write-Host "        That is a broken extraction in this file, not a host without Python." -ForegroundColor Red
+        exit 1
+    }
     Write-Host "  SKIP  no Python on this host, which is the fallback case and not a failure" -ForegroundColor Yellow
     exit 0
 }
@@ -208,17 +221,25 @@ $cmdletHung = Invoke-StudioEarlyPythonScriptViaCmdlets -Exe $exe -Script "import
 Check "the cmdlet launcher kills a hung child too" (
     $null -eq $cmdletHung -and ((Get-Date) - $cmdletStart).TotalSeconds -lt 30)
 
-# The handover, driven in a runspace that is genuinely in Constrained Language Mode.
+# The whole chain, driven in a runspace that is genuinely in Constrained Language Mode.
 #
-# Setting $ExecutionContext.SessionState.LanguageMode partway through a script is NOT enough and
-# was tried first: PowerShell fixes a function's language mode when the function is defined, so
-# functions defined before the switch keep running in FullLanguage and the primary launcher
-# succeeds. The check passed while proving nothing. A runspace created with
-# InitialSessionState.LanguageMode set is constrained before anything is defined in it, which is
-# what a locked-down host actually looks like.
+# Two mistakes are baked into this block because both were made here first.
+#
+# One: setting $ExecutionContext.SessionState.LanguageMode partway through a script proves
+# nothing. PowerShell fixes a function's language mode when the function is DEFINED, so functions
+# defined before the switch keep running in FullLanguage and the primary launcher keeps
+# succeeding. A runspace created with InitialSessionState.LanguageMode set is constrained before
+# anything is defined in it, which is what a locked-down host actually looks like.
+#
+# Two: testing the launcher alone proves nothing either. The launcher was fixed first and this
+# check passed while the rung as a whole was still dead, because Get-StudioEarlyPython THREW on
+# [System.IO.Path]::GetDirectoryName before the launcher was ever reached. CLM refuses method
+# calls on System.IO.Path and on Int32, and it throws rather than returning null, so the ladder
+# did not degrade, it failed. Every function between the entry point and the answer runs here.
 $clmFunctions = (@(
     "Remove-StudioTrailingNewline", "Invoke-StudioEarlyPythonScript",
-    "Invoke-StudioEarlyPythonScriptViaCmdlets"
+    "Invoke-StudioEarlyPythonScriptViaCmdlets", "Invoke-StudioEarlyPython",
+    "Get-StudioEarlyPython", "Get-StudioPythonFinalPath", "Get-StudioPythonProcessImageTable"
 ) | ForEach-Object {
     $name = $_
     ($ast.FindAll({ param($n)
@@ -241,18 +262,57 @@ Write-Output "MODE=`$(`$ExecutionContext.SessionState.LanguageMode)"
 try { `$null = New-Object System.Diagnostics.ProcessStartInfo; Write-Output 'PSI-ALLOWED' }
 catch { Write-Output 'PSI-BLOCKED' }
 Write-Output ("ANSWER=" + (Invoke-StudioEarlyPythonScript -Exe '$exe' -Script "$echoScript" -ScriptArgs @('a b', 'c\')))
+`$script:StudioEarlyPythonProbed = `$false
+`$script:StudioEarlyPython = `$null
+try { Write-Output ("DISCOVERY=" + (Get-StudioEarlyPython)) } catch { Write-Output "DISCOVERY-THREW" }
+try { Write-Output ("REALPATH=" + (Get-StudioPythonFinalPath -Path '$root')) } catch { Write-Output "REALPATH-THREW" }
 "@)
     $clmOut = @($ps.Invoke() | ForEach-Object { "$_".Trim() })
     Check "the runspace really is constrained" ($clmOut -contains "MODE=ConstrainedLanguage")
     # The premise of the whole fallback, measured rather than assumed.
     Check "Constrained Language Mode really does refuse ProcessStartInfo" ($clmOut -contains "PSI-BLOCKED")
-    # And therefore the primary launcher cannot answer there, so this can only have come from the
-    # fallback. Removing the fallback call from the catch makes this check fail.
+    # So this answer can only have come from the fallback launcher.
     Check "under Constrained Language Mode the answer still comes back, through the fallback" (
         $clmOut -contains "ANSWER=a b|c\")
+    # And the rungs around it survive too. A throw here is worse than a null: the ladder stops
+    # instead of falling through to the rung below.
+    Check "interpreter discovery survives Constrained Language Mode" (
+        -not ($clmOut -contains "DISCOVERY-THREW") -and ($clmOut | Where-Object { $_ -like "DISCOVERY=?*" }))
+    Check "the path resolver answers under Constrained Language Mode" (
+        -not ($clmOut -contains "REALPATH-THREW") -and
+        ($clmOut | Where-Object { $_ -eq "REALPATH=$root" }))
 } finally {
     if ($ps) { $ps.Dispose() }
     if ($rs) { $rs.Dispose() }
+}
+
+# The cmdlet launcher is the only new code that writes anything at all: three temporary files per
+# call. Idempotency means the tenth install leaves the machine as the first one found it, so every
+# exit path has to clean up, not just the happy one. The timeout path is the one that matters,
+# since it returns while the child is still being killed.
+#
+# Pointed at a private empty directory rather than counting the shared one: anything else running
+# on the machine writes there too, and a check that another process can move is not a measurement.
+$tempProbe = Join-Path ([System.IO.Path]::GetTempPath()) ("tempprobe-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $tempProbe | Out-Null
+$savedTmp = @{ TMPDIR = $env:TMPDIR; TEMP = $env:TEMP; TMP = $env:TMP }
+try {
+    $env:TMPDIR = $tempProbe; $env:TEMP = $tempProbe; $env:TMP = $tempProbe
+    for ($i = 0; $i -lt 3; $i++) {
+        $null = Invoke-StudioEarlyPythonScriptViaCmdlets -Exe $exe -Script "import sys;sys.stdout.write('ok')"
+    }
+    $null = Invoke-StudioEarlyPythonScriptViaCmdlets -Exe $exe -Script "import sys;sys.exit(3)"
+    $null = Invoke-StudioEarlyPythonScriptViaCmdlets -Exe $exe -Script "import time;time.sleep(60)" -TimeoutMs 1500
+    $null = Invoke-StudioEarlyPythonScriptViaCmdlets -Exe (Join-Path $root "no-such-interpreter") -Script "pass"
+    $left = @(Get-ChildItem -LiteralPath $tempProbe -Force -ErrorAction SilentlyContinue)
+    Check "the cmdlet launcher leaves no temporary files behind, on any exit path" ($left.Count -eq 0)
+    if ($left.Count -gt 0) { $left | ForEach-Object { Write-Host "        left behind: $($_.Name)" } }
+} finally {
+    foreach ($k in $savedTmp.Keys) {
+        if ($null -eq $savedTmp[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+        else { Set-Item "Env:$k" $savedTmp[$k] }
+    }
+    Remove-Item -LiteralPath $tempProbe -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ------------------------------------------------------- the table, through a stubbed runner
@@ -343,6 +403,26 @@ Check "the probe declares CloseHandle's argument type" (
 Check "the probe asks for the limited-information right only" ($probeText -match "OpenProcess\(0x1000,")
 # EnumProcesses reports the bytes it used. Equal to the buffer size means it may have run out, so
 # only a strictly smaller figure proves the enumeration was complete.
+# Exactness. This rung and the native rung must return the SAME string for the same process, or
+# Test-StudioProtectedPathMatch compares a path from one against a path recorded by the other and
+# sees a difference that is not there. They agree by construction only if the underlying call is
+# identical: same access right, same flags argument (0 is the Win32 path form; 1 would return
+# \Device\HarddiskVolume1\... instead), same buffer size. Read both out of the file and compare.
+$nativeInit = ($ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq "Get-StudioNativeProcessImagePath" }, $true)[0]).Extent.Text
+# The native rung names the constant rather than inlining it, so follow the name to its value.
+$nativeRight = if ($nativeInit -match '\$queryLimitedInformation\s*=\s*\[uint32\](0x[0-9a-fA-F]+)') { $Matches[1] } else { "" }
+Check "the native rung asks for the same access right the probe does" (
+    $nativeRight -eq "0x1000" -and
+    $nativeInit -match "OpenProcess\(\s*\r?\n?\s*\`$queryLimitedInformation," -and
+    $probeText -match "OpenProcess\(0x1000,")
+Check "both pass flags 0, so both get the Win32 path form and not the device form" (
+    $nativeInit -match "QueryFullProcessImageNameW\(\s*\`$handle,\s*\[uint32\]0," -and
+    $probeText -match "QueryFullProcessImageNameW\(h,0,")
+Check "both size the buffer the same" (
+    $nativeInit -match "32768" -and $probeText -match "create_unicode_buffer\(32768\)")
+
 Check "the probe grows its buffer until the enumeration is provably complete" (
     $probeText -match "b\.value\s*<\s*ctypes\.sizeof\(a\)")
 
