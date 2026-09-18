@@ -1,0 +1,34 @@
+name: ctypes probe on Windows
+on:
+  push:
+    branches: [ctypes-probe-ci]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: harness }
+      - uses: actions/checkout@v4
+        with: { repository: oobabooga/unsloth, ref: process-image-ctypes-ci, path: after, sparse-checkout: install.ps1, sparse-checkout-cone-mode: false }
+      - uses: actions/checkout@v4
+        with: { repository: unslothai/unsloth, ref: av-fp-early-python, path: before, sparse-checkout: install.ps1, sparse-checkout-cone-mode: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', architecture: '${{ matrix.arch }}' }
+      - name: after, pwsh 7
+        shell: pwsh
+        run: ./harness/verify.ps1 -Repo after -Label "after-pwsh-${{ matrix.arch }}"
+      - name: after, Windows PowerShell 5.1
+        if: always()
+        shell: powershell
+        run: .\harness\verify.ps1 -Repo after -Label "after-ps51-${{ matrix.arch }}"
+      - name: before, Windows PowerShell 5.1
+        if: always()
+        shell: powershell
+        run: .\harness\verify.ps1 -Repo before -Label "before-ps51-${{ matrix.arch }}"
