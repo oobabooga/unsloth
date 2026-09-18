@@ -21,7 +21,9 @@ permissions:
   contents: read
 
 env:
-  UNSLOTH_SHA: "14b40739a0100bccdd7f11b8e731a82725abf275"
+  # After: fix/vulkan-igpu-vram-used on LeoBorcherding/unsloth (before was unslothai/unsloth@14b40739a0).
+  UNSLOTH_REPO: "https://github.com/LeoBorcherding/unsloth.git"
+  UNSLOTH_SHA: "84037d7cf977e85bd3589653218e05536dfb830b"
   STUDIO_PORT: "8899"
 
 jobs:
@@ -164,7 +166,7 @@ jobs:
           $src = Join-Path $env:STUDIO_W "src\unsloth"
           git init -q $src
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          git -C $src remote add origin https://github.com/unslothai/unsloth.git
+          git -C $src remote add origin $env:UNSLOTH_REPO
           git -C $src fetch -q --depth 1 origin $env:UNSLOTH_SHA
           if ($LASTEXITCODE -ne 0) {
             Write-Host "depth-1 fetch of the SHA was refused; falling back to a shallow main fetch"
