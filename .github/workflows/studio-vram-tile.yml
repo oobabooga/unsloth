@@ -513,31 +513,40 @@ jobs:
           out = sys.argv[1]
           with sync_playwright() as p:
               b = p.chromium.launch()
-              page = b.new_page(viewport={"width": 1500, "height": 1000})
+              page = b.new_page(viewport={"width": 1500, "height": 1150})
               page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle", timeout=90000)
               page.screenshot(path=os.path.join(out, "01-landing.png"))
               try:
-                  page.fill("#username", "unsloth", timeout=20000)
-                  page.fill("#password", pw)
+                  # Single-user installs show only the password box; the username box exists on multi-user ones.
+                  if page.locator("#username").count():
+                      page.fill("#username", "unsloth")
+                  page.fill("#password", pw, timeout=20000)
                   page.keyboard.press("Enter")
-                  page.wait_for_timeout(5000)
+                  page.wait_for_function("() => !document.querySelector('#password')", timeout=30000)
+                  page.wait_for_timeout(4000)
+                  print("logged in, url:", page.url)
               except Exception as e:
-                  print("login form not found:", e)
+                  print("login failed:", e)
               page.screenshot(path=os.path.join(out, "02-after-login.png"))
+              # /settings opens the settings dialog and redirects home; the tab buttons carry data-testids.
               page.goto(f"http://127.0.0.1:{port}/settings", wait_until="networkidle", timeout=90000)
               page.wait_for_timeout(3000)
               clicked = False
-              for loc in (page.get_by_role("tab", name="Resources"), page.get_by_role("button", name="Resources"),
-                          page.get_by_role("link", name="Resources"), page.get_by_text("Resources", exact=True)):
-                  try:
-                      loc.first.click(timeout=5000)
-                      clicked = True
-                      break
-                  except Exception:
-                      pass
+              try:
+                  page.locator('[data-testid="settings-tab-resources"]').first.click(timeout=15000)
+                  clicked = True
+              except Exception as e:
+                  print("resources tab click failed:", e)
               print("resources tab clicked:", clicked)
               page.wait_for_timeout(12000)
               page.screenshot(path=os.path.join(out, "03-settings-resources.png"), full_page=True)
+              try:
+                  heading = page.get_by_text("Live monitor", exact=True).first
+                  heading.scroll_into_view_if_needed(timeout=5000)
+                  section = heading.locator("xpath=ancestor::section[1] | xpath=ancestor::div[2]").first
+                  section.screenshot(path=os.path.join(out, "04-live-monitor-section.png"))
+              except Exception as e:
+                  print("section screenshot skipped:", e)
               b.close()
           '@
           [System.IO.File]::WriteAllText($script, $code, (New-Object System.Text.UTF8Encoding($false)))
