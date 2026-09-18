@@ -87,12 +87,14 @@ shell32.SHGetSpecialFolderLocation(None, 0, ctypes.byref(desk))
 pidls.append(desk.value)
 for r in roots:
     pidls.append(shell32.ILCreateFromPathW(r))
-entries = (ENTRY * len(pidls))(*[ENTRY(p, True) for p in pidls])
 SHCNRF_ShellLevel, SHCNRF_NewDelivery = 0x0002, 0x8000
 events = 0x00002000 | 0x08000000 | 0x00001000  # UPDATEITEM | ASSOCCHANGED | UPDATEDIR
-reg = shell32.SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel | SHCNRF_NewDelivery, events,
-                                     WM_NOTIFY_ME, len(pidls), entries)
-out.write("REGISTER\t%d\troots=%d\n" % (reg, len(pidls)))
+# One entry per registration, so the struct's packing in the SDK header cannot matter.
+for p in pidls:
+    entry = ENTRY(p, True)
+    reg = shell32.SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel | SHCNRF_NewDelivery, events,
+                                         WM_NOTIFY_ME, 1, ctypes.byref(entry))
+    out.write("REGISTER\t%d\tpidl=%s\n" % (reg, hex(p or 0)))
 out.write("READY\n")
 deadline = time.time() + seconds
 msg = MSG()
