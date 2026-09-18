@@ -1,0 +1,101 @@
+name: PR 11116 full install on an ordinary and a Dynamic Code Security host
+
+on:
+  push:
+    branches: [pr11116-win-sim]
+
+permissions: {}
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ordinary, dcs]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fetch the mirror (current main + PR head) and the harness
+        shell: powershell
+        run: |
+          git clone -q https://github.com/oobabooga/unsloth "$env:GITHUB_WORKSPACE\repo"
+          git -C "$env:GITHUB_WORKSPACE\repo" checkout -q 562ae0866c
+          git -C "$env:GITHUB_WORKSPACE\repo" log -1 --format="%H %s"
+          git clone -q --depth 1 -b pr11116-win-sim https://github.com/oobabooga/unsloth "$env:RUNNER_TEMP\simsrc"
+      - name: Defender exclusions (speed only)
+        shell: powershell
+        run: |
+          foreach ($p in @("$env:USERPROFILE\.unsloth", "$env:USERPROFILE\AppData\Local\uv", "$env:GITHUB_WORKSPACE\repo")) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch { Write-Host "skip $p" } }
+      - name: Instrument the refresh call site (both variants) and force the native-type gate off (dcs)
+        shell: powershell
+        working-directory: repo
+        run: |
+          $s = [IO.File]::ReadAllText("$PWD\install.ps1")
+          $call = '\$null = Invoke-StudioPythonShellIconRefresh `\r?\n\s*-Paths \$createdShortcutPaths -Exe \$ManagedPythonPath'
+          if (([regex]::Matches($s, $call)).Count -ne 1) { throw "call site not found exactly once" }
+          $s = [regex]::Replace($s, $call, '$simAnswer = Invoke-StudioPythonShellIconRefresh -Paths $createdShortcutPaths -Exe $ManagedPythonPath; Write-Host "[SIM] icon refresh child returned $simAnswer"')
+          if ("${{ matrix.variant }}" -eq "dcs") {
+            $gate = 'function Test-StudioCanDefineNativeTypes \{'
+            if (([regex]::Matches($s, $gate)).Count -ne 1) { throw "gate not found exactly once" }
+            $s = [regex]::Replace($s, $gate, 'function Test-StudioCanDefineNativeTypes { $script:StudioCanDefineNativeTypes = $false; return $false;')
+          }
+          [IO.File]::WriteAllText("$PWD\install.ps1", $s, (New-Object System.Text.UTF8Encoding($true)))
+          git diff --stat
+      - name: Start the shell notification listener
+        shell: powershell
+        run: |
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+          Start-Process -FilePath (Get-Command python).Source -WindowStyle Hidden -ArgumentList @(
+            "`"$env:RUNNER_TEMP\simsrc\sim\listener.py`"", "`"$env:RUNNER_TEMP\listener.log`"",
+            "`"$env:RUNNER_TEMP\listener.stop`"", "3000", "`"$desktop`"", "`"$startMenu`"")
+          Start-Sleep 5; Get-Content "$env:RUNNER_TEMP\listener.log"
+      - name: Full install (Windows PowerShell 5.1, --local --no-torch)
+        shell: powershell
+        working-directory: repo
+        run: |
+          $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --local --no-torch; exit $LASTEXITCODE'
+          powershell -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\install.log"
+          $rc = $LASTEXITCODE
+          "INSTALL-EXIT=$rc"
+          if ($rc -ne 0) { exit $rc }
+      - name: After install
+        shell: powershell
+        run: |
+          Select-String -Path "$env:RUNNER_TEMP\install.log" -Pattern "\[SIM\]|shortcut" | ForEach-Object { $_.Line }
+          & "$env:RUNNER_TEMP\simsrc\sim\Read-Links.ps1"
+          Get-CimInstance Win32_Process -Filter "Name like 'python%'" | Select-Object ProcessId, CommandLine | Format-List
+      - name: Studio update path (install.ps1 --shortcuts-only), twice
+        shell: powershell
+        working-directory: repo
+        run: |
+          foreach ($i in 1, 2) {
+            $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --shortcuts-only; exit $LASTEXITCODE'
+            powershell -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\update$i.log"
+            "UPDATE$i-EXIT=$LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Verdict
+        shell: powershell
+        run: |
+          New-Item -ItemType File -Force -Path "$env:RUNNER_TEMP\listener.stop" | Out-Null; Start-Sleep 3
+          & "$env:RUNNER_TEMP\simsrc\sim\Read-Links.ps1"
+          $sim = @(Select-String -Path "$env:RUNNER_TEMP\install.log", "$env:RUNNER_TEMP\update1.log", "$env:RUNNER_TEMP\update2.log" -Pattern "\[SIM\] icon refresh child returned (\S*)")
+          "SIM lines: $($sim.Count)"; $sim | ForEach-Object { "  " + $_.Filename + ": " + $_.Line.Trim() }
+          $ev = @(Get-Content "$env:RUNNER_TEMP\listener.log" | Where-Object { $_ -match "`t0x00002000`t.*Unsloth Studio\.lnk" })
+          "UPDATEITEM events on the Studio .lnk files: $($ev.Count)"
+          $left = @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" | Where-Object { $_.CommandLine -match "SHChangeNotify|-I -S" })
+          "leftover refresh children: $($left.Count)"
+          $fail = 0
+          if ("${{ matrix.variant }}" -eq "dcs") {
+            if ($sim.Count -ne 3) { "FAIL expected the child on the install and both updates"; $fail++ }
+            if (@($sim | Where-Object { $_.Line -notmatch "returned True" }).Count) { "FAIL a child did not answer True"; $fail++ }
+            if ($ev.Count -lt 6) { "FAIL expected per-item notifications for both links on all three runs"; $fail++ }
+          } else {
+            if ($sim.Count -ne 0) { "FAIL the child ran on an ordinary host"; $fail++ }
+          }
+          if ($left.Count) { "FAIL a refresh child outlived its run"; $fail++ }
+          if ($fail) { exit 1 } else { "PASS" }
