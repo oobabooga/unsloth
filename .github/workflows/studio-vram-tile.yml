@@ -190,6 +190,7 @@ jobs:
           $p = Start-Process -FilePath "powershell.exe" `
             -ArgumentList (@("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ".\install.ps1") + $flags) `
             -WorkingDirectory $env:UNSLOTH_SRC -RedirectStandardOutput $log -RedirectStandardError $err -NoNewWindow -PassThru
+          $null = $p.Handle
           $maxMin = if ($env:LEG -eq "default") { 150 } else { 60 }
           if (-not $p.WaitForExit($maxMin * 60 * 1000)) {
             Write-Host "FATAL: install.ps1 still running after $maxMin min; killing it"
@@ -281,18 +282,39 @@ jobs:
           } else {
             $probe = Join-Path $env:UNSLOTH_SRC "studio\backend\core\inference\_vulkan_probe.py"
             $text += "## _vulkan_probe.py $env:GGML_VULKAN_DIR`n## columns: idx  free_bytes  is_igpu  total_bytes  name  type_known`n"
-            $text += ((& $env:UNSLOTH_PY $probe $env:GGML_VULKAN_DIR 2>&1) | Out-String)
+            $probeErr = Join-Path $env:STUDIO_W "out\vulkan-probe.stderr"
+            $text += ((& $env:UNSLOTH_PY $probe $env:GGML_VULKAN_DIR 2>$probeErr) | Out-String)
             $text += "exit=$LASTEXITCODE`n"
+            $text += "## probe stderr`n" + ((Get-Content $probeErr -ErrorAction SilentlyContinue | Where-Object { $_ -match "ggml" }) -join "`n") + "`n"
           }
           if ($env:LLAMA_SERVER) {
             $text += "`n## $env:LLAMA_SERVER --list-devices`n"
-            $text += ((& $env:LLAMA_SERVER --list-devices 2>&1) | Out-String)
+            $text += ((& $env:LLAMA_SERVER --list-devices 2>$null) | Out-String)
             $text += "exit=$LASTEXITCODE`n"
           }
           Write-Host $text
           [System.IO.File]::WriteAllText((Join-Path $env:STUDIO_W "out\vulkan-probe.md"), $text, $utf8)
 
-      - name: Boot Studio
+      - name: Prepare Playwright (best effort)
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          $dist = Join-Path $env:UNSLOTH_SRC "studio\frontend\dist\index.html"
+          if (-not (Test-Path -LiteralPath $dist)) { Write-Host "no frontend build, nothing to screenshot"; exit 0 }
+          $venv = Join-Path $env:STUDIO_W "pwvenv"
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $env:STUDIO_W "pw-browsers"
+          python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          & $py -m pip install -q --disable-pip-version-check playwright
+          if ($LASTEXITCODE -ne 0) { Write-Host "playwright install failed; skipping"; exit 0 }
+          & $py -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { Write-Host "chromium download failed; skipping"; exit 0 }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PW_PY=$py`nPLAYWRIGHT_BROWSERS_PATH=$($env:PLAYWRIGHT_BROWSERS_PATH)`n", $utf8)
+          exit 0
+
+      - name: Boot Studio, read /api/system, recompute the VRAM tile, screenshot
+        timeout-minutes: 45
         run: |
           $ErrorActionPreference = "Continue"
           $port = $env:STUDIO_PORT
@@ -306,6 +328,7 @@ jobs:
           $err = Join-Path $env:STUDIO_W "out\studio.err"
           $p = Start-Process -FilePath $env:UNSLOTH_EXE -ArgumentList $studioArgs -WorkingDirectory $env:STUDIO_W `
             -RedirectStandardOutput $log -RedirectStandardError $err -NoNewWindow -PassThru
+          $null = $p.Handle
           Write-Host ("studio pid {0}: {1} {2}" -f $p.Id, $env:UNSLOTH_EXE, ($studioArgs -join " "))
           $utf8 = New-Object System.Text.UTF8Encoding($false)
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "STUDIO_PID=$($p.Id)`n", $utf8)
@@ -326,9 +349,7 @@ jobs:
             exit 1
           }
           Write-Host ("health after ~{0}s: {1}" -f ($i * 5), $r.Content)
-
-      - name: Read /api/system and recompute the VRAM tile
-        run: |
+          # Everything that talks to Studio stays in THIS step: the runner reaped it at the previous step boundary.
           $ErrorActionPreference = "Continue"
           $script = Join-Path $env:STUDIO_W "read_system.py"
           $code = @'
@@ -480,22 +501,9 @@ jobs:
           '@
           [System.IO.File]::WriteAllText($script, $code, (New-Object System.Text.UTF8Encoding($false)))
           & $env:UNSLOTH_PY $script (Join-Path $env:STUDIO_W "out") 2>&1 | ForEach-Object { Write-Host $_ }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Screenshot Settings > Resources (best effort)
-        timeout-minutes: 20
-        run: |
-          $ErrorActionPreference = "Continue"
-          $dist = Join-Path $env:UNSLOTH_SRC "studio\frontend\dist\index.html"
-          if (-not (Test-Path -LiteralPath $dist)) { Write-Host "no frontend build, nothing to screenshot"; exit 0 }
-          $venv = Join-Path $env:STUDIO_W "pwvenv"
-          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $env:STUDIO_W "pw-browsers"
-          python -m venv $venv
-          $py = Join-Path $venv "Scripts\python.exe"
-          & $py -m pip install -q --disable-pip-version-check playwright
-          if ($LASTEXITCODE -ne 0) { Write-Host "playwright install failed; skipping"; exit 0 }
-          & $py -m playwright install chromium
-          if ($LASTEXITCODE -ne 0) { Write-Host "chromium download failed; skipping"; exit 0 }
+          $readExit = $LASTEXITCODE
+          Write-Host "read exit=$readExit"
+          if (-not ($env:PW_PY -and (Test-Path -LiteralPath $dist))) { Write-Host "no Playwright venv or no frontend build; skipping the screenshot" } else {
           $script = Join-Path $env:STUDIO_W "shot.py"
           $code = @'
           import os, sys
@@ -533,9 +541,11 @@ jobs:
               b.close()
           '@
           [System.IO.File]::WriteAllText($script, $code, (New-Object System.Text.UTF8Encoding($false)))
-          & $py $script (Join-Path $env:STUDIO_W "out") 2>&1 | ForEach-Object { Write-Host $_ }
+          & $env:PW_PY $script (Join-Path $env:STUDIO_W "out") 2>&1 | ForEach-Object { Write-Host $_ }
           Write-Host "screenshot exit=$LASTEXITCODE (advisory)"
-          exit 0
+          }
+          if ($p.HasExited) { Write-Host "Studio exited on its own during the read (code $($p.ExitCode))" } else { taskkill /PID $p.Id /T /F 2>&1 | Out-Host }
+          exit $readExit
 
       - name: Stop Studio
         if: always()
