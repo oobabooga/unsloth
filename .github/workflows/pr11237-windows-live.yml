@@ -115,8 +115,9 @@ jobs:
           def describe(directory=install):
               data = marker(directory)
               assert data, "No install marker"
+              assert data.get("backend") == a.backend, data
               assert not any("macos_load" in key for key in data), "macOS record leaked"
-              return {k: data.get(k) for k in ["repo", "tag", "release_tag", "install_kind", "llama_backend", "backend_request", "runtime_line", "fingerprint"]}
+              return {k: data.get(k) for k in ["published_repo", "tag", "release_tag", "bundle_profile", "backend", "backend_request", "runtime_line", "install_fingerprint"]}
           
           def run_install(directory=install, backend=None, pinned=""):
               m.install_prebuilt(directory, "latest", m.DEFAULT_PUBLISHED_REPO, pinned, llama_backend=backend)
@@ -161,7 +162,7 @@ jobs:
               m.validate_quantize(runtime / ("llama-quantize" + ext), model, root / "quantized.gguf",
                                   directory, host, runtime_line=data.get("runtime_line"))
               m.validate_server(runtime / ("llama-server" + ext), model, host, directory,
-                                runtime_line=data.get("runtime_line"), install_kind=data.get("install_kind"))
+                                runtime_line=data.get("runtime_line"), install_kind=("windows-" if host.is_windows else "linux-") + a.backend)
               return dict(quantized_bytes=(root / "quantized.gguf").stat().st_size, completion_http_status=200,
                           install=describe(directory))
           
