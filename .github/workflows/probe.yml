@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: oobabooga/unsloth, ref: process-image-ctypes-ci, path: after, sparse-checkout: install.ps1, sparse-checkout-cone-mode: false }
       - uses: actions/checkout@v4
-        with: { repository: unslothai/unsloth, ref: av-fp-early-python, path: before, sparse-checkout: install.ps1, sparse-checkout-cone-mode: false }
+        with: { repository: oobabooga/unsloth, ref: base-11104-ci, path: before, sparse-checkout: install.ps1, sparse-checkout-cone-mode: false }
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', architecture: '${{ matrix.arch }}' }
       - name: after, pwsh 7
@@ -32,3 +32,11 @@ jobs:
         if: always()
         shell: powershell
         run: .\harness\verify.ps1 -Repo before -Label "before-ps51-${{ matrix.arch }}"
+      - name: base vs PR resolver equivalence, pwsh 7
+        if: always()
+        shell: pwsh
+        run: ./harness/equiv.ps1 -Base before/install.ps1 -Pr after/install.ps1 -Py (Get-Command python).Source -Work "$env:RUNNER_TEMP\eq7"
+      - name: base vs PR resolver equivalence, Windows PowerShell 5.1
+        if: always()
+        shell: powershell
+        run: .\harness\equiv.ps1 -Base before\install.ps1 -Pr after\install.ps1 -Py (Get-Command python).Source -Work "$env:RUNNER_TEMP\eq51"

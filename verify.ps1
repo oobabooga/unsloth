@@ -57,6 +57,15 @@ try {
         Write-Host "  agree=$agree disagree=$($disagree.Count) getprocess_blind=$gpBlind covered_by_ctypes=$gpBlindCovered"
         $disagree | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" }
         Check "no disagreement with Get-Process where both answer" ($disagree.Count -eq 0)
+        # Parity with the WMI rung this one sits in front of: on a host where WMI is healthy the
+        # answer a process gets must not depend on which rung produced it.
+        $wmi = @{}; foreach ($row in @(Get-CimInstance -ClassName Win32_Process)) { if ($row.ExecutablePath) { $wmi[[int]$row.ProcessId] = [string]$row.ExecutablePath } }
+        $wAgree = 0; $wDis = @(); $ctOnly = 0; $wmiOnly = 0
+        foreach ($k in $table.Keys) { if ($wmi.ContainsKey($k)) { if ($wmi[$k] -ieq $table[$k]) { $wAgree++ } else { $wDis += "$k wmi=$($wmi[$k]) ct=$($table[$k])" } } else { $ctOnly++ } }
+        foreach ($k in $wmi.Keys) { if (-not $table.ContainsKey($k)) { $wmiOnly++ } }
+        Write-Host "  wmi: agree=$wAgree disagree=$($wDis.Count) ctypes_only=$ctOnly wmi_only=$wmiOnly"
+        $wDis | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" }
+        Check "no disagreement with WMI where both answer" ($wDis.Count -eq 0)
         # Handle leak: run the exact probe with a handle count before and after.
         $captured = $null
         $saved = ${function:Invoke-StudioEarlyPythonScript}
