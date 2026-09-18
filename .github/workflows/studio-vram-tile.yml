@@ -529,11 +529,20 @@ jobs:
                   print("login failed:", e)
               page.screenshot(path=os.path.join(out, "02-after-login.png"))
               # /settings opens the settings dialog and redirects home; the tab buttons carry data-testids.
+              # If the deep link did not leave the dialog open, the sidebar gear opens it.
               page.goto(f"http://127.0.0.1:{port}/settings", wait_until="networkidle", timeout=90000)
               page.wait_for_timeout(3000)
+              tab = page.locator('[data-testid="settings-tab-resources"]').first
+              if not tab.is_visible():
+                  try:
+                      page.get_by_role("button", name="Settings").first.click(timeout=10000)
+                      page.wait_for_timeout(2000)
+                      print("opened settings from the sidebar gear")
+                  except Exception as e:
+                      print("sidebar gear click failed:", e)
               clicked = False
               try:
-                  page.locator('[data-testid="settings-tab-resources"]').first.click(timeout=15000)
+                  tab.click(timeout=15000)
                   clicked = True
               except Exception as e:
                   print("resources tab click failed:", e)
