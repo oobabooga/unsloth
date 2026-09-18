@@ -1,0 +1,220 @@
+name: PR 11237 Windows live comparison
+on:
+  push:
+    branches: [amd-pr11237-windows-live-20260918]
+permissions: {}
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - name: Hardware and sources
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
+          $work = Join-Path $env:RUNNER_TEMP "pr11237-live"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          git clone --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$work/source"
+          if ($LASTEXITCODE -ne 0) { throw "clone failed" }
+          git -C "$work/source" fetch origin refs/pull/11237/head
+          if ($LASTEXITCODE -ne 0) { throw "fetch failed" }
+          git -C "$work/source" worktree add --detach "$work/base" 6a5ab1f389f2a7a6a509150fa1b87a91c5044d53
+          if ($LASTEXITCODE -ne 0) { throw "base failed" }
+          git -C "$work/source" worktree add --detach "$work/head" 8c20a32c168eae538b646cb52b26ad0d27238e49
+          if ($LASTEXITCODE -ne 0) { throw "head failed" }
+          python -m venv "$work/venv"
+          & "$work/venv/Scripts/python.exe" -m pip install pytest filelock requests packaging pyyaml
+          if ($LASTEXITCODE -ne 0) { throw "dependencies failed" }
+      - name: Live install update repair and inference
+        shell: python
+        run: |
+          import argparse
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          import sys
+          import time
+          import traceback
+          
+          p = argparse.ArgumentParser()
+          p.add_argument("--base", required=True)
+          p.add_argument("--head", required=True)
+          p.add_argument("--work", required=True)
+          p.add_argument("--case", choices=["base", "head", "migration"])
+          p.add_argument("--backend", default="cpu")
+          sys.argv = [sys.argv[0], "--base", str(Path(os.environ["RUNNER_TEMP"]) / "pr11237-live/base"), "--head", str(Path(os.environ["RUNNER_TEMP"]) / "pr11237-live/head"), "--work", str(Path(os.environ["RUNNER_TEMP"]) / "pr11237-live/results")]
+          if os.environ.get("PR11237_CASE"):
+              sys.argv.extend(["--case", os.environ["PR11237_CASE"], "--backend", os.environ["PR11237_BACKEND"]])
+          a = p.parse_args()
+          work = Path(a.work).resolve()
+          work.mkdir(parents=True, exist_ok=True)
+          os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+          venv_python = Path(os.environ["RUNNER_TEMP"]) / "pr11237-live/venv/Scripts/python.exe"
+          
+          if not a.case:
+              results = []
+              backends = ["cpu", "vulkan"] if platform.system() == "Windows" else ["cpu"]
+              for backend in backends:
+                  for case in ["base", "head", "migration"]:
+                      cmd = [sys.executable, __file__, "--base", a.base, "--head", a.head,
+                             "--work", str(work), "--backend", backend, "--case", case]
+                      log = work / (backend + "-" + case + ".log")
+                      started = time.monotonic()
+                      with log.open("w", encoding="utf-8") as out:
+                          env = dict(os.environ, PR11237_CASE=case, PR11237_BACKEND=backend)
+                          cmd[0] = str(venv_python)
+                          result = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
+                      text = log.read_text(encoding="utf-8", errors="replace")
+                      print(text, flush=True)
+                      row = dict(backend=backend, case=case, exit_code=result.returncode,
+                                 seconds=round(time.monotonic()-started, 2), log=str(log))
+                      results.append(row)
+                      print("CASE_RESULT " + json.dumps(row), flush=True)
+              (work / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+              print("LIVE_SUMMARY " + json.dumps(results), flush=True)
+              raise SystemExit(any(r["exit_code"] != 0 for r in results))
+          
+          source = Path(a.base if a.case == "base" else a.head).resolve()
+          sys.path.insert(0, str(source / "studio"))
+          spec = importlib.util.spec_from_file_location("live_installer", source / "studio/install_llama_prebuilt.py")
+          m = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = m
+          spec.loader.exec_module(m)
+          host = m.detect_host()
+          print("LIVE_HOST " + repr(host), flush=True)
+          root = work / (a.backend + "-" + ("base" if a.case == "migration" else a.case))
+          install = root / "install"
+          root.mkdir(parents=True, exist_ok=True)
+          steps = []
+          failures = []
+          
+          def step(name, fn):
+              started = time.monotonic()
+              try:
+                  value = fn()
+                  row = dict(step=name, status="PASS", seconds=round(time.monotonic()-started, 2), value=value)
+              except (Exception, SystemExit) as exc:
+                  traceback.print_exc()
+                  row = dict(step=name, status="FAIL", seconds=round(time.monotonic()-started, 2), error=str(exc))
+                  failures.append(row)
+              steps.append(row)
+              print("LIVE_STEP " + json.dumps(row, default=str), flush=True)
+              return row["status"] == "PASS"
+          
+          def marker(directory=install):
+              return m.load_prebuilt_metadata(directory) or {}
+          
+          def describe(directory=install):
+              data = marker(directory)
+              assert data, "No install marker"
+              assert not any("macos_load" in key for key in data), "macOS record leaked"
+              return {k: data.get(k) for k in ["repo", "tag", "release_tag", "install_kind", "llama_backend", "backend_request", "runtime_line", "fingerprint"]}
+          
+          def run_install(directory=install, backend=None, pinned=""):
+              m.install_prebuilt(directory, "latest", m.DEFAULT_PUBLISHED_REPO, pinned, llama_backend=backend)
+              return describe(directory)
+          
+          def payload_digest(directory=install):
+              data = marker(directory)
+              result = {}
+              for rel in data.get("runtime_files", {}):
+                  path = directory / rel
+                  if path.is_file():
+                      result[rel] = (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+              assert result, "No payload files checked"
+              return result
+          
+          def reuse(full=False):
+              before = payload_digest()
+              if full:
+                  os.environ["UNSLOTH_PREBUILT_FULL_CHECK"] = "1"
+              try:
+                  value = run_install()
+              finally:
+                  os.environ.pop("UNSLOTH_PREBUILT_FULL_CHECK", None)
+              assert payload_digest() == before, "Reuse changed runtime bytes"
+              assert m._existing_install_runs(install, host), "Reused binaries do not run"
+              return value
+          
+          def smoke(directory=install):
+              data = marker(directory)
+              runtime = m.install_runtime_dir(directory, host)
+              ext = ".exe" if host.is_windows else ""
+              model = root / "stories260K.gguf"
+              m.download_validation_model(model)
+              env = m.binary_env(runtime / ("llama-server" + ext), directory, host,
+                                 runtime_line=data.get("runtime_line"))
+              command = [str(runtime / ("llama-server" + ext)), "--list-devices"]
+              result = subprocess.run(command, env=env, capture_output=True, text=True, errors="replace", timeout=90)
+              print("LIVE_DEVICES " + result.stdout + result.stderr, flush=True)
+              assert result.returncode == 0
+              if a.backend == "vulkan":
+                  assert "vulkan" in (result.stdout + result.stderr).lower(), "No live Vulkan device"
+              m.validate_quantize(runtime / ("llama-quantize" + ext), model, root / "quantized.gguf",
+                                  directory, host, runtime_line=data.get("runtime_line"))
+              m.validate_server(runtime / ("llama-server" + ext), model, host, directory,
+                                runtime_line=data.get("runtime_line"), install_kind=data.get("install_kind"))
+              return dict(quantized_bytes=(root / "quantized.gguf").stat().st_size, completion_http_status=200,
+                          install=describe(directory))
+          
+          def repair():
+              runtime = m.install_runtime_dir(install, host)
+              binary = runtime / ("llama-quantize.exe" if host.is_windows else "llama-quantize")
+              original = binary.read_bytes()
+              binary.write_bytes(b"invalid executable\n")
+              try:
+                  value = run_install()
+                  assert binary.read_bytes() == original, "Corrupt binary was not restored"
+                  assert m._existing_install_runs(install, host)
+                  return value
+              finally:
+                  if binary.read_bytes() != original:
+                      binary.write_bytes(original)
+          
+          def api_install():
+              directory = root / "api-install"
+              os.environ["UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE"] = "1"
+              try:
+                  value = run_install(directory, a.backend)
+                  assert m._existing_install_runs(directory, host)
+                  return value
+              finally:
+                  os.environ.pop("UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE", None)
+          
+          if a.case == "migration":
+              if step("base-install-reused-by-head", reuse):
+                  step("migration-real-quantization-and-completion", smoke)
+          else:
+              if step("fresh-cdn-install", lambda: run_install(backend=a.backend)):
+                  step("real-quantization-and-completion", smoke)
+                  step("repeat-update-reuses-identical-bytes", reuse)
+                  step("full-check-update", lambda: reuse(True))
+                  step("corrupt-binary-recovery", repair)
+                  step("pinned-release-reuse", lambda: run_install(pinned=marker().get("release_tag") or marker().get("tag")))
+              step("fresh-api-install", api_install)
+          (work / (a.backend + "-" + a.case + "-results.json")).write_text(json.dumps(steps, indent=2, default=str), encoding="utf-8")
+          raise SystemExit(bool(failures))
+          
+      - name: Focused regression suites
+        if: always()
+        shell: powershell
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "pr11237-live"
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          $failed = $false
+          foreach ($revision in @("base", "head")) {
+            Set-Location "$work/$revision"
+            $files = @("tests/studio/install/test_install_llama_prebuilt_logic.py", "tests/studio/install/test_download_host_resolve.py", "tests/studio/install/test_keep_install_backcompat_9979.py")
+            if ($revision -eq "head") { $files += @("tests/studio/install/test_release_plan_laziness.py", "tests/studio/install/test_macos_loader_probe_record.py") }
+            & "$work/venv/Scripts/python.exe" -m pytest -q -o addopts= -p no:cacheprovider @files
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
