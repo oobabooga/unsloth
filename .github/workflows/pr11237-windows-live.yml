@@ -8,7 +8,7 @@ jobs:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 45
     steps:
-      - name: Hardware and sources
+      - name: Hardware
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -18,14 +18,36 @@ jobs:
           $work = Join-Path $env:RUNNER_TEMP "pr11237-live"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
           $env:PYTHONDONTWRITEBYTECODE = "1"
-          git clone --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$work/source"
-          if ($LASTEXITCODE -ne 0) { throw "clone failed" }
-          git -C "$work/source" fetch origin refs/pull/11237/head
-          if ($LASTEXITCODE -ne 0) { throw "fetch failed" }
-          git -C "$work/source" worktree add --detach "$work/base" 6a5ab1f389f2a7a6a509150fa1b87a91c5044d53
-          if ($LASTEXITCODE -ne 0) { throw "base failed" }
-          git -C "$work/source" worktree add --detach "$work/head" 8c20a32c168eae538b646cb52b26ad0d27238e49
-          if ($LASTEXITCODE -ne 0) { throw "head failed" }
+      - name: Download exact source snapshots
+        timeout-minutes: 10
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import tarfile
+          import time
+          import urllib.request
+          work = Path(os.environ["RUNNER_TEMP"]) / "pr11237-live"
+          work.mkdir(parents=True, exist_ok=True)
+          for name, sha in [("base", "6a5ab1f389f2a7a6a509150fa1b87a91c5044d53"), ("head", "8c20a32c168eae538b646cb52b26ad0d27238e49")]:
+              started = time.monotonic()
+              url = "https://codeload.github.com/unslothai/unsloth/tar.gz/" + sha
+              archive = work / (name + ".tar.gz")
+              print("Downloading", name, sha, flush=True)
+              with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as out:
+                  while chunk := response.read(1024 * 1024):
+                      out.write(chunk)
+              print("Downloaded", archive.stat().st_size, "bytes", flush=True)
+              with tarfile.open(archive) as bundle:
+                  bundle.extractall(work, filter="data")
+              (work / ("unsloth-" + sha)).rename(work / name)
+              print("Ready", name, round(time.monotonic()-started, 2), "seconds", flush=True)
+      - name: Python dependencies
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = Join-Path $env:RUNNER_TEMP "pr11237-live"
           python -m venv "$work/venv"
           & "$work/venv/Scripts/python.exe" -m pip install pytest filelock requests packaging pyyaml
           if ($LASTEXITCODE -ne 0) { throw "dependencies failed" }
