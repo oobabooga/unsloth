@@ -18,6 +18,7 @@ jobs:
           import urllib.request
           root = Path(os.environ["RUNNER_TEMP"]) / "pr11237-default"
           paths = ["studio/install_llama_prebuilt.py", "studio/prebuilt_core.py", "studio/nvidia_probe.py", "studio/backend/__init__.py", "studio/backend/utils/__init__.py", "studio/backend/utils/prebuilt/__init__.py", "studio/backend/utils/prebuilt/llama_backend.py"]
+          paths += ["studio/backend/vendor/truststore/" + name for name in ["__init__.py", "_api.py", "_macos.py", "_openssl.py", "_ssl_constants.py", "_windows.py"]]
           def fetch(task):
               name, sha, rel = task
               target = root / name / rel
@@ -98,4 +99,3 @@ jobs:
           m.validate_server(runtime / "llama-server.exe", model, host, install, runtime_line=marker.get("runtime_line"), install_kind="windows-" + marker["backend"])
           (root / (case + "-marker.json")).write_text(json.dumps(marker), encoding="utf-8")
           print("PASS", case, "real quantization and completion", flush=True)
-
