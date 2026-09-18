@@ -1,4 +1,4 @@
-name: PR 11237 Windows default path
+name: PR 11237 Windows CPU API retry
 on:
   push:
     branches: [amd-pr11237-default-windows-20260918]
@@ -7,6 +7,8 @@ jobs:
   windows:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 35
+    env:
+      UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE: '1'
     steps:
       - name: Fetch exact installer modules
         timeout-minutes: 5
@@ -35,7 +37,7 @@ jobs:
         run: |
           python -m pip install --target "$env:RUNNER_TEMP/pr11237-default/deps" filelock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Default auto install update and inference
+      - name: CPU API install update and inference
         shell: python
         run: |
           import hashlib
@@ -73,7 +75,7 @@ jobs:
           host = m.detect_host()
           print("HOST", repr(host), flush=True)
           started = time.monotonic()
-          m.install_prebuilt(install, "latest", m.DEFAULT_PUBLISHED_REPO, "")
+          m.install_prebuilt(install, "latest", m.DEFAULT_PUBLISHED_REPO, "", llama_backend="cpu")
           marker = m.load_prebuilt_metadata(install)
           assert marker
           print("INSTALL_OK", case, marker.get("backend"), marker.get("asset"), round(time.monotonic()-started, 2), flush=True)
