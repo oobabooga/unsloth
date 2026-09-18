@@ -1,0 +1,101 @@
+name: PR 11237 Windows default path
+on:
+  push:
+    branches: [amd-pr11237-default-windows-20260918]
+permissions: {}
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 35
+    steps:
+      - name: Fetch exact installer modules
+        timeout-minutes: 5
+        shell: python
+        run: |
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+          import os
+          import urllib.request
+          root = Path(os.environ["RUNNER_TEMP"]) / "pr11237-default"
+          paths = ["studio/install_llama_prebuilt.py", "studio/prebuilt_core.py", "studio/nvidia_probe.py", "studio/backend/__init__.py", "studio/backend/utils/__init__.py", "studio/backend/utils/prebuilt/__init__.py", "studio/backend/utils/prebuilt/llama_backend.py"]
+          def fetch(task):
+              name, sha, rel = task
+              target = root / name / rel
+              target.parent.mkdir(parents=True, exist_ok=True)
+              url = "https://raw.githubusercontent.com/unslothai/unsloth/" + sha + "/" + rel
+              with urllib.request.urlopen(url, timeout=90) as response:
+                  target.write_bytes(response.read())
+              print(name, rel, target.stat().st_size, flush=True)
+          tasks = [(name, sha, rel) for name, sha in [("base", "6a5ab1f389f2a7a6a509150fa1b87a91c5044d53"), ("head", "8c20a32c168eae538b646cb52b26ad0d27238e49")] for rel in paths]
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              list(pool.map(fetch, tasks))
+      - name: Install lock dependency
+        shell: powershell
+        run: |
+          python -m pip install --target "$env:RUNNER_TEMP/pr11237-default/deps" filelock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Default auto install update and inference
+        shell: python
+        run: |
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import time
+          root = Path(os.environ["RUNNER_TEMP"]) / "pr11237-default"
+          case = os.environ.get("PR11237_DEFAULT_CASE")
+          if not case:
+              failed = False
+              for case in ["base", "head", "migration"]:
+                  env = dict(os.environ, PR11237_DEFAULT_CASE=case, PYTHONDONTWRITEBYTECODE="1")
+                  print("BEGIN_CASE", case, flush=True)
+                  result = subprocess.run([sys.executable, __file__], env=env)
+                  print("END_CASE", case, result.returncode, flush=True)
+                  failed |= result.returncode != 0
+              if not failed:
+                  base = json.loads((root / "base-marker.json").read_text())
+                  head = json.loads((root / "head-marker.json").read_text())
+                  for field in ["backend", "asset", "release_tag", "install_fingerprint"]:
+                      assert base.get(field) == head.get(field), (field, base.get(field), head.get(field))
+                  print("PASS: automatic selection, asset, release and fingerprint agree", flush=True)
+              raise SystemExit(failed)
+          source = root / ("base" if case == "base" else "head")
+          sys.path[:0] = [str(root / "deps"), str(source / "studio")]
+          spec = importlib.util.spec_from_file_location("installer", source / "studio/install_llama_prebuilt.py")
+          m = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = m
+          spec.loader.exec_module(m)
+          install = root / ("base-install" if case in ["base", "migration"] else "head-install")
+          host = m.detect_host()
+          print("HOST", repr(host), flush=True)
+          started = time.monotonic()
+          m.install_prebuilt(install, "latest", m.DEFAULT_PUBLISHED_REPO, "")
+          marker = m.load_prebuilt_metadata(install)
+          assert marker
+          print("INSTALL_OK", case, marker.get("backend"), marker.get("asset"), round(time.monotonic()-started, 2), flush=True)
+          def digests():
+              return {rel: hashlib.sha256((install / rel).read_bytes()).hexdigest()
+                      for rel in marker["runtime_files"] if (install / rel).is_file()}
+          before = digests()
+          assert before
+          m.install_prebuilt(install, "latest", m.DEFAULT_PUBLISHED_REPO, "")
+          assert before == digests()
+          assert m._existing_install_runs(install, host)
+          print("REUSE_OK", case, flush=True)
+          model = root / "stories260K.gguf"
+          m.download_validation_model(model)
+          runtime = m.install_runtime_dir(install, host)
+          env = m.binary_env(runtime / "llama-server.exe", install, host, runtime_line=marker.get("runtime_line"))
+          devices = subprocess.run([str(runtime / "llama-server.exe"), "--list-devices"], env=env, capture_output=True, text=True, errors="replace", timeout=90)
+          print("DEVICES", devices.stdout, devices.stderr, flush=True)
+          assert devices.returncode == 0
+          if marker["backend"] == "vulkan":
+              assert "vulkan" in (devices.stdout + devices.stderr).lower()
+          m.validate_quantize(runtime / "llama-quantize.exe", model, root / (case + "-quantized.gguf"), install, host, runtime_line=marker.get("runtime_line"))
+          m.validate_server(runtime / "llama-server.exe", model, host, install, runtime_line=marker.get("runtime_line"), install_kind="windows-" + marker["backend"])
+          (root / (case + "-marker.json")).write_text(json.dumps(marker), encoding="utf-8")
+          print("PASS", case, "real quantization and completion", flush=True)
+
