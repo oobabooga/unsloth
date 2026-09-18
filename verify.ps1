@@ -30,8 +30,9 @@ Write-Host "  python bits: $arch"
 $venv = Join-Path $env:RUNNER_TEMP ("fakevenv-" + $Label)
 if (-not (Test-Path $venv)) { & $py -m venv $venv | Out-Null }
 $venvPy = Join-Path $venv "Scripts\python.exe"
-$live = Start-Process -FilePath $venvPy -ArgumentList "-c", "import time;time.sleep(600)" -PassThru -WindowStyle Hidden
+$live = Start-Process -FilePath $venvPy -ArgumentList '-c "import time;time.sleep(600)"' -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 2
+Check "harness: the live venv interpreter is running" (-not $live.HasExited)
 try {
     if ($present["Get-StudioPythonProcessImageTable"]) {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -67,7 +68,10 @@ try {
         $post = [char]10 + "_k.GetProcessHandleCount(_c.c_void_p(-1),_c.byref(_h));_s.stderr.write('POST=%d\n'%_h.value)"
         $leakFile = Join-Path $env:RUNNER_TEMP "leak.py"
         Set-Content -LiteralPath $leakFile -Value ($pre + $script:captured + $post) -Encoding UTF8
-        $errOut = & $py -I -S $leakFile 2>&1 | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }
+        $errFile = Join-Path $env:RUNNER_TEMP "leak.err"
+        $outFile = Join-Path $env:RUNNER_TEMP "leak.out"
+        Start-Process -FilePath $py -ArgumentList "-I -S `"$leakFile`"" -Wait -NoNewWindow -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+        $errOut = @(Get-Content -LiteralPath $errFile)
         $preN = [int](($errOut | Where-Object { $_ -match '^PRE=' }) -replace 'PRE=', '')
         $postN = [int](($errOut | Where-Object { $_ -match '^POST=' }) -replace 'POST=', '')
         Write-Host "  handles pre=$preN post=$postN"
