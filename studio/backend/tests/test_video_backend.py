@@ -3653,7 +3653,8 @@ def test_the_load_time_accelerator_probe_runs_under_the_reader_claim(monkeypatch
 
     # video.py imports this inside the load function, so the name must be replaced at its source
     # module; patching the video module misses it entirely and the test would pass vacuously.
-    monkeypatch.setattr(sd_cpp_backend, "sd_cpp_lists_accelerator_device", _watching_probe)
+    # The load reads the raw VERDICT now, so this is the name that has to be watched.
+    monkeypatch.setattr(sd_cpp_backend, "sd_cpp_accelerator_device_verdict", _watching_probe)
 
     backend = _run_h3_native_load()
 
