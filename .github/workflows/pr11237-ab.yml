@@ -1,0 +1,73 @@
+name: PR 11237 Windows A/B
+
+on:
+  push:
+    branches: [amd-devlab-pr11237-ab]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Hardware and sources
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version | Format-List
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List
+          python --version
+          $w = Join-Path $env:RUNNER_TEMP "ab"
+          New-Item -ItemType Directory -Force -Path $w | Out-Null
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$w\repo"
+          if ($LASTEXITCODE -ne 0) { throw "clone" }
+          git -C "$w\repo" worktree add -q --detach "$w\before" ef00d4946731d2cb9bed2982f1a24346843e7e19
+          if ($LASTEXITCODE -ne 0) { throw "before" }
+          git -C "$w\repo" worktree add -q --detach "$w\after" df0d65b805f568ee688c6e80a11d9e5f50293b99
+          if ($LASTEXITCODE -ne 0) { throw "after" }
+          python -m venv "$w\venv"
+          & "$w\venv\Scripts\python.exe" -m pip install -q pytest filelock
+          if ($LASTEXITCODE -ne 0) { throw "pip" }
+      - name: Live matrix (auto detection)
+        shell: powershell
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP "ab"
+          & "$w\venv\Scripts\python.exe" harness\ci\live_matrix.py --src "$w\before" --src "$w\after" --labels before,after --work "$w\work-auto" --pinned b11027-mix-3e83366
+          exit 0
+      - name: Live resolvers with forwarded ROCm gfx1151
+        shell: powershell
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP "ab"
+          & "$w\venv\Scripts\python.exe" harness\ci\live_matrix.py --src "$w\before" --src "$w\after" --labels before,after --work "$w\work-rocm" --pinned b11027-mix-3e83366 --only resolve_prebuilt,resolve_prebuilt_api,resolve_backends "--extra-args=--has-rocm --rocm-gfx gfx1151"
+          exit 0
+      - name: Unit suite tests/studio/install (before and after)
+        shell: powershell
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP "ab"
+          foreach ($l in "before", "after") {
+            Push-Location "$w\$l"
+            $t0 = Get-Date
+            & "$w\venv\Scripts\python.exe" -m pytest tests/studio/install -q -p no:cacheprovider --junitxml "$w\junit-$l.xml" -o junit_family=xunit1 2>&1 | Select-Object -Last 25
+            Write-Host "$l pytest exit=$LASTEXITCODE seconds=$([int]((Get-Date)-$t0).TotalSeconds)"
+            Pop-Location
+          }
+          exit 0
+      - name: Collect
+        if: always()
+        shell: powershell
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP "ab"
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          foreach ($d in "work-auto", "work-rocm") { if (Test-Path "$w\$d") { New-Item -ItemType Directory -Force -Path "out\$d" | Out-Null; Copy-Item -Recurse -Force "$w\$d\logs", "$w\$d\results.json" "out\$d\" -ErrorAction SilentlyContinue } }
+          Copy-Item "$w\junit-*.xml" out\ -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr11237-ab
+          path: out
