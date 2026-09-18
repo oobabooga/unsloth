@@ -3350,7 +3350,7 @@ exit 1
             if (-not (Test-StudioUvNoCache)) {
                 Write-StudioUvCacheMarker -StudioRoot $StudioRoot -Cache $studioCache
             }
-            step "uv cache" "forced Studio cache isolation ($studioCache); already-cached packages may download again" "Yellow"
+            step "uv cache" "forced Unsloth Studio cache isolation ($studioCache); already-cached packages may download again" "Yellow"
             return
         }
 
@@ -3477,19 +3477,19 @@ exit 1
             }
             "studio" {
                 if ($chosenCache) {
-                    step "uv cache" "reusing this install's Studio cache ($selectedCache)"
+                    step "uv cache" "reusing this install's Unsloth Studio cache ($selectedCache)"
                 # Never about the directory we are falling back TO: the Studio cache is itself
                 # a candidate now, so it can be the one refused, and naming it claims a fallback
                 # that did not happen.
                 } elseif ($scanBlocked -and -not [string]::IsNullOrWhiteSpace([string]$blockedCache) -and $blockedCache -ne $selectedCache) {
-                    step "uv cache" "using new Studio-owned cache ($selectedCache); part of $blockedCache could not be read, so cached packages may download again" "Yellow"
+                    step "uv cache" "using new Unsloth Studio-owned cache ($selectedCache); part of $blockedCache could not be read, so cached packages may download again" "Yellow"
                 } elseif ($scanBlocked -and [string]::IsNullOrWhiteSpace([string]$blockedCache)) {
-                    step "uv cache" "using new Studio-owned cache ($selectedCache); the existing uv cache could not be inspected, so cached packages may download again" "Yellow"
+                    step "uv cache" "using new Unsloth Studio-owned cache ($selectedCache); the existing uv cache could not be inspected, so cached packages may download again" "Yellow"
                 # Warm and still here means the write probe refused it.
                 } elseif ($warnCache -and $warnCache -ne $selectedCache) {
-                    step "uv cache" "using new Studio-owned cache ($selectedCache); $warnCache is populated but not writable, so cached packages may download again" "Yellow"
+                    step "uv cache" "using new Unsloth Studio-owned cache ($selectedCache); $warnCache is populated but not writable, so cached packages may download again" "Yellow"
                 } else {
-                    step "uv cache" "using new Studio-owned cache ($selectedCache)"
+                    step "uv cache" "using new Unsloth Studio-owned cache ($selectedCache)"
                 }
             }
         }
@@ -3934,16 +3934,103 @@ exit 1
         param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
 
         if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        if (-not $item) { return "" }
-        # Non-filesystem providers do not expose FileSystemInfo attributes.
-        if ($item -isnot [System.IO.FileSystemInfo]) { return "" }
-        if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return "" }
-        $target = $null
-        try { $target = $item.Target } catch { $target = $null }
-        # PS 5.1 exposes .Target as a collection; PS 7 as a string.
-        if ($target) { return " (it is a link to $(@($target) -join ', '))" }
-        return " (it is a link)"
+
+        # Read attributes through the filesystem API rather than Get-Item. Getting
+        # attributes needs only FILE_READ_ATTRIBUTES, which survives the ACLs that
+        # deny reading the directory itself, so Get-Item returns nothing in exactly
+        # the case this detail is meant to describe and the caller silently loses
+        # every hint below.
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($Path) } catch { $attrs = $null }
+        if ($null -eq $attrs) { return "" }
+
+        # Ordered by how much each one changes the fix. takeown/icacls cannot help
+        # with any of the first three, so name them before falling back to ACLs.
+        # On a directory this attribute only means new descendants are encrypted
+        # by default, so listing it never needs the key and a denial there is an
+        # ACL. Only a file's own streams are unreadable without the certificate.
+        $isDirectory = ([int]$attrs -band [int][System.IO.FileAttributes]::Directory) -ne 0
+        if (-not $isDirectory -and ($attrs -band [System.IO.FileAttributes]::Encrypted)) {
+            return " (it is EFS-encrypted, so it stays unreadable even elevated unless the encrypting account or its recovery certificate is available)"
+        }
+        # Offline plus either recall attribute is a cloud placeholder, typically
+        # OneDrive Files On-Demand that cannot hydrate.
+        # RECALL_ON_OPEN (0x40000) and RECALL_ON_DATA_ACCESS (0x400000) are absent
+        # from the FileAttributes enum on Windows PowerShell 5.1, so test the bits.
+        $offline = ([int]$attrs -band [int][System.IO.FileAttributes]::Offline) -ne 0
+        $recall = ([int]$attrs -band (0x00040000 -bor 0x00400000)) -ne 0
+        if ($offline -or $recall) {
+            return " (it is a cloud placeholder, e.g. OneDrive Files On-Demand, that cannot be hydrated right now)"
+        }
+        if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+            $target = $null
+            try {
+                $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+                if ($item -is [System.IO.FileSystemInfo]) { $target = $item.Target }
+            } catch { $target = $null }
+            # PS 5.1 exposes .Target as a collection; PS 7 as a string.
+            if ($target) { return " (it is a link to $(@($target) -join ', '))" }
+            return " (it is a link)"
+        }
+        return ""
+    }
+
+    # Which security software could be denying this path, as a possibility.
+    #
+    # Worth naming because takeown and icacls cannot clear a filter-driver block
+    # and elevation does not either, so a user whose antivirus is holding the
+    # folder is otherwise sent round the takeown loop for as long as they are
+    # willing. Nothing readable from here attributes the specific denial though,
+    # so this names the candidate and the log that settles it and never
+    # contradicts the ACL advice it follows.
+    #
+    # Defender's Controlled folder access modes are 0 Disabled, 1 Enabled,
+    # 2 AuditMode, 3 BlockDiskModificationOnly, 4 AuditDiskModificationOnly. Only
+    # 1 gates file access; 3 and 4 are direct disk-sector writes rather than
+    # files, so neither explains a denied folder.
+    #
+    # When Defender is not it, name whichever antivirus is registered and running
+    # instead: third-party suites ship the same protected-folders feature under
+    # their own product names, and the user cannot act on advice that does not say
+    # which product to open. Which suite ships what is recorded in
+    # tests/studio/test_installer_av_shapes.py and deliberately not repeated here,
+    # because this file is scanned in full before a line of it runs and a comment
+    # listing security products raises the score of the very file explaining it.
+    # Nothing below hard-codes a product: it reads what SecurityCenter2 registered.
+    #
+    # Answers "" whenever it cannot tell, so a machine with no Defender module
+    # and no SecurityCenter registration reads the same as one that says no.
+    function Get-SecuritySoftwareNote {
+        $mode = $null
+        try {
+            if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+                $mode = [int](Get-MpPreference -ErrorAction Stop).EnableControlledFolderAccess
+            }
+        } catch { $mode = $null }
+        if ($mode -eq 1) {
+            return "Controlled folder access is ON here, and it gates writes to protected folders whatever your privileges are, so where it is the cause takeown and icacls will not clear it: Windows Defender Operational events 1123 and 1124 say whether it stopped this path, and Virus & threat protection > Ransomware protection > Allow an app is where to allow Unsloth"
+        }
+        # SecurityCenter2 is the registration every consumer antivirus makes, and
+        # it is absent on Server SKUs, so this stays best-effort. productState
+        # packs the running state in 0xF000: 0x1000 on, 0x2000 snoozed, 0 off.
+        # A product that is not running cannot be holding the folder and naming it
+        # sends the user to the wrong console; a state we cannot read proves
+        # nothing either way, so it is kept.
+        $others = @()
+        try {
+            $others = @(Get-CimInstance -Namespace "root/SecurityCenter2" -ClassName AntiVirusProduct -ErrorAction Stop |
+                Where-Object { $state = $_.productState -as [uint32]; ($null -eq $state) -or (($state -band 0xF000) -eq 0x1000) } |
+                ForEach-Object { [string]$_.displayName } |
+                Where-Object { $_ -and $_ -notmatch "Windows Defender" -and $_ -notmatch "Microsoft Defender" })
+        } catch { $others = @() }
+        if ($others.Count -gt 0) {
+            $names = ($others | Select-Object -Unique) -join ", "
+            return "$names is running here, and its ransomware or protected-folder feature can deny a path whatever your privileges are. If takeown and icacls do not clear this, look in $names for a block on this folder, and add an exclusion for it and for Unsloth"
+        }
+        if ($mode -eq 2) {
+            return "Controlled folder access is in audit mode, so it is logging rather than blocking and is not the cause here; Windows Defender Operational events 1123 and 1124 name whatever it did stop"
+        }
+        return ""
     }
 
     # Print guidance; returns the failure reason as its only pipeline output.
@@ -3972,6 +4059,10 @@ exit 1
         substep "takeown /F `"$Path`" /R /D Y" "Yellow"
         substep "icacls `"$Path`" /reset /T" "Yellow"
         substep "Antivirus or Controlled folder access can deny this path too; allow or exclude it, then retry" "Yellow"
+        # After the generic line, since this one either confirms it or rules it
+        # out, and an empty answer must leave the generic advice standing.
+        $securitySoftware = Get-SecuritySoftwareNote
+        if ($securitySoftware) { substep $securitySoftware "Yellow" }
         if ($UserSupplied) {
             return "Access denied reading $Label at $Path. Restore access with takeown/icacls, or point UNSLOTH_LOCAL_LLAMA_CPP_DIR at a readable build, then re-run setup."
         }
@@ -4038,10 +4129,87 @@ exit 1
         Write-StudioLine ""
         # A denied custom home cannot be claimed as an Unsloth-managed cache.
         $homeIsCustom = Test-StudioHomeIsCustom
-        # Preserve user-supplied wording when either override names this tree.
+        # Preserve user-supplied wording when either override names this tree, or
+        # names a build inside it: moving or deleting this folder takes that build
+        # with it, and the later --with-llama-cpp-dir check then aborts on a path
+        # we made disappear.
         $suppliedDir = if ($WithLlamaCppDir) { $WithLlamaCppDir } else { $env:UNSLOTH_LOCAL_LLAMA_CPP_DIR }
-        $userSupplied = (-not [string]::IsNullOrWhiteSpace($suppliedDir)) -and
-            ((Get-CanonicalDir -Path $suppliedDir) -eq (Get-CanonicalDir -Path $dir))
+        # Walking the ancestors beats comparing the two canonical strings: an
+        # override that does not exist yet cannot be resolved, so a prefix test
+        # would compare a resolved path against an unresolved one and miss.
+        $userSupplied = $false
+        if (-not [string]::IsNullOrWhiteSpace($suppliedDir)) {
+            $canonicalDir = [string](Get-CanonicalDir -Path $dir)
+            $probe = [string](Get-CanonicalDir -Path $suppliedDir)
+            while (-not [string]::IsNullOrWhiteSpace($probe)) {
+                if ([string](Get-CanonicalDir -Path $probe) -eq $canonicalDir) {
+                    $userSupplied = $true
+                    break
+                }
+                $parent = ""
+                try { $parent = [string](Split-Path -Parent $probe) } catch { $parent = "" }
+                if ($parent -eq $probe) { break }
+                $probe = $parent
+            }
+        }
+
+        # Only the default branch below tells the user to delete this folder, so
+        # only that case may move it. A user-supplied build is not ours to touch,
+        # and an unreadable custom home cannot be confirmed as a managed cache.
+        # Renaming needs DELETE on the folder plus write on its parent, neither of
+        # which is read access, so this recovers denials that takeown and icacls
+        # do not: the folder is a managed cache that setup reinstalls anyway.
+        # Setup never makes this a link, so a link here is something the user
+        # arranged, pointing at a build we were not told about. Moving it would
+        # silently change which tree they run without touching the one they were
+        # protecting, so it is left alone and named in the guidance instead.
+        $isLink = $false
+        try {
+            $linkAttrs = [System.IO.File]::GetAttributes($dir)
+            $isLink = ([int]$linkAttrs -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0
+        } catch {
+            # Unreadable attributes prove nothing, and "proves nothing" must not
+            # mean "movable": fall through to the guidance rather than guess.
+            $isLink = $true
+        }
+        if (-not $userSupplied -and -not $homeIsCustom -and -not $isLink) {
+            $asideDir = "$dir.denied-$(Get-Date -Format 'yyyyMMddHHmmss')"
+            $moved = $false
+            try {
+                # [System.IO.Directory]::Move, not Move-Item. Move-Item falls back to
+                # copy-then-delete when the rename fails, which creates $asideDir and then
+                # dies on the unreadable contents, leaving a stray llama.cpp.denied-* folder
+                # beside the original on every run. Directory.Move is a bare rename: it
+                # either moves the tree or throws having created nothing.
+                # Measured on windows-latest, denying each shape on the folder itself:
+                #   (OI)(CI)(RX)  rename refused, Move-Item left a stray folder
+                #   (OI)(CI)(R)   rename refused, Move-Item left a stray folder
+                #   (RX)          rename refused, Move-Item left a stray folder
+                #   (DE)          rename SUCCEEDED, both ways
+                # So on Windows a read denial always refuses the rename (the open asks for
+                # SYNCHRONIZE, which every read deny removes) and this recovery cannot fire;
+                # denying DELETE, which sounds like the blocker, does not stop it. On POSIX
+                # the rename needs only write+execute on the parent, so the recovery is real
+                # there and is why this stays rather than being deleted.
+                [System.IO.Directory]::Move($dir, $asideDir)
+                $moved = $true
+            } catch {
+                # Expected when the denial covers the rename; fall through to guidance.
+                # Nothing to clean up: Directory.Move creates nothing when it throws.
+            }
+            if ($moved) {
+                step "permissions" "llama.cpp install at $dir could not be read, so it was moved aside" "Yellow"
+                substep "Moved to $asideDir; it is a managed cache and setup reinstalls it" "Yellow"
+                substep "Delete the moved folder once access is restored, it is no longer used" "Yellow"
+                Write-StudioLine ""
+                return $null
+            }
+            # This runs before the install lock, so a second run can have moved
+            # the folder in between. Re-probe rather than report a denial for a
+            # path that is no longer there and stop an install that can proceed.
+            if ((Get-LlamaCppInstallReadState -Path $dir) -ne "Denied") { return $null }
+        }
+
         $reason = Write-PathAccessDenied -Path $dir -Label "llama.cpp install" `
             -UserSupplied:$userSupplied -OwnershipUnverified:$homeIsCustom
         substep "Stopping here, before phase 1: nothing has been downloaded or installed" "Yellow"
@@ -9572,7 +9740,7 @@ exit 0
 
     $_desktopMinVer = if ($env:UNSLOTH_DESKTOP_BACKEND_VERSION) { $env:UNSLOTH_DESKTOP_BACKEND_VERSION.Trim() } else { "" }
     $_unslothDesktopInstallSpec = if ($_desktopMinVer) { "unsloth>=$_desktopMinVer" } else { $null }
-    $_unslothReleaseInstallSpec = if ($_unslothDesktopInstallSpec) { $_unslothDesktopInstallSpec } else { "unsloth>=2026.9.4" }
+    $_unslothReleaseInstallSpec = if ($_unslothDesktopInstallSpec) { $_unslothDesktopInstallSpec } else { "unsloth>=2026.9.7" }
 
     if ($_Migrated) {
         Write-TauriLog "STEP" "Installing unsloth"
@@ -9580,7 +9748,10 @@ exit 0
         if ($SkipTorch) {
             # No-torch: install unsloth + unsloth-zoo with --no-deps, then
             # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
-            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (migrated no-torch)" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth --reinstall-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.3" }
+            # --no-deps means unsloth's own metadata is never read, so this spec IS the zoo
+            # floor for this path. Keep it equal to the unsloth_zoo floor in pyproject.toml
+            # (tests/test_installer_zoo_floor_parity.py enforces that).
+            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (migrated no-torch)" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth --reinstall-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.6" }
             if ($baseInstallExit -eq 0) {
                 # Resolve pydantic WITH deps so pip pins pydantic-core
                 # to the matching version (no-torch-runtime.txt below
@@ -9599,7 +9770,7 @@ exit 0
                 }
             }
         } else {
-            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (migrated)" { & $script:UvExe pip install --python $VenvPython --reinstall-package unsloth --reinstall-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.3" }
+            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (migrated)" { & $script:UvExe pip install --python $VenvPython --reinstall-package unsloth --reinstall-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.6" }
         }
         if ($baseInstallExit -ne 0) {
             Write-StudioLine "[ERROR] Failed to install unsloth (exit code $baseInstallExit)" -ForegroundColor Red
@@ -9850,7 +10021,8 @@ exit 0
         if ($SkipTorch) {
             # No-torch: install unsloth + unsloth-zoo with --no-deps, then
             # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
-            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (no-torch)" { & $script:UvExe pip install --python $VenvPython --no-deps --upgrade-package unsloth --upgrade-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.3" }
+            # --no-deps: this spec IS the zoo floor here. Kept equal to pyproject.toml's.
+            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (no-torch)" { & $script:UvExe pip install --python $VenvPython --no-deps --upgrade-package unsloth --upgrade-package unsloth-zoo "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.6" }
             if ($baseInstallExit -eq 0) {
                 # Same pydantic-with-deps trick as the migrated branch.
                 $baseInstallExit = Invoke-InstallCommandRetry -Label "install pydantic" { & $script:UvExe pip install --python $VenvPython pydantic }
@@ -9870,11 +10042,11 @@ exit 0
             # Freeze the trio so this with-deps resolve cannot downgrade the pinned build.
             $script:TorchOverridesFile = New-UnslothTorchOverridesFile -PythonExe $VenvPython
             if ($script:TorchOverridesFile) {
-                $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (local)" { & $script:UvExe pip install --python $VenvPython --upgrade-package unsloth --overrides $script:TorchOverridesFile "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.3" }
+                $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (local)" { & $script:UvExe pip install --python $VenvPython --upgrade-package unsloth --overrides $script:TorchOverridesFile "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.6" }
                 Remove-Item -LiteralPath $script:TorchOverridesFile -Force -ErrorAction SilentlyContinue
                 $script:TorchOverridesFile = $null
             } else {
-                $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (local)" { & $script:UvExe pip install --python $VenvPython --upgrade-package unsloth "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.3" }
+                $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (local)" { & $script:UvExe pip install --python $VenvPython --upgrade-package unsloth "$_unslothReleaseInstallSpec" "unsloth-zoo>=2026.9.6" }
             }
         } else {
             $_unslothPkg = if ($PackageName -eq "unsloth" -and $_unslothDesktopInstallSpec) { $_unslothDesktopInstallSpec } else { $PackageName }
@@ -9911,7 +10083,7 @@ exit 0
         Write-TauriLog "STEP" "Installing unsloth"
         substep "installing unsloth (this may take a few minutes)..."
         if ($StudioLocalInstall) {
-            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (auto torch backend)" { & $script:UvExe pip install --python $VenvPython "unsloth-zoo>=2026.9.3" "$_unslothReleaseInstallSpec" --torch-backend=auto }
+            $baseInstallExit = Invoke-InstallCommandRetry -Label "install unsloth (auto torch backend)" { & $script:UvExe pip install --python $VenvPython "unsloth-zoo>=2026.9.6" "$_unslothReleaseInstallSpec" --torch-backend=auto }
             if ($baseInstallExit -ne 0) {
                 Write-StudioLine "[ERROR] Failed to install unsloth (exit code $baseInstallExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to install unsloth (exit code $baseInstallExit)" $baseInstallExit)
