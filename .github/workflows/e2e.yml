@@ -1,0 +1,35 @@
+name: native-off install e2e
+on:
+  push:
+    branches: [ctypes-e2e-ci]
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { side: after,  ref: process-image-ctypes-ci, shell: ps51 }
+          - { side: after,  ref: process-image-ctypes-ci, shell: pwsh }
+          - { side: before, ref: base-11104-ci,           shell: ps51 }
+    name: ${{ matrix.side }} ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: harness }
+      - uses: actions/checkout@v4
+        with: { repository: oobabooga/unsloth, ref: '${{ matrix.ref }}', path: repo, persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: e2e
+        shell: pwsh
+        working-directory: repo
+        run: ../harness/e2e.ps1 -Label "${{ matrix.side }}-${{ matrix.shell }}" -Shell "${{ matrix.shell }}"
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: 'e2e-${{ matrix.side }}-${{ matrix.shell }}', path: repo/logs, retention-days: 3 }
