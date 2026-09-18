@@ -13,7 +13,9 @@ $trace = Join-Path $env:RUNNER_TEMP "rung.log"
 $hasRung = $src.Contains('function Get-StudioPythonProcessImageTable {')
 if ($hasRung) {
     $src = $src.Replace('function Get-StudioPythonProcessImageTable {', 'function Get-StudioPythonProcessImageTable { Add-Content -LiteralPath ''' + $trace + ''' -Value "called"')
-    $src = $src.Replace("        if (`$table.Count -eq 0) { return `$null }`n        return `$table", "        Add-Content -LiteralPath '" + $trace + "' -Value (""rows="" + `$table.Count)`n        if (`$table.Count -eq 0) { return `$null }`n        return `$table")
+    $before = $src
+    $src = [regex]::Replace($src, '(\r?\n)(\s*)if \(\$table\.Count -eq 0\) \{ return \$null \}', { param($m) $m.Groups[1].Value + $m.Groups[2].Value + "Add-Content -LiteralPath '" + $trace + "' -Value (""rows="" + `$table.Count)" + $m.Groups[1].Value + $m.Groups[2].Value + 'if ($table.Count -eq 0) { return $null }' })
+    if ($src -ceq $before) { throw "row trace hook not applied" }
 }
 Set-Content -LiteralPath install.e2e.ps1 -Value $src -Encoding UTF8
 function Invoke-Install($log) {
