@@ -1,4 +1,4 @@
-name: "Studio VRAM tile on Windows Strix Halo (8060S)"
+name: "Studio VRAM tile on Strix Halo (8060S), Windows and Linux"
 
 # Does the Settings > Resources "Live monitor" VRAM tile read "Unknown" on a Windows
 # Strix Halo iGPU? Two legs, each on its own box of the devlab Windows pool (GMKtec
@@ -582,6 +582,416 @@ jobs:
         if: always()
         with:
           name: studio-vram-tile-${{ matrix.leg }}
+          path: ${{ env.STUDIO_W }}/out
+          retention-days: 14
+          if-no-files-found: warn
+
+  studio-linux:
+    name: "Studio (no-torch) on Linux 8060S, RADV"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      LEG: linux-no-torch
+    steps:
+
+      - name: Preamble
+        run: |
+          set +e
+          W="${RUNNER_TEMP:-/tmp}/studio-vram-linux"
+          rm -rf "$W"; mkdir -p "$W"/{out,src,tmp,cache/uv,cache/hf,studio-home}
+          pw=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+          echo "::add-mask::$pw"
+          {
+            echo "STUDIO_W=$W"
+            echo "UNSLOTH_STUDIO_HOME=$W/studio-home"
+            echo "UNSLOTH_SKIP_AUTOSTART=1"
+            echo "UNSLOTH_STUDIO_PASSWORD=$pw"
+            echo "UV_CACHE_DIR=$W/cache/uv"
+            echo "HF_HOME=$W/cache/hf"
+            echo "TMPDIR=$W/tmp"
+            echo "PYTHONUTF8=1"
+          } >> "$GITHUB_ENV"
+          echo "work root: $W   machine: $(uname -n)   user: $(id -un)"
+          df -h "${RUNNER_TEMP:-/tmp}" | tail -1
+
+      - name: Hardware
+        run: |
+          set +e
+          {
+            echo "## OS"; uname -a; head -4 /etc/os-release
+            echo; echo "## CPU / RAM"; lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core"; free -h
+            echo; echo "## PCI"; lspci -nn | grep -iE "vga|display|processing accelerator" || true
+            echo; echo "## amdgpu sysfs"
+            for d in /sys/class/drm/card*/device; do
+              [ -f "$d/mem_info_vram_total" ] || continue
+              echo "$d: vram_total=$(cat "$d/mem_info_vram_total") vram_used=$(cat "$d/mem_info_vram_used") gtt_total=$(cat "$d/mem_info_gtt_total") gtt_used=$(cat "$d/mem_info_gtt_used")"
+            done
+            echo; echo "## devices"; ls -l /dev/kfd /dev/dri 2>&1
+            echo; echo "## identity"; id
+            echo; echo "## Vulkan"
+            ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>&1
+            ls /usr/lib/x86_64-linux-gnu/libvulkan.so* 2>&1
+            if command -v vulkaninfo >/dev/null 2>&1; then vulkaninfo --summary 2>&1 | sed -n '/^Devices:/,$p' | head -40; else echo "vulkaninfo: absent"; fi
+            echo; echo "## ROCm"
+            if command -v rocminfo >/dev/null 2>&1; then rocminfo 2>/dev/null | grep -E "Marketing Name|gfx" | head -8; else echo "rocminfo: absent"; fi
+            [ -f /opt/rocm/.info/version ] && cat /opt/rocm/.info/version
+            echo; echo "## tools"
+            for t in python3 git node npm uv gcc cmake; do printf '%-8s %s\n' "$t" "$(command -v "$t" || echo absent)"; done
+            python3 --version
+            echo "HIP_VISIBLE_DEVICES='${HIP_VISIBLE_DEVICES:-}' ROCR_VISIBLE_DEVICES='${ROCR_VISIBLE_DEVICES:-}' GGML_VK_VISIBLE_DEVICES='${GGML_VK_VISIBLE_DEVICES:-}'"
+          } 2>&1 | tee "$STUDIO_W/out/hardware.md"
+
+      - name: Fetch unsloth at the pinned commit
+        run: |
+          set -e
+          src="$STUDIO_W/src/unsloth"
+          git init -q "$src"
+          git -C "$src" remote add origin "$UNSLOTH_REPO"
+          git -C "$src" fetch -q --depth 1 origin "$UNSLOTH_SHA"
+          git -C "$src" checkout -q --detach "$UNSLOTH_SHA"
+          git -C "$src" log -1 --format="%H %ci %s"
+          echo "UNSLOTH_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Install Studio (install.sh --local --no-torch)
+        timeout-minutes: 60
+        run: |
+          set +e
+          cd "$UNSLOTH_SRC"
+          t0=$(date +%s)
+          bash install.sh --local --no-torch --verbose > "$STUDIO_W/out/install.log" 2> "$STUDIO_W/out/install.err" < /dev/null
+          rc=$?
+          echo "install exit=$rc seconds=$(( $(date +%s) - t0 ))"
+          echo "--- install.log (last 120 lines)"; tail -120 "$STUDIO_W/out/install.log"
+          echo "--- install.err (last 40 lines)"; tail -40 "$STUDIO_W/out/install.err"
+          exe="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          py="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          if [ ! -x "$exe" ]; then echo "FATAL: $exe missing after install; nothing to boot."; exit 1; fi
+          { echo "UNSLOTH_EXE=$exe"; echo "UNSLOTH_PY=$py"; echo "INSTALL_EXIT=$rc"; } >> "$GITHUB_ENV"
+
+      - name: What the install put on disk
+        run: |
+          set +e
+          echo "## studio home"; ls "$UNSLOTH_STUDIO_HOME"
+          echo "## llama.cpp runtime files"
+          find "$UNSLOTH_STUDIO_HOME" \( -name llama-server -o -name 'libggml-*.so*' \) -not -path '*site-packages*' -exec ls -la {} \; 2>/dev/null
+          vk=$(find "$UNSLOTH_STUDIO_HOME" -name 'libggml-vulkan.so*' -not -path '*site-packages*' 2>/dev/null | head -1)
+          srv=$(find "$UNSLOTH_STUDIO_HOME" -name llama-server -type f -not -path '*site-packages*' 2>/dev/null | head -1)
+          echo "## packages in the studio venv"
+          "$UNSLOTH_PY" -c "import importlib.metadata as m; rows=sorted((d.metadata['Name'] or '', d.version) for d in m.distributions()); print('\n'.join(f'  {n}=={v}' for n,v in rows if n.lower().startswith(('torch','unsloth','llama','fastapi','uvicorn','structlog','psutil'))))"
+          if [ -f "$UNSLOTH_SRC/studio/frontend/dist/index.html" ]; then echo "frontend dist present: True"; else echo "frontend dist present: False"; fi
+          vkdir=""; [ -n "$vk" ] && vkdir=$(dirname "$vk")
+          { echo "GGML_VULKAN_DIR=$vkdir"; echo "LLAMA_SERVER=$srv"; } >> "$GITHUB_ENV"
+
+      - name: torch in the studio venv
+        run: |
+          set +e
+          cat > "$STUDIO_W/torch_probe.py" <<'PY'
+          import json, os, sys
+          out = {"python": sys.version.split()[0]}
+          try:
+              import torch
+              out["torch"] = torch.__version__
+              out["hip"] = getattr(torch.version, "hip", None)
+              out["cuda"] = getattr(torch.version, "cuda", None)
+              out["is_available"] = bool(torch.cuda.is_available())
+              if out["is_available"]:
+                  out["device_count"] = torch.cuda.device_count()
+                  devs = []
+                  for i in range(torch.cuda.device_count()):
+                      p = torch.cuda.get_device_properties(i)
+                      d = {"index": i, "name": p.name, "total_memory_gib": round(p.total_memory / 1024**3, 3)}
+                      for attr in ("gcnArchName", "is_integrated", "multi_processor_count"):
+                          d[attr] = getattr(p, attr, None)
+                      try:
+                          free, total = torch.cuda.mem_get_info(i)
+                          d["mem_get_info_free_gib"] = round(free / 1024**3, 3)
+                          d["mem_get_info_total_gib"] = round(total / 1024**3, 3)
+                      except Exception as e:
+                          d["mem_get_info_error"] = f"{type(e).__name__}: {e}"
+                      devs.append(d)
+                  out["devices"] = devs
+          except Exception as e:
+              out["torch_error"] = f"{type(e).__name__}: {e}"
+          text = json.dumps(out, indent=2)
+          print(text)
+          with open(os.path.join(sys.argv[1], "torch_probe.json"), "w", encoding="utf-8") as f:
+              f.write(text + "\n")
+          PY
+          "$UNSLOTH_PY" "$STUDIO_W/torch_probe.py" "$STUDIO_W/out"; echo "exit=$?"
+
+      - name: Raw ggml Vulkan probe and llama-server --list-devices
+        run: |
+          set +e
+          {
+            if [ -z "$GGML_VULKAN_DIR" ]; then
+              echo "no libggml-vulkan.so under the studio home: the installed llama.cpp is not a Vulkan build"
+            else
+              echo "## _vulkan_probe.py $GGML_VULKAN_DIR"; echo "## columns: idx  free_bytes  is_igpu  total_bytes  name  type_known"
+              "$UNSLOTH_PY" "$UNSLOTH_SRC/studio/backend/core/inference/_vulkan_probe.py" "$GGML_VULKAN_DIR" 2> "$STUDIO_W/out/vulkan-probe.stderr"; echo "exit=$?"
+              echo "## probe stderr"; grep -i ggml "$STUDIO_W/out/vulkan-probe.stderr"
+            fi
+            if [ -n "$LLAMA_SERVER" ]; then echo; echo "## $LLAMA_SERVER --list-devices"; "$LLAMA_SERVER" --list-devices 2>/dev/null; echo "exit=$?"; fi
+          } 2>&1 | tee "$STUDIO_W/out/vulkan-probe.md"
+
+      - name: Prepare Playwright (best effort)
+        timeout-minutes: 20
+        run: |
+          set +e
+          [ -f "$UNSLOTH_SRC/studio/frontend/dist/index.html" ] || { echo "no frontend build, nothing to screenshot"; exit 0; }
+          export PLAYWRIGHT_BROWSERS_PATH="$STUDIO_W/pw-browsers"
+          python3 -m venv "$STUDIO_W/pwvenv" && "$STUDIO_W/pwvenv/bin/python" -m pip install -q --disable-pip-version-check playwright || { echo "playwright install failed; skipping"; exit 0; }
+          "$STUDIO_W/pwvenv/bin/python" -m playwright install chromium || { echo "chromium download failed; skipping"; exit 0; }
+          # System libraries are the box's business; nothing here escalates. A missing one shows up as a skipped screenshot.
+          { echo "PW_PY=$STUDIO_W/pwvenv/bin/python"; echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"; } >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Boot Studio, read /api/system, recompute the VRAM tile, screenshot
+        timeout-minutes: 45
+        run: |
+          set +e
+          port="$STUDIO_PORT"
+          args=(studio -H 127.0.0.1 -p "$port")
+          [ -f "$UNSLOTH_SRC/studio/frontend/dist/index.html" ] || { echo "frontend dist missing; booting --api-only"; args+=(--api-only); }
+          cd "$STUDIO_W"
+          "$UNSLOTH_EXE" "${args[@]}" > "$STUDIO_W/out/studio.log" 2> "$STUDIO_W/out/studio.err" < /dev/null &
+          PID=$!
+          echo "studio pid $PID: $UNSLOTH_EXE ${args[*]}"
+          echo "STUDIO_PID=$PID" >> "$GITHUB_ENV"
+          up=0
+          for i in $(seq 1 180); do
+            kill -0 "$PID" 2>/dev/null || break
+            if curl -sf -m 5 "http://127.0.0.1:$port/api/health" > "$STUDIO_W/out/health-first.json"; then up=1; break; fi
+            sleep 5
+          done
+          if [ "$up" != 1 ]; then
+            alive=no; kill -0 "$PID" 2>/dev/null && alive=yes
+            echo "FATAL: no 200 from /api/health within 15 min (alive: $alive)"
+            tail -120 "$STUDIO_W/out/studio.log"; tail -60 "$STUDIO_W/out/studio.err"; exit 1
+          fi
+          echo "health after ~$(( i * 5 ))s: $(cat "$STUDIO_W/out/health-first.json")"
+          cat > "$STUDIO_W/read_system.py" <<'PY'
+          import json, os, sys, time, urllib.request
+
+          port = os.environ.get("STUDIO_PORT", "8899")
+          base = f"http://127.0.0.1:{port}"
+          out_dir = sys.argv[1]
+          pw = os.environ.get("UNSLOTH_STUDIO_PASSWORD", "")
+          leg = os.environ.get("LEG", "?")
+          sha = os.environ.get("UNSLOTH_SHA", "")[:10]
+
+          def call(path, token=None, method="GET", body=None, timeout=90):
+              req = urllib.request.Request(base + path, method=method)
+              if token:
+                  req.add_header("Authorization", "Bearer " + token)
+              data = None
+              if body is not None:
+                  data = json.dumps(body).encode()
+                  req.add_header("Content-Type", "application/json")
+              with urllib.request.urlopen(req, data, timeout=timeout) as r:
+                  return r.status, json.loads(r.read().decode("utf-8") or "null")
+
+          def save(name, obj):
+              with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+                  json.dump(obj, f, indent=2)
+
+          status, tok = call("/api/auth/login", method="POST", body={"username": "unsloth", "password": pw})
+          token = tok["access_token"]
+          print("login:", status, "must_change_password=", tok.get("must_change_password"))
+          if tok.get("must_change_password"):
+              # /api/system refuses a token still flagged for the change; rotate once and keep going.
+              status, tok = call("/api/auth/change-password", token, method="POST",
+                                 body={"current_password": pw, "new_password": pw + "x1"})
+              token = tok["access_token"]
+              print("change-password:", status, "must_change_password=", tok.get("must_change_password"))
+
+          deadline = time.time() + 600
+          while True:
+              status, h = call("/api/health", token)
+              if not (h.get("hardware_detecting") or h.get("torch_warm_in_progress")) or time.time() > deadline:
+                  break
+              time.sleep(5)
+          save("health.json", h)
+          print("health:", json.dumps({k: h.get(k) for k in ("version", "studio_version", "device_type", "hardware_detecting", "torch_warm_in_progress")}))
+
+          first = call("/api/system", token)[1]
+          save("system-first.json", first)
+          time.sleep(6)
+          sysinfo = call("/api/system?refresh_memory=true", token)[1]
+          save("system.json", sysinfo)
+          try:
+              hw = call("/api/system/hardware?include_details=true", token)[1]
+          except Exception as e:
+              hw = {"error": repr(e)}
+          save("system-hardware.json", hw)
+          try:
+              vis = call("/api/system/gpu-visibility", token)[1]
+          except Exception as e:
+              vis = {"error": repr(e)}
+          save("gpu-visibility.json", vis)
+
+          # The tile, computed the way resources-tab.tsx and gpu-vram.ts do it.
+          def fin(x):
+              return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf")
+          def r2(x):
+              return round(x * 100) / 100
+          def fmt(x):
+              return f"{x:.1f} GiB" if x >= 10 else f"{x:.2f} GiB"
+          def size(d):
+              t = d.get("memory_total_gb")
+              return t if fin(t) and t > 0 else 0
+          def totals(devs):
+              ded = r2(sum(size(d) for d in devs if not d.get("shared_memory")))
+              hb, res = 0.0, 0.0
+              for d in devs:
+                  if not d.get("shared_memory"):
+                      continue
+                  t = size(d)
+                  rep = d.get("shared_memory_host_backed_gb")
+                  known = fin(rep) and rep >= 0
+                  h = min(t, rep) if known else t
+                  hb = max(hb, h)
+                  res += (t - h) if known else 0
+              shared = r2(hb)
+              ded = r2(ded + res)
+              return {"dedicated": ded, "shared": shared, "total": r2(ded + shared)}
+          def per_device(devs):
+              return bool(devs) and all(fin(d.get("vram_used_gb")) for d in devs)
+          def used_of(gpu):
+              devs = (gpu or {}).get("devices") or []
+              if per_device(devs):
+                  return sum(d.get("vram_used_gb") or 0 for d in devs)
+              agg = (gpu or {}).get("vram_used_gb_aggregate")
+              return agg if fin(agg) else None
+
+          gpu = sysinfo.get("gpu") or {}
+          inf = sysinfo.get("inference_gpu")
+          displayed = gpu if gpu.get("available") else (inf if inf is not None else gpu)
+          devs = displayed.get("devices") or []
+          has_gpu = bool(displayed.get("available")) and len(devs) > 0
+          tt = totals(devs)
+          u = used_of(displayed)
+          cap = f"{fmt(tt['dedicated'])} VRAM + {fmt(tt['shared'])} shared" if tt["shared"] > 0 else fmt(tt["total"])
+          if has_gpu:
+              if u is not None:
+                  if per_device(devs):
+                      free = sum((d.get("vram_free_gb") if fin(d.get("vram_free_gb")) else max(0, (d.get("memory_total_gb") or 0) - (d.get("vram_used_gb") or 0))) for d in devs)
+                  else:
+                      free = max(0, tt["total"] - u)
+                  value, detail = f"{fmt(u)} / {cap}", f"{fmt(free)} free"
+              else:
+                  value, detail = f"Unknown / {cap}", "Unknown"
+          else:
+              value, detail = "No visible GPU", (displayed.get("backend") or sysinfo.get("device_backend") or "cpu").upper()
+          fed_by = "gpu (torch view)" if gpu.get("available") else ("inference_gpu (llama.cpp inventory)" if inf is not None else "gpu (unavailable)")
+
+          keys = ("index", "index_kind", "visible_ordinal", "name", "memory_total_gb", "vram_used_gb", "vram_free_gb",
+                  "vram_utilization_pct", "shared_memory", "unified_memory", "shared_memory_host_backed_gb")
+          lines = [f"## Live monitor VRAM tile, leg={leg}, unsloth {sha}", ""]
+          lines.append(f"VRAM tile value:  {value}")
+          lines.append(f"VRAM tile detail: {detail}")
+          lines.append(f"fed by: {fed_by}   backend={displayed.get('backend')}   device_backend={sysinfo.get('device_backend')}")
+          lines.append("")
+          lines.append(f"ml_packages: {json.dumps(sysinfo.get('ml_packages'))}   platform: {sysinfo.get('platform')}   python: {sysinfo.get('python_version')}")
+          lines.append(f"RAM: {json.dumps(sysinfo.get('memory'))}")
+          lines.append("")
+          for label, g in (("gpu", gpu), ("inference_gpu", inf)):
+              if g is None:
+                  lines.append(f"{label}: null")
+                  continue
+              lines.append(f"{label}: available={g.get('available')} backend={g.get('backend')} vram_used_gb_aggregate={g.get('vram_used_gb_aggregate')} gguf_gpu_ids_supported={g.get('gguf_gpu_ids_supported')} mismatch={json.dumps(g.get('mismatch'))}")
+              for d in g.get("devices") or []:
+                  lines.append("  " + json.dumps({k: d.get(k) for k in keys if k in d}))
+              if g.get("physical_devices"):
+                  lines.append("  physical_devices: " + json.dumps(g.get("physical_devices")))
+          lines.append("")
+          lines.append("/api/system/hardware gpu: " + json.dumps(hw.get("gpu") if isinstance(hw, dict) else hw))
+          lines.append("/api/system/hardware gpus: " + json.dumps(hw.get("gpus") if isinstance(hw, dict) else None))
+          lines.append("/api/system/gpu-visibility: " + json.dumps(vis)[:1500])
+          text = "\n".join(lines)
+          print(text)
+          with open(os.path.join(out_dir, "tile-summary.md"), "w", encoding="utf-8") as f:
+              f.write(text + "\n")
+          summ = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summ:
+              with open(summ, "a", encoding="utf-8") as f:
+                  f.write(text + "\n\n")
+          PY
+          "$UNSLOTH_PY" "$STUDIO_W/read_system.py" "$STUDIO_W/out"; readExit=$?
+          echo "read exit=$readExit"
+          if [ -n "${PW_PY:-}" ] && [ -f "$UNSLOTH_SRC/studio/frontend/dist/index.html" ]; then
+          cat > "$STUDIO_W/shot.py" <<'PY'
+          import os, sys
+          from playwright.sync_api import sync_playwright
+          port = os.environ["STUDIO_PORT"]
+          pw = os.environ["UNSLOTH_STUDIO_PASSWORD"]
+          out = sys.argv[1]
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              page = b.new_page(viewport={"width": 1500, "height": 1150})
+              page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle", timeout=90000)
+              page.screenshot(path=os.path.join(out, "01-landing.png"))
+              try:
+                  # Single-user installs show only the password box; the username box exists on multi-user ones.
+                  if page.locator("#username").count():
+                      page.fill("#username", "unsloth")
+                  page.fill("#password", pw, timeout=20000)
+                  page.keyboard.press("Enter")
+                  page.wait_for_function("() => !document.querySelector('#password')", timeout=30000)
+                  page.wait_for_timeout(4000)
+                  print("logged in, url:", page.url)
+              except Exception as e:
+                  print("login failed:", e)
+              page.screenshot(path=os.path.join(out, "02-after-login.png"))
+              # /settings opens the settings dialog and redirects home; the tab buttons carry data-testids.
+              # If the deep link did not leave the dialog open, the sidebar gear opens it.
+              page.goto(f"http://127.0.0.1:{port}/settings", wait_until="networkidle", timeout=90000)
+              page.wait_for_timeout(3000)
+              tab = page.locator('[data-testid="settings-tab-resources"]').first
+              if not tab.is_visible():
+                  try:
+                      page.get_by_role("button", name="Settings").first.click(timeout=10000)
+                      page.wait_for_timeout(2000)
+                      print("opened settings from the sidebar gear")
+                  except Exception as e:
+                      print("sidebar gear click failed:", e)
+              clicked = False
+              try:
+                  tab.click(timeout=15000)
+                  clicked = True
+              except Exception as e:
+                  print("resources tab click failed:", e)
+              print("resources tab clicked:", clicked)
+              page.wait_for_timeout(12000)
+              page.screenshot(path=os.path.join(out, "03-settings-resources.png"), full_page=True)
+              try:
+                  heading = page.get_by_text("Live monitor", exact=True).first
+                  heading.scroll_into_view_if_needed(timeout=5000)
+                  section = heading.locator("xpath=ancestor::section[1] | xpath=ancestor::div[2]").first
+                  section.screenshot(path=os.path.join(out, "04-live-monitor-section.png"))
+              except Exception as e:
+                  print("section screenshot skipped:", e)
+              b.close()
+          PY
+            "$PW_PY" "$STUDIO_W/shot.py" "$STUDIO_W/out"; echo "screenshot exit=$? (advisory)"
+          else
+            echo "no Playwright venv or no frontend build; skipping the screenshot"
+          fi
+          if kill -0 "$PID" 2>/dev/null; then kill "$PID"; sleep 3; kill -9 "$PID" 2>/dev/null; else echo "Studio exited on its own during the read"; fi
+          exit "$readExit"
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          set +e
+          [ -n "${STUDIO_PID:-}" ] && kill -9 "$STUDIO_PID" 2>/dev/null
+          echo "--- studio.log (last 80 lines)"; tail -80 "$STUDIO_W/out/studio.log" 2>/dev/null
+          echo "--- studio.err (last 40 lines)"; tail -40 "$STUDIO_W/out/studio.err" 2>/dev/null
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-vram-tile-linux-no-torch
           path: ${{ env.STUDIO_W }}/out
           retention-days: 14
           if-no-files-found: warn
