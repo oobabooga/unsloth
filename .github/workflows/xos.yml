@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: oobabooga/unsloth
-          ref: fb38475479
+          ref: fb38475479f6c351e3c916d427575b1f730df1f1
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
