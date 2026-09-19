@@ -73,8 +73,11 @@ jobs:
                   try: r = hw._determine_attention_impl_for_gpu_estimate(cfg)
                   except Exception as e: r = "EXC " + type(e).__name__  # the caller turns this into "eager"
                   out[f"{name}|env={env}"] = r
-          import unsloth.models._utils as U
-          out["_utils_from"] = os.path.relpath(U.__file__, os.path.dirname(tree)).split(os.sep)[0] if hasattr(U, "__file__") else None
+          try:
+              import unsloth.models._utils as U
+              out["_utils_from"] = os.path.relpath(U.__file__, os.path.dirname(tree)).split(os.sep)[0]
+          except Exception as e:
+              out["_utils_from"] = "not importable: " + type(e).__name__ + ": " + str(e)[:80]
           print("RESULT " + json.dumps(out, sort_keys=True))
           PY
           for t in main pr; do python probe.py "$GITHUB_WORKSPACE/$t" 2>&1 | tee "probe_$t.txt" | tail -3 || true; done
