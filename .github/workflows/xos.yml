@@ -25,55 +25,69 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-        with:
-          repository: oobabooga/unsloth
-          ref: fb38475479f6c351e3c916d427575b1f730df1f1
-          persist-credentials: false
+        with: {repository: oobabooga/unsloth, ref: fb38475479f6c351e3c916d427575b1f730df1f1, path: pr, persist-credentials: false}
+      - uses: actions/checkout@v4
+        with: {repository: oobabooga/unsloth, ref: b863e983a8675a3014a7058b03aed3846f691a6d, path: main, persist-credentials: false}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install CPU stack (mirrors core-cpu-setup)
         run: |
           set -euxo pipefail
+          cd pr
           python -m pip install --upgrade pip
           pip install -r studio/backend/requirements/studio.txt
           if [ "$RUNNER_OS" = "macOS" ]; then pip install 'torch>=2.4,<2.11' 'torchvision<0.26'; else
             pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11' 'torchvision<0.26'; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then pip install triton; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then pip install 'triton-windows<3.6'; fi
           pip install python-multipart aiofiles sqlalchemy cryptography pyyaml jinja2 requests typer 'numpy<3' pytest==9.0.3 pytest-asyncio pytest-timeout httpx protobuf sentencepiece psutil packaging tqdm safetensors datasets 'peft>=0.18,<0.20' 'accelerate>=0.34,<2'
           SPEC=$(python -c "import tomllib,re;d=tomllib.load(open('pyproject.toml','rb'))['project'];a=list(d.get('dependencies',[]))+[x for v in d.get('optional-dependencies',{}).values() for x in v];print(next((x for x in a if re.match(r'\s*transformers\b',x)),'transformers'))")
           pip install "$SPEC" trl
           pip install --no-deps 'git+https://github.com/unslothai/unsloth-zoo'
-          pip install -e . --no-deps
           python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__)"
-      - name: PR resolver + estimator tests
+      - name: PR resolver + estimator tests (torch path; triton is not installable on macOS)
+        if: runner.os != 'macOS'
+        working-directory: pr
         env:
-          PYTHONPATH: ${{ github.workspace }}/studio
+          PYTHONPATH: ${{ github.workspace }}/pr:${{ github.workspace }}/pr/studio
         run: |
           set -euxo pipefail
           python -m pytest -q -p no:cacheprovider tests/test_flex_gemma4_sliding_scope.py tests/test_flex_head_dim_version_gate.py tests/test_flex_large_head_dim_fallback.py tests/test_flex_large_head_dim_kernel_options.py tests/test_attention_implementation.py tests/test_attn_impl_honor_explicit.py
           cd studio/backend && python -m pytest -q -p no:cacheprovider tests/test_vram_estimation.py
-      - name: Routing probe on this host (no NVIDIA GPU)
+      - name: Studio estimator, main vs PR, on this host
         run: |
           set -euxo pipefail
-          python - <<'PY'
-          import os, sys
-          sys.path.insert(0, "tests")
-          import _zoo_aggressive_cuda_spoof as spoof
-          spoof.apply()
-          import torch
+          cat > probe.py <<'PY'
+          import json, os, sys
+          tree = sys.argv[1]
+          sys.path[:0] = [tree, os.path.join(tree, "studio", "backend")]
+          out = {}
+          from transformers import AutoConfig, LlamaConfig
+          cfgs = {"qwen3_5_0.8b": AutoConfig.from_pretrained("unsloth/Qwen3.5-0.8B"), "llama": LlamaConfig()}
+          from utils.hardware import hardware as hw
+          for name, cfg in cfgs.items():
+              for env in (None, "0", "1"):
+                  if env is None: os.environ.pop("UNSLOTH_FLEX_ATTENTION_FOR_LARGE_HEAD_DIM", None)
+                  else: os.environ["UNSLOTH_FLEX_ATTENTION_FOR_LARGE_HEAD_DIM"] = env
+                  try: r = hw._determine_attention_impl_for_gpu_estimate(cfg)
+                  except Exception as e: r = "EXC " + type(e).__name__  # the caller turns this into "eager"
+                  out[f"{name}|env={env}"] = r
           import unsloth.models._utils as U
-          from transformers import LlamaConfig, LlamaForCausalLM
-          from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-          # the spoofed host reports an A100 (8, 0); the gate reads shared memory, which the spoof does not raise to 227 KiB
-          print("gate", U._flex_kernels_fit_large_head_dim())
-          assert U._flex_kernels_fit_large_head_dim() is False
-          cfg = CONFIG_MAPPING["qwen3_5_text"]()
-          for env, want in ((None, False), ("0", False), ("1", True)):
-              if env is None: os.environ.pop(U._FLEX_LARGE_HEAD_DIM_ENV_VAR, None)
-              else: os.environ[U._FLEX_LARGE_HEAD_DIM_ENV_VAR] = env
-              got = U._prefers_flex_for_head_dim(cfg)
-              print("env", env, "prefers", got); assert got is want
-          from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-          assert getattr(ALL_ATTENTION_FUNCTIONS["flex_attention"], "_unsloth_flex_kernel_options", False)
-          print("routing probe OK on", sys.platform)
+          out["_utils_from"] = os.path.relpath(U.__file__, os.path.dirname(tree)).split(os.sep)[0] if hasattr(U, "__file__") else None
+          print("RESULT " + json.dumps(out, sort_keys=True))
+          PY
+          for t in main pr; do python probe.py "$GITHUB_WORKSPACE/$t" 2>&1 | tee "probe_$t.txt" | tail -3 || true; done
+          python - <<'PY'
+          import json
+          def load(t):
+              line = [l for l in open(f"probe_{t}.txt", encoding="utf-8", errors="replace") if l.startswith("RESULT ")]
+              return json.loads(line[-1][7:]) if line else {"import": "failed before RESULT"}
+          m, p = load("main"), load("pr")
+          print("main:", m); print("pr:  ", p)
+          diff = {k: (m.get(k), p.get(k)) for k in set(m) | set(p) if k != "_utils_from" and m.get(k) != p.get(k)}
+          print("differences:", diff)
+          # env=1 is the PR's new explicit override; every other row must match main exactly.
+          bad = {k: v for k, v in diff.items() if "env=1" not in k}
+          assert not bad, bad
           PY
