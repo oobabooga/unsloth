@@ -865,6 +865,11 @@ class _VideoLoadingState:
     asset_repos: tuple[str, ...] = ()
 
 
+def _physical_card_name(ordinal: Optional[int]) -> "tuple[Optional[str], Optional[int]]":
+    from .sd_cpp_backend import physical_card_name
+    return physical_card_name(ordinal)
+
+
 def _sd_cli_identity(binary: Optional[str]) -> Optional[tuple[int, int]]:
     """``(size, mtime_ns)`` of an sd.cpp binary, or None when it cannot be read.
 
@@ -878,6 +883,27 @@ def _sd_cli_identity(binary: Optional[str]) -> Optional[tuple[int, int]]:
     except OSError:
         return None
     return (stat.st_size, stat.st_mtime_ns)
+
+
+def _note_sd_cpp_accelerator_failure(
+    binary: Optional[str],
+    output: str,
+    *,
+    gpu_ordinal: Optional[int] = None,
+) -> None:
+    try:
+        from .sd_cpp_backend import note_accelerator_failure_from_output, selected_card_identity
+
+        # WHICH card: a record with no card names the whole HOST, so one unsupported card would divert loads selecting a card that works.
+        note_accelerator_failure_from_output(
+            binary, output, source = "video", card = selected_card_identity(gpu_ordinal)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not record the sd.cpp accelerator failure: %s", exc)
+
+
+# "Not read yet", distinct from None, the real answer for a binary the installer does not own.
+_UNREAD_ACCELERATOR = object()
 
 
 def _h3_te_canonical(repo_id: Optional[str]) -> str:
@@ -1979,10 +2005,19 @@ class VideoBackend:
         )
         from .diffusion_engine_router import _install_accelerator_for
         from .sd_cpp_backend import (
+            _accelerator_fingerprint,
             _install_allowed,
+            _installed_accelerator_of,
+            accelerator_probe_failure_is_decisive,
+            accelerator_verdict_keeps_gpu,
+            usable_or_recorded_failure,
             ensure_h3_sd_cpp_binary,
+            fallback_accelerator_for,
+            note_accelerator_runtime_failure,
+            preferred_accelerator,
+            selected_card_identity,
+            sd_cpp_accelerator_device_verdict,
             sd_cpp_device_name_for_ordinal,
-            sd_cpp_lists_accelerator_device,
             sd_cpp_supports_graph_cut,
         )
         from .sd_cpp_engine import SdCppEngine
@@ -2024,23 +2059,113 @@ class VideoBackend:
         # on disk (managed or user-supplied) is still discovered and used; when there is none, the ensure returns None
         # and the refusal below names it, which is the honest answer for a load that was told not to fetch anything.
         allow_install = _install_allowed() and not local_files_only
-        binary = ensure_h3_sd_cpp_binary(
-            allow_install = allow_install,
-            accelerator = _install_accelerator_for(target.backend),
+        # Once, for this load: this path RECORDS its render failures against
+        # ``selected_card_identity(gpu_ordinal)``, so reading the record back without it let a
+        # failure on one card send every later H3 load on this host to Vulkan -- including a load
+        # that explicitly picked another card whose ROCm build works.
+        selected_card = selected_card_identity(gpu_ordinal)
+        # Kept as a variable: the rung finally committed is what the failure note is keyed on.
+        accelerator = preferred_accelerator(_install_accelerator_for(target.backend), selected_card)
+        binary = usable_or_recorded_failure(
+            ensure_h3_sd_cpp_binary(
+                allow_install = allow_install,
+                accelerator = accelerator,
+            ),
+            accelerator,
+            selected_card,
         )
         native_device = target.device
         # What the accelerator decision below was made on, or None when it was never asked (a CPU or MPS target never
         # consults it). Re-checked under the reader claim, so a replacement that arrives mid-load cannot silently change
         # the answer this device choice rests on.
         listed_accelerator: Optional[bool] = None
+        # Sentinel, not None: None is a real answer here (an unowned binary has no class).
+        decided_accelerator: Any = _UNREAD_ACCELERATOR
         if target.backend not in ("cpu", "mps"):
             # Under the claim, like the recheck. This probe SPAWNS the managed sd-cli, so leaving it unclaimed lets an
             # install started by another in-process load extract over the executing binary: on Windows that fails on the
             # locked file, on Linux it can leave the replacement half-written. The later claimed recheck cannot undo
             # damage this first probe already allowed.
             from .sd_cpp_backend import _tree_reader as _claim_tree
+
             with _claim_tree(binary, cancel_event, VIDEO_CANCELLED_MSG):
-                listed_accelerator = sd_cpp_lists_accelerator_device(binary)
+                # The raw VERDICT: None is a build that could not be asked at all, what a generic
+                # ROCm prebuilt does on an unsupported card (#8814, #9278). Collapsing it hid that.
+                accelerator_verdict = sd_cpp_accelerator_device_verdict(binary) if binary else False
+                # Under the SAME claim that validated this binary: read afterwards, a tree replaced in between makes the re-vet compare ROCm with ROCm.
+                decided_accelerator = _installed_accelerator_of(binary)
+                # Whether THIS ACCELERATOR'S OWN build was asked: an ensure keeps a usable build of
+                # another class, so a CPU build's honest CPU-only answer got recorded against ROCm.
+                accelerator_probe_ran = bool(binary) and decided_accelerator == accelerator
+            listed_accelerator = accelerator_verdict_keeps_gpu(accelerator_verdict)
+            if not accelerator_verdict:
+                fallback = fallback_accelerator_for(accelerator)
+                if fallback:
+                    # BEFORE the fallback ensure, which can replace the tree: the bundle tag is read
+                    # live, so a later reading would describe the build that REPLACED the failed one.
+                    failed_fingerprint = _accelerator_fingerprint(binary)
+                    fallback_binary = usable_or_recorded_failure(
+                        ensure_h3_sd_cpp_binary(allow_install = allow_install, accelerator = fallback),
+                        fallback,
+                        selected_card,
+                    )
+                    fallback_verdict: Optional[bool] = None
+                    fallback_class: Optional[str] = None
+                    if fallback_binary:
+                        with _claim_tree(fallback_binary, cancel_event, VIDEO_CANCELLED_MSG):
+                            fallback_verdict = sd_cpp_accelerator_device_verdict(fallback_binary)
+                            fallback_class = _installed_accelerator_of(fallback_binary)
+                    # The class too, not just the verdict: an ensure that cannot deliver this rung
+                    # deliberately keeps a usable build of ANOTHER class, so `fallback_binary` can be the
+                    # very ROCm build that just failed. Its second probe answering yes then reads as
+                    # "Vulkan works", records ROCm as failed and pins a preference to a rung that was
+                    # never installed, when all that happened is the first probe was transient. This is
+                    # the same hazard `accelerator_probe_ran` guards on the first probe above.
+                    if fallback_verdict and fallback_class == fallback:
+                        # POSITIVE evidence only, so a host that cannot fetch this rung is unchanged.
+                        logger.warning(
+                            "video.sd_cpp_accelerator_fallback: the %s stable-diffusion.cpp build "
+                            "does not run on this host, using the %s build instead",
+                            accelerator,
+                            fallback,
+                        )
+                        # Only now, so what survives is a preference SHOWN to be better. `proven`
+                        # only when the host's own build ANSWERED, else a timeout diverts for good.
+                        # An answer of "CPU only" is not by itself proof: on Linux the ROCm build
+                        # exits 0 and enumerates no GPU when the HIP/BLAS runtime it needs is absent,
+                        # but a busy or masked card reads exactly the same. So a bare negative is
+                        # decisive only when the runtime is provably unloadable on this host, which
+                        # is what accelerator_probe_failure_is_decisive answers; otherwise it stays
+                        # ambiguous and takes the usual two strikes.
+                        note_accelerator_runtime_failure(
+                            accelerator,
+                            proven = (
+                                accelerator_probe_ran
+                                and accelerator_verdict is not None
+                                and (
+                                    accelerator_verdict is not False
+                                    or accelerator_probe_failure_is_decisive(accelerator)
+                                )
+                            ),
+                            fingerprint = failed_fingerprint,
+                            card = selected_card,
+                        )
+                        binary = fallback_binary
+                        accelerator = fallback
+                        decided_accelerator = fallback_class
+                        listed_accelerator = True
+                    elif fallback_binary:
+                        # Carry the binary actually in the tree and its OWN reading: inheriting the
+                        # replaced build's reading let a CPU-only Vulkan build skip the CPU rung.
+                        # `and`, never a plain assignment: this branch has no positive evidence, so
+                        # the swap may LOWER the reading and must never raise it.
+                        binary = fallback_binary
+                        decided_accelerator = fallback_class
+                        listed_accelerator = listed_accelerator and accelerator_verdict_keeps_gpu(
+                            fallback_verdict
+                        )
+                        # Keep the name on the binary it describes; leaving it on the replaced build is how the bug above started.
+                        accelerator = fallback
         if target.backend not in ("cpu", "mps") and not listed_accelerator:
             # Upstream currently publishes no Linux CUDA archive. Keep the picker functional with the CPU prebuilt when
             # the user has not supplied a locally compiled CUDA binary through the normal sd.cpp discovery path. The
@@ -2049,8 +2174,14 @@ class VideoBackend:
             # therefore skipped the fallback from the second load on, left native_device on the GPU, and applied GPU
             # offload policy and held the VIDEO claim while sd-cli ran wholly on the CPU -- so the next chat/image
             # acquire evicted a model to make room for one that was never there.
-            binary = ensure_h3_sd_cpp_binary(allow_install = allow_install, accelerator = "cpu")
+            binary = usable_or_recorded_failure(
+                ensure_h3_sd_cpp_binary(allow_install = allow_install, accelerator = "cpu"),
+                "cpu",
+                selected_card,
+            )
             native_device = "cpu"
+            # This rung replaces the binary and runs no claimed probe, so this class is the decision's.
+            decided_accelerator = _installed_accelerator_of(binary)
             # The baseline this branch is compared against is the DECISION, not a fresh probe of what came back. An
             # install can replace the returned CPU binary with a GPU build between that ensure and this line, and
             # probing here would record ITS answer -- after which the re-check under the claim below compares the
@@ -2067,6 +2198,10 @@ class VideoBackend:
             raise RuntimeError(
                 "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
             )
+        # The CLASS alongside the boolean: two different builds answer "does this enumerate an
+        # accelerator device" alike, so a ROCm build landing mid-download passed the boolean re-vet.
+        if decided_accelerator is _UNREAD_ACCELERATOR:
+            decided_accelerator = _installed_accelerator_of(binary)
         if cancel_event.is_set():
             raise RuntimeError(VIDEO_CANCELLED_MSG)
 
@@ -2123,6 +2258,7 @@ class VideoBackend:
             _tree_reader,
             sd_cpp_accelerator_device_verdict,
             sd_cpp_binary_vets_for_h3,
+            sd_cpp_device_named,
         )
         from .sd_cpp_engine import is_managed_binary
 
@@ -2161,6 +2297,17 @@ class VideoBackend:
             # baseline to compare against. A CPU or MPS target never asked the question, so this would spawn
             # --list-devices for an answer the test below cannot use -- on every H3 load, and for the full probe timeout
             # when the build hangs on it.
+            current_accelerator = _installed_accelerator_of(binary)
+            if (
+                decided_accelerator is not None
+                and current_accelerator is not None
+                and current_accelerator != decided_accelerator
+            ):
+                raise RuntimeError(
+                    "The stable-diffusion.cpp binary changed while this model was loading, and the "
+                    "one now at that path was built for a different accelerator. Try the load "
+                    "again."
+                )
             fresh_accelerator = (
                 sd_cpp_accelerator_device_verdict(binary)
                 if listed_accelerator is not None and binary
@@ -2189,6 +2336,13 @@ class VideoBackend:
                 if native_device == "cpu"
                 else sd_cpp_device_name_for_ordinal(binary, native_ordinal)
             )
+            if native_device_name is None and native_ordinal is not None:
+                # `Vulkan0` is not the physical index the user picked, so the lookup above answers
+                # None and sd.cpp takes its own default device while the claim names another card.
+                selected_name, selected_position = _physical_card_name(native_ordinal)
+                native_device_name = sd_cpp_device_named(
+                    binary, selected_name, position = selected_position
+                )
         requested_mode = normalize_memory_mode(memory_mode) or "auto"
         policy = {
             "auto": "none" if native_device == "cpu" else "group",
@@ -6508,6 +6662,13 @@ class VideoBackend:
                         )
                 except SdCppCancelled:
                     raise RuntimeError(VIDEO_CANCELLED_MSG) from None
+                except RuntimeError as exc:
+                    # The other half of #9278: the build starts, then dies in hipBLAS mid-render, with nothing about the install wrong.
+                    if not cancel.is_set() and VIDEO_CANCELLED_MSG not in str(exc):
+                        _note_sd_cpp_accelerator_failure(
+                            binary, str(exc), gpu_ordinal = state.gpu_ordinal
+                        )
+                    raise
                 if cancel.is_set():
                     raise RuntimeError(VIDEO_CANCELLED_MSG)
                 self._gen.update(phase = "export", eta_seconds = None)
