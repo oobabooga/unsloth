@@ -1,0 +1,176 @@
+name: "llama.cpp Windows vs Linux on one GPU class (issue 11336)"
+
+# Issue unslothai/unsloth#11336 reports 7 tok/s on Windows against 25 tok/s on Linux for
+# the same Unsloth llama.cpp build -- but on two different GPUs, so as filed it does not
+# separate "Windows is slower" from "the 2080 Ti box is slower". This workflow holds the
+# hardware class constant: the same Unsloth b11030-mix-5ff778e ROCm gfx1151 bundle, the
+# same GGUF, the same llama-bench flags, run on the Windows half and the Linux half of the
+# devlab-dispatch Strix Halo pool.
+#
+# It also tests the specific mechanism found in the Studio source: at
+# studio/backend/core/inference/llama_cpp.py:26611 Studio hard-pins `--threads 2` on
+# Windows whenever the model is fully GPU-offloaded, and on no other OS. So each leg
+# measures -t 2 against -t <all cores>. If the Windows deficit is the thread pin, the
+# Windows -t 2 and Linux -t 2 numbers will agree and both will trail -t 32.
+#
+# This is AMD gfx1151, not the reporter's NVIDIA 2080 Ti. It can answer "does the Unsloth
+# Windows path itself cost throughput at fixed hardware"; it cannot answer anything about
+# NVIDIA drivers on Windows. The verdict must say so.
+
+on:
+  push:
+    branches: [amd-os-ab-11336]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TAG: "b11030-mix-5ff778e"
+  MODEL_URL: "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf"
+  MODEL_NAME: "Qwen3-4B-Q4_K_M.gguf"
+
+jobs:
+
+  linux-bench:
+    name: "Linux gfx1151 llama-bench"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    # The measuring job holds the shared GPU group so no co-tenant moves the number.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - name: Identify the host
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+          echo "kernel: $(uname -srvmo)"
+          echo "cores: $(nproc)"
+          amd-smi static -g 0 2>&1 | head -40
+          echo "work root: $RUNNER_TEMP"
+
+      - name: Fetch the Unsloth ROCm bundle and the model
+        timeout-minutes: 45
+        run: |
+          set +e
+          WORK="$RUNNER_TEMP/osab"
+          mkdir -p "$WORK/bin"
+          curl -sSL --fail --retry 3 -o "$WORK/app.tar.gz" \
+            "https://github.com/unslothai/llama.cpp/releases/download/$TAG/app-$TAG-linux-x64-rocm-gfx1151.tar.gz"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then echo "FATAL: bundle download failed rc=$rc"; exit 1; fi
+          tar xzf "$WORK/app.tar.gz" -C "$WORK/bin"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then echo "FATAL: extract failed rc=$rc"; exit 1; fi
+          curl -sSL --fail --retry 3 -o "$WORK/$MODEL_NAME" "$MODEL_URL"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then echo "FATAL: model download failed rc=$rc"; exit 1; fi
+          ls -la "$WORK"
+          sha256sum "$WORK/$MODEL_NAME"
+          BENCH=$(find "$WORK/bin" -name llama-bench -type f | head -1)
+          if [ -z "$BENCH" ]; then echo "FATAL: no llama-bench in the bundle"; exit 1; fi
+          echo "BENCH=$BENCH" >> "$GITHUB_ENV"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+
+      - name: Benchmark at 2 threads and at all cores
+        timeout-minutes: 45
+        run: |
+          set +e
+          LIBDIR=$(dirname "$BENCH")
+          export LD_LIBRARY_PATH="$LIBDIR:$LD_LIBRARY_PATH"
+          mkdir -p "$WORK/out"
+          for T in 2 $(nproc); do
+            echo "=== linux -t $T"
+            "$BENCH" -m "$WORK/$MODEL_NAME" -ngl 999 -fa on -t "$T" \
+              -p 512 -n 128 -r 5 -o json > "$WORK/out/linux-t$T.json" 2> "$WORK/out/linux-t$T.stderr"
+            rc=$?
+            echo "rc=$rc"
+            tail -20 "$WORK/out/linux-t$T.stderr"
+            if [ "$rc" -ne 0 ]; then echo "FATAL: llama-bench failed at -t $T"; exit 1; fi
+            cat "$WORK/out/linux-t$T.json"
+          done
+          # Record which backend actually loaded. A Vulkan or CPU fallback here would
+          # make the cross-OS comparison meaningless, and system_info does not say.
+          grep -h "model buffer size" "$WORK/out"/linux-t*.stderr
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: osab-linux
+          path: ${{ env.WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  windows-bench:
+    name: "Windows gfx1151 llama-bench"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    # Serialised behind the Linux leg on purpose: the shared GPU group holds one runner
+    # plus one waiter, and a third arrival evicts the waiter silently.
+    needs: linux-bench
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Identify the host
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "machine: $env:COMPUTERNAME"
+          Write-Host "RUNNER_OS (observed blank on some of these boxes): '$env:RUNNER_OS'"
+          Write-Host "cores: $env:NUMBER_OF_PROCESSORS"
+          Write-Host "work root: $env:RUNNER_TEMP"
+          (Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status) | Format-List
+
+      - name: Fetch the Unsloth ROCm bundle and the model
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          $work = Join-Path $env:RUNNER_TEMP "osab"
+          New-Item -ItemType Directory -Force -Path "$work\bin" | Out-Null
+          $url = "https://github.com/unslothai/llama.cpp/releases/download/$env:TAG/app-$env:TAG-windows-x64-rocm-gfx1151.zip"
+          & curl.exe -sSL --fail --retry 3 -o "$work\app.zip" $url
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: bundle download failed"; exit 1 }
+          Expand-Archive -LiteralPath "$work\app.zip" -DestinationPath "$work\bin" -Force
+          & curl.exe -sSL --fail --retry 3 -o "$work\$env:MODEL_NAME" $env:MODEL_URL
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: model download failed"; exit 1 }
+          (Get-FileHash -Algorithm SHA256 "$work\$env:MODEL_NAME").Hash
+          $bench = Get-ChildItem -Path "$work\bin" -Filter "llama-bench.exe" -Recurse |
+                   Select-Object -First 1
+          if ($null -eq $bench) { Write-Host "FATAL: no llama-bench.exe in the bundle"; exit 1 }
+          Write-Host "bench: $($bench.FullName)"
+          # PowerShell 5.1 Out-File writes a BOM into GITHUB_ENV; Add-Content does not.
+          Add-Content -Path $env:GITHUB_ENV -Value "OSAB_BENCH=$($bench.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "OSAB_WORK=$work"
+
+      - name: Benchmark at 2 threads and at all cores
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          $work = $env:OSAB_WORK
+          $bench = $env:OSAB_BENCH
+          New-Item -ItemType Directory -Force -Path "$work\out" | Out-Null
+          $model = Join-Path $work $env:MODEL_NAME
+          foreach ($t in @(2, $env:NUMBER_OF_PROCESSORS)) {
+            Write-Host "=== windows -t $t"
+            & $bench -m $model -ngl 999 -fa on -t $t -p 512 -n 128 -r 5 -o json `
+              1> "$work\out\windows-t$t.json" 2> "$work\out\windows-t$t.stderr"
+            $rc = $LASTEXITCODE
+            Write-Host "rc=$rc"
+            Get-Content "$work\out\windows-t$t.stderr" -Tail 20
+            if ($rc -ne 0) { Write-Host "FATAL: llama-bench failed at -t $t"; exit 1 }
+            Get-Content "$work\out\windows-t$t.json"
+          }
+          Get-ChildItem "$work\out" -Filter "windows-t*.stderr" |
+            ForEach-Object { Select-String -Path $_.FullName -Pattern "model buffer size" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: osab-windows
+          path: ${{ env.OSAB_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
