@@ -1,0 +1,199 @@
+name: "AMD CI (Windows): validate PR 11305"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-pr11305-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "11305"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+  # Pinned, and the same tag the Linux leg uses.
+  LLAMA_TAG: "b11057"
+
+jobs:
+
+  linux-control:
+    name: "PR 11305 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows"
+          echo "selector matched no runner. If BOTH stay queued, the pool is busy."
+
+  windows:
+    name: "PR 11305 on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    # Uncomment when the job actually measures the GPU. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    # concurrency:
+    #   group: amd-ci-strix-halo-windows-gpu
+    #   cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr11305-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          $extra = @()
+          if ($env:MERGED -eq "1") { $extra += "--merged" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test environment
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py" -Encoding UTF8
+          # psutil only: the probe reads the Vulkan inventory and the host's RAM, and
+          # asks for no torch. Whether these boxes carry a ROCm-enabled torch is
+          # UNMEASURED, so the ROCm half of the observation is expected to be absent
+          # here and the verdict says so rather than implying it was checked.
+          & $py -m pip install -q psutil
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The same pinned tag as the Linux leg, so the two legs differ by the machine
+      # and not by the llama.cpp build. Fetched here because the pool shares no disk.
+      - name: Vulkan llama.cpp
+        run: |
+          $ErrorActionPreference = "Continue"
+          $work = $env:AMD_CI_WORK
+          $zip = Join-Path $work "llama.zip"
+          $dir = Join-Path $work "llama"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $url = "https://github.com/ggml-org/llama.cpp/releases/download/$env:LLAMA_TAG/llama-$env:LLAMA_TAG-bin-win-vulkan-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          if (-not (Test-Path -LiteralPath $zip)) { Write-Host "FATAL: download failed"; exit 1 }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $server = Get-ChildItem -LiteralPath $dir -Recurse -Filter "llama-server.exe" |
+            Select-Object -First 1
+          if ($null -eq $server) { Write-Host "FATAL: no llama-server.exe in the archive"; exit 1 }
+          $libdir = $server.DirectoryName
+          $vk = Get-ChildItem -LiteralPath $libdir -Filter "*vulkan*"
+          if ($null -eq $vk) {
+            Write-Host "FATAL: no ggml vulkan library beside the binary, so the inventory"
+            Write-Host "       would return nothing and the run would look like absent hardware."
+            exit 1
+          }
+          Write-Host "server: $($server.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Encoding UTF8 -Value @(
+            "LLAMA_SERVER_PATH=$($server.FullName)",
+            "AMD_CI_VULKAN_LIB_DIR=$libdir"
+          )
+
+      - name: Differential
+        env:
+          AMD_CI_RENDER_HARNESS: ${{ github.workspace }}\amd_ci\probes\render_probe.ts
+          AMD_CI_NODE: node
+          AMD_CI_NPM: npm
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/vulkan_igpu_display_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/vulkan_igpu_display.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows" `
+            --python "$env:AMD_CI_PY" 
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
+            "$env:AMD_CI_WORK\out\windows"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr11305-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
