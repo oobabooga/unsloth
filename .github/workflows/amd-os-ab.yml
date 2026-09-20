@@ -92,7 +92,10 @@ jobs:
           done
           # Record which backend actually loaded. A Vulkan or CPU fallback here would
           # make the cross-OS comparison meaningless, and system_info does not say.
+          # A no-match grep exits 1 and, as the step's last command, would fail the step
+          # after every benchmark has already succeeded.
           grep -h "model buffer size" "$WORK/out"/linux-t*.stderr
+          echo "benchmarks complete"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -166,6 +169,7 @@ jobs:
           }
           Get-ChildItem "$work\out" -Filter "windows-t*.stderr" |
             ForEach-Object { Select-String -Path $_.FullName -Pattern "model buffer size" }
+          Write-Host "benchmarks complete"
 
       - uses: actions/upload-artifact@v4
         if: always()
