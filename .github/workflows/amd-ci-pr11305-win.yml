@@ -130,11 +130,16 @@ jobs:
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py" -Encoding UTF8
-          # psutil only: the probe reads the Vulkan inventory and the host's RAM, and
-          # asks for no torch. Whether these boxes carry a ROCm-enabled torch is
-          # UNMEASURED, so the ROCm half of the observation is expected to be absent
-          # here and the verdict says so rather than implying it was checked.
-          & $py -m pip install -q psutil
+          # No torch: the probe reads the Vulkan inventory and the host's RAM only.
+          # Whether these boxes carry a ROCm-enabled torch is UNMEASURED, so the ROCm
+          # half of the observation is expected to be absent here and the verdict says
+          # so rather than implying it was checked.
+          # The backend's import chain, measured rather than guessed: hardware.py
+          # needs structlog, and the Vulkan inventory imports core.inference.llama_cpp
+          # which needs httpx. Without them get_vulkan_inference_gpu_info() swallows
+          # the ImportError at debug level and returns None, which is indistinguishable
+          # from "this host has no Vulkan". psutil is for the probe's own RAM reading.
+          & $py -m pip install -q psutil structlog httpx
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/setup-node@v4

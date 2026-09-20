@@ -187,6 +187,30 @@ def main() -> int:
         hw = None
 
     if hw is not None:
+        # get_vulkan_inference_gpu_info() returns None for several different
+        # reasons and logs them at debug, so a bare None cannot be told apart from
+        # "this host has no Vulkan". Ask the three questions it asks, and record the
+        # answers: a missing dependency and an absent backend are not the same finding.
+        why: dict = {}
+        try:
+            from core.inference.llama_cpp import LlamaCppBackend  # noqa: PLC0415
+            why["llama_cpp_import"] = "ok"
+            try:
+                why["server_binary"] = LlamaCppBackend._find_llama_server_binary()
+            except Exception as e:  # noqa: BLE001
+                why["server_binary_error"] = f"{type(e).__name__}: {e}"
+            try:
+                why["is_vulkan_backend"] = LlamaCppBackend._is_vulkan_backend()
+            except Exception as e:  # noqa: BLE001
+                why["is_vulkan_backend_error"] = f"{type(e).__name__}: {e}"
+            try:
+                why["device_inventory"] = LlamaCppBackend.vulkan_device_inventory()
+            except Exception as e:  # noqa: BLE001
+                why["device_inventory_error"] = f"{type(e).__name__}: {e}"
+        except Exception as e:  # noqa: BLE001
+            why["llama_cpp_import_error"] = f"{type(e).__name__}: {e}"
+        obs["vulkan_backend_check"] = why
+
         for name, call in (
             ("vulkan_gpu", "get_vulkan_inference_gpu_info"),
             ("backend_gpu", "get_backend_visible_gpu_info"),
