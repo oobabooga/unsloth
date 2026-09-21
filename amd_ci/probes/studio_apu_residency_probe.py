@@ -321,18 +321,23 @@ class Sampler(threading.Thread):
         self.interval = interval
         self.samples: list[dict] = []
         self.errors: list[str] = []
-        self._stop = threading.Event()
+        # NOT `self._stop`. `threading.Thread._stop` is a real private METHOD, and
+        # `Thread.join` calls it once the thread's state lock clears. Shadowing it
+        # with an Event makes join() raise `TypeError: 'Event' object is not
+        # callable` -- and only sometimes, because join skips that call when the
+        # thread has already finished, so it passed on Linux and failed on Windows.
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self.samples.append(sample_memory(self.errors))
             except Exception as e:  # noqa: BLE001
                 self.errors.append(f"{type(e).__name__}: {e}"[:200])
-            self._stop.wait(self.interval)
+            self._stop_event.wait(self.interval)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def peak(self, key: str):
         vals = [s[key] for s in self.samples if isinstance(s.get(key), (int, float))]
