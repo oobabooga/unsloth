@@ -133,6 +133,54 @@ jobs:
             -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue |
             Select-Object PSChildName, "HardwareInformation.qwMemorySize" |
             Format-List | Out-String | Write-Host
+          Write-Host "--- WDDM GPU memory counters (the Windows answer to amd-smi, which"
+          Write-Host "    fails here with 'Error LoadLibraryA'). Dedicated vs Shared Usage"
+          Write-Host "    is exactly the 'in VRAM or in system RAM' distinction #7449 is about."
+          foreach ($ctr in @("\GPU Adapter Memory(*)\Dedicated Usage",
+                             "\GPU Adapter Memory(*)\Shared Usage",
+                             "\GPU Adapter Memory(*)\Total Committed")) {
+            try {
+              (Get-Counter -Counter $ctr -ErrorAction Stop).CounterSamples |
+                Where-Object { $_.CookedValue -gt 0 } |
+                Select-Object Path, CookedValue | Format-List | Out-String | Write-Host
+            } catch {
+              Write-Host ("counter " + $ctr + " unavailable: " + $_.Exception.Message)
+            }
+          }
+          Write-Host "--- is there a HIP / ROCm runtime on this box at all?"
+          foreach ($p in @("$env:HIP_PATH", "C:\Program Files\AMD\ROCm",
+                            "$env:ProgramFiles\AMD\ROCm")) {
+            if ($p -and (Test-Path -LiteralPath $p)) {
+              Write-Host ("present: " + $p)
+              Get-ChildItem -LiteralPath $p -ErrorAction SilentlyContinue |
+                Select-Object -First 10 -ExpandProperty Name | Write-Host
+            }
+          }
+          foreach ($dll in @("amdhip64.dll", "amdhip64_6.dll", "amdhip64_7.dll", "hiprtc0507.dll")) {
+            $hit = Get-ChildItem -Path "C:\Windows\System32\$dll" -ErrorAction SilentlyContinue
+            if ($hit) { Write-Host ("system32 has " + $dll) }
+          }
+          Write-Host "--- Visual Studio Build Tools (defect 3 of #7449: Triton needs the C++ workload)"
+          foreach ($p in @("C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+                            "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC")) {
+            if (Test-Path -LiteralPath $p) {
+              Write-Host ("MSVC toolset dir: " + $p)
+              Get-ChildItem -LiteralPath $p | Select-Object -ExpandProperty Name | Write-Host
+            }
+          }
+          $sdk = "C:\Program Files (x86)\Windows Kits\10\Include"
+          if (Test-Path -LiteralPath $sdk) {
+            Write-Host "Windows SDK include versions:"
+            Get-ChildItem -LiteralPath $sdk | Select-Object -ExpandProperty Name | Write-Host
+          } else {
+            Write-Host "no Windows SDK include dir at $sdk"
+          }
+          # A native command earlier in this step (amd-smi) left a non-zero
+          # $LASTEXITCODE, and the Actions PowerShell wrapper exits with it. That
+          # failed the whole job on a diagnostic that worked. This step reports;
+          # it never decides, so it must not be able to fail the job.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Resolve states
         run: |
