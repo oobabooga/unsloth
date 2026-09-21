@@ -128,7 +128,10 @@ def extract(archive: Path, dest: Path, log: list) -> bool:
             with zipfile.ZipFile(archive) as z:
                 z.extractall(dest)
         else:
-            with tarfile.open(archive, "r:gz") as t:
+            # encoding names how MEMBER NAMES are decoded, and tarfile defaults to
+            # the locale, which is not utf-8 everywhere. Same rule as every
+            # other text read here.
+            with tarfile.open(archive, "r:gz", encoding = "utf-8") as t:
                 t.extractall(dest)
     except Exception as e:  # noqa: BLE001
         log.append({"extract": str(archive), "error": f"{type(e).__name__}: {e}"[:300]})
