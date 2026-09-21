@@ -1,0 +1,299 @@
+name: "AMD CI (Windows): issue 7449 defect 1 VRAM readout on gfx1151"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-i7449-fix-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "7449"
+  UPSTREAM: "https://github.com/oobabooga/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  linux-control:
+    name: "PR 7449 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows"
+          echo "selector matched no runner. If BOTH stay queued, the pool is busy."
+
+  windows:
+    name: "PR 7449 on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    # Uncomment when the job actually measures the GPU. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr7449-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ground truth from the machine itself
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "--- RUNNER_OS (echoed, never branched on: W103)"
+          Write-Host ("RUNNER_OS=[" + $env:RUNNER_OS + "]")
+          Write-Host "--- machine"
+          Write-Host ([System.Environment]::MachineName)
+          Write-Host "--- amd-smi static"
+          & amd-smi static 2>&1 | Select-Object -First 120
+          Write-Host "--- amd-smi metric mem-usage"
+          & amd-smi metric -g 0 --mem-usage 2>&1 | Select-Object -First 40
+          Write-Host "--- Win32_VideoController"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterRAM, DriverVersion, PNPDeviceID |
+            Format-List | Out-String | Write-Host
+          Write-Host "--- system memory"
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object TotalPhysicalMemory | Format-List | Out-String | Write-Host
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object FreePhysicalMemory, TotalVisibleMemorySize |
+            Format-List | Out-String | Write-Host
+          Write-Host "--- dedicated / shared video memory from the registry"
+          Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*" `
+            -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue |
+            Select-Object PSChildName, "HardwareInformation.qwMemorySize" |
+            Format-List | Out-String | Write-Host
+          Write-Host "--- WDDM GPU memory counters (the Windows answer to amd-smi, which"
+          Write-Host "    fails here with 'Error LoadLibraryA'). Dedicated vs Shared Usage"
+          Write-Host "    is exactly the 'in VRAM or in system RAM' distinction #7449 is about."
+          foreach ($ctr in @("\GPU Adapter Memory(*)\Dedicated Usage",
+                             "\GPU Adapter Memory(*)\Shared Usage",
+                             "\GPU Adapter Memory(*)\Total Committed")) {
+            try {
+              (Get-Counter -Counter $ctr -ErrorAction Stop).CounterSamples |
+                Where-Object { $_.CookedValue -gt 0 } |
+                Select-Object Path, CookedValue | Format-List | Out-String | Write-Host
+            } catch {
+              Write-Host ("counter " + $ctr + " unavailable: " + $_.Exception.Message)
+            }
+          }
+          Write-Host "--- is there a HIP / ROCm runtime on this box at all?"
+          foreach ($p in @("$env:HIP_PATH", "C:\Program Files\AMD\ROCm",
+                            "$env:ProgramFiles\AMD\ROCm")) {
+            if ($p -and (Test-Path -LiteralPath $p)) {
+              Write-Host ("present: " + $p)
+              Get-ChildItem -LiteralPath $p -ErrorAction SilentlyContinue |
+                Select-Object -First 10 -ExpandProperty Name | Write-Host
+            }
+          }
+          foreach ($dll in @("amdhip64.dll", "amdhip64_6.dll", "amdhip64_7.dll", "hiprtc0507.dll")) {
+            $hit = Get-ChildItem -Path "C:\Windows\System32\$dll" -ErrorAction SilentlyContinue
+            if ($hit) { Write-Host ("system32 has " + $dll) }
+          }
+          Write-Host "--- Visual Studio Build Tools (defect 3 of #7449: Triton needs the C++ workload)"
+          foreach ($p in @("C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+                            "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC")) {
+            if (Test-Path -LiteralPath $p) {
+              Write-Host ("MSVC toolset dir: " + $p)
+              Get-ChildItem -LiteralPath $p | Select-Object -ExpandProperty Name | Write-Host
+            }
+          }
+          $sdk = "C:\Program Files (x86)\Windows Kits\10\Include"
+          if (Test-Path -LiteralPath $sdk) {
+            Write-Host "Windows SDK include versions:"
+            Get-ChildItem -LiteralPath $sdk | Select-Object -ExpandProperty Name | Write-Host
+          } else {
+            Write-Host "no Windows SDK include dir at $sdk"
+          }
+          # A native command earlier in this step (amd-smi) left a non-zero
+          # $LASTEXITCODE, and the Actions PowerShell wrapper exits with it. That
+          # failed the whole job on a diagnostic that worked. This step reports;
+          # it never decides, so it must not be able to fail the job.
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          # base is the commit before #8863, the first of the three merged PRs that
+          # touch this readout (#8863, #9314, #11366); head is current main, not
+          # any one of their merge commits, because the question is what ships today.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states_at.py" `
+            --repo "$env:UPSTREAM" `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json" `
+            --label "issue 7449 defect 1 FIX: base = current main, head = the fix" `
+            "base=ef6ae0b5a" "head=5ca816b853484bf505d0aa1d6c6c21604eae6e78"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test environment
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The Studio backend's module-level import closure, which is NOT torch: any test
+          # under studio/backend/tests reaches loggers/__init__.py -> structlog and
+          # core/... -> fastapi while pytest is still COLLECTING. The Linux template gets
+          # these for free from its local-install step; a bare venv does not, and the failure
+          # is pytest exit 2 with 0 collected, which the criteria correctly call INCONCLUSIVE
+          # rather than a pass. Measured: these two are the whole closure for a torch-free
+          # backend suite. huggingface_hub is needed at RUN time rather than collection
+          # time: studio/backend/tests/conftest.py:145 imports it inside a session-scoped
+          # autouse fixture, so `pytest --collect-only` finds the closure complete without
+          # it and every test then ERRORS at setup.
+          & $py -m pip install -q structlog fastapi huggingface_hub
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_FALLBACK_PY=$py"
+
+      - name: Studio install (the environment a real user would have)
+        timeout-minutes: 90
+        run: |
+          # The whole unified-memory decision is gated on `_torch_is_rocm(torch)`,
+          # so "what torch does Studio's own Windows installer put here" IS the
+          # question, not a detail. Run the real installer rather than a bare venv.
+          # It is allowed to fail: a failure is recorded and the bare venv from the
+          # previous step stands in, so the probe still records the readout and the
+          # criteria gate still reports "not a ROCm torch" rather than a green skip.
+          $ErrorActionPreference = "Continue"
+          $home2 = Join-Path $env:AMD_CI_WORK "studio"
+          New-Item -ItemType Directory -Force -Path $home2 | Out-Null
+          $env:UNSLOTH_STUDIO_HOME = $home2
+          $env:UNSLOTH_SKIP_AUTOSTART = "1"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$home2"
+          Push-Location (Join-Path $env:AMD_CI_WORK "states\head")
+          & powershell -ExecutionPolicy Bypass -File ".\install.ps1" --local --skip-autostart 2>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\install_ps1.log" |
+            Select-Object -Last 60
+          $installRc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit code: $installRc"
+          $studioPy = $null
+          foreach ($c in @("$home2\unsloth_studio\Scripts\python.exe",
+                            "$home2\.venv\Scripts\python.exe",
+                            "$home2\venv\Scripts\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $studioPy = $c; break }
+          }
+          if ($null -eq $studioPy) {
+            $cand = Get-ChildItem -Path $home2 -Recurse -Filter "python.exe" `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $cand) { $studioPy = $cand.FullName }
+          }
+          $record = @{
+            install_rc = $installRc
+            studio_python = $studioPy
+            studio_home = $home2
+            used_fallback_venv = ($null -eq $studioPy)
+          } | ConvertTo-Json
+          [System.IO.File]::WriteAllText("$env:AMD_CI_WORK\out\studio_install.json", $record)
+          Write-Host $record
+          if ($null -ne $studioPy) {
+            & $studioPy -m pip install -q structlog fastapi huggingface_hub 2>&1 |
+              Select-Object -Last 5
+            Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$studioPy"
+            Write-Host "Probing with the STUDIO python: $studioPy"
+            & $studioPy -c "import sys; print(sys.version); import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())" 2>&1 |
+              Select-Object -Last 10
+          } else {
+            Write-Host "install.ps1 produced no venv; probing with the bare fallback venv."
+            Write-Host "That is itself a finding, not a skip: it is recorded in studio_install.json."
+          }
+
+      - name: Differential
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/studio_settings_vram_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/settings_vram_matches_the_machine.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows" `
+            --python "$env:AMD_CI_PY" `
+            '--' '--hold-gib' '8'
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
+            "$env:AMD_CI_WORK\out\windows"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr7449-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
