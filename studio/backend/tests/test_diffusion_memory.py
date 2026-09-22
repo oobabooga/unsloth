@@ -33,6 +33,7 @@ from core.inference.diffusion_memory import (
     apply_memory_plan,
     estimate_gguf_resident_mib,
     estimate_image_runtime_mib,
+    loaded_text_encoder_mib,
     normalize_memory_mode,
     plan_diffusion_memory,
     refine_memory_plan_for_components,
@@ -771,6 +772,71 @@ def test_refine_model_offload_streams_only_when_a_component_exceeds_budget(monke
     assert refined.offload_policy == OFFLOAD_STREAMING
     assert refined.estimates["largest_component_mib"] == 7500
     assert any("text_encoder" in reason for reason in refined.reasons)
+
+
+def test_loaded_text_encoder_mib_counts_every_encoder_the_pipe_holds_once(monkeypatch):
+    """The quant replan sizes the encoder from the weights the pipe holds, so a pre-cast fp8
+    encoder counts at its fp8 size and a failed injection counts dense. One module in two slots
+    is one set of weights."""
+    Module = _install_sized_torch(monkeypatch)
+    shared = Module(300)
+    pipe = types.SimpleNamespace(
+        components = {
+            "transformer": Module(9000),
+            "text_encoder": Module(1200),
+            "text_encoder_2": shared,
+            "text_encoder_3": shared,
+            "vae": Module(100),
+            "tokenizer": object(),
+        }
+    )
+    assert loaded_text_encoder_mib(pipe) == 1500
+    assert loaded_text_encoder_mib(types.SimpleNamespace(components = {"vae": Module(100)})) is None
+
+
+def test_largest_streamable_companion_mib_measures_only_the_text_encoders(monkeypatch):
+    """The loader checks this before quantising under whole-module offload, so it must size exactly
+    what refinement would stream besides the transformer."""
+    from core.inference.diffusion_memory import largest_streamable_companion_mib
+
+    Module = _install_sized_torch(monkeypatch)
+    transformer = Module(9000)
+    pipe = types.SimpleNamespace(
+        transformer = transformer,
+        components = {
+            "transformer": transformer,
+            "text_encoder": Module(1200),
+            "text_encoder_2": Module(4800),
+            "vae": Module(9500),
+        },
+    )
+    assert largest_streamable_companion_mib(pipe) == 4800
+    only_dit = types.SimpleNamespace(
+        transformer = transformer, components = {"transformer": transformer}
+    )
+    assert largest_streamable_companion_mib(only_dit) is None
+
+
+def test_refine_keeps_model_offload_for_a_torchao_transformer(monkeypatch):
+    """Streaming cannot move torchao weights, and the loader quantised under whole-module offload
+    only because the quantised transformer fits, so its bf16-shaped size must not force streaming."""
+    Module = _install_sized_torch(monkeypatch)
+    plan = MemoryPlan(
+        requested_mode = "low_vram",
+        offload_policy = OFFLOAD_MODEL,
+        vae_tiling = True,
+        vae_slicing = True,
+        device_memory = _discrete(8000),
+        estimates = {"safe_device_budget_mib": 6000},
+    )
+    transformer = Module(7500)
+    pipe = types.SimpleNamespace(
+        transformer = transformer,
+        components = {"transformer": transformer, "text_encoder": Module(1200)},
+    )
+    assert refine_memory_plan_for_components(pipe, plan).offload_policy == OFFLOAD_STREAMING
+    monkeypatch.setattr(diffusion_memory, "_holds_torchao_tensors", lambda module: True)
+    assert refine_memory_plan_for_components(pipe, plan) is plan
 
 
 def test_refine_keeps_model_offload_when_streaming_cannot_help(monkeypatch):
