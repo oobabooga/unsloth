@@ -3674,7 +3674,23 @@ export function ImagesPage({
     }
 
     // Snap to the model's grid and bounds so a half-typed value cannot 400.
-    const sent = unifiedEditRun ? editSize : fitSize(width, height, sizeLimits);
+    let sent = unifiedEditRun ? editSize : fitSize(width, height, sizeLimits);
+    // Match Image 1 before the async size read has landed would otherwise send the custom size.
+    if (unifiedEditRun && editSizing === "source" && !sourceDims && initImage) {
+      try {
+        const img = await loadImage(initImage);
+        sent = resolveEditSize(
+          "source",
+          { width: img.naturalWidth, height: img.naturalHeight },
+          matchResolution,
+          { width, height },
+          sizeLimits,
+        );
+      } catch {
+        toast.error("Could not read the source image size");
+        return;
+      }
+    }
     const w = sent.width;
     const h = sent.height;
     if (!unifiedEditRun || editSizing === "custom") {
@@ -3852,7 +3868,7 @@ export function ImagesPage({
       setGenDone(null);
       setGenStep(null);
     }
-  }, [prompt, negativePrompt, width, height, steps, guidance, seed, batchSize, count, workflow, initImage, maskImage, strength, extendPct, extendSides, upscaleFactor, upscaleStrength, referenceImages, loras, loraCapable, controlnetCapable, controlnetId, controlImage, controlType, controlStrength, ensureSrc, loadGallery, refreshStatus, unifiedEdit, localizedMode, localizedLayer, maxExtras, referenceResolution, conditioning, editSize, editSizing, sizeLimits]);
+  }, [prompt, negativePrompt, width, height, steps, guidance, seed, batchSize, count, workflow, initImage, maskImage, strength, extendPct, extendSides, upscaleFactor, upscaleStrength, referenceImages, loras, loraCapable, controlnetCapable, controlnetId, controlImage, controlType, controlStrength, ensureSrc, loadGallery, refreshStatus, unifiedEdit, localizedMode, localizedLayer, maxExtras, referenceResolution, conditioning, editSize, editSizing, sizeLimits, sourceDims, matchResolution]);
 
   // Stop the in-flight generation. Latch FIRST, so a multi-run request stops even if the POST
   // races the run that is already finishing.
