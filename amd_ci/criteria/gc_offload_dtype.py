@@ -75,7 +75,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                     str(o.get("import_error", "")).strip().splitlines()[-1][:180]
                     if o.get("import_error") else
                     f"gradient_checkpointing from {o.get('gc_file')} "
-                    f"(unsloth: {o.get('unsloth_import', 'unrecorded')})"))
+                    f"(unsloth package imported: {o.get('unsloth_in_sys_modules', 'unrecorded')})"))
         # Without this both legs could be measuring the same installed copy, and the
         # differential would compare a state against itself.
         out.append((f"{name}: source came from ITS OWN checkout", bool(o.get("gc_file_in_checkout")),
