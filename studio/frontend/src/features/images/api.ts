@@ -29,6 +29,8 @@ export interface DiffusionStatus {
   dtype: string | null;
   // Resolved load kind: "gguf" | "single_file" | "pipeline". Gates GGUF-only controls. Null when not loaded.
   model_kind?: string | null;
+  // A seed for the size fields, never a cap. Null/absent means no opinion (see resolutionFor).
+  recommended_canvas?: number | null;
   gguf_filename?: string | null;
   // Selected GGUF quant. Newer backends report this separately from the compute dtype.
   gguf_variant?: string | null;
