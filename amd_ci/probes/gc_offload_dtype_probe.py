@@ -162,6 +162,17 @@ def main() -> int:
     sys.path.insert(0, args.checkout)
     try:
         import torch
+        # `unsloth_zoo/__init__.py` refuses to import standalone: it requires find_spec
+        # ("unsloth") to resolve AND the UNSLOTH_IS_PRESENT marker that `import unsloth`
+        # sets. The repo's own tests/conftest.py arranges this, so the pytest leg never
+        # noticed; this probe imports the module directly and did. Import unsloth the way
+        # a user does, and record which route worked so the report can say.
+        try:
+            import unsloth  # noqa: F401
+            obs["unsloth_import"] = "imported"
+        except Exception as exc:  # noqa: BLE001
+            obs["unsloth_import"] = f"failed ({type(exc).__name__}: {exc}); set marker instead"
+            os.environ["UNSLOTH_IS_PRESENT"] = "1"
         from unsloth_zoo import gradient_checkpointing as gc
     except Exception:
         obs["import_error"] = traceback.format_exc()[-4000:]
