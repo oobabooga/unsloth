@@ -10,6 +10,7 @@ matrix and the applier's pipeline calls are exercised in isolation.
 
 from __future__ import annotations
 
+import math
 import sys
 import types
 
@@ -2097,3 +2098,36 @@ def test_the_same_load_reaches_group_offload_once_the_split_is_known():
     )
     assert plan.offload_policy == OFFLOAD_GROUP
     assert plan.vae_tiling is False
+
+
+def test_the_canvas_drops_once_the_weights_hold_most_of_the_card():
+    # The same 17 GB model trips it on a 24 GB card (0.708) and not on a 40 GB one (0.425).
+    card_24 = 24 * 1024
+    assert diffusion_memory.recommended_canvas_px(17 * 1024, card_24) == 512
+    assert diffusion_memory.recommended_canvas_px(18 * 1024, card_24) == 512
+    assert diffusion_memory.recommended_canvas_px(17 * 1024, 40 * 1024) == 1024
+    # `ceil`, not `int`: 24576 * 0.70 truncates to 17203, which is under the ratio.
+    at_ratio = math.ceil(card_24 * diffusion_memory.CANVAS_REDUCTION_RATIO)
+    assert diffusion_memory.recommended_canvas_px(at_ratio, card_24) == 512
+    assert diffusion_memory.recommended_canvas_px(at_ratio - 1, card_24) == 1024
+
+
+def test_an_unsizable_load_gets_no_canvas_opinion():
+    assert diffusion_memory.recommended_canvas_px(None, 24 * 1024) is None
+    assert diffusion_memory.recommended_canvas_px(17 * 1024, None) is None
+    assert diffusion_memory.recommended_canvas_px(17 * 1024, 0) is None
+    assert diffusion_memory.recommended_canvas_px(0, 24 * 1024) is None
+    assert diffusion_memory.recommended_canvas_px(17 * 1024, 24 * 1024, is_unified = True) is None
+
+
+def test_the_plan_carries_the_canvas_for_the_loader_to_report():
+    # The estimates key the load state reads; a drift has to fail here.
+    plan = diffusion_memory.plan_diffusion_memory(
+        target = _offloadable(),
+        device_memory = diffusion_memory.DeviceMemory(
+            "cuda", "cuda", "discrete_vram", 23000, 24 * 1024
+        ),
+        model_dense_mib = 17 * 1024,
+        runtime_headroom_mib = 4096,
+    )
+    assert plan.estimates["recommended_canvas_px"] == 512

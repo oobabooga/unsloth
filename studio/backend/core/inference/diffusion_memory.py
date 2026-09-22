@@ -724,6 +724,32 @@ def _sum_required(*values: Optional[int]) -> Optional[int]:
     return total
 
 
+DEFAULT_CANVAS_PX = 1024
+REDUCED_CANVAS_PX = 512
+
+# Quantising shrinks the weights, not the activations: 1024 costs ~7 GB more than 512 on
+# Qwen-Image-2.1, the whole margin once the weights hold 70% of the card.
+CANVAS_REDUCTION_RATIO = 0.70
+
+
+def recommended_canvas_px(
+    model_dense_mib: Optional[int],
+    device_total_mib: Optional[int],
+    *,
+    is_unified: bool = False,
+) -> Optional[int]:
+    """The square canvas an image load should DEFAULT to on this card, or None when unknowable.
+
+    Weights over the whole card, not over the safe budget or a predicted peak, so it matches what
+    nvidia-smi shows. None on unified memory, whose pool is shared with the host."""
+    if is_unified:
+        return None
+    if not model_dense_mib or not device_total_mib or device_total_mib <= 0:
+        return None
+    ratio = float(model_dense_mib) / float(device_total_mib)
+    return REDUCED_CANVAS_PX if ratio >= CANVAS_REDUCTION_RATIO else DEFAULT_CANVAS_PX
+
+
 def plan_diffusion_memory(
     *,
     target: Any,
@@ -790,6 +816,9 @@ def plan_diffusion_memory(
         "resident_required_mib": required,
         "group_floor_mib": group_floor,
         "group_floor_streamed_te_mib": group_floor_streamed_te,
+        "recommended_canvas_px": recommended_canvas_px(
+            model_dense_mib, device_memory.total_mib, is_unified = device_memory.is_unified
+        ),
     }
 
     def _group_fits() -> bool:

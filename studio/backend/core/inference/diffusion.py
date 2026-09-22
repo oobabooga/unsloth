@@ -907,6 +907,8 @@ class _LoadState:
     # Defaulted so older positional constructions keep working.
     offload_policy: str = OFFLOAD_NONE
     vae_tiling: bool = False
+    # Advisory: the UI seeds its size fields from it, and every explicit request is honoured.
+    recommended_canvas: Optional[int] = None
     memory_mode: str = "auto"
     # Resolved load kind ("gguf"|"single_file"|"pipeline"); lets the UI gate GGUF-only controls.
     kind: str = "gguf"
@@ -5665,6 +5667,7 @@ class DiffusionBackend:
                         cpu_offload = effective_policy != OFFLOAD_NONE,
                         offload_policy = effective_policy,
                         vae_tiling = effective_tiling,
+                        recommended_canvas = plan.estimates.get("recommended_canvas_px"),
                         memory_mode = plan.requested_mode,
                         speed_mode = effective_speed,
                         speed_optims = tuple(k for k, v in speed_applied.items() if v),
@@ -7536,6 +7539,7 @@ class DiffusionBackend:
                 "cpu_offload": False,
                 "offload_policy": None,
                 "vae_tiling": False,
+                "recommended_canvas": None,
                 "memory_mode": None,
                 "speed_mode": None,
                 "speed_optims": [],
@@ -7568,6 +7572,7 @@ class DiffusionBackend:
             "cpu_offload": state.cpu_offload,
             "offload_policy": state.offload_policy,
             "vae_tiling": state.vae_tiling,
+            "recommended_canvas": state.recommended_canvas,
             "memory_mode": state.memory_mode,
             "speed_mode": state.speed_mode,
             "speed_optims": list(state.speed_optims),
