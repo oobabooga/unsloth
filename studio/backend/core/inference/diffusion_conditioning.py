@@ -214,7 +214,7 @@ def decode_condition_images(
     reference in request order. More images than the family takes is refused, not truncated."""
     limit = int(getattr(fam, "max_condition_images", 4) or 4)
     mode = getattr(fam, "condition_image_mode", "RGB") or "RGB"
-    refs = [r for r in (reference_images or []) if r]
+    refs = list(reference_images or [])
     extra_from_mask = 1 if localized is not None and localized.mode == "mask" else 0
     total = 1 + extra_from_mask + len(refs)
     if total > limit:

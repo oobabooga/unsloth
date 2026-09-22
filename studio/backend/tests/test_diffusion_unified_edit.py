@@ -479,3 +479,16 @@ def test_an_elongated_source_matches_to_a_size_the_request_accepts(source, resol
 def test_an_output_side_below_the_minimum_is_refused():
     with pytest.raises(ValueError, match = "at least 256px"):
         cond.check_output_size(detect_family("Qwen/Qwen-Image-2.1"), 2048, 128)
+
+
+def test_an_empty_reference_is_refused_not_dropped():
+    # Dropping it ran with fewer images than the request (and the gallery count) named.
+    from pydantic import ValidationError
+
+    from models.inference import DiffusionGenerateRequest
+
+    with pytest.raises(ValidationError, match = "empty entries"):
+        DiffusionGenerateRequest(prompt = "p", init_image = "AA", reference_images = ["AA", ""])
+    fam = detect_family("Qwen/Qwen-Image-2.1")
+    with pytest.raises(ValueError):
+        cond.decode_condition_images(fam, _png(), [""])

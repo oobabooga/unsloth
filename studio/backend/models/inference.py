@@ -4165,6 +4165,8 @@ class DiffusionGenerateRequest(BaseModel):
         # Each reference is a base64 image; bound its length like init_image so several cannot buffer a multi-GB payload.
         if value is not None:
             for item in value:
+                if not item:
+                    raise ValueError("reference_images must not contain empty entries")
                 if len(item) > 32 * 1024 * 1024:
                     raise ValueError("each reference image must be at most 32 MiB (base64)")
         return value
