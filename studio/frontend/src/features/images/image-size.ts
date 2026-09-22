@@ -20,6 +20,13 @@ export const DEFAULT_SIZE_LIMITS: SizeLimits = {
   maxPixels: MAX_DIM * MAX_DIM,
 };
 
+/** The request schema's own ceiling (the largest 2K preset side), for sizes no model has bounded yet. */
+export const TRANSPORT_SIZE_LIMITS: SizeLimits = {
+  multiple: 16,
+  maxSide: 2752,
+  maxPixels: 2752 * 2752,
+};
+
 /** The loaded model's limits, or the historical ones when the backend reports none. */
 export function sizeLimitsFrom(
   conditioning: DiffusionConditioning | null | undefined,

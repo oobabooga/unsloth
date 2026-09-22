@@ -23,6 +23,7 @@ import {
 import { defaultsFor } from "../src/features/images/image-generation-defaults.ts";
 import {
   DEFAULT_SIZE_LIMITS,
+  TRANSPORT_SIZE_LIMITS,
   fitSize,
   matchSourceSize,
   restorableSize,
@@ -244,4 +245,24 @@ test("restoreSettings reopens Edit and Reference instead of Create", () => {
   // Generation stays blocked until the source and every restored slot are supplied again.
   assert.match(src, /usesInit && !initImage/);
   assert.match(src, /is empty\. Add it, or remove that slot\./);
+});
+
+test("a 2K recipe restored with no model loaded keeps its size until the model's limits apply", () => {
+  // Restore runs against the transport ceiling while nothing is loaded; the load then fits the
+  // form to the loaded model, which for Qwen-Image-2.1 keeps the 2K preset as recorded.
+  const restored = restorableSize(2752, 1536, "txt2img", TRANSPORT_SIZE_LIMITS);
+  assert.deepEqual(restored, { width: 2752, height: 1536 });
+  const qwen = sizeLimitsFrom({
+    max_condition_images: 10,
+    alpha: true,
+    dimension_multiple: 32,
+    max_output_side: 2752,
+    max_output_pixels: 2400 * 1792,
+    reference_resolutions: [512, 1024, 2048],
+    unified_edit: true,
+    localized_edit_modes: ["annotate", "paint", "mask"],
+  });
+  assert.deepEqual(fitSize(restored.width, restored.height, qwen), restored);
+  // Another family still gets its own bound once loaded.
+  assert.ok(Math.max(...Object.values(fitSize(restored.width, restored.height, DEFAULT_SIZE_LIMITS))) <= 2048);
 });

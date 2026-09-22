@@ -143,6 +143,7 @@ import {
   MIN_DIM,
   type SizeLimits,
   DEFAULT_SIZE_LIMITS,
+  TRANSPORT_SIZE_LIMITS,
   fitSize,
   restorableSize,
   sizeLimitsFrom,
@@ -2045,7 +2046,10 @@ export function ImagesPage({
     // Restore from the BASE batch seed, not this image's derived seed, or a replay with batch_size
     // advances it again.
     setSeed(String(image.batch_seed ?? image.seed));
-    const restored = restorableSize(image.width, image.height, image.workflow, sizeLimits);
+    // With nothing loaded the recipe's model is not known yet: keep its size (a 2K recipe included)
+    // and let the loaded model's limits fit it when they arrive.
+    const limits = status?.loaded ? sizeLimits : TRANSPORT_SIZE_LIMITS;
+    const restored = restorableSize(image.width, image.height, image.workflow, limits);
     setWidth(restored.width);
     setHeight(restored.height);
     // The batch shared one base seed, so a batch_index>0 image only reproduces by replaying the whole batch.
@@ -2095,7 +2099,7 @@ export function ImagesPage({
     // so rather than leaving the two silently disagreeing.
     const rescaled =
       restored.width !== image.width || restored.height !== image.height
-        ? { description: `Size scaled to ${restored.width} × ${restored.height} to fit the ${MIN_DIM}-${sizeLimits.maxSide} range.` }
+        ? { description: `Size scaled to ${restored.width} × ${restored.height} to fit the ${MIN_DIM}-${limits.maxSide} range.` }
         : undefined;
     // Say so, rather than letting a conditioned image restore as a plain Create that generates something unrelated.
     const conditioned =
@@ -2105,7 +2109,7 @@ export function ImagesPage({
     } else {
       toast.success("Settings restored to inputs", rescaled);
     }
-  }, [setWorkflow, sizeLimits]);
+  }, [setWorkflow, sizeLimits, status?.loaded]);
 
   // A locked ratio keeps the paired dimension in step; "custom" frees both, Flip swaps W/H. ratioHW is h/w for [a,b].
   const ratioHW = (a: number, b: number) => (portrait ? a / b : b / a);
