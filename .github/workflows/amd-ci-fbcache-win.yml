@@ -1,0 +1,106 @@
+name: "AMD CI: First-Block-Cache on Qwen-Image-2.1 (PR 11713, Windows)"
+
+# Windows counterpart of amd-ci-fbcache.yml on the non-Docker gfx1151 runners with AMD's gfx1151
+# torch wheels. Both checkouts get PR 11640 applied (the Windows ROCm torchao stub fix), without
+# which Studio cannot import there. No HF token is used anywhere.
+
+on:
+  push:
+    branches: [amd-ci-fbcache-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SRC_REPO: "https://github.com/unslothai/unsloth"
+  HEAD_BRANCH: "studio-prefix-kv-fbcache"
+  BASE_BRANCH: "main"
+
+jobs:
+
+  windows:
+    name: "fbcache on gfx1151 Windows"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu-windows
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "fbcache-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python found."; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Checkout head and base, apply PR 11640
+        run: |
+          $ErrorActionPreference = "Continue"
+          $diff = "$env:AMD_CI_WORK\pr11640.diff"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://patch-diff.githubusercontent.com/raw/unslothai/unsloth/pull/11640.diff" -OutFile $diff
+          foreach ($pair in @(@("head", $env:HEAD_BRANCH), @("base", $env:BASE_BRANCH))) {
+            $dst = "$env:AMD_CI_WORK\src\$($pair[0])"
+            git clone -q --depth 1 -b $pair[1] $env:SRC_REPO $dst
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git -C $dst apply --3way $diff
+            Write-Host "$($pair[0]) apply 11640 exit: $LASTEXITCODE"
+            git -C $dst log -1 --format='%h %s'
+          }
+
+      - name: Test environment
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" "torchvision>=0.26.0,<0.27.0"
+          Write-Host "torch install exit: $LASTEXITCODE"
+          & $py -m pip install -q "diffusers @ https://github.com/huggingface/diffusers/archive/80c7ed262aeffbeb43ef13ae04baeb9b84515a69.zip" "transformers==5.5.0" accelerate safetensors "gguf>=0.10" huggingface_hub pillow numpy scipy tqdm
+          & $py -m pip install -q -r "$env:AMD_CI_WORK\src\head\studio\backend\requirements\studio.txt"
+          Write-Host "studio requirements exit: $LASTEXITCODE"
+          & $py -m pip install -q --no-deps lpips
+          & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda?', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no device')"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_rocm.json"
+          Write-Host "rocm gate exit: $LASTEXITCODE"
+          exit 0
+
+      - name: End to end, eager
+        timeout-minutes: 240
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:TORCH_HOME = "$env:AMD_CI_WORK\torch_home"
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\fbcache_e2e_probe.py" `
+            --head "$env:AMD_CI_WORK\src\head" --base "$env:AMD_CI_WORK\src\base" `
+            --out-dir "$env:AMD_CI_WORK\out\e2e" --models "$env:AMD_CI_WORK\models" --steps 20 --prompts 3
+          "### Qwen-Image-2.1, fbcache vs uncached, eager (Windows)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:AMD_CI_WORK\out\e2e\SUMMARY.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fbcache-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
