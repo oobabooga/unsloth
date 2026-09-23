@@ -134,7 +134,10 @@ jobs:
           # unsloth and unsloth-zoo with --no-deps: both declare torch, and a resolver pass would
           # swap the ROCm build for PyPI's CPU one. zoo itself comes from each state's checkout
           # via PYTHONPATH, so only its dependencies are installed here.
-          & $py -m pip install -q --no-deps "unsloth @ git+https://github.com/unslothai/unsloth.git@main"
+          # PyPI's wheel, not a git build: building from source on Windows dies on MAX_PATH under
+          # studio/backend/plugins (measured on run 35854320947).
+          & $py -m pip install -q --no-deps unsloth
+          Write-Host "unsloth install exit: $LASTEXITCODE"
           & $py -m pip install -q "transformers==5.5.0" "trl>=0.18.2,!=0.19.0,<=1.13.0" "peft>=0.18.0" accelerate "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0" sentencepiece tqdm psutil wheel numpy protobuf huggingface_hub hf_transfer pillow regex msgspec typing_extensions filelock tyro typer rich pydantic pyyaml nest-asyncio structlog click
           Write-Host "stack install exit: $LASTEXITCODE"
           # torchao as a plain `pip install unsloth` gets it from zoo's dependency: present, and
