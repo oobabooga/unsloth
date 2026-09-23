@@ -151,6 +151,7 @@ def main() -> int:
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--prompts", type = int, default = len(PROMPTS))
     ap.add_argument("--reference-at-base", action = "store_true")
+    ap.add_argument("--speed", default = "off", help = "Studio speed_mode for every load")
     # Internal: run one scheme in this process and write only its arm. The parent runs every scheme
     # in a fresh process, as a user starting Studio would: on a unified-memory APU the pages an
     # earlier arm read stay charged to the system, so a second load in the same process is judged
@@ -249,7 +250,7 @@ def main() -> int:
                 local_files_only = True,
                 transformer_quant = scheme,
                 text_encoder_quant = "none",
-                speed_mode = "off",
+                speed_mode = args.speed,
             )
         except Exception as exc:  # noqa: BLE001 - a refusal is an observation
             rec["loaded"] = False
@@ -260,6 +261,7 @@ def main() -> int:
         rec["load_seconds"] = round(time.time() - t1, 1)
         rec["transformer_quant"] = status.get("transformer_quant")
         rec["resolved"] = (status.get("resolved") or {}).get("transformer_quant")
+        rec["speed"] = {k: status.get(k) for k in ("speed_mode", "speed_optims", "compiled") if k in status}
         # No local reference to the pipeline: one would keep this arm's weights alive through the next load.
         rec["transformer_gib"] = weight_gib(backend._state.pipe.transformer)
         rec["images"] = []
