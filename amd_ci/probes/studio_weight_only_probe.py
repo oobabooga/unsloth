@@ -229,6 +229,17 @@ def main() -> int:
         from core.inference import diffusion_transformer_quant as tq
 
         tq.torch_is_rocm = lambda: True
+    if os.environ.get("PROBE_FORCE_COMPILE") == "1":
+        # Studio does not compile on ROCm by default (supports_default_torch_compile = not is_rocm). Measuring what
+        # compile would buy means lifting only that gate: the runtime and bf16 checks still apply.
+        import core.inference.diffusion_speed as ds
+
+        ds.compile_eligible = lambda target, *, is_gguf, family: (
+            ds.torch_compile_runtime_available()
+            and bool(getattr(family, "supports_torch_compile", True))
+            and ds._is_bfloat16(getattr(target, "dtype", None))
+        )
+        obs["forced_compile"] = True
     from core.inference.diffusion import DiffusionBackend
 
     backend = DiffusionBackend()

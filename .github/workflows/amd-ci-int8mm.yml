@@ -72,38 +72,21 @@ jobs:
           "$AMD_CI_PY" -c "import torch, lpips; print('lpips ok, torch', torch.__version__)"
           exit 0
 
-      - name: Layer micro-benchmark
-        timeout-minutes: 30
+      - name: End to end, compile forced on ROCm
+        timeout-minutes: 200
         run: |
           set +e
-          "$AMD_CI_PY" -u amd_ci/probes/int8mm_layer_probe.py --checkout "$AMD_CI_WORK/src/unsloth" \
-            --out "$AMD_CI_WORK/out/layer.json" 2>&1 | grep -v "Warning\|warn("
-          exit 0
-
-      - name: End to end, eager
-        timeout-minutes: 120
-        run: |
-          set +e
-          export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home"
+          export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home" PROBE_FORCE_COMPILE=1
           "$AMD_CI_PY" -u amd_ci/probes/int8mm_e2e_probe.py --checkout "$AMD_CI_WORK/src/unsloth" \
-            --out-dir "$AMD_CI_WORK/out/e2e_off" --models "$AMD_CI_WORK/models" --speed off
-          { echo "### Eager"; cat "$AMD_CI_WORK/out/e2e_off/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: End to end, Studio default compile
-        timeout-minutes: 120
-        run: |
-          set +e
-          export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home"
-          "$AMD_CI_PY" -u amd_ci/probes/int8mm_e2e_probe.py --checkout "$AMD_CI_WORK/src/unsloth" \
-            --out-dir "$AMD_CI_WORK/out/e2e_default" --models "$AMD_CI_WORK/models" --speed default
-          { echo "### Studio default speed mode"; cat "$AMD_CI_WORK/out/e2e_default/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
+            --out-dir "$AMD_CI_WORK/out/e2e_compiled" --models "$AMD_CI_WORK/models" --speed default \
+            --arms ref,wo,w8a8_rot
+          { echo "### Studio default speed, compile forced on ROCm"; cat "$AMD_CI_WORK/out/e2e_compiled/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: int8mm-linux
+          name: int8mm-linux-compiled
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn

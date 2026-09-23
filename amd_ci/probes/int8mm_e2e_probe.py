@@ -34,11 +34,15 @@ def main() -> int:
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--prompts", type = int, default = 2)
     ap.add_argument("--speed", default = "off", help = "Studio speed_mode: off = eager, default = compiled")
+    ap.add_argument("--arms", default = "", help = "comma list of arm states to run (default: all)")
     args = ap.parse_args()
     out = args.out_dir
     out.mkdir(parents = True, exist_ok = True)
     summary: dict = {"arms": {}}
+    wanted = {a for a in args.arms.split(",") if a}
     for state, scheme, extra in ARMS:
+        if wanted and state not in wanted:
+            continue
         part = out / f"{state}.json"
         log = out / f"{state}.log"
         env = dict(os.environ, **extra)
@@ -75,7 +79,7 @@ def main() -> int:
         net = None
         summary["lpips_error"] = str(exc)[:200]
     for state in ("wo", "w8a8", "w8a8_rot"):
-        for item in summary["arms"][state].get("images") or []:
+        for item in (summary["arms"].get(state) or {}).get("images") or []:
             ref = out / "images_ref" / f"off_p{item.get('prompt_index')}.png"
             img = out / f"images_{state}" / str(item.get("path"))
             if "error" in item or not ref.is_file() or not img.is_file():
