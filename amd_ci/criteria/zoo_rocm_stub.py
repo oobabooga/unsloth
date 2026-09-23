@@ -32,14 +32,22 @@ def _hit(arm: dict) -> bool:
     return any(s in text for s in SIGNATURES)
 
 
+def _stub_live(state: dict) -> bool:
+    """zoo's stub was in play: the probe saw its finder, or a failure names a sentinel class
+    (``<class 'torchao.X'>``), which only zoo's _ROCmSentinelMeta produces. The second matters
+    because the defect can kill ``import unsloth_zoo`` before the probe records the finder."""
+    zi = _arm(state, "zoo_import")
+    return bool(zi.get("torchao_is_zoo_stub")) or "<class 'torchao." in f"{zi.get('error', '')} {zi.get('tb', '')}"
+
+
 def gates(obs: dict):
     head, base = obs.get("head") or {}, obs.get("base") or {}
     return [
         ("ROCm torch on an AMD GPU", bool(head.get("hip")) and str(head.get("arch") or "").startswith("gfx"),
          f"{head.get('device')} {head.get('arch')} hip={head.get('hip')}"),
-        ("zoo installed its stub at base", bool(_arm(base, "zoo_import").get("torchao_is_zoo_stub")),
+        ("zoo's stub was live at base", _stub_live(base),
          str(_arm(base, "zoo_import").get("torchao_type") or _arm(base, "zoo_import").get("error", ""))[:120]),
-        ("zoo installed its stub at head", bool(_arm(head, "zoo_import").get("torchao_is_zoo_stub")),
+        ("zoo's stub was live at head", _stub_live(head),
          str(_arm(head, "zoo_import").get("torchao_type") or _arm(head, "zoo_import").get("error", ""))[:120]),
     ]
 
