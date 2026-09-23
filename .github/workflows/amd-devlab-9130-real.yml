@@ -1,0 +1,483 @@
+name: AMD DevLab issue 9130 real backend
+
+# The companion to amd-devlab-9130-containment.yml, which ran as 35898689205.
+#
+# That job answered "what happens to a server process when a fault lands on the generation thread"
+# using a stand-in with no pipeline resident. It recorded an induced device fault being CAUGHT and
+# answered 500, and it would be wrong to generalise that to #9130's fault, which came out of MIOpen
+# mid-generation and was plainly not caught. A stub with no model loaded is not evidence about a
+# code path that has one.
+#
+# So: a real DiffusionBackend, a real pipeline resident, a real denoise, and the fault raised from
+# inside ``torch.nn.functional.conv2d``. Convolution is what MIOpen serves and is where the
+# reporter's hipErrorLaunchFailure surfaced, so this puts the fault where theirs was rather than
+# where it was convenient.
+#
+#   1  control      no fault              expect a completed image, server alive
+#   2  gpu          device fault in conv  THE QUESTION: caught and 500, or process gone?
+#   3  abort        signal in conv        expect the process gone (the stand-in's finding, on the
+#                                         real path this time)
+#
+# Cell 2 is the one that decides how #9130 should be written up. If it is caught, the gap is
+# specifically about faults that arrive as signals. If it takes the process, the gap is the broader
+# thing the issue claims and the stand-in's result was an artefact of having no model loaded.
+
+on:
+  push:
+    branches: [amd-devlab-9130-containment]
+
+permissions: {}
+
+env:
+  MAIN_SHA: 070f29261736c980b523cffde6890d61a6e76f88
+  # 33.1 GB, so it fits the runner's ~51 GB usable. Qwen-Image-2512 (57.7 GB) does not: the
+  # unified-memory guard refuses it here, which is why the August runs fell back to Z-Image.
+  REPO: unsloth/Qwen-Image-2.1
+  SURVIVE_HOLD: "5"
+
+jobs:
+  real-backend:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "devlab-9130-real"
+
+      - name: Fetch Studio at the pinned commit
+        run: |
+          set -euo pipefail
+          SRC="$AMD_CI_WORK/src"
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin https://github.com/unslothai/unsloth.git
+          git -C "$SRC" fetch -q --depth 1 origin "$MAIN_SHA"
+          git -C "$SRC" checkout -q "$MAIN_SHA"
+          git -C "$SRC" log -1 --format='%H %s'
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Same tree as the measurement. Main's installer now asks for unsloth>=2026.9.10 (#11616)
+          # while PyPI publishes 2026.9.7, so a clone-of-main install resolves to nothing.
+          cd "$SRC"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          set +e
+          bash install.sh --local 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q fastapi uvicorn
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
+
+      - name: Write the server and the watcher
+        run: |
+          set -euo pipefail
+          cat > "$AMD_CI_WORK/real_server.py" <<'SERVER'
+          #!/usr/bin/env python3
+          """The real DiffusionBackend behind the real route dispatch, with a fault armed in a conv.
+
+          The fault is raised from inside ``torch.nn.functional.conv2d`` rather than from a stub,
+          because convolution is the operation MIOpen serves and the one the reporter's
+          ``hipErrorLaunchFailure`` came out of. Patching at the torch level rather than reaching
+          into DiffusionBackend keeps this independent of Studio's private attributes, which is
+          what makes it survive a version bump.
+
+          The question: when a device fault happens where the reporter's happened, does it reach
+          Python as a catchable exception, or does it take the process?
+          """
+
+          import argparse
+          import asyncio
+          import ctypes
+          import os
+          import threading
+
+          import torch
+          import torch.nn.functional as F
+          import uvicorn
+          from fastapi import FastAPI, HTTPException
+          from pydantic import BaseModel
+
+          from core.inference.diffusion import DiffusionBackend
+
+          backend = DiffusionBackend()
+          app = FastAPI()
+
+          _armed = {"kind": None, "trip": 0}
+          _convs = {"n": 0}
+          _lock = threading.Lock()
+          _real_conv2d = F.conv2d
+
+
+          def _native_abort() -> None:
+              ctypes.CDLL(None).abort()
+
+
+          def _gpu_fault():
+              src = torch.randn(16, device = "cuda")
+              idx = torch.full((4096,), 2 ** 30, device = "cuda", dtype = torch.long)
+              out = src[idx]
+              torch.cuda.synchronize()
+              return out
+
+
+          def _patched_conv2d(*args, **kwargs):
+              with _lock:
+                  _convs["n"] += 1
+                  n, kind, trip = _convs["n"], _armed["kind"], _armed["trip"]
+                  fire = kind is not None and n >= trip
+                  if fire:
+                      _armed["kind"] = None
+              if fire:
+                  print("firing %s inside conv2d call #%d" % (kind, n), flush = True)
+                  if kind == "abort":
+                      _native_abort()
+                  elif kind == "gpu":
+                      _gpu_fault()
+              return _real_conv2d(*args, **kwargs)
+
+
+          F.conv2d = _patched_conv2d
+
+
+          class LoadBody(BaseModel):
+              repo: str
+
+
+          class GenBody(BaseModel):
+              prompt: str = "a photograph of a red bicycle leaning on a stone wall"
+              width: int = 512
+              height: int = 512
+              steps: int = 4
+              guidance: float = 0.0
+              seed: int = 1234
+
+
+          @app.get("/health")
+          def health() -> dict:
+              return {"ok": True, "pid": os.getpid(), "convs": _convs["n"], "armed": _armed["kind"]}
+
+
+          @app.post("/load")
+          def load(body: LoadBody) -> dict:
+              return backend.begin_load(body.repo, model_kind = "pipeline", gpu_ordinal = 0)
+
+
+          @app.get("/load-status")
+          def load_status() -> dict:
+              p = backend.load_progress()
+              return {
+                  "phase": p.get("phase"),
+                  "error": p.get("error"),
+                  "loaded": bool(backend.is_loaded),
+              }
+
+
+          @app.post("/arm/{kind}")
+          def arm(kind: str, after: int = 1) -> dict:
+              """Fire `kind` on a conv this many calls from now, so it lands mid-generation."""
+              if kind not in ("abort", "gpu", "none"):
+                  raise HTTPException(status_code = 400, detail = "unknown fault")
+              with _lock:
+                  _armed["kind"] = None if kind == "none" else kind
+                  _armed["trip"] = _convs["n"] + after
+                  return {"armed": _armed["kind"], "trip": _armed["trip"], "convs_so_far": _convs["n"]}
+
+
+          @app.post("/generate")
+          async def generate(body: GenBody) -> dict:
+              """The route's own dispatch, verbatim, around the real backend."""
+              try:
+                  result = await asyncio.to_thread(
+                      backend.generate,
+                      prompt = body.prompt, width = body.width, height = body.height,
+                      steps = body.steps, guidance = body.guidance, seed = body.seed,
+                  )
+              except Exception as exc:  # noqa: BLE001 -- the route's own handler, copied
+                  raise HTTPException(status_code = 500, detail = "%s: %s" % (type(exc).__name__, exc))
+              return {"images": len(result.get("images") or []), "convs": _convs["n"]}
+
+
+          if __name__ == "__main__":
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--port", type = int, default = 8890)
+              args = ap.parse_args()
+              uvicorn.run(app, host = "127.0.0.1", port = args.port, log_level = "warning")
+          SERVER
+
+          cat > "$AMD_CI_WORK/watcher.py" <<'WATCHER'
+          #!/usr/bin/env python3
+          """Sample liveness from OUTSIDE, so a dead server still produces a record."""
+
+          import json
+          import sys
+          import time
+          import urllib.request
+
+          url, out, interval = sys.argv[1], sys.argv[2], float(sys.argv[3])
+          with open(out, "w", encoding = "utf-8") as handle:
+              while True:
+                  started = time.time()
+                  try:
+                      with urllib.request.urlopen(url, timeout = 2) as resp:
+                          ok, detail = resp.status == 200, str(resp.status)
+                  except Exception as exc:  # noqa: BLE001
+                      ok, detail = False, "%s: %s" % (type(exc).__name__, exc)
+                  handle.write(json.dumps({"t": round(started, 3), "ok": ok, "detail": detail}) + "\n")
+                  handle.flush()
+                  time.sleep(max(0.0, interval - (time.time() - started)))
+          WATCHER
+
+          "$PY" -c "import ast; [ast.parse(open(p).read()) for p in ('$AMD_CI_WORK/real_server.py', '$AMD_CI_WORK/watcher.py')]"
+
+      - name: Load the pipeline
+        timeout-minutes: 90
+        run: |
+          set +e
+          set -uo pipefail
+          RESULTS="$AMD_CI_WORK/cells"
+          mkdir -p "$RESULTS"
+          BASE="http://127.0.0.1:8890"
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "RESULTS=$RESULTS" >> "$GITHUB_ENV"
+
+          "$PY" "$AMD_CI_WORK/real_server.py" --port 8890 > "$AMD_CI_WORK/server.log" 2>&1 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+          echo "server pid=$SERVER_PID"
+          for _ in $(seq 1 180); do
+            curl -sf --max-time 5 "$BASE/health" >/dev/null && break
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 1
+          done
+          curl -s --max-time 10 "$BASE/health"; echo
+          curl -s --max-time 60 -X POST "$BASE/load" -H 'Content-Type: application/json' \
+            -d "{\"repo\": \"$REPO\"}" | head -c 300; echo
+
+          LOADED=no
+          for i in $(seq 1 300); do
+            kill -0 "$SERVER_PID" 2>/dev/null || { echo "SERVER DIED DURING LOAD at t=$((i*15))s"; break; }
+            STATUS=$(curl -s --max-time 20 "$BASE/load-status")
+            case "$STATUS" in
+              *'"loaded":true'*) echo "loaded after $((i*15))s"; LOADED=yes; break;;
+              *'"phase":"error"'*) echo "LOAD FAILED: $STATUS"; break;;
+            esac
+            [ $((i % 8)) -eq 0 ] && echo "  t=$((i*15))s $STATUS"
+            sleep 15
+          done
+          echo "loaded=$LOADED"
+          echo "LOADED=$LOADED" >> "$GITHUB_ENV"
+          tail -20 "$AMD_CI_WORK/server.log"
+          true
+
+      - name: Run the three cells
+        if: env.LOADED == 'yes'
+        timeout-minutes: 60
+        run: |
+          set +e
+          set -uo pipefail
+
+          run_cell () {
+            kind="$1"; after="$2"
+            cell="real__${kind}"
+            echo "::group::$cell"
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "server already gone; cell SKIPPED"
+              echo "{\"cell\": \"$cell\", \"kind\": \"$kind\", \"status\": \"no_server\"}" > "$RESULTS/$cell.json"
+              echo "::endgroup::"
+              return
+            fi
+            "$PY" "$AMD_CI_WORK/watcher.py" "$BASE/health" "$RESULTS/$cell.timeline.jsonl" 0.1 &
+            WATCH_PID=$!
+            sleep 1
+            ARMED=""
+            if [ "$kind" != "control" ]; then
+              ARMED=$(curl -s --max-time 20 -X POST "$BASE/arm/$kind?after=$after")
+              echo "armed: $ARMED"
+            fi
+            SENT=$(date +%s.%N)
+            HTTP=$(curl -s -o "$RESULTS/$cell.body" -w '%{http_code}' --max-time 2400 \
+              -X POST "$BASE/generate" -H 'Content-Type: application/json' -d '{}')
+            CURL_RC=$?
+            sleep "$SURVIVE_HOLD"
+            if kill -0 "$SERVER_PID" 2>/dev/null; then PROC=alive; else PROC=gone; fi
+            curl -sf --max-time 10 "$BASE/health" >/dev/null && SERVED=yes || SERVED=no
+            kill -9 "$WATCH_PID" 2>/dev/null
+            wait "$WATCH_PID" 2>/dev/null
+            EXITST=""
+            [ "$PROC" = "gone" ] && { wait "$SERVER_PID"; EXITST=$?; }
+
+            "$PY" - "$RESULTS/$cell.json" "$cell" "$kind" "$SENT" "$HTTP" "$CURL_RC" \
+              "$PROC" "$SERVED" "$EXITST" "$ARMED" \
+              "$RESULTS/$cell.timeline.jsonl" "$RESULTS/$cell.body" <<'PY'
+          import json, os, sys
+
+          (out, cell, kind, sent, http, curl_rc, proc, served, exitst, armed,
+           timeline, body) = sys.argv[1:13]
+
+          samples = []
+          if os.path.exists(timeline):
+              with open(timeline, encoding="utf-8") as handle:
+                  for line in handle:
+                      if line.strip():
+                          samples.append(json.loads(line))
+
+          sent_at = float(sent)
+          ok = [s for s in samples if s["ok"]]
+          after_rows = [s for s in samples if s["t"] >= sent_at]
+          first_fail = next((s for s in after_rows if not s["ok"]), None)
+
+          raw = ""
+          if os.path.exists(body):
+              with open(body, encoding="utf-8", errors="replace") as handle:
+                  raw = handle.read()
+          try:
+              payload = json.loads(raw) if raw.strip() else {}
+          except ValueError:
+              payload = {"raw": raw[:400]}
+
+          json.dump({
+              "cell": cell, "kind": kind, "status": "ran",
+              "armed": armed, "http": http, "curl_rc": int(curl_rc), "body": payload,
+              "process": proc, "served_after_hold": served, "server_exit": exitst,
+              "samples": len(samples), "samples_ok": len(ok),
+              "first_failure_after_fault_s": (
+                  round(first_fail["t"] - sent_at, 3) if first_fail else None
+              ),
+              "first_failure_detail": first_fail["detail"] if first_fail else None,
+              "ok_samples_after_fault": sum(1 for s in after_rows if s["ok"]),
+          }, open(out, "w"), indent=2)
+          PY
+            cat "$RESULTS/$cell.json"
+            echo "--- server log tail ---"
+            tail -15 "$AMD_CI_WORK/server.log"
+            echo "::endgroup::"
+          }
+
+          # Control first: it proves the pipeline really renders on this box, so a later cell that
+          # dies cannot be blamed on the model never having worked.
+          run_cell control 0
+          # Then the device fault, then the signal. Ordered so the one that is expected to kill the
+          # server goes last and does not cost the others their run.
+          run_cell gpu 1
+          run_cell abort 1
+          ls -la "$RESULTS"
+          kill -9 "$SERVER_PID" 2>/dev/null
+          true
+
+      - name: Verdict
+        if: always()
+        run: |
+          set -eu
+          "$PY" - <<'PY'
+          import json, os, pathlib, sys
+
+          root = pathlib.Path(os.environ["AMD_CI_WORK"]) / "cells"
+          cells = {}
+          for path in sorted(root.glob("*.json")):
+              data = json.loads(path.read_text() or "{}")
+              cells[data.get("kind")] = data
+
+          if os.environ.get("LOADED") != "yes":
+              print("INCONCLUSIVE: the pipeline never loaded, so nothing was measured.")
+              sys.exit(1)
+
+          row = "{:<9} {:>7} {:>9} {:>9} {:>8} {:>13}  {}"
+          print(row.format("cell", "http", "process", "served", "exit", "first fail s", "detail"))
+          for kind in ("control", "gpu", "abort"):
+              c = cells.get(kind, {})
+              detail = c.get("body") if kind == "control" else (
+                  (c.get("body") or {}).get("detail") or c.get("first_failure_detail")
+              )
+              print(row.format(
+                  kind, str(c.get("http")), str(c.get("process")), str(c.get("served_after_hold")),
+                  str(c.get("server_exit")), str(c.get("first_failure_after_fault_s")),
+                  str(detail)[:70],
+              ))
+
+          fails = []
+
+          def check(label, ok, detail=""):
+              print(("PASS  " if ok else "FAIL  ") + label + ("  " + detail if detail else ""))
+              if not ok:
+                  fails.append(label)
+
+          print("\n=== the control, which makes the rest mean anything ===")
+          c = cells.get("control", {})
+          check("control: a real generation completed", str(c.get("http")) == "200"
+                and (c.get("body") or {}).get("images", 0) >= 1,
+                "http=%s body=%s" % (c.get("http"), c.get("body")))
+          check("control: the server survived it", c.get("served_after_hold") == "yes",
+                "served=%s" % c.get("served_after_hold"))
+          check("control: convolutions actually ran (the injection point is reachable)",
+                ((c.get("body") or {}).get("convs") or 0) > 0,
+                "convs=%s" % ((c.get("body") or {}).get("convs")))
+
+          print("\n=== the question: a device fault where the reporter's was ===")
+          g = cells.get("gpu", {})
+          if g.get("status") != "ran":
+              print("  gpu cell did not run")
+              fails.append("gpu cell missing")
+          elif g.get("served_after_hold") == "yes":
+              print("  CAUGHT. http=%s, server alive." % g.get("http"))
+              print("  detail: %s" % str((g.get("body") or {}).get("detail"))[:300])
+              print("  -> the stand-in's finding holds on the real path: a device fault in a conv")
+              print("     reaches Python and the route answers 500. #9130's fault escaped some")
+              print("     other way, and the write-up must say so rather than generalising.")
+          else:
+              print("  FATAL. server %s, exit=%s, stopped answering at +%ss" % (
+                  g.get("process"), g.get("server_exit"), g.get("first_failure_after_fault_s")))
+              print("  -> the stand-in UNDERSTATED it. With a pipeline resident, a device fault in a")
+              print("     conv takes the process, which is #9130 as written. The earlier 'caught'")
+              print("     result was an artefact of having no model loaded.")
+
+          print("\n=== the signal, on the real path this time ===")
+          a = cells.get("abort", {})
+          if a.get("status") != "ran":
+              print("  abort cell did not run (the gpu cell may have taken the server)")
+          else:
+              check("abort: the server stopped answering", a.get("served_after_hold") == "no",
+                    "exit=%s, first failure at +%ss" % (
+                        a.get("server_exit"), a.get("first_failure_after_fault_s")))
+
+          print()
+          if fails:
+              print("%d check(s) failed:" % len(fails))
+              for f in fails:
+                  print("  -", f)
+              sys.exit(1)
+          print("Measured on the real backend with a pipeline resident. Read the gpu section above:")
+          print("it decides whether #9130's claim is the broad one or the narrow one.")
+          PY
+
+      - name: Raw results
+        if: always()
+        run: |
+          set +e
+          for f in "$AMD_CI_WORK"/cells/*.json; do echo "===== $f ====="; cat "$f"; echo; done
+          echo "===== server log ====="
+          tail -60 "$AMD_CI_WORK/server.log" 2>/dev/null
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: devlab-9130-real
+          path: ${{ env.AMD_CI_WORK }}/cells

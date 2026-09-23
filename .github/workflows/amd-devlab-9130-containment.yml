@@ -38,9 +38,11 @@ name: AMD DevLab issue 9130 containment
 # The server holds its own GPU context for the gpu row, because the real one does. If the parent
 # dies of its child's fault despite the process boundary, that is a real finding, not a bug here.
 
+# Dispatch only. This ran green as 35898689205 and its result stands; leaving it on push would
+# re-spend an hour of the one GPU runner on a matrix already recorded, and queue ahead of the
+# real-backend job that supersedes it. Re-run it by hand if the code under it moves.
 on:
-  push:
-    branches: [amd-devlab-9130-containment]
+  workflow_dispatch:
 
 permissions: {}
 
