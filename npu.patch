@@ -1,56 +1,3 @@
-From 47158cd479e4897a7c35bba0fea04cc9df7735a9 Mon Sep 17 00:00:00 2001
-From: oobabooga <112222186+oobabooga@users.noreply.github.com>
-Date: Wed, 23 Sep 2026 14:31:33 -0300
-Subject: [PATCH] Studio: add chat on the AMD Ryzen AI NPU through Lemonade and
- FastFlowLM
-
----
- pyproject.toml                                |   1 +
- .../core/inference/external_provider.py       |  52 +-
- .../backend/core/inference/lemonade_server.py | 300 ++++++++++
- studio/backend/core/inference/npu_backend.py  | 551 ++++++++++++++++++
- studio/backend/core/inference/providers.py    |  27 +-
- studio/backend/main.py                        |   2 +
- studio/backend/models/inference.py            |   4 +
- studio/backend/routes/inference.py            | 529 ++++++++++++++++-
- studio/backend/routes/npu.py                  |  82 +++
- studio/backend/routes/providers.py            |   9 +-
- studio/backend/run.py                         |   9 +
- studio/backend/tests/fixtures/fake_lemond.py  | 188 ++++++
- studio/backend/tests/test_npu_backend.py      | 249 ++++++++
- studio/backend/tests/test_npu_chat_route.py   | 409 +++++++++++++
- studio/backend/tests/test_npu_detect.py       |  90 +++
- studio/backend/utils/hardware/npu.py          | 134 +++++
- .../frontend/src/features/chat/chat-page.tsx  |   7 +
- .../chat/hooks/use-chat-model-runtime.ts      |  97 +++
- .../frontend/src/features/chat/types/api.ts   |   3 +
- .../components/model-selector.tsx             |  87 ++-
- studio/frontend/src/features/npu/api.ts       | 148 +++++
- studio/frontend/src/features/npu/index.ts     |  11 +
- .../src/features/npu/npu-model-panel.tsx      | 288 +++++++++
- .../src/features/npu/use-npu-status.ts        |  45 ++
- studio/frontend/tests/npu-api.test.ts         |  91 +++
- studio/install_lemonade_prebuilt.py           | 226 +++++++
- studio/lemonade_prebuilt_pins.json            |  33 ++
- .../install/test_install_lemonade_prebuilt.py | 160 +++++
- 28 files changed, 3793 insertions(+), 39 deletions(-)
- create mode 100644 studio/backend/core/inference/lemonade_server.py
- create mode 100644 studio/backend/core/inference/npu_backend.py
- create mode 100644 studio/backend/routes/npu.py
- create mode 100644 studio/backend/tests/fixtures/fake_lemond.py
- create mode 100644 studio/backend/tests/test_npu_backend.py
- create mode 100644 studio/backend/tests/test_npu_chat_route.py
- create mode 100644 studio/backend/tests/test_npu_detect.py
- create mode 100644 studio/backend/utils/hardware/npu.py
- create mode 100644 studio/frontend/src/features/npu/api.ts
- create mode 100644 studio/frontend/src/features/npu/index.ts
- create mode 100644 studio/frontend/src/features/npu/npu-model-panel.tsx
- create mode 100644 studio/frontend/src/features/npu/use-npu-status.ts
- create mode 100644 studio/frontend/tests/npu-api.test.ts
- create mode 100644 studio/install_lemonade_prebuilt.py
- create mode 100644 studio/lemonade_prebuilt_pins.json
- create mode 100644 tests/studio/install/test_install_lemonade_prebuilt.py
-
 diff --git a/pyproject.toml b/pyproject.toml
 index 075a2366cd..aef512b126 100644
 --- a/pyproject.toml
@@ -169,10 +116,10 @@ index 5eaea65e7a..a966825f32 100644
      message: str,
 diff --git a/studio/backend/core/inference/lemonade_server.py b/studio/backend/core/inference/lemonade_server.py
 new file mode 100644
-index 0000000000..6b98dc9193
+index 0000000000..22f9563f81
 --- /dev/null
 +++ b/studio/backend/core/inference/lemonade_server.py
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,305 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -354,6 +301,11 @@ index 0000000000..6b98dc9193
 +            self._process = proc
 +            self.port = port
 +            self.api_key = api_key
++            # A quit that began between the check above and the adoption has already swept
++            # the recorded children, so this one would outlive it.
++            if is_process_shutting_down():
++                self._kill_locked()
++                raise LemonadeUnavailable("Unsloth is shutting down; not starting Lemonade.")
 +            self._drain_thread = threading.Thread(
 +                target = self._drain, args = (proc,), daemon = True, name = "lemond-drain"
 +            )
@@ -1118,10 +1070,18 @@ index de408536e1..b950a91125 100644
          None, description = "MLX KV quantization bit width actually applied, if any"
      )
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index f088df8297..a53f95774c 100644
+index f088df8297..0d8d6a75b9 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
-@@ -8887,7 +8887,15 @@ async def _no_model_loaded_error(
+@@ -7293,6 +7293,7 @@ def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
+     fields.update(
+         # Not MLX, so the MLX runtime fields report as absent.
+         is_mlx = False,
++        is_npu = False,
+         mlx_kv_bits = None,
+         mlx_kv_bits_requested = None,
+         mlx_kv_quant_eligibility = None,
+@@ -8887,7 +8888,15 @@ async def _no_model_loaded_error(
      """
      from utils.openai_auto_switch_settings import get_openai_auto_switch_enabled
      from core.inference.local_model_resolver import resolve_local_gguf
@@ -1137,7 +1097,7 @@ index f088df8297..a53f95774c 100644
      named = (
          requested_model
          if isinstance(requested_model, str)
-@@ -15768,6 +15776,97 @@ def _require_resolved_base_access(config) -> None:
+@@ -15768,6 +15777,97 @@ def _require_resolved_base_access(config) -> None:
          account_access.require_model_access(base.strip())
  
  
@@ -1235,7 +1195,7 @@ index f088df8297..a53f95774c 100644
  async def _load_model_impl(
      request: LoadRequest,
      fastapi_request: Request,
-@@ -15781,6 +15880,15 @@ async def _load_model_impl(
+@@ -15781,6 +15881,15 @@ async def _load_model_impl(
      anonymous_hf_access: bool = False,
      speech_codec_path: Optional[str] = None,
  ):
@@ -1251,7 +1211,7 @@ index f088df8297..a53f95774c 100644
      native_access_deferred = _defers_access_to_native_grant(request)
      if account_access.managed_account() and not native_access_deferred:
          await asyncio.to_thread(account_access.require_model_access, request.model_path)
-@@ -16557,6 +16665,7 @@ async def _load_model_impl(
+@@ -16557,6 +16666,7 @@ async def _load_model_impl(
                      # ownership so a later preview for another checkpoint is not 503'd.
                      _restore_marker_if_prior_preview_still_resident()
                      raise
@@ -1259,7 +1219,7 @@ index f088df8297..a53f95774c 100644
  
              # Every rejection and source check has completed. The immutable
              # intent resolved before teardown is now the only launch input.
-@@ -16715,6 +16824,7 @@ async def _load_model_impl(
+@@ -16715,6 +16825,7 @@ async def _load_model_impl(
              # later preview for another checkpoint is not 503'd against it.
              _restore_marker_if_prior_preview_still_resident()
              raise
@@ -1267,7 +1227,7 @@ index f088df8297..a53f95774c 100644
  
          # Free the export's VRAM, but only when this load wants VRAM: a CPU load masks
          # the accelerators, so killing the user's export frees nothing it needs.
-@@ -18379,8 +18489,30 @@ async def _unload_model_impl(request: UnloadRequest, current_subject: str):
+@@ -18379,8 +18490,30 @@ async def _unload_model_impl(request: UnloadRequest, current_subject: str):
      # next /v1 request can't resurrect this model. The idle loop unloads via the
      # backend directly (not this route), so clearing here never fights keep-warm.
      from core.inference.llama_keepwarm import inference_lifecycle_gate, note_model_unloaded
@@ -1298,7 +1258,7 @@ index f088df8297..a53f95774c 100644
          # Hidden Audio cleanup is cancellation, not a manual eject. Bind it to the
          # exact client load attempt so a delayed request can never stop a newer
          # same-model load or unload a model that has already become resident.
-@@ -19150,6 +19282,31 @@ async def get_status(current_subject: str):
+@@ -19150,6 +19283,31 @@ async def get_status(current_subject: str):
          _loading = [_tracked_loading_id] if _tracked_loading_id else []
          backend = _peek_inference_backend()
  
@@ -1330,7 +1290,7 @@ index f088df8297..a53f95774c 100644
          # If a GGUF model is loaded via llama-server, report that
          if llama_backend.is_loaded:
              _model_id = llama_backend.model_identifier
-@@ -22968,19 +23125,28 @@ async def _proxy_to_external_provider(
+@@ -22968,19 +23126,28 @@ async def _proxy_to_external_provider(
      payload: ChatCompletionRequest,
      request: Request,
      current_subject: Optional[str] = None,
@@ -1360,7 +1320,7 @@ index f088df8297..a53f95774c 100644
          # Saved-provider SQLite reads must not block the event loop.
          config = await asyncio.to_thread(providers_db.get_provider, payload.provider_id)
          if config is None:
-@@ -23018,6 +23184,8 @@ async def _proxy_to_external_provider(
+@@ -23018,6 +23185,8 @@ async def _proxy_to_external_provider(
          # native translator, so entering the loop for them would advertise tools
          # the model is never shown and finish as if none were selected.
          provider_model_runs_local_tools(provider_type, payload.external_model or payload.model)
@@ -1369,7 +1329,7 @@ index f088df8297..a53f95774c 100644
          and payload.stream is True
          and _explicit_studio_tool_loop_requested(payload)
          # A selection of purely hosted names is the provider's tool envelope, not
-@@ -23068,8 +23236,10 @@ async def _proxy_to_external_provider(
+@@ -23068,8 +23237,10 @@ async def _proxy_to_external_provider(
          )
      # Fall back to registry default base URL. The registry lookup is checked on
      # its own: a caller-supplied base_url used to make an unknown provider_type
@@ -1382,7 +1342,7 @@ index f088df8297..a53f95774c 100644
          raise HTTPException(
              status_code = 400,
              detail = f"Unknown provider type: {provider_type}",
-@@ -23082,11 +23252,12 @@ async def _proxy_to_external_provider(
+@@ -23082,11 +23253,12 @@ async def _proxy_to_external_provider(
              detail = f"Base URL is required for provider type: {provider_type}",
          )
      # Validate the proxy destination before the API key is decrypted, so a
@@ -1400,7 +1360,7 @@ index f088df8297..a53f95774c 100644
  
      if provider_type == "openai_codex":
          from core.inference.openai_codex_auth import (
-@@ -23535,7 +23706,9 @@ async def _proxy_to_external_provider(
+@@ -23535,7 +23707,9 @@ async def _proxy_to_external_provider(
          )
  
      api_key: Optional[str] = None
@@ -1411,7 +1371,7 @@ index f088df8297..a53f95774c 100644
          async with provider_config_guard(payload.provider_id):
              current = await asyncio.to_thread(providers_db.get_provider, payload.provider_id)
              routing_fields = ("provider_type", "base_url", "is_enabled")
-@@ -23571,7 +23744,7 @@ async def _proxy_to_external_provider(
+@@ -23571,7 +23745,7 @@ async def _proxy_to_external_provider(
              ),
          )
  
@@ -1420,7 +1380,7 @@ index f088df8297..a53f95774c 100644
      if model == "default":
          raise HTTPException(
              status_code = 400,
-@@ -23582,7 +23755,9 @@ async def _proxy_to_external_provider(
+@@ -23582,7 +23756,9 @@ async def _proxy_to_external_provider(
      from core.inference.providers import get_provider_info as _get_provider_info
  
      _pinfo = _get_provider_info(provider_type) or {}
@@ -1431,7 +1391,7 @@ index f088df8297..a53f95774c 100644
      _external_promoted_parts: list = []
      chat_messages = await _build_external_messages_async(
          payload.messages,
-@@ -23605,9 +23780,9 @@ async def _proxy_to_external_provider(
+@@ -23605,9 +23781,9 @@ async def _proxy_to_external_provider(
              endpoint = request.url.path,
              via_api_key = _request_used_api_key(request),
              method = request.method,
@@ -1443,11 +1403,11 @@ index f088df8297..a53f95774c 100644
              subject = current_subject,
          )
  
-@@ -23615,16 +23790,22 @@ async def _proxy_to_external_provider(
+@@ -23615,16 +23791,22 @@ async def _proxy_to_external_provider(
          provider_type = provider_type,
          base_url = base_url,
          api_key = api_key,
-+        managed_loopback = managed is not None,
++        **({"managed_loopback": True} if managed is not None else {}),
      )
  
      # Schema defaults are non-None (20, 0.01, 1.0) for the local path, so only
@@ -1469,7 +1429,7 @@ index f088df8297..a53f95774c 100644
      )
  
      # Unsloth-owned tool loop for every non-Codex provider that declares the
-@@ -23772,6 +23953,10 @@ async def _proxy_to_external_provider(
+@@ -23772,6 +23954,10 @@ async def _proxy_to_external_provider(
              sent_done = False
              stream_failed = False
              async for line in gen:
@@ -1480,7 +1440,7 @@ index f088df8297..a53f95774c 100644
                  monitor_event = _monitor_openai_sse_line(monitor_id, line)
                  if monitor_event is None:
                      try:
-@@ -23852,8 +24037,9 @@ async def _proxy_to_external_provider(
+@@ -23852,8 +24038,9 @@ async def _proxy_to_external_provider(
      def _tracked_stream():
          # Only the tool loop is registered: it can run for minutes and a /load
          # needs to know it would interrupt a chat. The plain proxy stays
@@ -1492,7 +1452,7 @@ index f088df8297..a53f95774c 100644
              return _stream()
  
          async def _wrapped():
-@@ -23873,6 +24059,278 @@ async def _proxy_to_external_provider(
+@@ -23873,6 +24060,278 @@ async def _proxy_to_external_provider(
      )
  
  
@@ -1771,7 +1731,7 @@ index f088df8297..a53f95774c 100644
  # ── OpenAI shell-tool container management ───────────────────────
  
  
-@@ -24659,6 +25117,12 @@ async def produce_openai_chat_completions(
+@@ -24659,6 +25118,12 @@ async def produce_openai_chat_completions(
          _predecoded_audio = _audio_preflight.get("decoded")
          _preprepared_audio = _audio_preflight.get("prepared")
  
@@ -1784,7 +1744,7 @@ index f088df8297..a53f95774c 100644
      llama_backend = get_llama_cpp_backend()
      using_gguf = llama_backend.is_loaded
  
-@@ -29061,6 +29525,24 @@ def _openai_model_objects() -> list[dict]:
+@@ -29061,6 +29526,24 @@ def _openai_model_objects() -> list[dict]:
      models: list[dict] = []
      _created = int(time.time())
  
@@ -1809,7 +1769,7 @@ index f088df8297..a53f95774c 100644
      # Check GGUF backend
      llama_backend = get_llama_cpp_backend()
      # Claiming a re-pulled tag would displace the scanned row holding its weights, and the id
-@@ -33838,6 +34320,17 @@ async def chat_count_tokens(
+@@ -33838,6 +34321,17 @@ async def chat_count_tokens(
              detail = "Cannot count tokens for messages containing images.",
          )
  
@@ -2177,6 +2137,107 @@ index 0000000000..84e780ae72
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/studio/backend/tests/multi_account/factories_media.py b/studio/backend/tests/multi_account/factories_media.py
+index aa9143f9c2..0ca66b2e77 100644
+--- a/studio/backend/tests/multi_account/factories_media.py
++++ b/studio/backend/tests/multi_account/factories_media.py
+@@ -277,9 +277,16 @@ FACTORIES = {
+     "routes.inference:HEAD:/sandbox/{session_id}/{filename:path}": Factory("media-sandbox"),
+ }
+ 
++_NPU_INSTALLATION_MODEL = (
++    "an NPU model id names FastFlowLM's one per-installation model store, not an account's "
++    "object, and the route is owner-only (policy.require_owner), so no account owns it"
++)
++
+ SKIPPED = {
+     "routes.inference:POST:/sandbox/{session_id}/reveal": (
+         "opens the backend host's file manager, so a success spawns xdg-open on a machine with "
+         "no desktop session and the only in-process outcome is the 500 that failure maps to"
+     ),
++    "routes.npu:DELETE:/models/{model_id}": _NPU_INSTALLATION_MODEL,
++    "routes.npu:POST:/models/{model_id}/download": _NPU_INSTALLATION_MODEL,
+ }
+diff --git a/studio/backend/tests/test_control_markup_neutralize_7066.py b/studio/backend/tests/test_control_markup_neutralize_7066.py
+index 490f70c37e..53f4c3eb68 100644
+--- a/studio/backend/tests/test_control_markup_neutralize_7066.py
++++ b/studio/backend/tests/test_control_markup_neutralize_7066.py
+@@ -2819,10 +2819,11 @@ def test_media_payload_in_a_tool_result_is_swept():
+ def test_custom_provider_is_treated_as_template_applying():
+     """A "custom" provider is a user-supplied OpenAI-compatible base_url
+     (routes/providers.py:207-213), which is how a self-hosted vLLM or llama.cpp is
+-    registered without its preset, so it has to be swept like the named ones (#7066)."""
++    registered without its preset, so it has to be swept like the named ones (#7066). The
++    NPU's lemond serves FastFlowLM, which applies the model's own template as well."""
+     from core.inference.external_provider import _TEMPLATE_APPLYING_PROVIDERS
+ 
+-    assert _TEMPLATE_APPLYING_PROVIDERS == {"vllm", "llama_cpp", "ollama", "custom"}
++    assert _TEMPLATE_APPLYING_PROVIDERS == {"vllm", "llama_cpp", "ollama", "custom", "lemonade"}
+     providers = (_REPO_ROOT / "studio" / "backend" / "routes" / "providers.py").read_text(
+         encoding = "utf-8"
+     )
+diff --git a/studio/backend/tests/test_desktop_auth.py b/studio/backend/tests/test_desktop_auth.py
+index 5dccb80dde..2c0a03604a 100644
+--- a/studio/backend/tests/test_desktop_auth.py
++++ b/studio/backend/tests/test_desktop_auth.py
+@@ -819,6 +819,8 @@ def test_health_response_reports_desktop_capability_fields(monkeypatch):
+     preview_module.router = APIRouter()
+     whisper_module = ModuleType("routes.whisper")
+     whisper_module.router = APIRouter()
++    npu_module = ModuleType("routes.npu")
++    npu_module.router = APIRouter()
+     profile_stats_module = ModuleType("routes.profile_stats")
+     profile_stats_module.router = APIRouter()
+     accounts_module = ModuleType("routes.accounts")
+@@ -844,6 +846,7 @@ def test_health_response_reports_desktop_capability_fields(monkeypatch):
+     monkeypatch.setitem(sys.modules, "routes.prompts", prompts_module)
+     monkeypatch.setitem(sys.modules, "routes.preview", preview_module)
+     monkeypatch.setitem(sys.modules, "routes.whisper", whisper_module)
++    monkeypatch.setitem(sys.modules, "routes.npu", npu_module)
+     monkeypatch.setitem(sys.modules, "routes.profile_stats", profile_stats_module)
+     monkeypatch.setitem(sys.modules, "routes.accounts", accounts_module)
+ 
+diff --git a/studio/backend/tests/test_gguf_load_cache_reuse.py b/studio/backend/tests/test_gguf_load_cache_reuse.py
+index e7b3a3ecc2..6b860d51ce 100644
+--- a/studio/backend/tests/test_gguf_load_cache_reuse.py
++++ b/studio/backend/tests/test_gguf_load_cache_reuse.py
+@@ -1052,6 +1052,7 @@ class TestLoadHubDownloadExclusion:
+             "requested_parallel_slots",
+             "parallel_slots",
+             "is_mlx",
++            "is_npu",
+             "mlx_kv_bits",
+             "mlx_kv_bits_requested",
+             "mlx_kv_quant_eligibility",
+diff --git a/studio/backend/tests/test_native_context_length.py b/studio/backend/tests/test_native_context_length.py
+index e24cfc68a5..8fbde82cf0 100644
+--- a/studio/backend/tests/test_native_context_length.py
++++ b/studio/backend/tests/test_native_context_length.py
+@@ -431,13 +431,23 @@ class TestRouteCompleteness:
+         block that leaves them off now defaults them to None and blanks the control.
+         """
+         blocks = self._find_construction_blocks("LoadResponse")
+-        non_gguf = [b for b in blocks if "is_gguf = True" not in b and "is_gguf=True" not in b]
++        # The NPU model's window comes from FastFlowLM's catalog, not the worker's _model_info.
++        npu = [b for b in blocks if "is_npu = True" in b]
++        non_gguf = [
++            b
++            for b in blocks
++            if "is_gguf = True" not in b and "is_gguf=True" not in b and b not in npu
++        ]
+         assert non_gguf, "Expected at least one non-GGUF LoadResponse block"
+         for block in non_gguf:
+             for field in ("native_context_length", "max_context_length"):
+                 assert re.search(
+                     rf"{field} = _positive_int_or_none\(\s*_model_info\.get\(", block
+                 ), f"Non-GGUF LoadResponse should read {field} from _model_info:\n{block[:200]}"
++        assert npu, "Expected the NPU LoadResponse block"
++        for block in npu:
++            for field in ("native_context_length", "max_context_length"):
++                assert f"{field} = model.max_context_length" in block, block[:200]
+ 
+     def test_non_gguf_load_responses_set_runtime_context_length(self):
+         """Non-GGUF LoadResponse blocks report runtime context_length."""
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
 new file mode 100644
 index 0000000000..2a416dcb24
@@ -2943,6 +3004,18 @@ index 0000000000..9d1e4be35b
 +    monkeypatch.setattr(npu.sys, "platform", "linux")
 +    monkeypatch.setattr(npu, "_linux_probe", broken)
 +    assert npu.detect_amd_npu() == {"present": False, "error": "sysfs", "supported": False}
+diff --git a/studio/backend/tests/test_orchestrator_unload_cancel.py b/studio/backend/tests/test_orchestrator_unload_cancel.py
+index 8d896ec182..035e8efad2 100644
+--- a/studio/backend/tests/test_orchestrator_unload_cancel.py
++++ b/studio/backend/tests/test_orchestrator_unload_cancel.py
+@@ -3427,6 +3427,7 @@ def test_every_long_lived_spawner_consults_the_shutdown_latch():
+     backend = Path(__file__).resolve().parent.parent
+     guarded = {
+         "core/export/orchestrator.py",
++        "core/inference/lemonade_server.py",
+         "core/inference/llama_cpp.py",
+         "core/inference/orchestrator.py",
+         "core/inference/sd_cpp_engine.py",
 diff --git a/studio/backend/utils/hardware/npu.py b/studio/backend/utils/hardware/npu.py
 new file mode 100644
 index 0000000000..439a7d7806
@@ -4474,6 +4547,3 @@ index 0000000000..8c9e9ddf53
 +        for asset in pins[section]["assets"].values():
 +            assert len(asset["sha256"]) == 64
 +    assert pins["fastflowlm"]["version"].startswith("v")
--- 
-2.43.0
-

@@ -38,6 +38,7 @@ jobs:
           UNSLOTH_SKIP_AUTOSTART=1 ./install.sh --local --no-torch --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
           tail -40 "$W/install.log"
       - name: NPU end to end
+        shell: bash {0}
         run: |
           set -uxo pipefail
           cd "$W/src"
@@ -46,9 +47,11 @@ jobs:
           start() {
             PORT=$(shuf -i 18800-18899 -n 1)
             echo "PORT=$PORT"
-            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --api-only --password "$PW" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
-            for i in $(seq 1 180); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
-            curl -s "http://127.0.0.1:$PORT/api/health"; echo
+            # --password sets the initial password only; a second start with it refuses to run.
+            if [ "$1" = main ]; then PWARG=(--password "$PW"); else PWARG=(); fi
+            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --api-only "${PWARG[@]}" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
+            for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+            if ! curl -sf "http://127.0.0.1:$PORT/api/health"; then echo "Studio did not start"; tail -80 "$W/studio-$1.log"; fi; echo
           }
           procs() { echo "== $1"; pgrep -af 'lemond|flm-real|/flm ' | grep -v pgrep || echo "no lemond/flm processes"; }
           start main
@@ -65,7 +68,7 @@ jobs:
           sleep 8
           procs "after SIGKILL of Studio"
           echo "======== studio-main.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-main.log" | tail -120
-          echo "======== studio-restart.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-restart.log" | tail -60
+          echo "======== studio-restart.log (tail)"; tail -80 "$W/studio-restart.log"
           python3 - "$W" <<'PY'
           import json, sys, pathlib
           w = pathlib.Path(sys.argv[1])
@@ -118,8 +121,13 @@ jobs:
           $PW = "npu-e2e-$env:GITHUB_RUN_ID-Pw1"
           function Start-Studio($tag) {
             $script:PORT = Get-Random -Minimum 18800 -Maximum 18899
-            $script:proc = Start-Process -FilePath $PY -ArgumentList 'run.py','--host','127.0.0.1','--port',"$script:PORT",'--api-only','--password',$PW -WorkingDirectory "$W\src\studio\backend" -RedirectStandardOutput "$W\studio-$tag.out" -RedirectStandardError "$W\studio-$tag.err" -PassThru -WindowStyle Hidden
-            for ($i = 0; $i -lt 240; $i++) { try { Invoke-RestMethod "http://127.0.0.1:$script:PORT/api/health" | Out-Null; break } catch { Start-Sleep 1 } }
+            $argList = @('run.py','--host','127.0.0.1','--port',"$script:PORT",'--api-only')
+            # --password sets the initial password only; a second start with it refuses to run.
+            if ($tag -eq 'main') { $argList += @('--password', $PW) }
+            $script:proc = Start-Process -FilePath $PY -ArgumentList $argList -WorkingDirectory "$W\src\studio\backend" -RedirectStandardOutput "$W\studio-$tag.out" -RedirectStandardError "$W\studio-$tag.err" -PassThru -WindowStyle Hidden
+            $up = $false
+            for ($i = 0; $i -lt 300; $i++) { try { Invoke-RestMethod "http://127.0.0.1:$script:PORT/api/health" | Out-Null; $up = $true; break } catch { Start-Sleep 1 } }
+            if (-not $up) { Write-Host "Studio did not start"; Get-Content "$W\studio-$tag.out","$W\studio-$tag.err" -Tail 80 -ErrorAction SilentlyContinue }
             Write-Host "Studio pid $($script:proc.Id) port $script:PORT"
           }
           function Show-Procs($label) {
