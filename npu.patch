@@ -11,7 +11,7 @@ index 075a2366cd..aef512b126 100644
      "src-tauri/icons/icon.png",
      "frontend/dist/**/*",
 diff --git a/studio/backend/core/inference/external_provider.py b/studio/backend/core/inference/external_provider.py
-index 5eaea65e7a..a966825f32 100644
+index 5eaea65e7a..dc860c0e74 100644
 --- a/studio/backend/core/inference/external_provider.py
 +++ b/studio/backend/core/inference/external_provider.py
 @@ -34,7 +34,7 @@ from core.inference.sse_control_frames import sanitize_provider_sse_line
@@ -32,7 +32,7 @@ index 5eaea65e7a..a966825f32 100644
  
  # llama-server reads repeat_penalty, not repetition_penalty (as routes/inference does).
  _REPETITION_PENALTY_BODY_KEY = {"llama_cpp": "repeat_penalty"}
-@@ -1287,14 +1287,20 @@ class ExternalProviderClient:
+@@ -1287,14 +1287,17 @@ class ExternalProviderClient:
          base_url: str,
          api_key: str,
          timeout: float = 120.0,
@@ -40,12 +40,11 @@ index 5eaea65e7a..a966825f32 100644
 +        managed_loopback: bool = False,
      ):
          self.provider_type = provider_type
-         # Single choke point for every outbound provider request (chat, models, responses, messages, containers): the
-         # URL is caller-controlled, so it is validated here even when a route already checked it. Routes turn the
+-        # Single choke point for every outbound provider request (chat, models, responses, messages, containers): the
+-        # URL is caller-controlled, so it is validated here even when a route already checked it. Routes turn the
 -        # ValueError into a 400; reaching it here means a caller bypassed them.
-+        # ValueError into a 400; reaching it here means a caller bypassed them. The NPU's lemond is not
-+        # caller-controlled: Unsloth started it on loopback, and the private-address policy for managed accounts
-+        # must not lock them out of the local model.
++        # Validate all caller-controlled destinations. Studio-owned loopback runtimes bypass
++        # provider URL restrictions so managed accounts can use the local model.
          from core.inference.providers import validate_provider_base_url
  
 -        self.base_url = validate_provider_base_url(base_url)
@@ -55,7 +54,7 @@ index 5eaea65e7a..a966825f32 100644
          # Strip a legacy `/openai` suffix from Google-hosted bases so configs saved before the native switch still
          # route correctly. Custom proxy paths ending in `/openai` are left untouched.
          if self.provider_type == "gemini":
-@@ -1575,6 +1581,8 @@ class ExternalProviderClient:
+@@ -1575,6 +1578,8 @@ class ExternalProviderClient:
                  body["reasoning_effort"] = effort
          elif self.provider_type == "ollama":
              _apply_ollama_reasoning_controls(body, enable_thinking, reasoning_effort)
@@ -64,30 +63,27 @@ index 5eaea65e7a..a966825f32 100644
  
          # OpenRouter's unified `reasoning` field gates per-model thinking. Some routes
          # (`*_MANDATORY_REASONING_MODELS`) 400 on explicit off.
-@@ -1813,6 +1821,11 @@ class ExternalProviderClient:
+@@ -1813,6 +1818,9 @@ class ExternalProviderClient:
                                                          continue
                                                      for ann in envelope.get("annotations") or []:
                                                          _record_or_url_citation(ann)
-+                        # FastFlowLM reports an NPU fault mid-stream as a bare JSON line with no "data:" prefix (seen:
-+                        # {"error":"qds_device::wait() unexpected command state"}). SSE readers skip that as an
-+                        # unknown field and the reply just ends, so restate it as a data line.
++                        # Wrap FastFlowLM's bare JSON errors as SSE so clients see the failure.
 +                        if self.provider_type == "lemonade" and line.startswith("{"):
 +                            line = _bare_json_error_as_sse(line) or line
                          # Verbatim relay, minus Unsloth's own UI control protocol: the frames this server writes to
                          # paint tool cards ride the same stream, so an endpoint that echoes them forges a card for a
                          # tool that never ran.
-@@ -6892,6 +6905,37 @@ _ANTHROPIC_ERROR_STATUS = {
+@@ -6892,6 +6900,36 @@ _ANTHROPIC_ERROR_STATUS = {
  }
  
  
 +def _apply_fastflowlm_reasoning_controls(
 +    body: dict[str, Any], enable_thinking: Optional[bool], reasoning_effort: Optional[str]
 +) -> None:
-+    """FastFlowLM's own ``think`` switch; it reads neither enable_thinking nor chat_template_kwargs.
++    """Translate reasoning controls to FastFlowLM's ``think`` field.
 +
-+    Without an explicit ``think`` a reasoning model decides for itself, and a reply cut off by the
-+    token limit keeps the raw ``<think>`` block in ``content``. ``reasoning_effort`` passes only
-+    as a level (gpt-oss reads it); ``none`` means thinking off."""
++    Explicit thinking preserves reasoning on length cutoffs; effort ``none`` disables it.
++    """
 +    effort = (reasoning_effort or "").strip().lower()
 +    if effort == "none":
 +        body["think"] = False
@@ -116,27 +112,18 @@ index 5eaea65e7a..a966825f32 100644
      message: str,
 diff --git a/studio/backend/core/inference/lemonade_server.py b/studio/backend/core/inference/lemonade_server.py
 new file mode 100644
-index 0000000000..385d5b71c0
+index 0000000000..3c2779f4af
 --- /dev/null
 +++ b/studio/backend/core/inference/lemonade_server.py
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,298 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""A private ``lemond`` (Lemonade Server) child that runs FastFlowLM on the AMD NPU.
++"""Private Lemonade process serving FastFlowLM on the AMD NPU.
 +
-+Unsloth owns this process the way it owns llama-server: loopback only, a free port chosen at
-+start, and an API key minted per start so no other process on the machine can drive it. lemond in
-+turn starts ``flm serve`` for the loaded model, so everything that stops lemond stops the whole
-+tree: on Windows a force-killed lemond leaves ``flm.exe`` running with the model in memory, and
-+``terminate_pid`` reaches descendants there. On Linux flm exits with a killed lemond.
-+
-+State lives in two directories Unsloth owns: ``cache_dir`` (lemond's downloaded FastFlowLM build)
-+and ``config_dir`` (``config.json``). FastFlowLM's model files go to ``flm_model_dir`` through
-+``FLM_MODEL_PATH``, which keeps them apart from any separately installed FastFlowLM, whose
-+versions can delete each other's models (lemonade-sdk/lemonade#3375).
-+
-+Import-light on purpose: no torch or transformers.
++Uses authenticated loopback and owns the child process tree. Runtime, config and models
++stay under Studio's home; a separate FLM_MODEL_PATH prevents other FastFlowLM installs
++from deleting these models (lemonade-sdk/lemonade#3375). No torch or transformers imports.
 +"""
 +
 +from __future__ import annotations
@@ -173,9 +160,7 @@ index 0000000000..385d5b71c0
 +    httpx.WriteError,
 +)
 +
-+# Written into config.json before every start. lemond announces itself on the LAN by default,
-+# checks for model updates, and scans the user's Hugging Face cache for GGUFs under
-+# models_dir "auto"; none of that belongs in a private child.
++# Disable LAN discovery and automatic updates for the private runtime.
 +_CONFIG_OVERRIDES: dict[str, Any] = {
 +    "broadcast": False,
 +    "auto_check_model_updates": False,
@@ -191,11 +176,10 @@ index 0000000000..385d5b71c0
 +
 +
 +def _kill_with_the_parent() -> None:
-+    """Re-arm PR_SET_PDEATHSIG with SIGKILL (Linux preexec, after child_popen_kwargs' SIGTERM).
++    """Override the Linux parent-death signal with SIGKILL.
 +
-+    With a FastFlowLM model loaded, lemond took about 9 s to exit on SIGTERM after its owner was
-+    SIGKILLed on the AMD DevLab runner, holding the NPU and the model the whole time; on SIGKILL it
-+    and its flm child were gone within a second."""
++    With a loaded model, SIGTERM held the NPU for about 9 s; SIGKILL released it within 1 s.
++    """
 +    import ctypes
 +    import signal
 +
@@ -258,11 +242,7 @@ index 0000000000..385d5b71c0
 +        tmp.replace(path)
 +
 +    def start(self, timeout: float = 60.0) -> None:
-+        """Spawn lemond and block until it answers an authenticated request.
-+
-+        The authenticated ``/v1/health`` is the ownership check as well as the readiness one: only
-+        the lemond started with this key accepts it, so another server that grabbed the port in
-+        the window between choosing it and binding it cannot pass."""
++        """Start lemond and wait for authenticated /v1/health to confirm readiness and ownership."""
 +        with self._lock:
 +            if self.is_alive():
 +                return
@@ -312,8 +292,7 @@ index 0000000000..385d5b71c0
 +            self._process = proc
 +            self.port = port
 +            self.api_key = api_key
-+            # A quit that began between the check above and the adoption has already swept
-+            # the recorded children, so this one would outlive it.
++            # Shutdown may have swept children before this process was adopted.
 +            if is_process_shutting_down():
 +                self._kill_locked()
 +                raise LemonadeUnavailable("Unsloth is shutting down; not starting Lemonade.")
@@ -416,8 +395,7 @@ index 0000000000..385d5b71c0
 +        if proc is None:
 +            return
 +        try:
-+            # The tree, not just lemond: flm.exe survives its parent on Windows. terminate_pid
-+            # keeps the record when part of the tree is still standing, for the exit sweep.
++            # Kill descendants too: flm.exe survives its parent on Windows.
 +            terminate_pid(proc.pid, timeout = 10.0, owner_verified = True)
 +            proc.wait(timeout = 10)
 +        except Exception as exc:  # noqa: BLE001 -- best-effort teardown
@@ -438,28 +416,18 @@ index 0000000000..385d5b71c0
 +            pass
 diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
 new file mode 100644
-index 0000000000..96abfe380e
+index 0000000000..4cc2c1d091
 --- /dev/null
 +++ b/studio/backend/core/inference/npu_backend.py
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,541 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""Chat models on the AMD Ryzen AI NPU, served by FastFlowLM through a private Lemonade.
++"""Manage FastFlowLM NPU models through a private Lemonade server.
 +
-+A loaded NPU model is Unsloth's local chat model like a GGUF is: ``/load`` with a
-+``lemonade:<id>`` model path loads it and unloads whatever was resident, ``/status`` reports it,
-+and chat requests go to it (``routes/inference.py``). Everything NPU-specific lives here:
-+
-+* enabling installs the pinned lemond (``install_lemonade_prebuilt.py``), starts it, has it
-+  download FastFlowLM, and runs ``flm validate`` so a driver, firmware or memlock problem is named
-+  before any model download;
-+* the catalog is FastFlowLM's own list of NPU-quantized models, from lemond's
-+  ``/v1/models?show_all=true``. Unsloth GGUFs cannot run here;
-+* a model counts as loaded only once lemond's ``/v1/health`` lists it on the NPU, and the context
-+  reported is the one FastFlowLM was started with, not the model's maximum.
-+
-+Import-light: no torch, so an NPU chat never pulls the GPU stack into the process.
++Installs and validates the runtime, manages its catalog, and loads models by
++``lemonade:<id>``. Health checks confirm residency and context length.
++GGUF models are unsupported. This module does not import the GPU stack.
 +"""
 +
 +from __future__ import annotations
@@ -552,7 +520,7 @@ index 0000000000..96abfe380e
 +
 +@dataclass(frozen = True)
 +class ManagedUpstream:
-+    """Where a chat for the loaded NPU model goes. Built by Unsloth, never by a request."""
++    """Server-owned routing and credentials for the loaded NPU model."""
 +
 +    provider_type: str
 +    base_url: str
@@ -715,7 +683,7 @@ index 0000000000..96abfe380e
 +            )
 +
 +    def _ensure_running(self) -> LemonadeServer:
-+        """lemond, started if the runtime is installed and it is not running yet."""
++        """Start the installed runtime if needed and return its server."""
 +        with self._lock:
 +            if self._server is not None and self._server.is_alive():
 +                return self._server
@@ -994,17 +962,16 @@ index 0000000000..96abfe380e
 +    """The backend if anything has touched it, without creating one (for shutdown)."""
 +    return _backend
 diff --git a/studio/backend/core/inference/providers.py b/studio/backend/core/inference/providers.py
-index 161eb0fea9..8fd78b4ae5 100644
+index 161eb0fea9..63ce75df7d 100644
 --- a/studio/backend/core/inference/providers.py
 +++ b/studio/backend/core/inference/providers.py
-@@ -409,6 +409,24 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
+@@ -409,6 +409,23 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
          "supports_chat_template_kwargs": True,
          "hidden": True,
      },
 +    "lemonade": {
 +        "display_name": "AMD NPU (FastFlowLM)",
-+        # Never user-supplied: Unsloth starts lemond on loopback and routes the loaded NPU model to it
-+        # (core/inference/npu_backend.py). Vision and tools are per model, from its catalog labels.
++        # Studio-owned loopback runtime; catalog labels determine each model's capabilities.
 +        "base_url": "",
 +        "default_models": [],
 +        "supports_streaming": True,
@@ -1022,13 +989,12 @@ index 161eb0fea9..8fd78b4ae5 100644
      "openrouter": {
          "display_name": "OpenRouter",
          "base_url": "https://openrouter.ai/api/v1",
-@@ -455,6 +473,13 @@ def get_provider_info(provider_type: str) -> dict[str, Any] | None:
+@@ -455,6 +472,12 @@ def get_provider_info(provider_type: str) -> dict[str, Any] | None:
      return PROVIDER_REGISTRY.get(provider_type)
  
  
 +def get_connectable_provider_info(provider_type: str) -> dict[str, Any] | None:
-+    """A type a user can save or name as a connection. ``managed`` entries only describe a server
-+    Unsloth runs itself, whose address and key never come from a request."""
++    """Return a user-configurable provider, excluding Studio-managed runtimes."""
 +    info = PROVIDER_REGISTRY.get(provider_type)
 +    return None if info is None or info.get("managed") else info
 +
@@ -1036,7 +1002,7 @@ index 161eb0fea9..8fd78b4ae5 100644
  def get_base_url(provider_type: str) -> str | None:
      info = PROVIDER_REGISTRY.get(provider_type)
      return info["base_url"] if info else None
-@@ -1067,7 +1092,7 @@ def list_available_providers(include_hidden: bool = False) -> list[dict[str, Any
+@@ -1067,7 +1090,7 @@ def list_available_providers(include_hidden: bool = False) -> list[dict[str, Any
      """
      result = []
      for provider_type, info in PROVIDER_REGISTRY.items():
@@ -1081,7 +1047,7 @@ index de408536e1..b950a91125 100644
          None, description = "MLX KV quantization bit width actually applied, if any"
      )
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index f088df8297..8b3efff2c0 100644
+index f088df8297..aa05d97cca 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -7293,6 +7293,7 @@ def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
@@ -1132,7 +1098,7 @@ index f088df8297..8b3efff2c0 100644
 +
 +
 +async def _unload_npu_before_local_load() -> None:
-+    """Loading a GGUF or Unsloth model replaces an NPU model, as it replaces each other."""
++    """Unload the NPU model before loading another local model."""
 +    from core.inference.npu_backend import peek_npu_backend
 +
 +    npu = peek_npu_backend()
@@ -1314,9 +1280,9 @@ index f088df8297..8b3efff2c0 100644
      Resolves provider config (DB or registry), decrypts the API key, and
      streams the response back in OpenAI SSE format.
 +
-+    ``managed`` (a ``ManagedUpstream``) is a server Unsloth runs itself, the NPU's lemond: its
-+    address, key and model come from that object alone, never from the request or the database,
-+    and its streams are tracked like a local generation so a model swap sees them.
++    Managed upstreams supply server-owned routing and credentials. Their streams are
++    tracked for cancellation during model swaps.
++
      """
      # Resolve provider type and base URL
      provider_type = payload.provider_type
@@ -1340,20 +1306,21 @@ index f088df8297..8b3efff2c0 100644
          and payload.stream is True
          and _explicit_studio_tool_loop_requested(payload)
          # A selection of purely hosted names is the provider's tool envelope, not
-@@ -23068,8 +23237,10 @@ async def _proxy_to_external_provider(
+@@ -23066,10 +23235,9 @@ async def _proxy_to_external_provider(
+                 param = "confirm_tool_calls",
+             ),
          )
-     # Fall back to registry default base URL. The registry lookup is checked on
-     # its own: a caller-supplied base_url used to make an unknown provider_type
+-    # Fall back to registry default base URL. The registry lookup is checked on
+-    # its own: a caller-supplied base_url used to make an unknown provider_type
 -    # pass straight through to the proxy.
 -    if get_provider_info(provider_type) is None:
-+    # pass straight through to the proxy. A managed type is reachable only with its managed
-+    # upstream: named by a request, it would send that request's own base URL.
++    # Reject unknown types and caller-supplied routing for managed providers.
 +    _provider_info_entry = get_provider_info(provider_type)
 +    if _provider_info_entry is None or (managed is None and _provider_info_entry.get("managed")):
          raise HTTPException(
              status_code = 400,
              detail = f"Unknown provider type: {provider_type}",
-@@ -23082,11 +23253,12 @@ async def _proxy_to_external_provider(
+@@ -23082,11 +23250,12 @@ async def _proxy_to_external_provider(
              detail = f"Base URL is required for provider type: {provider_type}",
          )
      # Validate the proxy destination before the API key is decrypted, so a
@@ -1371,7 +1338,7 @@ index f088df8297..8b3efff2c0 100644
  
      if provider_type == "openai_codex":
          from core.inference.openai_codex_auth import (
-@@ -23535,7 +23707,9 @@ async def _proxy_to_external_provider(
+@@ -23535,7 +23704,9 @@ async def _proxy_to_external_provider(
          )
  
      api_key: Optional[str] = None
@@ -1382,7 +1349,7 @@ index f088df8297..8b3efff2c0 100644
          async with provider_config_guard(payload.provider_id):
              current = await asyncio.to_thread(providers_db.get_provider, payload.provider_id)
              routing_fields = ("provider_type", "base_url", "is_enabled")
-@@ -23571,7 +23745,7 @@ async def _proxy_to_external_provider(
+@@ -23571,7 +23742,7 @@ async def _proxy_to_external_provider(
              ),
          )
  
@@ -1391,7 +1358,7 @@ index f088df8297..8b3efff2c0 100644
      if model == "default":
          raise HTTPException(
              status_code = 400,
-@@ -23582,7 +23756,9 @@ async def _proxy_to_external_provider(
+@@ -23582,7 +23753,9 @@ async def _proxy_to_external_provider(
      from core.inference.providers import get_provider_info as _get_provider_info
  
      _pinfo = _get_provider_info(provider_type) or {}
@@ -1402,7 +1369,7 @@ index f088df8297..8b3efff2c0 100644
      _external_promoted_parts: list = []
      chat_messages = await _build_external_messages_async(
          payload.messages,
-@@ -23605,9 +23781,9 @@ async def _proxy_to_external_provider(
+@@ -23605,9 +23778,9 @@ async def _proxy_to_external_provider(
              endpoint = request.url.path,
              via_api_key = _request_used_api_key(request),
              method = request.method,
@@ -1414,20 +1381,20 @@ index f088df8297..8b3efff2c0 100644
              subject = current_subject,
          )
  
-@@ -23615,16 +23791,22 @@ async def _proxy_to_external_provider(
+@@ -23615,16 +23788,19 @@ async def _proxy_to_external_provider(
          provider_type = provider_type,
          base_url = base_url,
          api_key = api_key,
 +        **({"managed_loopback": True} if managed is not None else {}),
      )
  
-     # Schema defaults are non-None (20, 0.01, 1.0) for the local path, so only
-     # `model_fields_set` separates "asked for 20" from "said nothing", and the provider keeps
-     # its own default for the latter. Read before ANY write: a setattr marks a field explicit.
+-    # Schema defaults are non-None (20, 0.01, 1.0) for the local path, so only
+-    # `model_fields_set` separates "asked for 20" from "said nothing", and the provider keeps
+-    # its own default for the latter. Read before ANY write: a setattr marks a field explicit.
 -    _top_p_explicit = payload.top_p if "top_p" in payload.model_fields_set else None
 -    _top_k_explicit = payload.top_k if "top_k" in payload.model_fields_set else None
-+    # FastFlowLM is the exception: it keeps the last sampler value it was sent, so an omitted
-+    # field would inherit the previous chat's instead of a default. It always gets the schema's.
++    # Read explicit fields before mutation so omitted values keep provider defaults.
++    # Always send defaults to FastFlowLM, which otherwise reuses the previous request's values.
 +    _always_send = managed is not None
 +    _top_p_explicit = payload.top_p if _always_send or "top_p" in payload.model_fields_set else None
 +    _top_k_explicit = payload.top_k if _always_send or "top_k" in payload.model_fields_set else None
@@ -1440,30 +1407,30 @@ index f088df8297..8b3efff2c0 100644
      )
  
      # Unsloth-owned tool loop for every non-Codex provider that declares the
-@@ -23772,6 +23954,10 @@ async def _proxy_to_external_provider(
+@@ -23772,6 +23948,9 @@ async def _proxy_to_external_provider(
              sent_done = False
              stream_failed = False
              async for line in gen:
-+                # Stop, or a model swap cancelling this chat: closing the stream is what makes
-+                # lemond stop FastFlowLM's generation.
++                # Closing the stream cancels FastFlowLM generation.
 +                if managed is not None and cancel_event.is_set():
 +                    break
                  monitor_event = _monitor_openai_sse_line(monitor_id, line)
                  if monitor_event is None:
                      try:
-@@ -23852,8 +24038,9 @@ async def _proxy_to_external_provider(
+@@ -23850,10 +24029,8 @@ async def _proxy_to_external_provider(
+             await client.close()
+ 
      def _tracked_stream():
-         # Only the tool loop is registered: it can run for minutes and a /load
-         # needs to know it would interrupt a chat. The plain proxy stays
+-        # Only the tool loop is registered: it can run for minutes and a /load
+-        # needs to know it would interrupt a chat. The plain proxy stays
 -        # untracked, as it was before.
 -        if not run_studio_tool_loop:
-+        # untracked, as it was before, except to a managed upstream: that is the
-+        # loaded local model, which a /load or /unload replaces under the chat.
++        # Track tool loops and local managed streams so model swaps can cancel them.
 +        if not run_studio_tool_loop and managed is None:
              return _stream()
  
          async def _wrapped():
-@@ -23873,6 +24060,280 @@ async def _proxy_to_external_provider(
+@@ -23873,6 +24050,274 @@ async def _proxy_to_external_provider(
      )
  
  
@@ -1471,13 +1438,10 @@ index f088df8297..8b3efff2c0 100644
 +
 +
 +class _NpuStreamRelay:
-+    """Rewrites FastFlowLM's stream into what Unsloth promises a caller.
++    """Normalize model IDs, enforce stop sequences, and collect non-streaming replies.
 +
-+    The reported model becomes the loaded ``lemonade:`` id (FastFlowLM names its own checkpoint,
-+    ``qwen3:0.6b``), and ``stop`` is enforced here because FastFlowLM ignores it: content is held
-+    back while it could still be the start of a stop sequence, and on a match the reply ends with
-+    ``finish_reason: "stop"``. Returning then closes the upstream stream, which ends FastFlowLM's
-+    generation. Also collects the reply, for a caller that asked for one JSON response."""
++    FastFlowLM ignores stop sequences, so buffer partial matches until resolved.
++    """
 +
 +    def __init__(self, public_model: str, stop: Optional[list[str]]) -> None:
 +        self.public_model = public_model
@@ -1627,13 +1591,11 @@ index f088df8297..8b3efff2c0 100644
 +
 +
 +async def _npu_chat_completions(payload, request: Request, current_subject: str):
-+    """Serve a chat with the loaded NPU model through the managed-upstream proxy.
++    """Proxy NPU chat, rejecting unsupported parameters.
 +
-+    FastFlowLM silently drops what it cannot do, and a plausible answer that ignored the image, the
-+    JSON schema or the tool list is worse than a refusal, so those are refused up front. The
-+    upstream is always streamed: FastFlowLM's non-streaming replies leave a cut-off ``<think>``
-+    block in ``content`` and report ``stop`` for a length cutoff, so a non-streaming caller gets
-+    the stream collected here instead."""
++    Always stream upstream: FastFlowLM's non-streaming replies mishandle reasoning
++    and finish reasons on length cutoffs. Collect the stream for JSON callers.
++    """
 +    from core.inference.npu_backend import NpuError, get_npu_backend
 +
 +    try:
@@ -1700,8 +1662,7 @@ index f088df8297..8b3efff2c0 100644
 +                    if line.strip():
 +                        yield line
 +        finally:
-+            # Now, not at garbage collection: closing is what stops FastFlowLM after a stop
-+            # sequence matched, and it releases the tracked generation.
++            # Close promptly to stop FastFlowLM and release the tracked generation.
 +            await body.aclose()
 +
 +    if wants_stream:
@@ -1744,7 +1705,7 @@ index f088df8297..8b3efff2c0 100644
  # ── OpenAI shell-tool container management ───────────────────────
  
  
-@@ -24659,6 +25120,12 @@ async def produce_openai_chat_completions(
+@@ -24659,6 +25104,12 @@ async def produce_openai_chat_completions(
          _predecoded_audio = _audio_preflight.get("decoded")
          _preprepared_audio = _audio_preflight.get("prepared")
  
@@ -1757,7 +1718,7 @@ index f088df8297..8b3efff2c0 100644
      llama_backend = get_llama_cpp_backend()
      using_gguf = llama_backend.is_loaded
  
-@@ -29061,6 +29528,24 @@ def _openai_model_objects() -> list[dict]:
+@@ -29061,6 +29512,24 @@ def _openai_model_objects() -> list[dict]:
      models: list[dict] = []
      _created = int(time.time())
  
@@ -1782,7 +1743,7 @@ index f088df8297..8b3efff2c0 100644
      # Check GGUF backend
      llama_backend = get_llama_cpp_backend()
      # Claiming a re-pulled tag would displace the scanned row holding its weights, and the id
-@@ -33838,6 +34323,17 @@ async def chat_count_tokens(
+@@ -33838,6 +34307,17 @@ async def chat_count_tokens(
              detail = "Cannot count tokens for messages containing images.",
          )
  
@@ -1802,19 +1763,16 @@ index f088df8297..8b3efff2c0 100644
          # The refusals above are about the request and so are shared; the ones below are
 diff --git a/studio/backend/routes/npu.py b/studio/backend/routes/npu.py
 new file mode 100644
-index 0000000000..bdd90cf8e4
+index 0000000000..ceb99be4c8
 --- /dev/null
 +++ b/studio/backend/routes/npu.py
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,81 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""Setup and model management for chat on the AMD Ryzen AI NPU.
++"""NPU detection, setup and model management.
 +
-+Loading, unloading and chatting go through the ordinary inference routes with a ``lemonade:<id>``
-+model path; these routes cover what has no equivalent there: detecting the NPU, enabling the
-+runtime (Lemonade plus FastFlowLM), and FastFlowLM's own model catalog, downloads and deletes.
-+Everything but the status read changes the installation, so it is owner-only.
++Loading and chat use the inference routes. All routes here except status are owner-only.
 +"""
 +
 +from __future__ import annotations
@@ -1863,8 +1821,10 @@ index 0000000000..bdd90cf8e4
 +
 +@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
 +async def download_npu_model(model_id: str):
-+    """Stream FastFlowLM's download progress as server-sent events, ending with ``complete``
-+    or an ``error`` event. Closing the connection stops following it, not the download."""
++    """Stream download progress through a final complete or error event.
++
++    Disconnecting stops progress updates, not the download.
++    """
 +    npu = get_npu_backend()
 +
 +    def _events():
@@ -1958,20 +1918,16 @@ index 852fe69839..e9fb9b1945 100644
          close_studio_tunnel_lifecycle()
 diff --git a/studio/backend/tests/fixtures/fake_lemond.py b/studio/backend/tests/fixtures/fake_lemond.py
 new file mode 100644
-index 0000000000..f88bc4abb2
+index 0000000000..41af446eec
 --- /dev/null
 +++ b/studio/backend/tests/fixtures/fake_lemond.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,188 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""A stand-in for Lemonade's ``lemond``, speaking the parts of its API Unsloth uses.
++"""Fake lemond 11.9.0 with authenticated requests, model state and download progress.
 +
-+Invoked the way ``LemonadeServer`` invokes lemond (``CACHE CONFIG --port N ...``), it answers only
-+requests carrying ``LEMONADE_API_KEY``, keeps FastFlowLM-style catalog state in memory, streams
-+``/v1/pull`` progress, and records every request to ``requests.jsonl`` in the cache dir so a test
-+can read what reached it. Responses are shaped like the ones lemond 11.9.0 returned on the AMD
-+DevLab runners.
++Accepts LemonadeServer's arguments and logs requests to cache/requests.jsonl.
 +"""
 +
 +from __future__ import annotations
@@ -2257,19 +2213,16 @@ index e24cfc68a5..8fbde82cf0 100644
          """Non-GGUF LoadResponse blocks report runtime context_length."""
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
 new file mode 100644
-index 0000000000..e89f5caf38
+index 0000000000..2d798fea1b
 --- /dev/null
 +++ b/studio/backend/tests/test_npu_backend.py
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,298 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""The NPU backend against a real child process speaking lemond's API.
++"""Exercise NPU lifecycle and API calls against a fake lemond child process.
 +
-+``tests/fixtures/fake_lemond.py`` stands in for lemond, so these run the actual spawn, the
-+key-authenticated readiness check, config seeding, enable, catalog, download, load, unload and
-+the process-tree stop. The installer is stubbed to point at it; POSIX only because the stub
-+"binary" is a shell script.
++POSIX only: the stub executable is a shell script.
 +"""
 +
 +from __future__ import annotations
@@ -2564,19 +2517,16 @@ index 0000000000..e89f5caf38
 +    assert not nb.is_npu_model_path(None)
 diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
 new file mode 100644
-index 0000000000..f5620d4abc
+index 0000000000..ffc2a40562
 --- /dev/null
 +++ b/studio/backend/tests/test_npu_chat_route.py
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,440 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""NPU chat through the real route and ``_proxy_to_external_provider``, over a socket.
++"""Test NPU chat through the route and proxy against a local HTTP server.
 +
-+The loopback server replays stream shapes FastFlowLM 1.0.3 produced on the AMD DevLab runners
-+(a ``role`` on every delta, ``: ping`` comments, usage on the finishing chunk, the checkpoint as
-+the model name, and a fault reported as a bare JSON line). What reached it is recorded, so the
-+body Unsloth builds is checked along with what the caller gets back.
++Replay FastFlowLM 1.0.3 stream shapes and record outgoing request bodies.
 +"""
 +
 +from __future__ import annotations
@@ -3121,19 +3071,17 @@ index 8d896ec182..035e8efad2 100644
          "core/inference/sd_cpp_engine.py",
 diff --git a/studio/backend/utils/hardware/npu.py b/studio/backend/utils/hardware/npu.py
 new file mode 100644
-index 0000000000..439a7d7806
+index 0000000000..66cf0727bd
 --- /dev/null
 +++ b/studio/backend/utils/hardware/npu.py
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,130 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""AMD Ryzen AI (XDNA 2) NPU detection, without starting anything.
++"""Detect AMD NPUs without starting a runtime.
 +
-+FastFlowLM supports only XDNA 2, PCI ``1022:17f0`` (Strix Halo, Strix Point, Kraken Point,
-+Gorgon Point). Earlier Ryzen AI chips are XDNA 1 (``1022:1502``) and are reported as present but
-+unsupported. This answers only "is the silicon there and is a driver bound"; whether FastFlowLM
-+can run is ``flm validate``'s call, which the NPU backend makes once its runtime is installed.
++XDNA 2 (1022:17f0) is supported; XDNA 1 (1022:1502) is not.
++Runtime readiness is checked separately by ``flm validate``.
 +"""
 +
 +from __future__ import annotations
@@ -3245,9 +3193,7 @@ index 0000000000..439a7d7806
 +
 +
 +def detect_amd_npu() -> dict[str, Any]:
-+    """``{"present": False}`` or the NPU's family, name, driver and firmware as far as known.
-+
-+    ``supported`` is True only for XDNA 2 on Linux or Windows, the combinations FastFlowLM ships."""
++    """Return NPU hardware details and whether FastFlowLM supports this platform."""
 +    try:
 +        if sys.platform.startswith("linux"):
 +            info = _linux_probe()
@@ -3299,16 +3245,14 @@ index e4545f83db..f102f86b05 100644
        stageOrLoad,
        view,
 diff --git a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
-index bbb399b8fa..9efcd6924f 100644
+index bbb399b8fa..bb7f08859c 100644
 --- a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
 +++ b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
-@@ -2775,6 +2775,102 @@ export function useChatModelRuntime() {
+@@ -2775,6 +2775,100 @@ export function useChatModelRuntime() {
      ],
    );
  
-+  /** Load a `lemonade:` model onto the NPU. /load replaces the resident model as for any local
-+   *  model, but none of selectModel's GGUF or Hub preparation applies: the files come from the
-+   *  NPU picker's own download, and the capabilities arrive in /status. */
++  /** Load a downloaded NPU model directly; read its capabilities from /status. */
 +  const loadNpuModel = useCallback(
 +    async (modelPath: string) => {
 +      const store = useChatRuntimeStore.getState();
@@ -3405,7 +3349,7 @@ index bbb399b8fa..9efcd6924f 100644
    const ejectModel = useCallback(async (): Promise<boolean> => {
      if (!params.checkpoint) {
        return false;
-@@ -2848,6 +2944,7 @@ export function useChatModelRuntime() {
+@@ -2848,6 +2942,7 @@ export function useChatModelRuntime() {
    return {
      refresh,
      selectModel,
@@ -3434,178 +3378,424 @@ index 25b26c9818..3f49247cfe 100644
    active_model: string | null;
    model_identifier?: string | null;
    is_vision: boolean;
+diff --git a/studio/frontend/src/features/hub/hub.css b/studio/frontend/src/features/hub/hub.css
+index c7623bc3e1..97aab8d227 100644
+--- a/studio/frontend/src/features/hub/hub.css
++++ b/studio/frontend/src/features/hub/hub.css
+@@ -15,6 +15,7 @@
+   --format-checkpoint: #f472b6;
+   --format-adapter: #8b5cf6;
+   --format-mlx: #f59e0b;
++  --format-npu: #06b6d4;
+   --status-warning: #eab308;
+   --status-danger: #ef4444;
+   --status-success: #11b686;
+@@ -30,6 +31,7 @@
+   --format-checkpoint: #f472b6;
+   --format-adapter: #a78bfa;
+   --format-mlx: #fbbf24;
++  --format-npu: #22d3ee;
+   --status-warning: #fbbf24;
+   --status-danger: #ef4444;
+   --status-success: #11b686;
+@@ -41,6 +43,7 @@
+   --color-format-checkpoint: var(--format-checkpoint);
+   --color-format-adapter: var(--format-adapter);
+   --color-format-mlx: var(--format-mlx);
++  --color-format-npu: var(--format-npu);
+   --color-status-warning: var(--status-warning);
+   --color-status-danger: var(--status-danger);
+   --color-status-success: var(--status-success);
 diff --git a/studio/frontend/src/features/model-picker/components/model-selector.tsx b/studio/frontend/src/features/model-picker/components/model-selector.tsx
-index 561b169afc..73ba32837a 100644
+index 561b169afc..f5999e0d1b 100644
 --- a/studio/frontend/src/features/model-picker/components/model-selector.tsx
 +++ b/studio/frontend/src/features/model-picker/components/model-selector.tsx
-@@ -14,11 +14,13 @@ import { ApiProviderLogo } from "@/features/chat/api-provider-logo";
+@@ -14,6 +14,7 @@ import { ApiProviderLogo } from "@/features/chat/api-provider-logo";
  import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
  // eslint-disable-next-line no-restricted-imports -- The settings barrel imports this feature back.
  import { useSettingsDialogStore } from "@/features/settings/stores/settings-dialog-store";
-+import { isNpuModelId, NpuModelPanel, useNpuStatus } from "@/features/npu";
++import { useNpuStatus } from "@/features/npu";
  import { useT } from "@/i18n";
  import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
  import { cn } from "@/lib/utils";
- import {
-   CheckmarkCircle02Icon,
-+  ChipIcon,
-   CloudIcon,
-   Download01Icon,
-   RemoveCircleIcon,
-@@ -261,7 +263,7 @@ function ModelSelectorTrigger({
-   );
- }
- 
--type HubSection = "downloaded" | "recommended" | "connected";
-+type HubSection = "downloaded" | "recommended" | "connected" | "npu";
- 
- // The user's most recently clicked Hub section, restored on every open.
- const HUB_SECTION_KEY = "unsloth_model_selector_section";
-@@ -373,12 +375,15 @@ function ModelSelectorContent({
+@@ -373,6 +374,12 @@ function ModelSelectorContent({
      [loraModels],
  
    );
-+  // The NPU section is chat's alone, and only on a machine with a supported AMD NPU.
++  // NPU models are chat's alone, listed only on a machine with a supported AMD NPU.
 +  const [npuStatus, setNpuStatus] = useNpuStatus(open && !task);
-+  const hasNpu = !task && npuStatus?.supported === true;
++  const npu =
++    !task && npuStatus?.supported === true
++      ? { status: npuStatus, onStatusChange: setNpuStatus }
++      : undefined;
    // Connected sits in the section toggle, shown only with external providers.
    const hubSectionTabs = useMemo(
--    () =>
--      hasExternal
-+    () => [
-+      ...HUB_SECTION_TABS,
-+      ...(hasExternal
-         ? [
--            ...HUB_SECTION_TABS,
-             {
-               value: "connected",
-               label: "Connected",
-@@ -387,23 +392,41 @@ function ModelSelectorContent({
-               ),
-             },
-           ]
--        : HUB_SECTION_TABS,
--    [hasExternal],
-+        : []),
-+      ...(hasNpu
-+        ? [
-+            {
-+              value: "npu",
-+              label: "NPU",
-+              icon: (
-+                <HugeiconsIcon icon={ChipIcon} className="size-3.5 shrink-0" />
-+              ),
-+            },
-+          ]
-+        : []),
-+    ],
-+    [hasExternal, hasNpu],
- 
-   );
-   const wantsConnectedDefault = Boolean(
-     value && externalModels.some((model) => model.id === value),
-   );
-+  const wantsNpuDefault = isNpuModelId(value);
-   const hasAdditionalOnDeviceModels =
-     (additionalOnDeviceModels?.length ?? 0) > 0;
-   const [hubSection, setHubSection] = useState<HubSection>(() =>
-     wantsConnectedDefault
-       ? "connected"
--      : defaultHubSection(hasAdditionalOnDeviceModels),
-+      : wantsNpuDefault
-+        ? "npu"
-+        : defaultHubSection(hasAdditionalOnDeviceModels),
-   );
--  // Connected is only valid while external providers exist; fall back otherwise.
-+  // Connected is only valid while external providers exist, NPU while the NPU does; fall back otherwise.
-   const effectiveHubSection: HubSection =
--    hubSection === "connected" && !hasExternal ? "recommended" : hubSection;
-+    (hubSection === "connected" && !hasExternal) ||
-+    (hubSection === "npu" && !hasNpu)
-+      ? "recommended"
-+      : hubSection;
- 
-   const [configTarget, setConfigTarget] = useState<ModelPickTarget | null>(
-     null,
-@@ -420,14 +443,21 @@ function ModelSelectorContent({
-       setHubSection(
-         wantsConnectedDefault
-           ? "connected"
--          : defaultHubSection(hasAdditionalOnDeviceModels),
-+          : wantsNpuDefault
-+            ? "npu"
-+            : defaultHubSection(hasAdditionalOnDeviceModels),
-       );
-     }
-     if (!open && wasOpen.current) {
-       setConfigTarget(null);
-     }
-     wasOpen.current = open;
--  }, [open, wantsConnectedDefault, hasAdditionalOnDeviceModels]);
-+  }, [
-+    open,
-+    wantsConnectedDefault,
-+    wantsNpuDefault,
-+    hasAdditionalOnDeviceModels,
-+  ]);
- 
-   function focusActiveModelOption(root: HTMLElement): boolean {
-     const option =
-@@ -605,6 +635,34 @@ function ModelSelectorContent({
-               }
-             />
-           </div>
-+        ) : effectiveHubSection === "npu" && npuStatus ? (
-+          <NpuModelPanel
-+            status={npuStatus}
-+            onStatusChange={setNpuStatus}
-+            value={value}
-+            loadedModelId={loaded ? value : undefined}
-+            onPick={(modelPath) =>
-+              onSelect(modelPath, {
-+                source: "local",
-+                isLora: false,
-+                isDownloaded: true,
-+              })
-+            }
-+            sectionToggle={
-+              <PillTabs
-+                className="[&_[role=tab]]:px-[calc(0.75rem*var(--ui-space-scale,1)_+_var(--picker-tab-pad)/2)]"
-+                ariaLabel={t("picker.hubSectionAriaLabel")}
-+                tabs={hubSectionTabs}
-+                value={effectiveHubSection}
-+                onValueChange={(next) => {
-+                  const section = next as HubSection;
-+                  setHubSection(section);
-+                  saveLastHubSection(section);
-+                }}
-+                fit={true}
-+              />
-+            }
-+          />
-         ) : (
-           <>
-             <HubModelPicker
-@@ -626,7 +684,12 @@ function ModelSelectorContent({
+     () =>
+@@ -626,6 +633,7 @@ function ModelSelectorContent({
                task={task}
                catalog={catalog}
                communityModelPolicy={communityModelPolicy}
--              section={effectiveHubSection}
-+              // Never "npu" here: that section renders NpuModelPanel above.
-+              section={
-+                effectiveHubSection === "npu"
-+                  ? "recommended"
-+                  : effectiveHubSection
-+              }
++              npu={npu}
+               section={effectiveHubSection}
                sectionToggle={
                  <PillTabs
-                   // Wider tabs than the shared default. The panel reserves
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+index 134d887c9e..790ba9909c 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+@@ -68,6 +68,13 @@ import {
+   pendingDrafterPresentation,
+ } from "@/features/hub";
+ import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
++import {
++  type NpuModel,
++  type NpuPickerSource,
++  NpuSetupNotice,
++  npuRowsFor,
++  useNpuCatalog,
++} from "@/features/npu";
+ import {
+   useDebouncedValue,
+   useDenseQuantSchemes,
+@@ -591,12 +598,13 @@ function ParamChip({ label }: { label: string }) {
+   );
+ }
+ 
+-// Format colours: gguf blue, mlx amber, safetensors/checkpoint pink, adapter.
++// Format colours: gguf blue, mlx amber, safetensors/checkpoint pink, adapter, npu cyan.
+ const FORMAT_TONE_DOT: Record<FormatTone, string> = {
+   gguf: "bg-format-gguf",
+   mlx: "bg-format-mlx",
+   checkpoint: "bg-format-checkpoint",
+   adapter: "bg-format-adapter",
++  npu: "bg-format-npu",
+ };
+ 
+ /** Format as a coloured dot ahead of the name, named on hover: a word like "Safetensors" is
+@@ -2542,13 +2550,15 @@ const FORMAT_FILTER_LABELS: Record<FormatFilter, string> = {
+   gguf: "GGUF",
+   mlx: "MLX",
+   safetensors: "Safetensors",
++  npu: "NPU",
+ };
+ 
+-// Dot colors match the row format tags: gguf blue, mlx amber, safetensors pink.
++// Dot colors match the row format tags: gguf blue, mlx amber, safetensors pink, npu cyan.
+ const FORMAT_FILTER_DOTS: Partial<Record<FormatFilter, string>> = {
+   gguf: "bg-format-gguf",
+   mlx: "bg-format-mlx",
+   safetensors: "bg-format-checkpoint",
++  npu: "bg-format-npu",
+ };
+ 
+ const FORMAT_FILTER_OPTIONS: HubOption<FormatFilter>[] = (
+@@ -2569,6 +2579,9 @@ const FORMAT_FILTER_OPTIONS: HubOption<FormatFilter>[] = (
+     ),
+   };
+ });
++const FORMAT_FILTER_OPTIONS_WITHOUT_NPU = FORMAT_FILTER_OPTIONS.filter(
++  (option) => option.value !== "npu",
++);
+ 
+ // Connected has no size, download date or load history, so it sorts by what a hosted catalogue
+ // does offer: the connection, or the name.
+@@ -2731,6 +2744,7 @@ export function HubModelPicker({
+   task,
+   catalog,
+   communityModelPolicy = "none",
++  npu,
+ }: {
+   models: ModelOption[];
+   /** Task-runtime downloads using a cache layout the shared Hub inventory cannot represent (for
+@@ -2763,6 +2777,8 @@ export function HubModelPicker({
+   /** Also surface community models carrying `task`'s pipeline tags, below the unsloth rows.
+    *  Opt-in, since the runtime has to load an arbitrary publisher's checkpoint: true of audio. */
+   communityModelPolicy?: CommunityModelPolicy;
++  /** A supported AMD NPU: FastFlowLM's catalog joins the rows, under its own format. */
++  npu?: NpuPickerSource;
+ }) {
+   const gpu = useGpuInfo();
+   const inferenceGpu = useInferenceGpuInfo();
+@@ -3414,7 +3430,14 @@ export function HubModelPicker({
+   const [downloadedSort, setDownloadedSort] = useState<LocalSortKey>("recent");
+   const [customSort, setCustomSort] = useState<LocalSortKey>("recent");
+   // Format filter toggle for the Unsloth listing.
+-  const [formatFilter, setFormatFilter] = useState<FormatFilter>("all");
++  const [chosenFormatFilter, setFormatFilter] = useState<FormatFilter>("all");
++  // FastFlowLM's catalog and actions; null unless chat runs on a machine with a supported NPU.
++  const npuCatalog = useNpuCatalog(npu);
++  // The NPU format goes with the NPU, so a filter left on it falls back to all formats.
++  const formatFilter: FormatFilter =
++    chosenFormatFilter === "npu" && !npuCatalog ? "all" : chosenFormatFilter;
++  const [npuOnDeviceCollapsed, setNpuOnDeviceCollapsed] = useState(false);
++  const [npuBrowseCollapsed, setNpuBrowseCollapsed] = useState(true);
+   // What this picker's task filter has already established about every row it can show; chat
+   // passes none and keeps the full set.
+   const capabilityScope = useMemo<readonly (keyof ModelCapabilities)[] | null>(() => {
+@@ -4369,6 +4392,24 @@ export function HubModelPicker({
+     formatFilter,
+     loadTimes,
+   ]);
++  // NPU rows sit beside the Hub's under the "All" and "NPU" formats only.
++  const npuModels = npuCatalog?.models ?? null;
++  const npuListed =
++    npuCatalog !== null && (formatFilter === "all" || formatFilter === "npu");
++  const npuOnDeviceRows = useMemo(
++    () =>
++      npuListed
++        ? npuRowsFor(npuModels, { onDevice: true, query: debouncedQuery })
++        : [],
++    [npuListed, npuModels, debouncedQuery],
++  );
++  const npuBrowseRows = useMemo(
++    () =>
++      npuListed
++        ? npuRowsFor(npuModels, { onDevice: false, query: debouncedQuery })
++        : [],
++    [npuListed, npuModels, debouncedQuery],
++  );
+   const unslothAdditionalOnDeviceModels = useMemo(
+     () =>
+       visibleAdditionalOnDeviceModels.filter((model) =>
+@@ -5310,6 +5351,7 @@ export function HubModelPicker({
+     visibleCachedGguf.length === 0 &&
+     visibleCachedModelRows.length === 0 &&
+     visibleAdditionalOnDeviceModels.length === 0 &&
++    npuOnDeviceRows.length === 0 &&
+     sortedLmStudio.length === 0 &&
+     sortedLocalDir.length === 0 &&
+     // Fine-tuned models are on-device too: do not show the empty state above a non-empty Fine-tuned section.
+@@ -6147,6 +6189,92 @@ export function HubModelPicker({
+     );
+   };
+ 
++  // A FastFlowLM model: the row loads it once downloaded, and on the Recommended list a click on
++  // one not yet downloaded fetches it first, as a Hub row's click does.
++  const renderNpuRow = (model: NpuModel, onDevice: boolean) => {
++    if (!npuCatalog) return null;
++    const optionKey = makeModelOptionKey(
++      onDevice ? "npu-on-device" : "npu",
++      model.id,
++    );
++    const isSelected = value === model.model_path;
++    const isLoaded = loadedModelId === model.model_path;
++    const downloading = model.id in npuCatalog.downloads;
++    const progress = npuCatalog.downloads[model.id];
++    const size =
++      model.size_gb == null
++        ? null
++        : model.size_gb < 1
++          ? `${Math.round(model.size_gb * 1000)} MB`
++          : `${model.size_gb.toFixed(1)} GB`;
++    const pick = () =>
++      onSelect(model.model_path, {
++        source: "local",
++        isLora: false,
++        isDownloaded: true,
++      });
++    const row = (
++      <ModelRow
++        label={model.id}
++        meta={
++          downloading
++            ? `NPU · Downloading${progress == null ? "" : ` ${Math.round(progress)}%`}`
++            : `NPU${size ? ` · ${size}` : ""}`
++        }
++        selected={isSelected}
++        loaded={isLoaded}
++        downloaded={!onDevice && model.downloaded}
++        capabilities={{
++          vision: model.supports_vision,
++          reasoning: model.supports_reasoning,
++          audio: false,
++          imageGen: false,
++          videoGen: false,
++        }}
++        alignMeta={onDevice ? "device" : "hub"}
++        optionProps={hubModelList.getOptionProps(optionKey, isSelected)}
++        onClick={() => {
++          if (downloading) return;
++          if (model.downloaded) {
++            pick();
++            return;
++          }
++          void npuCatalog.download(model).then((done) => {
++            if (done) pick();
++          });
++        }}
++        vramStatus={null}
++        className={onDevice ? downloadedRowButtonClassName : undefined}
++      />
++    );
++    if (!onDevice) return <div key={model.id}>{row}</div>;
++    return (
++      <div key={model.id} className={downloadedRowShellClassName(isSelected)}>
++        <div className="min-w-0 flex-1">{row}</div>
++        <span className={cn(ROW_ACTIONS_CLASS, "h-6")}>
++          <ModelDeleteAction
++            ariaLabel={`Delete ${model.id}`}
++            title={`Delete ${model.id}?`}
++            description="This removes the model's NPU files from this device."
++            successMessage={`Deleted ${model.id}`}
++            disabled={isLoaded}
++            onConfirm={() => npuCatalog.remove(model)}
++          />
++        </span>
++      </div>
++    );
++  };
++
++  // The NPU group on Recommended: setup and the whole catalog, folded unless asked for. The NPU
++  // filter or a search opens it, since then it is what the list is about.
++  const npuBrowseForcedOpen = formatFilter === "npu" || showHfSection;
++  const npuBrowseFolded = !npuBrowseForcedOpen && npuBrowseCollapsed;
++  const showNpuBrowse =
++    npuCatalog !== null &&
++    npuListed &&
++    section === "recommended" &&
++    (!showHfSection || npuBrowseRows.length > 0);
++
+   return (
+     <CapabilityScope.Provider value={capabilityScope}>
+       <div className="relative space-y-2">
+@@ -6237,7 +6365,11 @@ export function HubModelPicker({
+             <div className="flex max-w-full min-w-0 flex-wrap items-center gap-2">
+               <HubOptionMenu
+                 value={formatFilter}
+-                options={FORMAT_FILTER_OPTIONS}
++                options={
++                  npuCatalog
++                    ? FORMAT_FILTER_OPTIONS
++                    : FORMAT_FILTER_OPTIONS_WITHOUT_NPU
++                }
+                 onValueChange={setFormatFilter}
+                 ariaLabel="Filter by format"
+                 align="end"
+@@ -6512,6 +6644,26 @@ export function HubModelPicker({
+                   </div>
+                 ) : null}
+ 
++                {showDownloaded && npuOnDeviceRows.length > 0 ? (
++                  <>
++                    <ListLabel
++                      divider={
++                        pinnedRows.length > 0 ||
++                        unslothCachedGguf.length > 0 ||
++                        unslothCachedModelRows.length > 0 ||
++                        unslothAdditionalOnDeviceModels.length > 0 ||
++                        hasOtherModels
++                      }
++                      collapsed={npuOnDeviceCollapsed}
++                      onToggle={() => setNpuOnDeviceCollapsed((v) => !v)}
++                    >
++                      NPU
++                    </ListLabel>
++                    {!npuOnDeviceCollapsed &&
++                      npuOnDeviceRows.map((model) => renderNpuRow(model, true))}
++                  </>
++                ) : null}
++
+                 {/* Fine-tuned models: always shown on On Device so the train shortcut has a target. Hidden
+                     under a task filter. */}
+                 {section === "downloaded" && !task ? (
+@@ -7191,8 +7343,37 @@ export function HubModelPicker({
+                   </>
+                 ) : null}
+ 
+-                {showRecommendedSection ? (
++                {showNpuBrowse && npuCatalog ? (
++                  <>
++                    <ListLabel
++                      collapsed={npuBrowseFolded}
++                      onToggle={
++                        npuBrowseForcedOpen
++                          ? undefined
++                          : () => setNpuBrowseCollapsed((v) => !v)
++                      }
++                    >
++                      NPU
++                    </ListLabel>
++                    {npuBrowseFolded ? null : (
++                      <>
++                        {showHfSection ? null : (
++                          <NpuSetupNotice catalog={npuCatalog} />
++                        )}
++                        {npuBrowseRows.map((model) =>
++                          renderNpuRow(model, false),
++                        )}
++                      </>
++                    )}
++                  </>
++                ) : null}
++
++                {showRecommendedSection && formatFilter !== "npu" ? (
+                   <>
++                    {/* Below the NPU group, the curated list needs its own heading. */}
++                    {showNpuBrowse ? (
++                      <ListLabel divider={!npuBrowseFolded}>Unsloth</ListLabel>
++                    ) : null}
+                     {recommendedSearch.isLoading &&
+                     recommendedRows.length === 0 ? (
+                       <div className="flex items-center gap-2 px-5 py-3">
+@@ -7433,7 +7614,9 @@ export function HubModelPicker({
+                   </>
+                 ) : null}
+ 
+-                {showHfSection && section === "recommended" ? (
++                {showHfSection &&
++                section === "recommended" &&
++                formatFilter !== "npu" ? (
+                   <>
+                     {searchRowIds.length === 0 && !isLoading ? (
+                       filteredRecommendedIds.length === 0 ? (
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/recommended-fit.ts b/studio/frontend/src/features/model-picker/components/model-selector/recommended-fit.ts
+index c3ec2ede29..4ec9043152 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/recommended-fit.ts
++++ b/studio/frontend/src/features/model-picker/components/model-selector/recommended-fit.ts
+@@ -45,7 +45,8 @@ export function isRecommendableFormat(
+ }
+ 
+ /** Format filter for the listing toggle. "safetensors" means anything that is neither GGUF nor MLX. */
+-export type FormatFilter = "all" | "gguf" | "mlx" | "safetensors";
++// "npu" is FastFlowLM's own catalog, listed apart from the Hub rows this filters.
++export type FormatFilter = "all" | "gguf" | "mlx" | "safetensors" | "npu";
+ 
+ export function matchesFormatFilter(
+   id: string,
+@@ -59,6 +60,8 @@ export function matchesFormatFilter(
+       return isMlxId(id);
+     case "safetensors":
+       return !isGgufId(id, hintedIsGguf) && !isMlxId(id);
++    case "npu":
++      return false;
+     default:
+       return true;
+   }
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/row-meta.ts b/studio/frontend/src/features/model-picker/components/model-selector/row-meta.ts
+index bb100a3abb..2c69ef9623 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/row-meta.ts
++++ b/studio/frontend/src/features/model-picker/components/model-selector/row-meta.ts
+@@ -6,12 +6,13 @@
+ 
+ import type { LoraModelOption } from "./types";
+ 
+-export type FormatTone = "gguf" | "mlx" | "checkpoint" | "adapter";
++export type FormatTone = "gguf" | "mlx" | "checkpoint" | "adapter" | "npu";
+ 
+ // Format keyword to DotTag tone. Looked up by full token and by first word, so "Full finetune" resolves via "full".
+ export const FORMAT_TONE: Record<string, FormatTone> = {
+   gguf: "gguf",
+   mlx: "mlx",
++  npu: "npu",
+   local: "checkpoint",
+   safetensors: "checkpoint",
+   checkpoint: "checkpoint",
 diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
 new file mode 100644
-index 0000000000..41eefad347
+index 0000000000..a023698c16
 --- /dev/null
 +++ b/studio/frontend/src/features/npu/api.ts
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,176 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -3648,11 +3838,7 @@ index 0000000000..41eefad347
 +  loading_model: string | null;
 +}
 +
-+/**
-+ * Whether the NPU runtime can serve the catalog. A running runtime alone is not enough: the
-+ * backend keeps it running after a failed setup, and setup still in progress is not done.
-+ * "idle" with it running is a runtime started earlier, e.g. by a catalog request after a restart.
-+ */
++/** Failed setup can leave the runtime running. An idle runtime may be started by a catalog request. */
 +export function isNpuRuntimeReady(status: NpuStatus): boolean {
 +  return (
 +    status.state === "ready" ||
@@ -3671,6 +3857,26 @@ index 0000000000..41eefad347
 +  supports_reasoning: boolean;
 +  supports_tools: boolean;
 +  max_context_length: number | null;
++}
++
++/** The NPU rows a picker section shows: downloaded ones on device, all of them to browse. */
++export function npuRowsFor(
++  models: NpuModel[] | null,
++  {
++    onDevice,
++    query,
++  }: {
++    onDevice: boolean;
++    query: string;
++  },
++): NpuModel[] {
++  const needle = query.trim().toLowerCase();
++  return (models ?? []).filter(
++    (model) =>
++      (!onDevice || model.downloaded) &&
++      (!needle ||
++        `${model.id} ${model.checkpoint}`.toLowerCase().includes(needle)),
++  );
 +}
 +
 +export interface NpuDownloadEvent {
@@ -3768,10 +3974,10 @@ index 0000000000..41eefad347
 +}
 diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
 new file mode 100644
-index 0000000000..836deeb04f
+index 0000000000..71292a456b
 --- /dev/null
 +++ b/studio/frontend/src/features/npu/index.ts
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,17 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -3780,166 +3986,42 @@ index 0000000000..836deeb04f
 +  NPU_MODEL_PREFIX,
 +  type NpuModel,
 +  type NpuStatus,
++  npuRowsFor,
 +} from "./api";
-+export { NpuModelPanel } from "./npu-model-panel";
++export { NpuSetupNotice } from "./npu-setup-notice";
++export {
++  type NpuCatalog,
++  type NpuPickerSource,
++  useNpuCatalog,
++} from "./use-npu-catalog";
 +export { useNpuStatus } from "./use-npu-status";
-diff --git a/studio/frontend/src/features/npu/npu-model-panel.tsx b/studio/frontend/src/features/npu/npu-model-panel.tsx
+diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
 new file mode 100644
-index 0000000000..a8ff217b9a
+index 0000000000..853c0e1ae2
 --- /dev/null
-+++ b/studio/frontend/src/features/npu/npu-model-panel.tsx
-@@ -0,0 +1,293 @@
++++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
+@@ -0,0 +1,86 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
 +import { Button } from "@/components/ui/button";
 +import { Spinner } from "@/components/ui/spinner";
-+import { cn } from "@/lib/utils";
-+import {
-+  AlertCircleIcon,
-+  CheckmarkCircle02Icon,
-+  Delete02Icon,
-+  Download01Icon,
-+} from "@hugeicons/core-free-icons";
++import { AlertCircleIcon } from "@hugeicons/core-free-icons";
 +import { HugeiconsIcon } from "@hugeicons/react";
-+import { type ReactNode, useCallback, useEffect, useState } from "react";
-+import { toast } from "sonner";
-+import {
-+  type NpuModel,
-+  type NpuStatus,
-+  deleteNpuModel,
-+  downloadNpuModel,
-+  enableNpu,
-+  isNpuRuntimeReady,
-+  listNpuModels,
-+} from "./api";
++import type { NpuCatalog } from "./use-npu-catalog";
 +
-+const TAGS: Array<[keyof NpuModel, string]> = [
-+  ["supports_reasoning", "Reasoning"],
-+  ["supports_tools", "Tools"],
-+  ["supports_vision", "Vision"],
-+];
-+
-+function sizeLabel(sizeGb: number | null): string | null {
-+  if (sizeGb == null) return null;
-+  return sizeGb < 1
-+    ? `${Math.round(sizeGb * 1000)} MB`
-+    : `${sizeGb.toFixed(1)} GB`;
-+}
-+
-+/** The model picker's NPU section: enable the runtime, then download, delete and pick
-+ *  FastFlowLM models. Picking hands the `lemonade:` model path to the normal load flow. */
-+export function NpuModelPanel({
-+  status,
-+  onStatusChange,
-+  value,
-+  loadedModelId,
-+  onPick,
-+  sectionToggle,
-+}: {
-+  status: NpuStatus;
-+  onStatusChange: (status: NpuStatus) => void;
-+  value?: string;
-+  loadedModelId?: string;
-+  onPick: (modelPath: string) => void;
-+  sectionToggle: ReactNode;
-+}) {
-+  const [models, setModels] = useState<NpuModel[] | null>(null);
-+  const [listError, setListError] = useState<string | null>(null);
-+  const [enabling, setEnabling] = useState(false);
-+  const [downloads, setDownloads] = useState<Record<string, number | null>>({});
-+  const ready = isNpuRuntimeReady(status);
-+
-+  const refreshModels = useCallback(async () => {
-+    try {
-+      setModels(await listNpuModels());
-+      setListError(null);
-+    } catch (error) {
-+      setListError(error instanceof Error ? error.message : String(error));
-+    }
-+  }, []);
-+
-+  useEffect(() => {
-+    if (!status.runtime_installed || status.state === "failed") return;
-+    let live = true;
-+    listNpuModels().then(
-+      (next) => {
-+        if (!live) return;
-+        setModels(next);
-+        setListError(null);
-+      },
-+      (error) => {
-+        if (live) {
-+          setListError(error instanceof Error ? error.message : String(error));
-+        }
-+      },
-+    );
-+    return () => {
-+      live = false;
-+    };
-+  }, [status.runtime_installed, status.state]);
-+
-+  const enable = async () => {
-+    setEnabling(true);
-+    try {
-+      onStatusChange(await enableNpu());
-+      await refreshModels();
-+    } catch (error) {
-+      toast.error("Could not enable the NPU", {
-+        description: error instanceof Error ? error.message : String(error),
-+      });
-+    } finally {
-+      setEnabling(false);
-+    }
-+  };
-+
-+  const download = async (model: NpuModel) => {
-+    setDownloads((current) => ({ ...current, [model.id]: null }));
-+    try {
-+      await downloadNpuModel(model.id, (event) => {
-+        if (typeof event.percent === "number") {
-+          setDownloads((current) => ({
-+            ...current,
-+            [model.id]: event.percent ?? null,
-+          }));
-+        }
-+      });
-+      await refreshModels();
-+    } catch (error) {
-+      toast.error(`Could not download ${model.id}`, {
-+        description: error instanceof Error ? error.message : String(error),
-+      });
-+    } finally {
-+      setDownloads((current) => {
-+        const next = { ...current };
-+        delete next[model.id];
-+        return next;
-+      });
-+    }
-+  };
-+
-+  const remove = async (model: NpuModel) => {
-+    try {
-+      await deleteNpuModel(model.id);
-+      await refreshModels();
-+    } catch (error) {
-+      toast.error(`Could not delete ${model.id}`, {
-+        description: error instanceof Error ? error.message : String(error),
-+      });
-+    }
-+  };
-+
++/** The NPU group's header block in Recommended: setup, its errors, and attribution. */
++export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
++  const { status, ready, models, listError, enabling, enable } = catalog;
 +  const problems = status.validation?.problems ?? [];
 +  return (
-+    <div className="flex flex-col gap-3 pr-2">
-+      <div className="flex flex-wrap items-center gap-2">{sectionToggle}</div>
-+      <p className="text-xs text-muted-foreground">
-+        {status.hardware.name ?? "AMD NPU"}: models run on FastFlowLM through
-+        Lemonade. They are FastFlowLM's own NPU builds; GGUF models run on the
-+        GPU.
++    <div className="flex flex-col gap-2 px-2.5 pb-2 text-xs">
++      <p className="text-muted-foreground">
++        {status.hardware.name ?? "AMD NPU"}: FastFlowLM's own NPU builds, run
++        through Lemonade. GGUF models run on the GPU.
 +      </p>
 +      {status.error || problems.length > 0 ? (
-+        <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-xs text-destructive">
++        <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-destructive">
 +          <HugeiconsIcon
 +            icon={AlertCircleIcon}
 +            className="mt-0.5 size-3.5 shrink-0"
@@ -3960,7 +4042,7 @@ index 0000000000..a8ff217b9a
 +        </div>
 +      ) : null}
 +      {!ready || !status.runtime_installed ? (
-+        <div className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 p-3 text-xs">
++        <div className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 p-3">
 +          <span className="text-muted-foreground">
 +            Enabling downloads Lemonade (about 7 MB) and FastFlowLM (about 40
 +            MB), then checks the NPU driver.
@@ -3975,90 +4057,13 @@ index 0000000000..a8ff217b9a
 +          </Button>
 +        </div>
 +      ) : null}
-+      {listError ? (
-+        <p className="text-xs text-destructive">{listError}</p>
-+      ) : null}
-+      {models ? (
-+        <div className="model-list-scroll max-h-[calc(335px*var(--ui-space-scale,1))] overflow-y-auto px-0.5 pb-3">
-+          {models.map((model) => {
-+            const progress = downloads[model.id];
-+            const downloading = model.id in downloads;
-+            const selected = value === model.model_path;
-+            const loaded = loadedModelId === model.model_path;
-+            return (
-+              <div
-+                key={model.id}
-+                className={cn(
-+                  "flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm",
-+                  model.downloaded && "hover:bg-muted/60",
-+                  selected && "bg-muted/60",
-+                )}
-+              >
-+                <button
-+                  type="button"
-+                  className="flex min-w-0 flex-1 flex-col text-left disabled:cursor-default"
-+                  disabled={!model.downloaded || downloading}
-+                  aria-current={selected ? "true" : undefined}
-+                  title={
-+                    model.downloaded
-+                      ? undefined
-+                      : "Download this model to load it"
-+                  }
-+                  onClick={() => onPick(model.model_path)}
-+                  data-model-picker-option={true}
-+                >
-+                  <span className="truncate font-medium">{model.id}</span>
-+                  <span className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
-+                    {sizeLabel(model.size_gb) ? (
-+                      <span>{sizeLabel(model.size_gb)}</span>
-+                    ) : null}
-+                    {TAGS.filter(([key]) => model[key]).map(([, label]) => (
-+                      <span key={label}>{label}</span>
-+                    ))}
-+                  </span>
-+                </button>
-+                {loaded ? (
-+                  <HugeiconsIcon
-+                    icon={CheckmarkCircle02Icon}
-+                    className="size-4 shrink-0 text-primary"
-+                    aria-label="Loaded"
-+                  />
-+                ) : null}
-+                {downloading ? (
-+                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
-+                    <Spinner className="size-3.5" />
-+                    {progress != null ? `${Math.round(progress)}%` : null}
-+                  </span>
-+                ) : model.downloaded ? (
-+                  <Button
-+                    size="icon-xs"
-+                    variant="ghost"
-+                    aria-label={`Delete ${model.id}`}
-+                    disabled={loaded}
-+                    onClick={() => void remove(model)}
-+                  >
-+                    <HugeiconsIcon icon={Delete02Icon} />
-+                  </Button>
-+                ) : (
-+                  <Button
-+                    size="icon-xs"
-+                    variant="ghost"
-+                    aria-label={`Download ${model.id}`}
-+                    onClick={() => void download(model)}
-+                  >
-+                    <HugeiconsIcon icon={Download01Icon} />
-+                  </Button>
-+                )}
-+              </div>
-+            );
-+          })}
-+        </div>
-+      ) : ready && status.runtime_installed && !listError ? (
-+        <div className="flex justify-center py-4">
-+          <Spinner className="size-4" />
++      {listError ? <p className="text-destructive">{listError}</p> : null}
++      {ready && status.runtime_installed && !models && !listError ? (
++        <div className="flex justify-center py-2">
++          <Spinner className="size-3.5 text-muted-foreground" />
 +        </div>
 +      ) : null}
-+      <p className="pb-2 text-[11px] text-muted-foreground">
++      <p className="text-[11px] text-muted-foreground">
 +        Powered by{" "}
 +        <a
 +          href="https://github.com/ROCm/FastFlowLM"
@@ -4082,20 +4087,171 @@ index 0000000000..a8ff217b9a
 +    </div>
 +  );
 +}
+diff --git a/studio/frontend/src/features/npu/use-npu-catalog.ts b/studio/frontend/src/features/npu/use-npu-catalog.ts
+new file mode 100644
+index 0000000000..195f22910f
+--- /dev/null
++++ b/studio/frontend/src/features/npu/use-npu-catalog.ts
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { toast } from "@/lib/toast";
++import { useCallback, useEffect, useState } from "react";
++import {
++  type NpuModel,
++  type NpuStatus,
++  deleteNpuModel,
++  downloadNpuModel,
++  enableNpu,
++  getNpuStatus,
++  isNpuRuntimeReady,
++  listNpuModels,
++} from "./api";
++
++/** What the model picker needs to list NPU models beside the others. */
++export interface NpuPickerSource {
++  status: NpuStatus;
++  onStatusChange: (status: NpuStatus) => void;
++}
++
++export interface NpuCatalog {
++  status: NpuStatus;
++  ready: boolean;
++  models: NpuModel[] | null;
++  listError: string | null;
++  enabling: boolean;
++  /** Download progress by model id: a percent, or null before the first report. */
++  downloads: Record<string, number | null>;
++  enable: () => Promise<void>;
++  /** Resolves true once the model is on disk. */
++  download: (model: NpuModel) => Promise<boolean>;
++  remove: (model: NpuModel) => Promise<void>;
++}
++
++/** The FastFlowLM catalog and the actions on it, or null without a supported NPU. */
++export function useNpuCatalog(
++  source: NpuPickerSource | undefined,
++): NpuCatalog | null {
++  const [models, setModels] = useState<NpuModel[] | null>(null);
++  const [listError, setListError] = useState<string | null>(null);
++  const [enabling, setEnabling] = useState(false);
++  const [downloads, setDownloads] = useState<Record<string, number | null>>({});
++  const status = source?.status;
++  const onStatusChange = source?.onStatusChange;
++  const installed = status?.runtime_installed === true;
++  const failed = status?.state === "failed";
++
++  const refresh = useCallback(async () => {
++    try {
++      setModels(await listNpuModels());
++      setListError(null);
++    } catch (error) {
++      setListError(error instanceof Error ? error.message : String(error));
++    }
++  }, []);
++
++  useEffect(() => {
++    if (!installed || failed) return;
++    let live = true;
++    listNpuModels().then(
++      (next) => {
++        if (!live) return;
++        setModels(next);
++        setListError(null);
++      },
++      (error) => {
++        if (live) {
++          setListError(error instanceof Error ? error.message : String(error));
++        }
++      },
++    );
++    return () => {
++      live = false;
++    };
++  }, [installed, failed]);
++
++  const enable = useCallback(async () => {
++    if (!onStatusChange) return;
++    setEnabling(true);
++    try {
++      onStatusChange(await enableNpu());
++      await refresh();
++    } catch (error) {
++      toast.error("Could not enable the NPU", {
++        description: error instanceof Error ? error.message : String(error),
++      });
++      // The failed state carries the reason and the retry, so show it now.
++      await getNpuStatus().then(onStatusChange, () => undefined);
++    } finally {
++      setEnabling(false);
++    }
++  }, [onStatusChange, refresh]);
++
++  const download = useCallback(
++    async (model: NpuModel) => {
++      setDownloads((current) => ({ ...current, [model.id]: null }));
++      try {
++        await downloadNpuModel(model.id, (event) => {
++          if (typeof event.percent === "number") {
++            setDownloads((current) => ({
++              ...current,
++              [model.id]: event.percent ?? null,
++            }));
++          }
++        });
++        await refresh();
++        return true;
++      } catch (error) {
++        toast.error(`Could not download ${model.id}`, {
++          description: error instanceof Error ? error.message : String(error),
++        });
++        return false;
++      } finally {
++        setDownloads((current) => {
++          const next = { ...current };
++          delete next[model.id];
++          return next;
++        });
++      }
++    },
++    [refresh],
++  );
++
++  const remove = useCallback(
++    async (model: NpuModel) => {
++      await deleteNpuModel(model.id);
++      await refresh();
++    },
++    [refresh],
++  );
++
++  if (!status) return null;
++  return {
++    status,
++    ready: isNpuRuntimeReady(status),
++    models,
++    listError,
++    enabling,
++    downloads,
++    enable,
++    download,
++    remove,
++  };
++}
 diff --git a/studio/frontend/src/features/npu/use-npu-status.ts b/studio/frontend/src/features/npu/use-npu-status.ts
 new file mode 100644
-index 0000000000..f87a614789
+index 0000000000..dadc6a59f8
 --- /dev/null
 +++ b/studio/frontend/src/features/npu/use-npu-status.ts
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,44 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
 +import { useEffect, useState } from "react";
 +import { type NpuStatus, getNpuStatus } from "./api";
 +
-+// The NPU cannot appear or vanish while Unsloth runs, so one answer per page covers hardware
-+// detection; the runtime fields are refreshed by whoever changes them (enable, load).
++// Cache hardware detection; callers update runtime status after changes.
 +let cached: NpuStatus | null = null;
 +let pending: Promise<NpuStatus | null> | null = null;
 +
@@ -4135,15 +4291,16 @@ index 0000000000..f87a614789
 +}
 diff --git a/studio/frontend/tests/npu-api.test.ts b/studio/frontend/tests/npu-api.test.ts
 new file mode 100644
-index 0000000000..be20f90f2d
+index 0000000000..0ed7adcc23
 --- /dev/null
 +++ b/studio/frontend/tests/npu-api.test.ts
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,150 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
 +import assert from "node:assert/strict";
 +import test from "node:test";
++import { matchesFormatFilter } from "../src/features/model-picker/components/model-selector/recommended-fit.ts";
 +import type * as NpuApi from "../src/features/npu/api.ts";
 +import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
 +import { loadWithStubs } from "./helpers/module-stubs.ts";
@@ -4253,26 +4410,55 @@ index 0000000000..be20f90f2d
 +  // Started by a catalog request after a restart.
 +  assert.equal(ready("idle", true), true);
 +});
++
++test("NPU rows: downloaded ones on device, all of them to browse, by query", () => {
++  const { api } = client(() => new Response(null));
++  const model = (id: string, downloaded: boolean) => ({
++    id,
++    model_path: `lemonade:${id}`,
++    checkpoint: id.replace("-FLM", ""),
++    size_gb: 1,
++    downloaded,
++    labels: [],
++    supports_vision: false,
++    supports_reasoning: false,
++    supports_tools: false,
++    max_context_length: null,
++  });
++  const models = [model("qwen3-0.6b-FLM", true), model("gemma3-4b-FLM", false)];
++  const ids = (onDevice: boolean, query: string) =>
++    api.npuRowsFor(models, { onDevice, query }).map((m) => m.id);
++  assert.deepEqual(ids(true, ""), ["qwen3-0.6b-FLM"]);
++  assert.deepEqual(ids(false, ""), ["qwen3-0.6b-FLM", "gemma3-4b-FLM"]);
++  assert.deepEqual(ids(false, " GEMMA "), ["gemma3-4b-FLM"]);
++  assert.deepEqual(ids(true, "gemma"), []);
++  assert.deepEqual(api.npuRowsFor(null, { onDevice: false, query: "" }), []);
++});
++
++test("the picker's NPU format holds no Hub repo", () => {
++  for (const [id, gguf] of [
++    ["unsloth/Qwen3-0.6B-GGUF", true],
++    ["mlx-community/Qwen3-8B-4bit", false],
++    ["unsloth/Qwen3-0.6B", false],
++  ] as const) {
++    assert.equal(matchesFormatFilter(id, gguf, "npu"), false);
++    assert.equal(matchesFormatFilter(id, gguf, "all"), true);
++  }
++});
 diff --git a/studio/install_lemonade_prebuilt.py b/studio/install_lemonade_prebuilt.py
 new file mode 100644
-index 0000000000..0f116ca1d2
+index 0000000000..d7125fc070
 --- /dev/null
 +++ b/studio/install_lemonade_prebuilt.py
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,222 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""Install the pinned Embeddable Lemonade build that runs FastFlowLM on AMD NPUs.
++"""Install pinned Lemonade binaries when the user enables NPU support.
 +
-+Lemonade's embeddable archive holds ``lemond`` (the server Unsloth starts as a child), the
-+``lemonade`` CLI and ``resources/``. ``lemond`` downloads FastFlowLM itself on the first
-+``POST /v1/install``; the checksum written into ``resources/backend_versions.json`` here makes
-+that download verified too (``BackendUtils::lookup_expected_asset_hash`` in lemond).
-+
-+Nothing runs this from install.sh: the backend calls ``install()`` when the user enables the NPU
-+runtime, so a machine without an AMD NPU never downloads it. Run as a script it installs into
-+``--root`` (default ``~/.unsloth/studio/lemonade``) and prints the lemond path.
++Verify the archive before extraction and pin FastFlowLM's version and checksums in
++resources/backend_versions.json for lemond's /v1/install download.
 +"""
 +
 +from __future__ import annotations
@@ -4414,11 +4600,10 @@ index 0000000000..0f116ca1d2
 +    cancel: Optional[threading.Event] = None,
 +    pins_path: Path = PINS_PATH,
 +) -> Path:
-+    """Install the pinned lemond under ``root/<version>`` and return its path.
++    """Install pinned lemond under root/<version>, reusing a matching install.
 +
-+    Idempotent: a complete matching install returns at once. The archive is verified against the
-+    pinned sha256 before extraction and the directory appears only once fully populated, so a
-+    cancelled or failed attempt leaves nothing that ``installed_lemond`` accepts."""
++    Verify and extract in a temporary directory before replacing the installation.
++    """
 +    pins = load_pins(pins_path)
 +    key = host_asset_key()
 +    if key is None:
@@ -4529,19 +4714,14 @@ index 0000000000..d486af695b
 +}
 diff --git a/tests/studio/install/test_install_lemonade_prebuilt.py b/tests/studio/install/test_install_lemonade_prebuilt.py
 new file mode 100644
-index 0000000000..f39ec27f9b
+index 0000000000..763336645d
 --- /dev/null
 +++ b/tests/studio/install/test_install_lemonade_prebuilt.py
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,167 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""studio/install_lemonade_prebuilt.py against a local archive server.
-+
-+Covers the parts that decide whether an NPU install can be trusted: the pinned digest is enforced
-+before anything is extracted, a failed attempt leaves nothing ``installed_lemond`` accepts, a
-+complete install is not downloaded twice, and lemond's FastFlowLM download is pinned too.
-+"""
++"""Test archive integrity, atomic installation, reuse and FastFlowLM pins with a local server."""
 +
 +from __future__ import annotations
 +
