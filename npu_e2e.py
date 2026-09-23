@@ -309,7 +309,7 @@ def main_phase():
         "/api/inference/chat/completions",
         {
             "model": "m",
-            "messages": [{"role": "user", "content": "Use the python tool to compute 12345*6789, then tell me the result."}],
+            "messages": [{"role": "user", "content": "Use the python tool to run print(12345*6789), then tell me the printed number."}],
             "stream": True,
             "max_tokens": 400,
             "enable_tools": True,

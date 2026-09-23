@@ -51,7 +51,12 @@ jobs:
             if [ "$1" = main ]; then PWARG=(--password "$PW"); else PWARG=(); fi
             # The built frontend when there is one, for the UI walkthrough; the API alone otherwise.
             if [ -f "$PWD/studio/frontend/dist/index.html" ]; then FE=(--frontend "$PWD/studio/frontend/dist"); else FE=(--api-only); fi
-            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" "${FE[@]}" "${PWARG[@]}" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
+            # Not "(cd ... && nohup ... &)": that backgrounds a subshell, and $! would be the subshell's pid.
+            pushd studio/backend > /dev/null
+            nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" "${FE[@]}" "${PWARG[@]}" >> "$W/studio-$1.log" 2>&1 &
+            echo $! > "$W/studio.pid"
+            popd > /dev/null
+            ps -o pid,ppid,cmd -p "$(cat "$W/studio.pid")"
             for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
             if ! curl -sf "http://127.0.0.1:$PORT/api/health"; then echo "Studio did not start"; tail -80 "$W/studio-$1.log"; fi; echo
           }
@@ -71,7 +76,11 @@ jobs:
           start restart
           python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-restart.json" --phase after-restart
           procs "before SIGKILL"
-          kill -KILL "$(cat "$W/studio.pid")"
+          SPID=$(cat "$W/studio.pid")
+          for p in $(pgrep -f "$W/studio/lemonade/11.9.0/lemond"); do echo "lemond $p parent: $(ps -o pid=,cmd= -p "$(ps -o ppid= -p "$p")" | cut -c1-120)"; done
+          kill -KILL "$SPID"
+          sleep 1
+          if kill -0 "$SPID" 2>/dev/null; then echo "Studio $SPID survived SIGKILL"; else echo "Studio $SPID is gone"; fi
           # PR_SET_PDEATHSIG delivers SIGKILL to lemond; lemond's own flm child follows it.
           LEFT=1
           for i in $(seq 1 30); do
@@ -80,6 +89,24 @@ jobs:
           done
           procs "after SIGKILL of Studio"
           pkill -KILL -f "$W/studio/lemonade" || true
+          sleep 2
+          # Which death signal lemond needs with a model loaded: SIGTERM (child_popen_kwargs' default) or SIGKILL.
+          for SIG in TERM KILL; do
+            python3 "$GITHUB_WORKSPACE/harness/pdeath_probe.py" "$W/studio/lemonade" "$SIG" > "$W/probe-$SIG.log" 2>&1 &
+            OWNER=$!
+            for i in $(seq 1 120); do grep -q '^READY' "$W/probe-$SIG.log" && break; sleep 1; done
+            cat "$W/probe-$SIG.log"
+            LPID=$(awk '/^READY/ {print $2}' "$W/probe-$SIG.log")
+            procs "probe $SIG: before owner SIGKILL"
+            kill -KILL "$OWNER"
+            T0=$(date +%s)
+            for i in $(seq 1 90); do
+              if ! pgrep -f "$W/studio/lemonade" >/dev/null; then break; fi
+              sleep 1
+            done
+            if pgrep -f "$W/studio/lemonade" >/dev/null; then echo "PROBE $SIG: lemond/flm still running $(( $(date +%s) - T0 ))s after owner SIGKILL"; procs "probe $SIG leftovers"; pkill -KILL -f "$W/studio/lemonade"; else echo "PROBE $SIG: lemond $LPID and flm gone $(( $(date +%s) - T0 ))s after owner SIGKILL"; fi
+            sleep 2
+          done
           echo "======== studio-main.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-main.log" | tail -120
           echo "======== studio-restart.log (tail)"; tail -80 "$W/studio-restart.log"
           python3 - "$W" <<'PY'
