@@ -90,8 +90,9 @@ print("PROBE_JSON " + json.dumps(res))
 '''
 
 
-def _arm(python: str, code: str, checkout: str, timeout: int) -> dict:
+def _arm(python: str, code: str, checkout: str, timeout: int, extra_env: dict | None = None) -> dict:
     env = dict(os.environ)
+    env.update(extra_env or {})
     env["PYTHONPATH"] = checkout + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
     try:
@@ -126,7 +127,8 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         obs["torch_error"] = f"{type(e).__name__}: {e}"
     obs["arms"] = {
-        "zoo_import": _arm(sys.executable, ZOO_IMPORT, args.checkout, 900),
+        # unsloth sets UNSLOTH_IS_PRESENT before it imports the zoo; importing the zoo alone needs it.
+        "zoo_import": _arm(sys.executable, ZOO_IMPORT, args.checkout, 900, {"UNSLOTH_IS_PRESENT": "1"}),
         "unsloth_run": _arm(sys.executable, UNSLOTH_RUN, args.checkout, 3600),
     }
     args.out.parent.mkdir(parents = True, exist_ok = True)

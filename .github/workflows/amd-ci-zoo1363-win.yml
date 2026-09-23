@@ -138,6 +138,10 @@ jobs:
           # studio/backend/plugins (measured on run 35854320947).
           & $py -m pip install -q --no-deps unsloth
           Write-Host "unsloth install exit: $LASTEXITCODE"
+          # unsloth refuses to start without unsloth_zoo's metadata. The wheel supplies only that:
+          # each state's checkout comes first on PYTHONPATH, so its code is what runs.
+          & $py -m pip install -q --no-deps unsloth_zoo
+          Write-Host "unsloth_zoo metadata install exit: $LASTEXITCODE"
           & $py -m pip install -q "transformers==5.5.0" "trl>=0.18.2,!=0.19.0,<=1.13.0" "peft>=0.18.0" accelerate "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0" sentencepiece tqdm psutil wheel numpy protobuf huggingface_hub hf_transfer pillow regex msgspec typing_extensions filelock tyro typer rich pydantic pyyaml nest-asyncio structlog click
           Write-Host "stack install exit: $LASTEXITCODE"
           # torchao as a plain `pip install unsloth` gets it from zoo's dependency: present, and
