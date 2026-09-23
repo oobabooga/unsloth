@@ -1,0 +1,120 @@
+name: Lemonade NPU phase 1 probes
+'on':
+  push:
+    branches:
+    - amd-lemonade-phase1-20260923
+permissions: {}
+jobs:
+  linux:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 25
+    steps:
+    - name: Probe portable Lemonade and FastFlowLM on NPU
+      shell: bash
+      run: "python3 - <<'PYPROBE'\nimport os, sys, json, time, pathlib, platform, subprocess, urllib.request, urllib.error,\
+        \ tarfile, zipfile, socket, secrets, traceback, hashlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\n\
+        root.mkdir(parents=True, exist_ok=True)\nwin = os.name == 'nt'\nprint('PLATFORM', platform.platform(), flush=True)\n\
+        def command(args, timeout=30):\n    try:\n        p = subprocess.run(args, capture_output=True, text=True, errors='replace',\
+        \ timeout=timeout)\n        print('COMMAND', args, 'EXIT', p.returncode, p.stdout[-14000:], p.stderr[-4000:], flush=True)\n\
+        \    except Exception as e: print('COMMAND_ERROR', args, str(e), flush=True)\nif win:\n    command(['powershell','-NoProfile','-Command',\
+        \ \"Get-CimInstance Win32_Processor | Select-Object Name; Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,TotalPhysicalMemory;\
+        \ Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceName -match 'NPU|IPU|Neural'} | Select-Object DeviceName,DriverVersion,InfName\
+        \ | Format-List\"])\nelse:\n    command(['bash','-c','uname -a; id; lscpu | head -20; ls -l /dev/accel; cat /sys/bus/pci/drivers/amdxdna/*/fw_version;\
+        \ ulimit -l; ldconfig -p | grep -E \"xrt|amdxdna\"; cat /proc/cmdline; cat /sys/class/dmi/id/product_name'])\nasset\
+        \ = 'lemonade-embeddable-11.9.0-' + ('windows-x64.zip' if win else 'ubuntu-x64.tar.gz')\nurl = 'https://github.com/lemonade-sdk/lemonade/releases/download/v11.9.0/'\
+        \ + asset\narchive = root / asset\nurllib.request.urlretrieve(url, archive)\nprint('ARCHIVE_SHA256', hashlib.sha256(archive.read_bytes()).hexdigest(),\
+        \ flush=True)\nbins = root / 'package'\nbins.mkdir(exist_ok=True)\nif win:\n    with zipfile.ZipFile(archive) as z:\
+        \ z.extractall(bins)\nelse:\n    with tarfile.open(archive) as z: z.extractall(bins, filter='data')\nexe = next(bins.rglob('lemond.exe'\
+        \ if win else 'lemond'))\nprint('EXECUTABLE', str(exe), flush=True)\nif not win: command(['ldd',str(exe)])\ncommand([str(exe),'--version'])\n\
+        cache = root / 'cache'\nconfig = root / 'config'\ncache.mkdir(exist_ok=True); config.mkdir(exist_ok=True)\n(config\
+        \ / 'config.json').write_text(json.dumps({'broadcast':False, 'log_level':'debug', 'global_timeout':300, 'max_loaded_models':1,\
+        \ 'telemetry':False}))\nenv = os.environ.copy()\nenv['FLM_MODEL_PATH'] = str(root / 'flm')\nenv['HF_HOME'] = str(root\
+        \ / 'huggingface')\nenv['TMPDIR'] = str(root / 'tmp')\npathlib.Path(env['TMPDIR']).mkdir(exist_ok=True)\nkey=secrets.token_hex(24)\n\
+        env['LEMONADE_API_KEY']=key\nwith socket.socket() as s: s.bind(('127.0.0.1',0)); port=s.getsockname()[1]\nbase='http://127.0.0.1:'+str(port)\n\
+        log=open(root/'lemond.log','w',encoding='utf-8')\np=subprocess.Popen([str(exe),str(cache),str(config),'--host','127.0.0.1','--port',str(port),'--no-broadcast'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        def req(path, data=None, timeout=360, auth=True):\n    headers={'Content-Type':'application/json'}\n    if auth: headers['Authorization']='Bearer\
+        \ '+key\n    q=urllib.request.Request(base+path, data=None if data is None else json.dumps(data).encode(),headers=headers)\n\
+        \    start=time.monotonic()\n    try:\n        with urllib.request.urlopen(q,timeout=timeout) as r: body=r.read().decode();\
+        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),body[:20000],flush=True)\n\
+        \    try: return code,json.loads(body)\n    except ValueError: return code,body\ntry:\n    for i in range(90):\n \
+        \       try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200: break\n        except\
+        \ Exception: pass\n        if p.poll() is not None: raise RuntimeError('lemond exited '+str(p.returncode))\n     \
+        \   time.sleep(1)\n    else: raise RuntimeError('lemond startup timed out')\n    req('/v1/health',auth=False)\n  \
+        \  req('/v1/system-info')\n    req('/v1/install',{'recipe':'flm','backend':'npu','stream':False})\n    req('/v1/system-info')\n\
+        \    for flm in cache.rglob('flm.exe' if win else 'flm'):\n        if flm.is_file():\n            if not win: command(['ldd',str(flm)])\n\
+        \            command([str(flm),'version'])\n            command([str(flm),'validate','--json'],timeout=60)\n    code,models=req('/v1/models?show_all=true')\n\
+        \    candidates=[m for m in models.get('data',[]) if m.get('recipe')=='flm' and 'chat' in m.get('labels',[])]\n  \
+        \  print('FLM_CANDIDATES',json.dumps(candidates),flush=True)\n    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n\
+        \    if chosen is None: chosen=next((m for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None:\
+        \ raise RuntimeError('No FLM chat model discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n\
+        \    if code!=200: raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
+        \    if code!=200: raise RuntimeError('load failed')\n    req('/v1/health')\n    payload={'model':model,'messages':[{'role':'user','content':'Reply\
+        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    req('/v1/chat/completions',payload)\n\
+        \    req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n    req('/v1/stats')\n\
+        \    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\n\
+        except Exception:\n    traceback.print_exc()\n    print('PROBE_BLOCKED',flush=True)\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n\
+        \    except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
+        \    log.close()\n    print('LEMOND_LOG_TAIL', (root/'lemond.log').read_text(errors='replace')[-45000:],flush=True)\n\
+        PYPROBE\n"
+  windows:
+    runs-on:
+    - self-hosted
+    - Windows
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 25
+    steps:
+    - name: Probe portable Lemonade and FastFlowLM on NPU
+      shell: powershell
+      run: "$probe = @'\nimport os, sys, json, time, pathlib, platform, subprocess, urllib.request, urllib.error, tarfile,\
+        \ zipfile, socket, secrets, traceback, hashlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\n\
+        root.mkdir(parents=True, exist_ok=True)\nwin = os.name == 'nt'\nprint('PLATFORM', platform.platform(), flush=True)\n\
+        def command(args, timeout=30):\n    try:\n        p = subprocess.run(args, capture_output=True, text=True, errors='replace',\
+        \ timeout=timeout)\n        print('COMMAND', args, 'EXIT', p.returncode, p.stdout[-14000:], p.stderr[-4000:], flush=True)\n\
+        \    except Exception as e: print('COMMAND_ERROR', args, str(e), flush=True)\nif win:\n    command(['powershell','-NoProfile','-Command',\
+        \ \"Get-CimInstance Win32_Processor | Select-Object Name; Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,TotalPhysicalMemory;\
+        \ Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceName -match 'NPU|IPU|Neural'} | Select-Object DeviceName,DriverVersion,InfName\
+        \ | Format-List\"])\nelse:\n    command(['bash','-c','uname -a; id; lscpu | head -20; ls -l /dev/accel; cat /sys/bus/pci/drivers/amdxdna/*/fw_version;\
+        \ ulimit -l; ldconfig -p | grep -E \"xrt|amdxdna\"; cat /proc/cmdline; cat /sys/class/dmi/id/product_name'])\nasset\
+        \ = 'lemonade-embeddable-11.9.0-' + ('windows-x64.zip' if win else 'ubuntu-x64.tar.gz')\nurl = 'https://github.com/lemonade-sdk/lemonade/releases/download/v11.9.0/'\
+        \ + asset\narchive = root / asset\nurllib.request.urlretrieve(url, archive)\nprint('ARCHIVE_SHA256', hashlib.sha256(archive.read_bytes()).hexdigest(),\
+        \ flush=True)\nbins = root / 'package'\nbins.mkdir(exist_ok=True)\nif win:\n    with zipfile.ZipFile(archive) as z:\
+        \ z.extractall(bins)\nelse:\n    with tarfile.open(archive) as z: z.extractall(bins, filter='data')\nexe = next(bins.rglob('lemond.exe'\
+        \ if win else 'lemond'))\nprint('EXECUTABLE', str(exe), flush=True)\nif not win: command(['ldd',str(exe)])\ncommand([str(exe),'--version'])\n\
+        cache = root / 'cache'\nconfig = root / 'config'\ncache.mkdir(exist_ok=True); config.mkdir(exist_ok=True)\n(config\
+        \ / 'config.json').write_text(json.dumps({'broadcast':False, 'log_level':'debug', 'global_timeout':300, 'max_loaded_models':1,\
+        \ 'telemetry':False}))\nenv = os.environ.copy()\nenv['FLM_MODEL_PATH'] = str(root / 'flm')\nenv['HF_HOME'] = str(root\
+        \ / 'huggingface')\nenv['TMPDIR'] = str(root / 'tmp')\npathlib.Path(env['TMPDIR']).mkdir(exist_ok=True)\nkey=secrets.token_hex(24)\n\
+        env['LEMONADE_API_KEY']=key\nwith socket.socket() as s: s.bind(('127.0.0.1',0)); port=s.getsockname()[1]\nbase='http://127.0.0.1:'+str(port)\n\
+        log=open(root/'lemond.log','w',encoding='utf-8')\np=subprocess.Popen([str(exe),str(cache),str(config),'--host','127.0.0.1','--port',str(port),'--no-broadcast'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        def req(path, data=None, timeout=360, auth=True):\n    headers={'Content-Type':'application/json'}\n    if auth: headers['Authorization']='Bearer\
+        \ '+key\n    q=urllib.request.Request(base+path, data=None if data is None else json.dumps(data).encode(),headers=headers)\n\
+        \    start=time.monotonic()\n    try:\n        with urllib.request.urlopen(q,timeout=timeout) as r: body=r.read().decode();\
+        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),body[:20000],flush=True)\n\
+        \    try: return code,json.loads(body)\n    except ValueError: return code,body\ntry:\n    for i in range(90):\n \
+        \       try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200: break\n        except\
+        \ Exception: pass\n        if p.poll() is not None: raise RuntimeError('lemond exited '+str(p.returncode))\n     \
+        \   time.sleep(1)\n    else: raise RuntimeError('lemond startup timed out')\n    req('/v1/health',auth=False)\n  \
+        \  req('/v1/system-info')\n    req('/v1/install',{'recipe':'flm','backend':'npu','stream':False})\n    req('/v1/system-info')\n\
+        \    for flm in cache.rglob('flm.exe' if win else 'flm'):\n        if flm.is_file():\n            if not win: command(['ldd',str(flm)])\n\
+        \            command([str(flm),'version'])\n            command([str(flm),'validate','--json'],timeout=60)\n    code,models=req('/v1/models?show_all=true')\n\
+        \    candidates=[m for m in models.get('data',[]) if m.get('recipe')=='flm' and 'chat' in m.get('labels',[])]\n  \
+        \  print('FLM_CANDIDATES',json.dumps(candidates),flush=True)\n    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n\
+        \    if chosen is None: chosen=next((m for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None:\
+        \ raise RuntimeError('No FLM chat model discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n\
+        \    if code!=200: raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
+        \    if code!=200: raise RuntimeError('load failed')\n    req('/v1/health')\n    payload={'model':model,'messages':[{'role':'user','content':'Reply\
+        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    req('/v1/chat/completions',payload)\n\
+        \    req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n    req('/v1/stats')\n\
+        \    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\n\
+        except Exception:\n    traceback.print_exc()\n    print('PROBE_BLOCKED',flush=True)\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n\
+        \    except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
+        \    log.close()\n    print('LEMOND_LOG_TAIL', (root/'lemond.log').read_text(errors='replace')[-45000:],flush=True)\n\
+        '@\n$path = Join-Path $env:RUNNER_TEMP 'lemonade_probe.py'\n[System.IO.File]::WriteAllText($path, $probe)\npython\
+        \ $path\nexit $LASTEXITCODE\n"
