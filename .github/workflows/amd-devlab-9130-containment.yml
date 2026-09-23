@@ -1,0 +1,486 @@
+name: AMD DevLab issue 9130 containment
+
+# Issue #9130: a GPU fault during image generation killed the whole Studio server.
+#
+# Not a reproduction of the MIOpen fault (amd-devlab-9130-crash2 tried that on 2026-08-27 and got
+# reproduced=no). This measures the containment claim underneath it, which is deterministic.
+#
+# A 2x3 matrix. Each cell raises ONE fault in ONE placement against its OWN fresh server:
+#
+#                  on the generation thread            inside a spawn child
+#   python         expect ALIVE, HTTP 500              expect ALIVE, child exit 1
+#   abort          expect DEAD                         expect ALIVE, child -6
+#   gpu            expect DEAD                         expect ALIVE, child killed
+#
+# The python row is the control that makes the rest mean something: the route's `except Exception`
+# already handles a Python failure, so the hole is specifically native. The subprocess column is
+# not invented here: transformers inference already runs in a spawn child
+# (core/inference/worker.py) and orchestrator.py:1028 already renders `exitcode < 0` as
+# "signal=SIGABRT". Diffusers is the one inference path that skipped it.
+#
+# WHY THE WATCHER. The predecessor run (33031937295) recorded the in-process arm as an exit code
+# and nothing else, because a process that dies cannot report its own death. An absence of output
+# is not a measurement. So liveness is sampled from OUTSIDE, every 100 ms, into a JSONL timeline,
+# and each cell is judged on when the server stopped answering relative to when the fault was
+# sent. The same run also had its subprocess arm print `survived: true` and then exit 139 anyway,
+# so "the parent survived" is now asserted by polling for SURVIVE_HOLD seconds after the child
+# dies, not by a single instant.
+#
+# The server holds its own GPU context for the gpu row, because the real one does. If the parent
+# dies of its child's fault despite the process boundary, that is a real finding, not a bug here.
+
+on:
+  push:
+    branches: [amd-devlab-9130-containment]
+
+permissions: {}
+
+env:
+  # Pin the commit under measurement. Nothing below is true of any other.
+  MAIN_SHA: 070f29261736c980b523cffde6890d61a6e76f88
+  # Seconds the server must KEEP answering after a contained fault before the cell is called alive.
+  SURVIVE_HOLD: "5"
+
+jobs:
+  containment:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "devlab-9130-containment"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host-pre.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Fetch Studio at the pinned commit
+        run: |
+          set -euo pipefail
+          SRC="$AMD_CI_WORK/src"
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin https://github.com/unslothai/unsloth.git
+          git -C "$SRC" fetch -q --depth 1 origin "$MAIN_SHA"
+          git -C "$SRC" checkout -q "$MAIN_SHA"
+          git -C "$SRC" log -1 --format='%H %s'
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+
+      # The stand-in below copies the route's threading model. Assert that model is still what
+      # main does, so the copy cannot drift from it. A green containment result against a route
+      # that no longer looks like this would mean nothing.
+      - name: Route shape at this commit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          src = pathlib.Path(os.environ["SRC"]) / "studio" / "backend"
+          routes = (src / "routes" / "inference.py").read_text(encoding="utf-8")
+          diffusion = (src / "core" / "inference" / "diffusion.py").read_text(encoding="utf-8")
+          worker = (src / "core" / "inference" / "worker.py").read_text(encoding="utf-8")
+          fail = []
+
+          m = re.search(r"async def generate_diffusion_image\b.*?\n(?=@|\Z)", routes, re.S)
+          if not m:
+              fail.append("generate_diffusion_image not found")
+          else:
+              body = m.group(0)
+              print("generate_diffusion_image at routes/inference.py:%d"
+                    % (routes[: m.start()].count("\n") + 1))
+              if "asyncio.to_thread(" not in body or "backend.generate" not in body:
+                  fail.append("generate no longer dispatched via asyncio.to_thread(backend.generate")
+              else:
+                  print("  dispatches backend.generate on asyncio.to_thread -> in the server process")
+
+          if re.search(r"\b(multiprocessing|mp\.get_context|subprocess\.Popen)\b", diffusion):
+              fail.append("diffusion.py now spawns a process; the premise may already be fixed")
+          else:
+              print("core/inference/diffusion.py: no subprocess, no multiprocessing")
+
+          if 'get_context("spawn")' in worker or "spawn subprocess" in worker:
+              print("core/inference/worker.py: transformers inference IS in a spawn child")
+          else:
+              fail.append("worker.py no longer describes a spawn child; the contrast has no basis")
+
+          for f in fail:
+              print("PREMISE FAILED:", f)
+          sys.exit(1 if fail else 0)
+          PY
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 https://github.com/unslothai/unsloth "$AMD_CI_WORK/unsloth"
+          cd "$AMD_CI_WORK/unsloth"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q fastapi uvicorn
+          # Absolute path: this step cd'd away from the checkout, which has no amd_ci/.
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip)"
+
+      - name: Write the server and the watcher
+        run: |
+          set -euo pipefail
+          cat > "$AMD_CI_WORK/server.py" <<'SERVER'
+          #!/usr/bin/env python3
+          """A server shaped like the Studio diffusion route, with the generation replaced by a fault.
+
+          The subject is the threading model, not the pixels, so the pipeline is stubbed and the
+          dispatch is copied from ``generate_diffusion_image``: one FastAPI process, the blocking
+          call handed to the default executor with ``asyncio.to_thread``, wrapped in the same
+          ``except Exception -> HTTP 500``. Whatever survives here survives there.
+
+          The native faults stand in for the REPORTED fault's EFFECT, not its cause. #9130's trace is
+          ``terminate called after throwing an instance of 'c10::AcceleratorError'``, which reaches
+          the process as a fatal signal. ``abort()`` reaches it the same way, and the ``gpu`` fault
+          is a genuine device memory fault rather than a synthetic one.
+
+          With --gpu the process holds its own HIP context, as the real server does with a pipeline
+          resident. That is deliberate: it lets the subprocess arm answer whether a process boundary
+          is enough when the PARENT is also on the device.
+          """
+
+          import argparse
+          import asyncio
+          import ctypes
+          import multiprocessing as mp
+          import os
+          import sys
+
+          import uvicorn
+          from fastapi import FastAPI, HTTPException
+
+          app = FastAPI()
+
+
+          def _python_error() -> None:
+              raise ValueError("a plain Python failure, which the route already catches")
+
+
+          def _native_abort() -> None:
+              """SIGABRT from libc: the signal a C++ ``terminate`` delivers."""
+              ctypes.CDLL(None).abort()
+
+
+          def _gpu_fault() -> None:
+              """A genuine device memory fault: an out-of-bounds gather on the GPU."""
+              import torch
+
+              src = torch.randn(16, device = "cuda")
+              idx = torch.full((4096,), 2 ** 30, device = "cuda", dtype = torch.long)
+              out = src[idx]
+              torch.cuda.synchronize()
+              print("gpu fault did not fire", out.shape, flush = True)
+
+
+          FAULTS = {"python": _python_error, "abort": _native_abort, "gpu": _gpu_fault}
+
+
+          def _child(kind: str) -> None:
+              FAULTS[kind]()
+
+
+          @app.get("/health")
+          def health() -> dict:
+              return {"ok": True, "pid": os.getpid()}
+
+
+          @app.post("/fault/thread/{kind}")
+          async def fault_thread(kind: str) -> dict:
+              """Exactly how generate_diffusion_image dispatches backend.generate."""
+              if kind not in FAULTS:
+                  raise HTTPException(status_code = 400, detail = "unknown fault")
+              try:
+                  await asyncio.to_thread(FAULTS[kind])
+              except Exception as exc:  # noqa: BLE001 -- the route's own handler, copied
+                  raise HTTPException(status_code = 500, detail = f"{type(exc).__name__}: {exc}")
+              return {"returned": True}
+
+
+          @app.post("/fault/subprocess/{kind}")
+          async def fault_subprocess(kind: str) -> dict:
+              """The containment core/inference/worker.py already uses for transformers."""
+              if kind not in FAULTS:
+                  raise HTTPException(status_code = 400, detail = "unknown fault")
+              proc = mp.get_context("spawn").Process(target = _child, args = (kind,))
+              proc.start()
+              await asyncio.to_thread(proc.join, 120)
+              # orchestrator.py:1028 reads exactly this and renders it as signal=SIGABRT.
+              return {"exitcode": proc.exitcode, "server_pid": os.getpid()}
+
+
+          if __name__ == "__main__":
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--port", type = int, default = 8899)
+              ap.add_argument("--gpu", action = "store_true")
+              args = ap.parse_args()
+              if args.gpu:
+                  import torch
+
+                  _resident = torch.ones(1024, device = "cuda")
+                  torch.cuda.synchronize()
+                  print("server holds a HIP context", _resident.sum().item(), flush = True)
+              uvicorn.run(app, host = "127.0.0.1", port = args.port, log_level = "warning")
+          SERVER
+
+          cat > "$AMD_CI_WORK/watcher.py" <<'WATCHER'
+          #!/usr/bin/env python3
+          """Sample the server's liveness from OUTSIDE, so a dead server still produces a record.
+
+          Writes one JSON object per sample to a JSONL file. The predecessor run judged the
+          in-process arm on an exit code and no output, which cannot distinguish "the injected fault
+          killed it" from "it died somewhere else"; a timeline can.
+          """
+
+          import json
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          url, out, interval = sys.argv[1], sys.argv[2], float(sys.argv[3])
+          with open(out, "w", encoding = "utf-8") as handle:
+              while True:
+                  started = time.time()
+                  try:
+                      with urllib.request.urlopen(url, timeout = 2) as resp:
+                          ok, detail = resp.status == 200, str(resp.status)
+                  except urllib.error.URLError as exc:
+                      ok, detail = False, f"{type(exc.reason).__name__}: {exc.reason}"
+                  except Exception as exc:  # noqa: BLE001
+                      ok, detail = False, f"{type(exc).__name__}: {exc}"
+                  handle.write(json.dumps({"t": round(started, 3), "ok": ok, "detail": detail}) + "\n")
+                  handle.flush()
+                  time.sleep(max(0.0, interval - (time.time() - started)))
+          WATCHER
+
+          "$PY" -c "import ast; [ast.parse(open(p).read()) for p in ('$AMD_CI_WORK/server.py', '$AMD_CI_WORK/watcher.py')]"
+
+      - name: Run the matrix
+        run: |
+          set +e
+          set -uo pipefail
+          RESULTS="$AMD_CI_WORK/cells"
+          mkdir -p "$RESULTS"
+          PORT=8899
+
+          run_cell () {
+            kind="$1"; placement="$2"; gpuflag="$3"
+            cell="${placement}__${kind}"
+            PORT=$((PORT + 1))
+            BASE="http://127.0.0.1:$PORT"
+            echo "::group::$cell"
+
+            "$PY" "$AMD_CI_WORK/server.py" --port "$PORT" $gpuflag \
+              > "$RESULTS/$cell.server.log" 2>&1 &
+            SERVER_PID=$!
+            up=0
+            for _ in $(seq 1 120); do
+              curl -sf --max-time 5 "$BASE/health" >/dev/null && { up=1; break; }
+              kill -0 "$SERVER_PID" 2>/dev/null || break
+              sleep 1
+            done
+            if [ "$up" -ne 1 ]; then
+              echo "server never came up; cell is INCONCLUSIVE"
+              echo "{\"cell\": \"$cell\", \"kind\": \"$kind\", \"placement\": \"$placement\", \"status\": \"no_server\"}" \
+                > "$RESULTS/$cell.json"
+              tail -20 "$RESULTS/$cell.server.log"
+              kill -9 "$SERVER_PID" 2>/dev/null
+              echo "::endgroup::"
+              return
+            fi
+
+            "$PY" "$AMD_CI_WORK/watcher.py" "$BASE/health" "$RESULTS/$cell.timeline.jsonl" 0.1 &
+            WATCH_PID=$!
+            sleep 1
+
+            SENT=$(date +%s.%N)
+            HTTP=$(curl -s -o "$RESULTS/$cell.body" -w '%{http_code}' --max-time 180 \
+              -X POST "$BASE/fault/$placement/$kind")
+            CURL_RC=$?
+            # Hold: a server that answers once after a contained fault has not survived it.
+            sleep "$SURVIVE_HOLD"
+            if kill -0 "$SERVER_PID" 2>/dev/null; then PROC=alive; else PROC=gone; fi
+            curl -sf --max-time 10 "$BASE/health" >/dev/null && SERVED=yes || SERVED=no
+            kill -9 "$WATCH_PID" 2>/dev/null
+            wait "$WATCH_PID" 2>/dev/null
+            EXITST=""
+            if [ "$PROC" = "gone" ]; then wait "$SERVER_PID"; EXITST=$?; else kill -9 "$SERVER_PID" 2>/dev/null; fi
+
+            "$PY" - "$RESULTS/$cell.json" "$cell" "$kind" "$placement" "$SENT" \
+              "$HTTP" "$CURL_RC" "$PROC" "$SERVED" "$EXITST" \
+              "$RESULTS/$cell.timeline.jsonl" "$RESULTS/$cell.body" <<'PY'
+          import json, sys
+
+          (out, cell, kind, placement, sent, http, curl_rc, proc, served, exitst,
+           timeline, body) = sys.argv[1:13]
+
+          samples = []
+          with open(timeline, encoding="utf-8") as handle:
+              for line in handle:
+                  line = line.strip()
+                  if line:
+                      samples.append(json.loads(line))
+
+          sent_at = float(sent)
+          ok = [s for s in samples if s["ok"]]
+          after = [s for s in samples if s["t"] >= sent_at]
+          first_fail_after = next((s for s in after if not s["ok"]), None)
+
+          try:
+              payload = json.loads(open(body, encoding="utf-8").read() or "{}")
+          except Exception:
+              payload = {"raw": open(body, encoding="utf-8", errors="replace").read()[:300]}
+
+          json.dump({
+              "cell": cell, "kind": kind, "placement": placement,
+              "status": "ran",
+              "http": http, "curl_rc": int(curl_rc), "body": payload,
+              "process": proc, "served_after_hold": served,
+              "server_exit": exitst,
+              "samples": len(samples),
+              "samples_ok": len(ok),
+              "last_ok_before_fault_s": round(sent_at - max((s["t"] for s in ok if s["t"] < sent_at), default=sent_at), 3),
+              "first_failure_after_fault_s": (
+                  round(first_fail_after["t"] - sent_at, 3) if first_fail_after else None
+              ),
+              "first_failure_detail": first_fail_after["detail"] if first_fail_after else None,
+              "ok_samples_after_fault": sum(1 for s in after if s["ok"]),
+          }, open(out, "w"), indent=2)
+          PY
+            cat "$RESULTS/$cell.json"
+            echo "--- server log tail ---"
+            tail -15 "$RESULTS/$cell.server.log"
+            echo "::endgroup::"
+          }
+
+          for kind in python abort gpu; do
+            gpuflag=""
+            [ "$kind" = "gpu" ] && gpuflag="--gpu"
+            for placement in thread subprocess; do
+              run_cell "$kind" "$placement" "$gpuflag"
+            done
+          done
+          ls -la "$RESULTS"
+          true
+
+      - name: Verdict
+        run: |
+          set -eu
+          "$PY" - <<'PY'
+          import json, os, pathlib, sys
+
+          cells = {}
+          root = pathlib.Path(os.environ["AMD_CI_WORK"]) / "cells"
+          for path in sorted(root.glob("*.json")):
+              data = json.loads(path.read_text() or "{}")
+              cells[(data.get("placement"), data.get("kind"))] = data
+
+          row = "{:<10} {:<12} {:>7} {:>9} {:>10} {:>14}  {}"
+          print(row.format("fault", "placement", "http", "process", "served", "first fail s", "detail"))
+          for kind in ("python", "abort", "gpu"):
+              for placement in ("thread", "subprocess"):
+                  c = cells.get((placement, kind), {})
+                  print(row.format(
+                      kind, placement, str(c.get("http")), str(c.get("process")),
+                      str(c.get("served_after_hold")), str(c.get("first_failure_after_fault_s")),
+                      str(c.get("body") if placement == "subprocess" else c.get("first_failure_detail"))[:60],
+                  ))
+
+          fails, inconclusive = [], []
+
+          def check(label, ok, detail=""):
+              print(("PASS  " if ok else "FAIL  ") + label + ("  " + detail if detail else ""))
+              if not ok:
+                  fails.append(label)
+
+          print("\n=== controls ===")
+          for placement in ("thread", "subprocess"):
+              c = cells.get((placement, "python"), {})
+              if c.get("status") != "ran":
+                  inconclusive.append(f"python/{placement}")
+                  continue
+              check(f"python/{placement}: the server survives a caught failure",
+                    c.get("served_after_hold") == "yes" and c.get("process") == "alive",
+                    f"process={c.get('process')} served={c.get('served_after_hold')}")
+          c = cells.get(("thread", "python"), {})
+          check("python/thread: answered 500 rather than dying", str(c.get("http")) == "500",
+                f"http={c.get('http')}")
+
+          print("\n=== the measurement ===")
+          for kind in ("abort", "gpu"):
+              t = cells.get(("thread", kind), {})
+              s = cells.get(("subprocess", kind), {})
+              if t.get("status") != "ran" or s.get("status") != "ran":
+                  inconclusive.append(f"{kind}")
+                  continue
+              # In-process: the server must actually stop answering, on a timeline, not merely exit.
+              check(f"{kind}/thread: the server STOPPED ANSWERING after the fault",
+                    t.get("served_after_hold") == "no" and t.get("first_failure_after_fault_s") is not None,
+                    f"first failure at +{t.get('first_failure_after_fault_s')}s "
+                    f"({t.get('first_failure_detail')}), exit={t.get('server_exit')}")
+              check(f"{kind}/thread: it was healthy right up to the fault",
+                    (t.get("samples_ok") or 0) > 0 and (t.get("last_ok_before_fault_s") or 99) < 1.0,
+                    f"{t.get('samples_ok')} ok samples, last {t.get('last_ok_before_fault_s')}s before")
+              # Contained: answering for the whole hold, not at one instant.
+              check(f"{kind}/subprocess: the server KEPT answering for {os.environ['SURVIVE_HOLD']}s",
+                    s.get("served_after_hold") == "yes" and s.get("process") == "alive"
+                    and (s.get("ok_samples_after_fault") or 0) > 10,
+                    f"{s.get('ok_samples_after_fault')} ok samples after the fault")
+              check(f"{kind}/subprocess: the child died", str((s.get("body") or {}).get("exitcode")) not in ("0", "None"),
+                    f"child exitcode={(s.get('body') or {}).get('exitcode')}")
+
+          print()
+          if inconclusive:
+              print("INCONCLUSIVE, no server in: " + ", ".join(inconclusive))
+              sys.exit(1)
+          t_abort = cells.get(("thread", "abort"), {})
+          if t_abort.get("served_after_hold") == "yes":
+              print("VOID: the in-process arm did not exhibit the defect, so this run measured nothing.")
+              sys.exit(1)
+          if fails:
+              print(f"{len(fails)} check(s) failed:")
+              for f in fails:
+                  print("  -", f)
+              sys.exit(1)
+          print("Containment gap confirmed on gfx1151. A caught Python failure on the generation")
+          print("thread is answered 500 and the server lives. The same native and device faults on")
+          print("that thread stop the server answering. Behind a spawn boundary they do not.")
+          PY
+
+      - name: Raw results
+        if: always()
+        run: |
+          set +e
+          for f in "$AMD_CI_WORK"/cells/*.json; do echo "===== $f ====="; cat "$f"; echo; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: devlab-9130-containment
+          path: ${{ env.AMD_CI_WORK }}/cells
