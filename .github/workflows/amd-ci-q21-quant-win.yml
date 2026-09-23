@@ -134,8 +134,9 @@ jobs:
           # Studio's pinned diffusers main build (QwenImage21Pipeline) and the rest of the image stack.
           & $py -m pip install -q "diffusers @ https://github.com/huggingface/diffusers/archive/80c7ed262aeffbeb43ef13ae04baeb9b84515a69.zip" "transformers==5.5.0" accelerate safetensors "gguf>=0.10" huggingface_hub pillow numpy scipy tqdm
           Write-Host "stack install exit: $LASTEXITCODE"
-          & $py -m pip install -q --no-deps torchao==0.17.0
-          Write-Host "torchao install exit: $LASTEXITCODE"
+          # No torchao: on Windows ROCm torch it dies at import (torch.ops._c10d_functional.all_gather_into_tensor is
+          # absent, measured on run 35803008956) and takes transformers' Qwen3-VL import down with it. The native
+          # int8 / fp8 arms are the Windows answer; the torchao arms record the missing module.
           & $py -m pip install -q --no-deps lpips
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda?', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no device')"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"

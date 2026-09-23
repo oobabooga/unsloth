@@ -27,8 +27,8 @@ NEEDS = [
 ]
 
 ORDER = (
-    "bf16", "studio_int8", "fp8_layerwise", "studio_fp8",
-    "int8_weight", "fp8_weight", "te_fp8", "gguf_q4km",
+    "bf16", "int8_native_w8a8", "int8_native_weight", "fp8_native_weight", "fp8_layerwise",
+    "studio_int8", "studio_fp8", "int8_weight", "fp8_weight", "te_fp8", "gguf_q4km",
 )
 
 
