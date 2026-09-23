@@ -5,7 +5,7 @@ name: "AMD CI: W8A8 torch._int_mm vs weight-only int8 (Windows)"
 
 on:
   push:
-    branches: [amd-ci-int8mm]
+    branches: [amd-ci-int8mm-win]
   workflow_dispatch:
 
 permissions:
@@ -54,6 +54,15 @@ jobs:
           git clone -q --depth 1 -b $env:SRC_BRANCH $env:SRC_REPO "$env:AMD_CI_WORK\src\unsloth"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git -C "$env:AMD_CI_WORK\src\unsloth" log -1 --format='%h %s'
+
+      - name: Carry PR 11640 (torchao stub version transformers 5 can parse)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "$env:AMD_CI_WORK\src\unsloth"
+          git -C $src fetch -q --depth 50 https://github.com/unslothai/unsloth pull/11640/head
+          git -C $src -c user.name=ci -c user.email=ci@localhost merge -q --no-edit --allow-unrelated-histories FETCH_HEAD
+          Write-Host "merge exit $LASTEXITCODE, $(git -C $src log -1 --format=%h)"
+          exit 0
 
       - name: Test environment
         timeout-minutes: 90
