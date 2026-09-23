@@ -1,0 +1,255 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci-win]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Hardware
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select Caption, Version, BuildNumber | Format-List
+          Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -like '*NPU*' -or $_.DeviceID -like '*DEV_17F0*' -or $_.DeviceName -like '*Radeon*' } | Select DeviceName, DriverVersion, DriverDate, DeviceID | Format-List
+          Get-PnpDevice | Where-Object { $_.InstanceId -like '*DEV_17F0*' } | Format-List
+          Get-ChildItem 'C:\Windows\System32\AMD' -ErrorAction SilentlyContinue | Select -First 30 Name
+          Get-Command xrt-smi -ErrorAction SilentlyContinue; exit 0
+      - name: Lemonade + FLM probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP 'lem'
+          New-Item -ItemType Directory -Force -Path "$W\flm","$W\hf" | Out-Null
+          $env:HF_HOME = "$W\hf"; $env:FLM_MODEL_PATH = "$W\flm"
+          Set-Location $W
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri https://github.com/lemonade-sdk/lemonade/releases/download/v11.9.0/lemonade-embeddable-11.9.0-windows-x64.zip -OutFile lem.zip
+          Expand-Archive lem.zip -DestinationPath lemx -Force
+          $L = Get-ChildItem -Recurse lemx -Filter lemond.exe | Select -First 1
+          $D = $L.DirectoryName; Write-Host "D=$D"; Get-ChildItem $D | Format-Table Name, Length
+          $env:LEMONADE_API_KEY = 'probekey'
+          $p = Start-Process -FilePath $L.FullName -ArgumentList '.\','--port','13399' -WorkingDirectory $D -RedirectStandardOutput "$W\lemond.out" -RedirectStandardError "$W\lemond.err" -PassThru -WindowStyle Hidden
+          for ($i=0; $i -lt 60; $i++) { try { Invoke-RestMethod -Uri http://127.0.0.1:13399/v1/health -Headers @{Authorization='Bearer probekey'} | ConvertTo-Json -Depth 5; break } catch { Start-Sleep 1 } }
+          $probe = @'
+          import base64, json, os, struct, subprocess, sys, threading, time, urllib.request, urllib.error, zlib, glob, platform
+
+          BASE = sys.argv[1]
+          KEY = sys.argv[2]
+          ROOT = sys.argv[3]  # lemond working dir
+          MODELS = sys.argv[4].split(",")
+          OUT = {}
+
+
+          def log(*a):
+              print(*a, flush=True)
+
+
+          def req(method, path, body=None, timeout=60, raw=False):
+              data = json.dumps(body).encode() if body is not None else None
+              r = urllib.request.Request(BASE + path, data=data, method=method)
+              r.add_header("Authorization", "Bearer " + KEY)
+              if data is not None:
+                  r.add_header("Content-Type", "application/json")
+              t0 = time.time()
+              try:
+                  resp = urllib.request.urlopen(r, timeout=timeout)
+                  if raw:
+                      return resp, t0
+                  txt = resp.read().decode("utf-8", "replace")
+                  code = resp.status
+              except urllib.error.HTTPError as e:
+                  txt = e.read().decode("utf-8", "replace")
+                  code = e.code
+              except Exception as e:
+                  return 0, repr(e), time.time() - t0
+              try:
+                  return code, json.loads(txt), time.time() - t0
+              except Exception:
+                  return code, txt, time.time() - t0
+
+
+          def show(label, res, limit=3000):
+              code, body, dt = res
+              s = json.dumps(body, indent=1) if not isinstance(body, str) else body
+              log(f"=== {label}: HTTP {code} in {dt:.2f}s\n{s[:limit]}")
+
+
+          def unauth_check():
+              r = urllib.request.Request(BASE + "/v1/health")
+              try:
+                  resp = urllib.request.urlopen(r, timeout=10)
+                  log("=== unauth /v1/health:", resp.status)
+              except urllib.error.HTTPError as e:
+                  log("=== unauth /v1/health:", e.code)
+
+
+          def flm_bin():
+              names = ["flm.exe", "flm"]
+              for n in names:
+                  hits = glob.glob(os.path.join(ROOT, "bin", "flm", "**", n), recursive=True)
+                  if hits:
+                      return hits[0]
+              return None
+
+
+          def run(cmd, timeout=120):
+              log("$ " + " ".join(cmd))
+              try:
+                  p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                  log(f"rc={p.returncode}\nSTDOUT:\n{p.stdout[:4000]}\nSTDERR:\n{p.stderr[:2000]}")
+                  return p
+              except Exception as e:
+                  log("run failed:", repr(e))
+
+
+          def red_png():
+              w = h = 64
+              raw = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+              def chunk(t, d):
+                  c = struct.pack(">I", len(d)) + t + d
+                  return c + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+              return base64.b64encode(png).decode()
+
+
+          def stream_chat(model, messages, extra=None, close_after=None, label="stream"):
+              body = {"model": model, "messages": messages, "stream": True, "max_tokens": 200}
+              body.update(extra or {})
+              try:
+                  resp, t0 = req("POST", "/v1/chat/completions", body, timeout=600, raw=True)
+              except Exception as e:
+                  log(f"=== {label}: exception {e!r}")
+                  return
+              if isinstance(resp, int):
+                  log(f"=== {label}: failed {t0}")
+                  return
+              lines, first = [], None
+              n = 0
+              for line in resp:
+                  line = line.decode("utf-8", "replace").rstrip()
+                  if not line:
+                      continue
+                  if first is None:
+                      first = time.time() - t0
+                  n += 1
+                  lines.append(line)
+                  if close_after and n >= close_after:
+                      resp.close()
+                      break
+              total = time.time() - t0
+              log(f"=== {label}: {n} lines, ttfb={first}, total={total:.2f}s")
+              for l in lines[:12]:
+                  log("  " + l[:400])
+              if len(lines) > 12:
+                  log("  ...")
+                  for l in lines[-6:]:
+                      log("  " + l[:600])
+
+
+          def main():
+              log("platform:", platform.platform())
+              unauth_check()
+              show("health", req("GET", "/v1/health"))
+              code, si, _ = req("GET", "/v1/system-info", timeout=120)
+              if isinstance(si, dict):
+                  log("=== system-info keys:", list(si))
+                  for k in ("devices", "Processor", "OS Version", "Physical Memory"):
+                      if k in si:
+                          log(f"--- {k}:", json.dumps(si[k], indent=1)[:3000])
+                  log("--- recipes.flm:", json.dumps(si.get("recipes", {}).get("flm"), indent=1))
+                  log("--- recipes.llamacpp:", json.dumps(si.get("recipes", {}).get("llamacpp"), indent=1)[:2000])
+                  log("--- recipes.ryzenai-llm:", json.dumps(si.get("recipes", {}).get("ryzenai-llm"), indent=1)[:1500])
+              else:
+                  show("system-info", (code, si, 0))
+              show("install flm", req("POST", "/v1/install", {"recipe": "flm", "backend": "npu", "stream": False}, timeout=1200))
+              fb = flm_bin()
+              log("flm binary:", fb)
+              if fb:
+                  run([fb, "version", "--json"])
+                  run([fb, "validate", "--json"], timeout=300)
+                  run([fb, "validate"], timeout=300)
+                  if os.name != "nt":
+                      run(["bash", "-c", f"ldd '{fb}' | head -60; ls -la $(dirname '{fb}') | head -60"])
+                  else:
+                      run(["cmd", "/c", "dir", os.path.dirname(fb)])
+              code, si, _ = req("GET", "/v1/system-info", timeout=120)
+              if isinstance(si, dict):
+                  log("--- recipes.flm after install:", json.dumps(si.get("recipes", {}).get("flm"), indent=1))
+              code, models, _ = req("GET", "/v1/models?show_all=true", timeout=120)
+              if isinstance(models, dict):
+                  flm = [m for m in models.get("data", []) if m.get("recipe") == "flm" or str(m.get("id", "")).endswith("-FLM")]
+                  log(f"=== FLM models in catalog: {len(flm)}")
+                  for m in flm[:60]:
+                      log("  ", json.dumps(m)[:400])
+              else:
+                  show("models", (code, models, 0))
+
+              for model in MODELS:
+                  log(f"\n################ {model}")
+                  show("pull", req("POST", "/v1/pull", {"model_name": model}, timeout=1800), 2000)
+                  show("load", req("POST", "/v1/load", {"model_name": model, "ctx_size": 4096}, timeout=900), 2000)
+                  show("health after load", req("GET", "/v1/health"), 4000)
+                  msgs = [{"role": "user", "content": "What is 17*23? Answer briefly."}]
+                  show("chat nonstream", req("POST", "/v1/chat/completions", {"model": model, "messages": msgs, "max_tokens": 300, "temperature": 0.2}, timeout=600), 4000)
+                  show("stats", req("GET", "/v1/stats"))
+                  stream_chat(model, msgs, {"stream_options": {"include_usage": True}}, label="chat stream")
+                  show("stats", req("GET", "/v1/stats"))
+                  # sampling params passthrough
+                  show("chat params", req("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Count from 1 to 20 separated by spaces."}], "max_tokens": 60, "temperature": 0.7, "top_p": 0.9, "top_k": 20, "min_p": 0.05, "repeat_penalty": 1.1, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": 3, "stop": ["7"]}, timeout=600), 2000)
+                  # completions
+                  show("completions", req("POST", "/v1/completions", {"model": model, "prompt": "The capital of France is", "max_tokens": 16}, timeout=600), 1500)
+                  # tools
+                  tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+                  show("tools nonstream", req("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": "What's the weather in Paris right now? Use the tool."}], "tools": tools, "max_tokens": 400}, timeout=600), 4000)
+                  stream_chat(model, [{"role": "user", "content": "What's the weather in Paris right now? Use the tool."}], {"tools": tools, "max_tokens": 400}, label="tools stream")
+                  # thinking toggle (Qwen3 style)
+                  show("chat enable_thinking=false", req("POST", "/v1/chat/completions", {"model": model, "messages": msgs, "max_tokens": 200, "chat_template_kwargs": {"enable_thinking": False}}, timeout=600), 2000)
+                  # vision
+                  img = red_png()
+                  show("vision", req("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": [{"type": "text", "text": "What color is this image? One word."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]}], "max_tokens": 200}, timeout=600), 2000)
+                  # anthropic
+                  show("anthropic messages", req("POST", "/v1/messages", {"model": model, "max_tokens": 100, "messages": [{"role": "user", "content": "Say hi."}]}, timeout=600), 1500)
+                  # cancel mid-stream then immediate request
+                  stream_chat(model, [{"role": "user", "content": "Write a 500 word story about a lighthouse."}], {"max_tokens": 800}, close_after=5, label="cancelled stream")
+                  t = time.time()
+                  show("after cancel", req("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 10}, timeout=600), 1000)
+                  log(f"after-cancel request took {time.time()-t:.2f}s")
+                  # concurrency
+                  res = {}
+                  def worker(i):
+                      res[i] = req("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": f"Say the number {i}."}], "max_tokens": 20}, timeout=600)
+                  ths = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+                  t = time.time()
+                  [x.start() for x in ths]
+                  [x.join() for x in ths]
+                  for i in range(3):
+                      c, b, dt = res[i]
+                      log(f"concurrent {i}: HTTP {c} {dt:.2f}s {json.dumps(b)[:300]}")
+                  log(f"concurrency wall {time.time()-t:.2f}s")
+                  # decode speed on a longer generation
+                  body = {"model": model, "messages": [{"role": "user", "content": "Write a 300 word essay about the ocean."}], "max_tokens": 400, "chat_template_kwargs": {"enable_thinking": False}}
+                  show("long gen", req("POST", "/v1/chat/completions", body, timeout=900), 600)
+                  show("stats long", req("GET", "/v1/stats"))
+                  show("unload", req("POST", "/v1/unload", {"model_name": model}, timeout=120))
+              show("health end", req("GET", "/v1/health"), 1500)
+
+
+          main()
+
+          '@
+          [IO.File]::WriteAllText("$W\probe.py", $probe)
+          python "$W\probe.py" http://127.0.0.1:13399 probekey "$D" qwen3-0.6b-FLM,qwen3.5-0.8b-FLM,qwen3-it-4b-FLM
+          Write-Host '======== lemond.out'; Get-Content "$W\lemond.out" -Tail 400
+          Write-Host '======== lemond.err'; Get-Content "$W\lemond.err" -Tail 200
+          Get-ChildItem -Recurse "$W\flm" -ErrorAction SilentlyContinue | Select -First 40 FullName, Length
+          Get-ChildItem "$env:USERPROFILE\.flm" -Recurse -ErrorAction SilentlyContinue | Select -First 20 FullName
+          Get-ChildItem -Recurse "$D\bin" -ErrorAction SilentlyContinue | Select -First 60 FullName, Length
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          exit 0
+
