@@ -87,7 +87,7 @@ test("restoreSettings puts the record through restorableSize", () => {
   const body = restoreSettingsBody();
   assert.match(
     body,
-    /restorableSize\(image\.width, image\.height, image\.workflow\)/,
+    /restorableSize\(image\.width, image\.height, image\.workflow, limits\)/,
   );
   assert.doesNotMatch(
     body,
