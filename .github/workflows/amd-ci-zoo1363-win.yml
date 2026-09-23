@@ -1,4 +1,4 @@
-name: "AMD CI (Windows): validate PR 11640"
+name: "AMD CI (Windows): validate unsloth-zoo PR 1363"
 
 # Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
 #
@@ -30,22 +30,22 @@ name: "AMD CI (Windows): validate PR 11640"
 
 on:
   push:
-    branches: [amd-ci-pr11640-win]
+    branches: [amd-ci-zoo1363-win]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  PR: "11640"
-  UPSTREAM: "https://github.com/unslothai/unsloth"
+  PR: "1363"
+  UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
 
 jobs:
 
   linux-control:
-    name: "PR 11640 linux control (selector diagnosis)"
+    name: "zoo PR 1363 linux control (selector diagnosis)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 10
     env:
@@ -61,7 +61,7 @@ jobs:
           echo "selector matched no runner. If BOTH stay queued, the pool is busy."
 
   windows:
-    name: "PR 11640 on Windows (non-Docker)"
+    name: "zoo PR 1363 on Windows (non-Docker)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 300
     concurrency:
@@ -84,7 +84,7 @@ jobs:
 
       - name: Preamble
         run: |
-          .\amd_ci\lib\preamble.ps1 -Name "pr11640-windows"
+          .\amd_ci\lib\preamble.ps1 -Name "zoo1363-windows"
 
       - name: Locate the system Python
         run: |
@@ -131,45 +131,63 @@ jobs:
           # The ROCm torch Studio's install.ps1 resolves for gfx1151 on Windows: AMD's per-arch index.
           & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" "torchvision>=0.26.0,<0.27.0"
           Write-Host "torch install exit: $LASTEXITCODE"
-          # Studio's pinned diffusers main build (QwenImage21Pipeline) and the rest of the image stack.
-          & $py -m pip install -q "diffusers @ https://github.com/huggingface/diffusers/archive/80c7ed262aeffbeb43ef13ae04baeb9b84515a69.zip" "transformers==5.5.0" accelerate safetensors "gguf>=0.10" huggingface_hub pillow numpy scipy tqdm
-          # Studio's own backend dependencies, so the probe imports DiffusionBackend exactly as Studio does.
-          & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
-          Write-Host "studio requirements exit: $LASTEXITCODE"
+          # unsloth and unsloth-zoo with --no-deps: both declare torch, and a resolver pass would
+          # swap the ROCm build for PyPI's CPU one. zoo itself comes from each state's checkout
+          # via PYTHONPATH, so only its dependencies are installed here.
+          & $py -m pip install -q --no-deps "unsloth @ git+https://github.com/unslothai/unsloth.git@main"
+          & $py -m pip install -q "transformers==5.5.0" "trl>=0.18.2,!=0.19.0,<=1.13.0" "peft>=0.18.0" accelerate "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0" sentencepiece tqdm psutil wheel numpy protobuf huggingface_hub hf_transfer pillow regex msgspec typing_extensions filelock tyro typer rich pydantic pyyaml nest-asyncio structlog click
           Write-Host "stack install exit: $LASTEXITCODE"
-          # No torchao: on Windows ROCm torch it dies at import (torch.ops._c10d_functional.all_gather_into_tensor is
-          # absent, measured on run 35803008956) and takes transformers' Qwen3-VL import down with it. The native
-          # int8 / fp8 arms are the Windows answer; the torchao arms record the missing module.
-          & $py -m pip install -q --no-deps lpips
+          # torchao as a plain `pip install unsloth` gets it from zoo's dependency: present, and
+          # crashing at import on Windows ROCm torch, which is what makes zoo install its stub.
+          & $py -m pip install -q --no-deps "torchao==0.17.0"
+          Write-Host "torchao install exit: $LASTEXITCODE"
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda?', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no device')"
+          & $py -c "import torchao" 2>&1 | Select-Object -Last 3
+          Write-Host "bare import torchao exit: $LASTEXITCODE"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_rocm.json"
           Write-Host "rocm gate exit: $LASTEXITCODE"
           exit 0
 
-      - name: Differential
-        timeout-minutes: 200
+      - name: Differential, torchao installed (plain pip install unsloth)
+        timeout-minutes: 120
         run: |
           $ErrorActionPreference = "Continue"
-          $env:TORCH_HOME = "$env:AMD_CI_WORK\torch_home"
           $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
             --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/studio_weight_only_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/studio_windows_stub.py" `
-            --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --models "$env:AMD_CI_WORK\models" --schemes none --reference-at-base --prompts 1
-          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_rocm_stub_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_rocm_stub.py" `
+            --out-dir "$env:AMD_CI_WORK\out\present" `
+            --python "$env:AMD_CI_PY" -- --torchao-mode present
+          Get-Content "$env:AMD_CI_WORK\out\present\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
-          # This is the last command, so its exit status is the step's.
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
-            "$env:AMD_CI_WORK\out\windows"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\present"
+          Write-Host "announce exit: $LASTEXITCODE"
+          exit 0
+
+      - name: Differential, torchao absent (a --no-deps install)
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          & $env:AMD_CI_PY -m pip uninstall -y -q torchao
+          Write-Host "torchao uninstall exit: $LASTEXITCODE"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_rocm_stub_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_rocm_stub.py" `
+            --out-dir "$env:AMD_CI_WORK\out\absent" `
+            --python "$env:AMD_CI_PY" -- --torchao-mode absent
+          Get-Content "$env:AMD_CI_WORK\out\absent\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # Last command: its exit status is the step's, so VOID / INCONCLUSIVE fail the job.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\absent"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr11640-windows
+          name: zoo1363-windows
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
