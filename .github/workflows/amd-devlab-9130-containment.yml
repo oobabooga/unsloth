@@ -121,12 +121,16 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          git clone -q --depth 1 https://github.com/unslothai/unsloth "$AMD_CI_WORK/unsloth"
-          cd "$AMD_CI_WORK/unsloth"
+          # Install from the SAME tree the route assertion measured, not a fresh clone of main.
+          # One sha for the environment and the measurement, and it dodges a live breakage: main's
+          # installer now asks for unsloth>=2026.9.10 (#11616, 2026-09-22 16:17) while PyPI
+          # publishes 2026.9.7, so a clone-of-main install resolves to nothing. MAIN_SHA predates
+          # that bump and still pins >=2026.9.7.
+          cd "$SRC"
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
           set +e
-          bash install.sh --local 2>&1 | tail -15
+          bash install.sh --local 2>&1 | tail -40
           rc=${PIPESTATUS[0]}
           set -e
           [ "$rc" -eq 0 ] || exit "$rc"
