@@ -83,15 +83,10 @@ jobs:
           cd "$AMD_CI_WORK/states/head"
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
-          # Where the runner's release-age cutoff comes from: it hides unsloth releases the tree
-          # pins, and a global UV_EXCLUDE_NEWER drops the ROCm torch index instead.
-          env | grep -iE '^(UV_|PIP_|PYTHON_?INDEX|HF_HUB_OFFLINE)' | sed -E 's/(TOKEN|KEY|PASS)[^=]*=.*/\1=<redacted>/' || true
-          for f in /etc/uv/uv.toml "$HOME/.config/uv/uv.toml" "$HOME/.config/pip/pip.conf" /etc/pip.conf "$HOME/.pip/pip.conf"; do
-            [ -f "$f" ] && { echo "--- $f"; grep -viE 'token|password' "$f"; }
-          done
-          uv --version || true
-          uv pip compile --no-cache --python-version 3.13 - <<<"unsloth>=2026.9.10" 2>&1 | tail -5 || true
-          if [ "${AMD_CI_DIAG_ONLY:-1}" = 1 ]; then echo "diagnostic run, stopping before install"; exit 1; fi
+          # The runner's uv index is a PyPI mirror that lags new releases (it had unsloth only up
+          # to 2026.9.7 while the tree pins >=2026.9.10). pip.conf already adds pypi.org as an
+          # extra index; give uv the same, which it consults before the mirror.
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
           set +e
           bash install.sh --local 2>&1 | tail -15
           rc=${PIPESTATUS[0]}
