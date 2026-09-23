@@ -84,7 +84,9 @@ jobs:
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
           set +e
-          bash install.sh --local 2>&1 | tail -15
+          # --local asks for unsloth>=2026.9.10, not on PyPI yet (main is ahead of the release);
+          # the probe imports each state's checkout ahead of the installed copy anyway.
+          bash install.sh 2>&1 | tail -15
           rc=${PIPESTATUS[0]}
           set -e
           [ "$rc" -eq 0 ] || exit "$rc"
