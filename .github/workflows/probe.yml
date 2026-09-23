@@ -73,6 +73,56 @@ jobs:
                   q=urllib.request.Request('http://127.0.0.1:18473/v1/chat/completions',data=json.dumps(body).encode(),headers={'Authorization':'Bearer throwaway-local-probe','Content-Type':'application/json'})
                   with urllib.request.urlopen(q,timeout=180) as r:
                       for line in r: print('SSE',line.decode().rstrip(),flush=True)
+          
+                  # Exercise the existing Studio transport from a pinned public source snapshot.
+                  subprocess.run([sys.executable,'-m','pip','install','--target',str(root/'deps'),'httpx','structlog'],check=True,stdout=subprocess.DEVNULL)
+                  sys.path.insert(0,str(root/'deps'))
+                  src=root/'studio-source'; src.mkdir(exist_ok=True)
+                  snapshot=root/'studio.tar.gz'
+                  urllib.request.urlretrieve('https://api.github.com/repos/unslothai/unsloth/tarball/318fcc97c9b6ed82a4e122a1ca483dfaee0089d7',snapshot)
+                  with tarfile.open(snapshot) as t: t.extractall(src,filter='data')
+                  backend=next(src.glob('*/studio/backend')); sys.path.insert(0,str(backend))
+                  import asyncio
+                  from core.inference.external_provider import ExternalProviderClient
+                  async def studio_probe():
+                      client=ExternalProviderClient('custom','http://127.0.0.1:18473/v1','throwaway-local-probe')
+                      chunks=[]
+                      async for line in client.stream_chat_completion(messages=body['messages'],model=name,max_tokens=32): chunks.append(line)
+                      print('STUDIO TRANSPORT',json.dumps(chunks),flush=True)
+                      assert any('[DONE]' in x for x in chunks)
+                  asyncio.run(studio_probe())
+                  # Close a long stream early, then check health and issue the next request.
+                  body['messages']=[{'role':'user','content':'Write a very long story about a village. Continue for at least 1000 words.'}]
+                  body['max_tokens']=1024; body['stream']=True
+                  q=urllib.request.Request('http://127.0.0.1:18473/v1/chat/completions',data=json.dumps(body).encode(),headers={'Authorization':'Bearer throwaway-local-probe','Content-Type':'application/json'})
+                  start=time.monotonic()
+                  with urllib.request.urlopen(q,timeout=180) as r:
+                      for line in r:
+                          if b'delta' in line: print('CANCEL FIRST CHUNK',line.decode().rstrip(),flush=True); break
+                  time.sleep(1)
+                  print('CANCEL HEALTH',flush=True); req('/v1/health')
+                  body['messages']=[{'role':'user','content':'Reply with exactly: resumed'}]; body['stream']=False; body['max_tokens']=16
+                  req('/v1/chat/completions',body,timeout=90)
+                  print('CANCEL FOLLOWUP ELAPSED',time.monotonic()-start,flush=True)
+                  # Unknown ids, context overflow, and prompt caps must not look like success.
+                  req('/v1/chat/completions',{**body,'model':'nonexistent-flm-model'},timeout=30)
+                  req('/v1/chat/completions',{**body,'messages':[{'role':'user','content':'word '*3500}]},timeout=90)
+                  req('/v1/chat/completions',{**body,'messages':[{'role':'user','content':'Count from 1 to 100.'}],'max_tokens':3},timeout=90)
+                  req('/v1/unload',{'model_name':name})
+                  req('/v1/load',{'model_name':name,'ctx_size':2048},timeout=90)
+                  h=req('/v1/health'); child_pid=h['all_models_loaded'][0]['pid']
+                  p.terminate()
+                  try: p.wait(timeout=20)
+                  except subprocess.TimeoutExpired: p.kill(); p.wait()
+                  time.sleep(2)
+                  if win: command(['powershell','-NoProfile','-Command',f'Get-Process -Id {child_pid} -ErrorAction SilentlyContinue | Select Id,ProcessName'])
+                  else: command(['ps','-p',str(child_pid),'-o','pid,ppid,stat,comm'])
+                  p=subprocess.Popen([str(exe),str(work),'--port','18473'],cwd=work,env=env,stdout=log,stderr=subprocess.STDOUT)
+                  time.sleep(3)
+                  req('/v1/health')
+                  req('/v1/load',{'model_name':name,'ctx_size':2048},timeout=90)
+                  req('/v1/chat/completions',body,timeout=90)
+          
                   req('/v1/unload',{'model_name':name})
                   req('/v1/health')
           except Exception: traceback.print_exc()
@@ -153,6 +203,56 @@ jobs:
                   q=urllib.request.Request('http://127.0.0.1:18473/v1/chat/completions',data=json.dumps(body).encode(),headers={'Authorization':'Bearer throwaway-local-probe','Content-Type':'application/json'})
                   with urllib.request.urlopen(q,timeout=180) as r:
                       for line in r: print('SSE',line.decode().rstrip(),flush=True)
+          
+                  # Exercise the existing Studio transport from a pinned public source snapshot.
+                  subprocess.run([sys.executable,'-m','pip','install','--target',str(root/'deps'),'httpx','structlog'],check=True,stdout=subprocess.DEVNULL)
+                  sys.path.insert(0,str(root/'deps'))
+                  src=root/'studio-source'; src.mkdir(exist_ok=True)
+                  snapshot=root/'studio.tar.gz'
+                  urllib.request.urlretrieve('https://api.github.com/repos/unslothai/unsloth/tarball/318fcc97c9b6ed82a4e122a1ca483dfaee0089d7',snapshot)
+                  with tarfile.open(snapshot) as t: t.extractall(src,filter='data')
+                  backend=next(src.glob('*/studio/backend')); sys.path.insert(0,str(backend))
+                  import asyncio
+                  from core.inference.external_provider import ExternalProviderClient
+                  async def studio_probe():
+                      client=ExternalProviderClient('custom','http://127.0.0.1:18473/v1','throwaway-local-probe')
+                      chunks=[]
+                      async for line in client.stream_chat_completion(messages=body['messages'],model=name,max_tokens=32): chunks.append(line)
+                      print('STUDIO TRANSPORT',json.dumps(chunks),flush=True)
+                      assert any('[DONE]' in x for x in chunks)
+                  asyncio.run(studio_probe())
+                  # Close a long stream early, then check health and issue the next request.
+                  body['messages']=[{'role':'user','content':'Write a very long story about a village. Continue for at least 1000 words.'}]
+                  body['max_tokens']=1024; body['stream']=True
+                  q=urllib.request.Request('http://127.0.0.1:18473/v1/chat/completions',data=json.dumps(body).encode(),headers={'Authorization':'Bearer throwaway-local-probe','Content-Type':'application/json'})
+                  start=time.monotonic()
+                  with urllib.request.urlopen(q,timeout=180) as r:
+                      for line in r:
+                          if b'delta' in line: print('CANCEL FIRST CHUNK',line.decode().rstrip(),flush=True); break
+                  time.sleep(1)
+                  print('CANCEL HEALTH',flush=True); req('/v1/health')
+                  body['messages']=[{'role':'user','content':'Reply with exactly: resumed'}]; body['stream']=False; body['max_tokens']=16
+                  req('/v1/chat/completions',body,timeout=90)
+                  print('CANCEL FOLLOWUP ELAPSED',time.monotonic()-start,flush=True)
+                  # Unknown ids, context overflow, and prompt caps must not look like success.
+                  req('/v1/chat/completions',{**body,'model':'nonexistent-flm-model'},timeout=30)
+                  req('/v1/chat/completions',{**body,'messages':[{'role':'user','content':'word '*3500}]},timeout=90)
+                  req('/v1/chat/completions',{**body,'messages':[{'role':'user','content':'Count from 1 to 100.'}],'max_tokens':3},timeout=90)
+                  req('/v1/unload',{'model_name':name})
+                  req('/v1/load',{'model_name':name,'ctx_size':2048},timeout=90)
+                  h=req('/v1/health'); child_pid=h['all_models_loaded'][0]['pid']
+                  p.terminate()
+                  try: p.wait(timeout=20)
+                  except subprocess.TimeoutExpired: p.kill(); p.wait()
+                  time.sleep(2)
+                  if win: command(['powershell','-NoProfile','-Command',f'Get-Process -Id {child_pid} -ErrorAction SilentlyContinue | Select Id,ProcessName'])
+                  else: command(['ps','-p',str(child_pid),'-o','pid,ppid,stat,comm'])
+                  p=subprocess.Popen([str(exe),str(work),'--port','18473'],cwd=work,env=env,stdout=log,stderr=subprocess.STDOUT)
+                  time.sleep(3)
+                  req('/v1/health')
+                  req('/v1/load',{'model_name':name,'ctx_size':2048},timeout=90)
+                  req('/v1/chat/completions',body,timeout=90)
+          
                   req('/v1/unload',{'model_name':name})
                   req('/v1/health')
           except Exception: traceback.print_exc()
