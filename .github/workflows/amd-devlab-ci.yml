@@ -122,8 +122,10 @@ jobs:
           # In the clone's own config: a -c on clone alone does not reach the checkout below.
           git config core.autocrlf false
           git checkout -q $env:BASE_SHA
-          git -c core.autocrlf=false apply --index "$env:GITHUB_WORKSPACE\harness\npu.patch"
-          if ($LASTEXITCODE -ne 0) { throw "patch did not apply" }
+          # The branch's changed files, whole: a patch fights the runner's line-ending conversion.
+          tar -xzf "$env:GITHUB_WORKSPACE\harness\npu-files.tar.gz"
+          if ($LASTEXITCODE -ne 0) { throw "files did not extract" }
+          git status --short | Select-Object -First 40
           $env:UNSLOTH_SKIP_AUTOSTART = '1'
           $ErrorActionPreference = 'Continue'
           powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install.log"
