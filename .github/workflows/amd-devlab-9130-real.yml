@@ -81,6 +81,9 @@ jobs:
           done
           [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
           echo "PY=$V/bin/python" >> "$GITHUB_ENV"
+          # The server imports core.inference.diffusion from the measured tree, unlike the
+          # stand-in, which imported nothing from Studio. Without this it dies at import.
+          echo "PYTHONPATH=$SRC/studio/backend" >> "$GITHUB_ENV"
           "$V/bin/python" -m pip install -q fastapi uvicorn
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
@@ -258,6 +261,12 @@ jobs:
           echo "BASE=$BASE" >> "$GITHUB_ENV"
           echo "RESULTS=$RESULTS" >> "$GITHUB_ENV"
 
+          # Fail loudly at import rather than 15s later as a mystery dead server: run 35916952454
+          # lost its whole matrix to a missing PYTHONPATH and only said so in a log tail.
+          "$PY" -c "import core.inference.diffusion; print('Studio backend importable')" || {
+            echo "FATAL: the Studio backend is not importable; PYTHONPATH=${PYTHONPATH:-unset}"
+            exit 1
+          }
           "$PY" "$AMD_CI_WORK/real_server.py" --port 8890 > "$AMD_CI_WORK/server.log" 2>&1 &
           SERVER_PID=$!
           echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
