@@ -249,6 +249,10 @@ def main() -> int:
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
         os.environ.pop(key, None)
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # The runners reach the hub through a caching mirror whose large-file reads time out at the
+    # default 10 s; read before huggingface_hub is first imported, which the selector below does.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
     t_start = time.time()
     obs: dict = {"state": args.state, "args": vars(args) | {"out": str(args.out)}}
@@ -280,23 +284,32 @@ def main() -> int:
 
     from huggingface_hub import hf_hub_download, snapshot_download
 
+    obs["hf_endpoint"] = os.environ.get("HF_ENDPOINT")
     t0 = time.time()
-    base_dl = attempt(
-        lambda: snapshot_download(
-            BASE_REPO,
-            local_dir = str(models / "qwen_image_21"),
-            allow_patterns = [
-                "model_index.json",
-                "processor/*",
-                "scheduler/*",
-                "text_encoder/*",
-                "transformer/*",
-                "vae/*",
-            ],
-            token = False,
+    tries: list = []
+    base_dl: dict = {"ok": False}
+    for i in range(6):
+        base_dl = attempt(
+            lambda: snapshot_download(
+                BASE_REPO,
+                local_dir = str(models / "qwen_image_21"),
+                allow_patterns = [
+                    "model_index.json",
+                    "processor/*",
+                    "scheduler/*",
+                    "text_encoder/*",
+                    "transformer/*",
+                    "vae/*",
+                ],
+                token = False,
+                max_workers = 4,
+            )
         )
-    )
-    obs["download_base"] = {**base_dl, "seconds": round(time.time() - t0, 1)}
+        tries.append(base_dl.get("ok") or (base_dl.get("error") or {}).get("message", "")[:200])
+        if base_dl["ok"]:
+            break
+        time.sleep(20)
+    obs["download_base"] = {**base_dl, "seconds": round(time.time() - t0, 1), "tries": tries}
     write(args.out, obs)
     if not base_dl["ok"]:
         return 0
@@ -415,9 +428,19 @@ def main() -> int:
         elif arm == "gguf_q4km":
             from diffusers import GGUFQuantizationConfig
 
-            path = hf_hub_download(
-                GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
-            )
+            path = None
+            for _ in range(4):
+                try:
+                    path = hf_hub_download(
+                        GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
+                    )
+                    break
+                except Exception:  # noqa: BLE001 - the mirror times out; resumed below
+                    time.sleep(20)
+            if path is None:
+                path = hf_hub_download(
+                    GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
+                )
             from core.inference import diffusion as studio
             import logging
 
