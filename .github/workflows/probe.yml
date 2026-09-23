@@ -27,14 +27,21 @@ jobs:
           dmesg 2>/dev/null | grep -i xdna | tail -20 || true
           grep -o 'amd_iommu=[^ ]*' /proc/cmdline || true
       - name: Probe
-        env:
-          PROBE_MODELS: ${{ '' }}
         run: |
           export FLM_MODEL_PATH="$RUNNER_TEMP/flmhome"; mkdir -p "$FLM_MODEL_PATH"
           export HF_HOME="$RUNNER_TEMP/hf"
           curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/$GITHUB_SHA/probe.py" -o "$RUNNER_TEMP/probe.py"
           python3 "$RUNNER_TEMP/probe.py"
-          echo "--- post: memlock of flm children, FLM home"; ls -laR "$FLM_MODEL_PATH" | head -40; ls -la ~/.config/flm 2>/dev/null | head; du -sh ~/.flm ~/.config/flm 2>/dev/null || true
+          echo "--- FLM home"; du -sh "$FLM_MODEL_PATH"/* "$FLM_MODEL_PATH"/*/* 2>/dev/null | head -20; du -sh ~/.flm ~/.config/flm 2>/dev/null || true
+          cp "$RUNNER_TEMP"/lemo/*.log "$RUNNER_TEMP"/lemo/probe.json "$RUNNER_TEMP"/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-probe
+          path: |
+            ${{ runner.temp }}/probe.json
+            ${{ runner.temp }}/lemond.log
+            ${{ runner.temp }}/lemond2.log
 
   windows:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
@@ -59,4 +66,13 @@ jobs:
           python "$env:RUNNER_TEMP\probe.py"
           Get-ChildItem -Recurse $env:FLM_MODEL_PATH -ErrorAction SilentlyContinue | Select -First 40 FullName, Length
           Get-ChildItem "$env:USERPROFILE\.flm","$env:USERPROFILE\Documents\flm" -ErrorAction SilentlyContinue | Select FullName
+          Copy-Item "$env:RUNNER_TEMP\lemo\*.log","$env:RUNNER_TEMP\lemo\probe.json" "$env:RUNNER_TEMP\" -ErrorAction SilentlyContinue
           exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-probe
+          path: |
+            ${{ runner.temp }}/probe.json
+            ${{ runner.temp }}/lemond.log
+            ${{ runner.temp }}/lemond2.log

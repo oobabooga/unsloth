@@ -12,7 +12,9 @@ OUT = {}
 
 def rec(k, v):
     OUT[k] = v
-    print(f"=== {k}\n{json.dumps(v, indent=1)[:6000]}", flush=True)
+    print(f"=== {k}\n{json.dumps(v)[:1500]}", flush=True)
+    with open(os.path.join(ROOT, "probe.json"), "w") as f:
+        json.dump(OUT, f, indent=1)
 
 
 def req(method, path, body=None, timeout=1800, auth=True, raw=False):
@@ -172,6 +174,9 @@ def main():
             res["stream"] = stream_chat(m, {"messages": [{"role": "user", "content": "Write a 200-word story about a lighthouse."}], "max_tokens": 600, "temperature": 0.7, "top_p": 0.9, "top_k": 20, "min_p": 0.0, "repeat_penalty": 1.05, "presence_penalty": 0.0})
             res["stats2"] = req("GET", "/v1/stats")
             res["nothink"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What is 17*3? Answer briefly."}], "max_tokens": 300, "chat_template_kwargs": {"enable_thinking": False}})
+            res["think_true"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What is 17*3?"}], "max_tokens": 800, "think": True})
+            res["effort_low"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What is 17*3?"}], "max_tokens": 800, "reasoning_effort": "low"})
+            res["think_stream"] = stream_chat(m, {"messages": [{"role": "user", "content": "What is 17*3?"}], "max_tokens": 800, "chat_template_kwargs": {"enable_thinking": True}})
             res["stop"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}], "max_tokens": 400, "stop": ["7"]})
             res["tools"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What's the weather in Paris? Use the tool."}], "max_tokens": 600,
                                 "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]})
@@ -207,9 +212,35 @@ def main():
             res["unload"] = req("POST", "/v1/unload", {"model_name": m})
             res["health_after"] = req("GET", "/v1/health")
             rec(f"model:{ck}", res)
+        # streaming pull progress format
+        try:
+            rr = urllib.request.Request(BASE + "/v1/pull", data=json.dumps({"model_name": "lfm2.5-it-1.2b-FLM", "stream": True}).encode(), method="POST")
+            rr.add_header("Authorization", f"Bearer {KEY}"); rr.add_header("Content-Type", "application/json")
+            lines = []
+            with urllib.request.urlopen(rr, timeout=900) as resp:
+                for raw in resp:
+                    t = raw.decode("utf-8", "replace").strip()
+                    if t: lines.append(t[:300])
+            rec("pull_stream", {"n": len(lines), "head": lines[:8], "tail": lines[-6:]})
+        except Exception as e:
+            rec("pull_stream", {"error": repr(e)})
+        rec("downloads", req("GET", "/v1/downloads"))
         rec("flm_list_installed", run([flm_exe, "list", "--filter", "installed", "--json", "--quiet"]) if flm_exe else None)
     finally:
         proc.terminate()
+        try:
+            proc.wait(20)
+        except Exception:
+            proc.kill()
+        # restart: persistence of downloaded flags and FLM backend
+        log2 = open(os.path.join(ROOT, "lemond2.log"), "w")
+        p2 = subprocess.Popen([exe, d, "--port", str(PORT), "--no-broadcast"], cwd=d, env=env, stdout=log2, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if req("GET", "/live", auth=False, timeout=5).get("status") == 200: break
+            time.sleep(0.5)
+        mm = req("GET", "/v1/models")
+        rec("restart_models", [(m["id"], m.get("downloaded")) for m in (mm.get("json") or {}).get("data", []) if m.get("recipe") == "flm"])
+        proc = p2
         try:
             proc.wait(20)
         except Exception:
