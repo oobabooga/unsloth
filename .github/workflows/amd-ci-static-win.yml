@@ -1,12 +1,12 @@
-name: "AMD CI: First-Block-Cache on Qwen-Image-2.1 (PR 11713, Windows)"
+name: "AMD CI: static step skip on Qwen-Image-2.1 (PR 11737, Windows)"
 
-# Windows counterpart of amd-ci-fbcache.yml on the non-Docker gfx1151 runners with AMD's gfx1151
+# Windows counterpart of amd-ci-static.yml on the non-Docker gfx1151 runners with AMD's gfx1151
 # torch wheels. Both checkouts get PR 11640 applied (the Windows ROCm torchao stub fix), without
 # which Studio cannot import there. No HF token is used anywhere.
 
 on:
   push:
-    branches: [amd-ci-fbcache-win]
+    branches: [amd-ci-static-win]
   workflow_dispatch:
 
 permissions:
@@ -14,13 +14,13 @@ permissions:
 
 env:
   SRC_REPO: "https://github.com/unslothai/unsloth"
-  HEAD_BRANCH: "studio-prefix-kv-fbcache"
+  HEAD_BRANCH: "studio-static-step-skip"
   BASE_BRANCH: "main"
 
 jobs:
 
   windows:
-    name: "fbcache on gfx1151 Windows"
+    name: "static skip on gfx1151 Windows"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 330
     concurrency:
@@ -35,7 +35,7 @@ jobs:
 
       - name: Preamble
         run: |
-          .\amd_ci\lib\preamble.ps1 -Name "fbcache-windows"
+          .\amd_ci\lib\preamble.ps1 -Name "static-windows"
 
       - name: Locate the system Python
         run: |
@@ -92,15 +92,15 @@ jobs:
           $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
           & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\fbcache_e2e_probe.py" `
             --head "$env:AMD_CI_WORK\src\head" --base "$env:AMD_CI_WORK\src\base" `
-            --out-dir "$env:AMD_CI_WORK\out\e2e" --models "$env:AMD_CI_WORK\models" --steps 20 --prompts 3
-          "### Qwen-Image-2.1, fbcache vs uncached, eager (Windows)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            --out-dir "$env:AMD_CI_WORK\out\e2e" --models "$env:AMD_CI_WORK\models" --steps 25 --prompts 3 --cache static
+          "### Qwen-Image-2.1, static skip vs uncached, eager (Windows)" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:AMD_CI_WORK\out\e2e\SUMMARY.md" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fbcache-windows
+          name: static-windows
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn

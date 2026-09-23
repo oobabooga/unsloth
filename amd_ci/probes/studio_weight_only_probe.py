@@ -314,6 +314,12 @@ def main() -> int:
                 "path": path.name,
                 "mean_luma": round(float(np.asarray(image.convert("L"), dtype = np.float32).mean()), 2),
             }
+            try:
+                stats = backend.status().get("transformer_cache_stats")
+                if stats:
+                    item["cache_stats"] = stats.get("stats")
+            except Exception:  # noqa: BLE001 - a status field older checkouts do not have
+                pass
             rec["images"].append(item)
             write(args.out, obs)
         try:
