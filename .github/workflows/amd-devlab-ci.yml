@@ -1,0 +1,156 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-npu-e2e]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 00693c6f72
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install Studio from the patched checkout
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/npu-e2e-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "HF_HOME=$W/hf" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$W/uv" >> "$GITHUB_ENV"
+          echo "UNSLOTH_STUDIO_HOME=$W/studio" >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git checkout -q "$BASE_SHA"
+          git apply --index "$GITHUB_WORKSPACE/harness/npu.patch"
+          git -c user.name=ci -c user.email=ci@example.invalid commit -q -m npu
+          uname -a; ulimit -l; ls -l /dev/accel* || true
+          UNSLOTH_SKIP_AUTOSTART=1 ./install.sh --local --no-torch --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -40 "$W/install.log"
+      - name: NPU end to end
+        run: |
+          set -uxo pipefail
+          cd "$W/src"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PW="npu-e2e-$GITHUB_RUN_ID-Pw1"
+          start() {
+            PORT=$(shuf -i 18800-18899 -n 1)
+            echo "PORT=$PORT"
+            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --api-only --password "$PW" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
+            for i in $(seq 1 180); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+            curl -s "http://127.0.0.1:$PORT/api/health"; echo
+          }
+          procs() { echo "== $1"; pgrep -af 'lemond|flm-real|/flm ' | grep -v pgrep || echo "no lemond/flm processes"; }
+          start main
+          python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-main.json" --phase main
+          procs "with a model loaded"
+          python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-shutdown.json" --phase shutdown
+          for i in $(seq 1 60); do kill -0 "$(cat "$W/studio.pid")" 2>/dev/null || break; sleep 1; done
+          sleep 3
+          procs "after graceful shutdown"
+          start restart
+          python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-restart.json" --phase after-restart
+          procs "before SIGKILL"
+          kill -KILL "$(cat "$W/studio.pid")"
+          sleep 8
+          procs "after SIGKILL of Studio"
+          echo "======== studio-main.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-main.log" | tail -120
+          echo "======== studio-restart.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-restart.log" | tail -60
+          python3 - "$W" <<'PY'
+          import json, sys, pathlib
+          w = pathlib.Path(sys.argv[1])
+          bad = 0
+          for name in ("e2e-main.json", "e2e-shutdown.json", "e2e-restart.json"):
+              p = w / name
+              rows = json.loads(p.read_text()) if p.exists() else []
+              fails = [r["name"] for r in rows if not r["ok"]]
+              bad += len(fails) + (0 if rows else 1)
+              print(f"{name}: {len(rows) - len(fails)}/{len(rows)} passed", fails)
+          sys.exit(1 if bad else 0)
+          PY
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install Studio from the patched checkout
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "npu-e2e-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\tmp","$W\hf","$W\uv" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
+          git -c core.autocrlf=false clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          Set-Location "$W\src"
+          git checkout -q $env:BASE_SHA
+          git -c core.autocrlf=false apply --index "$env:GITHUB_WORKSPACE\harness\npu.patch"
+          if ($LASTEXITCODE -ne 0) { throw "patch did not apply" }
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          $ErrorActionPreference = 'Continue'
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\install.log" -Tail 60
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+      - name: NPU end to end
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = $env:W
+          Set-Location "$W\src"
+          $PY = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          $PW = "npu-e2e-$env:GITHUB_RUN_ID-Pw1"
+          function Start-Studio($tag) {
+            $script:PORT = Get-Random -Minimum 18800 -Maximum 18899
+            $script:proc = Start-Process -FilePath $PY -ArgumentList 'run.py','--host','127.0.0.1','--port',"$script:PORT",'--api-only','--password',$PW -WorkingDirectory "$W\src\studio\backend" -RedirectStandardOutput "$W\studio-$tag.out" -RedirectStandardError "$W\studio-$tag.err" -PassThru -WindowStyle Hidden
+            for ($i = 0; $i -lt 240; $i++) { try { Invoke-RestMethod "http://127.0.0.1:$script:PORT/api/health" | Out-Null; break } catch { Start-Sleep 1 } }
+            Write-Host "Studio pid $($script:proc.Id) port $script:PORT"
+          }
+          function Show-Procs($label) {
+            Write-Host "== $label"
+            $p = Get-Process | Where-Object { $_.ProcessName -match '^(lemond|flm)$' }
+            if ($p) { $p | Format-Table Id, ProcessName, WorkingSet64 | Out-String | Write-Host } else { Write-Host "no lemond/flm processes" }
+          }
+          Start-Studio 'main'
+          python "$env:GITHUB_WORKSPACE\harness\npu_e2e.py" "http://127.0.0.1:$PORT" $PW "$W\e2e-main.json" --phase main
+          Show-Procs 'with a model loaded'
+          python "$env:GITHUB_WORKSPACE\harness\npu_e2e.py" "http://127.0.0.1:$PORT" $PW "$W\e2e-shutdown.json" --phase shutdown
+          $proc.WaitForExit(90000) | Out-Null
+          Start-Sleep 5
+          Show-Procs 'after graceful shutdown'
+          Start-Studio 'restart'
+          python "$env:GITHUB_WORKSPACE\harness\npu_e2e.py" "http://127.0.0.1:$PORT" $PW "$W\e2e-restart.json" --phase after-restart
+          Show-Procs 'before a forced kill'
+          Stop-Process -Id $proc.Id -Force
+          Start-Sleep 8
+          Show-Procs 'after Stop-Process -Force of Studio'
+          Write-Host '======== studio-main (NPU lines)'
+          Select-String -Path "$W\studio-main.out","$W\studio-main.err" -Pattern 'npu|lemonade|fastflowlm|error|traceback' | Select-Object -Last 120 | ForEach-Object { $_.Line }
+          Get-Process | Where-Object { $_.ProcessName -match '^(lemond|flm)$' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          $bad = 0
+          foreach ($name in 'e2e-main.json','e2e-shutdown.json','e2e-restart.json') {
+            $p = "$W\$name"
+            if (Test-Path $p) {
+              $rows = Get-Content $p -Raw | ConvertFrom-Json
+              $fails = @($rows | Where-Object { -not $_.ok } | ForEach-Object { $_.name })
+              Write-Host "$name : $(@($rows).Count - $fails.Count)/$(@($rows).Count) passed $($fails -join '; ')"
+              $bad += $fails.Count
+            } else { Write-Host "$name missing"; $bad += 1 }
+          }
+          exit $bad

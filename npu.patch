@@ -1,0 +1,4479 @@
+From 47158cd479e4897a7c35bba0fea04cc9df7735a9 Mon Sep 17 00:00:00 2001
+From: oobabooga <112222186+oobabooga@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 14:31:33 -0300
+Subject: [PATCH] Studio: add chat on the AMD Ryzen AI NPU through Lemonade and
+ FastFlowLM
+
+---
+ pyproject.toml                                |   1 +
+ .../core/inference/external_provider.py       |  52 +-
+ .../backend/core/inference/lemonade_server.py | 300 ++++++++++
+ studio/backend/core/inference/npu_backend.py  | 551 ++++++++++++++++++
+ studio/backend/core/inference/providers.py    |  27 +-
+ studio/backend/main.py                        |   2 +
+ studio/backend/models/inference.py            |   4 +
+ studio/backend/routes/inference.py            | 529 ++++++++++++++++-
+ studio/backend/routes/npu.py                  |  82 +++
+ studio/backend/routes/providers.py            |   9 +-
+ studio/backend/run.py                         |   9 +
+ studio/backend/tests/fixtures/fake_lemond.py  | 188 ++++++
+ studio/backend/tests/test_npu_backend.py      | 249 ++++++++
+ studio/backend/tests/test_npu_chat_route.py   | 409 +++++++++++++
+ studio/backend/tests/test_npu_detect.py       |  90 +++
+ studio/backend/utils/hardware/npu.py          | 134 +++++
+ .../frontend/src/features/chat/chat-page.tsx  |   7 +
+ .../chat/hooks/use-chat-model-runtime.ts      |  97 +++
+ .../frontend/src/features/chat/types/api.ts   |   3 +
+ .../components/model-selector.tsx             |  87 ++-
+ studio/frontend/src/features/npu/api.ts       | 148 +++++
+ studio/frontend/src/features/npu/index.ts     |  11 +
+ .../src/features/npu/npu-model-panel.tsx      | 288 +++++++++
+ .../src/features/npu/use-npu-status.ts        |  45 ++
+ studio/frontend/tests/npu-api.test.ts         |  91 +++
+ studio/install_lemonade_prebuilt.py           | 226 +++++++
+ studio/lemonade_prebuilt_pins.json            |  33 ++
+ .../install/test_install_lemonade_prebuilt.py | 160 +++++
+ 28 files changed, 3793 insertions(+), 39 deletions(-)
+ create mode 100644 studio/backend/core/inference/lemonade_server.py
+ create mode 100644 studio/backend/core/inference/npu_backend.py
+ create mode 100644 studio/backend/routes/npu.py
+ create mode 100644 studio/backend/tests/fixtures/fake_lemond.py
+ create mode 100644 studio/backend/tests/test_npu_backend.py
+ create mode 100644 studio/backend/tests/test_npu_chat_route.py
+ create mode 100644 studio/backend/tests/test_npu_detect.py
+ create mode 100644 studio/backend/utils/hardware/npu.py
+ create mode 100644 studio/frontend/src/features/npu/api.ts
+ create mode 100644 studio/frontend/src/features/npu/index.ts
+ create mode 100644 studio/frontend/src/features/npu/npu-model-panel.tsx
+ create mode 100644 studio/frontend/src/features/npu/use-npu-status.ts
+ create mode 100644 studio/frontend/tests/npu-api.test.ts
+ create mode 100644 studio/install_lemonade_prebuilt.py
+ create mode 100644 studio/lemonade_prebuilt_pins.json
+ create mode 100644 tests/studio/install/test_install_lemonade_prebuilt.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 075a2366cd..aef512b126 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -55,6 +55,7 @@ studio = [
+     "*.ps1",
+     "*.bat",
+     "node_prebuilt_pins.json",
++    "lemonade_prebuilt_pins.json",
+     "src-tauri/icons/icon.icns",
+     "src-tauri/icons/icon.png",
+     "frontend/dist/**/*",
+diff --git a/studio/backend/core/inference/external_provider.py b/studio/backend/core/inference/external_provider.py
+index 5eaea65e7a..a966825f32 100644
+--- a/studio/backend/core/inference/external_provider.py
++++ b/studio/backend/core/inference/external_provider.py
+@@ -34,7 +34,7 @@ from core.inference.sse_control_frames import sanitize_provider_sse_line
+ # templated just like an in-process one (#7066). "custom" is a user-supplied OpenAI-compatible base_url, i.e. how a
+ # self-hosted vLLM or llama.cpp registers without its preset. Unknown endpoint means assume a template applies:
+ # sweeping a hosted API costs a space in delimiter-like text, not sweeping a local one costs a forged turn.
+-_TEMPLATE_APPLYING_PROVIDERS = frozenset({"vllm", "llama_cpp", "ollama", "custom"})
++_TEMPLATE_APPLYING_PROVIDERS = frozenset({"vllm", "llama_cpp", "ollama", "custom", "lemonade"})
+ 
+ # The subset documenting "continue_final_message" + "add_generation_prompt" on /v1/chat/completions.
+ _CONTINUATION_FLAG_PROVIDERS = frozenset({"vllm", "llama_cpp"})
+@@ -43,7 +43,7 @@ _CONTINUATION_FLAG_PROVIDERS = frozenset({"vllm", "llama_cpp"})
+ # providers report no llama.cpp timings either, so the monitor has no token count to derive a speed from. Same caution
+ # as the flag above: "custom" is any user-supplied base_url and a strict endpoint 400s on an unknown field. "openai"
+ # is absent because it routes to /v1/responses, which reports usage on its own.
+-_USAGE_STREAM_OPTION_PROVIDERS = frozenset({"vllm", "openrouter", "kimi"})
++_USAGE_STREAM_OPTION_PROVIDERS = frozenset({"vllm", "openrouter", "kimi", "lemonade"})
+ 
+ # llama-server reads repeat_penalty, not repetition_penalty (as routes/inference does).
+ _REPETITION_PENALTY_BODY_KEY = {"llama_cpp": "repeat_penalty"}
+@@ -1287,14 +1287,20 @@ class ExternalProviderClient:
+         base_url: str,
+         api_key: str,
+         timeout: float = 120.0,
++        *,
++        managed_loopback: bool = False,
+     ):
+         self.provider_type = provider_type
+         # Single choke point for every outbound provider request (chat, models, responses, messages, containers): the
+         # URL is caller-controlled, so it is validated here even when a route already checked it. Routes turn the
+-        # ValueError into a 400; reaching it here means a caller bypassed them.
++        # ValueError into a 400; reaching it here means a caller bypassed them. The NPU's lemond is not
++        # caller-controlled: Unsloth started it on loopback, and the private-address policy for managed accounts
++        # must not lock them out of the local model.
+         from core.inference.providers import validate_provider_base_url
+ 
+-        self.base_url = validate_provider_base_url(base_url)
++        self.base_url = (
++            base_url.rstrip("/") if managed_loopback else validate_provider_base_url(base_url)
++        )
+         # Strip a legacy `/openai` suffix from Google-hosted bases so configs saved before the native switch still
+         # route correctly. Custom proxy paths ending in `/openai` are left untouched.
+         if self.provider_type == "gemini":
+@@ -1575,6 +1581,8 @@ class ExternalProviderClient:
+                 body["reasoning_effort"] = effort
+         elif self.provider_type == "ollama":
+             _apply_ollama_reasoning_controls(body, enable_thinking, reasoning_effort)
++        elif self.provider_type == "lemonade":
++            _apply_fastflowlm_reasoning_controls(body, enable_thinking, reasoning_effort)
+ 
+         # OpenRouter's unified `reasoning` field gates per-model thinking. Some routes
+         # (`*_MANDATORY_REASONING_MODELS`) 400 on explicit off.
+@@ -1813,6 +1821,11 @@ class ExternalProviderClient:
+                                                         continue
+                                                     for ann in envelope.get("annotations") or []:
+                                                         _record_or_url_citation(ann)
++                        # FastFlowLM reports an NPU fault mid-stream as a bare JSON line with no "data:" prefix (seen:
++                        # {"error":"qds_device::wait() unexpected command state"}). SSE readers skip that as an
++                        # unknown field and the reply just ends, so restate it as a data line.
++                        if self.provider_type == "lemonade" and line.startswith("{"):
++                            line = _bare_json_error_as_sse(line) or line
+                         # Verbatim relay, minus Unsloth's own UI control protocol: the frames this server writes to
+                         # paint tool cards ride the same stream, so an endpoint that echoes them forges a card for a
+                         # tool that never ran.
+@@ -6892,6 +6905,37 @@ _ANTHROPIC_ERROR_STATUS = {
+ }
+ 
+ 
++def _apply_fastflowlm_reasoning_controls(
++    body: dict[str, Any], enable_thinking: Optional[bool], reasoning_effort: Optional[str]
++) -> None:
++    """FastFlowLM's own ``think`` switch; it reads neither enable_thinking nor chat_template_kwargs.
++
++    Without an explicit ``think`` a reasoning model decides for itself, and a reply cut off by the
++    token limit keeps the raw ``<think>`` block in ``content``. ``reasoning_effort`` passes only
++    as a level (gpt-oss reads it); ``none`` means thinking off."""
++    effort = (reasoning_effort or "").strip().lower()
++    if effort == "none":
++        body["think"] = False
++        return
++    if enable_thinking is not None:
++        body["think"] = bool(enable_thinking)
++    if effort in ("low", "medium", "high") and body.get("think", True):
++        body["reasoning_effort"] = effort
++
++
++def _bare_json_error_as_sse(line: str) -> Optional[str]:
++    try:
++        parsed = _json.loads(line)
++    except ValueError:
++        return None
++    if not isinstance(parsed, dict) or "error" not in parsed:
++        return None
++    error = parsed["error"]
++    if not isinstance(error, dict):
++        error = {"message": str(error), "type": "provider_error"}
++    return "data: " + _json.dumps({"error": error})
++
++
+ def _error_sse_line(
+     status_code: int,
+     message: str,
+diff --git a/studio/backend/core/inference/lemonade_server.py b/studio/backend/core/inference/lemonade_server.py
+new file mode 100644
+index 0000000000..6b98dc9193
+--- /dev/null
++++ b/studio/backend/core/inference/lemonade_server.py
+@@ -0,0 +1,300 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""A private ``lemond`` (Lemonade Server) child that runs FastFlowLM on the AMD NPU.
++
++Unsloth owns this process the way it owns llama-server: loopback only, a free port chosen at
++start, and an API key minted per start so no other process on the machine can drive it. lemond in
++turn starts ``flm serve`` for the loaded model, so everything that stops lemond stops the whole
++tree: on Windows a force-killed lemond leaves ``flm.exe`` running with the model in memory, and
++``terminate_pid`` reaches descendants there. On Linux lemond arms PR_SET_PDEATHSIG on its own
++children, so flm exits with it.
++
++State lives in two directories Unsloth owns: ``cache_dir`` (lemond's downloaded FastFlowLM build)
++and ``config_dir`` (``config.json``). FastFlowLM's model files go to ``flm_model_dir`` through
++``FLM_MODEL_PATH``, which keeps them apart from any separately installed FastFlowLM, whose
++versions can delete each other's models (lemonade-sdk/lemonade#3375).
++
++Import-light on purpose: no torch or transformers.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import secrets
++import socket
++import subprocess
++import threading
++import time
++from collections import deque
++from pathlib import Path
++from typing import Any, Optional
++
++import httpx
++
++from utils.native_path_leases import child_env_without_native_path_secret
++from utils.process_lifetime import (
++    adopt_pid,
++    child_popen_kwargs,
++    is_process_shutting_down,
++    spawn_on_lifetime_thread,
++    terminate_pid,
++)
++from utils.subprocess_compat import windows_hidden_subprocess_kwargs
++
++logger = logging.getLogger(__name__)
++
++_TRANSPORT_ERRORS = (
++    httpx.ConnectError,
++    httpx.ReadError,
++    httpx.RemoteProtocolError,
++    httpx.WriteError,
++)
++
++# Written into config.json before every start. lemond announces itself on the LAN by default,
++# checks for model updates, and scans the user's Hugging Face cache for GGUFs under
++# models_dir "auto"; none of that belongs in a private child.
++_CONFIG_OVERRIDES: dict[str, Any] = {
++    "broadcast": False,
++    "auto_check_model_updates": False,
++    "auto_update_models": False,
++    "log_file": "disabled",
++    "host": "127.0.0.1",
++    "max_loaded_models": 1,
++}
++
++
++class LemonadeUnavailable(RuntimeError):
++    """lemond is not running or stopped answering."""
++
++
++class LemonadeServer:
++    def __init__(
++        self, binary: Path, *, cache_dir: Path, config_dir: Path, flm_model_dir: Path
++    ) -> None:
++        self.binary = Path(binary)
++        self.cache_dir = Path(cache_dir)
++        self.config_dir = Path(config_dir)
++        self.flm_model_dir = Path(flm_model_dir)
++        self.port: Optional[int] = None
++        self.api_key: Optional[str] = None
++        self._process: Optional[subprocess.Popen] = None
++        self._tail: deque[str] = deque(maxlen = 200)
++        self._drain_thread: Optional[threading.Thread] = None
++        self._lock = threading.Lock()
++        self._client = httpx.Client(timeout = 30.0, trust_env = False)
++
++    @property
++    def base_url(self) -> str:
++        return f"http://127.0.0.1:{self.port}"
++
++    @property
++    def pid(self) -> Optional[int]:
++        return self._process.pid if self._process is not None else None
++
++    def is_alive(self) -> bool:
++        return self._process is not None and self._process.poll() is None
++
++    def log_tail(self, lines: int = 30) -> str:
++        return "\n".join(list(self._tail)[-lines:])
++
++    def headers(self) -> dict[str, str]:
++        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
++
++    @staticmethod
++    def _find_free_port() -> int:
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++            s.bind(("127.0.0.1", 0))
++            return int(s.getsockname()[1])
++
++    def _write_config(self) -> None:
++        self.config_dir.mkdir(parents = True, exist_ok = True)
++        path = self.config_dir / "config.json"
++        try:
++            config = json.loads(path.read_text(encoding = "utf-8"))
++            if not isinstance(config, dict):
++                config = {}
++        except (OSError, ValueError):
++            config = {}
++        config.update(_CONFIG_OVERRIDES)
++        config["models_dir"] = str(self.cache_dir / "models")
++        config.setdefault("flm", {})["prefer_system"] = False
++        tmp = path.with_suffix(".json.tmp")
++        tmp.write_text(json.dumps(config, indent = 2) + "\n", encoding = "utf-8")
++        tmp.replace(path)
++
++    def start(self, timeout: float = 60.0) -> None:
++        """Spawn lemond and block until it answers an authenticated request.
++
++        The authenticated ``/v1/health`` is the ownership check as well as the readiness one: only
++        the lemond started with this key accepts it, so another server that grabbed the port in
++        the window between choosing it and binding it cannot pass."""
++        with self._lock:
++            if self.is_alive():
++                return
++            if is_process_shutting_down():
++                raise LemonadeUnavailable("Unsloth is shutting down; not starting Lemonade.")
++            self.cache_dir.mkdir(parents = True, exist_ok = True)
++            self.flm_model_dir.mkdir(parents = True, exist_ok = True)
++            self._write_config()
++            port = self._find_free_port()
++            api_key = secrets.token_urlsafe(32)
++            env = child_env_without_native_path_secret()
++            env["LEMONADE_API_KEY"] = api_key
++            env["FLM_MODEL_PATH"] = str(self.flm_model_dir)
++            env["FLM_DISABLE_UPDATE_CHECK"] = "1"
++            cmd = [
++                str(self.binary),
++                str(self.cache_dir),
++                str(self.config_dir),
++                "--port",
++                str(port),
++                "--host",
++                "127.0.0.1",
++                "--no-broadcast",
++                "--log-file",
++                "disabled",
++            ]
++            logger.info("Starting Lemonade: %s", " ".join(cmd))
++            self._tail.clear()
++
++            def _spawn() -> subprocess.Popen:
++                return subprocess.Popen(
++                    cmd,
++                    cwd = str(self.binary.parent),
++                    stdout = subprocess.PIPE,
++                    stderr = subprocess.STDOUT,
++                    stdin = subprocess.DEVNULL,
++                    text = True,
++                    encoding = "utf-8",
++                    errors = "replace",
++                    env = env,
++                    **windows_hidden_subprocess_kwargs(),
++                    **child_popen_kwargs(),
++                )
++
++            proc = spawn_on_lifetime_thread(_spawn)
++            adopt_pid(proc.pid)
++            self._process = proc
++            self.port = port
++            self.api_key = api_key
++            self._drain_thread = threading.Thread(
++                target = self._drain, args = (proc,), daemon = True, name = "lemond-drain"
++            )
++            self._drain_thread.start()
++            if not self._wait_ready(timeout):
++                tail = self.log_tail()
++                self._kill_locked()
++                raise LemonadeUnavailable(f"Lemonade did not start. Last output:\n{tail}")
++
++    def _drain(self, proc: subprocess.Popen) -> None:
++        try:
++            assert proc.stdout is not None
++            for raw in proc.stdout:
++                line = raw.rstrip()
++                if line:
++                    self._tail.append(line)
++                    logger.debug("[lemond] %s", line)
++        except Exception:  # noqa: BLE001 -- the pipe closes at teardown
++            pass
++
++    def _wait_ready(self, timeout: float) -> bool:
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            if not self.is_alive():
++                return False
++            try:
++                response = self._client.get(
++                    f"{self.base_url}/v1/health", headers = self.headers(), timeout = 2.0
++                )
++                if response.status_code == 200:
++                    return True
++            except (*_TRANSPORT_ERRORS, httpx.TimeoutException):
++                pass
++            time.sleep(0.25)
++        return False
++
++    def request(
++        self,
++        method: str,
++        path: str,
++        *,
++        json_body: Optional[dict] = None,
++        timeout: float = 60.0,
++    ) -> httpx.Response:
++        if not self.is_alive():
++            raise LemonadeUnavailable("Lemonade is not running.")
++        try:
++            return self._client.request(
++                method,
++                f"{self.base_url}{path}",
++                json = json_body,
++                headers = self.headers(),
++                timeout = timeout,
++            )
++        except (*_TRANSPORT_ERRORS, httpx.TimeoutException) as exc:
++            detail = (
++                "" if self.is_alive() else f" (process exited). Last output:\n{self.log_tail()}"
++            )
++            raise LemonadeUnavailable(f"Lemonade request {path} failed: {exc}{detail}") from exc
++
++    def stream(
++        self,
++        method: str,
++        path: str,
++        *,
++        json_body: dict,
++        timeout: float = 3600.0,
++    ):
++        """``httpx.Client.stream`` against lemond, for server-sent progress."""
++        if not self.is_alive():
++            raise LemonadeUnavailable("Lemonade is not running.")
++        return self._client.stream(
++            method,
++            f"{self.base_url}{path}",
++            json = json_body,
++            headers = self.headers(),
++            timeout = httpx.Timeout(timeout, connect = 10.0, read = timeout),
++        )
++
++    def stop(self) -> None:
++        """Unload, then stop lemond and every process under it. Idempotent."""
++        with self._lock:
++            if self.is_alive():
++                try:
++                    self._client.post(
++                        f"{self.base_url}/v1/unload",
++                        json = {},
++                        headers = self.headers(),
++                        timeout = 10.0,
++                    )
++                except Exception:  # noqa: BLE001 -- the kill below still runs
++                    pass
++            self._kill_locked()
++
++    def _kill_locked(self) -> None:
++        proc = self._process
++        if proc is None:
++            return
++        try:
++            # The tree, not just lemond: flm.exe survives its parent on Windows. terminate_pid
++            # keeps the record when part of the tree is still standing, for the exit sweep.
++            terminate_pid(proc.pid, timeout = 10.0, owner_verified = True)
++            proc.wait(timeout = 10)
++        except Exception as exc:  # noqa: BLE001 -- best-effort teardown
++            logger.warning("Error stopping Lemonade: %s", exc)
++        finally:
++            self._process = None
++            self.port = None
++            self.api_key = None
++            if self._drain_thread is not None:
++                self._drain_thread.join(timeout = 2)
++                self._drain_thread = None
++
++    def close(self) -> None:
++        self.stop()
++        try:
++            self._client.close()
++        except Exception:  # noqa: BLE001
++            pass
+diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
+new file mode 100644
+index 0000000000..96abfe380e
+--- /dev/null
++++ b/studio/backend/core/inference/npu_backend.py
+@@ -0,0 +1,551 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Chat models on the AMD Ryzen AI NPU, served by FastFlowLM through a private Lemonade.
++
++A loaded NPU model is Unsloth's local chat model like a GGUF is: ``/load`` with a
++``lemonade:<id>`` model path loads it and unloads whatever was resident, ``/status`` reports it,
++and chat requests go to it (``routes/inference.py``). Everything NPU-specific lives here:
++
++* enabling installs the pinned lemond (``install_lemonade_prebuilt.py``), starts it, has it
++  download FastFlowLM, and runs ``flm validate`` so a driver, firmware or memlock problem is named
++  before any model download;
++* the catalog is FastFlowLM's own list of NPU-quantized models, from lemond's
++  ``/v1/models?show_all=true``. Unsloth GGUFs cannot run here;
++* a model counts as loaded only once lemond's ``/v1/health`` lists it on the NPU, and the context
++  reported is the one FastFlowLM was started with, not the model's maximum.
++
++Import-light: no torch, so an NPU chat never pulls the GPU stack into the process.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import subprocess
++import sys
++import threading
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++from core.inference.lemonade_server import LemonadeServer, LemonadeUnavailable
++from utils.hardware.npu import detect_amd_npu
++from utils.native_path_leases import child_env_without_native_path_secret
++from utils.subprocess_compat import windows_hidden_subprocess_kwargs
++
++logger = logging.getLogger(__name__)
++
++MODEL_PREFIX = "lemonade:"
++PROVIDER_TYPE = "lemonade"
++DEFAULT_CONTEXT_LENGTH = 8192
++
++# Model modes Unsloth's chat cannot serve: embeddings and transcription have no chat endpoint,
++# and a single-turn ("flash") model answers only the first message of a conversation.
++_EXCLUDED_LABELS = frozenset({"embeddings", "transcription", "single-turn"})
++
++# `flm validate --json` fields and the fix each one names.
++_VALIDATE_PROBLEMS = (
++    ("amd_device_found", "No AMD XDNA 2 NPU was found."),
++    ("npu_driver_ok", "The AMD NPU driver is missing or too old."),
++    ("all_fw_ok", "The NPU firmware is too old; update linux-firmware or the AMD NPU driver."),
++    ("kernel_ok", "This Linux kernel has no amdxdna support; use kernel 7.0+ or amdxdna-dkms."),
++    (
++        "memlock_ok",
++        "The locked-memory limit is too low. Set memlock to unlimited in "
++        "/etc/security/limits.conf, then log out and back in.",
++    ),
++)
++DRIVER_HELP_URL = {
++    "linux": "https://lemonade-server.ai/flm_npu_linux.html",
++    "win32": "https://lemonade-server.ai/driver_install.html",
++}
++
++
++class NpuError(RuntimeError):
++    """An NPU operation failed; the message is safe to show the user."""
++
++
++@dataclass(frozen = True)
++class NpuModel:
++    id: str
++    checkpoint: str
++    size_gb: Optional[float]
++    downloaded: bool
++    labels: tuple[str, ...]
++    max_context_length: Optional[int]
++
++    @property
++    def vision(self) -> bool:
++        return "vision" in self.labels
++
++    @property
++    def reasoning(self) -> bool:
++        return "reasoning" in self.labels
++
++    @property
++    def tools(self) -> bool:
++        return "tool-calling" in self.labels
++
++    @property
++    def model_path(self) -> str:
++        return MODEL_PREFIX + self.id
++
++    def to_json(self) -> dict[str, Any]:
++        return {
++            "id": self.id,
++            "model_path": self.model_path,
++            "checkpoint": self.checkpoint,
++            "size_gb": self.size_gb,
++            "downloaded": self.downloaded,
++            "labels": list(self.labels),
++            "supports_vision": self.vision,
++            "supports_reasoning": self.reasoning,
++            "supports_tools": self.tools,
++            "max_context_length": self.max_context_length,
++        }
++
++
++@dataclass(frozen = True)
++class ManagedUpstream:
++    """Where a chat for the loaded NPU model goes. Built by Unsloth, never by a request."""
++
++    provider_type: str
++    base_url: str
++    api_key: str
++    model: str
++    public_model: str
++    supports_vision: bool
++    supports_tools: bool
++    supports_reasoning: bool
++    context_length: Optional[int]
++
++
++@dataclass
++class _Loaded:
++    model: NpuModel
++    context_length: Optional[int]
++
++
++def is_npu_model_path(model_path: Optional[str]) -> bool:
++    return isinstance(model_path, str) and model_path.startswith(MODEL_PREFIX)
++
++
++def model_id_from_path(model_path: str) -> str:
++    model_id = model_path[len(MODEL_PREFIX) :].strip()
++    if not model_id or "/" in model_id or "\\" in model_id:
++        raise NpuError(f"Invalid NPU model id: {model_path!r}")
++    return model_id
++
++
++def _installer_module():
++    studio_dir = Path(__file__).resolve().parents[3]
++    if str(studio_dir) not in sys.path:
++        sys.path.insert(0, str(studio_dir))
++    import install_lemonade_prebuilt
++
++    return install_lemonade_prebuilt
++
++
++def _npu_root() -> Path:
++    from utils.paths.storage_roots import studio_root
++    return studio_root() / "lemonade"
++
++
++def _error_message(response) -> str:
++    try:
++        body = response.json()
++    except ValueError:
++        return response.text[:500] or f"HTTP {response.status_code}"
++    if isinstance(body, dict):
++        error = body.get("error")
++        if isinstance(error, dict) and error.get("message"):
++            return str(error["message"])
++        if isinstance(error, str):
++            return error
++        if body.get("message"):
++            return str(body["message"])
++    return json.dumps(body)[:500]
++
++
++def _positive_int(value: Any) -> Optional[int]:
++    try:
++        number = int(value)
++    except (TypeError, ValueError):
++        return None
++    return number if number > 0 else None
++
++
++class LemonadeNpuBackend:
++    def __init__(self, root: Optional[Path] = None) -> None:
++        self._root = Path(root) if root is not None else None
++        self._lock = threading.RLock()
++        self._server: Optional[LemonadeServer] = None
++        self._loaded: Optional[_Loaded] = None
++        self._loading: Optional[str] = None
++        self._hardware: Optional[dict[str, Any]] = None
++        self._validation: Optional[dict[str, Any]] = None
++        self._state = "idle"
++        self._error: Optional[str] = None
++
++    # -- paths ---------------------------------------------------------------------------
++
++    @property
++    def root(self) -> Path:
++        return self._root if self._root is not None else _npu_root()
++
++    def _installed_lemond(self) -> Optional[Path]:
++        try:
++            return _installer_module().installed_lemond(self.root)
++        except Exception as exc:  # noqa: BLE001 -- a broken pin file reads as "not installed"
++            logger.warning("Could not read the Lemonade install: %s", exc)
++            return None
++
++    def _flm_binary(self) -> Optional[Path]:
++        name = "flm.exe" if sys.platform == "win32" else "flm"
++        base = self.root / "cache" / "bin" / "flm" / "npu"
++        candidates = sorted(base.rglob(name)) if base.is_dir() else []
++        return candidates[0] if candidates else None
++
++    # -- status --------------------------------------------------------------------------
++
++    def hardware(self) -> dict[str, Any]:
++        if self._hardware is None:
++            self._hardware = detect_amd_npu()
++        return self._hardware
++
++    @property
++    def is_loaded(self) -> bool:
++        return self._loaded is not None and self._server is not None and self._server.is_alive()
++
++    @property
++    def loaded_model(self) -> Optional[NpuModel]:
++        return self._loaded.model if self.is_loaded else None
++
++    @property
++    def loaded_context_length(self) -> Optional[int]:
++        return self._loaded.context_length if self.is_loaded else None
++
++    @property
++    def loading_model(self) -> Optional[str]:
++        return self._loading
++
++    def status(self) -> dict[str, Any]:
++        hardware = self.hardware()
++        installed = self._installed_lemond() is not None
++        running = self._server is not None and self._server.is_alive()
++        loaded = self.loaded_model
++        platform_key = "linux" if sys.platform.startswith("linux") else sys.platform
++        return {
++            "supported": bool(hardware.get("supported")),
++            "hardware": hardware,
++            "runtime_installed": installed,
++            "runtime_running": running,
++            "state": self._state,
++            "error": self._error,
++            "validation": self._validation,
++            "help_url": DRIVER_HELP_URL.get(platform_key),
++            "loaded_model": loaded.model_path if loaded else None,
++            "context_length": self.loaded_context_length,
++            "loading_model": self._loading,
++        }
++
++    # -- lifecycle -------------------------------------------------------------------------
++
++    def _server_for(self, binary: Path) -> LemonadeServer:
++        return LemonadeServer(
++            binary,
++            cache_dir = self.root / "cache",
++            config_dir = self.root / "config",
++            flm_model_dir = self.root / "flm",
++        )
++
++    def _require_supported(self) -> None:
++        hardware = self.hardware()
++        if not hardware.get("present"):
++            raise NpuError("No AMD Ryzen AI NPU was found on this machine.")
++        if not hardware.get("supported"):
++            raise NpuError(
++                "FastFlowLM needs an XDNA 2 NPU (Ryzen AI 300/400 or Ryzen AI Max); "
++                "this NPU is XDNA 1."
++            )
++
++    def _ensure_running(self) -> LemonadeServer:
++        """lemond, started if the runtime is installed and it is not running yet."""
++        with self._lock:
++            if self._server is not None and self._server.is_alive():
++                return self._server
++            binary = self._installed_lemond()
++            if binary is None:
++                raise NpuError("The NPU runtime is not installed. Enable it first.")
++            if self._server is not None:
++                self._server.close()
++            self._loaded = None
++            self._server = self._server_for(binary)
++            try:
++                self._server.start()
++            except LemonadeUnavailable as exc:
++                self._server = None
++                raise NpuError(str(exc)) from exc
++            return self._server
++
++    def enable(self) -> dict[str, Any]:
++        """Install Lemonade and FastFlowLM, start them and validate the NPU. Idempotent."""
++        self._require_supported()
++        with self._lock:
++            self._error = None
++            try:
++                self._state = "installing"
++                _installer_module().install(self.root)
++                self._state = "starting"
++                server = self._ensure_running()
++                self._state = "installing_flm"
++                response = server.request(
++                    "POST",
++                    "/v1/install",
++                    json_body = {"recipe": "flm", "backend": "npu", "stream": False},
++                    timeout = 900.0,
++                )
++                if response.status_code != 200 or "error" in (response.json() or {}):
++                    raise NpuError(f"Installing FastFlowLM failed: {_error_message(response)}")
++                self._state = "validating"
++                self._validation = self._validate()
++                if not self._validation.get("ready"):
++                    raise NpuError(
++                        " ".join(self._validation.get("problems") or ["NPU validation failed."])
++                    )
++                self._state = "ready"
++            except NpuError as exc:
++                self._state = "failed"
++                self._error = str(exc)
++                raise
++            except Exception as exc:  # noqa: BLE001 -- surfaced to the user, not swallowed
++                self._state = "failed"
++                self._error = f"Enabling the NPU runtime failed: {exc}"
++                raise NpuError(self._error) from exc
++        return self.status()
++
++    def _validate(self) -> dict[str, Any]:
++        binary = self._flm_binary()
++        if binary is None:
++            return {"ready": False, "problems": ["FastFlowLM was not found after installing it."]}
++        env = child_env_without_native_path_secret()
++        env["FLM_MODEL_PATH"] = str(self.root / "flm")
++        env["FLM_DISABLE_UPDATE_CHECK"] = "1"
++        try:
++            completed = subprocess.run(
++                [str(binary), "validate", "--json"],
++                capture_output = True,
++                text = True,
++                encoding = "utf-8",
++                errors = "replace",
++                timeout = 120,
++                env = env,
++                **windows_hidden_subprocess_kwargs(),
++            )
++        except (OSError, subprocess.TimeoutExpired) as exc:
++            return {"ready": False, "problems": [f"flm validate could not run: {exc}"]}
++        try:
++            report = json.loads(completed.stdout)
++        except ValueError:
++            return {
++                "ready": False,
++                "problems": [f"flm validate returned no report: {completed.stdout[-300:].strip()}"],
++            }
++        problems = [message for key, message in _VALIDATE_PROBLEMS if report.get(key) is False]
++        ready = bool(report.get("ready"))
++        if not ready and not problems:
++            problems = ["NPU validation failed."]
++        return {"ready": ready, "problems": problems, "report": report}
++
++    def shutdown(self) -> None:
++        with self._lock:
++            self._loaded = None
++            if self._server is not None:
++                self._server.close()
++                self._server = None
++            if self._state not in ("failed",):
++                self._state = "idle"
++
++    # -- catalog ---------------------------------------------------------------------------
++
++    def catalog(self) -> list[NpuModel]:
++        server = self._ensure_running()
++        response = server.request("GET", "/v1/models?show_all=true", timeout = 60.0)
++        if response.status_code != 200:
++            raise NpuError(f"Listing NPU models failed: {_error_message(response)}")
++        models: list[NpuModel] = []
++        for row in response.json().get("data") or []:
++            if not isinstance(row, dict) or row.get("recipe") != "flm":
++                continue
++            labels = tuple(str(label) for label in row.get("labels") or ())
++            if "chat" not in labels or _EXCLUDED_LABELS.intersection(labels):
++                continue
++            size = row.get("size")
++            models.append(
++                NpuModel(
++                    id = str(row.get("id")),
++                    checkpoint = str(row.get("checkpoint") or ""),
++                    size_gb = float(size) if isinstance(size, (int, float)) else None,
++                    downloaded = bool(row.get("downloaded")),
++                    labels = labels,
++                    max_context_length = _positive_int(row.get("max_context_window")),
++                )
++            )
++        return sorted(models, key = lambda model: (not model.downloaded, model.id))
++
++    def _model(self, model_id: str) -> NpuModel:
++        for model in self.catalog():
++            if model.id == model_id:
++                return model
++        raise NpuError(f"{model_id} is not in the FastFlowLM catalog.")
++
++    def download(self, model_id: str) -> Iterator[dict[str, Any]]:
++        """Pull a model, yielding lemond's progress events, then a final ``complete`` one."""
++        model = self._model(model_id)
++        server = self._ensure_running()
++        event = "progress"
++        with server.stream(
++            "POST", "/v1/pull", json_body = {"model_name": model.id, "stream": True}
++        ) as response:
++            if response.status_code != 200:
++                response.read()
++                raise NpuError(f"Downloading {model.id} failed: {_error_message(response)}")
++            for line in response.iter_lines():
++                if line.startswith("event:"):
++                    event = line[len("event:") :].strip() or "progress"
++                    continue
++                if not line.startswith("data:"):
++                    continue
++                try:
++                    data = json.loads(line[len("data:") :].strip())
++                except ValueError:
++                    continue
++                if event == "error" or (isinstance(data, dict) and data.get("error")):
++                    message = data.get("error") if isinstance(data, dict) else data
++                    if isinstance(message, dict):
++                        message = message.get("message")
++                    raise NpuError(f"Downloading {model.id} failed: {message}")
++                if isinstance(data, dict):
++                    yield {"event": event, **data}
++                event = "progress"
++        yield {"event": "complete", "model": model.id, "percent": 100}
++
++    def delete(self, model_id: str) -> None:
++        with self._lock:
++            if self.is_loaded and self._loaded.model.id == model_id:
++                raise NpuError("Unload the model before deleting it.")
++            server = self._ensure_running()
++            response = server.request("POST", "/v1/delete", json_body = {"model_name": model_id})
++            if response.status_code != 200:
++                raise NpuError(f"Deleting {model_id} failed: {_error_message(response)}")
++
++    # -- load ------------------------------------------------------------------------------
++
++    def load(
++        self,
++        model_id: str,
++        context_length: Optional[int] = None,
++    ) -> NpuModel:
++        """Load a downloaded model onto the NPU and return it once lemond reports it resident."""
++        with self._lock:
++            self._loading = model_id
++            try:
++                model = self._model(model_id)
++                if not model.downloaded:
++                    raise NpuError(f"{model.id} is not downloaded yet.")
++                limit = model.max_context_length
++                ctx = context_length if context_length and context_length > 0 else None
++                ctx = ctx or min(DEFAULT_CONTEXT_LENGTH, limit or DEFAULT_CONTEXT_LENGTH)
++                if limit:
++                    ctx = min(ctx, limit)
++                server = self._ensure_running()
++                self._loaded = None
++                response = server.request(
++                    "POST",
++                    "/v1/load",
++                    json_body = {"model_name": model.id, "ctx_size": ctx, "save_options": False},
++                    timeout = 900.0,
++                )
++                if response.status_code != 200 or response.json().get("status") == "error":
++                    raise NpuError(f"Loading {model.id} failed: {_error_message(response)}")
++                resident_ctx = self._resident_context(server, model.id)
++                if resident_ctx is None:
++                    raise NpuError(f"Lemonade did not report {model.id} as loaded on the NPU.")
++                self._loaded = _Loaded(model = model, context_length = resident_ctx)
++                self._state = "ready"
++                self._error = None
++                return model
++            finally:
++                self._loading = None
++
++    @staticmethod
++    def _resident_context(server: LemonadeServer, model_id: str) -> Optional[int]:
++        response = server.request("GET", "/v1/health", timeout = 30.0)
++        if response.status_code != 200:
++            return None
++        for row in response.json().get("all_models_loaded") or []:
++            if (
++                isinstance(row, dict)
++                and row.get("model_name") == model_id
++                and row.get("device") == "npu"
++                and row.get("loaded", True)
++            ):
++                options = row.get("recipe_options") or {}
++                return _positive_int(options.get("ctx_size")) or DEFAULT_CONTEXT_LENGTH
++        return None
++
++    def unload(self) -> Optional[str]:
++        """Unload the resident NPU model. Returns its model path, or None if nothing was loaded."""
++        with self._lock:
++            loaded = self._loaded
++            self._loaded = None
++            if loaded is None:
++                return None
++            server = self._server
++            if server is not None and server.is_alive():
++                try:
++                    server.request(
++                        "POST",
++                        "/v1/unload",
++                        json_body = {"model_name": loaded.model.id},
++                        timeout = 60.0,
++                    )
++                except LemonadeUnavailable as exc:
++                    logger.warning("Unloading %s from Lemonade failed: %s", loaded.model.id, exc)
++            return loaded.model.model_path
++
++    def upstream(self) -> ManagedUpstream:
++        with self._lock:
++            if not self.is_loaded:
++                raise NpuError("No NPU model is loaded.")
++            server = self._server
++            model = self._loaded.model
++            return ManagedUpstream(
++                provider_type = PROVIDER_TYPE,
++                base_url = f"{server.base_url}/v1",
++                api_key = server.api_key or "",
++                model = model.id,
++                public_model = model.model_path,
++                supports_vision = model.vision,
++                supports_tools = model.tools,
++                supports_reasoning = model.reasoning,
++                context_length = self._loaded.context_length,
++            )
++
++
++_backend: Optional[LemonadeNpuBackend] = None
++_backend_lock = threading.Lock()
++
++
++def get_npu_backend() -> LemonadeNpuBackend:
++    global _backend
++    with _backend_lock:
++        if _backend is None:
++            _backend = LemonadeNpuBackend()
++        return _backend
++
++
++def peek_npu_backend() -> Optional[LemonadeNpuBackend]:
++    """The backend if anything has touched it, without creating one (for shutdown)."""
++    return _backend
+diff --git a/studio/backend/core/inference/providers.py b/studio/backend/core/inference/providers.py
+index 161eb0fea9..8fd78b4ae5 100644
+--- a/studio/backend/core/inference/providers.py
++++ b/studio/backend/core/inference/providers.py
+@@ -409,6 +409,24 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
+         "supports_chat_template_kwargs": True,
+         "hidden": True,
+     },
++    "lemonade": {
++        "display_name": "AMD NPU (FastFlowLM)",
++        # Never user-supplied: Unsloth starts lemond on loopback and routes the loaded NPU model to it
++        # (core/inference/npu_backend.py). Vision and tools are per model, from its catalog labels.
++        "base_url": "",
++        "default_models": [],
++        "supports_streaming": True,
++        "supports_vision": True,
++        "supports_tool_calling": True,
++        "studio_tools": True,
++        "auth_header": "Authorization",
++        "auth_prefix": "Bearer ",
++        "notes": "Unsloth-managed Lemonade serving FastFlowLM on the AMD NPU.",
++        # FastFlowLM 1.0.3 parses min_p into an integer, so 0.05 arrives as 0.
++        "body_omit": ("min_p",),
++        "hidden": True,
++        "managed": True,
++    },
+     "openrouter": {
+         "display_name": "OpenRouter",
+         "base_url": "https://openrouter.ai/api/v1",
+@@ -455,6 +473,13 @@ def get_provider_info(provider_type: str) -> dict[str, Any] | None:
+     return PROVIDER_REGISTRY.get(provider_type)
+ 
+ 
++def get_connectable_provider_info(provider_type: str) -> dict[str, Any] | None:
++    """A type a user can save or name as a connection. ``managed`` entries only describe a server
++    Unsloth runs itself, whose address and key never come from a request."""
++    info = PROVIDER_REGISTRY.get(provider_type)
++    return None if info is None or info.get("managed") else info
++
++
+ def get_base_url(provider_type: str) -> str | None:
+     info = PROVIDER_REGISTRY.get(provider_type)
+     return info["base_url"] if info else None
+@@ -1067,7 +1092,7 @@ def list_available_providers(include_hidden: bool = False) -> list[dict[str, Any
+     """
+     result = []
+     for provider_type, info in PROVIDER_REGISTRY.items():
+-        if info.get("hidden") and not include_hidden:
++        if (info.get("hidden") and not include_hidden) or info.get("managed"):
+             continue
+         result.append(
+             {
+diff --git a/studio/backend/main.py b/studio/backend/main.py
+index 997a799158..36f1184ead 100644
+--- a/studio/backend/main.py
++++ b/studio/backend/main.py
+@@ -351,6 +351,7 @@ from routes import (
+ from routes.llama import router as llama_router
+ from routes.llama_compat import is_engine_probe_path, router as llama_compat_router
+ from routes.whisper import router as whisper_router
++from routes.npu import router as npu_router
+ from routes.preview import router as preview_router
+ from hub.routes import (
+     inventory_router as hub_inventory_router,
+@@ -1631,6 +1632,7 @@ app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"
+ app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
+ app.include_router(llama_router, prefix = "/api/llama", tags = ["llama"])
+ app.include_router(whisper_router, prefix = "/api/whisper", tags = ["whisper"])
++app.include_router(npu_router, prefix = "/api/npu", tags = ["npu"])
+ app.include_router(export_router, prefix = "/api/export", tags = ["export"])
+ app.include_router(rag_router, prefix = "/api/rag", tags = ["rag"])
+ app.include_router(training_history_router, prefix = "/api/train", tags = ["training-history"])
+diff --git a/studio/backend/models/inference.py b/studio/backend/models/inference.py
+index de408536e1..b950a91125 100644
+--- a/studio/backend/models/inference.py
++++ b/studio/backend/models/inference.py
+@@ -1269,6 +1269,10 @@ class _InferenceRuntimeFields(BaseModel):
+         ),
+     )
+     is_mlx: bool = Field(False, description = "Whether the active model is served by the MLX backend")
++    is_npu: bool = Field(
++        False,
++        description = "Whether the active model runs on the AMD Ryzen AI NPU (FastFlowLM through Lemonade)",
++    )
+     mlx_kv_bits: Optional[int] = Field(
+         None, description = "MLX KV quantization bit width actually applied, if any"
+     )
+diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
+index f088df8297..a53f95774c 100644
+--- a/studio/backend/routes/inference.py
++++ b/studio/backend/routes/inference.py
+@@ -8887,7 +8887,15 @@ async def _no_model_loaded_error(
+     """
+     from utils.openai_auto_switch_settings import get_openai_auto_switch_enabled
+     from core.inference.local_model_resolver import resolve_local_gguf
++    from core.inference.npu_backend import peek_npu_backend
+ 
++    _npu = peek_npu_backend()
++    if _npu is not None and _npu.is_loaded:
++        # Not "nothing is loaded": the NPU model is, and it serves chat completions only.
++        return 400, (
++            f"The loaded NPU model ({_npu.loaded_model.model_path}) serves "
++            "/v1/chat/completions only. Load a GGUF model to use this endpoint."
++        )
+     named = (
+         requested_model
+         if isinstance(requested_model, str)
+@@ -15768,6 +15776,97 @@ def _require_resolved_base_access(config) -> None:
+         account_access.require_model_access(base.strip())
+ 
+ 
++def _npu_load_response(npu, status: str) -> LoadResponse:
++    model = npu.loaded_model
++    return LoadResponse(
++        status = status,
++        model = model.model_path,
++        display_name = model.id,
++        is_npu = True,
++        is_vision = model.vision,
++        inference = load_inference_config(model.id),
++        context_length = npu.loaded_context_length,
++        max_context_length = model.max_context_length,
++        native_context_length = model.max_context_length,
++        context_length_enforced = True,
++        supports_reasoning = model.reasoning,
++        reasoning_style = "enable_thinking",
++        supports_tools = model.tools,
++    )
++
++
++async def _unload_npu_before_local_load() -> None:
++    """Loading a GGUF or Unsloth model replaces an NPU model, as it replaces each other."""
++    from core.inference.npu_backend import peek_npu_backend
++
++    npu = peek_npu_backend()
++    if npu is not None and npu.is_loaded:
++        logger.info("Unloading the NPU model before loading a local model")
++        await asyncio.to_thread(npu.unload)
++
++
++async def _load_npu_model(
++    request: LoadRequest,
++    *,
++    current_request_counted: bool,
++    on_reload_confirmed,
++    load_cancel_event: Optional[threading.Event],
++) -> LoadResponse:
++    """``/load`` for a ``lemonade:<id>`` model: the same swap rules as any local model."""
++    from core.inference.npu_backend import NpuError, get_npu_backend, model_id_from_path
++    from core.inference.llama_keepwarm import note_model_unloaded
++
++    if account_access.managed_account():
++        raise HTTPException(
++            status_code = 403,
++            detail = "The AMD NPU runtime is available to this installation's owner only.",
++        )
++    npu = get_npu_backend()
++    try:
++        model_id = model_id_from_path(request.model_path)
++    except NpuError as exc:
++        raise HTTPException(status_code = 400, detail = str(exc)) from None
++    requested_ctx = (
++        request.max_seq_length if request.max_seq_length and request.max_seq_length > 0 else None
++    )
++    loaded = npu.loaded_model
++    if (
++        loaded is not None
++        and loaded.id == model_id
++        and not request.force_reload
++        and (requested_ctx is None or requested_ctx == npu.loaded_context_length)
++    ):
++        return _npu_load_response(npu, "already_loaded")
++    if load_cancel_event is not None and load_cancel_event.is_set():
++        raise HTTPException(status_code = 409, detail = "Model load cancelled")
++    # Point of no return: stop (or refuse over) the chats this swap interrupts.
++    if on_reload_confirmed is not None:
++        on_reload_confirmed(cancel = True)
++        if request.force_cancel_active:
++            await _wait_for_model_switch_idle(
++                current_request_counted = current_request_counted,
++                timeout_s = _POST_CANCEL_DRAIN_TIMEOUT_S,
++            )
++    _set_preview_resident(None)
++    await _unload_llama_before_standard_load(get_llama_cpp_backend())
++    backend = _peek_inference_backend()
++    if backend is not None and backend.active_model_name:
++        logger.info(
++            f"Unloading Unsloth model '{backend.active_model_name}' before loading on the NPU"
++        )
++        await asyncio.to_thread(backend.unload_model, backend.active_model_name)
++    # Nothing to reload once idle: this model is not the one the idle stash names.
++    note_model_unloaded()
++    await asyncio.to_thread(release_chat_gpu_claim)
++    try:
++        await asyncio.to_thread(npu.load, model_id, requested_ctx)
++    except NpuError as exc:
++        raise HTTPException(status_code = 400, detail = str(exc)) from None
++    account_access.join_resident("chat")
++    api_monitor.record_lifecycle(event = "load", model = request.model_path)
++    return _npu_load_response(npu, "loaded")
++
++
+ async def _load_model_impl(
+     request: LoadRequest,
+     fastapi_request: Request,
+@@ -15781,6 +15880,15 @@ async def _load_model_impl(
+     anonymous_hf_access: bool = False,
+     speech_codec_path: Optional[str] = None,
+ ):
++    from core.inference.npu_backend import is_npu_model_path
++
++    if is_npu_model_path(request.model_path):
++        return await _load_npu_model(
++            request,
++            current_request_counted = current_request_counted,
++            on_reload_confirmed = on_reload_confirmed,
++            load_cancel_event = load_cancel_event,
++        )
+     native_access_deferred = _defers_access_to_native_grant(request)
+     if account_access.managed_account() and not native_access_deferred:
+         await asyncio.to_thread(account_access.require_model_access, request.model_path)
+@@ -16557,6 +16665,7 @@ async def _load_model_impl(
+                     # ownership so a later preview for another checkpoint is not 503'd.
+                     _restore_marker_if_prior_preview_still_resident()
+                     raise
++            await _unload_npu_before_local_load()
+ 
+             # Every rejection and source check has completed. The immutable
+             # intent resolved before teardown is now the only launch input.
+@@ -16715,6 +16824,7 @@ async def _load_model_impl(
+             # later preview for another checkpoint is not 503'd against it.
+             _restore_marker_if_prior_preview_still_resident()
+             raise
++        await _unload_npu_before_local_load()
+ 
+         # Free the export's VRAM, but only when this load wants VRAM: a CPU load masks
+         # the accelerators, so killing the user's export frees nothing it needs.
+@@ -18379,8 +18489,30 @@ async def _unload_model_impl(request: UnloadRequest, current_subject: str):
+     # next /v1 request can't resurrect this model. The idle loop unloads via the
+     # backend directly (not this route), so clearing here never fights keep-warm.
+     from core.inference.llama_keepwarm import inference_lifecycle_gate, note_model_unloaded
++    from core.inference.npu_backend import is_npu_model_path, peek_npu_backend
+ 
+     try:
++        if is_npu_model_path(request.model_path):
++            npu = peek_npu_backend()
++            async with inference_lifecycle_gate():
++                if npu is not None and npu.is_loaded:
++                    # Same order as the llama-server eject below: stop the chats, let them
++                    # unwind, then take the model away.
++                    _raise_or_cancel_active_generations(
++                        force = request.force_cancel_active, action = "Unloading the model"
++                    )
++                    await _drain_and_recancel_before_teardown(
++                        force = request.force_cancel_active, action = "Unloading the model"
++                    )
++                    await asyncio.to_thread(npu.unload)
++                    note_model_unloaded()
++                    account_access.clear_resident("chat")
++                    api_monitor.record_lifecycle(
++                        event = "unload", model = request.model_path, reason = "manual"
++                    )
++                    logger.info(f"Unloaded NPU model: {request.model_path}")
++            return UnloadResponse(status = "unloaded", model = request.model_path)
++
+         # Hidden Audio cleanup is cancellation, not a manual eject. Bind it to the
+         # exact client load attempt so a delayed request can never stop a newer
+         # same-model load or unload a model that has already become resident.
+@@ -19150,6 +19282,31 @@ async def get_status(current_subject: str):
+         _loading = [_tracked_loading_id] if _tracked_loading_id else []
+         backend = _peek_inference_backend()
+ 
++        from core.inference.npu_backend import peek_npu_backend
++
++        _npu = peek_npu_backend()
++        if _npu is not None and _npu.is_loaded:
++            _npu_model = _npu.loaded_model
++            return InferenceStatusResponse(
++                # Display id, then the loadable one, as the GGUF branch reports them.
++                active_model = _npu_model.id,
++                model_identifier = _npu_model.model_path,
++                is_npu = True,
++                is_vision = _npu_model.vision,
++                loading = _loading,
++                loaded = [_npu_model.model_path],
++                inference = load_inference_config(_npu_model.id),
++                context_length = _npu.loaded_context_length,
++                requested_context_length = _npu.loaded_context_length,
++                max_context_length = _npu_model.max_context_length,
++                native_context_length = _npu_model.max_context_length,
++                context_length_enforced = True,
++                supports_reasoning = _npu_model.reasoning,
++                reasoning_style = "enable_thinking",
++                supports_tools = _npu_model.tools,
++                llama_cpp_supports_mtp = _supports_mtp,
++            )
++
+         # If a GGUF model is loaded via llama-server, report that
+         if llama_backend.is_loaded:
+             _model_id = llama_backend.model_identifier
+@@ -22968,19 +23125,28 @@ async def _proxy_to_external_provider(
+     payload: ChatCompletionRequest,
+     request: Request,
+     current_subject: Optional[str] = None,
++    *,
++    managed = None,
+ ) -> StreamingResponse:
+     """
+     Proxy a chat completion request to an external LLM provider.
+ 
+     Resolves provider config (DB or registry), decrypts the API key, and
+     streams the response back in OpenAI SSE format.
++
++    ``managed`` (a ``ManagedUpstream``) is a server Unsloth runs itself, the NPU's lemond: its
++    address, key and model come from that object alone, never from the request or the database,
++    and its streams are tracked like a local generation so a model swap sees them.
+     """
+     # Resolve provider type and base URL
+     provider_type = payload.provider_type
+     base_url = payload.provider_base_url
+     saved_provider_snapshot: Optional[dict] = None
+ 
+-    if payload.provider_id and not payload.encrypted_api_key:
++    if managed is not None:
++        provider_type = managed.provider_type
++        base_url = managed.base_url
++    elif payload.provider_id and not payload.encrypted_api_key:
+         # Saved-provider SQLite reads must not block the event loop.
+         config = await asyncio.to_thread(providers_db.get_provider, payload.provider_id)
+         if config is None:
+@@ -23018,6 +23184,8 @@ async def _proxy_to_external_provider(
+         # native translator, so entering the loop for them would advertise tools
+         # the model is never shown and finish as if none were selected.
+         provider_model_runs_local_tools(provider_type, payload.external_model or payload.model)
++        # An NPU model without the tool-calling label ignores a tool schema.
++        and (managed is None or managed.supports_tools)
+         and payload.stream is True
+         and _explicit_studio_tool_loop_requested(payload)
+         # A selection of purely hosted names is the provider's tool envelope, not
+@@ -23068,8 +23236,10 @@ async def _proxy_to_external_provider(
+         )
+     # Fall back to registry default base URL. The registry lookup is checked on
+     # its own: a caller-supplied base_url used to make an unknown provider_type
+-    # pass straight through to the proxy.
+-    if get_provider_info(provider_type) is None:
++    # pass straight through to the proxy. A managed type is reachable only with its managed
++    # upstream: named by a request, it would send that request's own base URL.
++    _provider_info_entry = get_provider_info(provider_type)
++    if _provider_info_entry is None or (managed is None and _provider_info_entry.get("managed")):
+         raise HTTPException(
+             status_code = 400,
+             detail = f"Unknown provider type: {provider_type}",
+@@ -23082,11 +23252,12 @@ async def _proxy_to_external_provider(
+             detail = f"Base URL is required for provider type: {provider_type}",
+         )
+     # Validate the proxy destination before the API key is decrypted, so a
+-    # refused target never sees a credential.
+-    try:
+-        base_url = validate_provider_base_url(base_url)
+-    except ValueError as exc:
+-        raise HTTPException(status_code = 400, detail = str(exc)) from None
++    # refused target never sees a credential. A managed upstream is Unsloth's own loopback.
++    if managed is None:
++        try:
++            base_url = validate_provider_base_url(base_url)
++        except ValueError as exc:
++            raise HTTPException(status_code = 400, detail = str(exc)) from None
+ 
+     if provider_type == "openai_codex":
+         from core.inference.openai_codex_auth import (
+@@ -23535,7 +23706,9 @@ async def _proxy_to_external_provider(
+         )
+ 
+     api_key: Optional[str] = None
+-    if saved_provider_snapshot is not None:
++    if managed is not None:
++        api_key = managed.api_key
++    elif saved_provider_snapshot is not None:
+         async with provider_config_guard(payload.provider_id):
+             current = await asyncio.to_thread(providers_db.get_provider, payload.provider_id)
+             routing_fields = ("provider_type", "base_url", "is_enabled")
+@@ -23571,7 +23744,7 @@ async def _proxy_to_external_provider(
+             ),
+         )
+ 
+-    model = payload.external_model or payload.model
++    model = managed.model if managed is not None else (payload.external_model or payload.model)
+     if model == "default":
+         raise HTTPException(
+             status_code = 400,
+@@ -23582,7 +23755,9 @@ async def _proxy_to_external_provider(
+     from core.inference.providers import get_provider_info as _get_provider_info
+ 
+     _pinfo = _get_provider_info(provider_type) or {}
+-    _supports_vision = _pinfo.get("supports_vision", False)
++    _supports_vision = (
++        managed.supports_vision if managed is not None else _pinfo.get("supports_vision", False)
++    )
+     _external_promoted_parts: list = []
+     chat_messages = await _build_external_messages_async(
+         payload.messages,
+@@ -23605,9 +23780,9 @@ async def _proxy_to_external_provider(
+             endpoint = request.url.path,
+             via_api_key = _request_used_api_key(request),
+             method = request.method,
+-            model = model,
++            model = managed.public_model if managed is not None else model,
+             prompt = _monitor_prompt_from_messages(payload.messages),
+-            context_length = None,
++            context_length = managed.context_length if managed is not None else None,
+             subject = current_subject,
+         )
+ 
+@@ -23615,16 +23790,22 @@ async def _proxy_to_external_provider(
+         provider_type = provider_type,
+         base_url = base_url,
+         api_key = api_key,
++        managed_loopback = managed is not None,
+     )
+ 
+     # Schema defaults are non-None (20, 0.01, 1.0) for the local path, so only
+     # `model_fields_set` separates "asked for 20" from "said nothing", and the provider keeps
+     # its own default for the latter. Read before ANY write: a setattr marks a field explicit.
+-    _top_p_explicit = payload.top_p if "top_p" in payload.model_fields_set else None
+-    _top_k_explicit = payload.top_k if "top_k" in payload.model_fields_set else None
++    # FastFlowLM is the exception: it keeps the last sampler value it was sent, so an omitted
++    # field would inherit the previous chat's instead of a default. It always gets the schema's.
++    _always_send = managed is not None
++    _top_p_explicit = payload.top_p if _always_send or "top_p" in payload.model_fields_set else None
++    _top_k_explicit = payload.top_k if _always_send or "top_k" in payload.model_fields_set else None
+     _min_p_explicit = payload.min_p if "min_p" in payload.model_fields_set else None
+     _repetition_penalty_explicit = (
+-        payload.repetition_penalty if "repetition_penalty" in payload.model_fields_set else None
++        payload.repetition_penalty
++        if _always_send or "repetition_penalty" in payload.model_fields_set
++        else None
+     )
+ 
+     # Unsloth-owned tool loop for every non-Codex provider that declares the
+@@ -23772,6 +23953,10 @@ async def _proxy_to_external_provider(
+             sent_done = False
+             stream_failed = False
+             async for line in gen:
++                # Stop, or a model swap cancelling this chat: closing the stream is what makes
++                # lemond stop FastFlowLM's generation.
++                if managed is not None and cancel_event.is_set():
++                    break
+                 monitor_event = _monitor_openai_sse_line(monitor_id, line)
+                 if monitor_event is None:
+                     try:
+@@ -23852,8 +24037,9 @@ async def _proxy_to_external_provider(
+     def _tracked_stream():
+         # Only the tool loop is registered: it can run for minutes and a /load
+         # needs to know it would interrupt a chat. The plain proxy stays
+-        # untracked, as it was before.
+-        if not run_studio_tool_loop:
++        # untracked, as it was before, except to a managed upstream: that is the
++        # loaded local model, which a /load or /unload replaces under the chat.
++        if not run_studio_tool_loop and managed is None:
+             return _stream()
+ 
+         async def _wrapped():
+@@ -23873,6 +24059,278 @@ async def _proxy_to_external_provider(
+     )
+ 
+ 
++# ── AMD NPU (FastFlowLM through a managed Lemonade) ──────────────
++
++
++class _NpuStreamRelay:
++    """Rewrites FastFlowLM's stream into what Unsloth promises a caller.
++
++    The reported model becomes the loaded ``lemonade:`` id (FastFlowLM names its own checkpoint,
++    ``qwen3:0.6b``), and ``stop`` is enforced here because FastFlowLM ignores it: content is held
++    back while it could still be the start of a stop sequence, and on a match the reply ends with
++    ``finish_reason: "stop"``. Returning then closes the upstream stream, which ends FastFlowLM's
++    generation. Also collects the reply, for a caller that asked for one JSON response."""
++
++    def __init__(self, public_model: str, stop: Optional[list[str]]) -> None:
++        self.public_model = public_model
++        self.stop = stop or []
++        self._pending = ""
++        self.stopped = False
++        self.content = ""
++        self.reasoning = ""
++        self.tool_calls: dict[int, dict] = {}
++        self.finish_reason: Optional[str] = None
++        self.usage: Optional[dict] = None
++        self.error: Optional[dict] = None
++        self.completion_id: Optional[str] = None
++        self.created: Optional[int] = None
++
++    def _held_back(self, text: str) -> int:
++        """Length of the longest tail of ``text`` that begins some stop sequence."""
++        longest = 0
++        for stop in self.stop:
++            for size in range(min(len(stop) - 1, len(text)), 0, -1):
++                if stop.startswith(text[-size:]):
++                    longest = max(longest, size)
++                    break
++        return longest
++
++    def _take_content(self, text: str) -> str:
++        buffer = self._pending + text
++        hits = [index for index in (buffer.find(stop) for stop in self.stop) if index >= 0]
++        if hits:
++            self._pending = ""
++            self.stopped = True
++            return buffer[: min(hits)]
++        keep = self._held_back(buffer)
++        self._pending = buffer[len(buffer) - keep :] if keep else ""
++        return buffer[: len(buffer) - keep] if keep else buffer
++
++    def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
++        return "data: " + json.dumps(
++            {
++                "id": self.completion_id or "chatcmpl-npu",
++                "object": "chat.completion.chunk",
++                "created": self.created or int(time.time()),
++                "model": self.public_model,
++                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
++            }
++        )
++
++    def feed(self, line: str) -> list[str]:
++        """The lines to send on for one line of the upstream stream."""
++        if not line.startswith("data:"):
++            return [line]
++        raw = line[len("data:") :].strip()
++        if raw == "[DONE]":
++            if self._pending:
++                self.content += self._pending
++                tail = self._chunk({"content": self._pending}, None)
++                self._pending = ""
++                return [tail, line]
++            return [line]
++        try:
++            chunk = json.loads(raw)
++        except ValueError:
++            return [line]
++        if not isinstance(chunk, dict):
++            return [line]
++        if "error" in chunk:
++            self.error = (
++                chunk["error"]
++                if isinstance(chunk["error"], dict)
++                else {"message": str(chunk["error"])}
++            )
++            return [line]
++        self.completion_id = self.completion_id or chunk.get("id")
++        self.created = self.created or chunk.get("created")
++        if "model" in chunk:
++            chunk["model"] = self.public_model
++        if isinstance(chunk.get("usage"), dict):
++            self.usage = chunk["usage"]
++        out: list[str] = []
++        for choice in chunk.get("choices") or []:
++            if not isinstance(choice, dict):
++                continue
++            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
++            reasoning = delta.get("reasoning_content")
++            if isinstance(reasoning, str):
++                self.reasoning += reasoning
++            for call in delta.get("tool_calls") or []:
++                if not isinstance(call, dict):
++                    continue
++                slot = self.tool_calls.setdefault(
++                    int(call.get("index", len(self.tool_calls))),
++                    {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
++                )
++                slot["id"] = call.get("id") or slot["id"]
++                function = call.get("function") or {}
++                slot["function"]["name"] += function.get("name") or ""
++                slot["function"]["arguments"] += function.get("arguments") or ""
++            if choice.get("finish_reason") is not None and not self.stopped:
++                self.finish_reason = choice["finish_reason"]
++                if self._pending:
++                    delta["content"] = (delta.get("content") or "") + self._pending
++                    self._pending = ""
++                    self.content += delta["content"]
++                    choice["delta"] = delta
++                    continue
++            content = delta.get("content")
++            if isinstance(content, str) and self.stop:
++                visible = self._take_content(content)
++                self.content += visible
++                delta["content"] = visible
++                if self.stopped:
++                    self.finish_reason = "stop"
++                    out.append("data: " + json.dumps(chunk))
++                    out.append(self._chunk({}, "stop"))
++                    out.append("data: [DONE]")
++                    return out
++            elif isinstance(content, str):
++                self.content += content
++        out.append("data: " + json.dumps(chunk))
++        return out
++
++    def completion(self) -> dict:
++        message: dict[str, Any] = {"role": "assistant", "content": self.content or None}
++        if self.reasoning:
++            message["reasoning_content"] = self.reasoning
++        if self.tool_calls:
++            message["tool_calls"] = [self.tool_calls[index] for index in sorted(self.tool_calls)]
++        body = {
++            "id": self.completion_id or f"chatcmpl-{uuid.uuid4().hex}",
++            "object": "chat.completion",
++            "created": self.created or int(time.time()),
++            "model": self.public_model,
++            "choices": [
++                {
++                    "index": 0,
++                    "message": message,
++                    "finish_reason": self.finish_reason or "stop",
++                    "logprobs": None,
++                }
++            ],
++        }
++        if self.usage is not None:
++            body["usage"] = self.usage
++        return body
++
++
++async def _npu_chat_completions(payload, request: Request, current_subject: str):
++    """Serve a chat with the loaded NPU model through the managed-upstream proxy.
++
++    FastFlowLM silently drops what it cannot do, and a plausible answer that ignored the image, the
++    JSON schema or the tool list is worse than a refusal, so those are refused up front. The
++    upstream is always streamed: FastFlowLM's non-streaming replies leave a cut-off ``<think>``
++    block in ``content`` and report ``stop`` for a length cutoff, so a non-streaming caller gets
++    the stream collected here instead."""
++    from core.inference.npu_backend import NpuError, get_npu_backend
++
++    try:
++        upstream = await asyncio.to_thread(get_npu_backend().upstream)
++    except NpuError as exc:
++        raise HTTPException(status_code = 400, detail = str(exc)) from None
++    if _wants_multiple_choices(payload):
++        _raise_unsupported_n("NPU chat completions")
++    if _response_format_constrains_decoding(payload):
++        _raise_unsupported_openai_parameter(
++            "response_format", "FastFlowLM on the NPU has no guided decoding for response_format."
++        )
++    if getattr(payload, "seed", None) is not None:
++        _raise_unsupported_openai_parameter(
++            "seed", "FastFlowLM on the NPU does not take a sampling seed."
++        )
++    if (
++        _request_has_video(payload)
++        or payload.audio_base64
++        or _messages_have_input_audio(payload.messages)
++    ):
++        raise HTTPException(
++            status_code = 400, detail = "Audio and video input are not supported on the NPU."
++        )
++    if not upstream.supports_vision and _request_has_attached_image(payload):
++        raise HTTPException(
++            status_code = 400,
++            detail = "This NPU model does not read images. Load a vision model to send one.",
++        )
++    if payload.tool_choice == "none":
++        # FastFlowLM 1.0.3 ignores tool_choice and calls a tool anyway.
++        payload.tools = None
++    elif payload.tools and not upstream.supports_tools:
++        raise HTTPException(
++            status_code = 400,
++            detail = openai_error_body(
++                "This NPU model does not support tool calling.",
++                status = 400,
++                code = "unsupported_parameter",
++                param = "tools",
++            ),
++        )
++
++    _normalize_chat_reasoning_controls(payload)
++    if not upstream.supports_reasoning:
++        payload.enable_thinking = False
++    elif payload.enable_thinking is None:
++        # Thinking on unless asked off, like a local GGUF's own template default.
++        payload.enable_thinking = payload.reasoning_effort != "none"
++
++    wants_stream = bool(payload.stream)
++    relay = _NpuStreamRelay(upstream.public_model, _normalize_stop_sequences(payload.stop))
++    upstream_payload = payload.model_copy(update = {"stream": True})
++    response = await _proxy_to_external_provider(
++        upstream_payload, request, current_subject, managed = upstream
++    )
++
++    async def _lines():
++        body = response.body_iterator
++        try:
++            async for piece in body:
++                text = piece.decode("utf-8") if isinstance(piece, bytes) else piece
++                for line in text.split("\n"):
++                    if line.strip():
++                        yield line
++        finally:
++            # Now, not at garbage collection: closing is what stops FastFlowLM after a stop
++            # sequence matched, and it releases the tracked generation.
++            await body.aclose()
++
++    if wants_stream:
++
++        async def _stream():
++            lines = _lines()
++            try:
++                async for line in lines:
++                    for out in relay.feed(line):
++                        yield f"{out}\n\n"
++                    if relay.stopped:
++                        return
++            finally:
++                await lines.aclose()
++
++        return StreamingResponse(
++            _stream(),
++            media_type = "text/event-stream",
++            headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
++        )
++
++    lines = _lines()
++    try:
++        async for line in lines:
++            relay.feed(line)
++            if relay.stopped or relay.error is not None:
++                break
++    finally:
++        await lines.aclose()
++    if relay.error is not None:
++        try:
++            status = int(relay.error.get("code") or 502)
++        except (TypeError, ValueError):
++            status = 502
++        status = status if 400 <= status < 600 else 502
++        return JSONResponse(status_code = status, content = {"error": relay.error})
++    return JSONResponse(content = relay.completion())
++
++
+ # ── OpenAI shell-tool container management ───────────────────────
+ 
+ 
+@@ -24659,6 +25117,12 @@ async def produce_openai_chat_completions(
+         _predecoded_audio = _audio_preflight.get("decoded")
+         _preprepared_audio = _audio_preflight.get("prepared")
+ 
++    from core.inference.npu_backend import peek_npu_backend
++
++    _npu = peek_npu_backend()
++    if _npu is not None and _npu.is_loaded:
++        return await _npu_chat_completions(payload, request, current_subject)
++
+     llama_backend = get_llama_cpp_backend()
+     using_gguf = llama_backend.is_loaded
+ 
+@@ -29061,6 +29525,24 @@ def _openai_model_objects() -> list[dict]:
+     models: list[dict] = []
+     _created = int(time.time())
+ 
++    from core.inference.npu_backend import peek_npu_backend
++
++    _npu = peek_npu_backend()
++    if _npu is not None and _npu.is_loaded:
++        _npu_model = _npu.loaded_model
++        _npu_entry = {
++            "id": _npu_model.model_path,
++            "object": "model",
++            "created": _created,
++            "owned_by": _OWNED_BY,
++            "device": "npu",
++        }
++        if _npu.loaded_context_length:
++            _npu_entry["context_length"] = _npu.loaded_context_length
++        if _npu_model.max_context_length:
++            _npu_entry["max_context_length"] = _npu_model.max_context_length
++        models.append(_npu_entry)
++
+     # Check GGUF backend
+     llama_backend = get_llama_cpp_backend()
+     # Claiming a re-pulled tag would displace the scanned row holding its weights, and the id
+@@ -33838,6 +34320,17 @@ async def chat_count_tokens(
+             detail = "Cannot count tokens for messages containing images.",
+         )
+ 
++    from core.inference.npu_backend import peek_npu_backend
++
++    _npu = peek_npu_backend()
++    if _npu is not None and _npu.is_loaded:
++        # FastFlowLM exposes no tokenizer endpoint, and no other tokenizer here is its
++        # model's. Each reply's usage still reports the real prompt size.
++        raise HTTPException(
++            status_code = 503,
++            detail = "Token counting is not available for NPU models.",
++        )
++
+     llama_backend = get_llama_cpp_backend()
+     if not llama_backend.is_loaded:
+         # The refusals above are about the request and so are shared; the ones below are
+diff --git a/studio/backend/routes/npu.py b/studio/backend/routes/npu.py
+new file mode 100644
+index 0000000000..bdd90cf8e4
+--- /dev/null
++++ b/studio/backend/routes/npu.py
+@@ -0,0 +1,82 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Setup and model management for chat on the AMD Ryzen AI NPU.
++
++Loading, unloading and chatting go through the ordinary inference routes with a ``lemonade:<id>``
++model path; these routes cover what has no equivalent there: detecting the NPU, enabling the
++runtime (Lemonade plus FastFlowLM), and FastFlowLM's own model catalog, downloads and deletes.
++Everything but the status read changes the installation, so it is owner-only.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++
++from fastapi import APIRouter, Depends, HTTPException
++from fastapi.responses import StreamingResponse
++from starlette.concurrency import iterate_in_threadpool
++
++from auth import policy
++from auth.authentication import get_current_subject
++from core.inference.npu_backend import NpuError, get_npu_backend
++
++router = APIRouter()
++
++
++async def _require_installation_owner(current_subject: str = Depends(get_current_subject)) -> None:
++    await policy.require_owner()
++
++
++@router.get("/status")
++async def npu_status(current_subject: str = Depends(get_current_subject)):
++    """Whether this machine has a supported NPU, and the runtime's state. Never starts anything."""
++    return await asyncio.to_thread(get_npu_backend().status)
++
++
++@router.post("/enable", dependencies = [Depends(_require_installation_owner)])
++async def enable_npu():
++    """Install and start Lemonade, install FastFlowLM and validate the NPU. Idempotent."""
++    try:
++        return await asyncio.to_thread(get_npu_backend().enable)
++    except NpuError as exc:
++        raise HTTPException(status_code = 400, detail = str(exc)) from None
++
++
++@router.get("/models", dependencies = [Depends(_require_installation_owner)])
++async def list_npu_models():
++    try:
++        models = await asyncio.to_thread(get_npu_backend().catalog)
++    except NpuError as exc:
++        raise HTTPException(status_code = 409, detail = str(exc)) from None
++    return {"models": [model.to_json() for model in models]}
++
++
++@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
++async def download_npu_model(model_id: str):
++    """Stream FastFlowLM's download progress as server-sent events, ending with ``complete``
++    or an ``error`` event. Closing the connection stops following it, not the download."""
++    npu = get_npu_backend()
++
++    def _events():
++        try:
++            for event in npu.download(model_id):
++                yield f"data: {json.dumps(event)}\n\n"
++        except NpuError as exc:
++            yield f"data: {json.dumps({'event': 'error', 'error': str(exc)})}\n\n"
++
++    return StreamingResponse(
++        iterate_in_threadpool(_events()),
++        media_type = "text/event-stream",
++        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
++    )
++
++
++@router.delete("/models/{model_id}", dependencies = [Depends(_require_installation_owner)])
++async def delete_npu_model(model_id: str):
++    try:
++        await asyncio.to_thread(get_npu_backend().delete, model_id)
++    except NpuError as exc:
++        raise HTTPException(status_code = 409, detail = str(exc)) from None
++    return {"status": "deleted", "model": model_id}
+diff --git a/studio/backend/routes/providers.py b/studio/backend/routes/providers.py
+index aa7e4114da..e07d89a511 100644
+--- a/studio/backend/routes/providers.py
++++ b/studio/backend/routes/providers.py
+@@ -32,6 +32,7 @@ from core.inference.key_exchange import (
+ )
+ from core.inference.providers import (
+     get_base_url,
++    get_connectable_provider_info,
+     get_provider_info,
+     list_available_providers,
+     validate_provider_base_url,
+@@ -216,7 +217,7 @@ async def create_provider_config(
+     """Create a saved provider configuration and optional encrypted API key."""
+ 
+     require_ui_session(via_api_key)
+-    info = get_provider_info(payload.provider_type)
++    info = get_connectable_provider_info(payload.provider_type)
+     if info is None:
+         raise HTTPException(
+             status_code = 400,
+@@ -670,7 +671,7 @@ async def test_provider(
+     """
+ 
+     payload = _bind_saved_provider_target(payload)
+-    info = get_provider_info(payload.provider_type)
++    info = get_connectable_provider_info(payload.provider_type)
+     if info is None:
+         raise HTTPException(
+             status_code = 400,
+@@ -814,7 +815,7 @@ async def list_provider_model_capabilities(
+     via_api_key: bool = Depends(authenticated_via_api_key),
+ ):
+     payload = _bind_saved_provider_target(payload)
+-    info = get_provider_info(payload.provider_type)
++    info = get_connectable_provider_info(payload.provider_type)
+     if info is None:
+         raise HTTPException(
+             status_code = 400,
+@@ -876,7 +877,7 @@ async def list_provider_models(
+     """
+ 
+     payload = _bind_saved_provider_target(payload)
+-    info = get_provider_info(payload.provider_type)
++    info = get_connectable_provider_info(payload.provider_type)
+     if info is None:
+         raise HTTPException(
+             status_code = 400,
+diff --git a/studio/backend/run.py b/studio/backend/run.py
+index 852fe69839..e9fb9b1945 100644
+--- a/studio/backend/run.py
++++ b/studio/backend/run.py
+@@ -1507,6 +1507,15 @@ def _graceful_shutdown(server = None):
+     except Exception as e:
+         logger.warning("Error shutting down llama-server: %s", e)
+ 
++    try:
++        from core.inference.npu_backend import peek_npu_backend
++        _npu = peek_npu_backend()
++        if _npu is not None:
++            # Unload first: lemond then stops FastFlowLM itself, before the tree kill.
++            _npu.shutdown()
++    except Exception as e:
++        logger.warning("Error shutting down the NPU runtime: %s", e)
++
+     try:
+         from cloudflare_tunnel import close_studio_tunnel_lifecycle
+         close_studio_tunnel_lifecycle()
+diff --git a/studio/backend/tests/fixtures/fake_lemond.py b/studio/backend/tests/fixtures/fake_lemond.py
+new file mode 100644
+index 0000000000..84e780ae72
+--- /dev/null
++++ b/studio/backend/tests/fixtures/fake_lemond.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""A stand-in for Lemonade's ``lemond``, speaking the parts of its API Unsloth uses.
++
++Invoked the way ``LemonadeServer`` invokes lemond (``CACHE CONFIG --port N ...``), it answers only
++requests carrying ``LEMONADE_API_KEY``, keeps FastFlowLM-style catalog state in memory, streams
++``/v1/pull`` progress, and records every request to ``requests.jsonl`` in the cache dir so a test
++can read what reached it. Responses are shaped like the ones lemond 11.9.0 returned on the AMD
++DevLab runners.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++CATALOG = [
++    {
++        "id": "qwen3-0.6b-FLM",
++        "checkpoint": "qwen3:0.6b",
++        "labels": ["reasoning", "chat"],
++        "size": 0.66,
++        "max_context_window": 40960,
++    },
++    {
++        "id": "qwen3-it-4b-FLM",
++        "checkpoint": "qwen3-it:4b",
++        "labels": ["tool-calling", "chat"],
++        "size": 3.1,
++        "max_context_window": 40960,
++    },
++    {
++        "id": "gemma3-4b-FLM",
++        "checkpoint": "gemma3:4b",
++        "labels": ["vision", "chat"],
++        "size": 4.5,
++        "max_context_window": 131072,
++    },
++    {
++        "id": "embed-gemma-300m-FLM",
++        "checkpoint": "embed-gemma:300m",
++        "labels": ["embeddings"],
++        "size": 0.62,
++    },
++    {
++        "id": "Qwen3-0.6B-GGUF",
++        "checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0",
++        "labels": ["chat"],
++        "recipe": "llamacpp",
++    },
++]
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("cache_dir")
++    parser.add_argument("config_dir")
++    parser.add_argument("--port", type = int, required = True)
++    parser.add_argument("--host", default = "127.0.0.1")
++    parser.add_argument("--no-broadcast", action = "store_true")
++    parser.add_argument("--log-file", default = "auto")
++    args = parser.parse_args()
++
++    key = os.environ.get("LEMONADE_API_KEY", "")
++    cache = Path(args.cache_dir)
++    record = cache / "requests.jsonl"
++    downloaded = set(json.loads(os.environ.get("FAKE_LEMOND_DOWNLOADED", "[]")))
++    loaded: dict[str, dict] = {}
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++
++        def log_message(self, *a) -> None:
++            return
++
++        def _send(self, status: int, body) -> None:
++            data = json.dumps(body).encode()
++            self.send_response(status)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def _authorized(self) -> bool:
++            if self.path == "/live":
++                return True
++            if self.headers.get("Authorization") != f"Bearer {key}":
++                self._send(401, {"error": "Invalid or missing API key"})
++                return False
++            return True
++
++        def _body(self) -> dict:
++            length = int(self.headers.get("Content-Length") or 0)
++            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
++            with open(record, "a", encoding = "utf-8") as handle:
++                handle.write(json.dumps({"path": self.path, "body": body}) + "\n")
++            return body
++
++        def do_GET(self) -> None:  # noqa: N802
++            if not self._authorized():
++                return
++            if self.path == "/live":
++                self._send(200, {"status": "ok"})
++            elif self.path == "/v1/health":
++                self._send(
++                    200,
++                    {
++                        "status": "ok",
++                        "all_models_loaded": [
++                            {
++                                "model_name": name,
++                                "device": "npu",
++                                "loaded": True,
++                                "recipe": "flm",
++                                "recipe_options": options,
++                            }
++                            for name, options in loaded.items()
++                        ],
++                    },
++                )
++            elif self.path.startswith("/v1/models"):
++                self._send(
++                    200,
++                    {
++                        "data": [
++                            {"recipe": "flm", **row, "downloaded": row["id"] in downloaded}
++                            for row in CATALOG
++                        ]
++                    },
++                )
++            else:
++                self._send(404, {"error": "not found"})
++
++        def do_POST(self) -> None:  # noqa: N802
++            if not self._authorized():
++                return
++            body = self._body()
++            name = body.get("model_name")
++            if self.path == "/v1/install":
++                flm = cache / "bin" / "flm" / "npu" / "flm"
++                flm.parent.mkdir(parents = True, exist_ok = True)
++                report = os.environ.get("FAKE_FLM_VALIDATE", '{"ready": true}')
++                flm.write_text(f"#!/bin/sh\necho '{report}'\n", encoding = "utf-8")
++                flm.chmod(0o755)
++                self._send(200, {"status": "success", "recipe": "flm", "backend": "npu"})
++            elif self.path == "/v1/pull":
++                downloaded.add(name)
++                events = (
++                    'data: {"file":"model.q4nx","file_index":2,"total_files":4,"percent":40,"bytes_downloaded":4,"bytes_total":10}\n\n'
++                    "event: complete\n"
++                    'data: {"file":"","file_index":4,"total_files":4,"percent":100}\n\n'
++                ).encode()
++                self.send_response(200)
++                self.send_header("Content-Type", "text/event-stream")
++                self.send_header("Content-Length", str(len(events)))
++                self.end_headers()
++                self.wfile.write(events)
++            elif self.path == "/v1/load":
++                if name not in downloaded:
++                    self._send(404, {"error": {"message": f"Model '{name}' was not found."}})
++                    return
++                loaded.clear()
++                loaded[name] = {"ctx_size": body.get("ctx_size"), "flm_args": ""}
++                self._send(200, {"status": "success", "model_name": name, "recipe": "flm"})
++            elif self.path == "/v1/unload":
++                if name:
++                    loaded.pop(name, None)
++                else:
++                    loaded.clear()
++                self._send(200, {"status": "success"})
++            elif self.path == "/v1/delete":
++                downloaded.discard(name)
++                self._send(200, {"status": "success", "message": f"Deleted model: {name}"})
++            else:
++                self._send(404, {"error": "not found"})
++
++    server = ThreadingHTTPServer((args.host, args.port), Handler)
++    print(f"fake lemond listening on {args.port}", flush = True)
++    server.serve_forever()
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
+new file mode 100644
+index 0000000000..2a416dcb24
+--- /dev/null
++++ b/studio/backend/tests/test_npu_backend.py
+@@ -0,0 +1,249 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""The NPU backend against a real child process speaking lemond's API.
++
++``tests/fixtures/fake_lemond.py`` stands in for lemond, so these run the actual spawn, the
++key-authenticated readiness check, config seeding, enable, catalog, download, load, unload and
++the process-tree stop. The installer is stubbed to point at it; POSIX only because the stub
++"binary" is a shell script.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from core.inference import npu_backend as nb
++from core.inference.lemonade_server import LemonadeServer, LemonadeUnavailable
++
++pytestmark = pytest.mark.skipif(sys.platform == "win32", reason = "shell-script lemond stand-in")
++
++_FAKE = Path(__file__).parent / "fixtures" / "fake_lemond.py"
++
++
++def _binary(tmp_path: Path) -> Path:
++    binary = tmp_path / "bin" / "lemond"
++    binary.parent.mkdir(parents = True)
++    binary.write_text(
++        textwrap.dedent(
++            f"""\
++            #!/bin/sh
++            exec "{sys.executable}" "{_FAKE}" "$@"
++            """
++        ),
++        encoding = "utf-8",
++    )
++    binary.chmod(0o755)
++    return binary
++
++
++class _Installer:
++    def __init__(self, binary: Path) -> None:
++        self.binary = binary
++        self.installs = 0
++
++    def installed_lemond(self, root):
++        return self.binary
++
++    def install(self, root):
++        self.installs += 1
++        return self.binary
++
++
++@pytest.fixture
++def npu(tmp_path, monkeypatch):
++    installer = _Installer(_binary(tmp_path))
++    monkeypatch.setattr(nb, "_installer_module", lambda: installer)
++    monkeypatch.setattr(
++        nb,
++        "detect_amd_npu",
++        lambda: {"present": True, "supported": True, "family": "XDNA2", "name": "NPU Strix Halo"},
++    )
++    backend = nb.LemonadeNpuBackend(root = tmp_path / "lemonade")
++    backend.installer = installer
++    yield backend
++    backend.shutdown()
++
++
++def _requests(backend) -> list[dict]:
++    path = backend.root / "cache" / "requests.jsonl"
++    if not path.exists():
++        return []
++    return [json.loads(line) for line in path.read_text().splitlines()]
++
++
++def test_enable_installs_starts_and_validates(npu):
++    status = npu.enable()
++    assert status["state"] == "ready"
++    assert status["runtime_running"] is True
++    assert status["validation"]["ready"] is True
++    assert npu.installer.installs == 1
++    assert [r["body"] for r in _requests(npu) if r["path"] == "/v1/install"] == [
++        {"recipe": "flm", "backend": "npu", "stream": False}
++    ]
++
++
++def test_config_is_private_and_quiet(npu):
++    npu.enable()
++    config = json.loads((npu.root / "config" / "config.json").read_text())
++    assert config["broadcast"] is False
++    assert config["auto_check_model_updates"] is False
++    assert config["host"] == "127.0.0.1"
++    # Not "auto", which scans the user's Hugging Face cache for GGUFs.
++    assert config["models_dir"] == str(npu.root / "cache" / "models")
++    assert config["flm"]["prefer_system"] is False
++
++
++def test_validation_failure_names_the_fix(npu, monkeypatch):
++    monkeypatch.setenv(
++        "FAKE_FLM_VALIDATE", '{"ready": false, "memlock_ok": false, "all_fw_ok": true}'
++    )
++    with pytest.raises(nb.NpuError, match = "locked-memory limit"):
++        npu.enable()
++    status = npu.status()
++    assert status["state"] == "failed"
++    assert "memlock" in status["error"]
++
++
++def test_unsupported_npu_is_refused_before_any_download(tmp_path, monkeypatch):
++    installer = _Installer(_binary(tmp_path))
++    monkeypatch.setattr(nb, "_installer_module", lambda: installer)
++    monkeypatch.setattr(
++        nb, "detect_amd_npu", lambda: {"present": True, "supported": False, "family": "XDNA1"}
++    )
++    backend = nb.LemonadeNpuBackend(root = tmp_path / "lemonade")
++    with pytest.raises(nb.NpuError, match = "XDNA 2"):
++        backend.enable()
++    assert installer.installs == 0
++
++
++def test_catalog_keeps_flm_chat_models_only(npu):
++    npu.enable()
++    ids = [model.id for model in npu.catalog()]
++    assert ids == sorted(["gemma3-4b-FLM", "qwen3-0.6b-FLM", "qwen3-it-4b-FLM"])
++    by_id = {model.id: model for model in npu.catalog()}
++    assert by_id["gemma3-4b-FLM"].vision and not by_id["gemma3-4b-FLM"].tools
++    assert by_id["qwen3-it-4b-FLM"].tools
++    assert by_id["qwen3-0.6b-FLM"].reasoning
++    assert by_id["qwen3-0.6b-FLM"].model_path == "lemonade:qwen3-0.6b-FLM"
++
++
++def test_download_relays_progress_then_completes(npu):
++    npu.enable()
++    events = list(npu.download("qwen3-0.6b-FLM"))
++    assert events[0]["percent"] == 40
++    assert events[-1]["event"] == "complete"
++    assert {m.id: m.downloaded for m in npu.catalog()}["qwen3-0.6b-FLM"] is True
++
++
++def test_load_requires_a_download(npu):
++    npu.enable()
++    with pytest.raises(nb.NpuError, match = "not downloaded"):
++        npu.load("qwen3-0.6b-FLM")
++    assert not npu.is_loaded
++
++
++def test_load_reports_the_context_lemond_started_with(npu, monkeypatch):
++    npu.enable()
++    list(npu.download("qwen3-0.6b-FLM"))
++    npu.load("qwen3-0.6b-FLM")
++    assert npu.is_loaded
++    # Not the model's 40960 maximum: an unset length loads at the default.
++    assert npu.loaded_context_length == nb.DEFAULT_CONTEXT_LENGTH
++    load = [r["body"] for r in _requests(npu) if r["path"] == "/v1/load"][-1]
++    assert load == {"model_name": "qwen3-0.6b-FLM", "ctx_size": 8192, "save_options": False}
++
++    npu.load("qwen3-0.6b-FLM", 100_000)
++    # Clamped to the model's own window.
++    assert npu.loaded_context_length == 40960
++    upstream = npu.upstream()
++    assert upstream.model == "qwen3-0.6b-FLM"
++    assert upstream.public_model == "lemonade:qwen3-0.6b-FLM"
++    assert upstream.base_url.startswith("http://127.0.0.1:")
++    assert upstream.api_key
++
++
++def test_unload_then_delete(npu):
++    npu.enable()
++    list(npu.download("qwen3-0.6b-FLM"))
++    npu.load("qwen3-0.6b-FLM")
++    with pytest.raises(nb.NpuError, match = "Unload"):
++        npu.delete("qwen3-0.6b-FLM")
++    assert npu.unload() == "lemonade:qwen3-0.6b-FLM"
++    assert not npu.is_loaded
++    assert npu.unload() is None
++    npu.delete("qwen3-0.6b-FLM")
++    assert {m.id: m.downloaded for m in npu.catalog()}["qwen3-0.6b-FLM"] is False
++
++
++def test_a_restarted_runtime_reports_nothing_loaded(npu):
++    npu.enable()
++    list(npu.download("qwen3-0.6b-FLM"))
++    npu.load("qwen3-0.6b-FLM")
++    npu._server._process.kill()
++    npu._server._process.wait()
++    assert not npu.is_loaded
++    # The next operation starts a fresh lemond; the old load does not come back.
++    assert npu.catalog()
++    assert npu.status()["loaded_model"] is None
++
++
++def test_requests_without_the_key_are_refused(npu):
++    import httpx
++
++    npu.enable()
++    base = npu._server.base_url
++    assert httpx.get(f"{base}/v1/health", trust_env = False).status_code == 401
++    assert httpx.get(f"{base}/live", trust_env = False).status_code == 200
++
++
++def test_stop_ends_the_process(npu):
++    npu.enable()
++    process = npu._server._process
++    npu.shutdown()
++    assert process.poll() is not None
++    assert npu.status()["runtime_running"] is False
++
++
++def test_a_server_that_never_answers_is_reported(tmp_path):
++    binary = tmp_path / "lemond"
++    binary.write_text("#!/bin/sh\necho 'bind failed'\nexit 3\n", encoding = "utf-8")
++    binary.chmod(0o755)
++    server = LemonadeServer(
++        binary,
++        cache_dir = tmp_path / "cache",
++        config_dir = tmp_path / "config",
++        flm_model_dir = tmp_path / "flm",
++    )
++    with pytest.raises(LemonadeUnavailable, match = "bind failed"):
++        server.start(timeout = 10)
++    assert not server.is_alive()
++
++
++@pytest.mark.parametrize(
++    "path, expected",
++    [
++        ("lemonade:qwen3-0.6b-FLM", "qwen3-0.6b-FLM"),
++        ("lemonade:  gemma3-4b-FLM ", "gemma3-4b-FLM"),
++    ],
++)
++def test_model_id_from_path(path, expected):
++    assert nb.is_npu_model_path(path)
++    assert nb.model_id_from_path(path) == expected
++
++
++@pytest.mark.parametrize("path", ["lemonade:", "lemonade:../x", "lemonade:a/b"])
++def test_model_id_from_path_rejects_non_ids(path):
++    with pytest.raises(nb.NpuError):
++        nb.model_id_from_path(path)
++
++
++def test_other_model_paths_are_not_npu():
++    assert not nb.is_npu_model_path("unsloth/Qwen3-0.6B-GGUF")
++    assert not nb.is_npu_model_path(None)
+diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
+new file mode 100644
+index 0000000000..f86b69602a
+--- /dev/null
++++ b/studio/backend/tests/test_npu_chat_route.py
+@@ -0,0 +1,409 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""NPU chat through the real route and ``_proxy_to_external_provider``, over a socket.
++
++The loopback server replays stream shapes FastFlowLM 1.0.3 produced on the AMD DevLab runners
++(a ``role`` on every delta, ``: ping`` comments, usage on the finishing chunk, the checkpoint as
++the model name, and a fault reported as a bare JSON line). What reached it is recorded, so the
++body Unsloth builds is checked along with what the caller gets back.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import httpx
++import pytest
++from fastapi import HTTPException
++
++from core.inference import external_provider as ep_mod
++from core.inference import npu_backend as nb
++from core.inference.external_provider import _apply_fastflowlm_reasoning_controls
++from models.inference import ChatCompletionRequest
++
++
++def _chunk(
++    delta: dict,
++    finish = None,
++    usage = None,
++) -> str:
++    body = {
++        "id": "chatcmpl-flm",
++        "object": "chat.completion.chunk",
++        "created": 1,
++        "model": "qwen3:0.6b",
++        "choices": [{"index": 0, "delta": {"role": "assistant", **delta}, "finish_reason": finish}],
++    }
++    if usage:
++        body["usage"] = usage
++    return "data: " + json.dumps(body) + "\n\n"
++
++
++_USAGE = {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
++
++
++def _script(prompt: str) -> str:
++    if "FAULT" in prompt:
++        return (
++            _chunk({"content": "par"})
++            + '{"error":"qds_device::wait() unexpected command state"}\n'
++            + "data: [DONE]\n\n"
++        )
++    if "TOOL" in prompt:
++        call = {
++            "index": 0,
++            "id": "call_1",
++            "type": "function",
++            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
++        }
++        return (
++            _chunk({"tool_calls": [call]}) + _chunk({}, "tool_calls", _USAGE) + "data: [DONE]\n\n"
++        )
++    if "THINK" in prompt:
++        return (
++            _chunk({"reasoning_content": "Let me add."})
++            + _chunk({"content": "4"})
++            + _chunk({}, "stop", _USAGE)
++            + "data: [DONE]\n\n"
++        )
++    words = ["one", " two", " sev", "en", " eight"]
++    return (
++        ": ping\n\n"
++        + "".join(_chunk({"content": w}) for w in words)
++        + _chunk({}, "length", _USAGE)
++        + "data: [DONE]\n\n"
++    )
++
++
++class _Handler(BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++
++    def log_message(self, *args) -> None:
++        return
++
++    def do_POST(self) -> None:  # noqa: N802
++        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
++        self.server.recorded.append({"body": body, "auth": self.headers.get("Authorization")})
++        prompt = json.dumps(body.get("messages"))
++        data = _script(prompt).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "text/event-stream")
++        self.send_header("Content-Length", str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++
++class _FakeNpu:
++    def __init__(self, upstream) -> None:
++        self._upstream = upstream
++        self.is_loaded = True
++
++    def upstream(self):
++        return self._upstream
++
++
++@pytest.fixture
++def flm(monkeypatch):
++    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
++    httpd.recorded = []
++    thread = threading.Thread(target = httpd.serve_forever, daemon = True)
++    thread.start()
++
++    def install(**caps):
++        upstream = nb.ManagedUpstream(
++            provider_type = "lemonade",
++            base_url = f"http://127.0.0.1:{httpd.server_address[1]}/v1",
++            api_key = "secret-key",
++            model = "qwen3-0.6b-FLM",
++            public_model = "lemonade:qwen3-0.6b-FLM",
++            supports_vision = caps.get("vision", False),
++            supports_tools = caps.get("tools", False),
++            supports_reasoning = caps.get("reasoning", False),
++            context_length = 8192,
++        )
++        monkeypatch.setattr(nb, "get_npu_backend", lambda: _FakeNpu(upstream))
++        return httpd.recorded
++
++    yield install
++    httpd.shutdown()
++    httpd.server_close()
++    thread.join(timeout = 10)
++
++
++def _request():
++    from starlette.requests import Request
++    async def receive() -> dict:
++        await asyncio.sleep(3600)
++        return {"type": "http.disconnect"}
++
++    return Request(
++        {
++            "type": "http",
++            "http_version": "1.1",
++            "method": "POST",
++            "path": "/v1/chat/completions",
++            "raw_path": b"/v1/chat/completions",
++            "root_path": "",
++            "scheme": "http",
++            "query_string": b"",
++            "headers": [(b"content-type", b"application/json")],
++            "client": ("127.0.0.1", 12345),
++            "server": ("127.0.0.1", 8000),
++        },
++        receive,
++    )
++
++
++def _call(**fields):
++    """Run the route; return (status, parsed body or SSE lines)."""
++    import routes.inference as ri
++
++    payload = ChatCompletionRequest(
++        messages = fields.pop("messages", [{"role": "user", "content": "count"}]), **fields
++    )
++    out: dict = {}
++    loop = asyncio.new_event_loop()
++    previous = ep_mod._http_client
++    client = httpx.AsyncClient()
++
++    async def go() -> None:
++        try:
++            response = await ri._npu_chat_completions(payload, _request(), "tester")
++            if hasattr(response, "body_iterator"):
++                lines = []
++                async for piece in response.body_iterator:
++                    text = piece.decode() if isinstance(piece, bytes) else piece
++                    lines.extend(line for line in text.split("\n") if line.strip())
++                out["status"], out["body"] = response.status_code, lines
++            else:
++                out["status"], out["body"] = response.status_code, json.loads(response.body)
++        finally:
++            await client.aclose()
++
++    ep_mod._http_client = client
++    try:
++        loop.run_until_complete(go())
++    finally:
++        ep_mod._http_client = previous
++        loop.close()
++    return out["status"], out["body"]
++
++
++def _data(lines):
++    return [
++        json.loads(line[5:]) for line in lines if line.startswith("data:") and "[DONE]" not in line
++    ]
++
++
++def test_the_body_fastflowlm_receives(flm):
++    recorded = flm(reasoning = True)
++    _call(stream = False, temperature = 0.3, min_p = 0.05)
++    sent = recorded[-1]
++    body = sent["body"]
++    assert sent["auth"] == "Bearer secret-key"
++    assert body["model"] == "qwen3-0.6b-FLM"
++    # Always streamed upstream, whatever the caller asked for.
++    assert body["stream"] is True
++    # Thinking is explicit: FastFlowLM decides for itself otherwise.
++    assert body["think"] is True
++    assert "chat_template_kwargs" not in body
++    # min_p is parsed into an integer by FastFlowLM 1.0.3, so it is never sent.
++    assert "min_p" not in body
++    # The sampler values FastFlowLM would otherwise inherit from the previous chat.
++    assert {"top_p", "top_k", "repetition_penalty", "temperature"} <= set(body)
++
++
++def test_thinking_off_and_non_reasoning_models(flm):
++    recorded = flm(reasoning = True)
++    _call(stream = False, enable_thinking = False)
++    assert recorded[-1]["body"]["think"] is False
++    recorded = flm(reasoning = False)
++    _call(stream = False)
++    assert recorded[-1]["body"]["think"] is False
++
++
++def test_non_streaming_reply_is_collected_from_the_stream(flm):
++    flm()
++    status, body = _call(stream = False)
++    assert status == 200
++    assert body["object"] == "chat.completion"
++    assert body["model"] == "lemonade:qwen3-0.6b-FLM"
++    choice = body["choices"][0]
++    assert choice["message"]["content"] == "one two seven eight"
++    # The stream's own reason: FastFlowLM's non-streaming reply says "stop" for a cutoff.
++    assert choice["finish_reason"] == "length"
++    assert body["usage"] == _USAGE
++
++
++def test_streaming_rewrites_the_model_name(flm):
++    flm()
++    status, lines = _call(stream = True)
++    chunks = _data(lines)
++    assert status == 200
++    assert {chunk["model"] for chunk in chunks} == {"lemonade:qwen3-0.6b-FLM"}
++    assert lines[-1] == "data: [DONE]"
++    assert (
++        "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
++        == "one two seven eight"
++    )
++
++
++@pytest.mark.parametrize("stream", [True, False])
++def test_stop_is_enforced_across_chunks(flm, stream):
++    flm()
++    status, out = _call(stream = stream, stop = ["seven"])
++    if stream:
++        chunks = _data(out)
++        text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
++        assert text == "one two "
++        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
++        assert out[-1] == "data: [DONE]"
++    else:
++        assert out["choices"][0]["message"]["content"] == "one two "
++        assert out["choices"][0]["finish_reason"] == "stop"
++
++
++def test_a_partial_stop_match_is_released(flm):
++    flm()
++    # "sev" starts "seventy" but the stop never completes, so nothing may be lost.
++    _, body = _call(stream = False, stop = ["seventy"])
++    assert body["choices"][0]["message"]["content"] == "one two seven eight"
++
++
++def test_reasoning_is_kept_apart(flm):
++    flm(reasoning = True)
++    _, body = _call(stream = False, messages = [{"role": "user", "content": "THINK"}])
++    message = body["choices"][0]["message"]
++    assert message["reasoning_content"] == "Let me add."
++    assert message["content"] == "4"
++
++
++def test_tool_calls_are_assembled(flm):
++    flm(tools = True)
++    tools = [
++        {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
++    ]
++    _, body = _call(stream = False, tools = tools, messages = [{"role": "user", "content": "TOOL"}])
++    choice = body["choices"][0]
++    assert choice["finish_reason"] == "tool_calls"
++    assert choice["message"]["tool_calls"] == [
++        {
++            "id": "call_1",
++            "type": "function",
++            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
++        }
++    ]
++
++
++def test_tool_choice_none_withholds_the_tools(flm):
++    recorded = flm(tools = True)
++    tools = [
++        {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
++    ]
++    _call(stream = False, tools = tools, tool_choice = "none")
++    assert "tools" not in recorded[-1]["body"]
++
++
++def test_a_bare_error_line_becomes_an_error(flm):
++    flm()
++    status, body = _call(stream = False, messages = [{"role": "user", "content": "FAULT"}])
++    assert status == 502
++    assert "qds_device" in body["error"]["message"]
++    status, lines = _call(stream = True, messages = [{"role": "user", "content": "FAULT"}])
++    errors = [chunk for chunk in _data(lines) if "error" in chunk]
++    assert errors and "qds_device" in errors[0]["error"]["message"]
++
++
++@pytest.mark.parametrize(
++    "fields, message",
++    [
++        ({"response_format": {"type": "json_object"}}, "response_format"),
++        ({"seed": 7}, "seed"),
++        ({"n": 2}, "n"),
++        (
++            {
++                "tools": [
++                    {
++                        "type": "function",
++                        "function": {"name": "f", "parameters": {"type": "object"}},
++                    }
++                ]
++            },
++            "tool calling",
++        ),
++        (
++            {
++                "messages": [
++                    {
++                        "role": "user",
++                        "content": [
++                            {"type": "text", "text": "what is this"},
++                            {
++                                "type": "image_url",
++                                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
++                            },
++                        ],
++                    }
++                ]
++            },
++            "does not read images",
++        ),
++    ],
++)
++def test_what_fastflowlm_would_drop_is_refused(flm, fields, message):
++    recorded = flm()
++    with pytest.raises(HTTPException) as caught:
++        _call(stream = False, **fields)
++    assert caught.value.status_code == 400
++    assert message in json.dumps(caught.value.detail)
++    assert recorded == []
++
++
++def test_a_saved_connection_cannot_name_the_managed_type():
++    from core.inference.providers import get_connectable_provider_info, list_available_providers
++
++    assert get_connectable_provider_info("lemonade") is None
++    assert get_connectable_provider_info("vllm") is not None
++    assert "lemonade" not in {
++        p["provider_type"] for p in list_available_providers(include_hidden = True)
++    }
++
++
++def test_a_request_cannot_route_to_the_managed_type():
++    import routes.inference as ri
++
++    payload = ChatCompletionRequest(
++        provider_type = "lemonade",
++        provider_base_url = "http://127.0.0.1:1/v1",
++        messages = [{"role": "user", "content": "hi"}],
++        stream = True,
++    )
++    loop = asyncio.new_event_loop()
++    try:
++        with pytest.raises(HTTPException) as caught:
++            loop.run_until_complete(ri._proxy_to_external_provider(payload, _request(), "t"))
++    finally:
++        loop.close()
++    assert caught.value.status_code == 400
++    assert "Unknown provider type" in str(caught.value.detail)
++
++
++@pytest.mark.parametrize(
++    "enable, effort, expected",
++    [
++        (None, None, {}),
++        (True, None, {"think": True}),
++        (False, None, {"think": False}),
++        (None, "none", {"think": False}),
++        (True, "high", {"think": True, "reasoning_effort": "high"}),
++        (False, "high", {"think": False}),
++    ],
++)
++def test_fastflowlm_reasoning_controls(enable, effort, expected):
++    body: dict = {}
++    _apply_fastflowlm_reasoning_controls(body, enable, effort)
++    assert body == expected
+diff --git a/studio/backend/tests/test_npu_detect.py b/studio/backend/tests/test_npu_detect.py
+new file mode 100644
+index 0000000000..9d1e4be35b
+--- /dev/null
++++ b/studio/backend/tests/test_npu_detect.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Linux NPU detection over a fake /sys tree.
++
++The values are the ones the AMD DevLab Strix Halo runner reported (amdxdna 2.25 DKMS,
++firmware 1.1.2.65)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from utils.hardware import npu
++
++
++def _device(
++    root: Path,
++    name: str,
++    vendor: str,
++    device: str,
++    *,
++    driver: str | None = None,
++) -> Path:
++    path = root / "devices" / name
++    path.mkdir(parents = True)
++    (path / "vendor").write_text(f"0x{vendor}\n")
++    (path / "device").write_text(f"0x{device}\n")
++    if driver:
++        target = root / "drivers" / driver
++        target.mkdir(parents = True, exist_ok = True)
++        (path / "driver").symlink_to(target)
++    return path
++
++
++def test_strix_halo_npu_with_driver(tmp_path):
++    _device(tmp_path, "0000:c3:00.0", "1002", "1586", driver = "amdgpu")
++    npu_dir = _device(tmp_path, "0000:c4:00.1", "1022", "17f0", driver = "amdxdna")
++    (npu_dir / "fw_version").write_text("1.1.2.65\n")
++    (npu_dir / "vbnv").write_text("NPU Strix Halo\n")
++    (npu_dir / "accel" / "accel0").mkdir(parents = True)
++    (tmp_path / "module" / "amdxdna").mkdir(parents = True)
++    (tmp_path / "module" / "amdxdna" / "version").write_text("2.25.260102\n")
++
++    assert npu._linux_probe(tmp_path / "devices", tmp_path / "module") == {
++        "present": True,
++        "family": "XDNA2",
++        "name": "NPU Strix Halo",
++        "driver": "amdxdna",
++        "driver_version": "2.25.260102",
++        "firmware_version": "1.1.2.65",
++        "device_node": "/dev/accel/accel0",
++    }
++
++
++def test_an_npu_without_a_driver_is_still_found(tmp_path):
++    _device(tmp_path, "0000:c4:00.1", "1022", "17f0")
++    info = npu._linux_probe(tmp_path / "devices", tmp_path / "module")
++    assert info["present"] is True
++    assert info["driver"] is None
++    assert info["device_node"] is None
++
++
++def test_no_npu(tmp_path):
++    _device(tmp_path, "0000:c3:00.0", "1002", "1586", driver = "amdgpu")
++    assert npu._linux_probe(tmp_path / "devices") == {"present": False}
++    assert npu._linux_probe(tmp_path / "missing") == {"present": False}
++
++
++@pytest.mark.parametrize("device, supported", [("17f0", True), ("1502", False)])
++def test_only_xdna2_is_supported(tmp_path, monkeypatch, device, supported):
++    _device(tmp_path, "0000:c4:00.1", "1022", device, driver = "amdxdna")
++    probe = npu._linux_probe
++    monkeypatch.setattr(npu.sys, "platform", "linux")
++    monkeypatch.setattr(
++        npu, "_linux_probe", lambda: probe(tmp_path / "devices", tmp_path / "module")
++    )
++    info = npu.detect_amd_npu()
++    assert info["present"] is True
++    assert info["supported"] is supported
++
++
++def test_detection_never_raises(monkeypatch):
++    def broken():
++        raise PermissionError("sysfs")
++
++    monkeypatch.setattr(npu.sys, "platform", "linux")
++    monkeypatch.setattr(npu, "_linux_probe", broken)
++    assert npu.detect_amd_npu() == {"present": False, "error": "sysfs", "supported": False}
+diff --git a/studio/backend/utils/hardware/npu.py b/studio/backend/utils/hardware/npu.py
+new file mode 100644
+index 0000000000..439a7d7806
+--- /dev/null
++++ b/studio/backend/utils/hardware/npu.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""AMD Ryzen AI (XDNA 2) NPU detection, without starting anything.
++
++FastFlowLM supports only XDNA 2, PCI ``1022:17f0`` (Strix Halo, Strix Point, Kraken Point,
++Gorgon Point). Earlier Ryzen AI chips are XDNA 1 (``1022:1502``) and are reported as present but
++unsupported. This answers only "is the silicon there and is a driver bound"; whether FastFlowLM
++can run is ``flm validate``'s call, which the NPU backend makes once its runtime is installed.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++from typing import Any, Optional
++
++_AMD_VENDOR = "1022"
++_XDNA2_DEVICE = "17f0"
++_XDNA1_DEVICE = "1502"
++_PCI_ROOT = Path("/sys/bus/pci/devices")
++_MODULE_ROOT = Path("/sys/module")
++
++
++def _read(path: Path) -> Optional[str]:
++    try:
++        return path.read_text(encoding = "utf-8", errors = "replace").strip()
++    except OSError:
++        return None
++
++
++def _linux_probe(pci_root: Path = _PCI_ROOT, module_root: Path = _MODULE_ROOT) -> dict[str, Any]:
++    try:
++        devices = sorted(pci_root.iterdir())
++    except OSError:
++        devices = []
++    for device in devices:
++        vendor = (_read(device / "vendor") or "").lower().removeprefix("0x")
++        product = (_read(device / "device") or "").lower().removeprefix("0x")
++        if vendor != _AMD_VENDOR or product not in (_XDNA2_DEVICE, _XDNA1_DEVICE):
++            continue
++        driver_link = device / "driver"
++        driver = driver_link.resolve().name if driver_link.exists() else None
++        accel = sorted((device / "accel").glob("accel*")) if (device / "accel").is_dir() else []
++        return {
++            "present": True,
++            "family": "XDNA2" if product == _XDNA2_DEVICE else "XDNA1",
++            "name": _read(device / "vbnv") or "AMD NPU",
++            "driver": driver,
++            "driver_version": _read(module_root / driver / "version") if driver else None,
++            "firmware_version": _read(device / "fw_version"),
++            "device_node": f"/dev/accel/{accel[0].name}" if accel else None,
++        }
++    return {"present": False}
++
++
++def _windows_probe() -> dict[str, Any]:
++    import winreg
++
++    base = r"SYSTEM\CurrentControlSet\Enum\PCI"
++    try:
++        pci = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
++    except OSError:
++        return {"present": False}
++    with pci:
++        index = 0
++        while True:
++            try:
++                hardware_id = winreg.EnumKey(pci, index)
++            except OSError:
++                return {"present": False}
++            index += 1
++            upper = hardware_id.upper()
++            if not upper.startswith(f"VEN_{_AMD_VENDOR.upper()}&DEV_"):
++                continue
++            product = upper.split("&DEV_", 1)[1][:4].lower()
++            if product not in (_XDNA2_DEVICE, _XDNA1_DEVICE):
++                continue
++            driver_version = None
++            name = None
++            try:
++                with winreg.OpenKey(pci, hardware_id) as by_id:
++                    instance = winreg.EnumKey(by_id, 0)
++                    with winreg.OpenKey(by_id, instance) as device:
++                        name = _reg_value(device, "FriendlyName") or _reg_value(
++                            device, "DeviceDesc"
++                        )
++                        driver_key = _reg_value(device, "Driver")
++                if driver_key:
++                    with winreg.OpenKey(
++                        winreg.HKEY_LOCAL_MACHINE,
++                        rf"SYSTEM\CurrentControlSet\Control\Class\{driver_key}",
++                    ) as driver:
++                        driver_version = _reg_value(driver, "DriverVersion")
++            except OSError:
++                pass
++            if name and ";" in name:
++                # DeviceDesc is stored as "@oemNN.inf,%key%;Readable name".
++                name = name.rsplit(";", 1)[1]
++            return {
++                "present": True,
++                "family": "XDNA2" if product == _XDNA2_DEVICE else "XDNA1",
++                "name": name or "AMD NPU",
++                "driver": "installed" if driver_version else None,
++                "driver_version": driver_version,
++                "firmware_version": None,
++                "device_node": None,
++            }
++
++
++def _reg_value(key, name: str) -> Optional[str]:
++    import winreg
++    try:
++        value, _kind = winreg.QueryValueEx(key, name)
++    except OSError:
++        return None
++    return str(value) if value is not None else None
++
++
++def detect_amd_npu() -> dict[str, Any]:
++    """``{"present": False}`` or the NPU's family, name, driver and firmware as far as known.
++
++    ``supported`` is True only for XDNA 2 on Linux or Windows, the combinations FastFlowLM ships."""
++    try:
++        if sys.platform.startswith("linux"):
++            info = _linux_probe()
++        elif sys.platform == "win32":
++            info = _windows_probe()
++        else:
++            info = {"present": False}
++    except Exception as exc:  # noqa: BLE001 -- detection must never break startup or /status
++        info = {"present": False, "error": str(exc)}
++    info["supported"] = bool(info.get("present")) and info.get("family") == "XDNA2"
++    return info
+diff --git a/studio/frontend/src/features/chat/chat-page.tsx b/studio/frontend/src/features/chat/chat-page.tsx
+index e4545f83db..f102f86b05 100644
+--- a/studio/frontend/src/features/chat/chat-page.tsx
++++ b/studio/frontend/src/features/chat/chat-page.tsx
+@@ -79,6 +79,7 @@ import {
+   useNativeModelDrop,
+   useNativePathLeasesSupported,
+ } from "@/features/native-intents";
++import { isNpuModelId } from "@/features/npu";
+ import { GuidedTour, useGuidedTourController } from "@/features/tour";
+ import { isTauri } from "@/lib/api-base";
+ import { chatModelLoaded } from "./lib/chat-model-loaded";
+@@ -2382,6 +2383,7 @@ export function ChatPage({
+   const {
+     refresh,
+     selectModel,
++    loadNpuModel,
+     ejectModel,
+     cancelLoading,
+     loadingModel,
+@@ -3180,6 +3182,10 @@ export function ChatPage({
+       if (isSameLoadedModel && !meta?.forceReload) {
+         return;
+       }
++      if (isNpuModelId(value)) {
++        void loadNpuModel(value);
++        return;
++      }
+       if (meta?.source === "external" || isExternalModelId(value)) {
+         const selectedExternal = parseExternalModelId(value);
+         const selectedProvider = selectedExternal
+@@ -3375,6 +3381,7 @@ export function ChatPage({
+     [
+       activeThreadId,
+       externalProvidersForChat,
++      loadNpuModel,
+       modelsFromStore,
+       stageOrLoad,
+       view,
+diff --git a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+index bbb399b8fa..9efcd6924f 100644
+--- a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
++++ b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+@@ -2775,6 +2775,102 @@ export function useChatModelRuntime() {
+     ],
+   );
+ 
++  /** Load a `lemonade:` model onto the NPU. /load replaces the resident model as for any local
++   *  model, but none of selectModel's GGUF or Hub preparation applies: the files come from the
++   *  NPU picker's own download, and the capabilities arrive in /status. */
++  const loadNpuModel = useCallback(
++    async (modelPath: string) => {
++      const store = useChatRuntimeStore.getState();
++      if (
++        store.params.checkpoint === modelPath &&
++        store.residentCheckpoint === modelPath
++      ) {
++        return;
++      }
++      if (loadingModelRef.current ?? store.loadingModelPick) {
++        toast.info("Another model is already loading", {
++          description: "Wait for it to finish or cancel it first.",
++        });
++        return;
++      }
++      const lease = store.beginModelLoading("preparing");
++      if (lease === null) {
++        toast.info("A model is loading", {
++          description: "Wait for it to finish or cancel it first.",
++        });
++        return;
++      }
++      loadLifecycleLeaseRef.current = lease;
++      const displayName = modelDisplayName(
++        modelPath.slice(modelPath.indexOf(":") + 1),
++      );
++      let toastId: string | number | undefined;
++      try {
++        const stopDecision = await confirmStopRunningChatsIfNeeded(
++          "Loading a different model",
++        );
++        if (!stopDecision.proceed) return;
++        const loadInfo = {
++          id: modelPath,
++          displayName,
++          isDownloaded: true,
++          isCachedLora: false,
++          ggufVariant: null,
++          nativePathToken: null,
++        };
++        setModelsError(null);
++        setLastModelLoadError(null);
++        setLoadingModel(loadInfo);
++        loadingModelRef.current = loadInfo;
++        useChatRuntimeStore.getState().setLoadingModelPick(pickOf(loadInfo));
++        setLoadProgress({ percent: null, label: null, phase: "starting" });
++        toastId = toast.loading(`Loading ${displayName} on the NPU`);
++        const previous = useChatRuntimeStore.getState();
++        const previousCheckpoint = previous.params.checkpoint;
++        const previousGgufVariant = previous.activeGgufVariant;
++        cancelPreStreamRunReservations(stopDecision.preStreamRunTokens);
++        requestLocalPromptQueueStop(stopDecision.promptQueueThreadIds);
++        await loadModel({
++          model_path: modelPath,
++          hf_token: null,
++          max_seq_length: 0,
++          load_in_4bit: false,
++          is_lora: false,
++          force_cancel_active: stopDecision.forceCancelActive,
++        });
++        const status = await getInferenceStatus();
++        useChatRuntimeStore.getState().setCheckpoint(modelPath, null);
++        applyActiveModelStatusToStore(status, {
++          previousCheckpoint,
++          previousGgufVariant,
++          seedLoadParams: true,
++        });
++        syncModelCapabilities(modelPath, status);
++        void refreshContextUsage({ afterModelLoad: true });
++        toast.success(`${displayName} loaded on the NPU`, {
++          id: toastId,
++          closeButton: true,
++          duration: 4000,
++        });
++      } catch (error) {
++        const message =
++          error instanceof Error ? error.message : "Failed to load model";
++        setModelsError(message);
++        setLastModelLoadError(message);
++        toast.error(message, {
++          id: toastId,
++          closeButton: true,
++          duration: 8000,
++        });
++        // The previous model may be gone even though this one did not load.
++        await syncInferenceStatusToStore().catch(() => {});
++      } finally {
++        resetLoadingUi();
++      }
++    },
++    [resetLoadingUi, setLastModelLoadError, setModelsError],
++  );
++
+   const ejectModel = useCallback(async (): Promise<boolean> => {
+     if (!params.checkpoint) {
+       return false;
+@@ -2848,6 +2944,7 @@ export function useChatModelRuntime() {
+   return {
+     refresh,
+     selectModel,
++    loadNpuModel,
+     ejectModel,
+     cancelLoading,
+     loadingModel,
+diff --git a/studio/frontend/src/features/chat/types/api.ts b/studio/frontend/src/features/chat/types/api.ts
+index 25b26c9818..3f49247cfe 100644
+--- a/studio/frontend/src/features/chat/types/api.ts
++++ b/studio/frontend/src/features/chat/types/api.ts
+@@ -212,6 +212,8 @@ export function isMultimodalResponse(
+ 
+ export interface LoadModelResponse {
+   is_mlx?: boolean;
++  /** Served by FastFlowLM on the AMD NPU through Unsloth's managed Lemonade. */
++  is_npu?: boolean;
+   status: string;
+   model: string;
+   display_name: string;
+@@ -327,6 +329,7 @@ export interface UnloadModelRequest {
+ 
+ export interface InferenceStatusResponse {
+   is_mlx?: boolean;
++  is_npu?: boolean;
+   active_model: string | null;
+   model_identifier?: string | null;
+   is_vision: boolean;
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector.tsx b/studio/frontend/src/features/model-picker/components/model-selector.tsx
+index 561b169afc..73ba32837a 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector.tsx
+@@ -14,11 +14,13 @@ import { ApiProviderLogo } from "@/features/chat/api-provider-logo";
+ import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
+ // eslint-disable-next-line no-restricted-imports -- The settings barrel imports this feature back.
+ import { useSettingsDialogStore } from "@/features/settings/stores/settings-dialog-store";
++import { isNpuModelId, NpuModelPanel, useNpuStatus } from "@/features/npu";
+ import { useT } from "@/i18n";
+ import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
+ import { cn } from "@/lib/utils";
+ import {
+   CheckmarkCircle02Icon,
++  ChipIcon,
+   CloudIcon,
+   Download01Icon,
+   RemoveCircleIcon,
+@@ -261,7 +263,7 @@ function ModelSelectorTrigger({
+   );
+ }
+ 
+-type HubSection = "downloaded" | "recommended" | "connected";
++type HubSection = "downloaded" | "recommended" | "connected" | "npu";
+ 
+ // The user's most recently clicked Hub section, restored on every open.
+ const HUB_SECTION_KEY = "unsloth_model_selector_section";
+@@ -373,12 +375,15 @@ function ModelSelectorContent({
+     [loraModels],
+ 
+   );
++  // The NPU section is chat's alone, and only on a machine with a supported AMD NPU.
++  const [npuStatus, setNpuStatus] = useNpuStatus(open && !task);
++  const hasNpu = !task && npuStatus?.supported === true;
+   // Connected sits in the section toggle, shown only with external providers.
+   const hubSectionTabs = useMemo(
+-    () =>
+-      hasExternal
++    () => [
++      ...HUB_SECTION_TABS,
++      ...(hasExternal
+         ? [
+-            ...HUB_SECTION_TABS,
+             {
+               value: "connected",
+               label: "Connected",
+@@ -387,23 +392,41 @@ function ModelSelectorContent({
+               ),
+             },
+           ]
+-        : HUB_SECTION_TABS,
+-    [hasExternal],
++        : []),
++      ...(hasNpu
++        ? [
++            {
++              value: "npu",
++              label: "NPU",
++              icon: (
++                <HugeiconsIcon icon={ChipIcon} className="size-3.5 shrink-0" />
++              ),
++            },
++          ]
++        : []),
++    ],
++    [hasExternal, hasNpu],
+ 
+   );
+   const wantsConnectedDefault = Boolean(
+     value && externalModels.some((model) => model.id === value),
+   );
++  const wantsNpuDefault = isNpuModelId(value);
+   const hasAdditionalOnDeviceModels =
+     (additionalOnDeviceModels?.length ?? 0) > 0;
+   const [hubSection, setHubSection] = useState<HubSection>(() =>
+     wantsConnectedDefault
+       ? "connected"
+-      : defaultHubSection(hasAdditionalOnDeviceModels),
++      : wantsNpuDefault
++        ? "npu"
++        : defaultHubSection(hasAdditionalOnDeviceModels),
+   );
+-  // Connected is only valid while external providers exist; fall back otherwise.
++  // Connected is only valid while external providers exist, NPU while the NPU does; fall back otherwise.
+   const effectiveHubSection: HubSection =
+-    hubSection === "connected" && !hasExternal ? "recommended" : hubSection;
++    (hubSection === "connected" && !hasExternal) ||
++    (hubSection === "npu" && !hasNpu)
++      ? "recommended"
++      : hubSection;
+ 
+   const [configTarget, setConfigTarget] = useState<ModelPickTarget | null>(
+     null,
+@@ -420,14 +443,21 @@ function ModelSelectorContent({
+       setHubSection(
+         wantsConnectedDefault
+           ? "connected"
+-          : defaultHubSection(hasAdditionalOnDeviceModels),
++          : wantsNpuDefault
++            ? "npu"
++            : defaultHubSection(hasAdditionalOnDeviceModels),
+       );
+     }
+     if (!open && wasOpen.current) {
+       setConfigTarget(null);
+     }
+     wasOpen.current = open;
+-  }, [open, wantsConnectedDefault, hasAdditionalOnDeviceModels]);
++  }, [
++    open,
++    wantsConnectedDefault,
++    wantsNpuDefault,
++    hasAdditionalOnDeviceModels,
++  ]);
+ 
+   function focusActiveModelOption(root: HTMLElement): boolean {
+     const option =
+@@ -605,6 +635,34 @@ function ModelSelectorContent({
+               }
+             />
+           </div>
++        ) : effectiveHubSection === "npu" && npuStatus ? (
++          <NpuModelPanel
++            status={npuStatus}
++            onStatusChange={setNpuStatus}
++            value={value}
++            loadedModelId={loaded ? value : undefined}
++            onPick={(modelPath) =>
++              onSelect(modelPath, {
++                source: "local",
++                isLora: false,
++                isDownloaded: true,
++              })
++            }
++            sectionToggle={
++              <PillTabs
++                className="[&_[role=tab]]:px-[calc(0.75rem*var(--ui-space-scale,1)_+_var(--picker-tab-pad)/2)]"
++                ariaLabel={t("picker.hubSectionAriaLabel")}
++                tabs={hubSectionTabs}
++                value={effectiveHubSection}
++                onValueChange={(next) => {
++                  const section = next as HubSection;
++                  setHubSection(section);
++                  saveLastHubSection(section);
++                }}
++                fit={true}
++              />
++            }
++          />
+         ) : (
+           <>
+             <HubModelPicker
+@@ -626,7 +684,12 @@ function ModelSelectorContent({
+               task={task}
+               catalog={catalog}
+               communityModelPolicy={communityModelPolicy}
+-              section={effectiveHubSection}
++              // Never "npu" here: that section renders NpuModelPanel above.
++              section={
++                effectiveHubSection === "npu"
++                  ? "recommended"
++                  : effectiveHubSection
++              }
+               sectionToggle={
+                 <PillTabs
+                   // Wider tabs than the shared default. The panel reserves
+diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
+new file mode 100644
+index 0000000000..3d0272a524
+--- /dev/null
++++ b/studio/frontend/src/features/npu/api.ts
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { authFetch } from "@/features/auth";
++import { readFastApiError } from "@/lib/format-fastapi-error";
++
++/** Model paths the backend loads onto the NPU (`lemonade:<Lemonade model id>`). */
++export const NPU_MODEL_PREFIX = "lemonade:";
++
++export function isNpuModelId(
++  value: string | null | undefined,
++): value is string {
++  return typeof value === "string" && value.startsWith(NPU_MODEL_PREFIX);
++}
++
++export interface NpuValidation {
++  ready: boolean;
++  problems: string[];
++}
++
++export interface NpuStatus {
++  supported: boolean;
++  hardware: {
++    present: boolean;
++    supported: boolean;
++    family?: string;
++    name?: string;
++    driver?: string | null;
++    driver_version?: string | null;
++    firmware_version?: string | null;
++  };
++  runtime_installed: boolean;
++  runtime_running: boolean;
++  state: string;
++  error: string | null;
++  validation: NpuValidation | null;
++  help_url: string | null;
++  loaded_model: string | null;
++  context_length: number | null;
++  loading_model: string | null;
++}
++
++export interface NpuModel {
++  id: string;
++  model_path: string;
++  checkpoint: string;
++  size_gb: number | null;
++  downloaded: boolean;
++  labels: string[];
++  supports_vision: boolean;
++  supports_reasoning: boolean;
++  supports_tools: boolean;
++  max_context_length: number | null;
++}
++
++export interface NpuDownloadEvent {
++  event: string;
++  percent?: number;
++  bytes_downloaded?: number;
++  bytes_total?: number;
++  file?: string;
++  file_index?: number;
++  total_files?: number;
++  error?: string;
++}
++
++export async function getNpuStatus(signal?: AbortSignal): Promise<NpuStatus> {
++  const response = await authFetch("/api/npu/status", { signal });
++  if (!response.ok) {
++    throw new Error(
++      await readFastApiError(response, "Could not read the NPU status"),
++    );
++  }
++  return (await response.json()) as NpuStatus;
++}
++
++export async function enableNpu(): Promise<NpuStatus> {
++  const response = await authFetch("/api/npu/enable", { method: "POST" });
++  if (!response.ok) {
++    throw new Error(
++      await readFastApiError(response, "Could not enable the NPU runtime"),
++    );
++  }
++  return (await response.json()) as NpuStatus;
++}
++
++export async function listNpuModels(): Promise<NpuModel[]> {
++  const response = await authFetch("/api/npu/models");
++  if (!response.ok) {
++    throw new Error(
++      await readFastApiError(response, "Could not list NPU models"),
++    );
++  }
++  return ((await response.json()) as { models: NpuModel[] }).models;
++}
++
++export async function deleteNpuModel(id: string): Promise<void> {
++  const response = await authFetch(
++    `/api/npu/models/${encodeURIComponent(id)}`,
++    {
++      method: "DELETE",
++    },
++  );
++  if (!response.ok) {
++    throw new Error(
++      await readFastApiError(response, "Could not delete the model"),
++    );
++  }
++}
++
++/** Download a model, reporting each progress event. Resolves on `complete`, rejects on `error`. */
++export async function downloadNpuModel(
++  id: string,
++  onProgress: (event: NpuDownloadEvent) => void,
++  signal?: AbortSignal,
++): Promise<void> {
++  const response = await authFetch(
++    `/api/npu/models/${encodeURIComponent(id)}/download`,
++    { method: "POST", signal },
++  );
++  if (!response.ok || !response.body) {
++    throw new Error(
++      await readFastApiError(response, "Could not download the model"),
++    );
++  }
++  const reader = response.body.getReader();
++  const decoder = new TextDecoder();
++  let buffer = "";
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    buffer += decoder.decode(value, { stream: true });
++    let boundary = buffer.indexOf("\n\n");
++    while (boundary >= 0) {
++      const frame = buffer.slice(0, boundary);
++      buffer = buffer.slice(boundary + 2);
++      boundary = buffer.indexOf("\n\n");
++      if (!frame.startsWith("data:")) continue;
++      const event = JSON.parse(frame.slice(5).trim()) as NpuDownloadEvent;
++      if (event.event === "error") {
++        throw new Error(event.error || "The download failed");
++      }
++      onProgress(event);
++      if (event.event === "complete") return;
++    }
++  }
++  throw new Error("The download ended before it completed");
++}
+diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
+new file mode 100644
+index 0000000000..836deeb04f
+--- /dev/null
++++ b/studio/frontend/src/features/npu/index.ts
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++export {
++  isNpuModelId,
++  NPU_MODEL_PREFIX,
++  type NpuModel,
++  type NpuStatus,
++} from "./api";
++export { NpuModelPanel } from "./npu-model-panel";
++export { useNpuStatus } from "./use-npu-status";
+diff --git a/studio/frontend/src/features/npu/npu-model-panel.tsx b/studio/frontend/src/features/npu/npu-model-panel.tsx
+new file mode 100644
+index 0000000000..072065fd7b
+--- /dev/null
++++ b/studio/frontend/src/features/npu/npu-model-panel.tsx
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { Button } from "@/components/ui/button";
++import { Spinner } from "@/components/ui/spinner";
++import { cn } from "@/lib/utils";
++import {
++  AlertCircleIcon,
++  CheckmarkCircle02Icon,
++  Delete02Icon,
++  Download01Icon,
++} from "@hugeicons/core-free-icons";
++import { HugeiconsIcon } from "@hugeicons/react";
++import { type ReactNode, useCallback, useEffect, useState } from "react";
++import { toast } from "sonner";
++import {
++  type NpuModel,
++  type NpuStatus,
++  deleteNpuModel,
++  downloadNpuModel,
++  enableNpu,
++  listNpuModels,
++} from "./api";
++
++const TAGS: Array<[keyof NpuModel, string]> = [
++  ["supports_reasoning", "Reasoning"],
++  ["supports_tools", "Tools"],
++  ["supports_vision", "Vision"],
++];
++
++function sizeLabel(sizeGb: number | null): string | null {
++  if (sizeGb == null) return null;
++  return sizeGb < 1
++    ? `${Math.round(sizeGb * 1000)} MB`
++    : `${sizeGb.toFixed(1)} GB`;
++}
++
++/** The model picker's NPU section: enable the runtime, then download, delete and pick
++ *  FastFlowLM models. Picking hands the `lemonade:` model path to the normal load flow. */
++export function NpuModelPanel({
++  status,
++  onStatusChange,
++  value,
++  loadedModelId,
++  onPick,
++  sectionToggle,
++}: {
++  status: NpuStatus;
++  onStatusChange: (status: NpuStatus) => void;
++  value?: string;
++  loadedModelId?: string;
++  onPick: (modelPath: string) => void;
++  sectionToggle: ReactNode;
++}) {
++  const [models, setModels] = useState<NpuModel[] | null>(null);
++  const [listError, setListError] = useState<string | null>(null);
++  const [enabling, setEnabling] = useState(false);
++  const [downloads, setDownloads] = useState<Record<string, number | null>>({});
++  const ready = status.state === "ready" || status.runtime_running;
++
++  const refreshModels = useCallback(async () => {
++    try {
++      setModels(await listNpuModels());
++      setListError(null);
++    } catch (error) {
++      setListError(error instanceof Error ? error.message : String(error));
++    }
++  }, []);
++
++  useEffect(() => {
++    if (!status.runtime_installed || status.state === "failed") return;
++    let live = true;
++    listNpuModels().then(
++      (next) => {
++        if (!live) return;
++        setModels(next);
++        setListError(null);
++      },
++      (error) => {
++        if (live) {
++          setListError(error instanceof Error ? error.message : String(error));
++        }
++      },
++    );
++    return () => {
++      live = false;
++    };
++  }, [status.runtime_installed, status.state]);
++
++  const enable = async () => {
++    setEnabling(true);
++    try {
++      onStatusChange(await enableNpu());
++      await refreshModels();
++    } catch (error) {
++      toast.error("Could not enable the NPU", {
++        description: error instanceof Error ? error.message : String(error),
++      });
++    } finally {
++      setEnabling(false);
++    }
++  };
++
++  const download = async (model: NpuModel) => {
++    setDownloads((current) => ({ ...current, [model.id]: null }));
++    try {
++      await downloadNpuModel(model.id, (event) => {
++        if (typeof event.percent === "number") {
++          setDownloads((current) => ({
++            ...current,
++            [model.id]: event.percent ?? null,
++          }));
++        }
++      });
++      await refreshModels();
++    } catch (error) {
++      toast.error(`Could not download ${model.id}`, {
++        description: error instanceof Error ? error.message : String(error),
++      });
++    } finally {
++      setDownloads((current) => {
++        const next = { ...current };
++        delete next[model.id];
++        return next;
++      });
++    }
++  };
++
++  const remove = async (model: NpuModel) => {
++    try {
++      await deleteNpuModel(model.id);
++      await refreshModels();
++    } catch (error) {
++      toast.error(`Could not delete ${model.id}`, {
++        description: error instanceof Error ? error.message : String(error),
++      });
++    }
++  };
++
++  const problems = status.validation?.problems ?? [];
++  return (
++    <div className="flex flex-col gap-3 pr-2">
++      <div className="flex flex-wrap items-center gap-2">{sectionToggle}</div>
++      <p className="text-xs text-muted-foreground">
++        {status.hardware.name ?? "AMD NPU"}: models run on FastFlowLM through
++        Lemonade. They are FastFlowLM's own NPU builds; GGUF models run on the
++        GPU.
++      </p>
++      {status.error || problems.length > 0 ? (
++        <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-xs text-destructive">
++          <HugeiconsIcon
++            icon={AlertCircleIcon}
++            className="mt-0.5 size-3.5 shrink-0"
++          />
++          <div className="flex flex-col gap-1">
++            <span>{status.error ?? problems.join(" ")}</span>
++            {status.help_url ? (
++              <a
++                href={status.help_url}
++                target="_blank"
++                rel="noreferrer"
++                className="underline underline-offset-2"
++              >
++                NPU driver setup
++              </a>
++            ) : null}
++          </div>
++        </div>
++      ) : null}
++      {!ready || !status.runtime_installed ? (
++        <div className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 p-3 text-xs">
++          <span className="text-muted-foreground">
++            Enabling downloads Lemonade (about 7 MB) and FastFlowLM (about 40
++            MB), then checks the NPU driver.
++          </span>
++          <Button size="sm" onClick={() => void enable()} disabled={enabling}>
++            {enabling ? <Spinner className="size-3.5" /> : null}
++            {status.runtime_installed ? "Start NPU runtime" : "Enable NPU"}
++          </Button>
++        </div>
++      ) : null}
++      {listError ? (
++        <p className="text-xs text-destructive">{listError}</p>
++      ) : null}
++      {models ? (
++        <div className="model-list-scroll max-h-[calc(335px*var(--ui-space-scale,1))] overflow-y-auto px-0.5 pb-3">
++          {models.map((model) => {
++            const progress = downloads[model.id];
++            const downloading = model.id in downloads;
++            const selected = value === model.model_path;
++            const loaded = loadedModelId === model.model_path;
++            return (
++              <div
++                key={model.id}
++                className={cn(
++                  "flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm",
++                  model.downloaded && "hover:bg-muted/60",
++                  selected && "bg-muted/60",
++                )}
++              >
++                <button
++                  type="button"
++                  className="flex min-w-0 flex-1 flex-col text-left disabled:cursor-default"
++                  disabled={!model.downloaded || downloading}
++                  aria-current={selected ? "true" : undefined}
++                  title={
++                    model.downloaded
++                      ? undefined
++                      : "Download this model to load it"
++                  }
++                  onClick={() => onPick(model.model_path)}
++                  data-model-picker-option={true}
++                >
++                  <span className="truncate font-medium">{model.id}</span>
++                  <span className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
++                    {sizeLabel(model.size_gb) ? (
++                      <span>{sizeLabel(model.size_gb)}</span>
++                    ) : null}
++                    {TAGS.filter(([key]) => model[key]).map(([, label]) => (
++                      <span key={label}>{label}</span>
++                    ))}
++                  </span>
++                </button>
++                {loaded ? (
++                  <HugeiconsIcon
++                    icon={CheckmarkCircle02Icon}
++                    className="size-4 shrink-0 text-primary"
++                    aria-label="Loaded"
++                  />
++                ) : null}
++                {downloading ? (
++                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
++                    <Spinner className="size-3.5" />
++                    {progress != null ? `${Math.round(progress)}%` : null}
++                  </span>
++                ) : model.downloaded ? (
++                  <Button
++                    size="icon-xs"
++                    variant="ghost"
++                    aria-label={`Delete ${model.id}`}
++                    disabled={loaded}
++                    onClick={() => void remove(model)}
++                  >
++                    <HugeiconsIcon icon={Delete02Icon} />
++                  </Button>
++                ) : (
++                  <Button
++                    size="icon-xs"
++                    variant="ghost"
++                    aria-label={`Download ${model.id}`}
++                    onClick={() => void download(model)}
++                  >
++                    <HugeiconsIcon icon={Download01Icon} />
++                  </Button>
++                )}
++              </div>
++            );
++          })}
++        </div>
++      ) : ready && status.runtime_installed && !listError ? (
++        <div className="flex justify-center py-4">
++          <Spinner className="size-4" />
++        </div>
++      ) : null}
++      <p className="pb-2 text-[11px] text-muted-foreground">
++        Powered by{" "}
++        <a
++          href="https://github.com/FastFlowLM/FastFlowLM"
++          target="_blank"
++          rel="noreferrer"
++          className="underline underline-offset-2"
++        >
++          FastFlowLM
++        </a>{" "}
++        and{" "}
++        <a
++          href="https://github.com/lemonade-sdk/lemonade"
++          target="_blank"
++          rel="noreferrer"
++          className="underline underline-offset-2"
++        >
++          Lemonade
++        </a>
++        .
++      </p>
++    </div>
++  );
++}
+diff --git a/studio/frontend/src/features/npu/use-npu-status.ts b/studio/frontend/src/features/npu/use-npu-status.ts
+new file mode 100644
+index 0000000000..f87a614789
+--- /dev/null
++++ b/studio/frontend/src/features/npu/use-npu-status.ts
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { useEffect, useState } from "react";
++import { type NpuStatus, getNpuStatus } from "./api";
++
++// The NPU cannot appear or vanish while Unsloth runs, so one answer per page covers hardware
++// detection; the runtime fields are refreshed by whoever changes them (enable, load).
++let cached: NpuStatus | null = null;
++let pending: Promise<NpuStatus | null> | null = null;
++
++function fetchOnce(): Promise<NpuStatus | null> {
++  pending ??= getNpuStatus()
++    .then((status) => {
++      cached = status;
++      return status;
++    })
++    .catch(() => null)
++    .finally(() => {
++      pending = null;
++    });
++  return pending;
++}
++
++/** The NPU status, or null until known (and on a backend without the route). */
++export function useNpuStatus(
++  active = true,
++): [NpuStatus | null, (next: NpuStatus) => void] {
++  const [status, setStatus] = useState<NpuStatus | null>(cached);
++  useEffect(() => {
++    if (!active) return;
++    let live = true;
++    void fetchOnce().then((next) => {
++      if (live && next) setStatus(next);
++    });
++    return () => {
++      live = false;
++    };
++  }, [active]);
++  const update = (next: NpuStatus) => {
++    cached = next;
++    setStatus(next);
++  };
++  return [status, update];
++}
+diff --git a/studio/frontend/tests/npu-api.test.ts b/studio/frontend/tests/npu-api.test.ts
+new file mode 100644
+index 0000000000..925afb6cca
+--- /dev/null
++++ b/studio/frontend/tests/npu-api.test.ts
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import { loadWithStubs } from "./helpers/module-stubs.ts";
++import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
++import type * as NpuApi from "../src/features/npu/api.ts";
++
++function client(response: () => Response) {
++  const requests: { path: string; init?: RequestInit }[] = [];
++  const api = loadWithStubs<typeof NpuApi>(
++    new URL("../src/features/npu/api.ts", import.meta.url),
++    {
++      "@/features/auth": {
++        authFetch: async (path: string, init?: RequestInit) => {
++          requests.push({ path, init });
++          return response();
++        },
++      },
++      "@/lib/format-fastapi-error": formatFastApiError,
++    },
++  );
++  return { api, requests };
++}
++
++/** An SSE body delivered in the given chunks, so frames can straddle reads. */
++function sse(chunks: string[]): Response {
++  const encoder = new TextEncoder();
++  return new Response(
++    new ReadableStream({
++      start(controller) {
++        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
++        controller.close();
++      },
++    }),
++    { headers: { "Content-Type": "text/event-stream" } },
++  );
++}
++
++test("recognizes NPU model paths only", () => {
++  const { api } = client(() => Response.json({}));
++  assert.equal(api.isNpuModelId("lemonade:qwen3-0.6b-FLM"), true);
++  assert.equal(api.isNpuModelId("unsloth/Qwen3-0.6B-GGUF"), false);
++  assert.equal(api.isNpuModelId(null), false);
++});
++
++test("download reports progress across split frames and resolves on complete", async () => {
++  const c = client(() =>
++    sse([
++      'data: {"event":"progress","percent":10}\n\ndata: {"event":"pro',
++      'gress","percent":55}\n\n',
++      'data: {"event":"complete","percent":100}\n\n',
++    ]),
++  );
++  const seen: number[] = [];
++  await c.api.downloadNpuModel("qwen3-0.6b-FLM", (event) => {
++    if (typeof event.percent === "number") seen.push(event.percent);
++  });
++  assert.deepEqual(seen, [10, 55, 100]);
++  assert.equal(c.requests[0].path, "/api/npu/models/qwen3-0.6b-FLM/download");
++  assert.equal(c.requests[0].init?.method, "POST");
++});
++
++test("download rejects on an error event", async () => {
++  const c = client(() =>
++    sse(['data: {"event":"error","error":"disk full"}\n\n']),
++  );
++  await assert.rejects(
++    c.api.downloadNpuModel("qwen3-0.6b-FLM", () => {}),
++    /disk full/,
++  );
++});
++
++test("download rejects a stream that ends before completing", async () => {
++  const c = client(() => sse(['data: {"event":"progress","percent":5}\n\n']));
++  await assert.rejects(
++    c.api.downloadNpuModel("qwen3-0.6b-FLM", () => {}),
++    /ended before it completed/,
++  );
++});
++
++test("enable surfaces the backend's reason", async () => {
++  const c = client(() =>
++    Response.json(
++      { detail: "The locked-memory limit is too low." },
++      { status: 400 },
++    ),
++  );
++  await assert.rejects(c.api.enableNpu(), /locked-memory limit/);
++});
+diff --git a/studio/install_lemonade_prebuilt.py b/studio/install_lemonade_prebuilt.py
+new file mode 100644
+index 0000000000..eff66c2b3d
+--- /dev/null
++++ b/studio/install_lemonade_prebuilt.py
+@@ -0,0 +1,226 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Install the pinned Embeddable Lemonade build that runs FastFlowLM on AMD NPUs.
++
++Lemonade's embeddable archive holds ``lemond`` (the server Unsloth starts as a child), the
++``lemonade`` CLI and ``resources/``. ``lemond`` downloads FastFlowLM itself on the first
++``POST /v1/install``; the checksum written into ``resources/backend_versions.json`` here makes
++that download verified too (``BackendUtils::lookup_expected_asset_hash`` in lemond).
++
++Nothing runs this from install.sh: the backend calls ``install()`` when the user enables the NPU
++runtime, so a machine without an AMD NPU never downloads it. Run as a script it installs into
++``--root`` (default ``~/.unsloth/studio/lemonade``) and prints the lemond path.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import platform
++import shutil
++import sys
++import tempfile
++import threading
++import urllib.request
++from pathlib import Path
++from typing import Callable, Optional
++
++_STUDIO_DIR = os.path.dirname(os.path.abspath(__file__))
++if _STUDIO_DIR not in sys.path:
++    sys.path.insert(0, _STUDIO_DIR)
++
++import prebuilt_core as core  # noqa: E402
++from backend.utils.auth_safe import auth_safe_open  # noqa: E402
++
++PINS_PATH = Path(_STUDIO_DIR) / "lemonade_prebuilt_pins.json"
++MARKER_NAME = "UNSLOTH_LEMONADE_INFO.json"
++_CHUNK = 1 << 20
++_DOWNLOAD_TIMEOUT_S = 60
++
++ProgressCallback = Callable[[int, Optional[int]], None]
++
++
++class LemonadeInstallCancelled(RuntimeError):
++    pass
++
++
++def load_pins(path: Path = PINS_PATH) -> dict:
++    with open(path, encoding = "utf-8") as handle:
++        pins = json.load(handle)
++    if pins.get("schema_version") != 1:
++        raise RuntimeError(f"{path} has an unsupported schema_version.")
++    return pins
++
++
++def host_asset_key() -> Optional[str]:
++    """The pin key for this OS and CPU, or None where Lemonade publishes no FastFlowLM build."""
++    machine = platform.machine().lower()
++    if machine not in ("x86_64", "amd64", "x64"):
++        return None
++    if sys.platform.startswith("linux"):
++        return "linux-x64"
++    if sys.platform == "win32":
++        return "windows-x64"
++    return None
++
++
++def lemond_name() -> str:
++    return "lemond.exe" if sys.platform == "win32" else "lemond"
++
++
++def install_dir(root: Path, pins: Optional[dict] = None) -> Path:
++    pins = pins or load_pins()
++    return Path(root) / pins["lemonade"]["version"]
++
++
++def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
++    """The lemond binary of a complete install matching the pin, else None."""
++    pins = pins or load_pins()
++    key = host_asset_key()
++    if key is None:
++        return None
++    target = install_dir(root, pins)
++    try:
++        marker = json.loads((target / MARKER_NAME).read_text(encoding = "utf-8"))
++    except (OSError, ValueError):
++        return None
++    asset = pins["lemonade"]["assets"][key]
++    if marker.get("sha256") != asset["sha256"] or marker.get("asset") != asset["name"]:
++        return None
++    binary = target / lemond_name()
++    return binary if binary.is_file() else None
++
++
++def _download(
++    url: str,
++    destination: Path,
++    *,
++    expected_sha256: str,
++    progress: Optional[ProgressCallback],
++    cancel: Optional[threading.Event],
++) -> None:
++    digest = hashlib.sha256()
++    request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-studio"})
++    with (
++        auth_safe_open(request, timeout = _DOWNLOAD_TIMEOUT_S) as response,
++        open(destination, "wb") as handle,
++    ):
++        total_header = response.headers.get("Content-Length")
++        total = int(total_header) if total_header and total_header.isdigit() else None
++        done = 0
++        while True:
++            if cancel is not None and cancel.is_set():
++                raise LemonadeInstallCancelled("Lemonade download cancelled.")
++            chunk = response.read(_CHUNK)
++            if not chunk:
++                break
++            handle.write(chunk)
++            digest.update(chunk)
++            done += len(chunk)
++            if progress is not None:
++                progress(done, total)
++    actual = digest.hexdigest()
++    if actual != expected_sha256:
++        raise core.ReleaseIntegrityError(
++            f"{url} has sha256 {actual}, expected {expected_sha256}; refusing to install it."
++        )
++
++
++def _pin_fastflowlm_checksum(resources: Path, pins: dict) -> None:
++    """Pin lemond's FastFlowLM download to the version and digests Unsloth tested."""
++    path = resources / "backend_versions.json"
++    versions = json.loads(path.read_text(encoding = "utf-8"))
++    flm = pins["fastflowlm"]
++    versions.setdefault("flm", {})["npu"] = flm["version"]
++    github = versions.setdefault("checksums", {}).setdefault("github", {})
++    by_tag = github.setdefault(flm["repo"], {}).setdefault(flm["version"], {})
++    for asset in flm["assets"].values():
++        by_tag[asset["name"]] = f"sha256:{asset['sha256']}"
++    core.atomic_write_bytes(path, (json.dumps(versions, indent = 2) + "\n").encode("utf-8"))
++
++
++def install(
++    root: Path,
++    *,
++    progress: Optional[ProgressCallback] = None,
++    cancel: Optional[threading.Event] = None,
++    pins_path: Path = PINS_PATH,
++) -> Path:
++    """Install the pinned lemond under ``root/<version>`` and return its path.
++
++    Idempotent: a complete matching install returns at once. The archive is verified against the
++    pinned sha256 before extraction and the directory appears only once fully populated, so a
++    cancelled or failed attempt leaves nothing that ``installed_lemond`` accepts."""
++    pins = load_pins(pins_path)
++    key = host_asset_key()
++    if key is None:
++        raise RuntimeError(
++            "Lemonade publishes FastFlowLM builds for Windows and Linux on x86_64 only."
++        )
++    root = Path(root)
++    target = install_dir(root, pins)
++    with core.install_lock(core.install_lock_path(target)):
++        existing = installed_lemond(root, pins)
++        if existing is not None:
++            return existing
++        asset = pins["lemonade"]["assets"][key]
++        url = core.release_asset_download_url(
++            pins["lemonade"]["repo"], f"v{pins['lemonade']['version']}", asset["name"]
++        )
++        root.mkdir(parents = True, exist_ok = True)
++        with tempfile.TemporaryDirectory(prefix = ".lemonade-install-", dir = root) as scratch:
++            scratch_dir = Path(scratch)
++            archive = scratch_dir / asset["name"]
++            _download(
++                url, archive, expected_sha256 = asset["sha256"], progress = progress, cancel = cancel
++            )
++            extracted = scratch_dir / "extracted"
++            extracted.mkdir()
++            core.extract_archive(archive, extracted)
++            core.restore_tar_exec_bits(archive, extracted)
++            binaries = sorted(extracted.rglob(lemond_name()))
++            if not binaries:
++                raise RuntimeError(f"{asset['name']} does not contain {lemond_name()}.")
++            payload = binaries[0].parent
++            _pin_fastflowlm_checksum(payload / "resources", pins)
++            (payload / MARKER_NAME).write_text(
++                json.dumps(
++                    {
++                        "version": pins["lemonade"]["version"],
++                        "asset": asset["name"],
++                        "sha256": asset["sha256"],
++                        "fastflowlm": pins["fastflowlm"]["version"],
++                    },
++                    indent = 2,
++                )
++                + "\n",
++                encoding = "utf-8",
++            )
++            if target.exists():
++                shutil.rmtree(target)
++            os.replace(payload, target)
++    binary = installed_lemond(root, pins)
++    if binary is None:
++        raise RuntimeError(f"Lemonade install at {target} did not verify.")
++    return binary
++
++
++def main(argv: Optional[list[str]] = None) -> int:
++    parser = argparse.ArgumentParser(description = __doc__.splitlines()[0])
++    parser.add_argument(
++        "--root",
++        type = Path,
++        default = Path.home() / ".unsloth" / "studio" / "lemonade",
++        help = "Directory that holds one subdirectory per Lemonade version.",
++    )
++    args = parser.parse_args(argv)
++    print(install(args.root))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/studio/lemonade_prebuilt_pins.json b/studio/lemonade_prebuilt_pins.json
+new file mode 100644
+index 0000000000..d486af695b
+--- /dev/null
++++ b/studio/lemonade_prebuilt_pins.json
+@@ -0,0 +1,33 @@
++{
++  "schema_version": 1,
++  "lemonade": {
++    "version": "11.9.0",
++    "repo": "lemonade-sdk/lemonade",
++    "assets": {
++      "linux-x64": {
++        "name": "lemonade-embeddable-11.9.0-ubuntu-x64.tar.gz",
++        "sha256": "a18beaf78b5e30996087d1387683a6a5b4207cdd50f0a8ed7d7dc88823eb204d",
++        "size": 7429447
++      },
++      "windows-x64": {
++        "name": "lemonade-embeddable-11.9.0-windows-x64.zip",
++        "sha256": "8311d9089c3f3747eb3ff5cee35c325a20686f7f5911c455763e7edf0619d1c7",
++        "size": 5382390
++      }
++    }
++  },
++  "fastflowlm": {
++    "version": "v1.0.3",
++    "repo": "ROCm/FastFlowLM",
++    "assets": {
++      "linux-x64": {
++        "name": "fastflowlm_1.0.3_linux.tar.gz",
++        "sha256": "f721254e6a1e06cbd729883e8a4bd583fa396aade761d59bb4333cea8f59ebd1"
++      },
++      "windows-x64": {
++        "name": "fastflowlm_1.0.3_windows_amd64.zip",
++        "sha256": "ca92eaf5f01909391100a1e7fde47240489a3a9b93ef5f52ea01b648f46f8a55"
++      }
++    }
++  }
++}
+diff --git a/tests/studio/install/test_install_lemonade_prebuilt.py b/tests/studio/install/test_install_lemonade_prebuilt.py
+new file mode 100644
+index 0000000000..8c9e9ddf53
+--- /dev/null
++++ b/tests/studio/install/test_install_lemonade_prebuilt.py
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""studio/install_lemonade_prebuilt.py against a local archive server.
++
++Covers the parts that decide whether an NPU install can be trusted: the pinned digest is enforced
++before anything is extracted, a failed attempt leaves nothing ``installed_lemond`` accepts, a
++complete install is not downloaded twice, and lemond's FastFlowLM download is pinned too.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import sys
++import tarfile
++import threading
++import zipfile
++from functools import partial
++from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++STUDIO_DIR = Path(__file__).resolve().parents[3] / "studio"
++if str(STUDIO_DIR) not in sys.path:
++    sys.path.insert(0, str(STUDIO_DIR))
++
++import install_lemonade_prebuilt as lp  # noqa: E402
++
++
++def _archive(directory: Path, key: str) -> Path:
++    top = "lemonade-embeddable-9.9.9"
++    binary = "lemond.exe" if key == "windows-x64" else "lemond"
++    versions = json.dumps({"flm": {"npu": "v0.0.1"}, "checksums": {"github": {"other/repo": {}}}})
++    files = {
++        f"{top}/{binary}": b"#!/bin/sh\n",
++        f"{top}/resources/backend_versions.json": versions.encode(),
++    }
++    if key == "windows-x64":
++        path = directory / "lemonade.zip"
++        with zipfile.ZipFile(path, "w") as archive:
++            for name, data in files.items():
++                archive.writestr(name, data)
++    else:
++        path = directory / "lemonade.tar.gz"
++        with tarfile.open(path, "w:gz") as archive:
++            for name, data in files.items():
++                info = tarfile.TarInfo(name)
++                info.size = len(data)
++                info.mode = 0o755
++                archive.addfile(info, io.BytesIO(data))
++    return path
++
++
++@pytest.fixture
++def served(tmp_path, monkeypatch):
++    key = lp.host_asset_key()
++    if key is None:
++        pytest.skip("no Lemonade build for this platform")
++    archive = _archive(tmp_path, key)
++    sha = hashlib.sha256(archive.read_bytes()).hexdigest()
++    httpd = ThreadingHTTPServer(
++        ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory = str(tmp_path))
++    )
++    httpd.requests = 0
++    original = httpd.finish_request
++
++    def counted(*args, **kwargs):
++        httpd.requests += 1
++        return original(*args, **kwargs)
++
++    httpd.finish_request = counted
++    thread = threading.Thread(target = httpd.serve_forever, daemon = True)
++    thread.start()
++    base = f"http://127.0.0.1:{httpd.server_address[1]}"
++    monkeypatch.setattr(
++        lp.core, "release_asset_download_url", lambda repo, tag, name: f"{base}/{name}"
++    )
++
++    def pins(digest: str = sha) -> Path:
++        path = tmp_path / "pins.json"
++        path.write_text(
++            json.dumps(
++                {
++                    "schema_version": 1,
++                    "lemonade": {
++                        "version": "9.9.9",
++                        "repo": "lemonade-sdk/lemonade",
++                        "assets": {key: {"name": archive.name, "sha256": digest}},
++                    },
++                    "fastflowlm": {
++                        "version": "v1.0.3",
++                        "repo": "ROCm/FastFlowLM",
++                        "assets": {key: {"name": "fastflowlm.tar.gz", "sha256": "ab" * 32}},
++                    },
++                }
++            )
++        )
++        return path
++
++    yield pins, httpd
++    httpd.shutdown()
++    httpd.server_close()
++
++
++def test_install_verifies_and_pins_fastflowlm(tmp_path, served):
++    pins, _ = served
++    path = pins()
++    root = tmp_path / "root"
++    binary = lp.install(root, pins_path = path)
++    assert binary == lp.installed_lemond(root, lp.load_pins(path))
++    versions = json.loads((binary.parent / "resources" / "backend_versions.json").read_text())
++    assert versions["flm"]["npu"] == "v1.0.3"
++    assert versions["checksums"]["github"]["ROCm/FastFlowLM"]["v1.0.3"] == {
++        "fastflowlm.tar.gz": "sha256:" + "ab" * 32
++    }
++    # What lemond already pinned stays.
++    assert "other/repo" in versions["checksums"]["github"]
++
++
++def test_a_complete_install_is_not_downloaded_again(tmp_path, served):
++    pins, httpd = served
++    path = pins()
++    root = tmp_path / "root"
++    lp.install(root, pins_path = path)
++    before = httpd.requests
++    lp.install(root, pins_path = path)
++    assert httpd.requests == before
++
++
++def test_a_digest_mismatch_installs_nothing(tmp_path, served):
++    pins, _ = served
++    path = pins("00" * 32)
++    root = tmp_path / "root"
++    with pytest.raises(lp.core.ReleaseIntegrityError):
++        lp.install(root, pins_path = path)
++    assert lp.installed_lemond(root, lp.load_pins(path)) is None
++    assert not (root / "9.9.9").exists()
++
++
++def test_a_cancelled_download_installs_nothing(tmp_path, served):
++    pins, _ = served
++    path = pins()
++    root = tmp_path / "root"
++    cancel = threading.Event()
++    cancel.set()
++    with pytest.raises(lp.LemonadeInstallCancelled):
++        lp.install(root, pins_path = path, cancel = cancel)
++    assert lp.installed_lemond(root, lp.load_pins(path)) is None
++
++
++def test_the_shipped_pins_cover_both_npu_platforms():
++    pins = lp.load_pins()
++    for section in ("lemonade", "fastflowlm"):
++        assert set(pins[section]["assets"]) == {"linux-x64", "windows-x64"}
++        for asset in pins[section]["assets"].values():
++            assert len(asset["sha256"]) == 64
++    assert pins["fastflowlm"]["version"].startswith("v")
+-- 
+2.43.0
+
