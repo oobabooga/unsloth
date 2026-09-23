@@ -7,12 +7,17 @@ its load / quantise time, per-step time, weight footprint and peak memory, or th
 
 Arms (transformer unless named; the text encoder stays bf16 unless the arm is about it):
   bf16            the reference
+  bf16_repeat     the reference again, reloaded: the run-to-run noise floor every LPIPS sits on
   studio_int8     Studio's own int8 W8A8 torchao path, the ROCm gate bypassed
   studio_fp8      Studio's own fp8 path (fp8 x fp8 _scaled_mm), the ROCm gate bypassed
   fp8_layerwise   fp8 weight STORAGE, bf16 compute (diffusers layerwise casting), no fp8 GEMM
   int8_weight     torchao int8 weight-only, bf16 activations
   fp8_weight      torchao fp8 weight-only, bf16 activations
   te_fp8          bf16 transformer, text encoder through Studio's fp8 layerwise cast
+  int8_native_*   torchao-free int8 in plain torch: per-row weight scale, then either a bf16
+                  dequant per call (weight) or torch._int_mm with per-token activations (w8a8).
+                  Windows ROCm torch ships no distributed ops, so real torchao cannot import there
+  fp8_native_weight  torchao-free fp8 e4m3 storage with a per-row scale, bf16 compute
   gguf_q4km       the public Q4_K_M GGUF through diffusers (today's GPU GGUF route)
 
 Only the head state renders; the base state records Studio's selector answers, which is cheap and
@@ -42,8 +47,12 @@ PROMPTS = (
 )
 ARMS = (
     "bf16",
-    "studio_int8",
+    "bf16_repeat",
+    "int8_native_w8a8",
+    "int8_native_weight",
+    "fp8_native_weight",
     "fp8_layerwise",
+    "studio_int8",
     "studio_fp8",
     "int8_weight",
     "fp8_weight",
@@ -216,12 +225,59 @@ def linear_filter(min_features: int = 1024):
     return fn
 
 
+def native_swap(module, mode: str) -> int:
+    """Replace each large Linear with a torchao-free int8 / fp8 twin. Returns layers swapped."""
+    import torch
+    from torch import nn
+    from torch.nn import functional as F
+
+    class NativeQuantLinear(nn.Module):
+        def __init__(self, lin):
+            super().__init__()
+            w = lin.weight.data.float()
+            self.in_features, self.out_features = lin.in_features, lin.out_features
+            if mode == "fp8_weight":
+                scale = w.abs().amax(dim = 1, keepdim = True).clamp(min = 1e-12) / 448.0
+                self.register_buffer("wq", (w / scale).to(torch.float8_e4m3fn))
+            else:
+                scale = w.abs().amax(dim = 1, keepdim = True).clamp(min = 1e-12) / 127.0
+                self.register_buffer("wq", (w / scale).round().clamp(-127, 127).to(torch.int8))
+            self.register_buffer("ws", scale.squeeze(1).to(torch.float32))
+            self.bias = lin.bias
+
+        def forward(self, x):
+            if mode != "int8_w8a8":
+                w = (self.wq.to(torch.float32) * self.ws[:, None]).to(x.dtype)
+                return F.linear(x, w, self.bias)
+            shape = x.shape
+            x2 = x.reshape(-1, shape[-1])
+            xs = x2.abs().amax(dim = 1, keepdim = True).float().clamp(min = 1e-12) / 127.0
+            xq = (x2.float() / xs).round().clamp(-127, 127).to(torch.int8)
+            m = xq.shape[0]
+            if m <= 16:  # _int_mm needs more than 16 rows
+                xq = torch.cat([xq, xq.new_zeros(17 - m, xq.shape[1])])
+            y = torch._int_mm(xq, self.wq.t())[:m]
+            y = (y.float() * xs * self.ws[None, :]).to(x.dtype)
+            if self.bias is not None:
+                y = y + self.bias
+            return y.reshape(*shape[:-1], self.out_features)
+
+    keep = linear_filter()
+    swaps = [(n, m) for n, m in module.named_modules() if keep(m, n)]
+    for name, lin in swaps:
+        parent = module.get_submodule(name.rsplit(".", 1)[0]) if "." in name else module
+        setattr(parent, name.rsplit(".", 1)[-1], NativeQuantLinear(lin))
+    return len(swaps)
+
+
 def count_converted(module) -> dict:
     import torch
 
     dense = converted = 0
     for m in module.modules():
-        if isinstance(m, torch.nn.Linear):
+        if type(m).__name__ == "NativeQuantLinear":
+            converted += 1
+        elif isinstance(m, torch.nn.Linear):
             w = m.weight
             data = getattr(w, "data", w)
             if type(data) is torch.Tensor and data.dtype in (torch.bfloat16, torch.float16, torch.float32):
@@ -249,6 +305,10 @@ def main() -> int:
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
         os.environ.pop(key, None)
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # The runners reach the hub through a caching mirror whose large-file reads time out at the
+    # default 10 s; read before huggingface_hub is first imported, which the selector below does.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
     t_start = time.time()
     obs: dict = {"state": args.state, "args": vars(args) | {"out": str(args.out)}}
@@ -280,23 +340,32 @@ def main() -> int:
 
     from huggingface_hub import hf_hub_download, snapshot_download
 
+    obs["hf_endpoint"] = os.environ.get("HF_ENDPOINT")
     t0 = time.time()
-    base_dl = attempt(
-        lambda: snapshot_download(
-            BASE_REPO,
-            local_dir = str(models / "qwen_image_21"),
-            allow_patterns = [
-                "model_index.json",
-                "processor/*",
-                "scheduler/*",
-                "text_encoder/*",
-                "transformer/*",
-                "vae/*",
-            ],
-            token = False,
+    tries: list = []
+    base_dl: dict = {"ok": False}
+    for i in range(6):
+        base_dl = attempt(
+            lambda: snapshot_download(
+                BASE_REPO,
+                local_dir = str(models / "qwen_image_21"),
+                allow_patterns = [
+                    "model_index.json",
+                    "processor/*",
+                    "scheduler/*",
+                    "text_encoder/*",
+                    "transformer/*",
+                    "vae/*",
+                ],
+                token = False,
+                max_workers = 4,
+            )
         )
-    )
-    obs["download_base"] = {**base_dl, "seconds": round(time.time() - t0, 1)}
+        tries.append(base_dl.get("ok") or (base_dl.get("error") or {}).get("message", "")[:200])
+        if base_dl["ok"]:
+            break
+        time.sleep(20)
+    obs["download_base"] = {**base_dl, "seconds": round(time.time() - t0, 1), "tries": tries}
     write(args.out, obs)
     if not base_dl["ok"]:
         return 0
@@ -415,9 +484,19 @@ def main() -> int:
         elif arm == "gguf_q4km":
             from diffusers import GGUFQuantizationConfig
 
-            path = hf_hub_download(
-                GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
-            )
+            path = None
+            for _ in range(4):
+                try:
+                    path = hf_hub_download(
+                        GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
+                    )
+                    break
+                except Exception:  # noqa: BLE001 - the mirror times out; resumed below
+                    time.sleep(20)
+            if path is None:
+                path = hf_hub_download(
+                    GGUF_REPO, GGUF_FILE, local_dir = str(models / "gguf"), token = False
+                )
             from core.inference import diffusion as studio
             import logging
 
@@ -457,6 +536,15 @@ def main() -> int:
                 rec["engaged"] = engaged
                 if engaged is None:
                     raise RuntimeError(f"quantize_transformer returned None for {arm}")
+            elif arm.startswith(("int8_native", "fp8_native")):
+                mode = {
+                    "int8_native_w8a8": "int8_w8a8",
+                    "int8_native_weight": "int8_weight",
+                    "fp8_native_weight": "fp8_weight",
+                }[arm]
+                rec["swapped"] = native_swap(tr, mode)
+                gc.collect()
+                torch.cuda.empty_cache()
             elif arm == "fp8_layerwise":
                 tr.enable_layerwise_casting(
                     storage_dtype = torch.float8_e4m3fn, compute_dtype = torch.bfloat16

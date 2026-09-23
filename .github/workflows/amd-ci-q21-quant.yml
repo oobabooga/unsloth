@@ -120,7 +120,7 @@ jobs:
             --probe amd_ci/probes/qwen21_amd_quant_probe.py \
             --criteria amd_ci/criteria/qwen21_amd_quant.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --models "$AMD_CI_WORK/models" --budget-min 200
+            --python "$AMD_CI_PY" -- --models "$AMD_CI_WORK/models" --budget-min 200 --arms bf16,bf16_repeat,int8_native_weight,fp8_native_weight,int8_native_w8a8,int8_weight,fp8_layerwise
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
