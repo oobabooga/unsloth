@@ -116,10 +116,10 @@ index 5eaea65e7a..a966825f32 100644
      message: str,
 diff --git a/studio/backend/core/inference/lemonade_server.py b/studio/backend/core/inference/lemonade_server.py
 new file mode 100644
-index 0000000000..22f9563f81
+index 0000000000..fecacc5727
 --- /dev/null
 +++ b/studio/backend/core/inference/lemonade_server.py
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,317 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -189,6 +189,18 @@ index 0000000000..22f9563f81
 +
 +class LemonadeUnavailable(RuntimeError):
 +    """lemond is not running or stopped answering."""
++
++
++def _kill_with_the_parent() -> None:
++    """Re-arm PR_SET_PDEATHSIG with SIGKILL (Linux preexec, after child_popen_kwargs' SIGTERM).
++
++    lemond takes its time over SIGTERM: with a FastFlowLM model loaded it was still running 90 s
++    after Unsloth was SIGKILLed on the AMD DevLab runner, holding the model in memory. Its flm child
++    needs nothing here, since lemond binds it with PR_SET_PDEATHSIG itself."""
++    import ctypes
++    import signal
++
++    ctypes.CDLL("libc.so.6", use_errno = True).prctl(1, signal.SIGKILL)
 +
 +
 +class LemonadeServer:
@@ -293,7 +305,7 @@ index 0000000000..22f9563f81
 +                    errors = "replace",
 +                    env = env,
 +                    **windows_hidden_subprocess_kwargs(),
-+                    **child_popen_kwargs(),
++                    **child_popen_kwargs(_kill_with_the_parent),
 +                )
 +
 +            proc = spawn_on_lifetime_thread(_spawn)
@@ -1945,10 +1957,10 @@ index 852fe69839..e9fb9b1945 100644
          close_studio_tunnel_lifecycle()
 diff --git a/studio/backend/tests/fixtures/fake_lemond.py b/studio/backend/tests/fixtures/fake_lemond.py
 new file mode 100644
-index 0000000000..84e780ae72
+index 0000000000..b0790c1507
 --- /dev/null
 +++ b/studio/backend/tests/fixtures/fake_lemond.py
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,192 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1966,6 +1978,7 @@ index 0000000000..84e780ae72
 +import argparse
 +import json
 +import os
++import signal
 +import sys
 +from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 +from pathlib import Path
@@ -2017,6 +2030,9 @@ index 0000000000..84e780ae72
 +    parser.add_argument("--log-file", default = "auto")
 +    args = parser.parse_args()
 +
++    if os.environ.get("FAKE_LEMOND_IGNORE_SIGTERM") == "1":
++        # A lemond whose SIGTERM shutdown never finishes, as seen with a FastFlowLM model loaded.
++        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 +    key = os.environ.get("LEMONADE_API_KEY", "")
 +    cache = Path(args.cache_dir)
 +    record = cache / "requests.jsonl"
@@ -2240,10 +2256,10 @@ index e24cfc68a5..8fbde82cf0 100644
          """Non-GGUF LoadResponse blocks report runtime context_length."""
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
 new file mode 100644
-index 0000000000..2a416dcb24
+index 0000000000..ff831578fe
 --- /dev/null
 +++ b/studio/backend/tests/test_npu_backend.py
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,301 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -2455,6 +2471,58 @@ index 0000000000..2a416dcb24
 +    npu.shutdown()
 +    assert process.poll() is not None
 +    assert npu.status()["runtime_running"] is False
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "PR_SET_PDEATHSIG is Linux")
++def test_lemond_dies_with_a_killed_owner_even_if_it_ignores_sigterm(tmp_path):
++    """A SIGKILLed Unsloth must not leave lemond (and the model FastFlowLM holds) behind.
++
++    The DevLab runner showed lemond still running 90 s after its owner died, since its SIGTERM
++    shutdown does not finish with a model loaded; this lemond ignores SIGTERM outright."""
++    import signal
++    import subprocess
++    import time
++
++    binary = _binary(tmp_path)
++    owner_src = textwrap.dedent(
++        f"""\
++        import sys, time
++        from pathlib import Path
++        sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
++        from core.inference.lemonade_server import LemonadeServer
++        root = Path({str(tmp_path)!r})
++        server = LemonadeServer(
++            Path({str(binary)!r}),
++            cache_dir = root / "cache",
++            config_dir = root / "config",
++            flm_model_dir = root / "flm",
++        )
++        server.start(timeout = 30)
++        print(server.pid, flush = True)
++        time.sleep(600)
++        """
++    )
++    env = dict(os.environ, FAKE_LEMOND_IGNORE_SIGTERM = "1")
++    owner = subprocess.Popen(
++        [sys.executable, "-c", owner_src], stdout = subprocess.PIPE, text = True, env = env
++    )
++    try:
++        lemond_pid = int(owner.stdout.readline())
++        owner.send_signal(signal.SIGKILL)
++        owner.wait(timeout = 10)
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            try:
++                os.kill(lemond_pid, 0)
++            except ProcessLookupError:
++                break
++            time.sleep(0.1)
++        else:
++            os.kill(lemond_pid, signal.SIGKILL)
++            pytest.fail("lemond outlived its SIGKILLed owner")
++    finally:
++        if owner.poll() is None:
++            owner.kill()
 +
 +
 +def test_a_server_that_never_answers_is_reported(tmp_path):

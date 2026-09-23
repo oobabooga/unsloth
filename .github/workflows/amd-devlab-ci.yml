@@ -12,7 +12,6 @@ env:
 
 jobs:
   linux:
-    if: ${{ false }}
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 150
     steps:
@@ -73,12 +72,14 @@ jobs:
           python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-restart.json" --phase after-restart
           procs "before SIGKILL"
           kill -KILL "$(cat "$W/studio.pid")"
-          # lemond gets SIGTERM from PR_SET_PDEATHSIG and shuts down on its own schedule.
-          for i in $(seq 1 18); do
-            sleep 5
-            if ! pgrep -f "$W/studio/lemonade" >/dev/null; then echo "Studio's lemond and flm gone $((i * 5))s after SIGKILL"; break; fi
+          # PR_SET_PDEATHSIG delivers SIGKILL to lemond; lemond's own flm child follows it.
+          LEFT=1
+          for i in $(seq 1 30); do
+            sleep 1
+            if ! pgrep -f "$W/studio/lemonade" >/dev/null; then echo "Studio's lemond and flm gone ${i}s after SIGKILL"; LEFT=0; break; fi
           done
           procs "after SIGKILL of Studio"
+          pkill -KILL -f "$W/studio/lemonade" || true
           echo "======== studio-main.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-main.log" | tail -120
           echo "======== studio-restart.log (tail)"; tail -80 "$W/studio-restart.log"
           python3 - "$W" <<'PY'
@@ -93,6 +94,9 @@ jobs:
               print(f"{name}: {len(rows) - len(fails)}/{len(rows)} passed", fails)
           sys.exit(1 if bad else 0)
           PY
+          RC=$?
+          [ "$LEFT" = 0 ] || { echo "lemond or flm outlived a SIGKILLed Studio"; RC=1; }
+          exit $RC
       - uses: actions/upload-artifact@v4
         if: always()
         with:

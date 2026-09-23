@@ -30,7 +30,10 @@ with sync_playwright() as p:
     shot = lambda name: page.screenshot(path=str(OUT / f"{name}.png"), animations="disabled")
     try:
         page.goto(f"{BASE}/login", wait_until="domcontentloaded", timeout=60_000)
-        page.locator("#username").fill("unsloth", timeout=60_000)
+        page.locator("#password").wait_for(state="visible", timeout=60_000)
+        # The username field only appears in multi-user mode.
+        if page.locator("#username").count():
+            page.locator("#username").fill("unsloth")
         page.locator("#password").fill(PASSWORD)
         page.locator('button[type="submit"]').click()
         composer = page.locator('textarea[aria-label="Message input"]')

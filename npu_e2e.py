@@ -255,7 +255,7 @@ def main_phase():
     rest = sse_lines(resp) if code == 200 else []
     record("Stop (cancel_id) ends the stream", ccode == 200 and cbody.get("cancelled", 0) >= 1 and time.time() - t0 < 10, f"cancelled={cbody} {len(first)}+{len(rest)} lines in {time.time()-t0:.2f}s")
     code, body, dt = chat("m", [{"role": "user", "content": "Say OK."}], stream=False, max_tokens=10, enable_thinking=False)
-    record("chat after a stop", code == 200, f"{dt:.2f}s")
+    record("chat after a stop", code == 200, f"{code} {dt:.2f}s {json.dumps(body)[:400]}")
 
     # Client disconnect mid-stream, then chat again.
     code, resp, _ = call("POST", "/v1/chat/completions", {"model": "m", "messages": story, "stream": True, "max_tokens": 900, "enable_thinking": False}, raw=True)
@@ -263,7 +263,7 @@ def main_phase():
         sse_lines(resp, limit=4)
         resp.close()
     code, body, dt = chat("m", [{"role": "user", "content": "Say OK."}], stream=False, max_tokens=10, enable_thinking=False)
-    record("chat after a client disconnect", code == 200 and dt < 30, f"{dt:.2f}s")
+    record("chat after a client disconnect", code == 200 and dt < 30, f"{code} {dt:.2f}s {json.dumps(body)[:400]}")
 
     # ---- qwen3.5-0.8b: reasoning + vision
     load("lemonade:qwen3.5-0.8b-FLM")
@@ -325,8 +325,9 @@ def main_phase():
     text = content_of(data_chunks(lines))
     record(
         "Studio tool loop runs python for the NPU model",
-        code == 200 and tool_frames and "83810205" in text.replace(",", ""),
-        f"{len(tool_frames)} tool frames, answer {text[-200:]!r}",
+        # The product lands in the tool_end frame; the 0.6B-4B model may restate it or not.
+        code == 200 and tool_frames and any("83810205" in l.replace(",", "") for l in tool_frames),
+        f"{len(tool_frames)} tool frames {[l[:200] for l in tool_frames][:4]}, answer {text[-200:]!r}",
     )
 
     # ---- A GGUF load replaces the NPU model, and an NPU load replaces the GGUF.
