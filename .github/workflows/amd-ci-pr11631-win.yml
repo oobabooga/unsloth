@@ -120,6 +120,18 @@ jobs:
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Carry PR 11640 into every state
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Without 11640's stub version, transformers 5 cannot import on Windows ROCm, so no state could
+          # load anything and the comparison would measure that instead of this PR.
+          Get-ChildItem -Directory "$env:AMD_CI_WORK\states" | ForEach-Object {
+            git -C $_.FullName fetch -q https://github.com/unslothai/unsloth pull/11640/head
+            git -C $_.FullName -c user.name=ci -c user.email=ci@localhost merge -q --no-edit FETCH_HEAD
+            Write-Host "$($_.Name): merge exit $LASTEXITCODE, $(git -C $_.FullName log -1 --format=%h)"
+          }
+          exit 0
+
       - name: Test environment
         timeout-minutes: 90
         run: |

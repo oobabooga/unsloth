@@ -68,6 +68,7 @@ def main() -> int:
     ap.add_argument("--size", type = int, default = 1024)
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--prompts", type = int, default = len(PROMPTS))
+    ap.add_argument("--reference-at-base", action = "store_true")
     args = ap.parse_args()
     # A stuck render still leaves evidence: stacks every 10 minutes into the probe log.
     faulthandler.dump_traceback_later(int(os.environ.get("PROBE_STACK_EVERY", "600")), repeat = True)
@@ -120,6 +121,17 @@ def main() -> int:
     write(args.out, obs)
 
     sys.path.insert(0, str(Path(args.checkout) / "studio" / "backend"))
+    # What run.py does first, so Windows ROCm sees the same stubs a real Studio process does.
+    try:
+        from core._torchao_stub import (
+            install_torchao_windows_rocm_stub,
+            install_xformers_windows_rocm_stub,
+        )
+
+        install_xformers_windows_rocm_stub()
+        install_torchao_windows_rocm_stub()
+    except Exception as exc:  # noqa: BLE001 - an older checkout without the stubs
+        obs["stub_error"] = str(exc)[:200]
     if os.environ.get("PROBE_FAKE_ROCM") == "1":
         import core._torchao_stub as stub
 
@@ -145,9 +157,10 @@ def main() -> int:
     refs: dict = {}
     arms: dict = {}
     obs["arms"] = arms
-    schemes = [s for s in args.schemes.split(",") if s]
+    # "none": PowerShell drops an empty-string argument, so an empty list needs a word.
+    schemes = [s for s in args.schemes.split(",") if s and s != "none"]
     # The base only has to show the refusal; its bf16 render would be the head's bf16 render again.
-    for scheme in schemes if args.state == "base" else ["off"] + schemes:
+    for scheme in schemes if args.state == "base" and not args.reference_at_base else ["off"] + schemes:
         rec: dict = {}
         arms[scheme] = rec
         t1 = time.time()
@@ -205,6 +218,7 @@ def main() -> int:
                 "seconds": round(time.time() - t2, 1),
                 "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
                 "path": path.name,
+                "mean_luma": round(float(np.asarray(image.convert("L"), dtype = np.float32).mean()), 2),
             }
             if scheme == "off":
                 refs[i] = image
