@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End to end through Studio: Qwen-Image-2.1 at bf16, int8 weight-only, and int8 W8A8 (torch._int_mm).
+"""End to end through Studio: Qwen-Image-2.1 at bf16, int8 weight-only, int8 W8A8 (torch._int_mm), and W8A8 with ConvRot.
 
 Each arm is one fresh process of studio_weight_only_probe.py --single, as a user starting Studio would.
 The W8A8 arm is the same int8 load with UNSLOTH_NATIVE_INT8_ACT=1. Every quantised render is scored
@@ -17,7 +17,12 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ARMS = (("ref", "off", {}), ("wo", "int8", {}), ("w8a8", "int8", {"UNSLOTH_NATIVE_INT8_ACT": "1"}))
+ARMS = (
+    ("ref", "off", {}),
+    ("wo", "int8", {}),
+    ("w8a8", "int8", {"UNSLOTH_NATIVE_INT8_ACT": "1", "UNSLOTH_NATIVE_INT8_ROT": "0"}),
+    ("w8a8_rot", "int8", {"UNSLOTH_NATIVE_INT8_ACT": "1"}),
+)
 
 
 def main() -> int:
@@ -49,6 +54,7 @@ def main() -> int:
         arm = (sub.get("arms") or {}).get(scheme) or {}
         arm["exit_code"] = rc
         arm["log_says_w8a8"] = "W8A8 torch._int_mm" in text
+        arm["log_says_convrot"] = "ConvRot g" in text
         arm["log_says_weight_only"] = "weight-only (torch" in text
         summary["arms"][state] = arm
         for key in ("torch", "hip", "device", "arch"):
@@ -68,7 +74,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         net = None
         summary["lpips_error"] = str(exc)[:200]
-    for state in ("wo", "w8a8"):
+    for state in ("wo", "w8a8", "w8a8_rot"):
         for item in summary["arms"][state].get("images") or []:
             ref = out / "images_ref" / f"off_p{item.get('prompt_index')}.png"
             img = out / f"images_{state}" / str(item.get("path"))
@@ -88,7 +94,7 @@ def main() -> int:
         secs = ", ".join(str(i.get("seconds", "err")) for i in imgs)
         lp = ", ".join(str(i.get("lpips", "")) for i in imgs if "lpips" in i)
         ps = ", ".join(str(i.get("psnr", "")) for i in imgs if "psnr" in i)
-        tag = "W8A8" if arm.get("log_says_w8a8") else ("weight-only" if arm.get("log_says_weight_only") else "-")
+        tag = ("W8A8 ConvRot" if arm.get("log_says_convrot") else "W8A8") if arm.get("log_says_w8a8") else ("weight-only" if arm.get("log_says_weight_only") else "-")
         lines.append(f"| {state} | {arm.get('transformer_gib')} | {arm.get('load_seconds')} | {secs} | {lp} | {ps} | {tag} |")
     table = "\n".join(lines)
     summary["table"] = table

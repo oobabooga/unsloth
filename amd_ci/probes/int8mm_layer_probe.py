@@ -68,7 +68,8 @@ def main() -> int:
             ref = x.float() @ lin.weight.float().t() + lin.bias.float()
             wo = cls(lin, "int8")
             w8 = cls(lin, "int8", act_int8 = True)
-            arms = {"bf16": lin, "weight_only": wo, "w8a8": w8}
+            w8r = cls(lin, "int8", act_int8 = True, rot_group = 256)
+            arms = {"bf16": lin, "weight_only": wo, "w8a8": w8, "w8a8_rot": w8r}
             for name, mod in arms.items():
                 with torch.no_grad():
                     y = mod(x).float()
@@ -89,7 +90,7 @@ def main() -> int:
             flops = 2 * args.rows * k * n
             rec["gemm_int8_tops"] = round(flops / rec["gemm_int8_ms"] / 1e9, 2)
             rec["gemm_bf16_tflops"] = round(flops / rec["gemm_bf16_ms"] / 1e9, 2)
-            del lin, wo, w8, arms, x, ref
+            del lin, wo, w8, w8r, arms, x, ref
             torch.cuda.empty_cache()
         except Exception as exc:  # noqa: BLE001
             rec["error"] = f"{type(exc).__name__}: {str(exc)[:500]}"
