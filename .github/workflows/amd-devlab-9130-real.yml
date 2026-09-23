@@ -30,9 +30,20 @@ permissions: {}
 
 env:
   MAIN_SHA: 070f29261736c980b523cffde6890d61a6e76f88
-  # 33.1 GB, so it fits the runner's ~51 GB usable. Qwen-Image-2512 (57.7 GB) does not: the
-  # unified-memory guard refuses it here, which is why the August runs fell back to Z-Image.
-  REPO: unsloth/Qwen-Image-2.1
+  # Z-Image-Turbo, not Qwen-Image-2.1, and not the reporter's Qwen-Image-2512.
+  #
+  # The reporter's own model is 57.7 GB against ~51 GB usable here: the unified-memory guard
+  # refuses it outright, so it was never an option. Qwen-Image-2.1 (33.1 GB) fits and was tried
+  # for four runs; at MAIN_SHA it downloads and then dies on
+  # `text_encoder/model-00001-of-00004.safetensors`, a file that IS in the repo at that revision
+  # and simply never got fetched (run 35919565347). That is Studio's text-encoder selection for
+  # this family, the area #11535/#11539/#11542 were moving through, and it is a different bug.
+  #
+  # Z-Image-Turbo is a real diffusers pipeline with a real convolutional VAE, and crash2 loaded
+  # and generated with it on this exact machine. What is being measured here -- whether a device
+  # fault raised inside a conv reaches Python or takes the process -- is a property of where the
+  # fault is raised in the stack, not of which weights are resident. Any real pipeline answers it.
+  REPO: unsloth/Z-Image-Turbo
   SURVIVE_HOLD: "5"
 
 jobs:
