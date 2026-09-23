@@ -116,10 +116,10 @@ index 5eaea65e7a..a966825f32 100644
      message: str,
 diff --git a/studio/backend/core/inference/lemonade_server.py b/studio/backend/core/inference/lemonade_server.py
 new file mode 100644
-index 0000000000..fecacc5727
+index 0000000000..385d5b71c0
 --- /dev/null
 +++ b/studio/backend/core/inference/lemonade_server.py
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,316 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -129,8 +129,7 @@ index 0000000000..fecacc5727
 +start, and an API key minted per start so no other process on the machine can drive it. lemond in
 +turn starts ``flm serve`` for the loaded model, so everything that stops lemond stops the whole
 +tree: on Windows a force-killed lemond leaves ``flm.exe`` running with the model in memory, and
-+``terminate_pid`` reaches descendants there. On Linux lemond arms PR_SET_PDEATHSIG on its own
-+children, so flm exits with it.
++``terminate_pid`` reaches descendants there. On Linux flm exits with a killed lemond.
 +
 +State lives in two directories Unsloth owns: ``cache_dir`` (lemond's downloaded FastFlowLM build)
 +and ``config_dir`` (``config.json``). FastFlowLM's model files go to ``flm_model_dir`` through
@@ -194,9 +193,9 @@ index 0000000000..fecacc5727
 +def _kill_with_the_parent() -> None:
 +    """Re-arm PR_SET_PDEATHSIG with SIGKILL (Linux preexec, after child_popen_kwargs' SIGTERM).
 +
-+    lemond takes its time over SIGTERM: with a FastFlowLM model loaded it was still running 90 s
-+    after Unsloth was SIGKILLed on the AMD DevLab runner, holding the model in memory. Its flm child
-+    needs nothing here, since lemond binds it with PR_SET_PDEATHSIG itself."""
++    With a FastFlowLM model loaded, lemond took about 9 s to exit on SIGTERM after its owner was
++    SIGKILLed on the AMD DevLab runner, holding the NPU and the model the whole time; on SIGKILL it
++    and its flm child were gone within a second."""
 +    import ctypes
 +    import signal
 +
@@ -1082,7 +1081,7 @@ index de408536e1..b950a91125 100644
          None, description = "MLX KV quantization bit width actually applied, if any"
      )
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index f088df8297..0d8d6a75b9 100644
+index f088df8297..8b3efff2c0 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -7293,6 +7293,7 @@ def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
@@ -1464,7 +1463,7 @@ index f088df8297..0d8d6a75b9 100644
              return _stream()
  
          async def _wrapped():
-@@ -23873,6 +24060,278 @@ async def _proxy_to_external_provider(
+@@ -23873,6 +24060,280 @@ async def _proxy_to_external_provider(
      )
  
  
@@ -1576,14 +1575,6 @@ index f088df8297..0d8d6a75b9 100644
 +                function = call.get("function") or {}
 +                slot["function"]["name"] += function.get("name") or ""
 +                slot["function"]["arguments"] += function.get("arguments") or ""
-+            if choice.get("finish_reason") is not None and not self.stopped:
-+                self.finish_reason = choice["finish_reason"]
-+                if self._pending:
-+                    delta["content"] = (delta.get("content") or "") + self._pending
-+                    self._pending = ""
-+                    self.content += delta["content"]
-+                    choice["delta"] = delta
-+                    continue
 +            content = delta.get("content")
 +            if isinstance(content, str) and self.stop:
 +                visible = self._take_content(content)
@@ -1591,12 +1582,22 @@ index f088df8297..0d8d6a75b9 100644
 +                delta["content"] = visible
 +                if self.stopped:
 +                    self.finish_reason = "stop"
++                    # The chunk below finishes the reply, so this one must not as well.
++                    choice["finish_reason"] = None
 +                    out.append("data: " + json.dumps(chunk))
 +                    out.append(self._chunk({}, "stop"))
 +                    out.append("data: [DONE]")
 +                    return out
 +            elif isinstance(content, str):
 +                self.content += content
++            if choice.get("finish_reason") is not None:
++                self.finish_reason = choice["finish_reason"]
++                if self._pending:
++                    # The reply ended partway into a stop sequence, so what was held back is text.
++                    delta["content"] = (delta.get("content") or "") + self._pending
++                    self.content += self._pending
++                    self._pending = ""
++                    choice["delta"] = delta
 +        out.append("data: " + json.dumps(chunk))
 +        return out
 +
@@ -1743,7 +1744,7 @@ index f088df8297..0d8d6a75b9 100644
  # ── OpenAI shell-tool container management ───────────────────────
  
  
-@@ -24659,6 +25118,12 @@ async def produce_openai_chat_completions(
+@@ -24659,6 +25120,12 @@ async def produce_openai_chat_completions(
          _predecoded_audio = _audio_preflight.get("decoded")
          _preprepared_audio = _audio_preflight.get("prepared")
  
@@ -1756,7 +1757,7 @@ index f088df8297..0d8d6a75b9 100644
      llama_backend = get_llama_cpp_backend()
      using_gguf = llama_backend.is_loaded
  
-@@ -29061,6 +29526,24 @@ def _openai_model_objects() -> list[dict]:
+@@ -29061,6 +29528,24 @@ def _openai_model_objects() -> list[dict]:
      models: list[dict] = []
      _created = int(time.time())
  
@@ -1781,7 +1782,7 @@ index f088df8297..0d8d6a75b9 100644
      # Check GGUF backend
      llama_backend = get_llama_cpp_backend()
      # Claiming a re-pulled tag would displace the scanned row holding its weights, and the id
-@@ -33838,6 +34321,17 @@ async def chat_count_tokens(
+@@ -33838,6 +34323,17 @@ async def chat_count_tokens(
              detail = "Cannot count tokens for messages containing images.",
          )
  
@@ -1957,7 +1958,7 @@ index 852fe69839..e9fb9b1945 100644
          close_studio_tunnel_lifecycle()
 diff --git a/studio/backend/tests/fixtures/fake_lemond.py b/studio/backend/tests/fixtures/fake_lemond.py
 new file mode 100644
-index 0000000000..b0790c1507
+index 0000000000..f88bc4abb2
 --- /dev/null
 +++ b/studio/backend/tests/fixtures/fake_lemond.py
 @@ -0,0 +1,192 @@
@@ -2031,7 +2032,7 @@ index 0000000000..b0790c1507
 +    args = parser.parse_args()
 +
 +    if os.environ.get("FAKE_LEMOND_IGNORE_SIGTERM") == "1":
-+        # A lemond whose SIGTERM shutdown never finishes, as seen with a FastFlowLM model loaded.
++        # A lemond that never acts on SIGTERM, so only a SIGKILL death signal ends it.
 +        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 +    key = os.environ.get("LEMONADE_API_KEY", "")
 +    cache = Path(args.cache_dir)
@@ -2256,7 +2257,7 @@ index e24cfc68a5..8fbde82cf0 100644
          """Non-GGUF LoadResponse blocks report runtime context_length."""
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
 new file mode 100644
-index 0000000000..ff831578fe
+index 0000000000..e89f5caf38
 --- /dev/null
 +++ b/studio/backend/tests/test_npu_backend.py
 @@ -0,0 +1,301 @@
@@ -2477,8 +2478,8 @@ index 0000000000..ff831578fe
 +def test_lemond_dies_with_a_killed_owner_even_if_it_ignores_sigterm(tmp_path):
 +    """A SIGKILLed Unsloth must not leave lemond (and the model FastFlowLM holds) behind.
 +
-+    The DevLab runner showed lemond still running 90 s after its owner died, since its SIGTERM
-+    shutdown does not finish with a model loaded; this lemond ignores SIGTERM outright."""
++    The death signal is SIGKILL, not SIGTERM: this lemond ignores SIGTERM outright, and the real one
++    took about 9 s over it with a model loaded."""
 +    import signal
 +    import subprocess
 +    import time
@@ -2563,10 +2564,10 @@ index 0000000000..ff831578fe
 +    assert not nb.is_npu_model_path(None)
 diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
 new file mode 100644
-index 0000000000..f86b69602a
+index 0000000000..f5620d4abc
 --- /dev/null
 +++ b/studio/backend/tests/test_npu_chat_route.py
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,443 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -2631,6 +2632,13 @@ index 0000000000..f86b69602a
 +        }
 +        return (
 +            _chunk({"tool_calls": [call]}) + _chunk({}, "tool_calls", _USAGE) + "data: [DONE]\n\n"
++        )
++    if "FINAL" in prompt:
++        # Content on the finishing chunk itself.
++        return (
++            _chunk({"content": "hello E"})
++            + _chunk({"content": "ND hidden"}, "stop", _USAGE)
++            + "data: [DONE]\n\n"
 +        )
 +    if "THINK" in prompt:
 +        return (
@@ -2841,6 +2849,33 @@ index 0000000000..f86b69602a
 +    # "sev" starts "seventy" but the stop never completes, so nothing may be lost.
 +    _, body = _call(stream = False, stop = ["seventy"])
 +    assert body["choices"][0]["message"]["content"] == "one two seven eight"
++
++
++@pytest.mark.parametrize("stream", [True, False])
++@pytest.mark.parametrize(
++    "stop, expected",
++    [
++        (["END"], "hello "),
++        # A partial match held back at the end is released in order, not after the last chunk.
++        (["END hiddenness"], "hello END hidden"),
++    ],
++)
++def test_stop_on_the_finishing_chunk(flm, stream, stop, expected):
++    flm()
++    messages = [{"role": "user", "content": "FINAL"}]
++    _, out = _call(stream = stream, stop = stop, messages = messages)
++    if stream:
++        chunks = _data(out)
++        text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
++        finish = [
++            c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]
++        ]
++        assert out[-1] == "data: [DONE]"
++    else:
++        text = out["choices"][0]["message"]["content"]
++        finish = [out["choices"][0]["finish_reason"]]
++    assert text == expected
++    assert finish == ["stop"]
 +
 +
 +def test_reasoning_is_kept_apart(flm):
@@ -3567,10 +3602,10 @@ index 561b169afc..73ba32837a 100644
                    // Wider tabs than the shared default. The panel reserves
 diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
 new file mode 100644
-index 0000000000..3d0272a524
+index 0000000000..41eefad347
 --- /dev/null
 +++ b/studio/frontend/src/features/npu/api.ts
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,160 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -3611,6 +3646,18 @@ index 0000000000..3d0272a524
 +  loaded_model: string | null;
 +  context_length: number | null;
 +  loading_model: string | null;
++}
++
++/**
++ * Whether the NPU runtime can serve the catalog. A running runtime alone is not enough: the
++ * backend keeps it running after a failed setup, and setup still in progress is not done.
++ * "idle" with it running is a runtime started earlier, e.g. by a catalog request after a restart.
++ */
++export function isNpuRuntimeReady(status: NpuStatus): boolean {
++  return (
++    status.state === "ready" ||
++    (status.state === "idle" && status.runtime_running)
++  );
 +}
 +
 +export interface NpuModel {
@@ -3738,10 +3785,10 @@ index 0000000000..836deeb04f
 +export { useNpuStatus } from "./use-npu-status";
 diff --git a/studio/frontend/src/features/npu/npu-model-panel.tsx b/studio/frontend/src/features/npu/npu-model-panel.tsx
 new file mode 100644
-index 0000000000..072065fd7b
+index 0000000000..a8ff217b9a
 --- /dev/null
 +++ b/studio/frontend/src/features/npu/npu-model-panel.tsx
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,293 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -3763,6 +3810,7 @@ index 0000000000..072065fd7b
 +  deleteNpuModel,
 +  downloadNpuModel,
 +  enableNpu,
++  isNpuRuntimeReady,
 +  listNpuModels,
 +} from "./api";
 +
@@ -3800,7 +3848,7 @@ index 0000000000..072065fd7b
 +  const [listError, setListError] = useState<string | null>(null);
 +  const [enabling, setEnabling] = useState(false);
 +  const [downloads, setDownloads] = useState<Record<string, number | null>>({});
-+  const ready = status.state === "ready" || status.runtime_running;
++  const ready = isNpuRuntimeReady(status);
 +
 +  const refreshModels = useCallback(async () => {
 +    try {
@@ -3919,7 +3967,11 @@ index 0000000000..072065fd7b
 +          </span>
 +          <Button size="sm" onClick={() => void enable()} disabled={enabling}>
 +            {enabling ? <Spinner className="size-3.5" /> : null}
-+            {status.runtime_installed ? "Start NPU runtime" : "Enable NPU"}
++            {status.state === "failed"
++              ? "Try again"
++              : status.runtime_installed
++                ? "Start NPU runtime"
++                : "Enable NPU"}
 +          </Button>
 +        </div>
 +      ) : null}
@@ -4009,7 +4061,7 @@ index 0000000000..072065fd7b
 +      <p className="pb-2 text-[11px] text-muted-foreground">
 +        Powered by{" "}
 +        <a
-+          href="https://github.com/FastFlowLM/FastFlowLM"
++          href="https://github.com/ROCm/FastFlowLM"
 +          target="_blank"
 +          rel="noreferrer"
 +          className="underline underline-offset-2"
@@ -4083,18 +4135,18 @@ index 0000000000..f87a614789
 +}
 diff --git a/studio/frontend/tests/npu-api.test.ts b/studio/frontend/tests/npu-api.test.ts
 new file mode 100644
-index 0000000000..925afb6cca
+index 0000000000..be20f90f2d
 --- /dev/null
 +++ b/studio/frontend/tests/npu-api.test.ts
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,114 @@
 +// SPDX-License-Identifier: AGPL-3.0-only
 +// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
 +import assert from "node:assert/strict";
 +import test from "node:test";
-+import { loadWithStubs } from "./helpers/module-stubs.ts";
-+import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
 +import type * as NpuApi from "../src/features/npu/api.ts";
++import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
++import { loadWithStubs } from "./helpers/module-stubs.ts";
 +
 +function client(response: () => Response) {
 +  const requests: { path: string; init?: RequestInit }[] = [];
@@ -4178,12 +4230,35 @@ index 0000000000..925afb6cca
 +  );
 +  await assert.rejects(c.api.enableNpu(), /locked-memory limit/);
 +});
++
++test("a runtime left running after a failed setup is not ready", () => {
++  const { api } = client(() => new Response(null));
++  const base = {
++    supported: true,
++    hardware: { present: true, supported: true },
++    runtime_installed: true,
++    error: null,
++    validation: null,
++    help_url: null,
++    loaded_model: null,
++    context_length: null,
++    loading_model: null,
++  };
++  const ready = (state: string, runtimeRunning: boolean) =>
++    api.isNpuRuntimeReady({ ...base, state, runtime_running: runtimeRunning });
++  assert.equal(ready("failed", true), false);
++  assert.equal(ready("validating", true), false);
++  assert.equal(ready("idle", false), false);
++  assert.equal(ready("ready", true), true);
++  // Started by a catalog request after a restart.
++  assert.equal(ready("idle", true), true);
++});
 diff --git a/studio/install_lemonade_prebuilt.py b/studio/install_lemonade_prebuilt.py
 new file mode 100644
-index 0000000000..eff66c2b3d
+index 0000000000..0f116ca1d2
 --- /dev/null
 +++ b/studio/install_lemonade_prebuilt.py
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,229 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
@@ -4276,6 +4351,9 @@ index 0000000000..eff66c2b3d
 +        return None
 +    asset = pins["lemonade"]["assets"][key]
 +    if marker.get("sha256") != asset["sha256"] or marker.get("asset") != asset["name"]:
++        return None
++    # A FastFlowLM-only pin change must rewrite backend_versions.json, whose version lemond installs.
++    if marker.get("fastflowlm") != pins["fastflowlm"]:
 +        return None
 +    binary = target / lemond_name()
 +    return binary if binary.is_file() else None
@@ -4379,7 +4457,7 @@ index 0000000000..eff66c2b3d
 +                        "version": pins["lemonade"]["version"],
 +                        "asset": asset["name"],
 +                        "sha256": asset["sha256"],
-+                        "fastflowlm": pins["fastflowlm"]["version"],
++                        "fastflowlm": pins["fastflowlm"],
 +                    },
 +                    indent = 2,
 +                )
@@ -4451,10 +4529,10 @@ index 0000000000..d486af695b
 +}
 diff --git a/tests/studio/install/test_install_lemonade_prebuilt.py b/tests/studio/install/test_install_lemonade_prebuilt.py
 new file mode 100644
-index 0000000000..8c9e9ddf53
+index 0000000000..f39ec27f9b
 --- /dev/null
 +++ b/tests/studio/install/test_install_lemonade_prebuilt.py
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,172 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -4536,7 +4614,7 @@ index 0000000000..8c9e9ddf53
 +        lp.core, "release_asset_download_url", lambda repo, tag, name: f"{base}/{name}"
 +    )
 +
-+    def pins(digest: str = sha) -> Path:
++    def pins(digest: str = sha, flm_version: str = "v1.0.3") -> Path:
 +        path = tmp_path / "pins.json"
 +        path.write_text(
 +            json.dumps(
@@ -4548,7 +4626,7 @@ index 0000000000..8c9e9ddf53
 +                        "assets": {key: {"name": archive.name, "sha256": digest}},
 +                    },
 +                    "fastflowlm": {
-+                        "version": "v1.0.3",
++                        "version": flm_version,
 +                        "repo": "ROCm/FastFlowLM",
 +                        "assets": {key: {"name": "fastflowlm.tar.gz", "sha256": "ab" * 32}},
 +                    },
@@ -4585,6 +4663,18 @@ index 0000000000..8c9e9ddf53
 +    before = httpd.requests
 +    lp.install(root, pins_path = path)
 +    assert httpd.requests == before
++
++
++def test_a_fastflowlm_only_pin_bump_repins_lemond(tmp_path, served):
++    pins, _ = served
++    root = tmp_path / "root"
++    lp.install(root, pins_path = pins())
++    bumped = pins(flm_version = "v1.0.5")
++    # Same Lemonade asset, so only the recorded FastFlowLM pin can tell the install is stale.
++    assert lp.installed_lemond(root, lp.load_pins(bumped)) is None
++    binary = lp.install(root, pins_path = bumped)
++    versions = json.loads((binary.parent / "resources" / "backend_versions.json").read_text())
++    assert versions["flm"]["npu"] == "v1.0.5"
 +
 +
 +def test_a_digest_mismatch_installs_nothing(tmp_path, served):
