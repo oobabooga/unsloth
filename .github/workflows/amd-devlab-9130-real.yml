@@ -277,15 +277,13 @@ jobs:
 
           "$PY" -c "import ast; [ast.parse(open(p).read()) for p in ('$AMD_CI_WORK/real_server.py', '$AMD_CI_WORK/watcher.py')]"
 
-      - name: Load the pipeline
-        timeout-minutes: 90
+      - name: Run each cell on its own server
+        timeout-minutes: 150
         run: |
           set +e
           set -uo pipefail
           RESULTS="$AMD_CI_WORK/cells"
           mkdir -p "$RESULTS"
-          BASE="http://127.0.0.1:8890"
-          echo "BASE=$BASE" >> "$GITHUB_ENV"
           echo "RESULTS=$RESULTS" >> "$GITHUB_ENV"
 
           # Fail loudly at import rather than 15s later as a mystery dead server: run 35916952454
@@ -294,52 +292,57 @@ jobs:
             echo "FATAL: the Studio backend is not importable; PYTHONPATH=${PYTHONPATH:-unset}"
             exit 1
           }
-          "$PY" "$AMD_CI_WORK/real_server.py" --port 8890 > "$AMD_CI_WORK/server.log" 2>&1 &
-          SERVER_PID=$!
-          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
-          echo "server pid=$SERVER_PID"
-          for _ in $(seq 1 180); do
-            curl -sf --max-time 5 "$BASE/health" >/dev/null && break
-            kill -0 "$SERVER_PID" 2>/dev/null || break
-            sleep 1
-          done
-          curl -s --max-time 10 "$BASE/health"; echo
-          curl -s --max-time 60 -X POST "$BASE/load" -H 'Content-Type: application/json' \
-            -d "{\"repo\": \"$REPO\"}" | head -c 300; echo
 
-          LOADED=no
-          for i in $(seq 1 300); do
-            kill -0 "$SERVER_PID" 2>/dev/null || { echo "SERVER DIED DURING LOAD at t=$((i*15))s"; break; }
-            STATUS=$(curl -s --max-time 20 "$BASE/load-status")
-            case "$STATUS" in
-              *'"loaded":true'*) echo "loaded after $((i*15))s"; LOADED=yes; break;;
-              *'"phase":"error"'*) echo "LOAD FAILED: $STATUS"; break;;
-            esac
-            [ $((i % 8)) -eq 0 ] && echo "  t=$((i*15))s $STATUS"
-            sleep 15
-          done
-          echo "loaded=$LOADED"
-          echo "LOADED=$LOADED" >> "$GITHUB_ENV"
-          tail -20 "$AMD_CI_WORK/server.log"
-          true
-
-      - name: Run the three cells
-        if: env.LOADED == 'yes'
-        timeout-minutes: 60
-        run: |
-          set +e
-          set -uo pipefail
+          # ONE SERVER PER CELL, with its own load and its own HIP context.
+          #
+          # Run 35921044921 shared a single server across all three cells and the abort cell came
+          # back reporting the gpu cell's AcceleratorError: a device fault leaves the context
+          # sticky, so every later generation dies at its first GPU op and an armed conv hook is
+          # never reached. A cell that cannot reach its own injection point measures nothing. The
+          # containment job already worked this way; this one did not, and that was the bug.
+          PORT=8890
+          CELL_OK=""
 
           run_cell () {
             kind="$1"; after="$2"
             cell="real__${kind}"
-            echo "::group::$cell"
-            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-              echo "server already gone; cell SKIPPED"
+            PORT=$((PORT + 1))
+            BASE="http://127.0.0.1:$PORT"
+            echo "::group::$cell (port $PORT)"
+
+            "$PY" "$AMD_CI_WORK/real_server.py" --port "$PORT" > "$RESULTS/$cell.server.log" 2>&1 &
+            SERVER_PID=$!
+            up=0
+            for _ in $(seq 1 180); do
+              curl -sf --max-time 5 "$BASE/health" >/dev/null && { up=1; break; }
+              kill -0 "$SERVER_PID" 2>/dev/null || break
+              sleep 1
+            done
+            if [ "$up" -ne 1 ]; then
+              echo "server never came up"
               echo "{\"cell\": \"$cell\", \"kind\": \"$kind\", \"status\": \"no_server\"}" > "$RESULTS/$cell.json"
-              echo "::endgroup::"
-              return
+              tail -20 "$RESULTS/$cell.server.log"; kill -9 "$SERVER_PID" 2>/dev/null
+              echo "::endgroup::"; return
             fi
+
+            curl -s --max-time 60 -X POST "$BASE/load" -H 'Content-Type: application/json'               -d "{\"repo\": \"$REPO\"}" | head -c 200; echo
+            LOADED=no
+            for i in $(seq 1 240); do
+              kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died during load"; break; }
+              STATUS=$(curl -s --max-time 20 "$BASE/load-status")
+              case "$STATUS" in
+                *'"loaded":true'*) echo "loaded after $((i*15))s"; LOADED=yes; break;;
+                *'"phase":"error"'*) echo "LOAD FAILED: $STATUS"; break;;
+              esac
+              [ $((i % 8)) -eq 0 ] && echo "  t=$((i*15))s $STATUS"
+              sleep 15
+            done
+            if [ "$LOADED" != "yes" ]; then
+              echo "{\"cell\": \"$cell\", \"kind\": \"$kind\", \"status\": \"no_load\"}" > "$RESULTS/$cell.json"
+              tail -20 "$RESULTS/$cell.server.log"; kill -9 "$SERVER_PID" 2>/dev/null
+              echo "::endgroup::"; return
+            fi
+
             "$PY" "$AMD_CI_WORK/watcher.py" "$BASE/health" "$RESULTS/$cell.timeline.jsonl" 0.1 &
             WATCH_PID=$!
             sleep 1
@@ -349,8 +352,7 @@ jobs:
               echo "armed: $ARMED"
             fi
             SENT=$(date +%s.%N)
-            HTTP=$(curl -s -o "$RESULTS/$cell.body" -w '%{http_code}' --max-time 2400 \
-              -X POST "$BASE/generate" -H 'Content-Type: application/json' -d '{}')
+            HTTP=$(curl -s -o "$RESULTS/$cell.body" -w '%{http_code}' --max-time 2400               -X POST "$BASE/generate" -H 'Content-Type: application/json' -d '{}')
             CURL_RC=$?
             sleep "$SURVIVE_HOLD"
             if kill -0 "$SERVER_PID" 2>/dev/null; then PROC=alive; else PROC=gone; fi
@@ -358,11 +360,9 @@ jobs:
             kill -9 "$WATCH_PID" 2>/dev/null
             wait "$WATCH_PID" 2>/dev/null
             EXITST=""
-            [ "$PROC" = "gone" ] && { wait "$SERVER_PID"; EXITST=$?; }
+            if [ "$PROC" = "gone" ]; then wait "$SERVER_PID"; EXITST=$?; else kill -9 "$SERVER_PID" 2>/dev/null; fi
 
-            "$PY" - "$RESULTS/$cell.json" "$cell" "$kind" "$SENT" "$HTTP" "$CURL_RC" \
-              "$PROC" "$SERVED" "$EXITST" "$ARMED" \
-              "$RESULTS/$cell.timeline.jsonl" "$RESULTS/$cell.body" <<'PY'
+            "$PY" - "$RESULTS/$cell.json" "$cell" "$kind" "$SENT" "$HTTP" "$CURL_RC"               "$PROC" "$SERVED" "$EXITST" "$ARMED"               "$RESULTS/$cell.timeline.jsonl" "$RESULTS/$cell.body" <<'PY'
           import json, os, sys
 
           (out, cell, kind, sent, http, curl_rc, proc, served, exitst, armed,
@@ -403,19 +403,16 @@ jobs:
           PY
             cat "$RESULTS/$cell.json"
             echo "--- server log tail ---"
-            tail -15 "$AMD_CI_WORK/server.log"
+            tail -15 "$RESULTS/$cell.server.log"
             echo "::endgroup::"
           }
 
-          # Control first: it proves the pipeline really renders on this box, so a later cell that
-          # dies cannot be blamed on the model never having worked.
+          # Control first: it proves the pipeline renders on this box and reports the conv count,
+          # so a later cell cannot be explained away as the model never having worked.
           run_cell control 0
-          # Then the device fault, then the signal. Ordered so the one that is expected to kill the
-          # server goes last and does not cost the others their run.
-          run_cell gpu 1
           run_cell abort 1
+          run_cell gpu 1
           ls -la "$RESULTS"
-          kill -9 "$SERVER_PID" 2>/dev/null
           true
 
       - name: Verdict
@@ -431,8 +428,12 @@ jobs:
               data = json.loads(path.read_text() or "{}")
               cells[data.get("kind")] = data
 
-          if os.environ.get("LOADED") != "yes":
-              print("INCONCLUSIVE: the pipeline never loaded, so nothing was measured.")
+          # Each cell now loads its own pipeline, so "did it load" is per cell, not global.
+          missing = [k for k, c in cells.items() if c.get("status") != "ran"]
+          if missing or not cells:
+              print("INCONCLUSIVE: no usable measurement in: %s" % (", ".join(missing) or "any cell"))
+              for k in missing:
+                  print("   %s -> %s" % (k, cells[k].get("status")))
               sys.exit(1)
 
           row = "{:<9} {:>7} {:>9} {:>9} {:>8} {:>13}  {}"
@@ -487,8 +488,17 @@ jobs:
           print("\n=== the signal, on the real path this time ===")
           a = cells.get("abort", {})
           if a.get("status") != "ran":
-              print("  abort cell did not run (the gpu cell may have taken the server)")
+              print("  abort cell did not run")
+              fails.append("abort cell missing")
           else:
+              # Non-vacuity, and the exact trap run 35921044921 fell into: the abort is armed on a
+              # conv, so if the generation dies of something else first the hook never fires and
+              # the cell reports that other failure while looking like a measurement. A device
+              # error in THIS cell's body means the armed abort was never reached.
+              a_detail = str((a.get("body") or {}).get("detail") or "")
+              check("abort: the cell reached its own injection point",
+                    "launch failure" not in a_detail.lower() and "AcceleratorError" not in a_detail,
+                    a_detail[:120] or "(no error body, as expected when the process dies)")
               check("abort: the server stopped answering", a.get("served_after_hold") == "no",
                     "exit=%s, first failure at +%ss" % (
                         a.get("server_exit"), a.get("first_failure_after_fault_s")))
