@@ -1,0 +1,62 @@
+name: AMD DevLab Lemonade FLM probe
+
+on:
+  push:
+    branches: [amd-devlab-lemonade-probe]
+
+permissions: {}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 50
+    steps:
+      - name: Hardware and NPU stack
+        run: |
+          uname -a; cat /etc/os-release | head -3; id
+          lscpu | grep -E 'Model name|^CPU\(s\)'; free -h
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          echo "--- amdxdna"; lsmod | grep -i amdxdna || echo "amdxdna not loaded"
+          modinfo amdxdna 2>/dev/null | grep -E 'filename|version|srcversion' || true
+          cat /sys/bus/pci/drivers/amdxdna/*/fw_version 2>/dev/null || echo "no fw_version"
+          ls -l /dev/accel* 2>/dev/null || true
+          echo "--- memlock"; ulimit -l; cat /proc/self/limits | grep -i lock
+          echo "--- sudo"; sudo -n true 2>&1 && echo SUDO_OK || echo NO_SUDO
+          echo "--- xrt"; dpkg -l 2>/dev/null | grep -iE 'xrt|xdna|fastflow|lemonade' || true
+          ls /opt/xilinx 2>/dev/null || true; which flm xrt-smi lemonade lemond 2>/dev/null || true
+          dmesg 2>/dev/null | grep -i xdna | tail -20 || true
+          grep -o 'amd_iommu=[^ ]*' /proc/cmdline || true
+      - name: Probe
+        env:
+          PROBE_MODELS: ${{ '' }}
+        run: |
+          export FLM_MODEL_PATH="$RUNNER_TEMP/flmhome"; mkdir -p "$FLM_MODEL_PATH"
+          export HF_HOME="$RUNNER_TEMP/hf"
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/$GITHUB_SHA/probe.py" -o "$RUNNER_TEMP/probe.py"
+          python3 "$RUNNER_TEMP/probe.py"
+          echo "--- post: memlock of flm children, FLM home"; ls -laR "$FLM_MODEL_PATH" | head -40; ls -la ~/.config/flm 2>/dev/null | head; du -sh ~/.flm ~/.config/flm 2>/dev/null || true
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 50
+    steps:
+      - name: Hardware and NPU driver
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select Caption, Version, BuildNumber | Format-List
+          Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match 'NPU|IPU|Compute Accelerator' } | Select DeviceName, DriverVersion, DriverDate, HardWareID | Format-List
+          Get-CimInstance Win32_VideoController | Select Name, DriverVersion | Format-List
+          Get-ChildItem C:\Windows\System32\AMD -ErrorAction SilentlyContinue | Select -First 30 Name
+          Get-ChildItem C:\Windows\System32\DriverStore\FileRepository -Filter "kipudrv*" -ErrorAction SilentlyContinue | Select Name
+          Get-Command xrt-smi, flm -ErrorAction SilentlyContinue | Select Source
+          python --version
+      - name: Probe
+        shell: powershell
+        run: |
+          $env:FLM_MODEL_PATH = "$env:RUNNER_TEMP\flmhome"; New-Item -ItemType Directory -Force $env:FLM_MODEL_PATH | Out-Null
+          $env:HF_HOME = "$env:RUNNER_TEMP\hf"
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/$env:GITHUB_SHA/probe.py" -OutFile "$env:RUNNER_TEMP\probe.py"
+          python "$env:RUNNER_TEMP\probe.py"
+          Get-ChildItem -Recurse $env:FLM_MODEL_PATH -ErrorAction SilentlyContinue | Select -First 40 FullName, Length
+          Get-ChildItem "$env:USERPROFILE\.flm","$env:USERPROFILE\Documents\flm" -ErrorAction SilentlyContinue | Select FullName
+          exit 0
