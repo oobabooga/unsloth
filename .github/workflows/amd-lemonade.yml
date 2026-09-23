@@ -16,7 +16,8 @@ jobs:
     - name: Probe portable Lemonade and FastFlowLM on NPU
       shell: bash
       run: "python3 - <<'PYPROBE'\nimport os, sys, json, time, pathlib, platform, subprocess, urllib.request, urllib.error,\
-        \ tarfile, zipfile, socket, secrets, traceback, hashlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\n\
+        \ tarfile, zipfile, socket, secrets, traceback, hashlib\nsys.stdout.reconfigure(encoding='utf-8', errors='replace')\n\
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\n\
         root.mkdir(parents=True, exist_ok=True)\nwin = os.name == 'nt'\nprint('PLATFORM', platform.platform(), flush=True)\n\
         def command(args, timeout=30):\n    try:\n        p = subprocess.run(args, capture_output=True, text=True, errors='replace',\
         \ timeout=timeout)\n        print('COMMAND', args, 'EXIT', p.returncode, p.stdout[-14000:], p.stderr[-4000:], flush=True)\n\
@@ -39,7 +40,10 @@ jobs:
         def req(path, data=None, timeout=360, auth=True):\n    headers={'Content-Type':'application/json'}\n    if auth: headers['Authorization']='Bearer\
         \ '+key\n    q=urllib.request.Request(base+path, data=None if data is None else json.dumps(data).encode(),headers=headers)\n\
         \    start=time.monotonic()\n    try:\n        with urllib.request.urlopen(q,timeout=timeout) as r: body=r.read().decode();\
-        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),body[:20000],flush=True)\n\
+        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    shown=body\n   \
+        \ if path=='/v1/system-info':\n        info=json.loads(body); shown=json.dumps({'devices':info.get('devices'), 'flm':info.get('recipes',{}).get('flm'),\
+        \ 'os':info.get('OS Version'), 'ram':info.get('Physical Memory')})\n    elif path.startswith('/v1/models?'): shown='catalog\
+        \ entries='+str(len(json.loads(body).get('data',[])))\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),shown[:20000],flush=True)\n\
         \    try: return code,json.loads(body)\n    except ValueError: return code,body\ntry:\n    for i in range(90):\n \
         \       try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200: break\n        except\
         \ Exception: pass\n        if p.poll() is not None: raise RuntimeError('lemond exited '+str(p.returncode))\n     \
@@ -48,17 +52,38 @@ jobs:
         \    for flm in cache.rglob('flm.exe' if win else 'flm'):\n        if flm.is_file():\n            if not win: command(['ldd',str(flm)])\n\
         \            command([str(flm),'version'])\n            command([str(flm),'validate','--json'],timeout=60)\n    code,models=req('/v1/models?show_all=true')\n\
         \    candidates=[m for m in models.get('data',[]) if m.get('recipe')=='flm' and 'chat' in m.get('labels',[])]\n  \
-        \  print('FLM_CANDIDATES',json.dumps(candidates),flush=True)\n    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n\
-        \    if chosen is None: chosen=next((m for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None:\
-        \ raise RuntimeError('No FLM chat model discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n\
-        \    if code!=200: raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
+        \  print('FLM_CANDIDATES',json.dumps([{'id':m['id'],'labels':m.get('labels'),'size':m.get('size')} for m in candidates]),flush=True)\n\
+        \    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n    if chosen is None: chosen=next((m\
+        \ for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None: raise RuntimeError('No FLM chat model\
+        \ discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n    if code!=200:\
+        \ raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
         \    if code!=200: raise RuntimeError('load failed')\n    req('/v1/health')\n    payload={'model':model,'messages':[{'role':'user','content':'Reply\
-        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    req('/v1/chat/completions',payload)\n\
-        \    req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n    req('/v1/stats')\n\
-        \    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
-        \    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\n\
-        except Exception:\n    traceback.print_exc()\n    print('PROBE_BLOCKED',flush=True)\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n\
-        \    except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
+        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    code, reply=req('/v1/chat/completions',payload)\n\
+        \    assert code==200 and reply['choices'][0]['message']['content']\n    code, wire=req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n\
+        \    assert code==200 and 'data: [DONE]' in wire\n    frames=[json.loads(line[6:]) for line in wire.splitlines() if\
+        \ line.startswith('data: ') and line[6:]!='[DONE]']\n    print('STREAM_USAGE',json.dumps([f for f in frames if 'usage'\
+        \ in f]),flush=True)\n    print('STREAM_FINISH',json.dumps([f for f in frames if any(c.get('finish_reason') for c\
+        \ in f.get('choices',[]))]),flush=True)\n    req('/v1/stats')\n    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n\
+        \    req('/v1/load',{'model_name':model,'ctx_size':2048})\n    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n\
+        \    # Closing a real streaming socket must release the backend for the next request.\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    long_payload={**payload,'messages':[{'role':'user','content':'Write a very long detailed story about a journey\
+        \ through space. Keep going for at least a thousand words.'}],'max_tokens':1024,'stream':True}\n    q=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(long_payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer\
+        \ '+key})\n    stream=urllib.request.urlopen(q,timeout=60)\n    first=stream.readline().decode()\n    print('CANCEL_FIRST_FRAME',first[:500],flush=True)\n\
+        \    stream.close()\n    stopped=time.monotonic()\n    code, health=req('/v1/health')\n    code, reply=req('/v1/chat/completions',payload,timeout=30)\n\
+        \    assert code==200 and reply['choices'][0]['message']['content']\n    print('CANCEL_FOLLOWUP_SECONDS',round(time.monotonic()-stopped,3),flush=True)\n\
+        \    # Record how the pinned runtime handles unsupported controls; a 200 alone is not proof.\n    req('/v1/chat/completions',{**payload,'stop':['moon']})\n\
+        \    req('/v1/chat/completions',{**payload,'response_format':{'type':'json_object'}})\n    req('/v1/chat/completions',{**payload,'model':'not-a-real-flm-model'})\n\
+        \    code, health=req('/v1/health')\n    assert any(m.get('recipe')=='flm' and m.get('device')=='npu' for m in health['all_models_loaded'])\n\
+        \    req('/v1/unload',{'model_name':model})\n    code, health=req('/v1/health')\n    assert not health['all_models_loaded']\n\
+        \    # Restart with the same private cache and config, then prove model persistence.\n    req('/internal/shutdown',{})\n\
+        \    p.wait(timeout=15)\n    p=subprocess.Popen([str(exe),str(cache),str(config),'--host','127.0.0.1','--port',str(port),'--no-broadcast'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        \    for i in range(60):\n        try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200:\
+        \ break\n        except Exception: pass\n        time.sleep(1)\n    code, models=req('/v1/models')\n    assert any(m.get('id')==model\
+        \ and m.get('downloaded') for m in models['data'])\n    code, _=req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    assert code==200\n    code, reply=req('/v1/chat/completions',payload)\n    assert code==200 and reply['choices'][0]['message']['content']\n\
+        \    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\nexcept Exception:\n    traceback.print_exc()\n\
+        \    print('PROBE_BLOCKED',flush=True)\n    raise\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n  \
+        \  except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
         \    log.close()\n    print('LEMOND_LOG_TAIL', (root/'lemond.log').read_text(errors='replace')[-45000:],flush=True)\n\
         PYPROBE\n"
   windows:
@@ -72,11 +97,12 @@ jobs:
     - name: Probe portable Lemonade and FastFlowLM on NPU
       shell: powershell
       run: "$probe = @'\nimport os, sys, json, time, pathlib, platform, subprocess, urllib.request, urllib.error, tarfile,\
-        \ zipfile, socket, secrets, traceback, hashlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\n\
-        root.mkdir(parents=True, exist_ok=True)\nwin = os.name == 'nt'\nprint('PLATFORM', platform.platform(), flush=True)\n\
-        def command(args, timeout=30):\n    try:\n        p = subprocess.run(args, capture_output=True, text=True, errors='replace',\
-        \ timeout=timeout)\n        print('COMMAND', args, 'EXIT', p.returncode, p.stdout[-14000:], p.stderr[-4000:], flush=True)\n\
-        \    except Exception as e: print('COMMAND_ERROR', args, str(e), flush=True)\nif win:\n    command(['powershell','-NoProfile','-Command',\
+        \ zipfile, socket, secrets, traceback, hashlib\nsys.stdout.reconfigure(encoding='utf-8', errors='replace')\nsys.stderr.reconfigure(encoding='utf-8',\
+        \ errors='replace')\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'lemonade-phase1'\nroot.mkdir(parents=True,\
+        \ exist_ok=True)\nwin = os.name == 'nt'\nprint('PLATFORM', platform.platform(), flush=True)\ndef command(args, timeout=30):\n\
+        \    try:\n        p = subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=timeout)\n \
+        \       print('COMMAND', args, 'EXIT', p.returncode, p.stdout[-14000:], p.stderr[-4000:], flush=True)\n    except\
+        \ Exception as e: print('COMMAND_ERROR', args, str(e), flush=True)\nif win:\n    command(['powershell','-NoProfile','-Command',\
         \ \"Get-CimInstance Win32_Processor | Select-Object Name; Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,TotalPhysicalMemory;\
         \ Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceName -match 'NPU|IPU|Neural'} | Select-Object DeviceName,DriverVersion,InfName\
         \ | Format-List\"])\nelse:\n    command(['bash','-c','uname -a; id; lscpu | head -20; ls -l /dev/accel; cat /sys/bus/pci/drivers/amdxdna/*/fw_version;\
@@ -95,7 +121,10 @@ jobs:
         def req(path, data=None, timeout=360, auth=True):\n    headers={'Content-Type':'application/json'}\n    if auth: headers['Authorization']='Bearer\
         \ '+key\n    q=urllib.request.Request(base+path, data=None if data is None else json.dumps(data).encode(),headers=headers)\n\
         \    start=time.monotonic()\n    try:\n        with urllib.request.urlopen(q,timeout=timeout) as r: body=r.read().decode();\
-        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),body[:20000],flush=True)\n\
+        \ code=r.status\n    except urllib.error.HTTPError as e: body=e.read().decode(); code=e.code\n    shown=body\n   \
+        \ if path=='/v1/system-info':\n        info=json.loads(body); shown=json.dumps({'devices':info.get('devices'), 'flm':info.get('recipes',{}).get('flm'),\
+        \ 'os':info.get('OS Version'), 'ram':info.get('Physical Memory')})\n    elif path.startswith('/v1/models?'): shown='catalog\
+        \ entries='+str(len(json.loads(body).get('data',[])))\n    print('HTTP',path,code,'SECONDS',round(time.monotonic()-start,3),shown[:20000],flush=True)\n\
         \    try: return code,json.loads(body)\n    except ValueError: return code,body\ntry:\n    for i in range(90):\n \
         \       try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200: break\n        except\
         \ Exception: pass\n        if p.poll() is not None: raise RuntimeError('lemond exited '+str(p.returncode))\n     \
@@ -104,17 +133,38 @@ jobs:
         \    for flm in cache.rglob('flm.exe' if win else 'flm'):\n        if flm.is_file():\n            if not win: command(['ldd',str(flm)])\n\
         \            command([str(flm),'version'])\n            command([str(flm),'validate','--json'],timeout=60)\n    code,models=req('/v1/models?show_all=true')\n\
         \    candidates=[m for m in models.get('data',[]) if m.get('recipe')=='flm' and 'chat' in m.get('labels',[])]\n  \
-        \  print('FLM_CANDIDATES',json.dumps(candidates),flush=True)\n    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n\
-        \    if chosen is None: chosen=next((m for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None:\
-        \ raise RuntimeError('No FLM chat model discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n\
-        \    if code!=200: raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
+        \  print('FLM_CANDIDATES',json.dumps([{'id':m['id'],'labels':m.get('labels'),'size':m.get('size')} for m in candidates]),flush=True)\n\
+        \    chosen=next((m for m in candidates if m['id']=='llama3.2-1b-FLM'),None)\n    if chosen is None: chosen=next((m\
+        \ for m in candidates if '1b' in m['id'].lower()),None)\n    if chosen is None: raise RuntimeError('No FLM chat model\
+        \ discovered')\n    model=chosen['id']\n    code,_=req('/v1/pull',{'model_name':model,'stream':False})\n    if code!=200:\
+        \ raise RuntimeError('pull failed')\n    code,_=req('/v1/load',{'model_name':model,'ctx_size':2048},timeout=360)\n\
         \    if code!=200: raise RuntimeError('load failed')\n    req('/v1/health')\n    payload={'model':model,'messages':[{'role':'user','content':'Reply\
-        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    req('/v1/chat/completions',payload)\n\
-        \    req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n    req('/v1/stats')\n\
-        \    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
-        \    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\n\
-        except Exception:\n    traceback.print_exc()\n    print('PROBE_BLOCKED',flush=True)\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n\
-        \    except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
+        \ with a short sentence about the moon.'}],'max_tokens':48,'temperature':0,'stream':False}\n    code, reply=req('/v1/chat/completions',payload)\n\
+        \    assert code==200 and reply['choices'][0]['message']['content']\n    code, wire=req('/v1/chat/completions',{**payload,'stream':True,'stream_options':{'include_usage':True}})\n\
+        \    assert code==200 and 'data: [DONE]' in wire\n    frames=[json.loads(line[6:]) for line in wire.splitlines() if\
+        \ line.startswith('data: ') and line[6:]!='[DONE]']\n    print('STREAM_USAGE',json.dumps([f for f in frames if 'usage'\
+        \ in f]),flush=True)\n    print('STREAM_FINISH',json.dumps([f for f in frames if any(c.get('finish_reason') for c\
+        \ in f.get('choices',[]))]),flush=True)\n    req('/v1/stats')\n    req('/v1/unload',{'model_name':model})\n    req('/v1/health')\n\
+        \    req('/v1/load',{'model_name':model,'ctx_size':2048})\n    req('/v1/chat/completions',payload)\n    req('/v1/unload',{'model_name':model})\n\
+        \    # Closing a real streaming socket must release the backend for the next request.\n    req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    long_payload={**payload,'messages':[{'role':'user','content':'Write a very long detailed story about a journey\
+        \ through space. Keep going for at least a thousand words.'}],'max_tokens':1024,'stream':True}\n    q=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(long_payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer\
+        \ '+key})\n    stream=urllib.request.urlopen(q,timeout=60)\n    first=stream.readline().decode()\n    print('CANCEL_FIRST_FRAME',first[:500],flush=True)\n\
+        \    stream.close()\n    stopped=time.monotonic()\n    code, health=req('/v1/health')\n    code, reply=req('/v1/chat/completions',payload,timeout=30)\n\
+        \    assert code==200 and reply['choices'][0]['message']['content']\n    print('CANCEL_FOLLOWUP_SECONDS',round(time.monotonic()-stopped,3),flush=True)\n\
+        \    # Record how the pinned runtime handles unsupported controls; a 200 alone is not proof.\n    req('/v1/chat/completions',{**payload,'stop':['moon']})\n\
+        \    req('/v1/chat/completions',{**payload,'response_format':{'type':'json_object'}})\n    req('/v1/chat/completions',{**payload,'model':'not-a-real-flm-model'})\n\
+        \    code, health=req('/v1/health')\n    assert any(m.get('recipe')=='flm' and m.get('device')=='npu' for m in health['all_models_loaded'])\n\
+        \    req('/v1/unload',{'model_name':model})\n    code, health=req('/v1/health')\n    assert not health['all_models_loaded']\n\
+        \    # Restart with the same private cache and config, then prove model persistence.\n    req('/internal/shutdown',{})\n\
+        \    p.wait(timeout=15)\n    p=subprocess.Popen([str(exe),str(cache),str(config),'--host','127.0.0.1','--port',str(port),'--no-broadcast'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        \    for i in range(60):\n        try:\n            code,health=req('/v1/health',timeout=2)\n            if code==200:\
+        \ break\n        except Exception: pass\n        time.sleep(1)\n    code, models=req('/v1/models')\n    assert any(m.get('id')==model\
+        \ and m.get('downloaded') for m in models['data'])\n    code, _=req('/v1/load',{'model_name':model,'ctx_size':2048})\n\
+        \    assert code==200\n    code, reply=req('/v1/chat/completions',payload)\n    assert code==200 and reply['choices'][0]['message']['content']\n\
+        \    req('/v1/unload',{'model_name':model})\n    print('PROBE_COMPLETE',flush=True)\nexcept Exception:\n    traceback.print_exc()\n\
+        \    print('PROBE_BLOCKED',flush=True)\n    raise\nfinally:\n    try: req('/internal/shutdown',{},timeout=10)\n  \
+        \  except Exception: pass\n    try: p.wait(timeout=15)\n    except subprocess.TimeoutExpired: p.kill(); p.wait()\n\
         \    log.close()\n    print('LEMOND_LOG_TAIL', (root/'lemond.log').read_text(errors='replace')[-45000:],flush=True)\n\
         '@\n$path = Join-Path $env:RUNNER_TEMP 'lemonade_probe.py'\n[System.IO.File]::WriteAllText($path, $probe)\npython\
         \ $path\nexit $LASTEXITCODE\n"
