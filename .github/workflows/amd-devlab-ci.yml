@@ -49,7 +49,9 @@ jobs:
             echo "PORT=$PORT"
             # --password sets the initial password only; a second start with it refuses to run.
             if [ "$1" = main ]; then PWARG=(--password "$PW"); else PWARG=(); fi
-            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --api-only "${PWARG[@]}" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
+            # The built frontend when there is one, for the UI walkthrough; the API alone otherwise.
+            if [ -f "$PWD/studio/frontend/dist/index.html" ]; then FE=(--frontend "$PWD/studio/frontend/dist"); else FE=(--api-only); fi
+            (cd studio/backend && nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" "${FE[@]}" "${PWARG[@]}" >> "$W/studio-$1.log" 2>&1 & echo $! > "$W/studio.pid")
             for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
             if ! curl -sf "http://127.0.0.1:$PORT/api/health"; then echo "Studio did not start"; tail -80 "$W/studio-$1.log"; fi; echo
           }
@@ -57,6 +59,11 @@ jobs:
           start main
           python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-main.json" --phase main
           procs "with a model loaded"
+          python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-unload.json" --phase unload
+          ls studio/frontend/dist | head -3
+          python3 -m venv "$W/pw" && "$W/pw/bin/pip" install -q 'playwright>=1.45,<2' && "$W/pw/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1
+          "$W/pw/bin/python" "$GITHUB_WORKSPACE/harness/npu_ui.py" "http://127.0.0.1:$PORT" "$PW" "$W/ui" || tail -20 "$W/pw-install.log"
+          mkdir -p "$GITHUB_WORKSPACE/ui-shots" && cp -r "$W/ui/." "$GITHUB_WORKSPACE/ui-shots/" || true
           python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-shutdown.json" --phase shutdown
           for i in $(seq 1 60); do kill -0 "$(cat "$W/studio.pid")" 2>/dev/null || break; sleep 1; done
           sleep 3
@@ -65,7 +72,11 @@ jobs:
           python3 "$GITHUB_WORKSPACE/harness/npu_e2e.py" "http://127.0.0.1:$PORT" "$PW" "$W/e2e-restart.json" --phase after-restart
           procs "before SIGKILL"
           kill -KILL "$(cat "$W/studio.pid")"
-          sleep 8
+          # lemond gets SIGTERM from PR_SET_PDEATHSIG and shuts down on its own schedule.
+          for i in $(seq 1 18); do
+            sleep 5
+            if ! pgrep -f "$W/studio/lemonade" >/dev/null; then echo "Studio's lemond and flm gone $((i * 5))s after SIGKILL"; break; fi
+          done
           procs "after SIGKILL of Studio"
           echo "======== studio-main.log (NPU lines)"; grep -iE "npu|lemonade|fastflowlm|error|traceback" "$W/studio-main.log" | tail -120
           echo "======== studio-restart.log (tail)"; tail -80 "$W/studio-restart.log"
@@ -73,7 +84,7 @@ jobs:
           import json, sys, pathlib
           w = pathlib.Path(sys.argv[1])
           bad = 0
-          for name in ("e2e-main.json", "e2e-shutdown.json", "e2e-restart.json"):
+          for name in ("e2e-main.json", "e2e-unload.json", "ui/ui-results.json", "e2e-shutdown.json", "e2e-restart.json"):
               p = w / name
               rows = json.loads(p.read_text()) if p.exists() else []
               fails = [r["name"] for r in rows if not r["ok"]]
@@ -81,6 +92,12 @@ jobs:
               print(f"{name}: {len(rows) - len(fails)}/{len(rows)} passed", fails)
           sys.exit(1 if bad else 0)
           PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-ui-screenshots
+          path: ui-shots
+          if-no-files-found: ignore
 
   windows:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
@@ -100,8 +117,10 @@ jobs:
           "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
-          git -c core.autocrlf=false clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
           Set-Location "$W\src"
+          # In the clone's own config: a -c on clone alone does not reach the checkout below.
+          git config core.autocrlf false
           git checkout -q $env:BASE_SHA
           git -c core.autocrlf=false apply --index "$env:GITHUB_WORKSPACE\harness\npu.patch"
           if ($LASTEXITCODE -ne 0) { throw "patch did not apply" }

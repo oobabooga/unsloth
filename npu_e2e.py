@@ -303,6 +303,31 @@ def main_phase():
     record("tool_choice none withholds the tools", code == 200 and not body["choices"][0]["message"].get("tool_calls"), json.dumps(body)[:400])
     code, body, _ = chat("m", q, stream=False, max_tokens=50, temperature=0.2)
     record("sampler values reach FastFlowLM and it answers", code == 200, json.dumps(body)[:300])
+    # Studio's own server-side tool loop, as the chat UI drives it.
+    code, resp, _ = call(
+        "POST",
+        "/api/inference/chat/completions",
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "Use the python tool to compute 12345*6789, then tell me the result."}],
+            "stream": True,
+            "max_tokens": 400,
+            "enable_tools": True,
+            "enabled_tools": ["python"],
+            "permission_mode": "full",
+            "bypass_permissions": True,
+        },
+        raw=True,
+        headers={"X-Unsloth-Events": "1"},
+    )
+    lines = sse_lines(resp) if code == 200 else []
+    tool_frames = [l for l in lines if "tool_start" in l or "tool_end" in l]
+    text = content_of(data_chunks(lines))
+    record(
+        "Studio tool loop runs python for the NPU model",
+        code == 200 and tool_frames and "83810205" in text.replace(",", ""),
+        f"{len(tool_frames)} tool frames, answer {text[-200:]!r}",
+    )
 
     # ---- A GGUF load replaces the NPU model, and an NPU load replaces the GGUF.
     gguf = load("unsloth/Qwen3-0.6B-GGUF", gguf_variant="Q4_K_M", max_seq_length=4096)
@@ -346,7 +371,17 @@ def shutdown_phase():
     record("graceful shutdown requested", code == 200, body)
 
 
-PHASES = {"main": main_phase, "after-restart": after_restart_phase, "shutdown": shutdown_phase}
+def unload_phase():
+    code, body, _ = call("POST", "/api/inference/unload", {"model_path": "lemonade:qwen3-0.6b-FLM"})
+    record("unload before the UI run", code == 200, body)
+
+
+PHASES = {
+    "main": main_phase,
+    "after-restart": after_restart_phase,
+    "shutdown": shutdown_phase,
+    "unload": unload_phase,
+}
 
 if login():
     try:
