@@ -29,10 +29,13 @@ def main() -> int:
     ap.add_argument("--size", type = int, default = 1024)
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--prompts", type = int, default = 3)
+    ap.add_argument("--cache", default = "fbcache", help = "the cache the head and base arms request (fbcache / static)")
     args = ap.parse_args()
+    marker = {"fbcache": "diffusion.cache: fbcache engaged", "static": "diffusion.step_skip: static engaged"}.get(
+        args.cache, f"{args.cache} engaged")
     out = args.out_dir
     out.mkdir(parents = True, exist_ok = True)
-    arms = (("ref", args.head, "off"), ("fb", args.head, "fbcache"), ("base_fb", args.base, "fbcache"))
+    arms = (("ref", args.head, "off"), ("fb", args.head, args.cache), ("base_fb", args.base, args.cache))
     summary: dict = {"arms": {}}
     for state, checkout, cache in arms:
         part = out / f"{state}.json"
@@ -49,7 +52,7 @@ def main() -> int:
         sub = json.loads(part.read_text(encoding = "utf-8")) if part.is_file() else {}
         arm = (sub.get("arms") or {}).get("off") or {}
         arm["exit_code"] = rc
-        arm["log_says_engaged"] = "diffusion.cache: fbcache engaged" in text
+        arm["log_says_engaged"] = marker in text
         summary["arms"][state] = arm
         for key in ("torch", "hip", "device", "arch"):
             summary.setdefault(key, sub.get(key))

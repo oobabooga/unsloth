@@ -1,13 +1,13 @@
-name: "AMD CI: First-Block-Cache on Qwen-Image-2.1 (PR 11713, Linux)"
+name: "AMD CI: static step skip on Qwen-Image-2.1 (PR 11737, Linux)"
 
-# PR 11713 lets an explicit transformer_cache=fbcache engage on prefix-KV image models. Studio runs
-# eager on ROCm, so skipped transformer blocks are a direct wall-clock saving there. Three arms,
-# one process each: head uncached (reference), head with fbcache, base (main) with fbcache, which
-# must still be refused (else the run is VOID). No HF token is used anywhere.
+# PR 11737 adds transformer_cache=static: a fixed schedule that skips whole transformer calls.
+# Studio runs eager on ROCm, so skipped calls are a direct wall-clock saving there. Three arms, one
+# process each: head uncached (reference), head with static, base (main) with static, which main
+# does not have (else the run is VOID). No HF token is used anywhere.
 
 on:
   push:
-    branches: [amd-ci-fbcache]
+    branches: [amd-ci-static]
   workflow_dispatch:
 
 permissions:
@@ -15,13 +15,13 @@ permissions:
 
 env:
   SRC_REPO: "https://github.com/unslothai/unsloth"
-  HEAD_BRANCH: "studio-prefix-kv-fbcache"
+  HEAD_BRANCH: "studio-static-step-skip"
   BASE_BRANCH: "main"
 
 jobs:
 
   gpu:
-    name: "fbcache on gfx1151 Linux (exclusive)"
+    name: "static skip on gfx1151 Linux (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 330
     concurrency:
@@ -33,7 +33,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "fbcache-gpu"
+          source amd_ci/lib/preamble.sh "static-gpu"
 
       - name: Checkout head and base
         run: |
@@ -80,14 +80,14 @@ jobs:
           export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home"
           "$AMD_CI_PY" -u amd_ci/probes/fbcache_e2e_probe.py --head "$AMD_CI_WORK/src/head" \
             --base "$AMD_CI_WORK/src/base" --out-dir "$AMD_CI_WORK/out/e2e" --models "$AMD_CI_WORK/models" \
-            --steps 20 --prompts 3
-          { echo "### Qwen-Image-2.1, fbcache vs uncached, eager"; cat "$AMD_CI_WORK/out/e2e/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
+            --steps 25 --prompts 3 --cache static
+          { echo "### Qwen-Image-2.1, static skip vs uncached, eager"; cat "$AMD_CI_WORK/out/e2e/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fbcache-linux
+          name: static-linux
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
