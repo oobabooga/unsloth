@@ -1,30 +1,29 @@
-name: "AMD CI: W8A8 torch._int_mm vs weight-only int8 (Linux)"
+name: "AMD CI: First-Block-Cache on Qwen-Image-2.1 (PR 11713, Linux)"
 
-# Is PR 11631's int8 faster on gfx1151 when the activations are int8 too, so the GEMM
-# runs through torch._int_mm instead of dequantising the weight to bf16? The branch
-# under test is studio-amd-int8-intmm (PR 11631 plus an opt-in UNSLOTH_NATIVE_INT8_ACT=1
-# path). Two measurements: one Linear on the DiT's real shapes, eager and compiled,
-# then Qwen-Image-2.1 end to end through Studio at bf16 / int8 weight-only / int8 W8A8,
-# eager and with Studio's default compile. No HF token is used anywhere.
+# PR 11713 lets an explicit transformer_cache=fbcache engage on prefix-KV image models. Studio runs
+# eager on ROCm, so skipped transformer blocks are a direct wall-clock saving there. Three arms,
+# one process each: head uncached (reference), head with fbcache, base (main) with fbcache, which
+# must still be refused (else the run is VOID). No HF token is used anywhere.
 
 on:
   push:
-    branches: [amd-ci-int8mm]
+    branches: [amd-ci-fbcache]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  SRC_REPO: "https://github.com/danielhanchen/unsloth-staging-2"
-  SRC_BRANCH: "studio-amd-int8-intmm"
+  SRC_REPO: "https://github.com/unslothai/unsloth"
+  HEAD_BRANCH: "studio-prefix-kv-fbcache"
+  BASE_BRANCH: "main"
 
 jobs:
 
   gpu:
-    name: "int8 W8A8 on gfx1151 Linux (exclusive)"
+    name: "fbcache on gfx1151 Linux (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 300
+    timeout-minutes: 330
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -34,19 +33,21 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "int8mm-gpu"
+          source amd_ci/lib/preamble.sh "fbcache-gpu"
 
-      - name: Checkout the branch under test
+      - name: Checkout head and base
         run: |
           set -euo pipefail
-          git clone -q --depth 1 -b "$SRC_BRANCH" "$SRC_REPO" "$AMD_CI_WORK/src/unsloth"
-          git -C "$AMD_CI_WORK/src/unsloth" log -1 --format='%h %s'
+          git clone -q --depth 1 -b "$HEAD_BRANCH" "$SRC_REPO" "$AMD_CI_WORK/src/head"
+          git clone -q --depth 1 -b "$BASE_BRANCH" "$SRC_REPO" "$AMD_CI_WORK/src/base"
+          git -C "$AMD_CI_WORK/src/head" log -1 --format='head %h %s'
+          git -C "$AMD_CI_WORK/src/base" log -1 --format='base %h %s'
 
       - name: Environment and real gate
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          cd "$AMD_CI_WORK/src/unsloth"
+          cd "$AMD_CI_WORK/src/head"
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
           export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
@@ -72,21 +73,21 @@ jobs:
           "$AMD_CI_PY" -c "import torch, lpips; print('lpips ok, torch', torch.__version__)"
           exit 0
 
-      - name: End to end, compile forced on ROCm
-        timeout-minutes: 200
+      - name: End to end, eager (Studio's ROCm default)
+        timeout-minutes: 240
         run: |
           set +e
-          export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home" PROBE_FORCE_COMPILE=1
-          "$AMD_CI_PY" -u amd_ci/probes/int8mm_e2e_probe.py --checkout "$AMD_CI_WORK/src/unsloth" \
-            --out-dir "$AMD_CI_WORK/out/e2e_compiled" --models "$AMD_CI_WORK/models" --speed default \
-            --arms ref,wo,w8a8_rot
-          { echo "### Studio default speed, compile forced on ROCm"; cat "$AMD_CI_WORK/out/e2e_compiled/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
+          export TORCH_HOME="$AMD_CI_WORK/torch_home" HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" -u amd_ci/probes/fbcache_e2e_probe.py --head "$AMD_CI_WORK/src/head" \
+            --base "$AMD_CI_WORK/src/base" --out-dir "$AMD_CI_WORK/out/e2e" --models "$AMD_CI_WORK/models" \
+            --steps 20 --prompts 3
+          { echo "### Qwen-Image-2.1, fbcache vs uncached, eager"; cat "$AMD_CI_WORK/out/e2e/SUMMARY.md"; } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: int8mm-linux-compiled
+          name: fbcache-linux
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
