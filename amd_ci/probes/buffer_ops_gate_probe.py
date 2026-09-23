@@ -76,7 +76,10 @@ def main() -> int:
     env.update(TMPDIR = str(work / "tmp"), TEMP = str(work / "tmp"), TMP = str(work / "tmp"),
                TRITON_HOME = str(work / "th"),
                PYTHONPATH = args.checkout + os.pathsep + env.get("PYTHONPATH", ""))
-    p = subprocess.run([args.python, "-c", CHILD], env = env, cwd = str(work),
+    # @triton.jit reads its source with inspect, so the child has to live in a real file.
+    child = work / "child.py"
+    child.write_text(CHILD, encoding = "utf-8")
+    p = subprocess.run([args.python, str(child)], env = env, cwd = str(work),
                        capture_output = True, text = True, timeout = 1800)
     obs["rc"] = p.returncode
     line = [l for l in p.stdout.splitlines() if l.startswith("@@PROBE@@")]
