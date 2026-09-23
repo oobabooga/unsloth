@@ -112,7 +112,7 @@ def main():
     env = dict(os.environ, LEMONADE_API_KEY=KEY)
     log = open(os.path.join(ROOT, "lemond.log"), "w")
     t = time.time()
-    proc = subprocess.Popen([exe, d, "--port", str(PORT)], cwd=d, env=env, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([exe, d, "--port", str(PORT), "--no-broadcast"], cwd=d, env=env, stdout=log, stderr=subprocess.STDOUT)
     up = None
     for _ in range(240):
         r = req("GET", "/live", auth=False, timeout=5)
@@ -147,29 +147,67 @@ def main():
             rec("flm_validate_text", run([flm_exe, "validate"]))
             rec("flm_list", run([flm_exe, "list", "--json", "--quiet"]))
         rec("system_info_after", req("GET", "/v1/system-info").get("json", {}).get("recipes", {}).get("flm"))
-        want = os.environ.get("PROBE_MODELS", "")
-        names = [m["id"] for m in flm]
-        pick = [n for n in want.split(",") if n in names] if want else []
-        if not pick and flm:
-            pick = [min(flm, key=lambda m: m.get("size") or 1e9)["id"]]
-        for m in pick:
+        models = req("GET", "/v1/models?show_all=true")
+        allm = models.get("json", {}).get("data", []) if isinstance(models.get("json"), dict) else []
+        flm = [m for m in allm if m.get("recipe") == "flm"]
+        rec("flm_models_after", [{k: m.get(k) for k in ("id", "checkpoint", "size", "labels", "downloaded")} for m in flm])
+        rec("flm_entry_full", flm[0] if flm else None)
+        by_ckpt = {m.get("checkpoint"): m["id"] for m in flm}
+        want = os.environ.get("PROBE_CKPTS", "qwen3:0.6b,qwen3:4b,gemma3:4b,gpt-oss:20b").split(",")
+        T0 = time.time()
+        for ck in want:
+            m = by_ckpt.get(ck)
+            if not m:
+                rec(f"missing:{ck}", None); continue
+            if time.time() - T0 > 1500:
+                rec(f"skipped_time:{ck}", None); continue
             res = {}
+            res["system_stats0"] = req("GET", "/v1/system-stats")
             res["pull"] = req("POST", "/v1/pull", {"model_name": m})
-            res["load"] = req("POST", "/v1/load", {"model_name": m, "ctx_size": 4096})
+            res["load"] = req("POST", "/v1/load", {"model_name": m, "ctx_size": 16384})
             res["health"] = req("GET", "/v1/health")
-            res["chat"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}], "max_tokens": 200, "temperature": 0})
+            res["system_stats1"] = req("GET", "/v1/system-stats")
+            res["chat"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}], "max_tokens": 400, "temperature": 0})
             res["stats1"] = req("GET", "/v1/stats")
-            res["stream"] = stream_chat(m, {"messages": [{"role": "user", "content": "Write a 150-word story about a lighthouse."}], "max_tokens": 300, "temperature": 0.7, "top_p": 0.9})
+            res["stream"] = stream_chat(m, {"messages": [{"role": "user", "content": "Write a 200-word story about a lighthouse."}], "max_tokens": 600, "temperature": 0.7, "top_p": 0.9, "top_k": 20, "min_p": 0.0, "repeat_penalty": 1.05, "presence_penalty": 0.0})
             res["stats2"] = req("GET", "/v1/stats")
-            res["stop"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}], "max_tokens": 200, "stop": ["7"]})
-            res["tools"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What's the weather in Paris? Use the tool."}], "max_tokens": 300,
+            res["nothink"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What is 17*3? Answer briefly."}], "max_tokens": 300, "chat_template_kwargs": {"enable_thinking": False}})
+            res["stop"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}], "max_tokens": 400, "stop": ["7"]})
+            res["tools"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "What's the weather in Paris? Use the tool."}], "max_tokens": 600,
                                 "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]})
+            res["tools_stream"] = stream_chat(m, {"messages": [{"role": "user", "content": "What's the weather in Paris? Use the tool."}], "max_tokens": 600,
+                                "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]})
+            long_prompt = ("The quick brown fox jumps over the lazy dog near the river bank. " * 450) + "\nHow many times did the fox jump? Reply in one sentence."
+            res["long_prompt"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": long_prompt}], "max_tokens": 200})
+            res["stats_long"] = req("GET", "/v1/stats")
+            # client disconnect mid-stream, then time a fresh short request
+            try:
+                rr = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps({"model": m, "stream": True, "max_tokens": 1500, "messages": [{"role": "user", "content": "Write a very long essay about oceans."}]}).encode(), method="POST")
+                rr.add_header("Authorization", f"Bearer {KEY}"); rr.add_header("Content-Type", "application/json")
+                resp = urllib.request.urlopen(rr, timeout=300)
+                for i, _ in enumerate(resp):
+                    if i > 10: break
+                resp.close()
+            except Exception as e:
+                res["cancel_err"] = repr(e)
+            res["after_cancel"] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 20, "chat_template_kwargs": {"enable_thinking": False}})
+            # two concurrent requests
+            import threading
+            outs = {}
+            def worker(i):
+                outs[i] = req("POST", "/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": f"Name {i+3} fruits."}], "max_tokens": 120})
+            ths = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+            tc = time.time(); [t.start() for t in ths]; [t.join() for t in ths]
+            res["concurrent"] = {"wall": round(time.time() - tc, 2), "each": {k: {"status": v.get("status"), "secs": v.get("secs"), "err": v.get("error")} for k, v in outs.items()}}
+            if "vision" in (next((x.get("labels") or [] for x in flm if x["id"] == m), [])):
+                png = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
+                res["vision"] = req("POST", "/v1/chat/completions", {"model": m, "max_tokens": 60, "messages": [{"role": "user", "content": [{"type": "text", "text": "What color is this image?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + png}}]}]})
             res["completions"] = req("POST", "/v1/completions", {"model": m, "prompt": "The capital of France is", "max_tokens": 16, "temperature": 0})
             res["anthropic"] = req("POST", "/v1/messages", {"model": m, "max_tokens": 64, "messages": [{"role": "user", "content": "Say hi."}]})
-            res["system_stats"] = req("GET", "/v1/system-stats")
             res["unload"] = req("POST", "/v1/unload", {"model_name": m})
             res["health_after"] = req("GET", "/v1/health")
-            rec(f"model:{m}", res)
+            rec(f"model:{ck}", res)
+        rec("flm_list_installed", run([flm_exe, "list", "--filter", "installed", "--json", "--quiet"]) if flm_exe else None)
     finally:
         proc.terminate()
         try:
