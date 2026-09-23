@@ -8,14 +8,23 @@ name: AMD DevLab issue 9130 containment
 # A 2x3 matrix. Each cell raises ONE fault in ONE placement against its OWN fresh server:
 #
 #                  on the generation thread            inside a spawn child
-#   python         expect ALIVE, HTTP 500              expect ALIVE, child exit 1
-#   abort          expect DEAD                         expect ALIVE, child -6
-#   gpu            expect DEAD                         expect ALIVE, child killed
+#   python         ALIVE, HTTP 500                     ALIVE, child exit 1
+#   gpu            ALIVE, HTTP 500                     ALIVE, child exit 1
+#   abort          DEAD                                ALIVE, child -6
 #
-# The python row is the control that makes the rest mean something: the route's `except Exception`
-# already handles a Python failure, so the hole is specifically native. The subprocess column is
-# not invented here: transformers inference already runs in a spawn child
-# (core/inference/worker.py) and orchestrator.py:1028 already renders `exitcode < 0` as
+# Measured in run 35821766348, not predicted. The gpu row is the one that moved, and it moved
+# against the hypothesis: a REAL hipErrorLaunchFailure raised in the ordinary torch call path
+# arrives in Python as a c10 AcceleratorError, the route's `except Exception` catches it, and the
+# server answers 500 and lives. A device fault on the generation thread is therefore not by
+# itself enough to take the server down, so the gpu row sits with the python row as a control.
+#
+# The abort row is the measurement. It is the shape #9130's own trace has: `terminate called
+# after throwing an instance of 'c10::AcceleratorError'` out of c10::cuda::SetDevice, thrown
+# where it cannot propagate to Python and so reaching the process as a fatal signal. No `except`
+# clause catches that, which is the whole argument for a process boundary.
+#
+# The subprocess column is not invented here: transformers inference already runs in a spawn
+# child (core/inference/worker.py) and orchestrator.py:1028 already renders `exitcode < 0` as
 # "signal=SIGABRT". Diffusers is the one inference path that skipped it.
 #
 # WHY THE WATCHER. The predecessor run (33031937295) recorded the in-process arm as an exit code
@@ -338,7 +347,7 @@ jobs:
             "$PY" - "$RESULTS/$cell.json" "$cell" "$kind" "$placement" "$SENT" \
               "$HTTP" "$CURL_RC" "$PROC" "$SERVED" "$EXITST" \
               "$RESULTS/$cell.timeline.jsonl" "$RESULTS/$cell.body" <<'PY'
-          import json, sys
+          import json, os, sys
 
           (out, cell, kind, placement, sent, http, curl_rc, proc, served, exitst,
            timeline, body) = sys.argv[1:13]
@@ -355,10 +364,17 @@ jobs:
           after = [s for s in samples if s["t"] >= sent_at]
           first_fail_after = next((s for s in after if not s["ok"]), None)
 
+          # curl writes no body file at all when the connection dies mid-request, which is exactly
+          # what the in-process arm does. Read defensively: the earlier version re-opened the file
+          # inside its own handler and took the whole cell's result down with it.
+          raw = ""
+          if os.path.exists(body):
+              with open(body, encoding="utf-8", errors="replace") as handle:
+                  raw = handle.read()
           try:
-              payload = json.loads(open(body, encoding="utf-8").read() or "{}")
-          except Exception:
-              payload = {"raw": open(body, encoding="utf-8", errors="replace").read()[:300]}
+              payload = json.loads(raw) if raw.strip() else {}
+          except ValueError:
+              payload = {"raw": raw[:300]}
 
           json.dump({
               "cell": cell, "kind": kind, "placement": placement,
@@ -422,40 +438,60 @@ jobs:
               if not ok:
                   fails.append(label)
 
-          print("\n=== controls ===")
-          for placement in ("thread", "subprocess"):
-              c = cells.get((placement, "python"), {})
-              if c.get("status") != "ran":
-                  inconclusive.append(f"python/{placement}")
-                  continue
-              check(f"python/{placement}: the server survives a caught failure",
-                    c.get("served_after_hold") == "yes" and c.get("process") == "alive",
-                    f"process={c.get('process')} served={c.get('served_after_hold')}")
-          c = cells.get(("thread", "python"), {})
-          check("python/thread: answered 500 rather than dying", str(c.get("http")) == "500",
-                f"http={c.get('http')}")
+          # Run 35821766348 corrected the hypothesis this section used to encode. A REAL
+          # hipErrorLaunchFailure raised in the ordinary torch call path reaches Python as a
+          # c10 AcceleratorError, and the route's `except Exception` catches it: the server
+          # answers 500 and lives. So a device fault on the generation thread does NOT by itself
+          # take the server down, and the gpu row belongs with the controls.
+          #
+          # What takes it down is a fault that arrives as a FATAL SIGNAL rather than an exception,
+          # which is the shape #9130's own trace has: `terminate called after throwing an instance
+          # of 'c10::AcceleratorError'` out of c10::cuda::SetDevice, thrown where it cannot
+          # propagate. abort() is that shape, and the abort row is the measurement.
 
-          print("\n=== the measurement ===")
-          for kind in ("abort", "gpu"):
-              t = cells.get(("thread", kind), {})
-              s = cells.get(("subprocess", kind), {})
-              if t.get("status") != "ran" or s.get("status") != "ran":
-                  inconclusive.append(f"{kind}")
-                  continue
-              # In-process: the server must actually stop answering, on a timeline, not merely exit.
-              check(f"{kind}/thread: the server STOPPED ANSWERING after the fault",
+          print("\n=== controls: what does NOT take the server down ===")
+          for kind in ("python", "gpu"):
+              for placement in ("thread", "subprocess"):
+                  c = cells.get((placement, kind), {})
+                  if c.get("status") != "ran":
+                      inconclusive.append(f"{kind}/{placement}")
+                      continue
+                  check(f"{kind}/{placement}: the server survives it",
+                        c.get("served_after_hold") == "yes" and c.get("process") == "alive",
+                        f"process={c.get('process')} served={c.get('served_after_hold')}")
+          for kind in ("python", "gpu"):
+              c = cells.get(("thread", kind), {})
+              check(f"{kind}/thread: answered 500 rather than dying", str(c.get("http")) == "500",
+                    f"http={c.get('http')}")
+
+          # Non-vacuity: the gpu control is only interesting if the device really did fault. Without
+          # this the row would pass on any exception at all, which would prove nothing.
+          gpu_detail = str((cells.get(("thread", "gpu"), {}).get("body") or {}).get("detail", ""))
+          check("gpu/thread: the caught error really was a device launch failure",
+                "launch failure" in gpu_detail.lower(), gpu_detail[:120])
+
+          print("\n=== the measurement: a fault that arrives as a signal ===")
+          t = cells.get(("thread", "abort"), {})
+          s = cells.get(("subprocess", "abort"), {})
+          if t.get("status") != "ran" or s.get("status") != "ran":
+              inconclusive.append("abort")
+          else:
+              # The server must be seen to STOP ANSWERING on a timeline, not merely to exit.
+              check("abort/thread: the server STOPPED ANSWERING after the fault",
                     t.get("served_after_hold") == "no" and t.get("first_failure_after_fault_s") is not None,
                     f"first failure at +{t.get('first_failure_after_fault_s')}s "
                     f"({t.get('first_failure_detail')}), exit={t.get('server_exit')}")
-              check(f"{kind}/thread: it was healthy right up to the fault",
+              check("abort/thread: it was healthy right up to the fault",
                     (t.get("samples_ok") or 0) > 0 and (t.get("last_ok_before_fault_s") or 99) < 1.0,
                     f"{t.get('samples_ok')} ok samples, last {t.get('last_ok_before_fault_s')}s before")
-              # Contained: answering for the whole hold, not at one instant.
-              check(f"{kind}/subprocess: the server KEPT answering for {os.environ['SURVIVE_HOLD']}s",
+              # Contained means answering for the whole hold, not at one instant: the predecessor
+              # run printed survived:true and then exited 139 anyway.
+              check(f"abort/subprocess: the server KEPT answering for {os.environ['SURVIVE_HOLD']}s",
                     s.get("served_after_hold") == "yes" and s.get("process") == "alive"
                     and (s.get("ok_samples_after_fault") or 0) > 10,
                     f"{s.get('ok_samples_after_fault')} ok samples after the fault")
-              check(f"{kind}/subprocess: the child died", str((s.get("body") or {}).get("exitcode")) not in ("0", "None"),
+              check("abort/subprocess: the child died on SIGABRT",
+                    str((s.get("body") or {}).get("exitcode")) == "-6",
                     f"child exitcode={(s.get('body') or {}).get('exitcode')}")
 
           print()
@@ -471,9 +507,11 @@ jobs:
               for f in fails:
                   print("  -", f)
               sys.exit(1)
-          print("Containment gap confirmed on gfx1151. A caught Python failure on the generation")
-          print("thread is answered 500 and the server lives. The same native and device faults on")
-          print("that thread stop the server answering. Behind a spawn boundary they do not.")
+          print("Containment gap confirmed on gfx1151, and narrower than #9130 states it.")
+          print("A real hipErrorLaunchFailure on the generation thread reaches Python, is caught,")
+          print("and the server answers 500 and lives. A fault that arrives as a fatal signal")
+          print("instead stops the server answering within a sample. Behind a spawn boundary the")
+          print("same signal is contained and reported as the child's exitcode.")
           PY
 
       - name: Raw results
