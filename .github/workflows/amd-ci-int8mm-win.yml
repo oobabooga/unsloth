@@ -59,9 +59,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $src = "$env:AMD_CI_WORK\src\unsloth"
-          git -C $src fetch -q --depth 50 https://github.com/unslothai/unsloth pull/11640/head
-          git -C $src -c user.name=ci -c user.email=ci@localhost merge -q --no-edit --allow-unrelated-histories FETCH_HEAD
-          Write-Host "merge exit $LASTEXITCODE, $(git -C $src log -1 --format=%h)"
+          # The clone is shallow, so apply the PR's diff rather than merge its history.
+          Invoke-WebRequest -UseBasicParsing -Uri "https://patch-diff.githubusercontent.com/raw/unslothai/unsloth/pull/11640.diff" -OutFile "$env:AMD_CI_WORK\pr11640.diff"
+          git -C $src apply --whitespace=nowarn "$env:AMD_CI_WORK\pr11640.diff"
+          Write-Host "apply exit $LASTEXITCODE"
+          git -C $src status --short
           exit 0
 
       - name: Test environment
