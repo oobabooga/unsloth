@@ -93,6 +93,11 @@ jobs:
             echo "HF_HUB_CACHE=$AMD_CI_WORK/cache/hf/hub"
             echo "HF_XET_CACHE=$AMD_CI_WORK/cache/hf/xet"
             echo "TORCH_HOME=$AMD_CI_WORK/cache/torch"
+            # Run 35919032388 died on `ReadTimeout` 92s into the pull. A Xet stall is a known
+            # failure mode on this box (Studio ships a watchdog for it, hf_xet_fallback), so take
+            # the plain HTTP path and give it a timeout that survives a slow chunk.
+            echo "HF_HUB_DISABLE_XET=1"
+            echo "HF_HUB_DOWNLOAD_TIMEOUT=60"
           } >> "$GITHUB_ENV"
           df -h "$AMD_CI_WORK" | tail -1
           "$V/bin/python" -m pip install -q fastapi uvicorn
