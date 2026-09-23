@@ -84,6 +84,17 @@ jobs:
           # The server imports core.inference.diffusion from the measured tree, unlike the
           # stand-in, which imported nothing from Studio. Without this it dies at import.
           echo "PYTHONPATH=$SRC/studio/backend" >> "$GITHUB_ENV"
+          # The Hub cache defaults to a shared machine path this job cannot write
+          # (/mnt/scratch/cache/hf, Errno 13 in run 35918636899). $RUNNER_TEMP is the only tree
+          # the runner reclaims, so the cache goes there: a cold ~33 GB pull, by design.
+          mkdir -p "$AMD_CI_WORK/cache/hf/hub" "$AMD_CI_WORK/cache/torch"
+          {
+            echo "HF_HOME=$AMD_CI_WORK/cache/hf"
+            echo "HF_HUB_CACHE=$AMD_CI_WORK/cache/hf/hub"
+            echo "HF_XET_CACHE=$AMD_CI_WORK/cache/hf/xet"
+            echo "TORCH_HOME=$AMD_CI_WORK/cache/torch"
+          } >> "$GITHUB_ENV"
+          df -h "$AMD_CI_WORK" | tail -1
           "$V/bin/python" -m pip install -q fastapi uvicorn
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
