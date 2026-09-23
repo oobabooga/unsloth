@@ -94,4 +94,15 @@ def table(obs: dict) -> str:
                 f"{mean('peak_gib')} | {mean('lpips') if scheme != 'off' else 'ref'} | "
                 f"{mean('psnr') if scheme != 'off' else 'ref'} | {note} |"
             )
+    reload = ((_arms(obs.get("head") or {}).get("off") or {}).get("same_process_reload")) or {}
+    if reload:
+        after = (_arms(obs.get("head") or {}).get("off") or {}).get("memory_after_unload") or {}
+        msg = ((reload.get("error") or {}).get("message") or "")[:200].replace("|", "/")
+        lines += [
+            "",
+            "Each arm above loads in a fresh process. Diagnostic, not judged: the same bf16 load again "
+            f"in the bf16 arm's process after its unload: {'loaded' if reload.get('loaded') else 'REFUSED'}"
+            + (f" ({msg})" if msg else "")
+            + f". Memory after that unload: {after}.",
+        ]
     return "\n".join(lines)

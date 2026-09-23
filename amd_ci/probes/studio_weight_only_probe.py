@@ -43,8 +43,6 @@ def write(out: Path, obs: dict) -> None:
 
 
 def weight_gib(module) -> float:
-    import torch
-
     seen, total = set(), 0
     for t in list(module.parameters()) + list(module.buffers()):
         try:
@@ -58,6 +56,90 @@ def weight_gib(module) -> float:
     return round(total / 2**30, 2)
 
 
+def memory() -> dict:
+    import torch
+
+    out: dict = {}
+    try:
+        free, total = torch.cuda.mem_get_info()
+        out["device_free_gib"], out["device_total_gib"] = round(free / 2**30, 2), round(total / 2**30, 2)
+        out["allocated_gib"] = round(torch.cuda.memory_allocated() / 2**30, 2)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)[:200]
+    try:
+        import psutil
+
+        out["process_rss_gib"] = round(psutil.Process().memory_info().rss / 2**30, 2)
+        vm = psutil.virtual_memory()
+        out["system_available_gib"] = round(vm.available / 2**30, 2)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def orchestrate(args) -> int:
+    """One process per scheme, then score every quantised render against the bf16 render."""
+    import subprocess
+
+    # "none": PowerShell drops an empty-string argument, so an empty list needs a word.
+    schemes = [s for s in args.schemes.split(",") if s and s != "none"]
+    # The base only has to show the refusal; its bf16 render would be the head's bf16 render again.
+    order = schemes if args.state == "base" and not args.reference_at_base else ["off"] + schemes
+    obs: dict = {"state": args.state, "args": vars(args) | {"out": str(args.out)}, "arms": {}}
+    write(args.out, obs)
+    for scheme in order:
+        part = args.out.with_name(f"{args.out.stem}.{scheme}.json")
+        cmd = [sys.executable, "-u", __file__, "--state", args.state, "--checkout", args.checkout,
+               "--out", str(part), "--models", args.models, "--schemes", args.schemes,
+               "--size", str(args.size), "--steps", str(args.steps), "--prompts", str(args.prompts),
+               "--single", scheme]
+        if args.reference_at_base:
+            cmd.append("--reference-at-base")
+        rc = subprocess.call(cmd)
+        sub = json.loads(part.read_text(encoding = "utf-8")) if part.is_file() else {}
+        for key in ("torch", "hip", "device", "arch", "download_seconds", "download_retries", "stub_error"):
+            if key in sub and key not in obs:
+                obs[key] = sub[key]
+        arm = (sub.get("arms") or {}).get(scheme) or {"loaded": False, "error": {"message": f"probe exited {rc}"}}
+        arm["exit_code"] = rc
+        obs["arms"][scheme] = arm
+        write(args.out, obs)
+    score(args, obs)
+    obs["done"] = True
+    write(args.out, obs)
+    return 0
+
+
+def score(args, obs: dict) -> None:
+    import numpy as np
+    from PIL import Image
+
+    img_dir = args.out.parent / f"images_{args.state}"
+    scorer = None
+    try:
+        import lpips
+        import torch
+
+        scorer = lpips.LPIPS(net = "alex", verbose = False).eval()
+    except Exception as exc:  # noqa: BLE001
+        obs["lpips_error"] = str(exc)[:200]
+    for scheme, rec in obs["arms"].items():
+        if scheme == "off":
+            continue
+        for item in rec.get("images") or []:
+            ref_path = img_dir / f"off_p{item.get('prompt_index')}.png"
+            if "error" in item or not ref_path.is_file():
+                continue
+            a = np.asarray(Image.open(ref_path).convert("RGB"), dtype = np.float32) / 255.0
+            b = np.asarray(Image.open(img_dir / item["path"]).convert("RGB"), dtype = np.float32) / 255.0
+            item["psnr"] = round(float(10 * np.log10(1.0 / max(float(((a - b) ** 2).mean()), 1e-12))), 3)
+            if scorer is not None:
+                ta = torch.from_numpy(a).permute(2, 0, 1)[None] * 2 - 1
+                tb = torch.from_numpy(b).permute(2, 0, 1)[None] * 2 - 1
+                with torch.no_grad():
+                    item["lpips"] = round(float(scorer(ta, tb).item()), 4)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -69,7 +151,14 @@ def main() -> int:
     ap.add_argument("--steps", type = int, default = 20)
     ap.add_argument("--prompts", type = int, default = len(PROMPTS))
     ap.add_argument("--reference-at-base", action = "store_true")
+    # Internal: run one scheme in this process and write only its arm. The parent runs every scheme
+    # in a fresh process, as a user starting Studio would: on a unified-memory APU the pages an
+    # earlier arm read stay charged to the system, so a second load in the same process is judged
+    # against memory the first one left behind, not against what the scheme needs.
+    ap.add_argument("--single", default = "")
     args = ap.parse_args()
+    if not args.single:
+        return orchestrate(args)
     # A stuck render still leaves evidence: stacks every 10 minutes into the probe log.
     faulthandler.dump_traceback_later(int(os.environ.get("PROBE_STACK_EVERY", "600")), repeat = True)
 
@@ -144,24 +233,12 @@ def main() -> int:
     backend = DiffusionBackend()
     import numpy as np
 
-    scorer = None
-    try:
-        import lpips
-
-        scorer = lpips.LPIPS(net = "alex", verbose = False).eval()
-    except Exception as exc:  # noqa: BLE001
-        obs["lpips_error"] = str(exc)[:200]
-
     img_dir = args.out.parent / f"images_{args.state}"
     img_dir.mkdir(parents = True, exist_ok = True)
-    refs: dict = {}
     arms: dict = {}
     obs["arms"] = arms
-    # "none": PowerShell drops an empty-string argument, so an empty list needs a word.
-    schemes = [s for s in args.schemes.split(",") if s and s != "none"]
-    # The base only has to show the refusal; its bf16 render would be the head's bf16 render again.
-    for scheme in schemes if args.state == "base" and not args.reference_at_base else ["off"] + schemes:
-        rec: dict = {}
+    for scheme in [args.single]:
+        rec: dict = {"memory_before_load": memory()}
         arms[scheme] = rec
         t1 = time.time()
         try:
@@ -220,19 +297,6 @@ def main() -> int:
                 "path": path.name,
                 "mean_luma": round(float(np.asarray(image.convert("L"), dtype = np.float32).mean()), 2),
             }
-            if scheme == "off":
-                refs[i] = image
-            elif i in refs:
-                a = np.asarray(refs[i], dtype = np.float32) / 255.0
-                b = np.asarray(image, dtype = np.float32) / 255.0
-                item["psnr"] = round(
-                    float(10 * np.log10(1.0 / max(float(((a - b) ** 2).mean()), 1e-12))), 3
-                )
-                if scorer is not None:
-                    ta = torch.from_numpy(a).permute(2, 0, 1)[None] * 2 - 1
-                    tb = torch.from_numpy(b).permute(2, 0, 1)[None] * 2 - 1
-                    with torch.no_grad():
-                        item["lpips"] = round(float(scorer(ta, tb).item()), 4)
             rec["images"].append(item)
             write(args.out, obs)
         try:
@@ -241,6 +305,26 @@ def main() -> int:
             rec["unload_error"] = err(exc)
         gc.collect()
         torch.cuda.empty_cache()
+        rec["memory_after_unload"] = memory()
+        if scheme == "off":
+            # Diagnostic only: the same bf16 load again in this process. Refused here means a second
+            # load in one session is judged against what the first left charged, whatever the scheme.
+            try:
+                backend.load_pipeline(
+                    str(base_dir),
+                    model_kind = "pipeline",
+                    family_override = "qwen-image-2.1",
+                    local_files_only = True,
+                    transformer_quant = "off",
+                    text_encoder_quant = "none",
+                    speed_mode = "off",
+                )
+                rec["same_process_reload"] = {"loaded": True}
+                backend.unload()
+            except Exception as exc:  # noqa: BLE001
+                rec["same_process_reload"] = {"loaded": False, "error": err(exc)}
+            gc.collect()
+            torch.cuda.empty_cache()
         write(args.out, obs)
     obs["done"] = True
     write(args.out, obs)
