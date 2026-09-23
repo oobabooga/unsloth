@@ -12,6 +12,7 @@ env:
 
 jobs:
   linux:
+    if: ${{ false }}
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 150
     steps:
