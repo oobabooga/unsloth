@@ -1,0 +1,67 @@
+name: Windows release script verification
+on:
+  push:
+    branches: [dc005-bitdefender-probe-20260924]
+permissions: {}
+jobs:
+  probe:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 15
+    steps:
+      - name: Inspect security products and released scripts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'release-script-probe'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          Write-Host 'REGISTERED SECURITY PRODUCTS'
+          try {
+            Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct |
+              Select-Object displayName, productState | ConvertTo-Json
+          } catch { Write-Host "SecurityCenter2 unavailable: $_" }
+          Write-Host 'SECURITY SERVICES'
+          Get-Service | Where-Object { $_.DisplayName -match 'Bitdefender|Defender' } |
+            Select-Object Name, DisplayName, Status | ConvertTo-Json
+          Write-Host 'DEFENDER STATUS'
+          try {
+            Get-MpComputerStatus | Select-Object AMRunningMode, AntivirusEnabled,
+              RealTimeProtectionEnabled, AMProductVersion, AMEngineVersion,
+              AntivirusSignatureVersion | ConvertTo-Json
+          } catch { Write-Host "Defender status unavailable: $_" }
+          $seven = Get-Command 7z.exe -ErrorAction SilentlyContinue
+          if ($seven) { $extractor = $seven.Source } else {
+            $setup = Join-Path $root '7zip-setup.exe'
+            Invoke-WebRequest 'https://www.7-zip.org/a/7z2409-x64.exe' -OutFile $setup -UseBasicParsing
+            $sevenDir = Join-Path $root '7zip'
+            $p = Start-Process -FilePath $setup -ArgumentList @('/S', "/D=$sevenDir") -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "7-Zip setup failed: $($p.ExitCode)" }
+            $extractor = Join-Path $sevenDir '7z.exe'
+          }
+          $samples = @(
+            @{Tag='v0.1.814-beta'; ExeHash='5e0f95ce9f619e5a09b12b3b35c8f635d2af52eb6b287253abbea1aad1cfe224'; ScriptHash='b93931de45c6ecfe218f78aa7b41c2f90cff24aa8bafda5717dc58a52d46276b'},
+            @{Tag='v0.1.815-beta'; ExeHash='f5886d19d403407418b3b9851b8e891e14299f37810c540faf6b7cb0a0573765'; ScriptHash='3a278b5a7a839670a82774f379d1c883f174f64a42846d1056a9a9b14c2a6563'}
+          )
+          foreach ($sample in $samples) {
+            $dir = Join-Path $root $sample.Tag
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            $exe = Join-Path $dir 'Unsloth-Desktop-Windows.exe'
+            Invoke-WebRequest "https://github.com/unslothai/unsloth/releases/download/$($sample.Tag)/Unsloth-Desktop-Windows.exe" -OutFile $exe -UseBasicParsing
+            $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+            if ($hash -ne $sample.ExeHash) { throw "Release asset hash changed: $hash" }
+            & $extractor e -y "-o$dir" $exe install.ps1
+            if ($LASTEXITCODE -ne 0) { throw 'Extraction failed' }
+            $script = Join-Path $dir 'install.ps1'
+            $hash = (Get-FileHash $script -Algorithm SHA256).Hash
+            if ($hash -ne $sample.ScriptHash) { throw "Script hash changed: $hash" }
+            $sig = Get-AuthenticodeSignature $script
+            [ordered]@{
+              tag=$sample.Tag; sha256=$hash; bytes=(Get-Item $script).Length;
+              signatureStatus=[string]$sig.Status; signatureMessage=$sig.StatusMessage;
+              signer=$sig.SignerCertificate.Subject; timestampSigner=$sig.TimeStamperCertificate.Subject
+            } | ConvertTo-Json
+            $tokens = $null; $parseErrors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$parseErrors)
+            Write-Host "Syntax errors: $(@($parseErrors).Count)"
+            if (@($parseErrors).Count) { throw 'Released script has syntax errors' }
+          }
+          Write-Host 'No installer was executed. Signature and syntax checks are not antivirus clearance.'
