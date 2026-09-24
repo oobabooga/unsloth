@@ -1,0 +1,31 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 110
+    steps:
+      - name: Host
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version | Format-List
+          Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, AntivirusSignatureVersion | Format-List
+          exit 0
+      - name: Scan and minimize
+        shell: powershell
+        env:
+          MODE: probe+min
+          BUDGET_SECONDS: "4800"
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "dc005src"
+          git clone --depth 1 --branch amd-devlab-ci https://github.com/oobabooga/unsloth.git $src
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $src log -1 --format=%H
+          python -u (Join-Path $src "probe.py")
+          exit $LASTEXITCODE
