@@ -1,0 +1,89 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci-dc005]
+
+permissions: {}
+
+jobs:
+  scan:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - name: Collect shipped install.ps1 samples
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $W = Join-Path $env:RUNNER_TEMP 'dc005'
+          $S = Join-Path $W 'samples'
+          New-Item -ItemType Directory -Force $S | Out-Null
+          try { Add-MpPreference -ExclusionPath $W, 'C:\EEK' } catch { "Add-MpPreference: $_" }
+          try { Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, AntivirusSignatureVersion | Format-List } catch { "Get-MpComputerStatus: $_" }
+
+          $rel = Invoke-RestMethod https://api.github.com/repos/ip7z/7zip/releases/latest
+          $msi = $rel.assets | Where-Object { $_.name -match '-x64\.msi$' } | Select-Object -First 1
+          Invoke-WebRequest $msi.browser_download_url -OutFile "$W\7z.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList '/i', "`"$W\7z.msi`"", '/qn' -Wait
+          $7z = 'C:\Program Files\7-Zip\7z.exe'
+
+          $marker = [Text.Encoding]::ASCII.GetBytes('# SIG # Begin signature block')
+          $latin = [Text.Encoding]::GetEncoding(28591)
+          $tags = 'v0.1.807-beta','v0.1.808-beta','v0.1.810-beta','v0.1.811-beta','v0.1.812-beta','v0.1.813-beta','v0.1.814-beta','v0.1.815-beta'
+          foreach ($t in $tags) {
+            $exe = "$W\$t.exe"
+            Invoke-WebRequest "https://github.com/unslothai/unsloth/releases/download/$t/Unsloth-Desktop-Windows.exe" -OutFile $exe -UseBasicParsing
+            $x = "$W\x-$t"
+            & $7z x -y "-o$x" $exe | Out-Null
+            $ps = Get-ChildItem $x -Recurse -Filter install.ps1 | Select-Object -First 1
+            if (-not $ps) { "$t : no install.ps1 in bundle"; continue }
+            Copy-Item $ps.FullName "$S\shipped-$t.ps1"
+            $bytes = [IO.File]::ReadAllBytes($ps.FullName)
+            $i = $latin.GetString($bytes).IndexOf('# SIG # Begin signature block')
+            if ($i -ge 0) {
+              $cut = New-Object byte[] $i
+              [Array]::Copy($bytes, $cut, $i)
+              [IO.File]::WriteAllBytes("$S\shipped-nosig-$t.ps1", $cut)
+            }
+            Invoke-WebRequest "https://raw.githubusercontent.com/unslothai/unsloth/$t/install.ps1" -OutFile "$S\repo-$t.ps1" -UseBasicParsing
+            $sig = Get-AuthenticodeSignature "$S\shipped-$t.ps1"
+            "{0}  shipped={1} bytes sha256={2} sigblock_at={3} authenticode={4}" -f $t, $bytes.Length, (Get-FileHash "$S\shipped-$t.ps1").Hash, $i, $sig.Status
+            "{0}  repo sha256={1} nosig sha256={2}" -f $t, (Get-FileHash "$S\repo-$t.ps1").Hash, $(if ($i -ge 0) { (Get-FileHash "$S\shipped-nosig-$t.ps1").Hash } else { '-' })
+          }
+
+          $C = Join-Path $W 'control'
+          New-Item -ItemType Directory -Force $C | Out-Null
+          $e = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS' + '-TEST-FILE!$H+H*'
+          [IO.File]::WriteAllText("$C\eicar.com", $e)
+          Get-ChildItem $S, $C | Select-Object Name, Length | Format-Table -AutoSize | Out-String -Width 200
+
+      - name: Scan with Emsisoft (Bitdefender engine)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $W = Join-Path $env:RUNNER_TEMP 'dc005'
+          Invoke-WebRequest https://dl.emsisoft.com/EmsisoftEmergencyKit.exe -OutFile "$W\eek.exe" -UseBasicParsing
+          Start-Process "$W\eek.exe" -ArgumentList '/s' -Wait
+          $a2 = 'C:\EEK\bin64\a2cmd.exe'
+          if (-not (Test-Path $a2)) { Get-ChildItem C:\EEK -Recurse -Depth 2 | Select-Object -First 50 FullName; exit 1 }
+          & $a2 /h
+          "=== update"
+          & $a2 /update
+          "=== scan"
+          & $a2 "/f=$W\samples,$W\control" /a /pup "/l=$W\a2.log"
+          "a2cmd exit $LASTEXITCODE"
+          Get-Content "$W\a2.log" -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Scan with Defender (reference)
+        shell: powershell
+        run: |
+          $W = Join-Path $env:RUNNER_TEMP 'dc005'
+          $mp = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+          & $mp -Scan -ScanType 3 -File "$W\samples" -DisableRemediation
+          "MpCmdRun exit $LASTEXITCODE"
+          exit 0
