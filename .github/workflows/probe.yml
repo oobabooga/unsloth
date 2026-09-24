@@ -1,0 +1,22 @@
+name: AMD DevLab parity Vulkan extension probe
+
+on:
+  push:
+    branches: [amd-devlab-parity-vk]
+
+permissions: {}
+
+jobs:
+  vk:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 20
+    steps:
+      - name: vulkaninfo without root
+        run: |
+          set +e
+          cd "$RUNNER_TEMP"
+          apt-get download vulkan-tools 2>&1 | tail -1
+          dpkg -x vulkan-tools_*.deb vt
+          VI=vt/usr/bin/vulkaninfo
+          $VI --summary 2>&1 | grep -E "deviceName|driverName|driverInfo|apiVersion" | sort -u
+          $VI 2>/dev/null | grep -iE "VK_EXT_shader_float8|VK_EXT_shader_ocp_microscaling|shaderFloat4|shaderFloat8|VK_NV_cooperative_matrix2|decode_vector|VK_KHR_cooperative_matrix|VK_KHR_shader_bfloat16" | sort | uniq -c
