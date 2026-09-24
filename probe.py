@@ -154,8 +154,41 @@ def minimize(a2, name, data):
     (WORK / "minimal.ps1").write_bytes(final)
 
 
+CONTROLS = {
+    "w11d-2026.06.10.zip": "https://codeload.github.com/Raphire/Win11Debloat/zip/refs/tags/2026.06.10",
+    "w11d-2026.06.11.zip": "https://codeload.github.com/Raphire/Win11Debloat/zip/refs/tags/2026.06.11",
+    "w11d-2026.06.14.zip": "https://codeload.github.com/Raphire/Win11Debloat/zip/refs/tags/2026.06.14",
+    "MediaCreationTool.bat": "https://raw.githubusercontent.com/AveYo/MediaCreationTool.bat/2f1f304652175d1d8c9a3a2f8eff6bb0ff881b13/MediaCreationTool.bat",
+}
+
+
+def controls(a2):
+    """Public scripts Bitdefender users reported as Heur.BZC false positives: does this scanner see that family?"""
+    import zipfile, io
+    files = {}
+    for name, url in CONTROLS.items():
+        data = urllib.request.urlopen(url).read()
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for info in z.infolist():
+                    if info.filename.lower().endswith((".ps1", ".bat", ".cmd", ".psm1")):
+                        flat = name[:-4] + "__" + info.filename.split("/", 1)[1].replace("/", "__")
+                        files[flat] = z.read(info)
+        else:
+            files[name] = data
+    res = scan(a2, files, "controls", verbose=True)
+    log("\n=== CONTROL RESULTS ===")
+    for name in sorted(res):
+        if res[name] or "Get-RegFileOperations" in name or name.endswith(".bat"):
+            log(f"{name:70s} {res[name] or 'clean'}")
+    log(f"controls scanned: {len(files)}, detected: {sum(1 for v in res.values() if v)}")
+
+
 def main():
     a2 = setup_eek()
+    for f in a2.parent.glob("Signatures/BD/update.txt"):
+        log("BD update.txt:", f.read_text(errors="replace"))
+    controls(a2)
     files, res = probe(a2)
     if MODE != "probe+min":
         return
