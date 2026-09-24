@@ -53,6 +53,20 @@ jobs:
             "{0}  repo sha256={1} nosig sha256={2}" -f $t, (Get-FileHash "$S\repo-$t.ps1").Hash, $(if ($i -ge 0) { (Get-FileHash "$S\shipped-nosig-$t.ps1").Hash } else { '-' })
           }
 
+          $R = Join-Path $W 'repo'
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git $R
+          $shas = @(git -C $R log --format=%h v0.1.807-beta..origin/HEAD -- install.ps1)
+          [array]::Reverse($shas)
+          $n = 0
+          foreach ($c in $shas) {
+            $n++
+            $out = "$S\c{0:D3}-{1}.ps1" -f $n, $c
+            $blob = git -C $R rev-parse "${c}:install.ps1"
+            cmd /c "git -C `"$R`" cat-file blob $blob > `"$out`""
+          }
+          "commit samples: $n"
+          git -C $R log --format='%h %ad %s' --date=short v0.1.807-beta..origin/HEAD -- install.ps1
+
           $C = Join-Path $W 'control'
           New-Item -ItemType Directory -Force $C | Out-Null
           $e = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS' + '-TEST-FILE!$H+H*'
