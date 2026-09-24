@@ -66,9 +66,16 @@ jobs:
         working-directory: src/studio/src-tauri
         run: cargo test --bin unsloth-studio 'install::' -- --nocapture
 
-      - name: Build the release app
+      - name: Build the release app, with a DevTools port on the main window (both sides)
         working-directory: src/studio/src-tauri
-        run: cargo build --release
+        shell: pwsh
+        run: |
+          $conf = Get-Content -Raw tauri.conf.json | ConvertFrom-Json
+          $win = $conf.app.windows[0]
+          $win | Add-Member -NotePropertyName additionalBrowserArgs -NotePropertyValue '--remote-debugging-port=9222 --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection'
+          $env:TAURI_CONFIG = @{ app = @{ windows = @($win) } } | ConvertTo-Json -Depth 10 -Compress
+          $env:TAURI_CONFIG
+          cargo build --release
 
       - name: Quarantine the bundled install.ps1, as the security product did
         shell: pwsh
@@ -86,7 +93,6 @@ jobs:
           python -m pip install -q websocket-client
           $out = "$env:RUNNER_TEMP/ab-${{ matrix.side }}"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'
           $exe = (Resolve-Path 'src/studio/src-tauri/target/release/unsloth-studio.exe').Path
           $app = Start-Process $exe -PassThru
           python ci/drive.py $out
