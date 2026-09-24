@@ -61,25 +61,41 @@ jobs:
 
       - name: Scan with Emsisoft (Bitdefender engine)
         shell: powershell
+        timeout-minutes: 40
         run: |
           $ErrorActionPreference = 'Continue'
           $ProgressPreference = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $W = Join-Path $env:RUNNER_TEMP 'dc005'
+          $nul = "$W\empty.txt"; Set-Content $nul '' -NoNewline
+          function Run($exe, [string[]]$argv, $sec, $tag) {
+            $o = "$W\$tag.out"; $e = "$W\$tag.err"
+            "=== $tag : $exe $($argv -join ' ')"
+            $p = Start-Process $exe -ArgumentList $argv -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e -RedirectStandardInput $nul
+            if (-not $p.WaitForExit($sec * 1000)) { "TIMEOUT after $sec s"; try { $p.Kill() } catch {} ; Get-Process | Where-Object { $_.Path -like 'C:\EEK\*' } | Stop-Process -Force -ErrorAction SilentlyContinue }
+            else { "exit $($p.ExitCode)" }
+            Get-Content $o -ErrorAction SilentlyContinue
+            Get-Content $e -ErrorAction SilentlyContinue
+          }
+          $t0 = Get-Date
           Invoke-WebRequest https://dl.emsisoft.com/EmsisoftEmergencyKit.exe -OutFile "$W\eek.exe" -UseBasicParsing
-          Start-Process "$W\eek.exe" -ArgumentList '/s' -Wait
+          "download took $([int]((Get-Date) - $t0).TotalSeconds)s, $((Get-Item "$W\eek.exe").Length) bytes"
+          Run "$W\eek.exe" @('/s') 300 'extract'
+          Get-ChildItem C:\EEK -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -HideTableHeaders | Out-String
+          Get-ChildItem C:\EEK\bin64 -Filter *.exe -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -HideTableHeaders | Out-String
           $a2 = 'C:\EEK\bin64\a2cmd.exe'
-          if (-not (Test-Path $a2)) { Get-ChildItem C:\EEK -Recurse -Depth 2 | Select-Object -First 50 FullName; exit 1 }
-          & $a2 /h
-          "=== update"
-          & $a2 /update
-          "=== scan"
-          & $a2 "/f=$W\samples,$W\control" /a /pup "/l=$W\a2.log"
-          "a2cmd exit $LASTEXITCODE"
+          if (-not (Test-Path $a2)) { 'no a2cmd'; exit 1 }
+          Run $a2 @('/h') 60 'help'
+          Run $a2 @('/update') 600 'update'
+          Run $a2 @("/f=$W\control") 300 'control'
+          Run $a2 @("/f=$W\samples", '/a', '/pup', "/l=$W\a2.log") 900 'samples'
+          '=== a2.log'
           Get-Content "$W\a2.log" -ErrorAction SilentlyContinue
           exit 0
 
       - name: Scan with Defender (reference)
+        if: always()
+        timeout-minutes: 10
         shell: powershell
         run: |
           $W = Join-Path $env:RUNNER_TEMP 'dc005'
