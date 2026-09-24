@@ -1,0 +1,51 @@
+name: AMD DevLab cudnn.benchmark probe
+on:
+  push:
+    branches: [amd-cudnn-benchmark-probe]
+permissions: {}
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 110
+    steps:
+      - name: Probe
+        env:
+          SRC_URL: https://raw.githubusercontent.com/oobabooga/unsloth/amd-cudnn-benchmark-probe
+        run: |
+          set -x
+          WORK_ROOT="$RUNNER_TEMP/w"; export WORK_ROOT
+          mkdir -p "$WORK_ROOT"/tmp "$WORK_ROOT"/hf; export TMPDIR="$WORK_ROOT/tmp" HF_HOME="$WORK_ROOT/hf"
+          cat /opt/rocm/.info/version || true
+          python3 -m venv "$WORK_ROOT/venv"; . "$WORK_ROOT/venv/bin/activate"
+          AMD=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
+          pip install -q "$AMD/torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl" \
+                         "$AMD/triton-3.6.0%2Brocm7.2.1.gitba5c1517-cp312-cp312-linux_x86_64.whl"
+          pip install -q 'numpy<3' pillow diffusers
+          cd "$WORK_ROOT"; curl -fsSLO "$SRC_URL/probe.py"; curl -fsSLO "$SRC_URL/run_arms.py"
+          python -c "import diffusers, torch; print(diffusers.__version__, torch.__version__, torch.version.hip)"
+          python run_arms.py
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 110
+    steps:
+      - name: Probe
+        shell: powershell
+        env:
+          SRC_URL: https://raw.githubusercontent.com/oobabooga/unsloth/amd-cudnn-benchmark-probe
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:WORK_ROOT = Join-Path $env:RUNNER_TEMP "w"
+          New-Item -ItemType Directory -Force -Path $env:WORK_ROOT, "$env:WORK_ROOT\hf", "$env:WORK_ROOT\tmp" | Out-Null
+          $env:HF_HOME = "$env:WORK_ROOT\hf"; $env:TMP = "$env:WORK_ROOT\tmp"; $env:TEMP = $env:TMP
+          python -m venv "$env:WORK_ROOT\venv"
+          $py = "$env:WORK_ROOT\venv\Scripts\python.exe"
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch<2.12"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -m pip install -q "numpy<3" pillow diffusers
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Set-Location $env:WORK_ROOT
+          Invoke-WebRequest "$env:SRC_URL/probe.py" -OutFile probe.py
+          Invoke-WebRequest "$env:SRC_URL/run_arms.py" -OutFile run_arms.py
+          & $py -c "import diffusers, torch; print(diffusers.__version__, torch.__version__, torch.version.hip, torch.cuda.is_available())"
+          & $py run_arms.py
+          exit $LASTEXITCODE
