@@ -34,6 +34,7 @@ def setup_eek():
     dest = WORK / "EEK"
     code, out = run([str(exe), "-s2", f"-d{dest}"], timeout=900)
     log(out[-2000:])
+    kill_gui()
     hits = list(dest.rglob("a2cmd.exe")) + list(Path("C:/EEK").rglob("a2cmd.exe"))
     hits = [h for h in hits if "bin64" in str(h).lower()] or hits
     if not hits:
@@ -50,6 +51,17 @@ def setup_eek():
     return a2
 
 
+def kill_gui():
+    # The SFX launches the GUI scanner after extracting, and a2cmd refuses to run beside it.
+    for _ in range(30):
+        time.sleep(2)
+        subprocess.run(["taskkill", "/f", "/im", "a2emergencykit.exe"], capture_output=True)
+        q = subprocess.run(["tasklist", "/fi", "imagename eq a2emergencykit.exe"], capture_output=True, text=True)
+        if "a2emergencykit" not in q.stdout.lower():
+            return
+    log("GUI scanner still running")
+
+
 def scan(a2, files, label, verbose=False):
     """files: dict name -> bytes. Returns {name: detection or None}."""
     d = WORK / "scan" / label
@@ -60,6 +72,9 @@ def scan(a2, files, label, verbose=False):
         (d / name).write_bytes(data)
     logf = WORK / "scan" / f"{label}.log"
     code, out = run([str(a2), f"/f={d}", "/pup", f"/l={logf}"], timeout=2400)
+    if code not in (0, 1) or "can't be used" in out:
+        log(out[-3000:])
+        raise SystemExit(f"scan {label} failed with exit {code}")
     text = out
     if logf.exists():
         raw = logf.read_bytes()
@@ -84,6 +99,10 @@ def scan(a2, files, label, verbose=False):
 
 def probe(a2):
     files = {p.name: p.read_bytes() for p in sorted(SAMPLES.glob("*.ps1"))}
+    # Positive control for the result parser: the EICAR test string, assembled at runtime.
+    files["zz-eicar-control.com"] = (
+        "X5O!P%@AP[4\\PZX54(P^)7CC)7}$" + "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+    ).encode()
     res = scan(a2, files, "probe", verbose=True)
     log("\n=== PROBE RESULTS ===")
     for name in sorted(res):
@@ -141,7 +160,9 @@ def main():
     if MODE != "probe+min":
         return
     order = ["rel-815-nosig.ps1", "rel-815.ps1"] + sorted(res)
-    target = next((n for n in order if res.get(n) and not res[n].startswith("VANISHED")), None)
+    if not res.get("zz-eicar-control.com"):
+        raise SystemExit("EICAR control was not detected; the parser or scanner is broken")
+    target = next((n for n in order if n.endswith(".ps1") and res.get(n) and not res[n].startswith("VANISHED")), None)
     if target is None:
         log("nothing detected; skipping minimization")
         return
