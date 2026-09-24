@@ -1,0 +1,70 @@
+name: Windows installer scanner probe
+on:
+  push:
+    branches: [dc005-av-investigation-20260924]
+permissions: {}
+jobs:
+  scan:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 20
+    steps:
+      - name: Prepare scanner and public release samples
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'installer-scanner-probe'
+          New-Item -ItemType Directory -Force "$root\samples", "$root\control" | Out-Null
+          try { Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object displayName, productState | ConvertTo-Json } catch { Write-Host $_ }
+          $seven = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $seven)) {
+            Invoke-WebRequest 'https://www.7-zip.org/a/7z2409-x64.exe' -OutFile "$root\7zip.exe" -UseBasicParsing
+            $p = Start-Process "$root\7zip.exe" -ArgumentList '/S', "/D=$root\7zip" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw '7-Zip installation failed' }
+            $seven = "$root\7zip\7z.exe"
+          }
+          Invoke-WebRequest 'https://dl.emsisoft.com/EmsisoftEmergencyKit.exe' -OutFile "$root\eek.exe" -UseBasicParsing
+          & $seven x -y "-o$root\eek" "$root\eek.exe" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Scanner extraction failed' }
+          foreach ($version in @('811', '814', '815')) {
+            $tag = "v0.1.$version-beta"
+            Invoke-WebRequest "https://github.com/unslothai/unsloth/releases/download/$tag/Unsloth-Desktop-Windows.exe" -OutFile "$root\$tag.exe" -UseBasicParsing
+            & $seven e -y "-o$root\$tag" "$root\$tag.exe" install.ps1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Release extraction failed' }
+            $file = "$root\$tag\install.ps1"
+            Copy-Item $file "$root\samples\$tag-signed.ps1"
+            $sig = Get-AuthenticodeSignature $file
+            Write-Host "$tag signature=$($sig.Status) signer=$($sig.SignerCertificate.Subject) hash=$((Get-FileHash $file).Hash)"
+            Invoke-WebRequest "https://raw.githubusercontent.com/unslothai/unsloth/$tag/install.ps1" -OutFile "$root\samples\$tag-source.ps1" -UseBasicParsing
+          }
+          Invoke-WebRequest 'https://raw.githubusercontent.com/unslothai/unsloth/0d4c1c635f6d4d231b61de0acf5a27ea7bc6a3d9/install.ps1' -OutFile "$root\samples\pr11193-source.ps1" -UseBasicParsing
+          Get-ChildItem "$root\samples" | Get-FileHash | Format-Table -AutoSize
+          Get-Item "$root\eek\bin64\a2cmd.exe" | Select-Object -ExpandProperty VersionInfo | Format-List FileVersion, ProductVersion
+      - name: Update scanner and scan samples without remediation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'installer-scanner-probe'
+          $scanner = "$root\eek\bin64\a2cmd.exe"
+          function Run-Scanner([string[]]$ScannerArgs, [string]$Label, [int]$Timeout) {
+            $p = Start-Process $scanner -ArgumentList $ScannerArgs -WorkingDirectory "$root\eek\bin64" -PassThru -RedirectStandardOutput "$root\$Label.out" -RedirectStandardError "$root\$Label.err"
+            if (-not $p.WaitForExit($Timeout * 1000)) {
+              Stop-Process -Id $p.Id -Force
+              Get-Content "$root\$Label.out", "$root\$Label.err" -ErrorAction SilentlyContinue
+              throw "$Label timed out"
+            }
+            $p.Refresh()
+            Get-Content "$root\$Label.out", "$root\$Label.err" -ErrorAction SilentlyContinue
+            Write-Host "$Label exit=$($p.ExitCode)"
+          }
+          Run-Scanner @('/h') 'help' 30
+          Run-Scanner @('/update') 'update' 240
+          Run-Scanner @("/f=$root\samples", '/a', "/l=$root\samples.log") 'samples' 180
+          Get-Content "$root\samples.log" -ErrorAction SilentlyContinue
+          $control = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS' + '-TEST-FILE!$H+H*'
+          try { [IO.File]::WriteAllText("$root\control\eicar.com", $control, [Text.Encoding]::ASCII) } catch { Write-Host "Control creation blocked: $_" }
+          if (Test-Path "$root\control\eicar.com") {
+            Run-Scanner @("/f=$root\control", "/l=$root\control.log") 'control' 120
+            Get-Content "$root\control.log" -ErrorAction SilentlyContinue
+          } else { Write-Host 'Control unavailable, possibly removed by resident protection' }
+          exit 0
