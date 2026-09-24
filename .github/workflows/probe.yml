@@ -103,7 +103,13 @@ jobs:
           $a2 = 'C:\EEK\bin64\a2cmd.exe'
           if (-not (Test-Path $a2)) { 'no a2cmd'; exit 1 }
           Run $a2 @('/h') 60 'help'
-          Run $a2 @('/update') 600 'update'
+          Run $a2 @('/update') 600 'update' | Where-Object { $_ -notmatch '^Downloading |KB downloaded' }
+          Run $a2 @('/update') 600 'update2' | Where-Object { $_ -notmatch '^Downloading |KB downloaded' }
+          Run $a2 @('/update') 600 'update3' | Where-Object { $_ -notmatch '^Downloading |KB downloaded' }
+          $sd = Get-ChildItem C:\EEK\bin32\Signatures -Recurse -File -ErrorAction SilentlyContinue
+          "signature files: $($sd.Count), newest: $(($sd | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime), oldest: $(($sd | Sort-Object LastWriteTime | Select-Object -First 1).LastWriteTime)"
+          $sd | Sort-Object LastWriteTime | Select-Object -First 8 Name, Length, LastWriteTime | Format-Table -AutoSize | Out-String
+          Get-ChildItem C:\EEK\bin32\Signatures -File | Select-Object Name, LastWriteTime | Format-Table -AutoSize | Out-String
           Run $a2 @("/f=$W\control") 300 'control'
           Run $a2 @("/f=$W\samples", '/a', '/pup', "/l=$W\a2.log") 900 'samples'
           '=== a2.log'
