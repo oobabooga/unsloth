@@ -543,6 +543,10 @@ jobs:
           # wants a different one fails the step loudly instead of swapping torch under us.
           "$RUNNER_TEMP/smoke/bin/python" -m pip freeze | grep -E '^(torch|triton)==' \
             > "$RUNNER_TEMP/smoke-constraints.txt"
+          # mamba-ssm allows apache-tvm-ffi<=0.1.12 beside tilelang 0.1.8, and that pair fails
+          # at `import mamba_ssm` (tvm_ffi's registry setattr on __dict__). 0.1.11 imports and
+          # runs mamba's forward and backward.
+          echo 'apache-tvm-ffi==0.1.11' >> "$RUNNER_TEMP/smoke-constraints.txt"
           cat "$RUNNER_TEMP/smoke-constraints.txt"
           "$RUNNER_TEMP/smoke/bin/python" - "src/dist/${WHEEL_NAME}" "$RUNNER_TEMP/smoke-constraints.txt" <<'PY'
           import email.parser, pathlib, re, subprocess, sys, zipfile
