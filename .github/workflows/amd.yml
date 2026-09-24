@@ -6,7 +6,7 @@ permissions: {}
 jobs:
   linux:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 110
+    timeout-minutes: 150
     steps:
       - name: Probe
         env:
@@ -26,7 +26,7 @@ jobs:
           python run_arms.py
   windows:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 110
+    timeout-minutes: 150
     steps:
       - name: Probe
         shell: powershell
