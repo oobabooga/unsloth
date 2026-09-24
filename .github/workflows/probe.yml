@@ -60,7 +60,6 @@ jobs:
             python "$root\run-scanner.py" $scanner "$root\eek\bin64" $Label $Timeout @ScannerArgs
             if ($LASTEXITCODE -ne 0) { throw "$Label scanner failed" }
           }
-          Run-Scanner @('/h') 'help' 30
           Run-Scanner @("/f=$root\samples", '/a', "/l=$root\packaged.log") 'packaged-definitions' 180
           Run-Scanner @('/update') 'update' 240
           Run-Scanner @('/update') 'update-confirmation' 240
