@@ -1,4 +1,4 @@
-name: AMD DevLab parity ROCm Linux
+name: AMD DevLab parity ROCm Linux 2
 
 # A/B of the unslothai/llama.cpp ROCm prebuilt recipe on gfx1151, all else identical:
 #   A  = ROCm 10.1.0a20260822 (frozen index, what ships today), fork cmake flags
@@ -11,7 +11,7 @@ name: AMD DevLab parity ROCm Linux
 
 on:
   push:
-    branches: [amd-devlab-parity-rocm-linux]
+    branches: [amd-devlab-parity-rocm-linux2]
 
 permissions: {}
 
@@ -54,10 +54,9 @@ jobs:
           get() { mkdir -p "$W/rocm-$1"; curl -fsSL --retry 3 "$2" | tar -xzf - -C "$W/rocm-$1" --strip-components=1; echo "$1 done"; }
           get 0822 https://rocm.nightlies.amd.com/tarball-multi-arch/therock-dist-linux-gfx1151-10.1.0a20260822.tar.gz &
           get 0924 https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.2.0a20260924.tar.gz &
-          get stable https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.0.0.tar.gz &
           wait
           ls -la models
-          for t in 0822 0924 stable; do ls "$W/rocm-$t" | head; ls "$W/rocm-$t/lib" | grep -E 'tensilelite|hipblaslt|origami' || true; done
+          for t in 0822 0924; do ls "$W/rocm-$t" | head; ls "$W/rocm-$t/lib" | grep -E 'tensilelite|hipblaslt|origami' || true; done
           df -h "$W"
 
       - name: Build four arms
@@ -66,7 +65,7 @@ jobs:
           BASEPATH="$PATH"
           build() {
             local name=$1 R=$2 mode=$3 flags
-            if [ "$mode" = fork ]; then flags="-DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Linux"; else flags="-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"; fi
+            case $mode in fork) flags="-DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Linux";; fixed) flags="-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON";; minimal) flags="";; esac
             (
               export ROCM_PATH=$R HIP_PATH=$R HIP_PLATFORM=amd HIP_CLANG_PATH=$R/llvm/bin HIP_INCLUDE_PATH=$R/include HIP_LIB_PATH=$R/lib HIP_DEVICE_LIB_PATH=$R/lib/llvm/amdgcn/bitcode
               export PATH=$R/bin:$R/llvm/bin:$BASEPATH LD_LIBRARY_PATH=$R/lib:$R/lib64:$R/llvm/lib LIBRARY_PATH=$R/lib:$R/lib64 CPATH=$R/include PKG_CONFIG_PATH=$R/lib/pkgconfig
@@ -87,13 +86,19 @@ jobs:
           build A "$W/rocm-0822" fork
           build B "$W/rocm-0924" fork
           build C "$W/rocm-0924" fixed
-          build D "$W/rocm-stable" fork
+          build E "$W/rocm-0924" minimal
 
-      - name: Packaging test (current copy list, ROCm tree hidden)
+      - name: Probe Vulkan and Docker
         if: always()
         run: |
-          set -uo pipefail
-          M8=$W/models/q8b.gguf
+          set +e
+          which vulkaninfo && vulkaninfo 2>/dev/null | grep -iE "deviceName|driverInfo|shader_float8|ocp_microscaling|cooperative_matrix|decode_vector" | sort | uniq -c
+          docker info 2>&1 | grep -E "Server Version|Runtimes" ; getent group render video
+
+      - name: Packaging test in a clean ubuntu:24.04 container
+        if: always()
+        run: |
+          set +e
           pack() {
             local name=$1 R=$2 D=$W/bundle-$1
             rm -rf "$D"; cp -a "$W/build-$name/bin" "$D"
@@ -108,52 +113,51 @@ jobs:
                      lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so; do
               cp "$R/$p"* "$D/" 2>/dev/null || echo "  $name: $(basename $p)* not found"
             done
-            cp "$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')" "$D/" 2>/dev/null || true
-            ( cd "$D"; for f in *.so* llama-*; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done )
+            cp "$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')" "$D/" 2>/dev/null
+            ( cd "$D"; for f in *.so* llama-*; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null; done )
           }
-          runit() {
-            local name=$1 label=$2 D=$W/bundle-$1
-            echo "=== $name $label: ldd not found:"
-            env -u LD_LIBRARY_PATH ldd "$D/libggml-hip.so" | grep 'not found' || echo "  (none)"
-            env -u LD_LIBRARY_PATH "$D/llama-bench" -m "$M8" -ngl 99 -p 64 -n 16 -r 1 -o md > "$W/out/pack-$name-$label.txt" 2>&1
-            echo "  exit=$?"; tail -6 "$W/out/pack-$name-$label.txt"
+          RG=$(getent group render | cut -d: -f3); VG=$(getent group video | cut -d: -f3)
+          crun() {
+            local name=$1 label=$2
+            echo "=== bundle $name / $label"
+            docker run --rm --device /dev/kfd --device /dev/dri --group-add "$VG" --group-add "$RG" --security-opt seccomp=unconfined \
+              -v "$W/bundle-$name:/b:ro" -v "$W/models:/m:ro" ubuntu:24.04 bash -c '
+                ls /opt/rocm 2>/dev/null && echo "UNEXPECTED /opt/rocm in container"
+                for f in /b/libggml-hip.so /b/libhipblaslt.so.1; do [ -e $f ] && ldd $f | grep "not found" | sed "s|^|  $(basename $f): |"; done
+                /b/llama-bench -m /m/q8b.gguf -ngl 99 -p 64 -n 16 -r 1 -o md 2>&1 | grep -E "error|cannot open|ROCm|q8b|qwen3|pp64|tg16" | head -6
+                echo "  exit=${PIPESTATUS[0]}"'
           }
-          for arm in A:0822 B:0924; do
-            name=${arm%%:*}; R=$W/rocm-${arm#*:}
-            pack "$name" "$R"
-            mv "$R" "$R.hidden"
-            runit "$name" current-list
-            cp "$R.hidden/lib/libtensilelite-host.so"* "$W/bundle-$name/" 2>/dev/null && echo "  added tensilelite" || echo "  no tensilelite in toolchain"
-            runit "$name" plus-tensilelite
-            cp -L "$R.hidden/lib/llvm/lib/libomp.so" "$W/bundle-$name/" 2>/dev/null && echo "  added libomp.so" || echo "  no libomp.so"
-            runit "$name" plus-tensilelite-libomp
-            mv "$R.hidden" "$R"
-          done
+          docker pull -q ubuntu:24.04
+          pack A "$W/rocm-0822"; crun A current-list
+          pack B "$W/rocm-0924"; crun B current-list
+          cp "$W/rocm-0924/lib/libtensilelite-host.so"* "$W/bundle-B/"; crun B plus-tensilelite
+          cp -L "$W/rocm-0924/lib/llvm/lib/libomp.so" "$W/bundle-B/"; ( cd "$W/bundle-B"; for f in libtensilelite-host.so* libomp.so; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"; done ); crun B plus-tensilelite-libomp
+          pack C "$W/rocm-0924"; cp "$W/rocm-0924/lib/libtensilelite-host.so"* "$W/bundle-C/"; cp -L "$W/rocm-0924/lib/llvm/lib/libomp.so" "$W/bundle-C/"
+          ( cd "$W/bundle-C"; for f in libtensilelite-host.so* libomp.so; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"; done ); crun C dl-layout-plus-2-libs
+          exit 0
 
       - name: Benchmarks (interleaved, two rounds)
         if: always()
         run: |
-          set -uo pipefail
+          set +e
           M8=$W/models/q8b.gguf; M30=$W/models/q30b.gguf
-          rt() { case $1 in A) echo "$W/rocm-0822";; B|C) echo "$W/rocm-0924";; D) echo "$W/rocm-stable";; esac; }
+          rt() { case $1 in A) echo "$W/rocm-0822";; *) echo "$W/rocm-0924";; esac; }
           b() {
             local arm=$1 tag=$2; shift 2
             local R; R=$(rt "$arm")
             LD_LIBRARY_PATH=$R/lib:$R/lib64:$R/llvm/lib "$W/build-$arm/bin/llama-bench" "$@" -o jsonl >> "$W/out/bench-$arm-$tag.jsonl" 2>> "$W/out/bench-$arm-$tag.err" || echo "FAILED $arm $tag"
           }
           for round in 1 2; do
-            for arm in A B C D; do
+            for arm in B C E; do
               echo "round $round arm $arm $(date +%T)"
-              b $arm gpu-8b    -m "$M8"  -ngl 99 -fa 1 -p 512 -n 128 -r 3
-              b $arm gpu-30b   -m "$M30" -ngl 99 -fa 1 -p 512 -n 128 -r 3
-            done
-            for arm in B C; do
-              echo "round $round arm $arm cpu $(date +%T)"
-              b $arm ncmoe-30b -m "$M30" -ngl 99 -ncmoe 99 -fa 1 -p 512 -n 128 -r 2
-              b $arm cpu-8b    -m "$M8"  -dev none -p 512 -n 128 -r 2
+              b $arm ncmoe99-30b -m "$M30" -ngl 99 -ncmoe 99 -fa 1 -p 512 -n 128 -r 3
+              b $arm ncmoe24-30b -m "$M30" -ngl 99 -ncmoe 24 -fa 1 -p 512 -n 128 -r 3
+              b $arm cpu-8b      -m "$M8"  -dev none -p 512 -n 128 -r 2
+              b $arm gpu-8b      -m "$M8"  -ngl 99 -fa 1 -p 512 -n 128 -r 3
             done
           done
-          grep -h "load_backend\|CPU backend" "$W"/out/bench-C-cpu-8b.err | sort -u | head
+          grep -h "loaded CPU backend" "$W"/out/bench-*-cpu-8b.err | sort | uniq -c
+          grep -h "system_info\|CPU :" "$W"/out/bench-E-cpu-8b.err | sort -u | head -3
           python3 - "$W/out" <<'EOF'
           import json,sys,glob,os,statistics as st
           rows={}
@@ -164,9 +168,8 @@ jobs:
                   except: continue
                   k=(tag, 'pp' if d['n_prompt'] else 'tg', arm)
                   rows.setdefault(k,[]).append(d['avg_ts'])
-          print(f"{'test':12} {'kind':3} {'arm':3} {'mean t/s':>9} {'runs':>18}")
           for k in sorted(rows):
-              v=rows[k]; print(f"{k[0]:12} {k[1]:3} {k[2]:3} {st.mean(v):9.2f} {str([round(x,1) for x in v]):>18}")
+              v=rows[k]; print(f"{k[0]:12} {k[1]:3} {k[2]:3} {st.mean(v):9.2f} {[round(x,1) for x in v]}")
           EOF
 
       - name: Upload logs
