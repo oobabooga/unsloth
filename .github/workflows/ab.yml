@@ -1,0 +1,112 @@
+name: Desktop quarantined install.ps1 A/B
+
+on:
+  push:
+    branches: [dc005-quarantine-ab]
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: side ${{ matrix.side }}
+    runs-on: windows-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [A, B]
+    env:
+      BASE_SHA: df946e0864d2ccf05dfb00193fb79c80d7e48996
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: ci
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Source at main, plus the fix on side B
+        shell: pwsh
+        run: |
+          git init -q src
+          git -C src fetch -q --depth 1 https://github.com/unslothai/unsloth.git $env:BASE_SHA
+          git -C src checkout -q FETCH_HEAD
+          if ('${{ matrix.side }}' -eq 'B') { git -C src apply --verbose ../ci/fix.patch; if ($LASTEXITCODE) { exit 1 } }
+          git -C src log --oneline -1
+          git -C src diff --stat
+
+      - name: What PowerShell 5.1 prints for a -File that is gone (same flags as install.rs)
+        shell: pwsh
+        run: |
+          $missing = Join-Path $env:RUNNER_TEMP 'gone\install.ps1'
+          $psi = [Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+          foreach ($a in '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','RemoteSigned','-File',$missing,'--tauri') { $psi.ArgumentList.Add($a) }
+          $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+          $p = [Diagnostics.Process]::Start($psi); $out = $p.StandardOutput.ReadToEnd(); $err = $p.StandardError.ReadToEnd(); $p.WaitForExit()
+          "exit code: $($p.ExitCode)"
+          "--- stdout"; $out
+          "--- stderr"; $err
+
+      - name: Frontend build
+        working-directory: src/studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+
+      - name: install.rs unit tests
+        working-directory: src/studio/src-tauri
+        run: cargo test --bin unsloth-studio install:: -- --nocapture
+
+      - name: Build the release app
+        working-directory: src/studio/src-tauri
+        run: cargo build --release
+
+      - name: Quarantine the bundled install.ps1, as the security product did
+        shell: pwsh
+        run: |
+          $rel = 'src/studio/src-tauri/target/release'
+          Get-ChildItem $rel -File | Where-Object { $_.Extension -in '.exe','.ps1' } | Select-Object Name, Length | Format-Table -AutoSize
+          if (-not (Test-Path "$rel/install.ps1")) { throw 'install.ps1 was not copied beside the exe; the scenario would not be faithful' }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/quarantine" | Out-Null
+          Move-Item "$rel/install.ps1" "$env:RUNNER_TEMP/quarantine/install.ps1"
+          "install.ps1 beside the exe now: $(Test-Path "$rel/install.ps1")"
+
+      - name: Launch the app and press Get Started
+        shell: pwsh
+        run: |
+          python -m pip install -q websocket-client
+          $out = "$env:RUNNER_TEMP/ab-${{ matrix.side }}"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'
+          $exe = (Resolve-Path 'src/studio/src-tauri/target/release/unsloth-studio.exe').Path
+          $app = Start-Process $exe -PassThru
+          python ci/drive.py $out
+          $rc = $LASTEXITCODE
+          $log = Join-Path $env:USERPROFILE '.unsloth/studio/tauri.log'
+          if (Test-Path $log) { '--- tauri.log [install] lines'; Select-String -Path $log -Pattern '\[install\]' | ForEach-Object { $_.Line }; Copy-Item $log $out }
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          exit $rc
+
+      - name: Verdict
+        shell: pwsh
+        run: |
+          $shown = Get-Content -Raw "$env:RUNNER_TEMP/ab-${{ matrix.side }}/setup-error.txt"
+          "side ${{ matrix.side }} shows: $shown"
+          if ('${{ matrix.side }}' -eq 'B') {
+            if ($shown -notmatch 'install\.ps1 is missing from the app folder' -or $shown -match 'Copyright') { throw 'B does not name the missing script' }
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: ab-${{ matrix.side }}
+          path: ${{ runner.temp }}/ab-${{ matrix.side }}
