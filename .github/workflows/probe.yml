@@ -94,9 +94,12 @@ jobs:
           $t0 = Get-Date
           Invoke-WebRequest https://dl.emsisoft.com/EmsisoftEmergencyKit.exe -OutFile "$W\eek.exe" -UseBasicParsing
           "download took $([int]((Get-Date) - $t0).TotalSeconds)s, $((Get-Item "$W\eek.exe").Length) bytes"
-          Run "$W\eek.exe" @('/s') 300 'extract'
+          Run "$W\eek.exe" @('/s') 120 'extract'
           Get-ChildItem C:\EEK -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -HideTableHeaders | Out-String
           Get-ChildItem C:\EEK\bin64 -Filter *.exe -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -HideTableHeaders | Out-String
+          Start-Sleep 5
+          Get-Process | Where-Object { $_.Path -like 'C:\EEK\*' } | ForEach-Object { "killing $($_.Name)"; $_ | Stop-Process -Force }
+          Start-Sleep 3
           $a2 = 'C:\EEK\bin64\a2cmd.exe'
           if (-not (Test-Path $a2)) { 'no a2cmd'; exit 1 }
           Run $a2 @('/h') 60 'help'
