@@ -64,7 +64,7 @@ jobs:
 
       - name: install.rs unit tests
         working-directory: src/studio/src-tauri
-        run: cargo test --bin unsloth-studio install:: -- --nocapture
+        run: cargo test --bin unsloth-studio 'install::' -- --nocapture
 
       - name: Build the release app
         working-directory: src/studio/src-tauri
