@@ -1,0 +1,176 @@
+name: AMD DevLab parity ROCm Linux
+
+# A/B of the unslothai/llama.cpp ROCm prebuilt recipe on gfx1151, all else identical:
+#   A  = ROCm 10.1.0a20260822 (frozen index, what ships today), fork cmake flags
+#   B  = ROCm 10.2.0a20260924 (new index), fork cmake flags
+#   C  = ROCm 10.2.0a20260924, CPU backend fixed (no CMAKE_SYSTEM_NAME/CROSSCOMPILING,
+#        GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON)
+#   D  = ROCm 10.0.0 stable, fork cmake flags
+# Source: upstream b11139 for every arm. Plus a packaging test of the bundle
+# copy list with the ROCm tree hidden.
+
+on:
+  push:
+    branches: [amd-devlab-parity-rocm-linux]
+
+permissions: {}
+
+jobs:
+  rocm:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 480
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu | head -25
+          free -h
+          df -h "$RUNNER_TEMP"
+          id
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          ls -d /opt/rocm* 2>&1 || true
+          ldconfig -p | grep -iE 'hip|rocblas|hsa|tensile|libomp' || echo "no ROCm libs in ldconfig"
+          cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null || true
+
+      - name: Setup
+        run: |
+          set -eux
+          W="$RUNNER_TEMP/w"
+          mkdir -p "$W"/{models,tmp,out,src}
+          python3 -m venv "$W/venv"
+          "$W/venv/bin/pip" install -q cmake ninja patchelf
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "$W/venv/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+
+      - name: Fetch source, models, toolchains
+        run: |
+          set -eux
+          cd "$W"
+          git clone -q --depth 1 --branch b11139 https://github.com/ggml-org/llama.cpp src/llama.cpp
+          git -C src/llama.cpp log -1 --format='%H %s'
+          curl -fsSL --retry 3 -o models/q8b.gguf https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf &
+          curl -fsSL --retry 3 -o models/q30b.gguf https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf &
+          get() { mkdir -p "$W/rocm-$1"; curl -fsSL --retry 3 "$2" | tar -xzf - -C "$W/rocm-$1" --strip-components=1; echo "$1 done"; }
+          get 0822 https://rocm.nightlies.amd.com/tarball-multi-arch/therock-dist-linux-gfx1151-10.1.0a20260822.tar.gz &
+          get 0924 https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.2.0a20260924.tar.gz &
+          get stable https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.0.0.tar.gz &
+          wait
+          ls -la models
+          for t in 0822 0924 stable; do ls "$W/rocm-$t" | head; ls "$W/rocm-$t/lib" | grep -E 'tensilelite|hipblaslt|origami' || true; done
+          df -h "$W"
+
+      - name: Build four arms
+        run: |
+          set -euo pipefail
+          BASEPATH="$PATH"
+          build() {
+            local name=$1 R=$2 mode=$3 flags
+            if [ "$mode" = fork ]; then flags="-DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Linux"; else flags="-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"; fi
+            (
+              export ROCM_PATH=$R HIP_PATH=$R HIP_PLATFORM=amd HIP_CLANG_PATH=$R/llvm/bin HIP_INCLUDE_PATH=$R/include HIP_LIB_PATH=$R/lib HIP_DEVICE_LIB_PATH=$R/lib/llvm/amdgcn/bitcode
+              export PATH=$R/bin:$R/llvm/bin:$BASEPATH LD_LIBRARY_PATH=$R/lib:$R/lib64:$R/llvm/lib LIBRARY_PATH=$R/lib:$R/lib64 CPATH=$R/include PKG_CONFIG_PATH=$R/lib/pkgconfig
+              B=$W/build-$name
+              t0=$(date +%s)
+              cmake -S "$W/src/llama.cpp" -B "$B" -G Ninja \
+                -DCMAKE_C_COMPILER=$R/llvm/bin/clang -DCMAKE_CXX_COMPILER=$R/llvm/bin/clang++ \
+                -DCMAKE_CXX_FLAGS="-I$R/include" -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx1151 \
+                -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_HIP=ON -DGGML_OPENMP=OFF \
+                -DGGML_CUDA_FORCE_CUBLAS=OFF -DGGML_RPC=ON -DGGML_HIP_ROCWMMA_FATTN=OFF \
+                -DLLAMA_BUILD_BORINGSSL=ON -DGGML_NATIVE=OFF -DGGML_STATIC=OFF $flags > "$W/out/configure-$name.log" 2>&1
+              grep -E 'CMAKE_SYSTEM_PROCESSOR|GGML_SYSTEM_ARCH|Unknown CPU|Adding CPU backend variant|not used by the project|ROCWMMA|HIP_VERSION|hip.*version' -A2 "$W/out/configure-$name.log" | head -40 || true
+              cmake --build "$B" -j "$(nproc)" > "$W/out/build-$name.log" 2>&1 || { tail -50 "$W/out/build-$name.log"; exit 1; }
+              echo "arm $name built in $(( $(date +%s) - t0 ))s"
+              ls "$B/bin" | grep -E 'ggml|llama-bench' | tr '\n' ' '; echo
+            )
+          }
+          build A "$W/rocm-0822" fork
+          build B "$W/rocm-0924" fork
+          build C "$W/rocm-0924" fixed
+          build D "$W/rocm-stable" fork
+
+      - name: Packaging test (current copy list, ROCm tree hidden)
+        if: always()
+        run: |
+          set -uo pipefail
+          M8=$W/models/q8b.gguf
+          pack() {
+            local name=$1 R=$2 D=$W/bundle-$1
+            rm -rf "$D"; cp -a "$W/build-$name/bin" "$D"
+            mkdir -p "$D/rocblas" "$D/hipblaslt"
+            [ -d "$R/lib/rocblas/library" ] && cp -r "$R/lib/rocblas/library" "$D/rocblas/"
+            [ -d "$R/lib/hipblaslt/library" ] && cp -r "$R/lib/hipblaslt/library" "$D/hipblaslt/"
+            for p in lib/libhipblas.so lib/librocblas.so lib/libamdhip64.so lib/librocsolver.so lib/libroctx64.so lib/libhipblaslt.so \
+                     lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so lib/librocprofiler-register.so lib/libamd_comgr.so lib/libamd_comgr_loader.so \
+                     lib/libhsa-runtime64.so lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so lib/librocroller.so lib/liborigami.so lib/librocm_kpack.so \
+                     lib/rocm_sysdeps/lib/librocm_sysdeps_z.so lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so lib/llvm/lib/libLLVM.so lib/llvm/lib/libclang-cpp.so \
+                     lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so \
+                     lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so; do
+              cp "$R/$p"* "$D/" 2>/dev/null || echo "  $name: $(basename $p)* not found"
+            done
+            cp "$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')" "$D/" 2>/dev/null || true
+            ( cd "$D"; for f in *.so* llama-*; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done )
+          }
+          runit() {
+            local name=$1 label=$2 D=$W/bundle-$1
+            echo "=== $name $label: ldd not found:"
+            env -u LD_LIBRARY_PATH ldd "$D/libggml-hip.so" | grep 'not found' || echo "  (none)"
+            env -u LD_LIBRARY_PATH "$D/llama-bench" -m "$M8" -ngl 99 -p 64 -n 16 -r 1 -o md > "$W/out/pack-$name-$label.txt" 2>&1
+            echo "  exit=$?"; tail -6 "$W/out/pack-$name-$label.txt"
+          }
+          for arm in A:0822 B:0924; do
+            name=${arm%%:*}; R=$W/rocm-${arm#*:}
+            pack "$name" "$R"
+            mv "$R" "$R.hidden"
+            runit "$name" current-list
+            cp "$R.hidden/lib/libtensilelite-host.so"* "$W/bundle-$name/" 2>/dev/null && echo "  added tensilelite" || echo "  no tensilelite in toolchain"
+            runit "$name" plus-tensilelite
+            cp -L "$R.hidden/lib/llvm/lib/libomp.so" "$W/bundle-$name/" 2>/dev/null && echo "  added libomp.so" || echo "  no libomp.so"
+            runit "$name" plus-tensilelite-libomp
+            mv "$R.hidden" "$R"
+          done
+
+      - name: Benchmarks (interleaved, two rounds)
+        if: always()
+        run: |
+          set -uo pipefail
+          M8=$W/models/q8b.gguf; M30=$W/models/q30b.gguf
+          rt() { case $1 in A) echo "$W/rocm-0822";; B|C) echo "$W/rocm-0924";; D) echo "$W/rocm-stable";; esac; }
+          b() {
+            local arm=$1 tag=$2; shift 2
+            local R; R=$(rt "$arm")
+            LD_LIBRARY_PATH=$R/lib:$R/lib64:$R/llvm/lib "$W/build-$arm/bin/llama-bench" "$@" -o jsonl >> "$W/out/bench-$arm-$tag.jsonl" 2>> "$W/out/bench-$arm-$tag.err" || echo "FAILED $arm $tag"
+          }
+          for round in 1 2; do
+            for arm in A B C D; do
+              echo "round $round arm $arm $(date +%T)"
+              b $arm gpu-8b    -m "$M8"  -ngl 99 -fa 1 -p 512 -n 128 -r 3
+              b $arm gpu-30b   -m "$M30" -ngl 99 -fa 1 -p 512 -n 128 -r 3
+            done
+            for arm in B C; do
+              echo "round $round arm $arm cpu $(date +%T)"
+              b $arm ncmoe-30b -m "$M30" -ngl 99 -ncmoe 99 -fa 1 -p 512 -n 128 -r 2
+              b $arm cpu-8b    -m "$M8"  -dev none -p 512 -n 128 -r 2
+            done
+          done
+          grep -h "load_backend\|CPU backend" "$W"/out/bench-C-cpu-8b.err | sort -u | head
+          python3 - "$W/out" <<'EOF'
+          import json,sys,glob,os,statistics as st
+          rows={}
+          for f in sorted(glob.glob(sys.argv[1]+'/bench-*.jsonl')):
+              arm,tag=os.path.basename(f)[6:-6].split('-',1)
+              for l in open(f):
+                  try: d=json.loads(l)
+                  except: continue
+                  k=(tag, 'pp' if d['n_prompt'] else 'tg', arm)
+                  rows.setdefault(k,[]).append(d['avg_ts'])
+          print(f"{'test':12} {'kind':3} {'arm':3} {'mean t/s':>9} {'runs':>18}")
+          for k in sorted(rows):
+              v=rows[k]; print(f"{k[0]:12} {k[1]:3} {k[2]:3} {st.mean(v):9.2f} {str([round(x,1) for x in v]):>18}")
+          EOF
+
+      - name: Upload logs
+        if: always()
+        run: |
+          cd "$W/out"; for f in *.jsonl *.err pack-*.txt; do echo "===== $f"; cat "$f"; done 2>/dev/null | tail -c 400000
+          grep -h -E 'Unknown CPU|GGML_SYSTEM_ARCH|Adding CPU backend variant|not used by the project' -A3 configure-*.log || true
