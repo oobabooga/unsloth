@@ -46,19 +46,27 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'installer-scanner-probe'
           $scanner = "$root\eek\bin64\a2cmd.exe"
+          @'
+          import subprocess, sys
+          exe, cwd, label, timeout, *args = sys.argv[1:]
+          result = subprocess.run([exe, *args], cwd=cwd, capture_output=True, timeout=int(timeout))
+          print(result.stdout.decode('utf-8', errors='replace'))
+          print(result.stderr.decode('utf-8', errors='replace'))
+          print(f'{label}: native_exit={result.returncode}', flush=True)
+          if result.returncode not in (0, 1):
+              raise SystemExit(result.returncode)
+          '@ | Set-Content "$root\run-scanner.py" -Encoding UTF8
           function Run-Scanner([string[]]$ScannerArgs, [string]$Label, [int]$Timeout) {
-            $p = Start-Process $scanner -ArgumentList $ScannerArgs -WorkingDirectory "$root\eek\bin64" -PassThru -RedirectStandardOutput "$root\$Label.out" -RedirectStandardError "$root\$Label.err"
-            if (-not $p.WaitForExit($Timeout * 1000)) {
-              Stop-Process -Id $p.Id -Force
-              Get-Content "$root\$Label.out", "$root\$Label.err" -ErrorAction SilentlyContinue
-              throw "$Label timed out"
-            }
-            $p.Refresh()
-            Get-Content "$root\$Label.out", "$root\$Label.err" -ErrorAction SilentlyContinue
-            Write-Host "$Label exit=$($p.ExitCode)"
+            python "$root\run-scanner.py" $scanner "$root\eek\bin64" $Label $Timeout @ScannerArgs
+            if ($LASTEXITCODE -ne 0) { throw "$Label scanner failed" }
           }
           Run-Scanner @('/h') 'help' 30
+          Run-Scanner @("/f=$root\samples", '/a', "/l=$root\packaged.log") 'packaged-definitions' 180
           Run-Scanner @('/update') 'update' 240
+          Run-Scanner @('/update') 'update-confirmation' 240
+          Get-Content "$root\eek\bin64\Signatures\a2vers.dat"
+          Get-Item "$root\eek\bin64\bdcore.dll", "$root\eek\bin64\Signatures\BD\bdcore.dll" -ErrorAction SilentlyContinue | ForEach-Object { $_.VersionInfo | Format-List FileName, FileVersion, CompanyName }
+
           Run-Scanner @("/f=$root\samples", '/a', "/l=$root\samples.log") 'samples' 180
           Get-Content "$root\samples.log" -ErrorAction SilentlyContinue
           $control = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS' + '-TEST-FILE!$H+H*'
