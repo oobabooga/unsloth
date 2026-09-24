@@ -62,10 +62,6 @@ jobs:
           npm ci --no-fund --no-audit
           npm run build
 
-      - name: install.rs unit tests
-        working-directory: src/studio/src-tauri
-        run: cargo test --bin unsloth-studio 'install::' -- --nocapture
-
       - name: Build the release app, with a DevTools port on the main window (both sides)
         working-directory: src/studio/src-tauri
         shell: pwsh

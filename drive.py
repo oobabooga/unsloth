@@ -23,8 +23,9 @@ page = None
 while time.time() < deadline:
     try:
         pages = [t for t in targets() if t.get("type") == "page"]
-        if pages:
-            page = pages[0]
+        loaded = [t for t in pages if t.get("url", "").startswith("http")]
+        if loaded or (pages and time.time() > deadline - 120):
+            page = (loaded or pages)[0]
             break
     except Exception as e:
         last = e
@@ -33,7 +34,7 @@ if not page:
     sys.exit("no WebView2 page on the DevTools port")
 print("page:", page.get("url"))
 
-ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=30)
+ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=30, suppress_origin=True)
 seq = 0
 
 
