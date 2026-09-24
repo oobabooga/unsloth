@@ -104,7 +104,7 @@ jobs:
           $shown = Get-Content -Raw "$env:RUNNER_TEMP/ab-${{ matrix.side }}/setup-error.txt"
           "side ${{ matrix.side }} shows: $shown"
           if ('${{ matrix.side }}' -eq 'B') {
-            if ($shown -notmatch 'install\.ps1 is missing from the app folder' -or $shown -match 'Copyright') { throw 'B does not name the missing script' }
+            if ($shown -notmatch 'install\.ps1, which Unsloth needs' -or $shown -match 'Copyright') { throw 'B does not name the missing script' }
           }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

@@ -1,5 +1,5 @@
 diff --git a/studio/src-tauri/src/install.rs b/studio/src-tauri/src/install.rs
-index ece3c7cbf5..24057a0b81 100644
+index ece3c7cbf5..1cf6355fa5 100644
 --- a/studio/src-tauri/src/install.rs
 +++ b/studio/src-tauri/src/install.rs
 @@ -42,6 +42,35 @@ fn generic_failure_message(code: i32) -> String {
@@ -18,7 +18,7 @@ index ece3c7cbf5..24057a0b81 100644
 +    warn!("[install] cannot open {}: {err}", script.display());
 +    Some(format!(
 +        "Installation failed: {name}, which Unsloth needs to finish setting up, is missing or \
-+         blocked. This usually means security software quarantined it. Restore it from \
++         blocked. Security software may have quarantined or blocked it. Restore it from \
 +         quarantine or reinstall Unsloth, then try again."
 +    ))
 +}
