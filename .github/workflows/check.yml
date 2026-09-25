@@ -1,0 +1,434 @@
+name: AMD DevLab PR 233 Windows ROCm build check
+
+on:
+  push:
+    branches: [amd-devlab-win-rocm-pr233]
+
+permissions: {}
+
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Tools
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force -Path C:\ninja | Out-Null
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\ninja.zip" https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip
+          Expand-Archive "$env:RUNNER_TEMP\ninja.zip" C:\ninja -Force
+          "C:\ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          python -m pip install --quiet --disable-pip-version-check pefile
+          if (Test-Path llama.cpp) { Remove-Item -Recurse -Force llama.cpp }
+          if (Test-Path C:\opt\rocm) { Remove-Item -Recurse -Force C:\opt\rocm }
+          git clone -q --depth 1 --branch b11139 https://github.com/ggml-org/llama.cpp llama.cpp
+          exit 0
+
+      - name: Download ROCm nightly tarball (PR step)
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          # Retry helper: Invoke-WebRequest's -MaximumRetryCount only retries on
+          # HTTP status failures (400-599/304), not on the TCP-level connection
+          # timeouts these download hosts intermittently throw, so wrap each
+          # download in an explicit catch-all retry with linear backoff.
+          function Invoke-DownloadWithRetry {
+            param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+            for ($i = 1; $i -le $Retries; $i++) {
+              try {
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+                return
+              } catch {
+                Write-Host "Download attempt $i/$Retries for $Uri failed: $($_.Exception.Message)"
+                if ($i -eq $Retries) { throw }
+                Start-Sleep -Seconds ($DelaySec * $i)
+              }
+            }
+          }
+
+          # Determine ROCm version to use
+          $rocmVersion = "weekly"
+          $currentTarget = "gfx1151"
+
+          # Map the build target to the matching TheRock archive family
+          $archiveTarget = $currentTarget
+          if ($currentTarget -eq "gfx103X" -or $currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
+            $archiveTarget = "$currentTarget-all"
+            Write-Host "Using target with -all suffix: $archiveTarget"
+          }
+
+          # The index embeds a JSON `files` array with names and mtimes.
+          $baseUrl = "https://nightly.repo.amd.com/rocm/core/tarball"
+          if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
+            # weekly: see the Linux job.
+            $cutoff = "99999999"
+            if ($rocmVersion -eq "weekly") {
+              $cutoff = "20260924"
+              if (-not $cutoff) {
+                # Windows uses its own zone ids; the IANA name is the fallback.
+                try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
+                catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
+                $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+                $cutoff = $sf.Date.AddDays(-([int]$sf.DayOfWeek + 1)).ToString("yyyyMMdd")
+              }
+              Write-Host "Weekly pin: newest build dated on or before $cutoff (week of the last SF Sunday)"
+            } else {
+              Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+            }
+            $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
+            $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            if (-not $filesMatch.Success) {
+              Write-Error "Failed to parse file index from $baseUrl/"
+              exit 1
+            }
+
+            # Pick the newest build date and exclude sibling test archives.
+            $allFiles = $filesMatch.Groups[1].Value | ConvertFrom-Json
+            $prefix = "therock-dist-windows-$archiveTarget-"
+            $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
+            $latest = $allFiles |
+              Where-Object { $_.name -match $versionPattern } |
+              Where-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value -le $cutoff } |
+              Sort-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value } |
+              Select-Object -Last 1
+            if (-not $latest) {
+              Write-Error "No tarball found for prefix '$prefix' at or before $cutoff at $baseUrl/"
+              exit 1
+            }
+            $latestFile = $latest.name
+            Write-Host "Found latest file: $latestFile"
+
+            # Extract version from the filename for environment variable
+            if ($latestFile -match "therock-dist-windows-$archiveTarget-(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+              $rocmVersion = $matches[1]
+              Write-Host "Detected latest ROCm version: $rocmVersion"
+            } else {
+              Write-Error "Failed to extract ROCm version from latest file: $latestFile"
+              Write-Error "Expected pattern: therock-dist-windows-$archiveTarget-<version>.tar.gz"
+              exit 1
+            }
+
+            $rocmUrl = "$baseUrl/$latestFile"
+          } else {
+            $rocmUrl = "$baseUrl/therock-dist-windows-$archiveTarget-$rocmVersion.tar.gz"
+          }
+
+          # Store the version for use in other steps
+          echo "DETECTED_ROCM_VERSION=$rocmVersion" >> $env:GITHUB_ENV
+
+          Write-Host "Downloading ROCm from: $rocmUrl"
+          Invoke-DownloadWithRetry -Uri $rocmUrl -OutFile "rocm.tar.gz"
+
+      - name: Extract ROCm (PR step)
+        run: |
+          # Create directory if it doesn't exist
+          New-Item -ItemType Directory -Force -Path "C:\opt\rocm"
+
+          # Extract the tarball
+          tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
+
+      - name: Repro, PR flags as-is, sse42 variant only
+        continue-on-error: true
+        shell: cmd
+        run: |
+
+          REM Map GPU targets
+          set "current_target=gfx1151"
+          echo Input target: %current_target%
+
+          if "%current_target%"=="gfx110X" (
+            set "mapped_target=gfx1100;gfx1101;gfx1102;gfx1103"
+          ) else if "%current_target%"=="gfx103X" (
+            set "mapped_target=gfx1030;gfx1031;gfx1032;gfx1034"
+          ) else if "%current_target%"=="gfx1151" (
+            set "mapped_target=gfx1151"
+          ) else if "%current_target%"=="gfx1150" (
+            set "mapped_target=gfx1150"
+          ) else if "%current_target%"=="gfx120X" (
+            set "mapped_target=gfx1200;gfx1201"
+          ) else (
+            set "mapped_target=%current_target%"
+          )
+          echo Mapped target: %mapped_target%
+
+          REM Set up environment variables and PATH
+          set HIP_PATH=C:\opt\rocm
+          set HIP_PLATFORM=amd
+          set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;%PATH%
+
+          REM Set up x64 Native Tools Command Prompt environment.
+          REM Pin to the VS 2022 line (-version "[17.0,18.0)") so vswhere -latest does not
+          REM pick up the runner image's VS 2026 (MSVC 14.51), whose STL adds constexpr to
+          REM math builtins like isgreater; that constexpr (implicitly __host__ __device__)
+          REM collides with clang's HIP __device__ forward declares and breaks the ggml-cuda
+          REM .cu compile (ggml-org/llama.cpp#22570). VS 2022 (MSVC 14.44) is unaffected.
+          call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+          set /p VS_PATH=<vs_path.txt
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          REM Create build directory
+          cd llama.cpp
+          mkdir build
+          cd build
+
+          REM Configure the project
+          REM Only the C/CXX launchers here: ggml-hip forces CXX_IS_HIPCC on
+          REM WIN32, so the device sources compile as C++, not the HIP language.
+          REM Keep native CPU detection; select CPU variants at runtime.
+          cmake .. -G Ninja ^
+            -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+            -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGPU_TARGETS="%mapped_target%" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DGGML_HIP=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+            -DGGML_RPC=ON ^
+            -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_STATIC=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER= ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=
+
+          REM Build the project
+          cmake --build . -j %NUMBER_OF_PROCESSORS% --target ggml-cpu-sse42
+
+      - name: Clean build dir
+        run: Remove-Item -Recurse -Force llama.cpp\build
+
+      - name: Full build, PR flags plus -Wno-error=incompatible-pointer-types
+        shell: cmd
+        run: |
+
+          REM Map GPU targets
+          set "current_target=gfx1151"
+          echo Input target: %current_target%
+
+          if "%current_target%"=="gfx110X" (
+            set "mapped_target=gfx1100;gfx1101;gfx1102;gfx1103"
+          ) else if "%current_target%"=="gfx103X" (
+            set "mapped_target=gfx1030;gfx1031;gfx1032;gfx1034"
+          ) else if "%current_target%"=="gfx1151" (
+            set "mapped_target=gfx1151"
+          ) else if "%current_target%"=="gfx1150" (
+            set "mapped_target=gfx1150"
+          ) else if "%current_target%"=="gfx120X" (
+            set "mapped_target=gfx1200;gfx1201"
+          ) else (
+            set "mapped_target=%current_target%"
+          )
+          echo Mapped target: %mapped_target%
+
+          REM Set up environment variables and PATH
+          set HIP_PATH=C:\opt\rocm
+          set HIP_PLATFORM=amd
+          set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;%PATH%
+
+          REM Set up x64 Native Tools Command Prompt environment.
+          REM Pin to the VS 2022 line (-version "[17.0,18.0)") so vswhere -latest does not
+          REM pick up the runner image's VS 2026 (MSVC 14.51), whose STL adds constexpr to
+          REM math builtins like isgreater; that constexpr (implicitly __host__ __device__)
+          REM collides with clang's HIP __device__ forward declares and breaks the ggml-cuda
+          REM .cu compile (ggml-org/llama.cpp#22570). VS 2022 (MSVC 14.44) is unaffected.
+          call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+          set /p VS_PATH=<vs_path.txt
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          REM Create build directory
+          cd llama.cpp
+          mkdir build
+          cd build
+
+          REM Configure the project
+          REM Only the C/CXX launchers here: ggml-hip forces CXX_IS_HIPCC on
+          REM WIN32, so the device sources compile as C++, not the HIP language.
+          REM Keep native CPU detection; select CPU variants at runtime.
+          cmake .. -G Ninja ^
+            -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+            -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGPU_TARGETS="%mapped_target%" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DGGML_HIP=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+            -DGGML_RPC=ON ^
+            -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_STATIC=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER= ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=
+
+          REM Build the project
+          cmake --build . -j %NUMBER_OF_PROCESSORS%
+
+      - name: Copy ROCm core DLLs (PR step)
+        run: |
+          $rocmVersion = if ($env:DETECTED_ROCM_VERSION) { $env:DETECTED_ROCM_VERSION } else { "weekly" }
+          $buildBinPath = "llama.cpp\build\bin"
+          $rocmBinPath = "C:\opt\rocm\bin"
+
+          Write-Host "Copying ROCm core DLL files to build directory..."
+          Write-Host "Source: $rocmBinPath"
+          Write-Host "Destination: $buildBinPath"
+
+          if (Test-Path $rocmBinPath) {
+            # Copy files matching patterns and specific names
+            $filesToCopy = @(
+              "amdhip64_*.dll",
+              "rocm_kpack.dll",
+              "amd_comgr*.dll",
+              "libhipblas.dll",
+              "rocblas.dll",
+              "rocsolver.dll",
+              "hipblaslt.dll",
+              "libhipblaslt.dll",
+              "hipblas.dll",
+              "origami.dll",
+              "libtensilelite-host.dll"
+            )
+
+            foreach ($pattern in $filesToCopy) {
+              $matchingFiles = Get-ChildItem -Path $rocmBinPath -Name $pattern -ErrorAction SilentlyContinue
+              if ($matchingFiles) {
+                foreach ($file in $matchingFiles) {
+                  $sourcePath = Join-Path $rocmBinPath $file
+                  $destPath = Join-Path $buildBinPath $file
+                  Copy-Item $sourcePath $destPath
+                  Write-Host "Copied: $file"
+                }
+              } else {
+                Write-Host "Warning: No files found matching pattern: $pattern"
+              }
+            }
+
+            # Copy the rocblas\library folder and all its contents
+            $rocblasLibPath = Join-Path $rocmBinPath "rocblas\library"
+            if (Test-Path $rocblasLibPath) {
+              Write-Host "Copying rocblas\library folder and all contents..."
+              $destRocblasPath = Join-Path $buildBinPath "rocblas\library"
+              Copy-Item -Path $rocblasLibPath -Destination $destRocblasPath -Recurse -Force
+              Write-Host "Copied: rocblas\library folder with all contents"
+
+              # List the contents of the copied rocblas\library folder
+              Write-Host "Contents of rocblas\library:"
+              Get-ChildItem $destRocblasPath -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+            } else {
+              Write-Host "Warning: rocblas\library folder not found at: $rocblasLibPath"
+            }
+
+            # Copy the hipblaslt\library folder and all its contents
+            $hipblasltLibPath = Join-Path $rocmBinPath "hipblaslt\library"
+            if (Test-Path $hipblasltLibPath) {
+              Write-Host "Copying hipblaslt\library folder and all contents..."
+              $destHipblasltPath = Join-Path $buildBinPath "hipblaslt\library"
+              Copy-Item -Path $hipblasltLibPath -Destination $destHipblasltPath -Recurse -Force
+              Write-Host "Copied: hipblaslt\library folder with all contents"
+
+              # List the contents of the copied hipblaslt\library folder
+              Write-Host "Contents of hipblaslt\library:"
+              Get-ChildItem $destHipblasltPath -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+            } else {
+              Write-Host "Warning: rocblas\library folder not found at: $rocblasLibPath"
+            }
+
+            Write-Host "ROCm core files successfully copied to build directory"
+          } else {
+            Write-Error "ROCm bin directory not found: $rocmBinPath"
+            exit 1
+          }
+
+      - name: Dependency check (PR step)
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pefile
+          @'
+          import os, sys, pefile
+          bundle, rocm = r"llama.cpp\build\bin", r"C:\opt\rocm\bin"
+          have = {f.lower() for f in os.listdir(bundle)}
+          rocm_dlls = {f.lower() for f in os.listdir(rocm) if f.lower().endswith(".dll")}
+          dirs = [pefile.DIRECTORY_ENTRY[d] for d in ("IMAGE_DIRECTORY_ENTRY_IMPORT", "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT")]
+          missing = []
+          for name in sorted(have):
+              if not name.endswith((".dll", ".exe")):
+                  continue
+              pe = pefile.PE(os.path.join(bundle, name), fast_load=True)
+              pe.parse_data_directories(directories=dirs)
+              for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) + getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
+                  dep = entry.dll.decode().lower()
+                  if dep in rocm_dlls and dep not in have:
+                      missing.append(f"{name} -> {dep}")
+          if missing:
+              print("\n".join(missing))
+              print("::error::the bundle imports ROCm DLLs it does not carry")
+              sys.exit(1)
+          print("every imported ROCm DLL is in the bundle")
+          '@ | python -
+
+      - name: Benchmarks vs shipped zip
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force -Path $W,"$W\old" | Out-Null
+          curl.exe -fsSL -o "$W\old.zip" https://github.com/unslothai/llama.cpp/releases/download/b11139-mix-a6922cc/app-b11139-mix-a6922cc-windows-x64-rocm-gfx1151.zip
+          tar -xf "$W\old.zip" -C "$W\old"
+          curl.exe -fsSL -o "$W\q8b.gguf" https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf
+          curl.exe -fsSL -o "$W\q30b.gguf" https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf
+          $new = (Resolve-Path llama.cpp\build\bin).Path
+          function B($dir, $label, $a) {
+            $p = Start-Process -FilePath "$dir\llama-bench.exe" -ArgumentList $a -WorkingDirectory $dir -RedirectStandardOutput "$W\$label.out" -RedirectStandardError "$W\$label.err" -NoNewWindow -Wait -PassThru
+            Write-Host "=== $label exit=$($p.ExitCode)"
+            Get-Content "$W\$label.err" | Select-String 'load_backend|error' | Select-Object -First 4 | ForEach-Object Line
+            Get-Content "$W\$label.out" | Select-String '\|' | ForEach-Object Line
+          }
+          B $new "pr-devices" "--list-devices"
+          foreach ($r in 1,2) {
+            foreach ($d in @(@("old","$W\old"), @("pr",$new))) {
+              B $d[1] "$($d[0])-gpu-8b-r$r" "-m $W\q8b.gguf -ngl 99 -fa 1 -p 512 -n 128 -r 3 -o md"
+              B $d[1] "$($d[0])-ncmoe-30b-r$r" "-m $W\q30b.gguf -ngl 99 -ncmoe 99 -fa 1 -p 512 -n 128 -r 2 -o md"
+              B $d[1] "$($d[0])-cpu-8b-r$r" "-m $W\q8b.gguf -dev none -p 512 -n 128 -r 2 -o md"
+            }
+          }
+          exit 0
+
+      - name: Negative, libtensilelite-host.dll removed
+        run: |
+          Move-Item llama.cpp\build\bin\libtensilelite-host.dll $env:RUNNER_TEMP\
+          $p = Start-Process -FilePath "llama.cpp\build\bin\llama-bench.exe" -ArgumentList "--list-devices" -WorkingDirectory "llama.cpp\build\bin" -RedirectStandardOutput "$env:RUNNER_TEMP\neg.out" -RedirectStandardError "$env:RUNNER_TEMP\neg.err" -NoNewWindow -Wait -PassThru
+          Write-Host "list-devices exit=$($p.ExitCode)"; Get-Content "$env:RUNNER_TEMP\neg.out"
+          @'
+          import os, sys, pefile
+          bundle, rocm = r"llama.cpp\build\bin", r"C:\opt\rocm\bin"
+          have = {f.lower() for f in os.listdir(bundle)}
+          rocm_dlls = {f.lower() for f in os.listdir(rocm) if f.lower().endswith(".dll")}
+          dirs = [pefile.DIRECTORY_ENTRY[d] for d in ("IMAGE_DIRECTORY_ENTRY_IMPORT", "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT")]
+          missing = []
+          for name in sorted(have):
+              if not name.endswith((".dll", ".exe")):
+                  continue
+              pe = pefile.PE(os.path.join(bundle, name), fast_load=True)
+              pe.parse_data_directories(directories=dirs)
+              for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) + getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
+                  dep = entry.dll.decode().lower()
+                  if dep in rocm_dlls and dep not in have:
+                      missing.append(f"{name} -> {dep}")
+          if missing:
+              print("\n".join(missing))
+              print("::error::the bundle imports ROCm DLLs it does not carry")
+              sys.exit(1)
+          print("every imported ROCm DLL is in the bundle")
+          '@ | python -
+          Write-Host "dependency check exit=$LASTEXITCODE"
+          exit 0
