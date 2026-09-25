@@ -87,7 +87,7 @@ jobs:
           if-no-files-found: error
 
   gpu:
-    name: "test-backend-ops full, Vulkan0 then ROCm0, gfx1151 (exclusive)"
+    name: "test-backend-ops ROCm0 per op + SOLVE_TRI rocBLAS check, gfx1151 (exclusive)"
     needs: build
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
@@ -124,40 +124,69 @@ jobs:
         timeout-minutes: 30
         run: |
           set -eu
-          python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/app-$TAG-linux-x64-vulkan.tar.gz" \
-            --dest "$AMD_CI_WORK/lcpp/vulkan" --out "$AMD_CI_WORK/out/bin_vulkan.json"
           python3 amd_ci/lib/fetch_llamacpp.py --url "$REL/app-$TAG-linux-x64-rocm-gfx1151.tar.gz" \
             --dest "$AMD_CI_WORK/lcpp/rocm" --out "$AMD_CI_WORK/out/bin_rocm.json"
           python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" | tee -a "$GITHUB_ENV"
           eval "$(python3 amd_ci/lib/emit_bin_env.py "$AMD_CI_WORK/out" | grep -v '^#')"
-          for D in "$VULKAN_BIN" "$ROCM_BIN"; do
+          for D in "$ROCM_BIN"; do
             cp "$AMD_CI_WORK/exe/test-backend-ops" "$D/" && chmod +x "$D/test-backend-ops"
             ls "$D" | grep -E '^lib(ggml|llama)' | tr '\n' ' '; echo
           done
 
-      - name: Vulkan0 full run
+      - name: Which rocBLAS the bundle loads, and what kernels it carries
         if: always()
-        timeout-minutes: 150
         run: |
           set +e
-          cd "$VULKAN_BIN"
-          L="$AMD_CI_WORK/out/strix-vulkan.txt"
-          LD_LIBRARY_PATH="$VULKAN_BIN" timeout 8400 ./test-backend-ops test -b Vulkan0 2>&1 \
-            | sed -E 's/\x1b\[[0-9;]*m//g' > "$L"
-          echo "exit=${PIPESTATUS[0]}" | tee "$AMD_CI_WORK/out/strix-vulkan.exit"
-          head -20 "$L"; echo ...; tail -30 "$L"
+          O="$AMD_CI_WORK/out/rocblas.txt"
+          {
+            echo "## bundle top level"; ls "$ROCM_BIN" | grep -vE '^llama-' | tr '\n' ' '; echo
+            echo "## ldd libggml-hip"; LD_LIBRARY_PATH="$ROCM_BIN" ldd "$ROCM_BIN/libggml-hip.so" | grep -iE 'rocblas|hipblas|amdhip|hsa|rocsolver'
+            for L in "$ROCM_BIN"/rocblas/library "$ROCM_BIN"/lib/rocblas/library /opt/rocm/lib/rocblas/library; do
+              [ -d "$L" ] || { echo "## $L: absent"; continue; }
+              echo "## $L: $(ls "$L" | wc -l) files, gfx1151: $(ls "$L" | grep -c gfx1151)"
+              ls "$L" | grep gfx1151 | head -8
+            done
+            for S in "$ROCM_BIN"/librocblas.so* /opt/rocm/lib/librocblas.so.*.*; do
+              [ -f "$S" ] || continue
+              echo "## $S offload targets:"; strings "$S" | grep -oE 'amdgcn-amd-amdhsa--gfx[0-9a-z]+' | sort -u | tr '\n' ' '; echo
+            done
+          } > "$O" 2>&1
+          cat "$O"
 
-      - name: ROCm0 full run
+      - name: SOLVE_TRI repro, shipped rocBLAS vs the host's ROCm 7.2.1 rocBLAS
         if: always()
-        timeout-minutes: 150
+        timeout-minutes: 20
         run: |
           set +e
           cd "$ROCM_BIN"
-          L="$AMD_CI_WORK/out/strix-rocm.txt"
-          LD_LIBRARY_PATH="$ROCM_BIN" timeout 8400 ./test-backend-ops test -b ROCm0 2>&1 \
-            | sed -E 's/\x1b\[[0-9;]*m//g' > "$L"
-          echo "exit=${PIPESTATUS[0]}" | tee "$AMD_CI_WORK/out/strix-rocm.exit"
-          head -20 "$L"; echo ...; tail -30 "$L"
+          mkdir -p "$AMD_CI_WORK/sysrb"
+          for f in /opt/rocm/lib/librocblas.so*; do ln -sf "$f" "$AMD_CI_WORK/sysrb/"; done
+          for V in shipped host; do
+            LP="$ROCM_BIN"; [ "$V" = host ] && LP="$AMD_CI_WORK/sysrb:$ROCM_BIN"
+            echo "== $V rocBLAS (LD_LIBRARY_PATH=$LP)"
+            LD_LIBRARY_PATH="$LP" timeout 600 ./test-backend-ops test -b ROCm0 -o SOLVE_TRI 2>&1 \
+              | sed -E 's/\x1b\[[0-9;]*m//g' | grep -vE 'graph warmup|^\[New LWP|^#[0-9]' > "$AMD_CI_WORK/out/solve_tri_$V.txt"
+            echo "exit=${PIPESTATUS[0]}" | tee -a "$AMD_CI_WORK/out/solve_tri_$V.txt"
+            grep -E 'SOLVE_TRI|tests passed|Backend ROCm0|error' "$AMD_CI_WORK/out/solve_tri_$V.txt" | head -30
+          done
+
+      - name: ROCm0, one op per process so a crash only takes out its own op
+        if: always()
+        timeout-minutes: 240
+        run: |
+          set +e
+          cd "$ROCM_BIN"
+          D="$AMD_CI_WORK/out/rocm_ops"; mkdir -p "$D"
+          S="$AMD_CI_WORK/out/rocm_per_op.tsv"
+          printf 'op\texit\tpassed\tfail_lines\n' > "$S"
+          for OP in ABS SGN NEG STEP TANH ELU RELU SIGMOID GELU GELU_QUICK SILU HARDSWISH HARDSIGMOID EXP EXPM1 SOFTPLUS GELU_ERF FLOOR CEIL ROUND TRUNC RELU_SQR GELU_MUL SILU_MUL SIGMOID_MUL SOFTPLUS_MUL SNAKE_FUSE DSV4_HC_COMB DSV4_HC_PRE DSV4_HC_POST REGLU GEGLU SWIGLU GEGLU_ERF GEGLU_QUICK SWIGLU_OAI SWIGLU_CLAMP GET_ROWS GET_ROWS_BACK SET_ROWS ROPE_SET_ROWS POOL_2D POOL_1D IM2COL IM2COL_3D CONV_2D CONV_2D_DW CONV_3D CONV_TRANSPOSE_1D COL2IM_1D CONV_TRANSPOSE_2D COUNT_EQUAL ARGMAX REPEAT REPEAT_BACK DUP SET CPY CONT ADD SUB MUL DIV SCALE SOFTCAP SILU_BACK NORM RMS_NORM NORM_SCALE RMS_NORM_SCALE RMS_NORM_BACK L2_NORM L2_NORM_BATCH RMS_NORM_MUL_ROPE RMS_NORM_MUL_ADD NORM_MUL_ADD ADD_RMS_NORM ADD_ADD SSM_CONV SSM_CONV_BIAS_SILU SSM_SCAN SSM_SCAN_ROLLBACK RWKV_WKV6 RWKV_WKV7 GATED_LINEAR_ATTN MUL_MAT_HADAMARD MUL_MAT MUL_MAT_ID MUL_MAT_ID_FUSION OUT_PROD ADD_ID SQR SQRT LOG SIN COS CLAMP LEAKY_RELU DIAG_MASK_INF SOFT_MAX SOFT_MAX_BACK ROPE ROPE_BACK CONCAT ARGSORT TOP_K TOPK_QSA UPSCALE SUM MEAN SUM_ROWS GROUP_NORM GROUP_NORM_MUL_ADD ACC PAD PAD_REFLECT_1D ROLL ARANGE TIMESTEP_EMBEDDING CUMSUM XIELU TRI FILL DIAG SOLVE_TRI FLASH_ATTN_EXT FLASH_ATTN_EXT_BANDED CROSS_ENTROPY_LOSS CROSS_ENTROPY_LOSS_BACK OPT_STEP_ADAMW OPT_STEP_SGD MUL_MAT_VEC_FUSION TOPK_MOE MOE_REDUCE GATED_DELTA_NET GATED_DELTA_NET_CACHE_FUSION LIGHTNING_INDEXER; do
+            LD_LIBRARY_PATH="$ROCM_BIN" timeout 1800 ./test-backend-ops test -b ROCm0 -o "$OP" 2>&1 \
+              | sed -E 's/\x1b\[[0-9;]*m//g' > "$D/$OP.txt"
+            rc=${PIPESTATUS[0]}
+            p=$(grep -oE '[0-9]+/[0-9]+ tests passed' "$D/$OP.txt" | head -1 | cut -d' ' -f1)
+            printf '%s\t%s\t%s\t%s\n' "$OP" "$rc" "${p:-none}" "$(grep -c FAIL "$D/$OP.txt")" | tee -a "$S"
+          done
+          cat "$D"/*.txt > "$AMD_CI_WORK/out/strix-rocm-per-op.txt"
 
       - name: Report
         if: always()
@@ -165,23 +194,21 @@ jobs:
           set +e
           cd "$AMD_CI_WORK/out"
           {
-            for B in vulkan rocm; do
-              echo "## $B"; echo '```'
-              cat "strix-$B.exit"
-              grep -E "ggml_vulkan: [0-9]|Device [0-9]:|found [0-9]+ ROCm" "strix-$B.txt" | head -5
-              grep -E "tests passed|Backend .*: (OK|FAIL)|Backend [^:]*:" "strix-$B.txt" | tail -4
-              echo "FAIL lines: $(grep -c FAIL "strix-$B.txt")"
-              grep FAIL "strix-$B.txt" | head -200
-              echo "iq4_xs RDNA1 cases:"
-              grep -E 'MUL_MAT\(type_a=iq4_xs,type_b=f32,m=16,n=8,k=(256|4096),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1' "strix-$B.txt"
-              echo '```'
-            done
+            echo '```'
+            grep -m2 -E "found [0-9]+ ROCm|Device 0:" strix-rocm-per-op.txt
+            awk -F'\t' 'NR>1 && $3!="none"{split($3,a,"/");p+=a[1];t+=a[2]} END{print p"/"t" passed across ops that completed"}' rocm_per_op.tsv
+            echo "ops that did not exit 0:"; awk -F'\t' 'NR>1 && $2!=0' rocm_per_op.tsv
+            echo "FAIL lines: $(grep -c FAIL strix-rocm-per-op.txt)"
+            grep FAIL strix-rocm-per-op.txt | head -200
+            echo "iq4_xs RDNA1 cases:"
+            grep -E 'MUL_MAT\(type_a=iq4_xs,type_b=f32,m=16,n=8,k=(256|4096),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1' strix-rocm-per-op.txt
+            echo '```'
           } | tee REPORT.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tbo146-gfx1151
+          name: tbo146-gfx1151-rocm-per-op
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
