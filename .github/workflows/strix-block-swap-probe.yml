@@ -1,0 +1,89 @@
+# Coverage row 13 for unslothai/unsloth#11832: on a unified-memory APU,
+# get_peft_model(block_swap_layers=N) must refuse and install nothing.
+# Same pool and dispatch shape as probe.yml on amd-devlab-ci-dc005.
+name: Strix Halo block-swap probe
+
+on:
+  push:
+    branches: [amd-devlab-block-swap]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  UNSLOTH_SPEC: "unsloth @ git+https://github.com/LeoBorcherding/unsloth@feat/block-swap"
+  ZOO_SPEC: "unsloth-zoo @ git+https://github.com/LeoBorcherding/unsloth-zoo@feat/block-swap"
+  ROCM_INDEX: https://repo.amd.com/rocm/whl/gfx1151
+  UV_ZIP: https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-pc-windows-msvc.zip
+  BNB_WHEEL: https://github.com/bitsandbytes-foundation/bitsandbytes/releases/download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-win_amd64.whl
+
+jobs:
+  probe:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - name: Python 3.12 + ROCm torch (gfx1151 index)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $W = Join-Path $env:RUNNER_TEMP 'blockswap'
+          New-Item -ItemType Directory -Force $W | Out-Null
+          $env:UV_CACHE_DIR = "$W\uv-cache"
+          $env:UV_PYTHON_INSTALL_DIR = "$W\uv-python"
+          Invoke-WebRequest $env:UV_ZIP -OutFile "$W\uv.zip" -UseBasicParsing
+          Expand-Archive "$W\uv.zip" -DestinationPath "$W\uv" -Force
+          $uv = Get-ChildItem "$W\uv" -Recurse -Filter uv.exe | Select-Object -First 1 -ExpandProperty FullName
+          & $uv python install 3.12
+          & $uv venv "$W\venv" --python 3.12
+          $py = "$W\venv\Scripts\python.exe"
+          # Same shape as install.ps1's AMD path: the per-arch AMD index replaces PyPI for torch.
+          & $uv pip install --python $py --default-index $env:ROCM_INDEX "torch>=2.11.0,<2.12.0"
+          & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda_available', torch.cuda.is_available()); p = torch.cuda.get_device_properties(0); print('device', p.name, getattr(p, 'gcnArchName', None), 'is_integrated', getattr(p, 'is_integrated', '<no attribute>'), 'total_GiB', round(p.total_memory / 2**30, 1))"
+          Add-Content $env:GITHUB_ENV "W=$W"
+          Add-Content $env:GITHUB_ENV "UV=$uv"
+          Add-Content $env:GITHUB_ENV "PY=$py"
+          Add-Content $env:GITHUB_ENV "UV_CACHE_DIR=$W\uv-cache"
+          Add-Content $env:GITHUB_ENV "UV_PYTHON_INSTALL_DIR=$W\uv-python"
+          Add-Content $env:GITHUB_ENV "HF_HOME=$W\hf"
+
+      - name: Install the two block-swap branches
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          # unsloth imports bitsandbytes unconditionally. The continuous-release wheel is the
+          # one a working Windows ROCm env carries; PyPI's CUDA build is the import-only fallback.
+          & $env:UV pip install --python $env:PY $env:BNB_WHEEL
+          if ($LASTEXITCODE -ne 0) { "continuous-release bitsandbytes failed, falling back to PyPI"; & $env:UV pip install --python $env:PY "bitsandbytes>=0.45.5" }
+          & $env:UV pip install --python $env:PY --extra-index-url $env:ROCM_INDEX --index-strategy unsafe-best-match "$env:UNSLOTH_SPEC"
+          & $env:UV pip install --python $env:PY --no-deps --reinstall-package unsloth-zoo "$env:ZOO_SPEC"
+          & $env:PY -c "import torch, unsloth_zoo, unsloth; print('torch', torch.__version__); print('unsloth', unsloth.__version__, 'zoo', unsloth_zoo.__version__)"
+          & $env:PY -c "import unsloth_zoo.block_swap as b; from unsloth.models import _utils; print('block_swap module', b.__file__); print('install_block_swap', hasattr(_utils, 'install_block_swap'))"
+
+      - name: Run the probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git clone -q --depth 1 --branch $env:GITHUB_REF_NAME "https://github.com/$env:GITHUB_REPOSITORY.git" "$env:W\src"
+          & $env:PY "$env:W\src\.github\strix\strix_probe.py" --e2e --bnb 2>&1 | Tee-Object "$env:W\probe.log"
+          "probe exit $LASTEXITCODE"
+
+      - name: Summary
+        if: always()
+        shell: powershell
+        run: |
+          $line = Select-String -Path "$env:W\probe.log" -Pattern '^STRIX_RESULT ' -ErrorAction SilentlyContinue | Select-Object -Last 1
+          if ($line) {
+            $j = $line.Line.Substring(13) | ConvertFrom-Json
+            "## Strix Halo block-swap probe" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "| field | value |" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "|---|---|" | Add-Content $env:GITHUB_STEP_SUMMARY
+            foreach ($d in $j.devices) { "| device $($d.index) | $($d.name) $($d.arch) $($d.total_GiB) GiB, is_integrated=$($d.is_integrated) (attr present: $($d.has_is_integrated_attr)) |" | Add-Content $env:GITHUB_STEP_SUMMARY }
+            foreach ($k in 'torch','hip','unsloth_says_unified','install_block_swap_present','zoo_block_swap_present','e2e','e2e_message','e2e_named_unified_memory','e2e_swapper_present','e2e_error','bnb','bnb_4bit_matmul','bnb_error') {
+              if ($null -ne $j.$k) { "| $k | $($j.$k) |" | Add-Content $env:GITHUB_STEP_SUMMARY }
+            }
+            $line.Line
+          } else { "no STRIX_RESULT line in probe.log" | Add-Content $env:GITHUB_STEP_SUMMARY }
+          exit 0
