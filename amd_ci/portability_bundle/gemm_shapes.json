@@ -1,0 +1,737 @@
+{
+ "notes": {
+  "units": "device_ms is summed over the profiled render; pct_of_stage is the share of that stage's total CUDA time (all kernels, incl. attention/norms); tflops is achieved bf16 throughput.",
+  "q21": "Qwen-Image-2.1 1024x1024, speed_mode=off (eager bf16 denoiser, bf16 text encoder, bf16 VAE), 5-step profiled render; per-step shares scale linearly with steps for the denoiser. Contended GPU: absolute ms inflated, shares indicative.",
+  "h3": "MiniMax-H3 960x544x124, dense bf16 denoiser (torch 2.12 venv where the hosted int8 pickle is refused), hosted int8-ConvRot text encoder (dequantised, bf16 F.linear), 2-step profiled render (1 denoiser call). Contended GPU."
+ },
+ "models": {
+  "qwen_image_2.1": {
+   "source": "/mnt/disks/unslothai/ubuntu/workspace_81/outputs/bottlenecks_q21_h3/q21/gemm_bf16_eager/gemm_02_c01.json",
+   "stage_device_total_ms": {
+    "other": 0.03,
+    "text_encode": 9.48,
+    "denoiser": 873.37,
+    "scheduler_step": 0.09,
+    "vae_decode": 132.02
+   },
+   "gemm_pct_of_stage": {
+    "denoiser": 46.6,
+    "text_encode": 44.1
+   },
+   "gemm_by_stage": {
+    "denoiser": [
+     {
+      "op": "aten::mm",
+      "M": 4096,
+      "N": 4096,
+      "K": 4096,
+      "batch": 1,
+      "calls": 512,
+      "device_ms": 139.713,
+      "pct_of_stage": 16.0,
+      "tflops": 503.7
+     },
+     {
+      "op": "aten::mm",
+      "M": 4096,
+      "N": 12288,
+      "K": 4096,
+      "batch": 1,
+      "calls": 256,
+      "device_ms": 138.471,
+      "pct_of_stage": 15.85,
+      "tflops": 762.3
+     },
+     {
+      "op": "aten::mm",
+      "M": 4096,
+      "N": 4096,
+      "K": 12288,
+      "batch": 1,
+      "calls": 128,
+      "device_ms": 61.551,
+      "pct_of_stage": 7.05,
+      "tflops": 857.4
+     },
+     {
+      "op": "aten::mm",
+      "M": 4125,
+      "N": 12288,
+      "K": 4096,
+      "batch": 1,
+      "calls": 64,
+      "device_ms": 33.025,
+      "pct_of_stage": 3.78,
+      "tflops": 804.7
+     },
+     {
+      "op": "aten::mm",
+      "M": 4125,
+      "N": 4096,
+      "K": 4096,
+      "batch": 1,
+      "calls": 128,
+      "device_ms": 22.379,
+      "pct_of_stage": 2.56,
+      "tflops": 791.7
+     },
+     {
+      "op": "aten::mm",
+      "M": 4125,
+      "N": 4096,
+      "K": 12288,
+      "batch": 1,
+      "calls": 32,
+      "device_ms": 11.031,
+      "pct_of_stage": 1.26,
+      "tflops": 1204.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 2,
+      "N": 16384,
+      "K": 4096,
+      "batch": 1,
+      "calls": 5,
+      "device_ms": 0.157,
+      "pct_of_stage": 0.02,
+      "tflops": 8.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 2,
+      "N": 4096,
+      "K": 4096,
+      "batch": 1,
+      "calls": 10,
+      "device_ms": 0.145,
+      "pct_of_stage": 0.02,
+      "tflops": 4.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 29,
+      "N": 4096,
+      "K": 4096,
+      "batch": 1,
+      "calls": 10,
+      "device_ms": 0.121,
+      "pct_of_stage": 0.01,
+      "tflops": 80.7
+     }
+    ],
+    "text_encode": [
+     {
+      "op": "aten::mm",
+      "M": 43,
+      "N": 12288,
+      "K": 4096,
+      "batch": 1,
+      "calls": 72,
+      "device_ms": 1.733,
+      "pct_of_stage": 18.28,
+      "tflops": 179.9
+     },
+     {
+      "op": "aten::mm",
+      "M": 43,
+      "N": 4096,
+      "K": 12288,
+      "batch": 1,
+      "calls": 36,
+      "device_ms": 0.879,
+      "pct_of_stage": 9.28,
+      "tflops": 177.2
+     },
+     {
+      "op": "aten::mm",
+      "M": 43,
+      "N": 4096,
+      "K": 4096,
+      "batch": 1,
+      "calls": 72,
+      "device_ms": 0.783,
+      "pct_of_stage": 8.27,
+      "tflops": 132.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 43,
+      "N": 1024,
+      "K": 4096,
+      "batch": 1,
+      "calls": 72,
+      "device_ms": 0.578,
+      "pct_of_stage": 6.1,
+      "tflops": 44.9
+     },
+     {
+      "op": "aten::mm",
+      "M": 43,
+      "N": 151936,
+      "K": 4096,
+      "batch": 1,
+      "calls": 1,
+      "device_ms": 0.205,
+      "pct_of_stage": 2.16,
+      "tflops": 261.2
+     }
+    ]
+   },
+   "conv_by_stage": {
+    "vae_decode": [
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 144, 1026, 1026], [144, 144, 3, 3]]",
+      "calls": 5,
+      "device_ms": 13.475,
+      "pct_of_stage": 10.21
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 66, 66], [1152, 1152, 3, 3]]",
+      "calls": 10,
+      "device_ms": 4.41,
+      "pct_of_stage": 3.34
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 256, 256], [1152, 1152, 3, 3]]",
+      "calls": 1,
+      "device_ms": 4.022,
+      "pct_of_stage": 3.05
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 128, 128], [1152, 1152, 3, 3]]",
+      "calls": 1,
+      "device_ms": 3.222,
+      "pct_of_stage": 2.44
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 144, 1026, 1026], [4, 144, 3, 3]]",
+      "calls": 1,
+      "device_ms": 3.088,
+      "pct_of_stage": 2.34
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 288, 514, 514], [288, 288, 3, 3]]",
+      "calls": 5,
+      "device_ms": 2.918,
+      "pct_of_stage": 2.21
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 576, 258, 258], [576, 576, 3, 3]]",
+      "calls": 5,
+      "device_ms": 2.708,
+      "pct_of_stage": 2.05
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 258, 258], [576, 1152, 3, 3]]",
+      "calls": 1,
+      "device_ms": 2.609,
+      "pct_of_stage": 1.98
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 288, 1024, 1024], [288, 288, 3, 3]]",
+      "calls": 1,
+      "device_ms": 2.465,
+      "pct_of_stage": 1.87
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 130, 130], [1152, 1152, 3, 3]]",
+      "calls": 6,
+      "device_ms": 2.408,
+      "pct_of_stage": 1.82
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 576, 512, 512], [576, 576, 3, 3]]",
+      "calls": 1,
+      "device_ms": 1.986,
+      "pct_of_stage": 1.5
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 288, 1026, 1026], [144, 288, 3, 3]]",
+      "calls": 1,
+      "device_ms": 1.628,
+      "pct_of_stage": 1.23
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 576, 514, 514], [288, 576, 3, 3]]",
+      "calls": 1,
+      "device_ms": 1.392,
+      "pct_of_stage": 1.05
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 1152, 256, 256], [576, 1152, 1, 1]]",
+      "calls": 1,
+      "device_ms": 0.24,
+      "pct_of_stage": 0.18
+     },
+     {
+      "stage": "vae_decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 288, 1024, 1024], [144, 288, 1, 1]]",
+      "calls": 1,
+      "device_ms": 0.139,
+      "pct_of_stage": 0.11
+     }
+    ]
+   }
+  },
+  "minimax_h3": {
+   "source": "/mnt/disks/unslothai/ubuntu/workspace_81/outputs/bottlenecks_q21_h3/h3/bf16dense_teint8_960_torch212/gemm_08_t2v.json",
+   "stage_device_total_ms": {
+    "other": 0.03,
+    "block.MiniMaxH3TextEncoderStep": 83.84,
+    "block.MiniMaxH3PrepareLayoutStep": 0.03,
+    "block.MiniMaxH3PrepareLatentsStep": 0.4,
+    "block.MiniMaxH3SetTimestepsStep": 0.03,
+    "pipeline_call": 0.0,
+    "block.MiniMaxH3LoopDenoiser": 0.0,
+    "transformer": 1651.11,
+    "block.MiniMaxH3LoopSchedulerStep": 0.1,
+    "block.MiniMaxH3AfterDenoiseStep": 0.01,
+    "block.MiniMaxH3VideoDecodeStep": 453.2,
+    "vae.decode": 3124.06,
+    "block.MiniMaxH3AudioDecodeStep": 0.01,
+    "audio_vae.decode": 37.5
+   },
+   "gemm_pct_of_stage": {
+    "vae.decode": 23.4,
+    "transformer": 49.2,
+    "block.MiniMaxH3TextEncoderStep": 13.4
+   },
+   "gemm_by_stage": {
+    "vae.decode": [
+     {
+      "op": "aten::addmm",
+      "M": 1797,
+      "N": 16384,
+      "K": 2048,
+      "batch": 1,
+      "calls": 3780,
+      "device_ms": 335.104,
+      "pct_of_stage": 10.73,
+      "tflops": 1360.3
+     },
+     {
+      "op": "aten::addmm",
+      "M": 1797,
+      "N": 2048,
+      "K": 2048,
+      "batch": 1,
+      "calls": 15120,
+      "device_ms": 221.12,
+      "pct_of_stage": 7.08,
+      "tflops": 1030.8
+     },
+     {
+      "op": "aten::addmm",
+      "M": 1797,
+      "N": 2048,
+      "K": 8192,
+      "batch": 1,
+      "calls": 3780,
+      "device_ms": 170.787,
+      "pct_of_stage": 5.47,
+      "tflops": 1334.6
+     },
+     {
+      "op": "aten::addmm",
+      "M": 1797,
+      "N": 3072,
+      "K": 2048,
+      "batch": 1,
+      "calls": 105,
+      "device_ms": 1.866,
+      "pct_of_stage": 0.06,
+      "tflops": 1272.3
+     },
+     {
+      "op": "aten::mm",
+      "M": 1792,
+      "N": 2048,
+      "K": 24,
+      "batch": 1,
+      "calls": 105,
+      "device_ms": 0.63,
+      "pct_of_stage": 0.02,
+      "tflops": 29.3
+     }
+    ],
+    "transformer": [
+     {
+      "op": "aten::mm",
+      "M": 19303,
+      "N": 28672,
+      "K": 5376,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 323.343,
+      "pct_of_stage": 19.58,
+      "tflops": 920.2
+     },
+     {
+      "op": "aten::mm",
+      "M": 19303,
+      "N": 7168,
+      "K": 5376,
+      "batch": 1,
+      "calls": 150,
+      "device_ms": 214.58,
+      "pct_of_stage": 13.0,
+      "tflops": 1040.0
+     },
+     {
+      "op": "aten::mm",
+      "M": 19303,
+      "N": 5376,
+      "K": 14336,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 166.92,
+      "pct_of_stage": 10.11,
+      "tflops": 891.3
+     },
+     {
+      "op": "aten::mm",
+      "M": 19303,
+      "N": 5376,
+      "K": 7168,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 95.373,
+      "pct_of_stage": 5.78,
+      "tflops": 779.9
+     },
+     {
+      "op": "aten::addmm",
+      "M": 1,
+      "N": 96768,
+      "K": 2688,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 10.539,
+      "pct_of_stage": 0.64,
+      "tflops": 2.5
+     },
+     {
+      "op": "aten::addmm",
+      "M": 18870,
+      "N": 5376,
+      "K": 96,
+      "batch": 1,
+      "calls": 1,
+      "device_ms": 0.916,
+      "pct_of_stage": 0.06,
+      "tflops": 21.3
+     },
+     {
+      "op": "aten::addmm",
+      "M": 19303,
+      "N": 96,
+      "K": 5376,
+      "batch": 1,
+      "calls": 1,
+      "device_ms": 0.675,
+      "pct_of_stage": 0.04,
+      "tflops": 29.5
+     },
+     {
+      "op": "aten::addmm",
+      "M": 19303,
+      "N": 32,
+      "K": 5376,
+      "batch": 1,
+      "calls": 1,
+      "device_ms": 0.322,
+      "pct_of_stage": 0.02,
+      "tflops": 20.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 28672,
+      "K": 5376,
+      "batch": 1,
+      "calls": 2,
+      "device_ms": 0.099,
+      "pct_of_stage": 0.01,
+      "tflops": 118.9
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 7168,
+      "K": 5376,
+      "batch": 1,
+      "calls": 6,
+      "device_ms": 0.098,
+      "pct_of_stage": 0.01,
+      "tflops": 89.7
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 5376,
+      "K": 14336,
+      "batch": 1,
+      "calls": 2,
+      "device_ms": 0.062,
+      "pct_of_stage": 0.0,
+      "tflops": 94.4
+     }
+    ],
+    "block.MiniMaxH3TextEncoderStep": [
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 25600,
+      "K": 5120,
+      "batch": 1,
+      "calls": 100,
+      "device_ms": 4.979,
+      "pct_of_stage": 5.94,
+      "tflops": 100.0
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 5120,
+      "K": 25600,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 2.706,
+      "pct_of_stage": 3.23,
+      "tflops": 92.0
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 5120,
+      "K": 8192,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 0.988,
+      "pct_of_stage": 1.18,
+      "tflops": 80.7
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 1024,
+      "K": 5120,
+      "batch": 1,
+      "calls": 100,
+      "device_ms": 0.868,
+      "pct_of_stage": 1.04,
+      "tflops": 22.9
+     },
+     {
+      "op": "aten::mm",
+      "M": 380,
+      "N": 256,
+      "K": 256,
+      "batch": 1,
+      "calls": 250,
+      "device_ms": 0.729,
+      "pct_of_stage": 0.87,
+      "tflops": 17.1
+     },
+     {
+      "op": "aten::mm",
+      "M": 19,
+      "N": 8192,
+      "K": 5120,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 0.689,
+      "pct_of_stage": 0.82,
+      "tflops": 115.6
+     },
+     {
+      "op": "aten::mm",
+      "M": 1900,
+      "N": 256,
+      "K": 256,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 0.161,
+      "pct_of_stage": 0.19,
+      "tflops": 77.2
+     },
+     {
+      "op": "aten::mm",
+      "M": 608,
+      "N": 256,
+      "K": 256,
+      "batch": 1,
+      "calls": 50,
+      "device_ms": 0.146,
+      "pct_of_stage": 0.17,
+      "tflops": 27.2
+     }
+    ]
+   },
+   "conv_by_stage": {
+    "audio_vae.decode": [
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 256, 1, 5175], [256, 256, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.327,
+      "pct_of_stage": 0.87
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 8, 1, 165600], [8, 8, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.312,
+      "pct_of_stage": 0.83
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 512, 1, 1035], [512, 512, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.307,
+      "pct_of_stage": 0.82
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 8, 1, 165600], [8, 8, 1, 7]]",
+      "calls": 6,
+      "device_ms": 0.281,
+      "pct_of_stage": 0.75
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 512, 1, 1035], [512, 512, 1, 7]]",
+      "calls": 6,
+      "device_ms": 0.245,
+      "pct_of_stage": 0.65
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 128, 1, 10350], [128, 128, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.235,
+      "pct_of_stage": 0.63
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 256, 1, 5175], [256, 256, 1, 7]]",
+      "calls": 6,
+      "device_ms": 0.234,
+      "pct_of_stage": 0.62
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 16, 1, 82800], [16, 16, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.228,
+      "pct_of_stage": 0.61
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 16, 1, 82800], [16, 16, 1, 7]]",
+      "calls": 6,
+      "device_ms": 0.2,
+      "pct_of_stage": 0.53
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 8, 1, 165600], [8, 8, 1, 3]]",
+      "calls": 6,
+      "device_ms": 0.2,
+      "pct_of_stage": 0.53
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 64, 1, 20700], [64, 64, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.191,
+      "pct_of_stage": 0.51
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 32, 1, 41400], [32, 32, 1, 11]]",
+      "calls": 6,
+      "device_ms": 0.19,
+      "pct_of_stage": 0.51
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 128, 1, 10350], [128, 128, 1, 7]]",
+      "calls": 6,
+      "device_ms": 0.186,
+      "pct_of_stage": 0.5
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 512, 1, 1035], [512, 512, 1, 3]]",
+      "calls": 6,
+      "device_ms": 0.178,
+      "pct_of_stage": 0.48
+     },
+     {
+      "stage": "audio_vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[2, 256, 1, 5175], [256, 256, 1, 3]]",
+      "calls": 6,
+      "device_ms": 0.174,
+      "pct_of_stage": 0.46
+     }
+    ],
+    "vae.decode": [
+     {
+      "stage": "vae.decode",
+      "op": "aten::cudnn_convolution",
+      "shapes": "[[1, 24, 7, 16, 16], [24, 24, 1, 1, 1]]",
+      "calls": 105,
+      "device_ms": 0.273,
+      "pct_of_stage": 0.01
+     }
+    ]
+   }
+  }
+ }
+}
