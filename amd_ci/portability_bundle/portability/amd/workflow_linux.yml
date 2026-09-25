@@ -1,0 +1,79 @@
+name: "AMD CI: kernel portability harness (Linux gfx1151)"
+
+# Runs scripts/portability/harness.py (bundled under amd_ci/portability_bundle with the exact kernel sources of
+# PR 11801 and PR 10731) on the gfx1151 Linux runner: int8 GEMM paths, the H3 VAE Triton kernels, the NVFP4 gate,
+# Inductor's Triton conv template vs MIOpen, and Studio's compile / CUDA-graph tier settings in bf16 and fp16.
+# A capability probe, not a PR differential: there is no defect to reproduce on a base, so no base leg.
+# No HF token and no model download: every case uses synthetic tensors at the real shapes.
+
+on:
+  push:
+    branches: [amd-ci-portability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  gpu:
+    name: "portability harness on gfx1151 Linux (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "portability-gpu"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set +e
+          python3 -m venv "$AMD_CI_WORK/venv"
+          PY="$AMD_CI_WORK/venv/bin/python"
+          "$PY" -m pip install -q --upgrade pip 2>&1 | tail -2
+          "$PY" -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" 2>&1 | tail -5
+          "$PY" -c "import triton" 2>/dev/null || "$PY" -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ triton 2>&1 | tail -3
+          "$PY" -m pip install -q numpy 2>&1 | tail -2
+          "$PY" -m pip install -q --no-deps "torchao==0.17.0" 2>&1 | tail -2
+          "$PY" -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available() and torch.cuda.get_device_name(0))"
+          "$PY" -c "import triton; print('triton', triton.__version__)"
+          "$PY" -c "import torchao; print('torchao', torchao.__version__)"
+          echo "AMD_CI_PY=$PY" >> "$GITHUB_ENV"
+          "$PY" amd_ci/lib/gate.py --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          gate_rc=$?
+          exit $gate_rc
+
+      - name: Portability harness
+        timeout-minutes: 170
+        run: |
+          set +e
+          "$AMD_CI_PY" -u amd_ci/portability_bundle/portability/harness.py --cases all --quick --iters 10 \
+            --timeout 2400 --bundle "$GITHUB_WORKSPACE/amd_ci/portability_bundle" \
+            --out "$AMD_CI_WORK/out/portability" > "$AMD_CI_WORK/out/harness.log" 2>&1
+          harness_rc=$?
+          grep -E '^(=====|\[|wrote|device )' "$AMD_CI_WORK/out/harness.log" | tail -400
+          echo "harness exit $harness_rc"
+          cat "$AMD_CI_WORK/out/portability/report.md" >> "$GITHUB_STEP_SUMMARY"
+          test -f "$AMD_CI_WORK/out/portability/results.json"
+
+      - name: What this host cannot answer
+        if: always()
+        run: |
+          set +e
+          "$AMD_CI_PY" -c "import sys; sys.path.insert(0, 'amd_ci/lib'); import capability as c; print(c.untested_section(c.detect(), ['rocm', 'gpu', 'nvidia', 'discrete_gpu', 'multi_gpu', 'windows']))" > "$AMD_CI_WORK/out/UNTESTED.md"
+          cat "$AMD_CI_WORK/out/UNTESTED.md" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: portability-gfx1151-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
