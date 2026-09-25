@@ -11,7 +11,7 @@ on:
 permissions: {}
 
 env:
-  UNSLOTH_SPEC: "unsloth @ git+https://github.com/LeoBorcherding/unsloth@feat/block-swap"
+  UNSLOTH_SPEC: "unsloth[huggingface] @ git+https://github.com/LeoBorcherding/unsloth@feat/block-swap"
   ZOO_SPEC: "unsloth-zoo @ git+https://github.com/LeoBorcherding/unsloth-zoo@feat/block-swap"
   ROCM_INDEX: https://repo.amd.com/rocm/whl/gfx1151
   UV_ZIP: https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-pc-windows-msvc.zip
@@ -55,12 +55,13 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           # unsloth imports bitsandbytes unconditionally. The continuous-release wheel is the
           # one a working Windows ROCm env carries; PyPI's CUDA build is the import-only fallback.
+          $env:UV_SKIP_WHEEL_FILENAME_CHECK = '1'   # the wheel's filename version differs from its metadata
           & $env:UV pip install --python $env:PY $env:BNB_WHEEL
           if ($LASTEXITCODE -ne 0) { "continuous-release bitsandbytes failed, falling back to PyPI"; & $env:UV pip install --python $env:PY "bitsandbytes>=0.45.5" }
           & $env:UV pip install --python $env:PY --extra-index-url $env:ROCM_INDEX --index-strategy unsafe-best-match "$env:UNSLOTH_SPEC"
           & $env:UV pip install --python $env:PY --no-deps --reinstall-package unsloth-zoo "$env:ZOO_SPEC"
-          & $env:PY -c "import torch, unsloth_zoo, unsloth; print('torch', torch.__version__); print('unsloth', unsloth.__version__, 'zoo', unsloth_zoo.__version__)"
-          & $env:PY -c "import unsloth_zoo.block_swap as b; from unsloth.models import _utils; print('block_swap module', b.__file__); print('install_block_swap', hasattr(_utils, 'install_block_swap'))"
+          & $env:PY -c "import torch, unsloth, unsloth_zoo; print('torch', torch.__version__); print('unsloth', unsloth.__version__, 'zoo', unsloth_zoo.__version__)"
+          & $env:PY -c "import unsloth; import unsloth_zoo.block_swap as b; from unsloth.models import _utils; print('block_swap module', b.__file__); print('install_block_swap', hasattr(_utils, 'install_block_swap'))"
 
       - name: Run the probe
         shell: powershell
