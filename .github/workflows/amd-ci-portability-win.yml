@@ -1,0 +1,122 @@
+name: "AMD CI (Windows): kernel portability harness (gfx1151)"
+
+# Windows counterpart of amd-ci-portability.yml: the same bundled harness on the non-Docker Windows 11 gfx1151
+# boxes, with AMD's gfx1151 torch wheels. Whether Triton (and so torch.compile and every Triton kernel) exists
+# here is part of what is measured: a missing Triton shows up as fails / fallback rows, not a skipped job.
+# No HF token and no model download.
+#
+# linux-control differs from the Windows job only in the OS label: if it starts and the Windows job does not,
+# the selector matched no runner.
+
+on:
+  push:
+    branches: [amd-ci-portability-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+
+  windows:
+    name: "portability harness on gfx1151 Windows"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu-windows
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "portability-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0"
+          Write-Host "torch install exit: $LASTEXITCODE"
+          & $py -c "import triton" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ triton
+            Write-Host "triton (AMD index) install exit: $LASTEXITCODE"
+          }
+          & $py -m pip install -q numpy
+          & $py -m pip install -q --no-deps "torchao==0.17.0"
+          & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available() and torch.cuda.get_device_name(0))"
+          & $py -c "import triton; print('triton', triton.__version__)"
+          & $py -c "import torchao; print('torchao', torchao.__version__)"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host.json"
+          exit $LASTEXITCODE
+
+      - name: Portability harness
+        timeout-minutes: 170
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:PYTHONIOENCODING = "utf-8"
+          $env:PYTHONUTF8 = "1"
+          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\portability_bundle\portability\harness.py" `
+            --cases all --quick --iters 10 --timeout 2400 `
+            --bundle "$env:GITHUB_WORKSPACE\amd_ci\portability_bundle" `
+            --out "$env:AMD_CI_WORK\out\portability" *> "$env:AMD_CI_WORK\out\harness.log"
+          Write-Host "harness exit $LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\harness.log" -Encoding UTF8 | Select-String -Pattern '^(=====|\[|wrote|device )' | Select-Object -Last 400
+          Get-Content "$env:AMD_CI_WORK\out\portability\report.md" -Encoding UTF8 | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\portability\results.json")) { exit 1 }
+
+      - name: What this host cannot answer
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -c "import sys; sys.path.insert(0, r'amd_ci\lib'); import capability as c; print(c.untested_section(c.detect(), ['rocm', 'gpu', 'nvidia', 'discrete_gpu', 'multi_gpu', 'windows_docker']))" |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\UNTESTED.md"
+          Get-Content "$env:AMD_CI_WORK\out\UNTESTED.md" -Encoding UTF8 | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: portability-gfx1151-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
