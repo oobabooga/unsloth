@@ -41,6 +41,9 @@ jobs:
           "$PY" -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" 2>&1 | tail -5
           "$PY" -c "import triton" 2>/dev/null || "$PY" -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ triton 2>&1 | tail -3
           "$PY" -m pip install -q numpy 2>&1 | tail -2
+          # the kernel verifier builds its references from Diffusers' own modules; never let it touch the ROCm torch
+          "$PY" -m pip install -q huggingface_hub safetensors regex requests filelock pillow 2>&1 | tail -2
+          "$PY" -m pip install -q --no-deps diffusers 2>&1 | tail -2
           "$PY" -m pip install -q --no-deps "torchao==0.17.0" 2>&1 | tail -2
           "$PY" -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available() and torch.cuda.get_device_name(0))"
           "$PY" -c "import triton; print('triton', triton.__version__)"

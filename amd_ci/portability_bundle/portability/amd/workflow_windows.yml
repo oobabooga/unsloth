@@ -88,6 +88,8 @@ jobs:
             Write-Host "triton-windows install exit: $LASTEXITCODE"
           }
           & $py -m pip install -q numpy
+          & $py -m pip install -q huggingface_hub safetensors regex requests filelock pillow
+          & $py -m pip install -q --no-deps diffusers
           & $py -m pip install -q --no-deps "torchao==0.17.0"
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available() and torch.cuda.get_device_name(0))"
           & $py -c "import triton; print('triton', triton.__version__)"
