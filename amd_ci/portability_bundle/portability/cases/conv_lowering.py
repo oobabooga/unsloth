@@ -51,6 +51,7 @@ def _run(ctx):
     have_backends = hasattr(icfg, "max_autotune_conv_backends")
     engine = "MIOpen" if ctx.is_rocm else "cuDNN"
     dts = [("fp16", torch.float16), ("bf16", torch.bfloat16)]
+    slow_bf16 = (not ctx.is_rocm) and ctx.cap < (8, 0)
     ws_root = os.environ.get("WORKSPACE")
     for si, (tag, xs, wsh, st) in enumerate(conv_shapes(ctx.quick, ws_root, ctx.bundle)):
         nd = len(xs) - 2
@@ -58,6 +59,10 @@ def _run(ctx):
         convf = F.conv3d if nd == 3 else F.conv2d
         shp = f"{tag} {'x'.join(map(str, xs[1:]))} k{'x'.join(map(str, wsh[2:]))}"
         for dn, dt in dts:
+            if dt is torch.bfloat16 and slow_bf16 and si > 0:
+                ctx.row("eager", shape = shp, dtype = dn, status = SKIPPED,
+                        note = "bf16 conv has no tensor-core path below sm80 (~14x fp16); measured on the first shape only")
+                continue
             try:
                 g = torch.Generator(device = "cuda").manual_seed(100 + si)
                 x = torch.randn(*xs, device = "cuda", generator = g).to(dt).contiguous(memory_format = cl)
@@ -85,6 +90,12 @@ def _run(ctx):
             except Exception as exc:  # noqa: BLE001
                 ctx.fail("eager", exc, shape = shp, dtype = dn)
             variants = [("compiled", {}, None)]
+            if eager_ms is not None and eager_ms > 250:
+                ctx.row("compiled", shape = shp, dtype = dn, status = SKIPPED,
+                        note = f"eager {eager_ms:.0f} ms per call: autotuning this shape would exceed the case budget")
+                del x, w, b, ref
+                torch.cuda.empty_cache()
+                continue
             if have_backends:
                 variants += [("ma_aten_triton", {"max_autotune_conv_backends": "ATEN,TRITON"},
                               "max-autotune-no-cudagraphs"),

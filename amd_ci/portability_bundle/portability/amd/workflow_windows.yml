@@ -87,6 +87,27 @@ jobs:
             & $py -m pip install -q "triton-windows<3.7"
             Write-Host "triton-windows install exit: $LASTEXITCODE"
           }
+          # triton-windows' AMD backend builds a HIP stub with clang-cl and needs the ROCm SDK headers (rocm[devel])
+          $rv = ""
+          $show = & $py -m pip show rocm 2>$null | Select-String '^Version:'
+          if ($null -ne $show) { $rv = $show.ToString().Split(':')[1].Trim() }
+          if ($rv -ne "") { $spec = "rocm[devel]==$rv" } else { $spec = "rocm[devel]" }
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ $spec
+          Write-Host "$spec install exit: $LASTEXITCODE"
+          $sdk = "$env:AMD_CI_WORK\venv\Scripts\rocm-sdk.exe"
+          if (Test-Path -LiteralPath $sdk) {
+            & $sdk init
+            $root = (& $sdk path --root | Out-String).Trim()
+            Write-Host "rocm sdk root: $root"
+            if ($root -ne "" -and (Test-Path -LiteralPath "$root\include\hip\hip_runtime.h")) {
+              Add-Content -Path $env:GITHUB_ENV -Value "HIP_PATH=$root"
+              Add-Content -Path $env:GITHUB_ENV -Value "ROCM_HOME=$root"
+              Add-Content -Path $env:GITHUB_ENV -Value "INCLUDE=$root\include;$env:INCLUDE"
+              Write-Host "hip_runtime.h found under $root\include"
+            } else {
+              Write-Host "hip_runtime.h NOT found under the SDK root"
+            }
+          }
           & $py -m pip install -q numpy
           & $py -m pip install -q huggingface_hub safetensors regex requests filelock pillow
           & $py -m pip install -q --no-deps diffusers

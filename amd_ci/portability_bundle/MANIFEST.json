@@ -1,9 +1,9 @@
 {
- "built": "2026-09-25 00:54:23",
+ "built": "2026-09-25 01:43:18",
  "repo": "/mnt/disks/unslothai/ubuntu/workspace_81/wt_port_h3",
  "h3": {
   "ref": "origin/studio-h3-vae-fast",
-  "sha": "a0758151a7d106b432454a3ca2974ba0d869ad24"
+  "sha": "a9af4455757bb03b9232fdfbf340cb3216f06f61"
  },
  "bias": {
   "ref": "origin/studio-nvfp4-kernels",
