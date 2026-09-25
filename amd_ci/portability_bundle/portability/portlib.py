@@ -50,6 +50,13 @@ def device_facts() -> dict:
         info["total_mem_gb"] = round(p.total_memory / 2**30, 1)
         info["sm_count"] = p.multi_processor_count
         try:
+            from torch._inductor.utils import is_big_gpu
+
+            # below 68 SMs (NVIDIA) Inductor offers no Triton GEMM / conv templates, so max-autotune is aten-only
+            info["inductor_big_gpu"] = bool(is_big_gpu(0))
+        except Exception as exc:  # noqa: BLE001
+            info["inductor_big_gpu"] = f"unknown: {type(exc).__name__}"
+        try:
             info["cudnn"] = torch.backends.cudnn.version()
         except Exception:  # noqa: BLE001
             info["cudnn"] = None

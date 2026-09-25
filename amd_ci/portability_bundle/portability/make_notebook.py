@@ -40,10 +40,10 @@ if not torch.cuda.is_available():
 v = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:3])
 AO = {(2, 6): "0.12.0", (2, 7): "0.12.0", (2, 8): "0.13.0", (2, 10): "0.16.0", (2, 11): "0.17.0", (2, 12): "0.17.0"}
 ao = "0.14.1" if v[:3] == (2, 9, 0) else "0.15.0" if v[:2] == (2, 9) else AO.get(v[:2], "0.17.0")
-try:
-    import torchao
-    print("torchao preinstalled", torchao.__version__)
-except Exception:
+r = subprocess.run([sys.executable, "-c", "import torchao; print(torchao.__version__)"], capture_output=True, text=True)
+have = r.stdout.strip().split("+")[0] if r.returncode == 0 else None
+print("torchao preinstalled:", have, "matched to this torch:", ao)
+if have != ao:
     r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", f"torchao=={ao}"],
                        capture_output=True, text=True)
     print("pip torchao", ao, "rc", r.returncode, r.stderr[-500:])

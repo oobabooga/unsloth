@@ -119,7 +119,8 @@ def main(argv = None):
     for d in order:
         i = devs[d]["device"]
         L.append(f"- {d}: {i.get('name')} ({i.get('arch')}), torch {i.get('torch')}, triton {i.get('triton')}, "
-                 f"torchao {i.get('torchao')}, cuda {i.get('cuda_runtime')}, hip {i.get('hip')}, {i.get('platform')}, "
+                 f"torchao {i.get('torchao')}, cuda {i.get('cuda_runtime')}, hip {i.get('hip')}, SMs {i.get('sm_count')}, "
+                 f"inductor big_gpu {i.get('inductor_big_gpu')}, {i.get('platform')}, "
                  f"run {devs[d].get('time')}")
     L += ["", "## Non-runs (first notes)", ""]
     for lab in labels:

@@ -1,5 +1,5 @@
 {
- "built": "2026-09-25 00:15:43",
+ "built": "2026-09-25 00:51:11",
  "repo": "/mnt/disks/unslothai/ubuntu/workspace_81/wt_port_h3",
  "h3": {
   "ref": "origin/studio-h3-vae-fast",
@@ -7,11 +7,11 @@
  },
  "bias": {
   "ref": "origin/studio-nvfp4-kernels",
-  "sha": "d317b7086dba873258bfae0b019d583e7b17698b"
+  "sha": "006cc7173b5f508753763eba0550019130ed4db3"
  },
  "main": {
   "ref": "origin/main",
-  "sha": "f9bffe265889379126785d129700345a11f38b60"
+  "sha": "1ecc01a306a5643dbcc80d19aa3c11a66e3b12ec"
  },
  "verify": {
   "path": "/mnt/disks/unslothai/ubuntu/workspace_81/scripts/triton_vs_inductor/verify.py",

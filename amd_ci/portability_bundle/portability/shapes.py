@@ -53,39 +53,35 @@ def _profiler_table(ws: str | None, bundle: str | None):
     return None, None
 
 
-def _parse_profiler(obj) -> list:
-    """Tolerant: any list (or dict of lists) of records carrying M/K/N (any case) becomes a shape."""
-    recs = []
+# (model key in gemm_shapes.json, stage, top-k quick, top-k full, M cap in quick)
+_PROF_GEMM = [
+    ("qwen_image_2.1", "denoiser", 3, 6, 4352),
+    ("minimax_h3", "transformer", 3, 5, 8192),
+    ("minimax_h3", "vae.decode", 2, 3, 2048),
+    ("qwen_image_2.1", "text_encode", 0, 1, 64),
+    ("minimax_h3", "block.MiniMaxH3TextEncoderStep", 0, 1, 64),
+]
+_TAG = {"qwen_image_2.1": "q21", "minimax_h3": "h3"}
 
-    def walk(o, model = ""):
-        if isinstance(o, dict):
-            keys = {k.lower(): k for k in o}
-            if all(x in keys for x in ("m", "k", "n")):
-                recs.append((o.get("model", model), int(o[keys["m"]]), int(o[keys["k"]]), int(o[keys["n"]]),
-                             bool(o.get("bias", False)), float(o.get("time_share", o.get("share", 0)) or 0)))
-                return
-            for k, v in o.items():
-                walk(v, k if isinstance(v, (list, dict)) and not model else model)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v, model)
 
-    walk(obj)
-    return recs
+def _profiler_gemms(table, quick: bool, src: str) -> list:
+    out = []
+    models = (table or {}).get("models", {})
+    for model, stage, kq, kf, mcap in _PROF_GEMM:
+        recs = [r for r in models.get(model, {}).get("gemm_by_stage", {}).get(stage, []) if r.get("batch", 1) == 1]
+        recs.sort(key = lambda r: -float(r.get("pct_of_stage", 0)))
+        for r in recs[: (kq if quick else kf)]:
+            m = int(r["M"])
+            out.append({"tag": f"{_TAG.get(model, model)}.{stage}.{r['K']}x{r['N']}", "M": min(m, mcap) if quick else m,
+                        "K": int(r["K"]), "N": int(r["N"]), "bias": r.get("op") == "aten::addmm",
+                        "source": f"profiler {os.path.basename(src)} {stage} {r.get('pct_of_stage')}% (M={m})"})
+    return out
 
 
 def gemm_shapes(quick: bool, ws: str | None = None, bundle: str | None = None) -> list[dict]:
     """[{tag, M, K, N, bias, source}], deduplicated on (M, K, N, bias)."""
     table, src = _profiler_table(ws, bundle)
-    out = []
-    if table is not None:
-        recs = _parse_profiler(table)
-        recs.sort(key = lambda r: -r[5])
-        for model, m, k, n, b, share in recs[: (6 if quick else 16)]:
-            if quick:
-                m = min(m, 4352)
-            out.append({"tag": f"{model or 'prof'}.{k}x{n}", "M": m, "K": k, "N": n, "bias": b,
-                        "source": f"profiler {os.path.basename(src)} share={share:.3f}"})
+    out = _profiler_gemms(table, quick, src) if table is not None else []
     if not out:
         qm, hm = (Q21_TOK_QUICK, H3_TOK_QUICK) if quick else (Q21_TOK, H3_TOK)
         for tag, k, n, b, _ in Q21_LINEARS:
@@ -94,12 +90,6 @@ def gemm_shapes(quick: bool, ws: str | None = None, bundle: str | None = None) -
             out.append({"tag": tag, "M": hm, "K": k, "N": n, "bias": b, "source": "config"})
         for tag, k, n, b, _ in H3_VAE_LINEARS[: (1 if quick else 3)]:
             out.append({"tag": tag, "M": 2048 if quick else H3_VAE_TOK, "K": k, "N": n, "bias": b, "source": "config"})
-        if quick:
-            # the Qwen 1024x1024 production size on the two most expensive shapes
-            out.append({"tag": "q21.mlp.proj_gate@1024", "M": Q21_TOK, "K": 4096, "N": 12288, "bias": False,
-                        "source": "config"})
-            out.append({"tag": "q21.attn.to_qkv@1024", "M": Q21_TOK, "K": 4096, "N": 4096, "bias": False,
-                        "source": "config"})
     seen, uniq = set(), []
     for s in out:
         key = (s["M"], s["K"], s["N"], s["bias"])
@@ -109,29 +99,49 @@ def gemm_shapes(quick: bool, ws: str | None = None, bundle: str | None = None) -
     return uniq
 
 
-# Conv3d on an already causally padded, channels-last input (Studio pads outside the conv, as the H3 fused path and
-# the Wan-style CausalConv3d both do). (tag, Cin, Cout, T_in, H_in, W_in, kernel, stride)
-# H3 encoder at a 256x256 tile, 17-frame clip (block_out_channels 128,256,256,512,512,1024).
-# Qwen-Image-2.1 VAE (Wan-style, base 96 / decoder base 144, dim_mult 1,2,4,8,8) decoding one 1024x1024 image: a
-# single frame whose causal pad makes T_in = 3.
-CONV_SHAPES_FULL = [
-    ("h3.enc.L0.128", 128, 128, 19, 258, 258, (3, 3, 3), (1, 1, 1)),
-    ("h3.enc.L1.256", 256, 256, 19, 130, 130, (3, 3, 3), (1, 1, 1)),
-    ("h3.enc.L3.512", 512, 512, 7, 34, 34, (3, 3, 3), (1, 1, 1)),
-    ("h3.enc.conv_in", 3, 128, 19, 258, 258, (3, 3, 3), (1, 1, 1)),
-    ("h3.enc.shortcut1x1", 128, 256, 17, 128, 128, (1, 1, 1), (1, 1, 1)),
-    ("q21.dec.1152@64", 1152, 1152, 3, 66, 66, (3, 3, 3), (1, 1, 1)),
-    ("q21.dec.576@256", 576, 576, 3, 258, 258, (3, 3, 3), (1, 1, 1)),
-    ("q21.dec.288@512", 288, 288, 3, 514, 514, (3, 3, 3), (1, 1, 1)),
-    ("q21.dec.144@1024", 144, 144, 3, 1026, 1026, (3, 3, 3), (1, 1, 1)),
+# Conv on an already padded, channels-last input (Studio / the VAEs pad outside the conv). Entries are
+# (tag, input shape, weight shape, stride). H3 encoder (block_out_channels 128,256,256,512,512,1024) at a 256x256 tile,
+# 17-frame clip, from the config; the Qwen-Image-2.1 VAE decode convs come from the profiler (2D 3x3 in image mode).
+H3_ENC_CONV = [
+    ("h3.enc.L0.128", (1, 128, 19, 258, 258), (128, 128, 3, 3, 3), 1),
+    ("h3.enc.L1.256", (1, 256, 19, 130, 130), (256, 256, 3, 3, 3), 1),
+    ("h3.enc.L3.512", (1, 512, 7, 34, 34), (512, 512, 3, 3, 3), 1),
+    ("h3.enc.conv_in", (1, 3, 19, 258, 258), (128, 3, 3, 3, 3), 1),
 ]
-CONV_SHAPES_QUICK = [
-    ("h3.enc.L0.128.T5", 128, 128, 7, 130, 130, (3, 3, 3), (1, 1, 1)),
-    ("h3.enc.L3.512", 512, 512, 7, 34, 34, (3, 3, 3), (1, 1, 1)),
-    ("q21.dec.1152@64", 1152, 1152, 3, 66, 66, (3, 3, 3), (1, 1, 1)),
-    ("q21.dec.288@512", 288, 288, 3, 514, 514, (3, 3, 3), (1, 1, 1)),
+H3_ENC_CONV_QUICK = [
+    ("h3.enc.L0.128.T5", (1, 128, 7, 130, 130), (128, 128, 3, 3, 3), 1),
+    ("h3.enc.L3.512", (1, 512, 7, 34, 34), (512, 512, 3, 3, 3), 1),
+]
+Q21_DEC_CONV = [
+    ("q21.vae_decode.144@1024", (1, 144, 1026, 1026), (144, 144, 3, 3), 1),
+    ("q21.vae_decode.1152@64", (1, 1152, 66, 66), (1152, 1152, 3, 3), 1),
+    ("q21.vae_decode.1152@256", (1, 1152, 256, 256), (1152, 1152, 3, 3), 1),
+    ("q21.vae_decode.288@512", (1, 288, 514, 514), (288, 288, 3, 3), 1),
 ]
 
 
-def conv_shapes(quick: bool) -> list:
-    return CONV_SHAPES_QUICK if quick else CONV_SHAPES_FULL
+def _profiler_convs(table, quick: bool) -> list:
+    out = []
+    for model, stages in (("qwen_image_2.1", ("vae_decode",)), ("minimax_h3", ("vae.decode",))):
+        for st in stages:
+            recs = (table or {}).get("models", {}).get(model, {}).get("conv_by_stage", {}).get(st, [])
+            recs = sorted(recs, key = lambda r: -float(r.get("device_ms", 0)))
+            for r in recs[: (3 if quick else 6)]:
+                try:
+                    x, w = json.loads(r["shapes"])
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(x) not in (4, 5) or len(w) != len(x) or w[1] != x[1]:
+                    continue
+                if w[0] * w[1] * (x[-1] * x[-2]) < 1 << 20:
+                    continue
+                tag = f"{_TAG.get(model, model)}.{st}.{w[1]}->{w[0]}@{x[-2]}"
+                out.append((tag, tuple(x), tuple(w), 1))
+    return out
+
+
+def conv_shapes(quick: bool, ws: str | None = None, bundle: str | None = None) -> list:
+    table, _ = _profiler_table(ws, bundle)
+    prof = _profiler_convs(table, quick) if table is not None else []
+    q21 = prof or (Q21_DEC_CONV[:2] if quick else Q21_DEC_CONV)
+    return (H3_ENC_CONV_QUICK if quick else H3_ENC_CONV) + q21

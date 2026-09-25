@@ -1,5 +1,5 @@
 """Item 3: Inductor's own Triton conv template (torch/_inductor/kernel/conv.py, via max-autotune) vs cuDNN / MIOpen,
-on the H3 encoder and Qwen-Image-2.1 VAE Conv3d shapes, fp16 and bf16, channels-last like Studio.
+on the H3 encoder Conv3d and Qwen-Image-2.1 VAE decode Conv2d shapes, fp16 and bf16, channels-last like Studio.
 
   eager            F.conv3d, cudnn.benchmark on (cuDNN on NVIDIA, MIOpen on ROCm)
   compiled         torch.compile default: Inductor keeps the conv as an extern aten call
@@ -51,24 +51,29 @@ def _run(ctx):
     have_backends = hasattr(icfg, "max_autotune_conv_backends")
     engine = "MIOpen" if ctx.is_rocm else "cuDNN"
     dts = [("fp16", torch.float16), ("bf16", torch.bfloat16)]
-    for si, (tag, cin, cout, T, H, W, k, st) in enumerate(conv_shapes(ctx.quick)):
-        shp = f"{tag} {cin}->{cout} {T}x{H}x{W} k{k[0]}"
+    ws_root = os.environ.get("WORKSPACE")
+    for si, (tag, xs, wsh, st) in enumerate(conv_shapes(ctx.quick, ws_root, ctx.bundle)):
+        nd = len(xs) - 2
+        cl = torch.channels_last_3d if nd == 3 else torch.channels_last
+        convf = F.conv3d if nd == 3 else F.conv2d
+        shp = f"{tag} {'x'.join(map(str, xs[1:]))} k{'x'.join(map(str, wsh[2:]))}"
         for dn, dt in dts:
             try:
                 g = torch.Generator(device = "cuda").manual_seed(100 + si)
-                x = torch.randn(1, cin, T, H, W, device = "cuda", generator = g).to(dt)
-                x = x.contiguous(memory_format = torch.channels_last_3d)
-                w = (torch.randn(cout, cin, *k, device = "cuda", generator = g) / (cin * k[0] * k[1] * k[2]) ** 0.5)
-                w = w.to(dt).contiguous(memory_format = torch.channels_last_3d)
-                b = (torch.randn(cout, device = "cuda", generator = g) * 0.1).to(dt)
-                ref = F.conv3d(x.float(), w.float(), b.float(), st)
+                x = torch.randn(*xs, device = "cuda", generator = g).to(dt).contiguous(memory_format = cl)
+                fan = 1
+                for d in wsh[1:]:
+                    fan *= d
+                w = (torch.randn(*wsh, device = "cuda", generator = g) / fan ** 0.5).to(dt).contiguous(memory_format = cl)
+                b = (torch.randn(wsh[0], device = "cuda", generator = g) * 0.1).to(dt)
+                ref = convf(x.float(), w.float(), b.float(), st)
             except torch.cuda.OutOfMemoryError as exc:
                 ctx.row("setup", shape = shp, dtype = dn, status = SKIPPED, note = f"OOM: {exc}"[:200])
                 torch.cuda.empty_cache()
                 continue
 
-            def conv(a, ww, bb):
-                return F.conv3d(a, ww, bb, st)
+            def conv(a, ww, bb, _f = convf):
+                return _f(a, ww, bb, st)
 
             eager_ms = comp_ms = None
             try:
