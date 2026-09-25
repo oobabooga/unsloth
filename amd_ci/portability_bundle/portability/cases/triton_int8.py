@@ -22,7 +22,14 @@ def kernels():
         return _KERNELS
     import triton
     import triton.language as tl
-    from triton.language.extra import libdevice
+
+    @triton.jit
+    def _rne(y):
+        # round half to even from floor: HIP's libdevice lacks rint on some Triton builds (3.6 ROCm)
+        f = tl.floor(y)
+        d = y - f
+        odd = f - 2.0 * tl.floor(f * 0.5)
+        return tl.where(d > 0.5, f + 1.0, tl.where(d < 0.5, f, f + odd))
 
     hip = bool(getattr(torch.version, "hip", None))
     stages = [2] if hip else [3, 4]
@@ -46,7 +53,7 @@ def kernels():
         for k0 in range(0, K, BLOCK_K):
             offs = k0 + tl.arange(0, BLOCK_K)
             x = tl.load(x_ptr + row * stride_xm + offs, mask = offs < K, other = 0.0).to(tl.float32)
-            q = libdevice.rint(tl.div_rn(x, s))
+            q = _rne(tl.div_rn(x, s))
             q = tl.minimum(tl.maximum(q, -127.0), 127.0)
             tl.store(q_ptr + row * K + offs, q.to(tl.int8), mask = offs < K)
 
@@ -87,7 +94,7 @@ def kernels():
                         mask = (rm[:, None] < M) & (ka[None, :] < K), other = 0)
             if FUSED_QUANT:
                 # multiply by the reciprocal: an IEEE divide per element per N tile costs ~15x the whole GEMM
-                q = libdevice.rint(a.to(tl.float32) * inv[:, None])
+                q = _rne(a.to(tl.float32) * inv[:, None])
                 a = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
             b = tl.load(b_ptr + rn64[None, :] * stride_bn + ka[:, None] * stride_bk,
                         mask = (rn[None, :] < N) & (ka[:, None] < K), other = 0)
