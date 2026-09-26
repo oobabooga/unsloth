@@ -72,8 +72,8 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
 
 
 def table(obs: dict) -> str:
-    rows = ["| state | image | ROCm | torch | HIP | bnb libs loaded | bnb 4-bit fwd/bwd | Unsloth QLoRA 3 steps |",
-            "|---|---|---|---|---|---|---|---|"]
+    rows = ["| state | image | ROCm | torch | HIP | device arch (build archs has it?) | torch.compile on CPU | bnb lib on import | bnb 4-bit fwd/bwd | Unsloth QLoRA 3 steps |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for n, v in obs.items():
         if n.startswith("_"):
             continue
@@ -84,8 +84,13 @@ def table(obs: dict) -> str:
                 f"FAIL rc={b.get('rc')}" + (f" SIG{b['signal']}" if b.get("signal") else ""))
             ucell = ("ok " + ", ".join(f"{l:.3f}" for l in u.get("losses", []))) if _train_ok(r) else (
                 f"FAIL rc={u.get('rc')}" + (f" SIG{u['signal']}" if u.get("signal") else ""))
+            arch = ti.get("arch")
+            archcell = f"{arch} ({'yes' if arch and arch.split(':')[0] in (ti.get('arch_list') or []) else 'NO'})"
+            dy = (r.get("dynamo") or {})
+            dcell = "ok" if dy.get("dynamo_ok") else f"FAIL rc={dy.get('rc')}"
+            bi = ", ".join((r.get("bnb_import") or {}).get("loaded_bnb_libs") or []) or "-"
             rows.append(f"| {n} | {t} | {r.get('container_rocm_version')} | {ti.get('torch')} | "
-                        f"{ti.get('hip')} | {libs} | {bcell} | {ucell} |")
+                        f"{ti.get('hip')} | {archcell} | {dcell} | {bi} | {bcell} | {ucell} |")
     rows += ["", "Declared arch gfx1100 via UNSLOTH_ROCM_GFX_ARCH, run through HSA_OVERRIDE_GFX_VERSION=11.0.0 "
              "on gfx1151 silicon. Containers share the runner's host kernel driver, which is new: an old "
              "amdgpu/KFD driver paired with a rocm6.4 torch is NOT exercised by this run."]

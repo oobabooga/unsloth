@@ -13,16 +13,33 @@ import subprocess
 import sys
 
 TORCH_INFO = r"""
-import json, torch
-d = {"torch": torch.__version__, "hip": torch.version.hip, "cuda_available": torch.cuda.is_available()}
+import json, os, torch
+d = {"torch": torch.__version__, "hip": torch.version.hip, "cuda_available": torch.cuda.is_available(),
+     "hsa_override": os.environ.get("HSA_OVERRIDE_GFX_VERSION"), "arch_list": torch.cuda.get_arch_list()}
 if d["cuda_available"]:
     p = torch.cuda.get_device_properties(0)
     d["device"] = torch.cuda.get_device_name(0)
     d["arch"] = getattr(p, "gcnArchName", None)
-    a = torch.randn(512, 512, device="cuda"); b = a @ a
-    torch.cuda.synchronize()
-    d["plain_matmul_ok"] = bool(torch.isfinite(b).all())
+    try:
+        a = torch.randn(512, 512, device="cuda"); b = a @ a
+        torch.cuda.synchronize()
+        d["plain_matmul_ok"] = bool(torch.isfinite(b).all())
+    except Exception as e:
+        d["plain_matmul_ok"] = False
+        d["plain_matmul_error"] = f"{type(e).__name__}: {str(e).splitlines()[0]}"
 print("RESULT " + json.dumps(d))
+"""
+
+DYNAMO = r"""
+import json, torch
+f = torch.compile(lambda x: x * 2 + 1, backend="eager")
+print("RESULT " + json.dumps({"dynamo_ok": bool((f(torch.ones(3)) == 3).all())}))
+"""
+
+BNB_IMPORT = r"""
+import json, bitsandbytes as bnb
+libs = sorted({l.split()[-1].rsplit("/", 1)[-1] for l in open("/proc/self/maps") if "libbitsandbytes" in l})
+print("RESULT " + json.dumps({"bnb": bnb.__version__, "loaded_bnb_libs": libs}))
 """
 
 BNB_4BIT = r"""
@@ -91,6 +108,8 @@ def main() -> int:
         d = json.load(fh)
     py = sys.executable
     d["torch_info"] = child(py, TORCH_INFO, 600)
+    d["dynamo"] = child(py, DYNAMO, 600)
+    d["bnb_import"] = child(py, BNB_IMPORT, 600)
     d["bnb_4bit"] = child(py, BNB_4BIT, 900)
     d["unsloth_qlora"] = child(py, UNSLOTH_QLORA, 2400)
     with open(args.out, "w", encoding = "utf-8") as fh:
