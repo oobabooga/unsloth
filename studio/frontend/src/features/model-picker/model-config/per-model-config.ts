@@ -3,6 +3,7 @@
 
 import type { GpuIndexKind } from "@/hooks/use-gpu-info";
 import {
+  cachedRepoConfigId,
   ggufVariantFromStorageKey,
   isStandaloneGgufPath,
   modelIdFromStorageKey,
@@ -18,6 +19,9 @@ import {
 } from "@/lib/speculative-modes";
 
 export interface PerModelConfig {
+  engineParallelism?: "tensor" | "pipeline" | "data";
+  enginePrecision?: "auto" | "bf16" | "fp16" | "int4" | "int8" | "fp8";
+  engine?: "auto" | "vllm" | "sglang";
   customContextLength: number | null;
   maxSeqLength: number | null;
   kvCacheDtype: string | null;
@@ -59,6 +63,9 @@ export interface PerModelConfig {
 }
 
 export const DEFAULT_PER_MODEL_CONFIG: PerModelConfig = {
+  engine: "auto",
+  enginePrecision: "auto",
+  engineParallelism: "tensor",
   customContextLength: null,
   maxSeqLength: null,
   kvCacheDtype: null,
@@ -150,7 +157,9 @@ export function residentIsServedByMlx(
   chatOnlyReason: string | null | undefined,
   loadedIsMlx: boolean | null | undefined,
 ): boolean {
-  return isServedByMlx(isGguf, deviceType, chatOnlyReason) && loadedIsMlx !== false;
+  return (
+    isServedByMlx(isGguf, deviceType, chatOnlyReason) && loadedIsMlx !== false
+  );
 }
 
 export function presetLoadSettingNames(
@@ -517,7 +526,10 @@ export function savedContextPin(config: {
   customContextLength?: number | null;
   maxSeqLength?: number | null;
 }): number | null {
-  return config.customContextLength ?? normalizeMaxSeqLength(config.maxSeqLength ?? null);
+  return (
+    config.customContextLength ??
+    normalizeMaxSeqLength(config.maxSeqLength ?? null)
+  );
 }
 
 /** The patch that pins a context for a non-GGUF target, on the backend serving it. An edit leaves a pin in
@@ -932,6 +944,17 @@ function normalizeV1(partial: RawConfig): PerModelConfig {
       ? partial.specDraftCacheDtype
       : null;
   return {
+    engineParallelism: partial.engineParallelism === "pipeline" || partial.engineParallelism === "data"
+      ? partial.engineParallelism : "tensor",
+    enginePrecision: ["bf16", "fp16", "int4", "int8", "fp8"].includes(
+      partial.enginePrecision ?? "",
+    )
+      ? partial.enginePrecision
+      : "auto",
+    engine:
+      partial.engine === "vllm" || partial.engine === "sglang"
+        ? partial.engine
+        : "auto",
     customContextLength:
       typeof partial.customContextLength === "number" &&
       Number.isFinite(partial.customContextLength) &&
@@ -1194,6 +1217,9 @@ export function resolveOnlyRememberedGgufVariant(
 
 export function isDefaultConfig(config: PerModelConfig): boolean {
   return (
+    (config.engine ?? "auto") === "auto" &&
+    (config.enginePrecision ?? "auto") === "auto" &&
+    (config.engineParallelism ?? "tensor") === "tensor" &&
     config.customContextLength == null &&
     config.maxSeqLength == null &&
     (config.kvCacheDtype ?? null) === DEFAULT_PER_MODEL_CONFIG.kvCacheDtype &&
@@ -1466,6 +1492,19 @@ export function resolveInitialConfig(
   return { config: { ...DEFAULT_PER_MODEL_CONFIG }, remembered: false };
 }
 
+/** Moves a record an older build saved under a cached repo's snapshot path to the repo id the
+ *  settings panel keys it by. Returns that repo id, or null when the model is not one. */
+export function adoptCachedRepoConfig(
+  modelId: string,
+  ggufVariant?: string | null,
+): string | null {
+  const repoId = cachedRepoConfigId(modelId, ggufVariant);
+  if (repoId) {
+    adoptLegacyConfigKey(repoId, modelId, null);
+  }
+  return repoId;
+}
+
 /** Remembered settings for the identifier /api/inference/status reports as loaded. An API auto-switch hands the
  *  loader a concrete snapshot path while settings are keyed by repo id, so reading the raw identifier reports the
  *  resident model as unremembered and blanks a control it is running with. Only a namespaced collapse is adopted,
@@ -1474,6 +1513,10 @@ export function resolveResidentInitialConfig(
   modelId: string,
   ggufVariant?: string | null,
 ): ResolvedPerModelConfig {
+  const repoId = adoptCachedRepoConfig(modelId, ggufVariant);
+  if (repoId) {
+    return resolveInitialConfig(repoId, null);
+  }
   // a standalone file's reported quant is a label; its settings are saved without a variant.
   const standalone = isStandaloneGgufPath(modelId);
   const direct = resolveInitialConfig(modelId, standalone ? null : ggufVariant);

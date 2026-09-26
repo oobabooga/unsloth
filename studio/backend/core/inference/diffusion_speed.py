@@ -34,6 +34,7 @@ load bit-identical. torch imported lazily.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -283,6 +284,30 @@ def fp16_compile_explicit_only(target: Any) -> bool:
     return _is_float16(getattr(target, "dtype", None))
 
 
+def family_compiles_regionally(family: Any) -> bool:
+    """False only for an EMPTY ``_repeated_blocks`` (``compile_repeated_blocks`` raises); unknown reads True."""
+    if getattr(family, "denoiser_attr", "transformer") != "transformer":
+        return True
+    name = getattr(family, "transformer_class", None)
+    if not isinstance(name, str) or not name:
+        return True
+    # Called before load_pipeline's guard; `import diffusers` imports torch._dynamo, so wait for the torch warm.
+    try:
+        from loggers import get_logger
+        from utils.torch_warmup import close_dynamo_import_window
+        close_dynamo_import_window(get_logger(__name__))
+    except Exception:  # noqa: BLE001, S110 - optimisation only
+        pass
+    try:
+        import diffusers
+        cls = getattr(diffusers, name, None)
+    except Exception:  # noqa: BLE001 - an unanswerable probe keeps today's behaviour
+        return True
+    if cls is None or not hasattr(cls, "_repeated_blocks"):
+        return True
+    return bool(cls._repeated_blocks)
+
+
 def _is_bfloat16(dtype: Any) -> bool:
     try:
         import torch
@@ -492,8 +517,9 @@ def compiled_shapes_are_static(pipe: Any, speed_mode: Optional[str]) -> bool:
 
     ``max`` compiles regional DiT blocks with automatic dynamic (static until a dimension changes, then one
     generalised graph; tracked by graph count, not shape) and U-Net whole-module is always static;
-    ``default`` DiT compiles dynamic=True (one artifact across shapes). The compile-cache layer
-    keys on this to re-save its bundle when a session hits an uncovered shape."""
+    ``default`` DiT compiles dynamic=True (one artifact across shapes) EXCEPT a stream-merging DiT,
+    static there (see ``_STREAM_MERGING_BLOCKS``). The compile-cache layer keys on this to re-save its
+    bundle when a session hits an uncovered shape."""
     mode = normalize_speed_mode(speed_mode)
     if mode == SPEED_MAX:
         # An auto-dynamic DiT generalises a dimension once and then reuses that graph for unseen values, so a new
@@ -501,9 +527,10 @@ def compiled_shapes_are_static(pipe: Any, speed_mode: Optional[str]) -> bool:
         return _denoiser_unet(pipe) is not None or not auto_dynamic_active(pipe)
     if mode != SPEED_DEFAULT:
         return False
-    # A torchao-quantised DiT compiles with automatic dynamic: its first shapes get their own artifacts.
-    return _denoiser_unet(pipe) is not None or any(
-        getattr(t, "_unsloth_auto_dynamic", False) for t in _denoiser_dits(pipe)
+    return (
+        _denoiser_unet(pipe) is not None
+        or any(getattr(t, "_unsloth_auto_dynamic", False) for t in _denoiser_dits(pipe))
+        or _dits_merge_streams(_denoiser_dits(pipe))
     )
 
 
@@ -518,6 +545,52 @@ def _denoiser_dits(pipe: Any) -> list:
         if m is not None and m not in dits:
             dits.append(m)
     return dits
+
+
+# Blocks MEASURED to raise inductor CantSplit under dynamic = True; measure before adding.
+_STREAM_MERGING_BLOCKS: frozenset[str] = frozenset({"FluxSingleTransformerBlock"})
+
+_STREAM_MERGE_DETECT_ENV = "UNSLOTH_STATIC_STREAM_MERGE_DETECT"
+_STREAM_MERGE_SOURCE = re.compile(
+    r"torch\.cat\(\s*\[\s*(?:encoder_hidden_states\s*,\s*hidden_states"
+    r"|hidden_states\s*,\s*encoder_hidden_states)\s*\]"
+)
+
+
+@lru_cache(maxsize = None)
+def _class_merges_streams(cls: type, broad: bool = False) -> bool:
+    """``broad`` is an argument, not an env read in the body, so the memo cannot outlive it."""
+    if cls.__name__ in _STREAM_MERGING_BLOCKS:
+        return True
+    if not broad:
+        return False
+    try:
+        import inspect  # noqa: PLC0415 - only reached under the opt-in broad sweep
+        source = inspect.getsource(cls.forward)
+    except Exception:  # noqa: BLE001 - no source (frozen / C ext) means fall back to the name list
+        return False
+    return bool(_STREAM_MERGE_SOURCE.search(source))
+
+
+def _dits_merge_streams(dits: list) -> bool:
+    broad = os.environ.get(_STREAM_MERGE_DETECT_ENV) == "1"
+    seen: set[type] = set()
+    for transformer in dits:
+        names = set(getattr(transformer, "_repeated_blocks", ()) or ())
+        if not names:
+            continue
+        try:
+            modules = list(transformer.named_modules())
+        except Exception:  # noqa: BLE001 - a probe, never a failed load
+            continue
+        for _name, sub in modules:
+            cls = type(sub)
+            if cls.__name__ not in names or cls in seen:
+                continue
+            seen.add(cls)
+            if _class_merges_streams(cls, broad):
+                return True
+    return False
 
 
 def _compile_repeated_blocks(
@@ -540,9 +613,15 @@ def _compile_repeated_blocks(
     # (Qwen-Image-2.1: 4-6s on about half of new prompts). Inductor's own cudagraph modes fail on the regional block --
     # "accessing tensor output of CUDAGraphs that has been overwritten" -- so the tier stays on -no-cudagraphs and the
     # capture is taken one level up, at the denoiser module.
+    static_shapes = (not max_autotune) and _dits_merge_streams(dits)
+    if static_shapes and logger is not None:
+        logger.info(
+            "diffusion.speed: regional compile is static; this DiT merges the text and image streams "
+            "inside its repeated block and cannot be codegen'd with dynamic sequence lengths",
+        )
     kwargs: dict[str, Any] = {
         "fullgraph": not (cache_active or offload_active),
-        "dynamic": None if max_autotune else True,
+        "dynamic": None if max_autotune else (not static_shapes),
     }
     if max_autotune:
         kwargs["mode"] = "max-autotune-no-cudagraphs"
@@ -585,8 +664,22 @@ def _compile_repeated_blocks(
     for transformer in dits:
         dit_kwargs = dict(kwargs)
         dit_kwargs["dynamic"] = compile_dynamic(transformer, kwargs["dynamic"])
+        if (
+            max_autotune
+            and dit_kwargs["dynamic"] is None
+            and _carries_torchao_weights(transformer)
+            and _dits_merge_streams([transformer])
+        ):
+            # Auto dynamic hits CantSplit on torchao stream-merging blocks and drops to eager; static recompiles.
+            dit_kwargs["dynamic"] = False
         # Read by auto_dynamic_active: the generalising recompile on a new text length must reach the bundle.
         transformer._unsloth_auto_dynamic = dit_kwargs["dynamic"] is None
+        if type(transformer).__name__ == "QwenImage21Transformer2DModel":
+            try:
+                from .diffusion_qwenimage21_rope import install as install_real_rope
+                install_real_rope(logger)
+            except Exception as exc:  # noqa: BLE001 - optimisation only
+                _warn(logger, "qwen-image-2.1 real rope", exc)
         try:
             transformer.compile_repeated_blocks(**dit_kwargs)
             engaged = True

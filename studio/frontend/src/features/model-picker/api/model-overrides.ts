@@ -24,6 +24,9 @@ const OVERRIDES_URL = "/api/settings/openai-auto-switch/overrides";
 
 /** One model's stored launch config, as the backend persists it. */
 export interface ApiModelOverride {
+  engine_parallelism?: "tensor" | "pipeline" | "data";
+  engine_precision?: "auto" | "bf16" | "fp16" | "int4" | "int8" | "fp8";
+  engine?: "auto" | "vllm" | "sglang";
   // biome-ignore lint/style/useNamingConvention: API schema
   llama_extra_args?: string[];
   // biome-ignore lint/style/useNamingConvention: API schema
@@ -269,6 +272,22 @@ export async function fetchLoadExtraArgs(
   return resolvedFrom(resolved ?? {});
 }
 
+/** The row as a settings panel applies it. llama-server arguments reach a GGUF load alone, and
+ *  hydrating them into another model's config would count a list it cannot show as a change. */
+export function panelOverrideRow(
+  override: ApiModelOverride | null,
+  isGguf: boolean,
+): ApiModelOverride | null {
+  if (!override || isGguf) {
+    return override;
+  }
+  return presentOverride(
+    Object.fromEntries(
+      Object.entries(override).filter(([key]) => key !== "llama_extra_args"),
+    ),
+  );
+}
+
 /** Translate one server-resolved override into the picker's config shape. The row is
  *  authoritative for the fields it CARRIES and only those: an absent field is not evidence
  *  the user chose the default, since a failed PUT, a refused value and an old row all leave
@@ -295,6 +314,10 @@ export function fromApiOverride(
     override.custom_context_length != null || override.max_seq_length != null;
   const normalized = normalizePerModelConfig({
     ...DEFAULT_PER_MODEL_CONFIG,
+    engine: override.engine ?? "auto",
+    engineParallelism: override.engine_parallelism ?? local.engineParallelism ?? "tensor",
+    enginePrecision:
+      override.engine_precision ?? local.enginePrecision ?? "auto",
     customContextLength: serverStatesPin
       ? (override.custom_context_length ?? null)
       : local.customContextLength,
@@ -346,7 +369,11 @@ export function toApiOverride(config: PerModelConfig | null): ApiModelOverride {
   if (!config) {
     return {};
   }
-  const payload: ApiModelOverride = {};
+  const payload: ApiModelOverride = {
+    engine: config.engine ?? "auto",
+    engine_precision: config.enginePrecision ?? "auto",
+    engine_parallelism: config.engineParallelism ?? "tensor",
+  };
   if (config.maxSeqLength && config.maxSeqLength > 0) {
     payload.max_seq_length = config.maxSeqLength;
   }

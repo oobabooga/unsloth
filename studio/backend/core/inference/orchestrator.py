@@ -29,7 +29,7 @@ from core.inference.audio_errors import (
     AudioGenerationCancelledError,
 )
 from utils.hardware import get_device, prepare_gpu_selection
-from utils.utils import hf_env_offline
+from utils.utils import hf_env_offline, is_metal_queue_dead
 
 # Re-exported from the shared helper so GGUF, training and inference share one type. Via PEP 562, not a module-level
 # import: resolving the name imports unsloth_zoo, hence torch, and routes/inference.py imports this module at startup
@@ -173,6 +173,12 @@ def _redact_worker_output(text: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return _ABSOLUTE_PATH_RE.sub(_shorten_path, redacted)
+
+
+class _WorkerMailbox(queue.Queue):
+    def __init__(self, worker):
+        super().__init__()
+        self.worker = worker
 
 
 class _LoadCancelled(Exception):
@@ -361,12 +367,13 @@ class InferenceOrchestrator:
     subprocess."""
 
     def __init__(self):
+        self._managed_engine = None
         self._proc: Optional[mp.Process] = None
         # Retired when the next worker is spawned; read long after _proc has been cleared.
         self._stderr_capture: Any = None
         self._cmd_queue: Any = None
         self._resp_queue: Any = None
-        self._subprocess_shutdown_lock = threading.Lock()
+        self._subprocess_shutdown_lock = threading.RLock()
         self._cancel_event: Any = None  # mp.Event - set to cancel generation
         # Set for the whole unload; the worker never clears it (unlike _cancel_event), so a generate queued behind the
         # cancelled one is skipped, not run.
@@ -672,6 +679,9 @@ class InferenceOrchestrator:
     def is_worker_alive(self) -> bool:
         """True while the inference subprocess is running, even with no model active (a failed load
         can leave a live worker holding sidecar modules)."""
+        managed = getattr(self, "_managed_engine", None)
+        if managed is not None:
+            return managed.alive()
         proc = self._proc
         return proc is not None and proc.is_alive()
 
@@ -750,6 +760,13 @@ class InferenceOrchestrator:
 
     def _shutdown_subprocess(self, timeout: float = 10.0) -> bool:
         with self._subprocess_shutdown_lock:
+            managed = getattr(self, "_managed_engine", None)
+            if managed is not None:
+                if not managed.stop():
+                    return False
+                self._managed_engine = None
+                self.active_model_name = None
+                self.models.clear()
             return self._shutdown_subprocess_locked(timeout)
 
     def _shutdown_subprocess_locked(self, timeout: float) -> bool:
@@ -991,6 +1008,31 @@ class InferenceOrchestrator:
     def _ensure_subprocess_alive(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
 
+    def _observe_response(self, resp, worker):
+        """Retire ``worker`` if its Metal queue is dead; nothing else reaps it."""
+        detail = resp.get("error") or ""
+        if worker is None or not is_metal_queue_dead(detail):
+            return resp
+        with self._subprocess_shutdown_lock:
+            if self._proc is not worker:
+                return resp
+            logger.error("Retiring the inference worker: its GPU queue is dead (%s)", detail)
+            if self._shutdown_subprocess_locked(5):  # a survivor still holds the model
+                self.active_model_name = None
+                self.models.clear()
+        return resp
+
+    def _observe_off_thread(self, resp, worker) -> None:
+        """Off the dispatcher thread because retiring joins it."""
+        if worker is None or not is_metal_queue_dead(resp.get("error") or ""):
+            return
+        threading.Thread(
+            target = self._observe_response,
+            args = (resp, worker),
+            daemon = True,
+            name = "inference-retire-worker",
+        ).start()
+
     def _subprocess_crash_message(
         self,
         context: str,
@@ -1053,12 +1095,27 @@ class InferenceOrchestrator:
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Failed to send command to subprocess: {exc}")
 
-    def _read_resp(self, timeout: float = 1.0) -> Optional[dict]:
-        """Read a response from the subprocess (non-blocking with timeout)."""
-        if self._resp_queue is None:
+    def _read_mailbox(
+        self,
+        mailbox: _WorkerMailbox,
+        timeout: Optional[float] = None,
+    ):
+        resp = mailbox.get_nowait() if timeout is None else mailbox.get(timeout = timeout)
+        return self._observe_response(resp, mailbox.worker)
+
+    def _read_resp(
+        self,
+        timeout: float = 1.0,
+        observe: bool = True,
+    ) -> Optional[dict]:
+        # Handle before queue, else a reload between them blames the replacement.
+        worker = self._proc
+        resp_queue = self._resp_queue
+        if resp_queue is None:
             return None
         try:
-            return self._resp_queue.get(timeout = timeout)
+            resp = resp_queue.get(timeout = timeout)
+            return self._observe_response(resp, worker) if observe else resp
         except queue.Empty:
             return None
         except (EOFError, OSError, ValueError):
@@ -1152,22 +1209,23 @@ class InferenceOrchestrator:
 
         Returns (read_one, drain, release).
         """
-        mailbox: queue.Queue = queue.Queue()
+        mailbox = _WorkerMailbox(self._proc)
         with self._mailbox_lock:
             self._direct_mailboxes[request_id] = mailbox
 
         def read_one(timeout: float = 1.0):
             try:
-                return mailbox.get_nowait()
+                return self._read_mailbox(mailbox)
             except queue.Empty:
                 pass
             thread = self._dispatcher_thread
             if thread is not None and thread.is_alive():
                 try:
-                    return mailbox.get(timeout = timeout)
+                    return self._read_mailbox(mailbox, timeout)
                 except queue.Empty:
                     return None
-            resp = self._read_resp(timeout = timeout)
+            worker = self._proc  # handle before queue, as in _read_resp
+            resp = self._read_resp(timeout = timeout, observe = False)
             if resp is None:
                 return None
             rid = resp.get("request_id")
@@ -1182,9 +1240,11 @@ class InferenceOrchestrator:
                         else:
                             self._mark_worker_started(owner)
                     other.put(resp)
+                # Observe only after hand-over: retiring clears the registry.
+                self._observe_response(resp, worker)
                 # Outside the mailbox check on purpose: a released request's late frames go to nobody.
                 return None
-            return resp
+            return self._observe_response(resp, worker)
 
         def drain(timeout: float = 5.0) -> bool:
             deadline = time.monotonic() + timeout
@@ -1416,6 +1476,7 @@ class InferenceOrchestrator:
             if self._resp_queue is None:
                 break
 
+            worker = self._proc  # handle before queue, as in _read_resp
             try:
                 resp = self._resp_queue.get(timeout = _DISPATCH_POLL_INTERVAL)
             except queue.Empty:
@@ -1434,6 +1495,7 @@ class InferenceOrchestrator:
                     continue
 
                 # Route to mailbox if a matching request_id exists
+                delivered = False
                 if rid:
                     with self._mailbox_lock:
                         mbox = self._mailboxes.get(rid) or self._direct_mailboxes.get(rid)
@@ -1448,13 +1510,16 @@ class InferenceOrchestrator:
                             else:
                                 self._mark_worker_started(owner)
                         mbox.put(resp)
-                        continue
+                        delivered = True
 
-                logger.debug(
-                    "Dispatcher: no mailbox for request_id=%s type=%s, dropping",
-                    rid,
-                    rtype,
-                )
+                if not delivered:
+                    logger.debug(
+                        "Dispatcher: no mailbox for request_id=%s type=%s, dropping",
+                        rid,
+                        rtype,
+                    )
+                # Every response: an abandoned mailbox is never read.
+                self._observe_off_thread(resp, worker)
             except Exception:
                 logger.exception("Inference dispatcher: failed to route a response; continuing")
                 continue
@@ -1553,7 +1618,7 @@ class InferenceOrchestrator:
             video_b64 = video,
         )
 
-        mailbox: queue.Queue = queue.Queue()
+        mailbox = _WorkerMailbox(self._proc)
         with self._mailbox_lock:
             # _unload_pending alone is not enough: an unload that ran fully since _start_dispatcher clears it in its
             # finally and stops the dispatcher, so it reads False here though the dispatcher is gone and the model
@@ -1613,7 +1678,7 @@ class InferenceOrchestrator:
 
         def read_mailbox(timeout):
             try:
-                return mailbox.get(timeout = timeout)
+                return self._read_mailbox(mailbox, timeout)
             except queue.Empty:
                 return None
 
@@ -1637,15 +1702,15 @@ class InferenceOrchestrator:
 
     def _drain_mailbox(
         self,
-        mailbox: queue.Queue,
+        mailbox: _WorkerMailbox,
         timeout: float = 5.0,
     ) -> None:
         """Drain a mailbox until gen_done/gen_error, discarding tokens."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                resp = mailbox.get(
-                    timeout = min(_DISPATCH_POLL_INTERVAL, deadline - time.monotonic())
+                resp = self._read_mailbox(
+                    mailbox, min(_DISPATCH_POLL_INTERVAL, deadline - time.monotonic())
                 )
             except queue.Empty:
                 continue
@@ -1775,9 +1840,29 @@ class InferenceOrchestrator:
         cache_environment: Optional[Mapping[str, str]] = None,
         anonymous_hf_access: bool = False,
         audio_codec_path: Optional[str] = None,
+        engine: str = "auto",
+        engine_options = None,
     ) -> bool:
         """Load a model for inference. Always spawns a fresh subprocess per load for a clean
         interpreter (no stale unsloth patches, torch.compile caches, or getsource failures)."""
+        if engine != "auto":
+            return self._load_managed_engine(
+                engine,
+                config,
+                max_seq_length,
+                gpu_ids,
+                hf_token,
+                load_cancel_event,
+                cache_environment,
+                anonymous_hf_access,
+                engine_options,
+                trust_remote_code,
+                approved_remote_code_fingerprint,
+                subject,
+            )
+        if getattr(self, "_managed_engine", None) is not None:
+            if not self._shutdown_subprocess():
+                raise RuntimeError("Previous inference engine has not stopped")
         from utils.transformers_version import needs_transformers_5
 
         from utils.hf_xet_fallback import DownloadStallError
@@ -2062,6 +2147,116 @@ class InferenceOrchestrator:
                 logger.warning("Could not shut the failed load's worker down: %s", teardown_exc)
             raise
 
+    def reap_dead_managed_engine(self):
+        with self._subprocess_shutdown_lock:
+            managed = getattr(self, "_managed_engine", None)
+            if managed is not None and self.active_model_name and not managed.alive():
+                self._shutdown_subprocess()
+
+    def _load_managed_engine(
+        self,
+        engine,
+        config,
+        context,
+        gpu_ids,
+        hf_token,
+        cancel,
+        cache_environment,
+        anonymous,
+        options = None,
+        trust_remote_code = False,
+        approved_remote_code_fingerprint = None,
+        subject = None,
+    ):
+        from types import SimpleNamespace
+
+        from core.inference.managed_engine import ManagedEngine
+        from utils.hf_cache_settings import get_hf_cache_paths
+        from hub.utils.hf_tokens import apply_token_to_child_env
+
+        if not self._shutdown_subprocess():
+            raise RuntimeError("Previous inference process has not stopped")
+        model = config.identifier
+        with self._subprocess_shutdown_lock:
+            self.active_model_name = None
+            self.models.clear()
+            self.loading_models.add(model)
+            managed = ManagedEngine(engine)
+            self._managed_engine = managed
+        try:
+            # The engine loads the checkpoint itself, so the worker's malware and consent gates run here.
+            from core.inference.worker import _run_security_gates
+
+            replies = []
+            if not _run_security_gates(
+                [config.path if getattr(config, "is_local", False) else model],
+                trust_remote_code = bool(trust_remote_code),
+                hf_token = None if anonymous else hf_token,
+                approved_fingerprint = approved_remote_code_fingerprint,
+                resp_queue = SimpleNamespace(put = replies.append),
+                compute_subdirs = False,
+                subject = subject,
+            ):
+                raise RuntimeError(
+                    (replies[-1].get("message") if replies else None)
+                    or "The model was blocked by the security scan."
+                )
+            env = get_hf_cache_paths().child_env()
+            if cache_environment:
+                env.update(cache_environment)
+            apply_token_to_child_env(env, False if anonymous else hf_token)
+            managed.start(
+                model,
+                context,
+                gpu_ids,
+                env,
+                cancel,
+                options,
+                trust_remote_code,
+                # Validation read config.path; a WSL drive path only resolves in that form.
+                model_path = config.path if config.is_local else None,
+            )
+            with self._subprocess_shutdown_lock:
+                if (
+                    self._managed_engine is not managed
+                    or model not in self.loading_models
+                    or (cancel is not None and cancel.is_set())
+                    or not managed.alive()
+                ):
+                    raise RuntimeError("Model load cancelled")
+                self.models[model] = {
+                    "engine": engine,
+                    "engine_parallelism": (options or {}).get("parallelism", "tensor"),
+                    "engine_precision": (options or {}).get("precision", "auto"),
+                    "is_vision": (options or {}).get("is_vision", config.is_vision),
+                    "chat_template_info": {
+                        "accepts_multiple_images": bool(
+                            (options or {}).get("is_vision", config.is_vision)
+                        )
+                    },
+                    "is_audio": False,
+                    "is_lora": False,
+                    "context_length": managed.context,
+                    "max_context_length": managed.context,
+                    "context_length_enforced": True,
+                    "requested_context_length": context,
+                    "max_seq_length_requested": context,
+                    "load_in_4bit_requested": False,
+                    "gpu_ids_requested": gpu_ids,
+                    "gpu_ids": list(gpu_ids or [0]),
+                    "tensor_parallel": len(gpu_ids or [0]) > 1
+                    and (options or {}).get("parallelism", "tensor") == "tensor",
+                    "supports_tools": bool((options or {}).get("tool_parser")),
+                }
+                self.active_model_name = model
+                self.load_generation += 1
+                return True
+        except Exception:
+            self._shutdown_subprocess()
+            raise
+        finally:
+            self.loading_models.discard(model)
+
     def cancel_load(self, model_name: str) -> bool:
         """Abort an in-flight load by terminating its subprocess. Returns True if a load for
         ``model_name`` (matched case-insensitively) was cancelled, False if nothing was loading
@@ -2090,7 +2285,8 @@ class InferenceOrchestrator:
         self.loading_models.discard(target)
         self.active_model_name = None
         self.models.clear()
-        self._shutdown_subprocess(timeout = 0.5)
+        managed = getattr(self, "_managed_engine", None) is not None
+        stopped = self._shutdown_subprocess(timeout = 0.5)
         # Clear the local mirrors again AFTER the teardown. A racing off-gate load_model may still be parked in
         # _wait_response("loaded"): its worker already queued a "loaded" reply, so during the shutdown window above
         # (the 0.5s settle before the response queue is drained and nulled) that thread can consume it and repopulate
@@ -2099,6 +2295,8 @@ class InferenceOrchestrator:
         # model. The nulled queue lets no further "loaded" through, so re-clearing here wipes any repopulation.
         self.active_model_name = None
         self.models.clear()
+        if managed and stopped is False:
+            raise RuntimeError("The inference engine did not stop.")
         return True
 
     # Dictation models run in the STT sidecars (whisper-server, llama-server, and the Transformers spawn child), not
@@ -2148,6 +2346,11 @@ class InferenceOrchestrator:
         if self.cancel_load(model_name):
             return True
 
+        managed = getattr(self, "_managed_engine", None)
+        if managed is not None:
+            if model_name != self.active_model_name:
+                return True
+            return self._shutdown_subprocess()
         if not self._ensure_subprocess_alive():
             self.models.pop(model_name, None)
             if self.active_model_name == model_name:
@@ -2257,6 +2460,9 @@ class InferenceOrchestrator:
         through an addressed mailbox, as generations do: compare mode bypasses the generation
         lock and leaves a dispatcher owning the response queue, which would route this reply
         nowhere."""
+        managed = getattr(self, "_managed_engine", None)
+        if managed is not None:
+            return managed.count_tokens(messages, system_prompt, tools = tools)
         if not self._gen_lock.acquire(blocking = False):
             raise RuntimeError("Cannot count tokens while a generation is in progress")
         request_id = str(uuid.uuid4())
@@ -2558,6 +2764,10 @@ class InferenceOrchestrator:
         (no _gen_lock) so compare-mode requests don't block each other; the subprocess serializes
         them via its sequential command loop. Backend failures raise instead of becoming
         assistant text."""
+        if getattr(self, "_managed_engine", None) is not None:
+            raise GenStreamErrorRaised(
+                "Adapter comparisons are unavailable for this engine.", public = True
+            )
         stream = self._generate_dispatched(
             use_adapter = use_adapter,
             cancel_event = cancel_event,
@@ -2608,6 +2818,23 @@ class InferenceOrchestrator:
         """Inner generation logic: sends the command to the subprocess and yields tokens. Serialized
         by _gen_lock (one generation at a time) so concurrent readers don't consume each other's
         tokens off the shared resp_queue."""
+        managed = getattr(self, "_managed_engine", None)
+        if managed is not None:
+            kwargs = dict(locals())
+            for key in ("self", "managed", "kwargs"):
+                kwargs.pop(key, None)
+            from .engine_transport import EngineHTTPError
+
+            try:
+                cumulative = ""
+                for delta in managed.generate(**kwargs):
+                    cumulative += delta
+                    yield cumulative
+            except EngineHTTPError:
+                raise
+            except Exception as exc:
+                yield GenStreamError(str(exc), public = True)
+            return
         if not self._ensure_subprocess_alive():
             yield GenStreamError("Error: Inference subprocess is not running", public = True)
             return
