@@ -125,8 +125,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout structlog psutil
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The route both base and head pick for gfx1151, so detection sees the real GPU.
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
           # --require rocm gpu --expect-arch gfx1151. The gate EXITS 1 when it is
