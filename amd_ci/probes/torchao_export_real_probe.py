@@ -43,7 +43,16 @@ import json, os, sys, tempfile, traceback
 r = {}
 def err(e):
     return f"{type(e).__name__}: {e}"[:700]
+# What Studio's spawn child does before the worker target: re-run run.py as __mp_main__.
+import runpy
+sys.argv = ["run.py"]
+try:
+    runpy.run_path("run.py", run_name = "__mp_main__")
+    r["mp_main"] = "ran"
+except BaseException as e:
+    r["mp_main"] = err(e)
 import core._torchao_stub as S
+r["stubbed_before_loader"] = S.is_stubbed("torchao")
 loader = getattr(S, "install_torchao_windows_rocm_real_or_stub", None)
 r["worker_loader"] = "real_or_stub" if loader else "stub"
 (loader or S.install_torchao_windows_rocm_stub)()

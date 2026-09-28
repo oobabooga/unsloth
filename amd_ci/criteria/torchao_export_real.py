@@ -59,6 +59,7 @@ def table(obs):
         ("torch.distributed.is_available()", lambda o: _p(o).get("dist_available")),
         ("stock `import torchao`", lambda o: _p(o).get("stock_torchao")),
         ("plain Core `import unsloth`: torchao", lambda o: {k: (o or {}).get("core", {}).get(k) for k in ("unsloth_import_error", "torchao_file", "torchao_version", "configs")}),
+        ("spawn child: run.py as __mp_main__, stubbed before loader", lambda o: f"{_w(o).get('mp_main')} / {_w(o).get('stubbed_before_loader')}"),
         ("export worker loads torchao via", lambda o: _w(o).get("worker_loader")),
         ("torchao in the worker", lambda o: f"stub={_w(o).get('torchao_is_stub')} version={_w(o).get('torchao_version')}"),
         ("_torchao_export_supported()", lambda o: _w(o).get("gate_torchao_export_supported")),
@@ -91,6 +92,7 @@ def head_is_fixed(head):
         return isinstance(row, dict) and row.get("finite") is True and qtype in row.get("param_types", [])
 
     checks = {
+        "run.py re-run as __mp_main__ stubbed torchao first": w.get("mp_main") == "ran" and w.get("stubbed_before_loader") is True,
         "real torchao loaded in the worker": w.get("torchao_is_stub") is False,
         "plain Core import unsloth gets real torchao": isinstance((head or {}).get("core", {}).get("configs"), list),
         "formats advertised": (w.get("export_capability") or {}).get("torchao_export_supported") is True,
