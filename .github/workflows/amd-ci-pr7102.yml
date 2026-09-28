@@ -116,16 +116,6 @@ jobs:
             --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Head = the PR head plus the candidate commit (amd_ci/head_candidate.patch), before it is pushed.
-          $head = & $env:AMD_CI_PY -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
-          git -C "$head" log --oneline -1
-          # Runner git uses core.autocrlf=true; the patch is LF, so re-checkout the head with LF endings.
-          git -C "$head" config core.autocrlf false
-          git -C "$head" rm -q --cached -r .
-          git -C "$head" reset -q --hard
-          git -C "$head" apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\amd_ci\head_candidate.patch"
-          if ($LASTEXITCODE -ne 0) { Write-Host "candidate patch does not apply"; exit 1 }
-          git -C "$head" status --short
 
       - name: Test environment
         timeout-minutes: 75
