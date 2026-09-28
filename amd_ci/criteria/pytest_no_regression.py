@@ -47,6 +47,12 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name} suite collected tests", collected > 0,
                     f"{collected} collected (passed {o.get('n_passed', 0)}, "
                     f"failed {o.get('n_failed', 0)}, skipped {o.get('n_skipped', 0)})"))
+
+        # Skips and setup ERRORs are not executions: 33 skipped + 387 setup errors (missing structlog, gfx1151
+        # Windows) passed both gates above and read as no regression.
+        executed = (o.get("n_passed", 0) or 0) + (o.get("n_failed", 0) or 0)
+        out.append((f"{name} suite executed at least one test", executed > 0,
+                    f"{executed} executed, {len(o.get('errors', []) or [])} setup/collection errors"))
     return out
 
 

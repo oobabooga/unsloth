@@ -131,6 +131,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -m pip install -q "diffusers==0.40.0" "transformers==5.5.0" accelerate safetensors huggingface_hub pillow numpy scipy sympy tqdm psutil
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $req = "$env:AMD_CI_WORK\states\head\studio\backend\requirements"
+          & $py -m pip install -q -r "$req\no-torch-runtime.txt"
+          & $py -m pip install -q --no-deps -r "$req\extras-no-deps.txt"
+          & $py -m pip install -q -r "$req\studio.txt"
+          & $py -m pip install -q -r "$req\diffusers-pin.txt"
+          & $py -c "import structlog, fastapi, diffusers, torch; print('studio deps ok', torch.__version__, diffusers.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 --out "$env:AMD_CI_WORK\out\host_torch.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
