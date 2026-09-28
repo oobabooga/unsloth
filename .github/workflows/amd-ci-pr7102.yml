@@ -146,6 +146,13 @@ jobs:
           # Real torchao kept OUT of the venv (Studio skips it on Windows ROCm); only the premise probe imports it.
           & $py -m pip install --no-deps --target "$env:AMD_CI_WORK\tao" torchao
           & $py -m pip uninstall -y torchao
+          # bitsandbytes as studio/install_python_stack.py installs it on AMD Windows, and BNB_ROCM_VERSION from its DLL.
+          & $py -m pip install --force-reinstall --no-cache-dir --no-deps https://github.com/bitsandbytes-foundation/bitsandbytes/releases/download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-win_amd64.whl
+          if ($LASTEXITCODE -ne 0) { & $py -m pip install --no-deps "bitsandbytes>=0.50.0" }
+          $bnbv = & $py -c "import glob,os,re,importlib.util as u; d=os.path.dirname(u.find_spec('bitsandbytes').origin); m=[re.search(r'rocm(\d+)', os.path.basename(f)).group(1) for f in glob.glob(os.path.join(d,'libbitsandbytes_rocm*.dll'))]; print(sorted(m)[-1] if m else '')"
+          Write-Host "BNB_ROCM_VERSION=$bnbv"
+          if ($bnbv) { Add-Content -Path $env:GITHUB_ENV -Value "BNB_ROCM_VERSION=$bnbv"; $env:BNB_ROCM_VERSION = $bnbv }
+          & $py -c "import bitsandbytes as b; print('bnb', b.__version__)"
           & $py -m pip list 2>$null | Select-String -Pattern "^(torch|torchvision|transformers|unsloth|unsloth.zoo|peft|trl|accelerate|torchao) "
           & $py -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.distributed.is_available())"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
