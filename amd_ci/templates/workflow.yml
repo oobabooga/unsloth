@@ -173,7 +173,7 @@ jobs:
             --probe __PROBE__ \
             --criteria __CRITERIA__ \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" __PROBE_ARGS__
+            --python "$AMD_CI_PY" __DIFF_ARGS__
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"

@@ -173,7 +173,7 @@ jobs:
             --probe amd_ci/probes/pytest_probe.py \
             --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" 
+            --python "$AMD_CI_PY" -- --tests tests/test_diffusion_cuda_graph.py tests/test_diffusion_dynamic_text.py tests/test_diffusion_inductor_backports.py tests/test_diffusion_qwenimage21_vae_layout.py tests/test_diffusion_speed.py tests/test_diffusion_stream_merge_dynamic.py tests/test_diffusion_vae_compile_dynamic.py tests/test_diffusion_vae_regional_compile.py tests/test_diffusion_vae_single_frame.py tests/test_video_hv15_vae.py tests/test_video_minimax_h3_vae.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
