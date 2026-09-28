@@ -96,6 +96,22 @@ try:
 except BaseException as e:
     r["export_error"] = err(e)
     r["export_trace"] = traceback.format_exc()[-1500:]
+# End to end, as the Studio export worker runs it: a real (tiny) LoRA model through the real export call.
+try:
+    from unsloth import FastLanguageModel
+    model, tok = FastLanguageModel.from_pretrained(
+        "trl-internal-testing/tiny-Qwen3ForCausalLM", max_seq_length = 128,
+        load_in_4bit = False, dtype = None)
+    model = FastLanguageModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"], lora_alpha = 8)
+    r["e2e_model_device"] = str(next(model.parameters()).device)
+    be2 = ex.ExportBackend.__new__(ex.ExportBackend)
+    be2.current_model, be2.current_tokenizer, be2._audio_type, be2.is_peft = model, tok, None, True
+    be2.current_checkpoint = None
+    out = be2.export_merged_model("amdci_torchao_e2e", compressed_method = "torchao_int8")
+    r["e2e_torchao_export"] = {"ok": bool(out[0]), "message": str(out[1])[:800], "output": str(out[2])[:300]}
+except BaseException as e:
+    r["e2e_error"] = err(e)
+    r["e2e_trace"] = traceback.format_exc()[-2500:]
 try:
     from utils.hardware import hardware as hw
     hw.detect_hardware()
@@ -112,7 +128,9 @@ def _run(py: str, code: str, cwd: Path, args: list[str], timeout: int) -> dict:
     with tempfile.NamedTemporaryFile("w", suffix = ".py", delete = False, encoding = "utf-8") as f:
         f.write(code)
         script = f.name
-    env = dict(os.environ, PYTHONPATH = str(cwd), PYTHONIOENCODING = "utf-8", UNSLOTH_DISABLE_AUTO_UPDATES = "1")
+    studio_home = os.path.join(tempfile.gettempdir(), "amdci_studio_home")
+    os.makedirs(studio_home, exist_ok = True)
+    env = dict(os.environ, PYTHONPATH = str(cwd), PYTHONIOENCODING = "utf-8", UNSLOTH_DISABLE_AUTO_UPDATES = "1", UNSLOTH_STUDIO_HOME = studio_home)
     try:
         p = subprocess.run([py, script, *args], cwd = cwd, capture_output = True, text = True,
                            encoding = "utf-8", errors = "replace", timeout = timeout, env = env)

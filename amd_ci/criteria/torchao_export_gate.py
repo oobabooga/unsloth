@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Criteria for unslothai/unsloth#7102 (pairs with probes/torchao_export_gate_probe.py).
 
-Defect at the base: on Windows ROCm torch.distributed is absent, real torchao cannot import,
-Studio's stub makes Int8WeightOnlyConfig() return None, transformers rejects
-TorchAoConfig(quant_type=None), yet the export gate still offers the torchao formats.
+Defect at the base: on Windows ROCm torch.distributed is absent and Studio's stub makes
+Int8WeightOnlyConfig() return None, yet the export gate still offers the torchao formats and a
+real torchao export of a real LoRA model fails. The exact error text depends on the transformers
+and torchao versions installed, so it is recorded, not matched.
 Fixed at the head: the gate withholds them, a forced torchao export is refused with a
 Windows ROCm message before any work, and export_capability() reports win32_rocm True.
 """
@@ -39,6 +40,9 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                     w.get("unsloth_import_error") or f"unsloth {w.get('unsloth_version')}"))
         out.append((f"{name}: Studio torchao stub active", w.get("torchao_is_stub") is True,
                     w.get("stub_error") or f"torchao_is_stub={w.get('torchao_is_stub')}"))
+        # A load failure must not pass for an export failure.
+        out.append((f"{name}: real model loaded and export attempted", "e2e_torchao_export" in w,
+                    w.get("e2e_error") or f"model on {w.get('e2e_model_device')}"))
     return out
 
 
@@ -63,7 +67,9 @@ def table(obs: dict) -> str:
         ("stubbed Int8WeightOnlyConfig()", lambda o: _w(o).get("int8_config")),
         ("TorchAoConfig(quant_type=<that>)", lambda o: _w(o).get("torchaoconfig_error")),
         ("_torchao_export_supported()", lambda o: _w(o).get("gate_torchao_export_supported")),
-        ("forced torchao_int8 export", lambda o: _w(o).get("forced_torchao_export") or _w(o).get("export_error")),
+        ("forced torchao_int8 export (placeholder model)", lambda o: _w(o).get("forced_torchao_export") or _w(o).get("export_error")),
+        ("real LoRA model on", lambda o: _w(o).get("e2e_model_device")),
+        ("real torchao_int8 export of a LoRA model", lambda o: _w(o).get("e2e_torchao_export") or _w(o).get("e2e_error")),
         ("export_capability()", lambda o: _w(o).get("export_capability") or _w(o).get("capability_error")),
     ]
     for label, f in facts:
@@ -73,11 +79,12 @@ def table(obs: dict) -> str:
 
 def base_shows_defect(base: dict) -> tuple[bool, str]:
     p, w = _p(base), _w(base)
+    e2e = w.get("e2e_torchao_export") or {}
     checks = {
         "torch.distributed unavailable": p.get("dist_available") is False,
         "stubbed config is None": w.get("int8_config") == "None",
-        "transformers rejects it": "quant_type must be" in str(w.get("torchaoconfig_error") or ""),
         "gate still offers torchao": w.get("gate_torchao_export_supported") is True,
+        "real torchao export of a LoRA model fails": e2e.get("ok") is False,
     }
     missing = [k for k, v in checks.items() if not v]
     return (not missing), ("all of: " + ", ".join(checks)) if not missing else "missing: " + ", ".join(missing)
@@ -90,6 +97,8 @@ def head_is_fixed(head: dict) -> tuple[bool, str]:
         "gate withholds torchao": w.get("gate_torchao_export_supported") is False,
         "forced request refused with a Windows ROCm message": forced.get("ok") is False and "Windows ROCm" in str(forced.get("message", "")),
         "export_capability reports win32_rocm": (w.get("export_capability") or {}).get("win32_rocm") is True,
+        "real LoRA export refused with a Windows ROCm message": (w.get("e2e_torchao_export") or {}).get("ok") is False
+        and "Windows ROCm" in str((w.get("e2e_torchao_export") or {}).get("message", "")),
     }
     missing = [k for k, v in checks.items() if not v]
     return (not missing), ("all of: " + ", ".join(checks)) if not missing else "missing: " + ", ".join(missing)
