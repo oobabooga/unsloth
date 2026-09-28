@@ -192,6 +192,8 @@ def main() -> int:
     env = dict(os.environ)
     env["UNSLOTH_IS_PRESENT"] = "1"
     env["UNSLOTH_COMPILE_LOCATION"] = str(work / "compiled")
+    # The runner's shared Hugging Face cache is not writable by every job.
+    env["HF_HOME"] = str(a.out.parent / "hf_home")
     overlay = ""
     if a.transformers:
         overlay_dir = a.out.parent / f"tf_overlay_{a.transformers}"
