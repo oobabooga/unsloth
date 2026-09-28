@@ -39,7 +39,37 @@ def _prompts(vocab):
     return [torch.randint(10, min(vocab, 2000), (n,), generator = g).tolist() for n in PROMPT_LENS]
 
 
+def _windows_rocm_distributed_stubs():
+    # Same stubs Studio installs (studio/backend/utils/hardware/hardware.py): AMD's Windows torch ships
+    # without torch._C._distributed_c10d, and transformers model modules import torch.distributed.
+    import types
+    import torch
+    if sys.platform != "win32" or not getattr(torch.version, "hip", None):
+        return False
+
+    class _Dummy:
+        pass
+
+    for name in ("torch._C._distributed_c10d", "torch._C._distributed_autograd", "torch._C._distributed_rpc"):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            for sym in ("FakeProcessGroup", "ProcessGroup", "Work", "Store", "PrefixStore", "FileStore", "TCPStore",
+                        "HashStore", "Reducer", "Logger", "DistributedDebugLevel", "GradBucket", "BuiltinCommHookType"):
+                setattr(stub, sym, _Dummy)
+            sys.modules[name] = stub
+    try:
+        import torch.distributed as td
+        for attr, fn in (("is_initialized", lambda: False), ("is_available", lambda: False), ("get_rank", lambda: 0),
+                         ("get_world_size", lambda: 1), ("is_torchelastic_launched", lambda: False)):
+            if not hasattr(td, attr):
+                setattr(td, attr, fn)
+    except ImportError:
+        pass
+    return True
+
+
 def role_build(work: Path):
+    _windows_rocm_distributed_stubs()
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -75,6 +105,8 @@ def role_unsloth(work: Path, checkout: Path, out: Path):
         "has_flash_softcapping": bool(getattr(g2, "HAS_FLASH_ATTENTION_SOFTCAPPING", False)),
         "flash_decode_gate": getattr(g2, "_FLASH_DECODE", None),
         "has_embed_scale_helper": hasattr(_utils, "embedding_applies_scale"),
+        "c10d_stubbed_in_unsloth_process": "torch._C._distributed_c10d" in sys.modules
+        and not hasattr(sys.modules["torch._C._distributed_c10d"], "__file__"),
     }
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     info["dtype"] = str(dtype)
@@ -94,6 +126,8 @@ def role_unsloth(work: Path, checkout: Path, out: Path):
             try:
                 return _gen(i, m)
             except Exception as e:  # recorded per case; the base may crash where the head is fixed
+                import traceback
+                traceback.print_exc()
                 return repr(e)[:300]
 
         def _gen(i, m):
@@ -114,6 +148,7 @@ def role_unsloth(work: Path, checkout: Path, out: Path):
 
 
 def role_hf(work: Path, inp: Path, out: Path):
+    _windows_rocm_distributed_stubs()
     import torch
     from transformers import AutoModelForCausalLM
 
