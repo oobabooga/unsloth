@@ -125,13 +125,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          # The index and pins Studio's setup.ps1 uses for gfx1151 on Windows.
+          # The index and pins Studio's setup.ps1 uses for gfx1151 on Windows; transformers / trl / peft
+          # as studio/backend/requirements/extras-no-deps.txt pins them.
           & $py -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" "torchvision>=0.26.0,<0.27.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $tv = & $py -c "import torch, torchvision; print(torch.__version__); print(torchvision.__version__)"
           Write-Host "installed: $tv"
           $pins = "$env:AMD_CI_WORK\pins.txt"
-          [System.IO.File]::WriteAllText($pins, "torch==$($tv[0])`ntorchvision==$($tv[1])`n", (New-Object System.Text.UTF8Encoding($false)))
+          [System.IO.File]::WriteAllText($pins, "torch==$($tv[0])`ntorchvision==$($tv[1])`ntransformers==5.5.0`ntrl==0.23.1`npeft==0.18.1`n", (New-Object System.Text.UTF8Encoding($false)))
           # unsloth/ is identical at base and head (the PR is Studio-only), so one install from the head serves both states.
           $head = & $py -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
           Write-Host "head checkout: $head"
@@ -144,6 +145,7 @@ jobs:
           & $py -c "import unsloth.save as s; print('unsloth ok', hasattr(s, '_normalize_torchao_method'))"
           # Real torchao kept OUT of the venv (Studio skips it on Windows ROCm); only the premise probe imports it.
           & $py -m pip install --no-deps --target "$env:AMD_CI_WORK\tao" torchao
+          & $py -m pip uninstall -y torchao
           & $py -m pip list 2>$null | Select-String -Pattern "^(torch|torchvision|transformers|unsloth|unsloth.zoo|peft|trl|accelerate|torchao) "
           & $py -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.distributed.is_available())"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
