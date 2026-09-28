@@ -111,6 +111,49 @@ for method in ("torchao_int8", "torchao_fp8"):
 print("AMDCI_JSON=" + json.dumps(r))
 '''
 
+_BASELINE_TORCH = _COMMON + r'''
+for stmt in ("import torch._inductor.lowering", "import torch.distributed.rpc", "import torch.distributed.device_mesh"):
+    try:
+        exec(stmt); r[stmt] = "ok"
+    except BaseException as e:
+        r[stmt] = err(e)
+print("AMDCI_JSON=" + json.dumps(r))
+'''
+
+_PATCH_SWEEP = _COMMON + r'''
+import pkgutil, importlib
+import _torchao_nodist_patch as P
+r["patched"] = P.fix_torchao_without_torch_distributed()
+import torchao
+fails = {}
+n = 0
+for m in pkgutil.walk_packages(torchao.__path__, "torchao.", onerror = lambda x: None):
+    name = m.name
+    if any(t in name for t in (".test", "_models", "benchmarks", "examples", "mps")):
+        continue
+    n += 1
+    try:
+        importlib.import_module(name)
+    except BaseException as e:
+        fails[name] = err(e)[:200]
+r["modules_tried"] = n
+r["module_failures"] = fails
+r["failure_causes"] = sorted(set(fails.values()))
+for stmt in ("from transformers.processing_utils import Unpack", "import transformers.quantizers.quantizer_torchao", "import peft.tuners.lora.torchao"):
+    try:
+        exec(stmt); r[stmt] = "ok"
+    except BaseException as e:
+        r[stmt] = err(e)
+r["stub_importers_outside_torchao"] = sorted({f"{m} <- {imp}" for m, imp in P.STUB_IMPORTERS if not str(imp).startswith("torchao")})
+r["stub_count"] = len(P.STUB_IMPORTERS)
+try:
+    import torch.distributed.tensor  # noqa: F401
+    r["dist_tensor_outside_torchao"] = "importable (LEAK)"
+except Exception as e:
+    r["dist_tensor_outside_torchao"] = err(e)
+print("AMDCI_JSON=" + json.dumps(r))
+'''
+
 
 def _run(py, code, tao_dir, timeout):
     with tempfile.NamedTemporaryFile("w", suffix = ".py", delete = False, encoding = "utf-8") as f:
@@ -144,7 +187,9 @@ def main():
     for d in a.tao_dirs:
         key = Path(d).name
         res[key] = {
+            "baseline_torch": _run(a.python, _BASELINE_TORCH, d, a.timeout),
             "no_patch": _run(a.python, _NO_PATCH, d, a.timeout),
+            "patch_sweep": _run(a.python, _PATCH_SWEEP, d, a.timeout),
             "patch_quant": _run(a.python, _PATCH_QUANT, d, a.timeout),
             "patch_unsloth": _run(a.python, _PATCH_UNSLOTH, d, a.timeout),
         }
