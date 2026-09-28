@@ -98,14 +98,16 @@ except BaseException as e:
     print("AMDCI_JSON=" + json.dumps(r)); raise SystemExit
 model, tok = FastLanguageModel.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", max_seq_length = 128, load_in_4bit = False)
 model = FastLanguageModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"], lora_alpha = 8)
+root = tempfile.mkdtemp()
+r["export_root"] = root
 for method in ("merged_16bit", "torchao_int8", "torchao_fp8"):
-    base = os.path.join(tempfile.mkdtemp(), "m")
+    base = os.path.join(root, method, "m")
+    os.makedirs(os.path.dirname(base), exist_ok = True)
     try:
         model.save_pretrained_merged(base, tok, save_method = method)
         outs = [p for p in os.listdir(os.path.dirname(base)) if p.startswith("m-")] or ["m"]
         out = os.path.join(os.path.dirname(base), outs[0])
-        ok, t = finite_logits(out)
-        r[f"unsloth_{method}"] = {"output": outs[0], "files": sorted(os.listdir(out))[:12], "finite_logits": ok, "reloaded_weight_type": t}
+        r[f"unsloth_{method}"] = {"output": out, "files": sorted(os.listdir(out))[:12]}
     except BaseException as e:
         r[f"unsloth_{method}"] = err(e); r[f"unsloth_{method}_trace"] = "".join(l for l in traceback.format_exc().splitlines(True) if "site-packages" in l or "Error" in l)[-6000:]
 print("AMDCI_JSON=" + json.dumps(r))
@@ -173,11 +175,40 @@ print("AMDCI_JSON=" + json.dumps(r))
 '''
 
 
-def _run(py, code, tao_dir, timeout):
+_VERIFY = _COMMON + r'''
+from _torchao_nodist_patch import fix_torchao_without_torch_distributed
+r["patched"] = fix_torchao_without_torch_distributed()
+from transformers import AutoModelForCausalLM
+paths = json.loads(os.environ["AMDCI_EXPORTS"])
+ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], device = "cuda")
+ref = None
+for method in ("merged_16bit", "torchao_int8", "torchao_fp8"):
+    out = paths.get(method)
+    if out is None:
+        continue
+    try:
+        m = AutoModelForCausalLM.from_pretrained(out, device_map = "cuda")
+        with torch.no_grad():
+            logits = m(ids).logits.float()
+        types = sorted({type(p.data).__name__ for p in m.parameters()})
+        row = {"finite": bool(torch.isfinite(logits).all()), "param_types": types,
+               "quant_config": type(getattr(m.config, "quantization_config", None)).__name__}
+        if method == "merged_16bit":
+            ref = logits
+        elif ref is not None:
+            row["max_abs_diff_vs_16bit"] = float((logits - ref).abs().max())
+            row["top1_agree_vs_16bit"] = float((logits.argmax(-1) == ref.argmax(-1)).float().mean())
+        r[method] = row
+    except BaseException as e:
+        r[method] = err(e); r[method + "_trace"] = traceback.format_exc()[-2500:]
+print("AMDCI_JSON=" + json.dumps(r))
+'''
+
+def _run(py, code, tao_dir, timeout, extra_env = None):
     with tempfile.NamedTemporaryFile("w", suffix = ".py", delete = False, encoding = "utf-8") as f:
         f.write(f"HERE = {str(HERE)!r}\n" + code)
         script = f.name
-    env = dict(os.environ, PYTHONPATH = tao_dir, PYTHONIOENCODING = "utf-8", UNSLOTH_DISABLE_AUTO_UPDATES = "1")
+    env = dict(os.environ, PYTHONPATH = tao_dir, PYTHONIOENCODING = "utf-8", UNSLOTH_DISABLE_AUTO_UPDATES = "1", **(extra_env or {}))
     try:
         p = subprocess.run([py, script], capture_output = True, text = True, encoding = "utf-8",
                            errors = "replace", timeout = timeout, env = env, cwd = tempfile.gettempdir())
@@ -211,6 +242,9 @@ def main():
             "patch_quant": _run(a.python, _PATCH_QUANT, d, a.timeout),
             "patch_unsloth": _run(a.python, _PATCH_UNSLOTH, d, a.timeout),
         }
+        exports = {m[len("unsloth_"):]: v["output"] for m, v in res[key]["patch_unsloth"].items()
+                   if m.startswith("unsloth_") and isinstance(v, dict) and "output" in v}
+        res[key]["verify_without_unsloth"] = _run(a.python, _VERIFY, d, a.timeout, {"AMDCI_EXPORTS": json.dumps(exports)})
     a.out.parent.mkdir(parents = True, exist_ok = True)
     a.out.write_text(json.dumps(res, indent = 2), encoding = "utf-8")
     for k, v in res.items():
