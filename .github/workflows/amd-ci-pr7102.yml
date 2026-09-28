@@ -164,6 +164,19 @@ jobs:
             --require windows rocm gpu --expect-arch gfx1151 --out "$env:AMD_CI_WORK\out\host_rocm.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: torchao without torch.distributed (diagnostic)
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($v in @("0.17.0", "0.18.0")) {
+            & $env:AMD_CI_PY -m pip install -q --no-deps --target "$env:AMD_CI_WORK\tao_$v" "torchao==$v"
+          }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\torchao_nodist_diag.py" `
+            --python "$env:AMD_CI_PY" --tao-dirs "$env:AMD_CI_WORK\tao_0.17.0" "$env:AMD_CI_WORK\tao_0.18.0" `
+            --out "$env:AMD_CI_WORK\out\torchao_nodist.json"
+          # Findings live in the JSON; this step never gates the job.
+          exit 0
+
       - name: Differential
         run: |
           $ErrorActionPreference = "Continue"
