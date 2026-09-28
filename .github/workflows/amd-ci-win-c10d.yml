@@ -1,0 +1,176 @@
+name: "AMD CI (Windows): Core on torch without torch._C._distributed_c10d"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-win-c10d]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "0"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  linux-control:
+    name: "c10d linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows"
+          echo "selector matched no runner. If BOTH stay queued, the pool is busy."
+
+  windows:
+    name: "c10d on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    # Uncomment when the job actually measures the GPU. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    # concurrency:
+    #   group: amd-ci-strix-halo-windows-gpu
+    #   cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "c10d-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Checkouts (base = main, head = fix branch)
+        run: |
+          $ErrorActionPreference = "Continue"
+          git clone -q --depth 1 "$env:UPSTREAM" "$env:AMD_CI_WORK\states\base"
+          git clone -q --depth 1 -b windows-rocm-torch-distributed-stub "$env:UPSTREAM" "$env:AMD_CI_WORK\states\head"
+          git -C "$env:AMD_CI_WORK\states\base" log --oneline -1
+          git -C "$env:AMD_CI_WORK\states\head" log --oneline -1
+          if (-not (Test-Path "$env:AMD_CI_WORK\states\head\tests\test_torch_without_distributed_backend.py")) { exit 1 }
+
+      - name: Test environment (Studio installer from main, as a Windows AMD user gets it)
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\out" | Out-Null
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          $env:UNSLOTH_SKIP_AUTOSTART = "1"
+          $env:UNSLOTH_INSTALL_NO_ROLLBACK = "1"
+          Push-Location "$env:AMD_CI_WORK\states\base"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local --skip-autostart *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\install.log" | Select-Object -Last 40
+          Pop-Location
+          $py = Get-ChildItem -Path "$env:AMD_CI_WORK\studio" -Recurse -Filter python.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'unsloth_studio\\Scripts\\python.exe$' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $py) { Write-Host "FATAL: Studio venv python not found"; exit 1 }
+          $uv = Get-ChildItem -Path "$env:AMD_CI_WORK\studio" -Recurse -Filter uv.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if ($uv) { & $uv pip install -q --python $py pytest } else { & $py -m pip install -q pytest }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_UV=$uv"
+          & $py -c "import torch, importlib.metadata as m; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), 'dist', torch.distributed.is_available()); print({d.metadata['Name']: d.version for d in m.distributions() if (d.metadata['Name'] or '').lower() in ('torchao','accelerate','transformers','trl','peft','triton-windows')})"
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Core base vs head (Studio pins)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\core_c10d_probe.py" --python $env:AMD_CI_PY `
+            --root "$env:AMD_CI_WORK\states" --out "$env:AMD_CI_WORK\out\probe"
+          Add-Content -Path $env:GITHUB_ENV -Value "RC_PINS=$LASTEXITCODE"
+
+      - name: Core base vs head (accelerate 1.15.0, as pip gives Core users)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf_home"
+          if ($env:AMD_CI_UV) { & $env:AMD_CI_UV pip install -q --python $env:AMD_CI_PY "accelerate==1.15.0" } else { & $env:AMD_CI_PY -m pip install -q "accelerate==1.15.0" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\core_c10d_probe.py" --python $env:AMD_CI_PY `
+            --root "$env:AMD_CI_WORK\states" --out "$env:AMD_CI_WORK\out\probe" --steps train --tag _acc115
+          Add-Content -Path $env:GITHUB_ENV -Value "RC_ACC=$LASTEXITCODE"
+
+      - name: Unit tests on head
+        run: |
+          $ErrorActionPreference = "Continue"
+          Push-Location "$env:AMD_CI_WORK\states\head"
+          $env:PYTHONPATH = "$env:AMD_CI_WORK\states\head"
+          $env:UNSLOTH_COMPILE_LOCATION = "$env:AMD_CI_WORK\out\compiled_pytest"
+          & $env:AMD_CI_PY -m pytest tests/test_torch_without_distributed_backend.py -q -p no:cacheprovider *>&1 | Tee-Object -FilePath "$env:AMD_CI_WORK\out\pytest.log" | Select-Object -Last 15
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "pins rc $env:RC_PINS, accelerate 1.15 rc $env:RC_ACC, pytest rc $rc"
+          if ($env:RC_PINS -ne "0" -or $env:RC_ACC -ne "0" -or $rc -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c10d-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
