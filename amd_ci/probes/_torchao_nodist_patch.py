@@ -82,7 +82,8 @@ STUB_IMPORTERS = []  # (stubbed module, first non-importlib importer module) for
 
 
 def _importer():
-    f = sys._getframe(2)
+    """__name__ of the first frame outside importlib and this module: whoever asked."""
+    f = sys._getframe(1)
     while f is not None:
         name = f.f_globals.get("__name__", "")
         if not name.startswith(("importlib", "_frozen_importlib")) and name != __name__:
@@ -91,14 +92,23 @@ def _importer():
     return None
 
 
+def _is_torchao(name):
+    return isinstance(name, str) and (name == "torchao" or name.startswith("torchao."))
+
+
 class _DistStubFinder(importlib.abc.MetaPathFinder):
-    """Inside the window only: any torch.distributed.* not already loaded is an inert stand-in."""
+    """Inside the window, and only for imports made BY torchao code: a torch.distributed.*
+    module that is not loaded becomes an inert stand-in. torch internals imported meanwhile
+    (torch._dynamo) keep the normal failure they already handle."""
 
     def find_spec(self, fullname, path = None, target = None):
-        if fullname.startswith("torch.distributed.") and fullname not in sys.modules:
-            STUB_IMPORTERS.append((fullname, _importer()))
-            return importlib.machinery.ModuleSpec(fullname, _StubLoader(), is_package = True)
-        return None
+        if not fullname.startswith("torch.distributed.") or fullname in sys.modules:
+            return None
+        who = _importer()
+        STUB_IMPORTERS.append((fullname, who))
+        if not _is_torchao(who):
+            return None
+        return importlib.machinery.ModuleSpec(fullname, _StubLoader(), is_package = True)
 
 
 class _InertPacket:
@@ -127,14 +137,15 @@ class _Window:
         self.depth = 0
         self.packets = {}
         self.dist_finder = _DistStubFinder()
+        self.snapshots = []
 
     def __enter__(self):
         self.lock.acquire()
         self.depth += 1
         _IMPORTING[0] = self.depth
+        self.snapshots.append(set(sys.modules))
         if self.depth == 1:
             torch = self.torch
-            self.before = set(sys.modules)
             sys.meta_path.insert(0, self.dist_finder)
             ns_cls = torch._ops._OpNamespace
             self.original_getattr = original = ns_cls.__getattr__
@@ -146,6 +157,8 @@ class _Window:
                 except AttributeError:
                     if ns.name not in _OP_NAMESPACES or op_name.startswith("__"):
                         raise
+                    if not _is_torchao(sys._getframe(1).f_globals.get("__name__")):
+                        raise
                     key = f"{ns.name}.{op_name}"
                     return packets.setdefault(key, _InertPacket(key))
 
@@ -156,18 +169,18 @@ class _Window:
         try:
             self.depth -= 1
             _IMPORTING[0] = self.depth
+            # Drop this module's stand-ins as soon as its body is done; it keeps its references.
+            for n in set(sys.modules) - self.snapshots.pop():
+                mod = sys.modules.get(n)
+                if getattr(mod, "__unsloth_nodist_stub__", False):
+                    del sys.modules[n]
+                    parent_name, _, attr = n.rpartition(".")
+                    parent = sys.modules.get(parent_name)
+                    if parent is not None and getattr(parent, attr, None) is mod:
+                        delattr(parent, attr)
             if self.depth == 0:
-                torch = self.torch
-                torch._ops._OpNamespace.__getattr__ = self.original_getattr
+                self.torch._ops._OpNamespace.__getattr__ = self.original_getattr
                 sys.meta_path.remove(self.dist_finder)
-                for n in set(sys.modules) - self.before:
-                    mod = sys.modules.get(n)
-                    if getattr(mod, "__unsloth_nodist_stub__", False):
-                        del sys.modules[n]
-                        parent_name, _, attr = n.rpartition(".")
-                        parent = sys.modules.get(parent_name)
-                        if parent is not None and getattr(parent, attr, None) is mod:
-                            delattr(parent, attr)
         finally:
             self.lock.release()
         return False

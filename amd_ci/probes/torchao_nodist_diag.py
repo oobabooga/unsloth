@@ -98,16 +98,16 @@ except BaseException as e:
     print("AMDCI_JSON=" + json.dumps(r)); raise SystemExit
 model, tok = FastLanguageModel.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", max_seq_length = 128, load_in_4bit = False)
 model = FastLanguageModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"], lora_alpha = 8)
-for method in ("torchao_int8", "torchao_fp8"):
+for method in ("merged_16bit", "torchao_int8", "torchao_fp8"):
     base = os.path.join(tempfile.mkdtemp(), "m")
     try:
         model.save_pretrained_merged(base, tok, save_method = method)
-        outs = [p for p in os.listdir(os.path.dirname(base)) if p.startswith("m-")]
+        outs = [p for p in os.listdir(os.path.dirname(base)) if p.startswith("m-")] or ["m"]
         out = os.path.join(os.path.dirname(base), outs[0])
         ok, t = finite_logits(out)
         r[f"unsloth_{method}"] = {"output": outs[0], "files": sorted(os.listdir(out))[:12], "finite_logits": ok, "reloaded_weight_type": t}
     except BaseException as e:
-        r[f"unsloth_{method}"] = err(e); r[f"unsloth_{method}_trace"] = traceback.format_exc()[-2500:]
+        r[f"unsloth_{method}"] = err(e); r[f"unsloth_{method}_trace"] = "".join(l for l in traceback.format_exc().splitlines(True) if "site-packages" in l or "Error" in l)[-6000:]
 print("AMDCI_JSON=" + json.dumps(r))
 '''
 
@@ -144,7 +144,25 @@ for stmt in ("from transformers.processing_utils import Unpack", "import transfo
         exec(stmt); r[stmt] = "ok"
     except BaseException as e:
         r[stmt] = err(e)
-r["stub_importers_outside_torchao"] = sorted({f"{m} <- {imp}" for m, imp in P.STUB_IMPORTERS if not str(imp).startswith("torchao")})
+r["stand_in_requests_refused_outside_torchao"] = sorted({f"{m} <- {imp}" for m, imp in P.STUB_IMPORTERS if not str(imp).startswith("torchao")})
+poisoned = []
+for mname, mod in list(sys.modules.items()):
+    if mname == "torchao" or mname.startswith("torchao.") or mname.startswith("_torchao_nodist") or mod is None:
+        continue
+    try:
+        items = list(vars(mod).items())
+    except Exception:
+        continue
+    for k, v in items:
+        try:
+            hit = (isinstance(v, (P._NeverMeta, P._InertPacket))
+                   or (isinstance(v, type(sys)) and v.__dict__.get("__unsloth_nodist_stub__", False))
+                   or (callable(v) and getattr(v, "__qualname__", "") == "_unavailable.<locals>.fn"))
+        except Exception:
+            hit = False
+        if hit:
+            poisoned.append(f"{mname}.{k}")
+r["stand_ins_held_outside_torchao"] = poisoned
 r["stub_count"] = len(P.STUB_IMPORTERS)
 try:
     import torch.distributed.tensor  # noqa: F401
