@@ -116,6 +116,12 @@ jobs:
             --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Head = the PR head plus the candidate commit (amd_ci/head_candidate.patch), before it is pushed.
+          $head = & $env:AMD_CI_PY -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
+          git -C "$head" log --oneline -1
+          git -C "$head" apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\amd_ci\head_candidate.patch"
+          if ($LASTEXITCODE -ne 0) { Write-Host "candidate patch does not apply"; exit 1 }
+          git -C "$head" status --short
 
       - name: Test environment
         timeout-minutes: 75
@@ -133,7 +139,7 @@ jobs:
           Write-Host "installed: $tv"
           $pins = "$env:AMD_CI_WORK\pins.txt"
           [System.IO.File]::WriteAllText($pins, "torch==$($tv[0])`ntorchvision==$($tv[1])`ntransformers==5.5.0`ntrl==0.23.1`npeft==0.18.1`n", (New-Object System.Text.UTF8Encoding($false)))
-          # unsloth/ is identical at base and head (the PR is Studio-only), so one install from the head serves both states.
+          # Each state's unsloth/ comes first on the probe's PYTHONPATH; this install only brings the dependencies.
           $head = & $py -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
           Write-Host "head checkout: $head"
           & $py -m pip install -c $pins "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" "$head"
@@ -143,9 +149,9 @@ jobs:
           & $py -m pip install -c $pins "triton-windows<3.7"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "import unsloth.save as s; print('unsloth ok', hasattr(s, '_normalize_torchao_method'))"
-          # Real torchao kept OUT of the venv (Studio skips it on Windows ROCm); only the premise probe imports it.
-          & $py -m pip install --no-deps --target "$env:AMD_CI_WORK\tao" torchao
-          & $py -m pip uninstall -y torchao
+          # The torchao Studio pairs with torch 2.11, installed as the head installer now does on Windows ROCm.
+          & $py -m pip install --no-deps "torchao==0.17.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # bitsandbytes as studio/install_python_stack.py installs it on AMD Windows, and BNB_ROCM_VERSION from its DLL.
           & $py -m pip install --force-reinstall --no-cache-dir --no-deps https://github.com/bitsandbytes-foundation/bitsandbytes/releases/download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-win_amd64.whl
           if ($LASTEXITCODE -ne 0) { & $py -m pip install --no-deps "bitsandbytes>=0.50.0" }
@@ -164,28 +170,15 @@ jobs:
             --require windows rocm gpu --expect-arch gfx1151 --out "$env:AMD_CI_WORK\out\host_rocm.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: torchao without torch.distributed (diagnostic)
-        timeout-minutes: 45
-        run: |
-          $ErrorActionPreference = "Continue"
-          foreach ($v in @("0.17.0", "0.18.0")) {
-            & $env:AMD_CI_PY -m pip install -q --no-deps --target "$env:AMD_CI_WORK\tao_$v" "torchao==$v"
-          }
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\torchao_nodist_diag.py" `
-            --python "$env:AMD_CI_PY" --tao-dirs "$env:AMD_CI_WORK\tao_0.17.0" "$env:AMD_CI_WORK\tao_0.18.0" `
-            --out "$env:AMD_CI_WORK\out\torchao_nodist.json"
-          # Findings live in the JSON; this step never gates the job.
-          exit 0
-
       - name: Differential
         run: |
           $ErrorActionPreference = "Continue"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
             --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/torchao_export_gate_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/torchao_export_gate.py" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/torchao_export_real_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/torchao_export_real.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --torchao-dir "$env:AMD_CI_WORK\tao"
+            --python "$env:AMD_CI_PY"
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
