@@ -1,0 +1,169 @@
+{
+ "name": "stack12059_12061_flux",
+ "description": "FLUX.1-schnell main (7581d507) vs stack tip (#12061), fp8 + bf16, off + default",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": "$WORKSPACE/bin/python",
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 4,
+  "warmup": 1,
+  "short_n": 2,
+  "options": {
+   "model_kind": "pipeline",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 30,
+  "min_free_mib": 50000,
+  "timeout_s": 1800
+ },
+ "cells": [
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "main_fp8_off",
+   "ref": "main_fp8_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "fp8",
+    "speed_mode": "off",
+    "studio_src": "$WORKSPACE/wt_main_7581"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_main_fp8_off"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "main_fp8_default",
+   "ref": "main_fp8_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "fp8",
+    "speed_mode": "default",
+    "studio_src": "$WORKSPACE/wt_main_7581"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_main_fp8_default"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "main_none_off",
+   "ref": "main_none_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none",
+    "speed_mode": "off",
+    "studio_src": "$WORKSPACE/wt_main_7581"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_main_none_off"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "main_none_default",
+   "ref": "main_none_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none",
+    "speed_mode": "default",
+    "studio_src": "$WORKSPACE/wt_main_7581"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_main_none_default"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "tip_fp8_off",
+   "ref": "tip_fp8_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "fp8",
+    "speed_mode": "off",
+    "studio_src": "$WORKSPACE/wt_r12061"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_tip_fp8_off"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "tip_fp8_default",
+   "ref": "tip_fp8_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "fp8",
+    "speed_mode": "default",
+    "studio_src": "$WORKSPACE/wt_r12061"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_tip_fp8_default"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "tip_none_off",
+   "ref": "tip_none_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none",
+    "speed_mode": "off",
+    "studio_src": "$WORKSPACE/wt_r12061"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_tip_none_off"
+   }
+  },
+  {
+   "model": "@flux_schnell",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "tag": "tip_none_default",
+   "ref": "tip_none_off",
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none",
+    "speed_mode": "default",
+    "studio_src": "$WORKSPACE/wt_r12061"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/stack12061_tip_none_default"
+   }
+  }
+ ]
+}
