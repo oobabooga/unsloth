@@ -138,6 +138,10 @@ jobs:
           & $py -m pip install -c $pins "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" "$head"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -m pip install -c $pins fastapi pydantic httpx psutil
+          # Studio's setup.ps1 installs this on every Windows torch, ROCm included; unsloth imports triton.
+          & $py -m pip install -c $pins "triton-windows<3.7"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -c "import unsloth.save as s; print('unsloth ok', hasattr(s, '_normalize_torchao_method'))"
           # Real torchao kept OUT of the venv (Studio skips it on Windows ROCm); only the premise probe imports it.
           & $py -m pip install --no-deps --target "$env:AMD_CI_WORK\tao" torchao
           & $py -m pip list 2>$null | Select-String -Pattern "^(torch|torchvision|transformers|unsloth|unsloth.zoo|peft|trl|accelerate|torchao) "
