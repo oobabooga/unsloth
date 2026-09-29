@@ -29,6 +29,18 @@ ap.add_argument("--reps", type = int, default = 5)
 args = ap.parse_args()
 sys.path.insert(0, args.backend)
 
+# As Studio's run.py does before any import: Windows ROCm torch has no torch.distributed, so a stock
+# torchao (pulled in by transformers' quantizers) dies on import unless these stubs are seeded first.
+try:
+    from core import _torchao_stub as _stub
+
+    for _name in ("install_xformers_windows_rocm_stub", "hide_xformers_built_for_another_torch",
+                  "install_torchao_windows_rocm_stub"):
+        if hasattr(_stub, _name):
+            getattr(_stub, _name)()
+except ImportError:
+    pass
+
 import numpy as np
 import torch
 
