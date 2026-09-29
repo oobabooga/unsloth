@@ -26,7 +26,17 @@ def main() -> int:
     tmp = Path(os.environ.get("RUNNER_TEMP") or args.out.parent)
     home = tmp / f"studio_home_{args.state}"
     obs: dict = {"state": args.state, "home": str(home)}
-    env = {**os.environ, "UNSLOTH_STUDIO_HOME": str(home), "UNSLOTH_SKIP_AUTOSTART": "1"}
+    hf = tmp / f"hf_{args.state}"
+    # The runner's shared HF cache is not writable by every job: each state downloads into its own.
+    env = {
+        **os.environ,
+        "UNSLOTH_STUDIO_HOME": str(home),
+        "UNSLOTH_SKIP_AUTOSTART": "1",
+        "HF_HOME": str(hf),
+        "HF_HUB_CACHE": str(hf / "hub"),
+        "HF_XET_CACHE": str(hf / "xet"),
+        "HUGGINGFACE_HUB_CACHE": str(hf / "hub"),
+    }
     t = time.time()
     log = tmp / f"install_{args.state}.log"
     with open(log, "w", encoding = "utf-8") as fh:
@@ -41,7 +51,7 @@ def main() -> int:
         res = tmp / f"probe_{args.state}.json"
         p = subprocess.run([sys.executable, str(HERE / "multi_model_probe.py"), "--bin", str(cli),
                             "--home", str(home), "--out", str(res)],
-                           capture_output = True, text = True, encoding = "utf-8", errors = "replace")
+                           capture_output = True, text = True, encoding = "utf-8", errors = "replace", env = env)
         obs["probe_rc"] = p.returncode
         obs["probe_tail"] = (p.stdout or "")[-4000:]
         if res.exists():
