@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ def main() -> int:
     impl = Path(__file__).with_name("laya_mem_impl.py")
     backend = Path(args.checkout) / "studio" / "backend"
     obs: dict = {"state": args.state, "runs": {}}
-    for device, reps in (("auto", "5"), ("cpu", "2")):
+    devices = os.environ.get("LAYA_PROBE_DEVICES", "auto,cpu").split(",")
+    for device, reps in [(d, r) for d, r in (("auto", "5"), ("cpu", "2")) if d in devices]:
         out = args.out.with_name(f"{args.out.stem}_{args.state}_{device}.json")
         cmd = [args.python, str(impl), "--backend", str(backend), "--device", device, "--reps", reps, "--out", str(out)]
         try:

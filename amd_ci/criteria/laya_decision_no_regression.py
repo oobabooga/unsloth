@@ -9,6 +9,7 @@ more than 25% slower. Pairs with probes/laya_decision_probe.py.
 from __future__ import annotations
 
 TITLE = "Decision API (Laya): accuracy, memory and latency, base versus head"
+DEVICES = [d for d in ("auto", "cpu") if d in __import__("os").environ.get("LAYA_PROBE_DEVICES", "auto,cpu").split(",")]
 MODE = "regression"
 NEEDS: list[str] = ["rocm", "gpu"]
 
@@ -20,7 +21,7 @@ def _run(obs, device):
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out = []
     for name in ("base", "head"):
-        for device in ("auto", "cpu"):
+        for device in DEVICES:
             r = _run(obs.get(name), device)
             ok = r.get("rc") == 0 and (r.get("accuracy") or {}).get("answers", 0) > 0
             out.append((f"{name} {device} run answered requests", ok,
@@ -37,7 +38,7 @@ def table(obs: dict) -> str:
             "guardrail ms | briefing ms | worst ms | max dprob | changed | graphs |",
             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name in ("base", "head"):
-        for device in ("auto", "cpu"):
+        for device in DEVICES:
             r = _run(obs.get(name), device)
             w = r.get("workloads") or {}
             ms = lambda k: next((v.get("median_ms") for n, v in w.items() if n.startswith(k)), None)
@@ -52,7 +53,7 @@ def table(obs: dict) -> str:
 
 def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
     problems, notes = [], []
-    for device in ("auto", "cpu"):
+    for device in DEVICES:
         b, h = _run(base, device), _run(head, device)
         ba, ha = b.get("accuracy") or {}, h.get("accuracy") or {}
         if ha.get("changed_answers", 0) > ba.get("changed_answers", 0):

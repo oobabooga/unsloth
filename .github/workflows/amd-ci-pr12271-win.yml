@@ -159,6 +159,8 @@ jobs:
         if: always()
         run: |
           $ErrorActionPreference = "Continue"
+          # CPU is measured on Linux (sweep); Windows answers the ROCm GPU question within the job limit.
+          $env:LAYA_PROBE_DEVICES = "auto"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
             --states "$env:AMD_CI_WORK\out\states.json" `
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/laya_decision_probe.py" `
