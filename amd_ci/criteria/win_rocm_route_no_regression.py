@@ -55,6 +55,12 @@ def table(obs: dict) -> str:
             f"| {mm.get('max_abs_err')} | {round(mm.get('tflops_4096_fp16') or 0, 2)} "
             f"| {gm.get('max_abs_err_vs_bmm', gm.get('error'))} "
             f"| {tr.get('first')} -> {tr.get('last')} | {', '.join(failed) or 'none'} |")
+    for name in ("base", "head"):
+        tf = ((_smoke(obs.get(name) or {}).get("matmul") or {}).get("tflops_fp16")) or {}
+        if tf:
+            rows.append("")
+            rows.append(f"{name} fp16 TFLOPS median [min, max] of 7: " + ", ".join(
+                f"n={n}: {v['median']:.2f} [{v['min']:.2f}, {v['max']:.2f}]" for n, v in tf.items()))
     return "\n".join(rows)
 
 

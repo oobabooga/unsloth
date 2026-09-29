@@ -70,7 +70,7 @@ jobs:
     # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
     # raises W101 if a step here touches GPU memory without a group.
     concurrency:
-      group: amd-ci-strix-halo-windows-gpu-pr11846
+      group: amd-ci-strix-halo-windows-gpu
       cancel-in-progress: false
     defaults:
       run:
@@ -128,10 +128,18 @@ jobs:
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
-          # If the change needs a ROCm torch, install it here and then re-gate with
-          # --require rocm gpu --expect-arch gfx1151. The gate EXITS 1 when it is
-          # absent, which is the point: whether these boxes carry a ROCm-enabled
-          # torch has not been measured, and a green skip would hide that.
+          # ROCm torch in the harness venv so capability.py can measure the host (neutral:
+          # today's per-family build; each state's probe installs its own route in its own venv).
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Host gate (ROCm GPU)
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" `
+            --require windows rocm gpu windows_rocm_wddm --expect-arch gfx1151 `
+            --out "$env:AMD_CI_WORK\out\host_rocm.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Differential
         run: |

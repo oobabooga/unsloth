@@ -54,11 +54,17 @@ if res["cuda_available"]:
         a = torch.randn(512, 512); b = torch.randn(512, 512)
         ref = a @ b
         out = (a.half().cuda() @ b.half().cuda()).float().cpu()
-        x = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
-        torch.cuda.synchronize(); t = time.perf_counter()
-        for _ in range(10): x @ x
-        torch.cuda.synchronize(); dt = (time.perf_counter() - t) / 10
-        return {"max_abs_err": float((out - ref).abs().max()), "tflops_4096_fp16": 2 * 4096**3 / dt / 1e12}
+        tf = {}
+        for n in (2048, 4096, 8192):
+            x = torch.randn(n, n, device="cuda", dtype=torch.float16)
+            for _ in range(3): x @ x
+            reps = []
+            for _ in range(7):
+                torch.cuda.synchronize(); t = time.perf_counter()
+                for _ in range(10): x @ x
+                torch.cuda.synchronize(); reps.append(2 * n**3 * 10 / (time.perf_counter() - t) / 1e12)
+            reps.sort(); tf[n] = {"median": reps[3], "min": reps[0], "max": reps[-1]}
+        return {"max_abs_err": float((out - ref).abs().max()), "tflops_4096_fp16": tf[4096]["median"], "tflops_fp16": tf}
     step("matmul", matmul)
     def grouped():
         if not hasattr(torch, "_grouped_mm"):
