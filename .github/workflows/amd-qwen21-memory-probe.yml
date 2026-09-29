@@ -70,9 +70,11 @@ jobs:
           -r "$WORK_ROOT/code/studio/backend/requirements/diffusers-pin.txt" \
           'transformers==5.5.0' 'accelerate>=1.0' 'peft>=0.18' \
           sentencepiece psutil protobuf scipy einops Pillow pyyaml ninja safetensors
+        python -m pip install -c "$WORK_ROOT/torch-constraints.txt" \
+          -r "$WORK_ROOT/code/studio/backend/requirements/diffusers-main.txt"
         python -m pip freeze > "$WORK_ROOT/out/pip-freeze.txt"
         echo "PYTHONPATH=$WORK_ROOT/code/studio/backend" >> "$GITHUB_ENV"
-        PYTHONPATH="$WORK_ROOT/code/studio/backend" python -c 'from core.inference.diffusion import DiffusionBackend; print("Studio backend import passed")'
+        PYTHONPATH="$WORK_ROOT/code/studio/backend" python -c 'from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print("Studio backend and Qwen-Image-2.1 pipeline imports passed")'
     - name: Write measurement harness
       run: |
         cat > "$WORK_ROOT/probe.py" <<'PY'
@@ -282,6 +284,14 @@ jobs:
         timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
           --case native-auto --free-gib 0 --memory-mode auto --output "$WORK_ROOT/out" \
           2>&1 | tee "$WORK_ROOT/out/native-auto.log"
+    - name: Save native-auto evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: native-auto-evidence
+        path: ${{ env.WORK_ROOT }}/out/native-auto*
+        retention-days: 7
+        if-no-files-found: warn
     - name: cap20-free19-auto
       continue-on-error: true
       timeout-minutes: 30
@@ -292,6 +302,14 @@ jobs:
         timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
           --case cap20-free19-auto --free-gib 19 --memory-mode auto --output "$WORK_ROOT/out" \
           2>&1 | tee "$WORK_ROOT/out/cap20-free19-auto.log"
+    - name: Save cap20-free19-auto evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cap20-free19-auto-evidence
+        path: ${{ env.WORK_ROOT }}/out/cap20-free19-auto*
+        retention-days: 7
+        if-no-files-found: warn
     - name: cap20-free16-auto
       continue-on-error: true
       timeout-minutes: 30
@@ -302,6 +320,14 @@ jobs:
         timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
           --case cap20-free16-auto --free-gib 16 --memory-mode auto --output "$WORK_ROOT/out" \
           2>&1 | tee "$WORK_ROOT/out/cap20-free16-auto.log"
+    - name: Save cap20-free16-auto evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cap20-free16-auto-evidence
+        path: ${{ env.WORK_ROOT }}/out/cap20-free16-auto*
+        retention-days: 7
+        if-no-files-found: warn
     - name: cap20-free16-low-vram
       continue-on-error: true
       timeout-minutes: 30
@@ -312,6 +338,14 @@ jobs:
         timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
           --case cap20-free16-low-vram --free-gib 16 --memory-mode low_vram --output "$WORK_ROOT/out" \
           2>&1 | tee "$WORK_ROOT/out/cap20-free16-low-vram.log"
+    - name: Save cap20-free16-low-vram evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cap20-free16-low-vram-evidence
+        path: ${{ env.WORK_ROOT }}/out/cap20-free16-low-vram*
+        retention-days: 7
+        if-no-files-found: warn
     - name: Summarize measured results
       if: always()
       run: |
