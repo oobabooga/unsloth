@@ -29,6 +29,18 @@ ap.add_argument("--reps", type = int, default = 5)
 args = ap.parse_args()
 sys.path.insert(0, args.backend)
 
+# As Studio's run.py does before any import: Windows ROCm torch has no torch.distributed, so a stock
+# torchao (pulled in by transformers' quantizers) dies on import unless these stubs are seeded first.
+try:
+    from core import _torchao_stub as _stub
+
+    for _name in ("install_xformers_windows_rocm_stub", "hide_xformers_built_for_another_torch",
+                  "install_torchao_windows_rocm_stub"):
+        if hasattr(_stub, _name):
+            getattr(_stub, _name)()
+except ImportError:
+    pass
+
 import numpy as np
 import torch
 
@@ -49,6 +61,9 @@ if args.checkpoint:
 if args.device == "auto":
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
 laya_runtime._device = lambda: args.device
+# Sweep hooks: LAYA_CPU_CHUNK overrides the CPU chunk budget, LAYA_WORKLOADS keeps the named workloads only.
+if os.environ.get("LAYA_CPU_CHUNK") and isinstance(getattr(laya_runtime, "_CHUNK_TOKENS", None), dict):
+    laya_runtime._CHUNK_TOKENS["cpu"] = int(os.environ["LAYA_CPU_CHUNK"])
 gpu = args.device == "cuda"
 result = {"modernbert_import": result_modernbert_import, "device": args.device, "torch": torch.__version__, "hip": torch.version.hip, "platform": sys.platform}
 if gpu:
@@ -127,6 +142,11 @@ def sync():
         torch.cuda.synchronize()
 
 
+result["torch_threads"] = torch.get_num_threads()
+result["cpu_chunk"] = (getattr(laya_runtime, "_CHUNK_TOKENS", None) or {}).get("cpu")
+if os.environ.get("LAYA_WORKLOADS"):
+    keep = os.environ["LAYA_WORKLOADS"].split(",")
+    WORKLOADS = {k: v for k, v in WORKLOADS.items() if any(k.startswith(x) for x in keep)}
 result["workloads"] = {}
 answers = {}
 for name, reqs in WORKLOADS.items():
@@ -155,6 +175,11 @@ if gpu:
     result["peak_device_used_over_idle_mib"] = round(peak_used[0] - idle)
     result["device_idle_used_mib"] = round(idle)
 
+if os.environ.get("LAYA_SKIP_ACCURACY") == "1":
+    print(json.dumps(result, indent = 1), flush = True)
+    with open(args.out, "w", encoding = "utf-8") as f:
+        json.dump(result, f, indent = 1)
+    raise SystemExit(0)
 # Accuracy vs laya's own fp32 forward on CPU, over every request above.
 if hasattr(laya_runtime, "_laya"):
     laya_module = laya_runtime._laya()
