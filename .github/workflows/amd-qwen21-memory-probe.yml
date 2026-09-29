@@ -1,0 +1,354 @@
+name: AMD Qwen-Image-2.1 memory and timing probe
+'on':
+  push:
+    branches:
+    - amd-qwen21-memory-probe-20260929
+permissions: {}
+jobs:
+  probe:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 150
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    env:
+      PYTHONUNBUFFERED: '1'
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+    - name: Hardware and isolated storage
+      run: |
+        set -euo pipefail
+        WORK_ROOT="$RUNNER_TEMP/qwen21-memory-probe"
+        mkdir -p "$WORK_ROOT"/{out,tmp,cache/huggingface,cache/torch,cache/pip,cache/triton,studio}
+        {
+          echo "WORK_ROOT=$WORK_ROOT"
+          echo "TMPDIR=$WORK_ROOT/tmp"
+          echo "HF_HOME=$WORK_ROOT/cache/huggingface"
+          echo "HUGGINGFACE_HUB_CACHE=$WORK_ROOT/cache/huggingface/hub"
+          echo "TORCH_HOME=$WORK_ROOT/cache/torch"
+          echo "PIP_CACHE_DIR=$WORK_ROOT/cache/pip"
+          echo "TRITON_CACHE_DIR=$WORK_ROOT/cache/triton"
+          echo "UNSLOTH_HOME=$WORK_ROOT/unsloth"
+          echo "UNSLOTH_STUDIO_HOME=$WORK_ROOT/unsloth/studio"
+        } >> "$GITHUB_ENV"
+        {
+          uname -a
+          lscpu
+          free -h
+          df -h "$RUNNER_TEMP"
+          lspci -nn | grep -iE 'vga|display|processing accelerator' || true
+          rocminfo 2>/dev/null | grep -E 'Name:|Marketing Name:|gfx' | head -50 || true
+          rocm-smi 2>/dev/null || true
+          for f in /sys/class/drm/card*/device/mem_info*; do
+            [ -f "$f" ] && { echo "$f"; cat "$f"; }
+          done
+        } | tee "$WORK_ROOT/out/host.txt"
+    - name: Pinned Studio source and AMD Python environment
+      timeout-minutes: 25
+      run: |
+        set -euo pipefail
+        git init "$WORK_ROOT/code"
+        git -C "$WORK_ROOT/code" remote add origin https://github.com/unslothai/unsloth.git
+        git -C "$WORK_ROOT/code" fetch --depth=1 origin 3617ea62638bcb17fefe0fd7ccdb97bfdeff301e
+        git -C "$WORK_ROOT/code" checkout --detach FETCH_HEAD
+        git -C "$WORK_ROOT/code" rev-parse HEAD | tee "$WORK_ROOT/out/source-sha.txt"
+        python3 -m venv "$WORK_ROOT/venv"
+        . "$WORK_ROOT/venv/bin/activate"
+        python -m pip install --upgrade pip
+        python -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ \
+          --extra-index-url https://pypi.org/simple \
+          'torch==2.11.0+rocm7.13.0' 'torchvision==0.26.0+rocm7.13.0' 'triton==3.6.0+rocm7.13.0'
+        python -m pip freeze | grep -E '^(torch|torchvision|triton)==' > "$WORK_ROOT/torch-constraints.txt"
+        python -m pip install -c "$WORK_ROOT/torch-constraints.txt" \
+          -r "$WORK_ROOT/code/studio/backend/requirements/studio.txt" \
+          -r "$WORK_ROOT/code/studio/backend/requirements/diffusers-pin.txt" \
+          'transformers==5.5.0' 'accelerate>=1.0' 'peft>=0.18' \
+          sentencepiece psutil protobuf scipy einops Pillow pyyaml ninja safetensors
+        python -m pip freeze > "$WORK_ROOT/out/pip-freeze.txt"
+        echo "PYTHONPATH=$WORK_ROOT/code/studio/backend" >> "$GITHUB_ENV"
+        PYTHONPATH="$WORK_ROOT/code/studio/backend" python -c 'from core.inference.diffusion import DiffusionBackend; print("Studio backend import passed")'
+    - name: Write measurement harness
+      run: |
+        cat > "$WORK_ROOT/probe.py" <<'PY'
+        """Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""
+        import argparse
+        import collections
+        import functools
+        import importlib.metadata
+        import json
+        import os
+        from pathlib import Path
+        import resource
+        import sys
+        import threading
+        import time
+        import traceback
+
+        p = argparse.ArgumentParser()
+        p.add_argument('--case', required=True)
+        p.add_argument('--free-gib', type=float, default=0)
+        p.add_argument('--memory-mode', default='auto')
+        p.add_argument('--output', required=True)
+        args = p.parse_args()
+        out = Path(args.output)
+        out.mkdir(parents=True, exist_ok=True)
+
+        def emit(event, **fields):
+            row = dict(event=event, case=args.case, time=time.time(), **fields)
+            line = json.dumps(row, default=str)
+            print('PROBE ' + line, flush=True)
+            with (out / (args.case + '.jsonl')).open('a') as f:
+                f.write(line + '\n')
+
+        import torch
+        import psutil
+        assert torch.cuda.is_available(), 'AMD GPU unavailable'
+        assert torch.version.hip or 'rocm' in torch.__version__.lower(), 'ROCm torch required'
+        torch.cuda.set_device(0)
+        torch.cuda.init()
+        props = torch.cuda.get_device_properties(0)
+        versions = {}
+        for name in ('torch', 'torchvision', 'triton', 'transformers', 'diffusers', 'accelerate', 'peft', 'gguf'):
+            try:
+                versions[name] = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                versions[name] = None
+        emit('hardware', name=props.name, properties=str(props), hip=torch.version.hip,
+             architecture=getattr(props, 'gcnArchName', None), versions=versions,
+             physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),
+             host_memory=psutil.virtual_memory()._asdict(),
+             integrated=getattr(props, 'integrated', getattr(props, 'is_integrated', None)))
+        # A real HIP operation verifies the wheel's kernel coverage before downloading models.
+        x = torch.randn((1024, 1024), device='cuda', dtype=torch.bfloat16)
+        y = x @ x
+        torch.cuda.synchronize()
+        assert torch.isfinite(y).all().item()
+        del x, y
+        torch.cuda.empty_cache()
+
+        from utils.hardware import ensure_hardware_detected
+        ensure_hardware_detected()
+        from core.inference import diffusion_memory as dm
+        from core.inference import diffusion as d
+        from core.inference.diffusion_device import resolve_diffusion_device_target
+
+        target = resolve_diffusion_device_target()
+        emit('device_target', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())
+        if args.free_gib:
+            # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.
+            # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth
+            # and this GPU's compute performance remain those of the actual Strix Halo runner.
+            cap = int(args.free_gib * 2**30)
+            assert cap < props.total_memory
+            torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)
+            def virtual_memory(backend):
+                physical_free, _ = torch.cuda.mem_get_info()
+                remaining = max(0, cap - torch.cuda.memory_reserved())
+                return min(physical_free, remaining) // 2**20, 20 * 1024, 'discrete_vram'
+            dm._cuda_memory = virtual_memory
+            emit('synthetic_capacity', total_gib=20, initial_free_gib=args.free_gib,
+                 allocator_cap_bytes=cap, warning='Capacity experiment on an APU, not a 7900 XT hardware reproduction')
+
+        plans = []
+        original_plan = d.plan_diffusion_memory
+        def record_plan(**kwargs):
+            plan = original_plan(**kwargs)
+            plans.append(plan)
+            emit('plan', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,
+                 stream_text_encoders=plan.stream_text_encoders)
+            for mode in ('auto', 'fast', 'balanced', 'low_vram'):
+                other = original_plan(**dict(kwargs, requested_mode=mode))
+                emit('planner_comparison', mode=mode, policy=other.offload_policy,
+                     stream_transformer=other.stream_transformer,
+                     stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,
+                     reasons=other.reasons)
+            return plan
+        d.plan_diffusion_memory = record_plan
+
+        process = psutil.Process()
+        def memory():
+            return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),
+                        peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                        peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,
+                        max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+                        host_available_bytes=psutil.virtual_memory().available)
+
+        backend = d.DiffusionBackend()
+        stop = threading.Event()
+        def monitor():
+            while not stop.wait(10):
+                emit('sample', memory=memory(), progress=backend.generate_progress())
+        threading.Thread(target=monitor, daemon=True).start()
+        try:
+            start = time.perf_counter()
+            backend.begin_load('unsloth/Qwen-Image-2.1-GGUF', gguf_filename='qwen-image-2.1-Q4_K_M.gguf',
+                               family_override='qwen-image-2.1', memory_mode=args.memory_mode)
+            deadline = time.monotonic() + 2400
+            while True:
+                progress = backend.load_progress()
+                emit('load_progress', progress=progress)
+                if progress.get('error'):
+                    raise RuntimeError(progress['error'])
+                if progress.get('phase') == 'ready':
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError('Model load exceeded 40 minutes')
+                time.sleep(10)
+            torch.cuda.synchronize()
+            state = backend._state
+            pipe = state.pipe
+            emit('loaded', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())
+            for name, component in pipe.components.items():
+                if not isinstance(component, torch.nn.Module):
+                    continue
+                counts = collections.Counter()
+                seen = set()
+                for tensor in list(component.parameters()) + list(component.buffers()):
+                    if tensor.device.type == 'meta':
+                        counts['meta'] += tensor.numel() * tensor.element_size()
+                        continue
+                    storage = tensor.untyped_storage()
+                    key = (str(tensor.device), storage.data_ptr())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    counts[str(tensor.device) + ':' + str(tensor.dtype)] += storage.nbytes()
+                emit('component_storage', component=name, bytes_by_device_and_dtype=dict(counts))
+
+            # First two passes have no forward wrappers or additional GPU synchronizations inside
+            # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.
+            prompts = [
+                'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.',
+                'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.',
+                'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.',
+            ]
+            phase_records = collections.defaultdict(list)
+            def instrument(obj, method, phase):
+                original = getattr(obj, method)
+                @functools.wraps(original)
+                def measured(*a, **kw):
+                    torch.cuda.synchronize()
+                    began = time.perf_counter()
+                    before = torch.cuda.memory_allocated()
+                    try:
+                        return original(*a, **kw)
+                    finally:
+                        torch.cuda.synchronize()
+                        record = dict(seconds=time.perf_counter()-began, allocated_before=before,
+                                      allocated_after=torch.cuda.memory_allocated())
+                        phase_records[phase].append(record)
+                        emit('phase_call', phase=phase, **record)
+                setattr(obj, method, measured)
+            for i, prompt in enumerate(prompts):
+                profiled = i == 2
+                if profiled:
+                    instrument(pipe, 'encode_prompt', 'encode_prompt')
+                    instrument(pipe.transformer, 'forward', 'transformer_forward')
+                    instrument(pipe.vae, 'decode', 'vae_decode')
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                began = time.perf_counter()
+                result = backend.generate(prompt=prompt, width=1024, height=1024, steps=20, guidance=1.0, seed=42)
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter()-began
+                for j, picture in enumerate(result['images']):
+                    picture.save(out / f'{args.case}-{i}-{j}.png')
+                emit('render', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,
+                     inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())
+            emit('phase_totals', phases={name: dict(calls=len(rows), seconds=sum(r['seconds'] for r in rows))
+                                        for name, rows in phase_records.items()})
+            emit('complete', success=True)
+        except Exception as exc:
+            emit('failure', error=repr(exc), traceback=traceback.format_exc(), memory=memory())
+            raise
+        finally:
+            stop.set()
+            backend.unload()
+
+        PY
+    - name: native-auto
+      continue-on-error: true
+      timeout-minutes: 30
+      run: |
+        set -euo pipefail
+        . "$WORK_ROOT/venv/bin/activate"
+        export TORCHINDUCTOR_CACHE_DIR="$WORK_ROOT/cache/inductor-native-auto"
+        timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
+          --case native-auto --free-gib 0 --memory-mode auto --output "$WORK_ROOT/out" \
+          2>&1 | tee "$WORK_ROOT/out/native-auto.log"
+    - name: cap20-free19-auto
+      continue-on-error: true
+      timeout-minutes: 30
+      run: |
+        set -euo pipefail
+        . "$WORK_ROOT/venv/bin/activate"
+        export TORCHINDUCTOR_CACHE_DIR="$WORK_ROOT/cache/inductor-cap20-free19-auto"
+        timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
+          --case cap20-free19-auto --free-gib 19 --memory-mode auto --output "$WORK_ROOT/out" \
+          2>&1 | tee "$WORK_ROOT/out/cap20-free19-auto.log"
+    - name: cap20-free16-auto
+      continue-on-error: true
+      timeout-minutes: 30
+      run: |
+        set -euo pipefail
+        . "$WORK_ROOT/venv/bin/activate"
+        export TORCHINDUCTOR_CACHE_DIR="$WORK_ROOT/cache/inductor-cap20-free16-auto"
+        timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
+          --case cap20-free16-auto --free-gib 16 --memory-mode auto --output "$WORK_ROOT/out" \
+          2>&1 | tee "$WORK_ROOT/out/cap20-free16-auto.log"
+    - name: cap20-free16-low-vram
+      continue-on-error: true
+      timeout-minutes: 30
+      run: |
+        set -euo pipefail
+        . "$WORK_ROOT/venv/bin/activate"
+        export TORCHINDUCTOR_CACHE_DIR="$WORK_ROOT/cache/inductor-cap20-free16-low-vram"
+        timeout --signal=TERM --kill-after=30s 1700s python -u "$WORK_ROOT/probe.py" \
+          --case cap20-free16-low-vram --free-gib 16 --memory-mode low_vram --output "$WORK_ROOT/out" \
+          2>&1 | tee "$WORK_ROOT/out/cap20-free16-low-vram.log"
+    - name: Summarize measured results
+      if: always()
+      run: |
+        python3 - <<'PY'
+        import json, os
+        from pathlib import Path
+        root = Path(os.environ['WORK_ROOT']) / 'out'
+        lines = ['Capacity-limited runs are synthetic planner/allocator experiments on an APU, not a 7900 XT reproduction.', '',
+                 '| Case | Pass | Inference seconds | Peak allocated GiB | Peak RSS GiB |',
+                 '| --- | --- | ---: | ---: | ---: |']
+        successful = set()
+        for file in sorted(root.glob('*.jsonl')):
+            for line in file.read_text().splitlines():
+                row = json.loads(line)
+                if row['event'] == 'render':
+                    m = row['memory']
+                    kind = 'profiled' if row['profiled'] else ('cold' if row['cold'] else 'warm')
+                    lines.append(f"| {row['case']} | {kind} | {row['inference_seconds']:.2f} | {m['peak_allocated_bytes']/2**30:.2f} | {m['max_rss_bytes']/2**30:.2f} |")
+                elif row['event'] == 'complete':
+                    successful.add(row['case'])
+                elif row['event'] == 'failure':
+                    lines.append(f"Failure in {row['case']}: {row['error']}")
+        report = '\n'.join(lines) + '\n'
+        (root / 'summary.txt').write_text(report)
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write(report)
+        print(report)
+        required = {'native-auto', 'cap20-free19-auto', 'cap20-free16-auto', 'cap20-free16-low-vram'}
+        missing = required - successful
+        if missing:
+            raise SystemExit('Incomplete cases: ' + ', '.join(sorted(missing)))
+        PY
+    - name: Keep logs, measurements and generated images
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: amd-qwen21-memory-probe
+        path: ${{ env.WORK_ROOT }}/out
+        retention-days: 7
+        if-no-files-found: warn
