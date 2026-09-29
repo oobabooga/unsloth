@@ -80,8 +80,9 @@ def main() -> int:
     # stderr is where pytest writes usage errors. Not capturing it is what made
     # this failure invisible.
     obs["stderr_tail"] = (err or "")[-2000:]
-    obs["failed"] = sorted(set(re.findall(r"^FAILED\s+(\S+)", tail, re.M)))
-    obs["errors"] = sorted(set(re.findall(r"^ERROR\s+(\S+)", tail, re.M)))
+    # Full output, not the tail: a long short-summary section pushed IDs out of it (82 failures, 45 IDs).
+    obs["failed"] = sorted(set(re.findall(r"^FAILED\s+(.+?)(?: - |$)", out or "", re.M)))
+    obs["errors"] = sorted(set(re.findall(r"^ERROR\s+(.+?)(?: - |$)", out or "", re.M)))
     m = re.search(r"(\d+) failed", tail)
     obs["n_failed"] = int(m.group(1)) if m else 0
     m = re.search(r"(\d+) passed", tail)
