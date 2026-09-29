@@ -18,6 +18,10 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_ENDPOINT: https://huggingface.co
+      HF_HUB_DOWNLOAD_TIMEOUT: '120'
+      HF_HUB_ETAG_TIMEOUT: '30'
+      HF_HUB_DISABLE_XET: '1'
       HF_HUB_DISABLE_TELEMETRY: '1'
       DO_NOT_TRACK: '1'
     steps:
