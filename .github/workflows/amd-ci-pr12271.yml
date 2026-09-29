@@ -168,8 +168,6 @@ jobs:
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
       - name: Differential
-        # Read in run 36552964760; this round only sweeps the CPU budget.
-        if: false
         run: |
           set +e
           "$AMD_CI_PY" amd_ci/lib/differential.py \
@@ -183,7 +181,8 @@ jobs:
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 
       - name: CPU chunk budget sweep
-        if: always()
+        # Read in run 36583755195.
+        if: false
         timeout-minutes: 170
         run: |
           set +e
