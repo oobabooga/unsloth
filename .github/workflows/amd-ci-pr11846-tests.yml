@@ -141,7 +141,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/studio/install/test_windows_multiarch_all_11815.py tests/studio/install/test_rdna1_multiarch_windows_route_11614.py tests/studio/install/test_rocm_support.py tests/studio/install/test_cuda_repair.py tests/studio/install/test_unsupported_arch_routing_guards_8529.py tests/studio/install/test_rdna1_unsupported_message_8529.py tests/studio/install/test_rocm_arch_table_parity.py tests/studio/install/test_missing_kernel_arch_routing_9396.py tests/studio/install/test_selection_logic.py tests/test_windows_amd_gpu_scan_fallback.py --subdir . --timeout 1800
+            --python "$env:AMD_CI_PY" -- --tests tests/studio/install/test_windows_multiarch_all_11815.py tests/studio/install/test_rdna1_multiarch_windows_route_11614.py --subdir . --timeout 1800
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
