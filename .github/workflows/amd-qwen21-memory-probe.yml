@@ -1,4 +1,4 @@
-name: AMD VAE tight memory baseline and convolution compatibility
+name: AMD VAE tiled solver selection variability and shared database control
 'on':
   push:
     branches:
@@ -76,20 +76,20 @@ jobs:
         import os
         from pathlib import Path
         (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\np.add_argument('--no-naive',action='store_true');p.add_argument('--cache-source',default='default-cold')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache'/('vae-'+a.cache_source)/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nif a.no_naive:os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom core.inference import diffusion as studio_diffusion\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
-    - name: baseline-16gib
+    - name: stock-tiled-0
       shell: python3 -X utf8 {0}
-      timeout-minutes: 35
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='baseline-16gib';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-0';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cap', '16']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -100,27 +100,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence baseline-16gib
+    - name: Evidence stock-tiled-0
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-baseline-16gib
-        path: ${{ env.WORK_ROOT }}/out/baseline-16gib
+        name: vae-linux-stock-tiled-0
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-0
         retention-days: 14
-    - name: no-naive-16gib-tiled
+    - name: excluded-tiled-0
       shell: python3 -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 10
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='no-naive-16gib-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-0';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-naive', '--cap', '16', '--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=540)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -131,48 +131,198 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence no-naive-16gib-tiled
+    - name: Evidence excluded-tiled-0
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-no-naive-16gib-tiled
-        path: ${{ env.WORK_ROOT }}/out/no-naive-16gib-tiled
+        name: vae-linux-excluded-tiled-0
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-0
         retention-days: 14
-    - name: Convolution smoke stock
+    - name: stock-tiled-1
       shell: python3 -X utf8 {0}
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='no-naive':os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  reference=fn(x.float(),w.float(),stride=stride,padding=pad,dilation=dilation,groups=groups)\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   actual=y.cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'stock'],check=True)
-      timeout-minutes: 25
+      timeout-minutes: 15
       continue-on-error: true
-    - name: Smoke evidence stock
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-1';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-tiled-1
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-smoke-stock
-        path: ${{ env.WORK_ROOT }}/out/smoke-stock
+        name: vae-linux-stock-tiled-1
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-1
         retention-days: 14
-    - name: Convolution smoke no-naive
+    - name: excluded-tiled-1
       shell: python3 -X utf8 {0}
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='no-naive':os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  reference=fn(x.float(),w.float(),stride=stride,padding=pad,dilation=dilation,groups=groups)\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   actual=y.cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'no-naive'],check=True)
-      timeout-minutes: 25
+      timeout-minutes: 10
       continue-on-error: true
-    - name: Smoke evidence no-naive
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-1';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-tiled-1
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-smoke-no-naive
-        path: ${{ env.WORK_ROOT }}/out/smoke-no-naive
+        name: vae-linux-excluded-tiled-1
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-1
+        retention-days: 14
+    - name: stock-tiled-2
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 15
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-2';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-tiled-2
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-stock-tiled-2
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-2
+        retention-days: 14
+    - name: excluded-tiled-2
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-2';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-tiled-2
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-excluded-tiled-2
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-2
+        retention-days: 14
+    - name: excluded-stock-cache
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-stock-cache';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive', '--cache', 'both', '--cache-source', 'stock-tiled-0']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-stock-cache
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-excluded-stock-cache
+        path: ${{ env.WORK_ROOT }}/out/excluded-stock-cache
+        retention-days: 14
+    - name: stock-excluded-cache
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-excluded-cache';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--cache', 'both', '--cache-source', 'excluded-tiled-0']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-excluded-cache
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-stock-excluded-cache
+        path: ${{ env.WORK_ROOT }}/out/stock-excluded-cache
         retention-days: 14
     - name: Environment evidence
       if: always()
@@ -252,20 +402,20 @@ jobs:
         import os
         from pathlib import Path
         (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\np.add_argument('--no-naive',action='store_true');p.add_argument('--cache-source',default='default-cold')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache'/('vae-'+a.cache_source)/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nif a.no_naive:os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom core.inference import diffusion as studio_diffusion\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
-    - name: baseline-16gib
+    - name: stock-tiled-0
       shell: python -X utf8 {0}
-      timeout-minutes: 35
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='baseline-16gib';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-0';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cap', '16']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -276,27 +426,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence baseline-16gib
+    - name: Evidence stock-tiled-0
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-baseline-16gib
-        path: ${{ env.WORK_ROOT }}/out/baseline-16gib
+        name: vae-windows-stock-tiled-0
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-0
         retention-days: 14
-    - name: no-naive-16gib-tiled
+    - name: excluded-tiled-0
       shell: python -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 10
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='no-naive-16gib-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-0';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-naive', '--cap', '16', '--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=540)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -307,48 +457,198 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence no-naive-16gib-tiled
+    - name: Evidence excluded-tiled-0
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-no-naive-16gib-tiled
-        path: ${{ env.WORK_ROOT }}/out/no-naive-16gib-tiled
+        name: vae-windows-excluded-tiled-0
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-0
         retention-days: 14
-    - name: Convolution smoke stock
+    - name: stock-tiled-1
       shell: python -X utf8 {0}
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='no-naive':os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  reference=fn(x.float(),w.float(),stride=stride,padding=pad,dilation=dilation,groups=groups)\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   actual=y.cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'stock'],check=True)
-      timeout-minutes: 25
+      timeout-minutes: 15
       continue-on-error: true
-    - name: Smoke evidence stock
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-1';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-tiled-1
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-smoke-stock
-        path: ${{ env.WORK_ROOT }}/out/smoke-stock
+        name: vae-windows-stock-tiled-1
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-1
         retention-days: 14
-    - name: Convolution smoke no-naive
+    - name: excluded-tiled-1
       shell: python -X utf8 {0}
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='no-naive':os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  reference=fn(x.float(),w.float(),stride=stride,padding=pad,dilation=dilation,groups=groups)\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   actual=y.cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'no-naive'],check=True)
-      timeout-minutes: 25
+      timeout-minutes: 10
       continue-on-error: true
-    - name: Smoke evidence no-naive
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-1';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-tiled-1
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-smoke-no-naive
-        path: ${{ env.WORK_ROOT }}/out/smoke-no-naive
+        name: vae-windows-excluded-tiled-1
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-1
+        retention-days: 14
+    - name: stock-tiled-2
+      shell: python -X utf8 {0}
+      timeout-minutes: 15
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-tiled-2';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-tiled-2
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-stock-tiled-2
+        path: ${{ env.WORK_ROOT }}/out/stock-tiled-2
+        retention-days: 14
+    - name: excluded-tiled-2
+      shell: python -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-tiled-2';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-tiled-2
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-excluded-tiled-2
+        path: ${{ env.WORK_ROOT }}/out/excluded-tiled-2
+        retention-days: 14
+    - name: excluded-stock-cache
+      shell: python -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='excluded-stock-cache';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--no-naive', '--cache', 'both', '--cache-source', 'stock-tiled-0']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence excluded-stock-cache
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-excluded-stock-cache
+        path: ${{ env.WORK_ROOT }}/out/excluded-stock-cache
+        retention-days: 14
+    - name: stock-excluded-cache
+      shell: python -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='stock-excluded-cache';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling', '--cache', 'both', '--cache-source', 'excluded-tiled-0']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence stock-excluded-cache
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-stock-excluded-cache
+        path: ${{ env.WORK_ROOT }}/out/stock-excluded-cache
         retention-days: 14
     - name: Environment evidence
       if: always()
