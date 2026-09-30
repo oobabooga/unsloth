@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: '1'
+      PYTHONUTF8: '1'
+      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: '1'
       HF_ENDPOINT: https://huggingface.co
       HF_HUB_DISABLE_XET: '1'
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
@@ -22,7 +24,7 @@ jobs:
       HF_HUB_ETAG_TIMEOUT: '30'
     steps:
     - name: Hardware and faithful AMD Python environment
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 40
       run: |
         import os,sys,subprocess,json,platform
@@ -62,13 +64,13 @@ jobs:
         with (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)
         run([py,'-c',"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
     - name: Write measurement harness
-      shell: python3
+      shell: python3 -X utf8 {0}
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
     - name: free19-default
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 45
       continue-on-error: true
       run: |
@@ -97,8 +99,38 @@ jobs:
         name: linux-free19-default
         path: ${{ env.WORK_ROOT }}/out/free19-default*
         retention-days: 7
+    - name: free19-math-attention
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='free19-math-attention'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--math-attention']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence free19-math-attention
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-free19-math-attention
+        path: ${{ env.WORK_ROOT }}/out/free19-math-attention*
+        retention-days: 7
     - name: free19-eager
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -128,7 +160,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-eager*
         retention-days: 7
     - name: free19-off
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -158,7 +190,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-off*
         retention-days: 7
     - name: free16-auto
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -188,7 +220,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free16-auto*
         retention-days: 7
     - name: free12-auto
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -218,7 +250,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free12-auto*
         retention-days: 7
     - name: free16-low
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -248,7 +280,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free16-low*
         retention-days: 7
     - name: free19-dense-te
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -278,7 +310,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-dense-te*
         retention-days: 7
     - name: free19-large
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
@@ -308,7 +340,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-large*
         retention-days: 7
     - name: free19-resident-tiled
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -338,7 +370,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-resident-tiled*
         retention-days: 7
     - name: free19-resident-untiled
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -368,7 +400,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-resident-untiled*
         retention-days: 7
     - name: native-default
-      shell: python3
+      shell: python3 -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
@@ -398,7 +430,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/native-default*
         retention-days: 7
     - name: Summarize
-      shell: python3
+      shell: python3 -X utf8 {0}
       if: always()
       run: |
         import os,json
@@ -429,6 +461,8 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: '1'
+      PYTHONUTF8: '1'
+      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: '1'
       HF_ENDPOINT: https://huggingface.co
       HF_HUB_DISABLE_XET: '1'
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
@@ -437,7 +471,7 @@ jobs:
       HF_HUB_ETAG_TIMEOUT: '30'
     steps:
     - name: Hardware and faithful AMD Python environment
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 40
       run: |
         import os,sys,subprocess,json,platform
@@ -477,13 +511,13 @@ jobs:
         with (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)
         run([py,'-c',"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
     - name: Write measurement harness
-      shell: python
+      shell: python -X utf8 {0}
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
     - name: free19-default
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 45
       continue-on-error: true
       run: |
@@ -512,8 +546,38 @@ jobs:
         name: windows-free19-default
         path: ${{ env.WORK_ROOT }}/out/free19-default*
         retention-days: 7
+    - name: free19-math-attention
+      shell: python -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='free19-math-attention'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--math-attention']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence free19-math-attention
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-free19-math-attention
+        path: ${{ env.WORK_ROOT }}/out/free19-math-attention*
+        retention-days: 7
     - name: free19-eager
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -543,7 +607,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-eager*
         retention-days: 7
     - name: free19-off
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -573,7 +637,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-off*
         retention-days: 7
     - name: free16-auto
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -603,7 +667,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free16-auto*
         retention-days: 7
     - name: free12-auto
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -633,7 +697,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free12-auto*
         retention-days: 7
     - name: free16-low
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -663,7 +727,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free16-low*
         retention-days: 7
     - name: free19-dense-te
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
@@ -693,7 +757,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-dense-te*
         retention-days: 7
     - name: free19-large
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
@@ -723,7 +787,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-large*
         retention-days: 7
     - name: free19-resident-tiled
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -753,7 +817,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-resident-tiled*
         retention-days: 7
     - name: free19-resident-untiled
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
       run: |
@@ -783,7 +847,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/free19-resident-untiled*
         retention-days: 7
     - name: native-default
-      shell: python
+      shell: python -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
@@ -813,7 +877,7 @@ jobs:
         path: ${{ env.WORK_ROOT }}/out/native-default*
         retention-days: 7
     - name: Summarize
-      shell: python
+      shell: python -X utf8 {0}
       if: always()
       run: |
         import os,json
