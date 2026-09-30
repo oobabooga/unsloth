@@ -1,4 +1,4 @@
-name: Studio AMD fallback preserving search cutoff integration
+name: AMD search cutoff capacity and forward backward convolution coverage
 'on':
   push:
     branches:
@@ -75,162 +75,172 @@ jobs:
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'full_probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\np.add_argument(\'--vae-mode\',choices=[\'default\',\'immediate\',\'native\',\'channels-last\',\'fast\',\'no-naive\',\'search-cutoff\'],default=\'default\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\nemit_lock = threading.Lock()\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    with emit_lock:\n        print(\'PROBE \' + line, flush=True)\n        with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n            f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\ncache=Path(os.environ[\'WORK_ROOT\'])/\'cache\'/(\'full-vae-\'+args.case)\nfor part in (\'db\',\'kernels\'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ[\'MIOPEN_USER_DB_PATH\']=str(cache/\'db\')\nos.environ[\'MIOPEN_CUSTOM_CACHE_DIR\']=str(cache/\'kernels\')\nos.environ.pop(\'MIOPEN_FIND_MODE\',None)\nif args.vae_mode==\'fast\':os.environ[\'MIOPEN_FIND_MODE\']=\'FAST\'\nif args.vae_mode==\'search-cutoff\':os.environ[\'MIOPEN_SEARCH_CUTOFF\']=\'1\'\nif args.vae_mode==\'no-naive\':os.environ[\'MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD\']=\'0\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\ntry:\n    from core.inference import diffusion_qwenimage21_rocm as qchunks\nexcept ImportError:\n    qchunks=None\nchunk_calls=[0]\nif qchunks is not None:\n    real_chunks=qchunks._chunk_attention\n    def counted_chunks(*a,**kw):\n        chunk_calls[0]+=1\n        return real_chunks(*a,**kw)\n    qchunks._chunk_attention=counted_chunks\nemit(\'source\', backend_file=studio_main.__file__, patch_present=qchunks is not None)\n\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nemit(\'blas_backend\', value=str(torch.backends.cuda.preferred_blas_library()), cudnn_benchmark=torch.backends.cudnn.benchmark)\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    import contextlib\n    decode_original=pipe.vae.decode\n    decode_count=[0]\n    if args.tiling:pipe.vae.enable_tiling()\n    if args.vae_mode==\'channels-last\':pipe.vae.to(memory_format=torch.channels_last)\n    def candidate_decode(*a,**kw):\n        index=decode_count[0];decode_count[0]+=1\n        torch.save(a[0].detach().cpu(),out/f\'{args.case}-latent-{index}.pt\')\n        emit(\'vae_before\',index=index,memory=memory(),miopen_immediate=torch.backends.miopen.immediate,cudnn_enabled=torch.backends.cudnn.enabled)\n        if args.vae_mode==\'immediate\':ctx=torch.backends.miopen.flags(immediate=True)\n        elif args.vae_mode==\'native\':ctx=torch.backends.cudnn.flags(enabled=False,benchmark=False)\n        else:ctx=contextlib.nullcontext()\n        try:\n            with ctx:\n                result=decode_original(*a,**kw)\n            return result\n        finally:\n            emit(\'vae_after\',index=index,memory=memory(),miopen_immediate=torch.backends.miopen.immediate,cudnn_enabled=torch.backends.cudnn.enabled)\n    pipe.vae.decode=candidate_decode\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'encoder-base-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages(group_by_input_shape=True).table(sort_by=\'self_device_time_total\', row_limit=80))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'query_chunk_calls\',count=chunk_calls[0])\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n',encoding='utf-8')
-    - name: encoder-base
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\np.add_argument('--search-cutoff',action='store_true');p.add_argument('--skip-if-alt',action='store_true');p.add_argument('--no-naive',action='store_true');p.add_argument('--cache-source',default='default-cold')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache'/('vae-'+a.cache_source)/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nif a.search_cutoff:os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nif a.skip_if_alt:os.environ['MIOPEN_NAIVE_DISABLE_IF_ALT']='1'\nif a.no_naive:os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom core.inference import diffusion as studio_diffusion\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ntry:\n paths=sorted({m.path for m in process.memory_maps() if 'miopen' in m.path.lower()})\n emit('miopen_libraries',paths=paths)\n for name in paths:\n  fp=Path(name)\n  if fp.is_file():\n   import mmap\n   with fp.open('rb') as f, mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:\n    emit('miopen_features',path=name,features={key:mm.find(key.encode())>=0 for key in ['MIOPEN_NAIVE_DISABLE_IF_ALT','MIOPEN_SEARCH_CUTOFF','MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD','MIOPEN_NAIVE_TIMEOUT']})\nexcept Exception as exc:emit('miopen_library_probe_failure',error=repr(exc))\n\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+    - name: cutoff-512
       shell: python3 -X utf8 {0}
-      timeout-minutes: 35
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-base';out=root/'out'
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-512';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '40', '--repeats', '2', '--free-gib', '19']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--size', '512']]
         start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
          from collections import deque
-         print(''.join(deque(f,maxlen=35)))
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-base
+    - name: Evidence cutoff-512
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-linux-encoder-base
-        path: ${{ env.WORK_ROOT }}/out/encoder-base*
+        name: vae-linux-cutoff-512
+        path: ${{ env.WORK_ROOT }}/out/cutoff-512
         retention-days: 14
-    - name: cutoff-full512
+    - name: cutoff-tiled1536
       shell: python3 -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full512';out=root/'out'
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-tiled1536';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '512', '--height', '512', '--steps', '4', '--repeats', '2', '--free-gib', '19']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--tiling', '--size', '1536']]
         start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
          from collections import deque
-         print(''.join(deque(f,maxlen=35)))
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence cutoff-full512
+    - name: Evidence cutoff-tiled1536
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-linux-cutoff-full512
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full512*
+        name: vae-linux-cutoff-tiled1536
+        path: ${{ env.WORK_ROOT }}/out/cutoff-tiled1536
         retention-days: 14
-    - name: cutoff-full1536
+    - name: cutoff-16gib-tiled
       shell: python3 -X utf8 {0}
+      timeout-minutes: 15
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-16gib-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--cap', '16', '--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence cutoff-16gib-tiled
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-cutoff-16gib-tiled
+        path: ${{ env.WORK_ROOT }}/out/cutoff-16gib-tiled
+        retention-days: 14
+    - name: cutoff-16gib
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-16gib';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--cap', '16']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence cutoff-16gib
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-cutoff-16gib
+        path: ${{ env.WORK_ROOT }}/out/cutoff-16gib
+        retention-days: 14
+    - name: Convolution smoke stock
+      shell: python3 -X utf8 {0}
+      run: |
+        import os,sys,subprocess
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='cutoff':os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  rx=x.float().requires_grad_();rw=w.float().requires_grad_()\n  reference=fn(rx,rw,stride=stride,padding=pad,dilation=dilation,groups=groups)\n  go=torch.randn(reference.shape,generator=g)\n  ref_grads=torch.autograd.grad(reference,(rx,rw),go)\n  reference=reference.detach()\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   gx=gx.detach().requires_grad_();gw=gw.detach().requires_grad_()\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   grads=torch.autograd.grad(y,(gx,gw),go.to(device='cuda',dtype=dtype))\n   actual=y.detach().cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n   for tag,actual_grad,ref_grad in zip(('input_grad','weight_grad'),grads,ref_grads):\n    actual_grad=actual_grad.detach().cpu().float();err=(actual_grad-ref_grad).square().mean().sqrt()/ref_grad.square().mean().sqrt().clamp_min(1e-8)\n    grow=dict(key=key+'-'+tag,nrmse=err.item(),finite=bool(torch.isfinite(actual_grad).all()))\n    rows.append(grow);values[grow['key']]=actual_grad;print(json.dumps(grow),flush=True)\n    assert grow['finite'] and grow['nrmse']<0.02,grow\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'stock'],check=True)
       timeout-minutes: 25
       continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full1536';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1536', '--height', '1536', '--steps', '4', '--repeats', '2', '--free-gib', '19', '--tiling']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence cutoff-full1536
+    - name: Smoke evidence stock
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-linux-cutoff-full1536
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full1536*
+        name: vae-linux-smoke-stock
+        path: ${{ env.WORK_ROOT }}/out/smoke-stock
         retention-days: 14
-    - name: reference-cutoff
+    - name: Convolution smoke cutoff
       shell: python3 -X utf8 {0}
+      run: |
+        import os,sys,subprocess
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='cutoff':os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  rx=x.float().requires_grad_();rw=w.float().requires_grad_()\n  reference=fn(rx,rw,stride=stride,padding=pad,dilation=dilation,groups=groups)\n  go=torch.randn(reference.shape,generator=g)\n  ref_grads=torch.autograd.grad(reference,(rx,rw),go)\n  reference=reference.detach()\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   gx=gx.detach().requires_grad_();gw=gw.detach().requires_grad_()\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   grads=torch.autograd.grad(y,(gx,gw),go.to(device='cuda',dtype=dtype))\n   actual=y.detach().cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n   for tag,actual_grad,ref_grad in zip(('input_grad','weight_grad'),grads,ref_grads):\n    actual_grad=actual_grad.detach().cpu().float();err=(actual_grad-ref_grad).square().mean().sqrt()/ref_grad.square().mean().sqrt().clamp_min(1e-8)\n    grow=dict(key=key+'-'+tag,nrmse=err.item(),finite=bool(torch.isfinite(actual_grad).all()))\n    rows.append(grow);values[grow['key']]=actual_grad;print(json.dumps(grow),flush=True)\n    assert grow['finite'] and grow['nrmse']<0.02,grow\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'cutoff'],check=True)
       timeout-minutes: 25
       continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-cutoff';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '4', '--repeats', '2', '--free-gib', '19', '--reference']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence reference-cutoff
+    - name: Smoke evidence cutoff
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-linux-reference-cutoff
-        path: ${{ env.WORK_ROOT }}/out/reference-cutoff*
-        retention-days: 14
-    - name: cutoff-full16gib
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 20
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full16gib';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '4', '--repeats', '1', '--free-gib', '16']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence cutoff-full16gib
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: fullvae-linux-cutoff-full16gib
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full16gib*
+        name: vae-linux-smoke-cutoff
+        path: ${{ env.WORK_ROOT }}/out/smoke-cutoff
         retention-days: 14
     - name: Environment evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-linux-environment
+        name: vae-linux-environment
         path: ${{ env.WORK_ROOT }}/out/*.txt
         retention-days: 14
   windows:
@@ -303,161 +313,171 @@ jobs:
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'full_probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\np.add_argument(\'--vae-mode\',choices=[\'default\',\'immediate\',\'native\',\'channels-last\',\'fast\',\'no-naive\',\'search-cutoff\'],default=\'default\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\nemit_lock = threading.Lock()\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    with emit_lock:\n        print(\'PROBE \' + line, flush=True)\n        with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n            f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\ncache=Path(os.environ[\'WORK_ROOT\'])/\'cache\'/(\'full-vae-\'+args.case)\nfor part in (\'db\',\'kernels\'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ[\'MIOPEN_USER_DB_PATH\']=str(cache/\'db\')\nos.environ[\'MIOPEN_CUSTOM_CACHE_DIR\']=str(cache/\'kernels\')\nos.environ.pop(\'MIOPEN_FIND_MODE\',None)\nif args.vae_mode==\'fast\':os.environ[\'MIOPEN_FIND_MODE\']=\'FAST\'\nif args.vae_mode==\'search-cutoff\':os.environ[\'MIOPEN_SEARCH_CUTOFF\']=\'1\'\nif args.vae_mode==\'no-naive\':os.environ[\'MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD\']=\'0\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\ntry:\n    from core.inference import diffusion_qwenimage21_rocm as qchunks\nexcept ImportError:\n    qchunks=None\nchunk_calls=[0]\nif qchunks is not None:\n    real_chunks=qchunks._chunk_attention\n    def counted_chunks(*a,**kw):\n        chunk_calls[0]+=1\n        return real_chunks(*a,**kw)\n    qchunks._chunk_attention=counted_chunks\nemit(\'source\', backend_file=studio_main.__file__, patch_present=qchunks is not None)\n\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nemit(\'blas_backend\', value=str(torch.backends.cuda.preferred_blas_library()), cudnn_benchmark=torch.backends.cudnn.benchmark)\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    import contextlib\n    decode_original=pipe.vae.decode\n    decode_count=[0]\n    if args.tiling:pipe.vae.enable_tiling()\n    if args.vae_mode==\'channels-last\':pipe.vae.to(memory_format=torch.channels_last)\n    def candidate_decode(*a,**kw):\n        index=decode_count[0];decode_count[0]+=1\n        torch.save(a[0].detach().cpu(),out/f\'{args.case}-latent-{index}.pt\')\n        emit(\'vae_before\',index=index,memory=memory(),miopen_immediate=torch.backends.miopen.immediate,cudnn_enabled=torch.backends.cudnn.enabled)\n        if args.vae_mode==\'immediate\':ctx=torch.backends.miopen.flags(immediate=True)\n        elif args.vae_mode==\'native\':ctx=torch.backends.cudnn.flags(enabled=False,benchmark=False)\n        else:ctx=contextlib.nullcontext()\n        try:\n            with ctx:\n                result=decode_original(*a,**kw)\n            return result\n        finally:\n            emit(\'vae_after\',index=index,memory=memory(),miopen_immediate=torch.backends.miopen.immediate,cudnn_enabled=torch.backends.cudnn.enabled)\n    pipe.vae.decode=candidate_decode\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'encoder-base-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages(group_by_input_shape=True).table(sort_by=\'self_device_time_total\', row_limit=80))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'query_chunk_calls\',count=chunk_calls[0])\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n',encoding='utf-8')
-    - name: encoder-base
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\np.add_argument('--search-cutoff',action='store_true');p.add_argument('--skip-if-alt',action='store_true');p.add_argument('--no-naive',action='store_true');p.add_argument('--cache-source',default='default-cold')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache'/('vae-'+a.cache_source)/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nif a.search_cutoff:os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nif a.skip_if_alt:os.environ['MIOPEN_NAIVE_DISABLE_IF_ALT']='1'\nif a.no_naive:os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD']='0'\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom core.inference import diffusion as studio_diffusion\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ntry:\n paths=sorted({m.path for m in process.memory_maps() if 'miopen' in m.path.lower()})\n emit('miopen_libraries',paths=paths)\n for name in paths:\n  fp=Path(name)\n  if fp.is_file():\n   import mmap\n   with fp.open('rb') as f, mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:\n    emit('miopen_features',path=name,features={key:mm.find(key.encode())>=0 for key in ['MIOPEN_NAIVE_DISABLE_IF_ALT','MIOPEN_SEARCH_CUTOFF','MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD','MIOPEN_NAIVE_TIMEOUT']})\nexcept Exception as exc:emit('miopen_library_probe_failure',error=repr(exc))\n\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+    - name: cutoff-512
       shell: python -X utf8 {0}
-      timeout-minutes: 35
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-base';out=root/'out'
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-512';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '40', '--repeats', '2', '--free-gib', '19']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--size', '512']]
         start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
          from collections import deque
-         print(''.join(deque(f,maxlen=35)))
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-base
+    - name: Evidence cutoff-512
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-windows-encoder-base
-        path: ${{ env.WORK_ROOT }}/out/encoder-base*
+        name: vae-windows-cutoff-512
+        path: ${{ env.WORK_ROOT }}/out/cutoff-512
         retention-days: 14
-    - name: cutoff-full512
+    - name: cutoff-tiled1536
       shell: python -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 15
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full512';out=root/'out'
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-tiled1536';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '512', '--height', '512', '--steps', '4', '--repeats', '2', '--free-gib', '19']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--tiling', '--size', '1536']]
         start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
          from collections import deque
-         print(''.join(deque(f,maxlen=35)))
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence cutoff-full512
+    - name: Evidence cutoff-tiled1536
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-windows-cutoff-full512
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full512*
+        name: vae-windows-cutoff-tiled1536
+        path: ${{ env.WORK_ROOT }}/out/cutoff-tiled1536
         retention-days: 14
-    - name: cutoff-full1536
+    - name: cutoff-16gib-tiled
       shell: python -X utf8 {0}
+      timeout-minutes: 15
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-16gib-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--cap', '16', '--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=840)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence cutoff-16gib-tiled
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-cutoff-16gib-tiled
+        path: ${{ env.WORK_ROOT }}/out/cutoff-16gib-tiled
+        retention-days: 14
+    - name: cutoff-16gib
+      shell: python -X utf8 {0}
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='cutoff-16gib';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--search-cutoff', '--cap', '16']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=540)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence cutoff-16gib
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-cutoff-16gib
+        path: ${{ env.WORK_ROOT }}/out/cutoff-16gib
+        retention-days: 14
+    - name: Convolution smoke stock
+      shell: python -X utf8 {0}
+      run: |
+        import os,sys,subprocess
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='cutoff':os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  rx=x.float().requires_grad_();rw=w.float().requires_grad_()\n  reference=fn(rx,rw,stride=stride,padding=pad,dilation=dilation,groups=groups)\n  go=torch.randn(reference.shape,generator=g)\n  ref_grads=torch.autograd.grad(reference,(rx,rw),go)\n  reference=reference.detach()\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   gx=gx.detach().requires_grad_();gw=gw.detach().requires_grad_()\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   grads=torch.autograd.grad(y,(gx,gw),go.to(device='cuda',dtype=dtype))\n   actual=y.detach().cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n   for tag,actual_grad,ref_grad in zip(('input_grad','weight_grad'),grads,ref_grads):\n    actual_grad=actual_grad.detach().cpu().float();err=(actual_grad-ref_grad).square().mean().sqrt()/ref_grad.square().mean().sqrt().clamp_min(1e-8)\n    grow=dict(key=key+'-'+tag,nrmse=err.item(),finite=bool(torch.isfinite(actual_grad).all()))\n    rows.append(grow);values[grow['key']]=actual_grad;print(json.dumps(grow),flush=True)\n    assert grow['finite'] and grow['nrmse']<0.02,grow\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'stock'],check=True)
       timeout-minutes: 25
       continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full1536';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1536', '--height', '1536', '--steps', '4', '--repeats', '2', '--free-gib', '19', '--tiling']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence cutoff-full1536
+    - name: Smoke evidence stock
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-windows-cutoff-full1536
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full1536*
+        name: vae-windows-smoke-stock
+        path: ${{ env.WORK_ROOT }}/out/smoke-stock
         retention-days: 14
-    - name: reference-cutoff
+    - name: Convolution smoke cutoff
       shell: python -X utf8 {0}
+      run: |
+        import os,sys,subprocess
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        (root/'conv_smoke.py').write_text("import os,sys,json,time,math\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']);variant=sys.argv[1];out=root/'out'/('smoke-'+variant);out.mkdir(exist_ok=True)\ncache=root/'cache'/('smoke-'+variant)\nfor part in ('db','kernels'):(cache/part).mkdir(parents=True,exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nif variant=='cutoff':os.environ['MIOPEN_SEARCH_CUTOFF']='1'\nimport torch\nimport torch.nn.functional as F\ntorch.backends.cudnn.benchmark=False\nshapes=[('standard',(1,16,32,32),(32,16,3,3),1,1,1,1),('odd',(2,3,29,31),(7,3,3,3),1,1,1,1),('grouped',(1,8,31,33),(12,4,3,3),2,2,2,2),('depthwise',(1,8,31,33),(8,1,3,3),1,1,1,8),('pointwise',(2,17,16,16),(9,17,1,1),1,0,1,1),('patch',(1,3,56,56),(16,3,14,14),14,0,1,1),('volume',(1,8,4,8,8),(12,8,3,3,3),1,1,1,1)]\nrows=[];values={}\nfor dtype in (torch.float32,torch.float16,torch.bfloat16):\n for name,ins,ws,stride,pad,dilation,groups in shapes:\n  g=torch.Generator().manual_seed(42);x=torch.randn(ins,generator=g).to(dtype);w=(torch.randn(ws,generator=g)/math.sqrt(math.prod(ws[1:]))).to(dtype)\n  fn=F.conv3d if len(ins)==5 else F.conv2d\n  rx=x.float().requires_grad_();rw=w.float().requires_grad_()\n  reference=fn(rx,rw,stride=stride,padding=pad,dilation=dilation,groups=groups)\n  go=torch.randn(reference.shape,generator=g)\n  ref_grads=torch.autograd.grad(reference,(rx,rw),go)\n  reference=reference.detach()\n  for layout in (['contiguous','channels_last'] if len(ins)==4 else ['contiguous']):\n   key=f'{name}-{dtype}-{layout}';gx=x.to('cuda');gw=w.to('cuda')\n   if layout=='channels_last':gx=gx.contiguous(memory_format=torch.channels_last);gw=gw.contiguous(memory_format=torch.channels_last)\n   gx=gx.detach().requires_grad_();gw=gw.detach().requires_grad_()\n   t=time.perf_counter();y=fn(gx,gw,stride=stride,padding=pad,dilation=dilation,groups=groups);torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   grads=torch.autograd.grad(y,(gx,gw),go.to(device='cuda',dtype=dtype))\n   actual=y.detach().cpu().float();d=(actual-reference).abs();rmse=d.square().mean().sqrt().item();nrmse=rmse/max(reference.square().mean().sqrt().item(),1e-8)\n   row=dict(key=key,seconds=elapsed,max_abs=d.max().item(),nrmse=nrmse,finite=bool(torch.isfinite(actual).all()))\n   rows.append(row);values[key]=actual;print(json.dumps(row),flush=True)\n   assert row['finite'] and nrmse<0.01,(key,row)\n   for tag,actual_grad,ref_grad in zip(('input_grad','weight_grad'),grads,ref_grads):\n    actual_grad=actual_grad.detach().cpu().float();err=(actual_grad-ref_grad).square().mean().sqrt()/ref_grad.square().mean().sqrt().clamp_min(1e-8)\n    grow=dict(key=key+'-'+tag,nrmse=err.item(),finite=bool(torch.isfinite(actual_grad).all()))\n    rows.append(grow);values[grow['key']]=actual_grad;print(json.dumps(grow),flush=True)\n    assert grow['finite'] and grow['nrmse']<0.02,grow\n(root/'out'/('smoke-'+variant)/'results.json').write_text(json.dumps(rows,indent=2));torch.save(values,out/'outputs.pt')\n",encoding='utf-8')
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        subprocess.run([str(py),'-u',str(root/'conv_smoke.py'),'cutoff'],check=True)
       timeout-minutes: 25
       continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-cutoff';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '4', '--repeats', '2', '--free-gib', '19', '--reference']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence reference-cutoff
+    - name: Smoke evidence cutoff
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-windows-reference-cutoff
-        path: ${{ env.WORK_ROOT }}/out/reference-cutoff*
-        retention-days: 14
-    - name: cutoff-full16gib
-      shell: python -X utf8 {0}
-      timeout-minutes: 20
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='cutoff-full16gib';out=root/'out'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'full_probe.py'),'--case',case,'--output',str(out),*['--vae-mode', 'search-cutoff', '--width', '1024', '--height', '1024', '--steps', '4', '--repeats', '1', '--free-gib', '16']]
-        start=time.time()
-        with (out/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=35)))
-        sys.exit(rc)
-    - name: Evidence cutoff-full16gib
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: fullvae-windows-cutoff-full16gib
-        path: ${{ env.WORK_ROOT }}/out/cutoff-full16gib*
+        name: vae-windows-smoke-cutoff
+        path: ${{ env.WORK_ROOT }}/out/smoke-cutoff
         retention-days: 14
     - name: Environment evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fullvae-windows-environment
+        name: vae-windows-environment
         path: ${{ env.WORK_ROOT }}/out/*.txt
         retention-days: 14
