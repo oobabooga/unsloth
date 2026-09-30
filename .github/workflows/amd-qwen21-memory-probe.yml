@@ -1,4 +1,4 @@
-name: AMD cold VAE search and cache investigation
+name: AMD VAE immediate mode and memory layout investigation
 'on':
   push:
     branches:
@@ -75,7 +75,7 @@ jobs:
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
     - name: default-cold
       shell: python3 -X utf8 {0}
       timeout-minutes: 35
@@ -107,140 +107,16 @@ jobs:
         name: vae-linux-default-cold
         path: ${{ env.WORK_ROOT }}/out/default-cold
         retention-days: 14
-    - name: default-warm-disk
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 15
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-disk';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'both']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=840)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-disk
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-linux-default-warm-disk
-        path: ${{ env.WORK_ROOT }}/out/default-warm-disk
-        retention-days: 14
-    - name: default-warm-kernels
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 35
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-kernels';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'kernels']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-kernels
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-linux-default-warm-kernels
-        path: ${{ env.WORK_ROOT }}/out/default-warm-kernels
-        retention-days: 14
-    - name: default-warm-db
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 35
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-db';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'db']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-db
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-linux-default-warm-db
-        path: ${{ env.WORK_ROOT }}/out/default-warm-db
-        retention-days: 14
-    - name: fast-cold
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 20
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='fast-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence fast-cold
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-linux-fast-cold
-        path: ${{ env.WORK_ROOT }}/out/fast-cold
-        retention-days: 14
-    - name: trust-verify-cold
+    - name: immediate-cold
       shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='trust-verify-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'TRUST_VERIFY']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
@@ -255,27 +131,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence trust-verify-cold
+    - name: Evidence immediate-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-trust-verify-cold
-        path: ${{ env.WORK_ROOT }}/out/trust-verify-cold
+        name: vae-linux-immediate-cold
+        path: ${{ env.WORK_ROOT }}/out/immediate-cold
         retention-days: 14
-    - name: default-tiled-cold
+    - name: immediate-tiled-cold
       shell: python3 -X utf8 {0}
-      timeout-minutes: 30
+      timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate', '--tiling']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1740)
+         try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -286,27 +162,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence default-tiled-cold
+    - name: Evidence immediate-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-default-tiled-cold
-        path: ${{ env.WORK_ROOT }}/out/default-tiled-cold
+        name: vae-linux-immediate-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/immediate-tiled-cold
         retention-days: 14
-    - name: fast-tiled-cold
+    - name: immediate-1536-tiled
       shell: python3 -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='fast-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-1536-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST', '--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate', '--tiling', '--size', '1536']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -317,27 +193,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence fast-tiled-cold
+    - name: Evidence immediate-1536-tiled
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-fast-tiled-cold
-        path: ${{ env.WORK_ROOT }}/out/fast-tiled-cold
+        name: vae-linux-immediate-1536-tiled
+        path: ${{ env.WORK_ROOT }}/out/immediate-1536-tiled
         retention-days: 14
-    - name: native-conv-cold
+    - name: channels-last-cold
       shell: python3 -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 35
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='native-conv-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='channels-last-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-cudnn']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--channels-last']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=2040)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -348,12 +224,43 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence native-conv-cold
+    - name: Evidence channels-last-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-linux-native-conv-cold
-        path: ${{ env.WORK_ROOT }}/out/native-conv-cold
+        name: vae-linux-channels-last-cold
+        path: ${{ env.WORK_ROOT }}/out/channels-last-cold
+        retention-days: 14
+    - name: fast-channels-last-cold
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 25
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='fast-channels-last-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--channels-last', '--mode', 'FAST']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=1440)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence fast-channels-last-cold
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-fast-channels-last-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-channels-last-cold
         retention-days: 14
     - name: Environment evidence
       if: always()
@@ -432,7 +339,7 @@ jobs:
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\np.add_argument('--immediate',action='store_true');p.add_argument('--channels-last',action='store_true')\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.immediate:torch.backends.miopen.immediate=True\nemit('backend_flags',miopen_immediate=torch.backends.miopen.immediate)\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n if a.channels_last:vae.to(memory_format=torch.channels_last)\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
     - name: default-cold
       shell: python -X utf8 {0}
       timeout-minutes: 35
@@ -464,140 +371,16 @@ jobs:
         name: vae-windows-default-cold
         path: ${{ env.WORK_ROOT }}/out/default-cold
         retention-days: 14
-    - name: default-warm-disk
-      shell: python -X utf8 {0}
-      timeout-minutes: 15
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-disk';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'both']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=840)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-disk
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-windows-default-warm-disk
-        path: ${{ env.WORK_ROOT }}/out/default-warm-disk
-        retention-days: 14
-    - name: default-warm-kernels
-      shell: python -X utf8 {0}
-      timeout-minutes: 35
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-kernels';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'kernels']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-kernels
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-windows-default-warm-kernels
-        path: ${{ env.WORK_ROOT }}/out/default-warm-kernels
-        retention-days: 14
-    - name: default-warm-db
-      shell: python -X utf8 {0}
-      timeout-minutes: 35
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-warm-db';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'db']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2040)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence default-warm-db
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-windows-default-warm-db
-        path: ${{ env.WORK_ROOT }}/out/default-warm-db
-        retention-days: 14
-    - name: fast-cold
-      shell: python -X utf8 {0}
-      timeout-minutes: 20
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='fast-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST']]
-        start=time.time()
-        with (out/'full.log').open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
-        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
-         from collections import deque
-         print(''.join(deque(f,maxlen=40)))
-        print('CASE_RESULT',case,rc,flush=True)
-        sys.exit(rc)
-    - name: Evidence fast-cold
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: vae-windows-fast-cold
-        path: ${{ env.WORK_ROOT }}/out/fast-cold
-        retention-days: 14
-    - name: trust-verify-cold
+    - name: immediate-cold
       shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='trust-verify-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'TRUST_VERIFY']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
@@ -612,27 +395,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence trust-verify-cold
+    - name: Evidence immediate-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-trust-verify-cold
-        path: ${{ env.WORK_ROOT }}/out/trust-verify-cold
+        name: vae-windows-immediate-cold
+        path: ${{ env.WORK_ROOT }}/out/immediate-cold
         retention-days: 14
-    - name: default-tiled-cold
+    - name: immediate-tiled-cold
       shell: python -X utf8 {0}
-      timeout-minutes: 30
+      timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='default-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate', '--tiling']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1740)
+         try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -643,27 +426,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence default-tiled-cold
+    - name: Evidence immediate-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-default-tiled-cold
-        path: ${{ env.WORK_ROOT }}/out/default-tiled-cold
+        name: vae-windows-immediate-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/immediate-tiled-cold
         retention-days: 14
-    - name: fast-tiled-cold
+    - name: immediate-1536-tiled
       shell: python -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 25
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='fast-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='immediate-1536-tiled';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST', '--tiling']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--immediate', '--tiling', '--size', '1536']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -674,27 +457,27 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence fast-tiled-cold
+    - name: Evidence immediate-1536-tiled
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-fast-tiled-cold
-        path: ${{ env.WORK_ROOT }}/out/fast-tiled-cold
+        name: vae-windows-immediate-1536-tiled
+        path: ${{ env.WORK_ROOT }}/out/immediate-1536-tiled
         retention-days: 14
-    - name: native-conv-cold
+    - name: channels-last-cold
       shell: python -X utf8 {0}
-      timeout-minutes: 20
+      timeout-minutes: 35
       continue-on-error: true
       run: |
         import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='native-conv-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        root=Path(os.environ['WORK_ROOT']);case='channels-last-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-cudnn']]
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--channels-last']]
         start=time.time()
         with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1140)
+         try:rc=p.wait(timeout=2040)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
@@ -705,12 +488,43 @@ jobs:
          print(''.join(deque(f,maxlen=40)))
         print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence native-conv-cold
+    - name: Evidence channels-last-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: vae-windows-native-conv-cold
-        path: ${{ env.WORK_ROOT }}/out/native-conv-cold
+        name: vae-windows-channels-last-cold
+        path: ${{ env.WORK_ROOT }}/out/channels-last-cold
+        retention-days: 14
+    - name: fast-channels-last-cold
+      shell: python -X utf8 {0}
+      timeout-minutes: 25
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='fast-channels-last-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--channels-last', '--mode', 'FAST']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=1440)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence fast-channels-last-cold
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-fast-channels-last-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-channels-last-cold
         retention-days: 14
     - name: Environment evidence
       if: always()
