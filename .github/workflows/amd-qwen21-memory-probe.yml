@@ -1,4 +1,4 @@
-name: Qwen image AMD production fixes live A B
+name: AMD cold VAE search and cache investigation
 'on':
   push:
     branches:
@@ -11,7 +11,7 @@ jobs:
     - Linux
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 360
+    timeout-minutes: 300
     env:
       UNSLOTH_IS_PRESENT: '1'
       PYTHONUNBUFFERED: '1'
@@ -70,339 +70,297 @@ jobs:
         run([py,'-c',"import main; import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
 
         run([py,"-m","pip","install","pytest"])
-    - name: Prepare separate baseline and patched checkouts
+    - name: Prepare probe
       shell: python3 -X utf8 {0}
       run: |
-        import os,subprocess
+        import os
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        p=root/'encoder.patch'
-        p.write_bytes(b'diff --git a/studio/backend/core/inference/diffusion_te_prequant.py b/studio/backend/core/inference/diffusion_te_prequant.py\nindex e9943bc719..51e76f9a54 100644\n--- a/studio/backend/core/inference/diffusion_te_prequant.py\n+++ b/studio/backend/core/inference/diffusion_te_prequant.py\n@@ -212,15 +212,14 @@ def te_candidate_is_readable(name: Optional[str]) -> bool:\n     NOT the transformer\'s ``restricted_prequant_load_supported``: this state dict is plain\n     tensors, read under a bare ``weights_only`` load with no constructor allowlist, so a ``.pt``\n     is always readable and asking the DiT\'s question would refuse one on every install whose\n-    torchao lacks some DiT scheme\'s constructors. Only the safetensors container has a\n-    requirement, and a plan that drops the dense encoder for an artifact this install cannot open\n-    leaves the load with neither.\n+    torchao lacks some DiT scheme\'s constructors. The safetensors container needs only\n+    safetensors, not torchao. Check that dependency before planning without dense shards.\n     """\n     if not name:\n         return False\n-    from .prequant_safetensors import is_safetensors_checkpoint, safetensors_prequant_supported\n+    from .prequant_safetensors import is_safetensors_checkpoint, plain_safetensors_supported\n \n-    return safetensors_prequant_supported() if is_safetensors_checkpoint(name) else True\n+    return plain_safetensors_supported() if is_safetensors_checkpoint(name) else True\n \n \n def family_te_prequant_repo(fam: Any, scheme: str, component: str) -> Optional[str]:\n@@ -419,15 +418,15 @@ def load_prequant_text_encoder(\n \n         import torch\n \n-        from .prequant_safetensors import is_safetensors_checkpoint, load_prequant_safetensors\n+        from .prequant_safetensors import is_safetensors_checkpoint, load_plain_prequant_safetensors\n \n         # The layerwise-fp8 state dict is plain tensors, so weights_only=True suffices and no pickle code runs even for\n         # a local path. A future torchao-subclass scheme needs a format bump AND the DiT module\'s allowlist.\n-        # A ``.safetensors`` artifact is read through the shared reader instead, which returns the same dict shape, so\n+        # A ``.safetensors`` artifact is read through the plain-tensor reader instead, which returns the same dict shape, so\n         # ``_validate_checkpoint`` and everything after it are unchanged. Dispatch is on the extension the resolver\n         # asked the Hub for, never on sniffing the bytes.\n         if is_safetensors_checkpoint(path):\n-            ckpt = load_prequant_safetensors(path)\n+            ckpt = load_plain_prequant_safetensors(path)\n         else:\n             ckpt = torch.load(path, weights_only = True, map_location = "cpu")\n         if not _validate_checkpoint(ckpt, scheme, component, base, logger):\ndiff --git a/studio/backend/core/inference/prequant_safetensors.py b/studio/backend/core/inference/prequant_safetensors.py\nindex 2307fca8d0..74d99184bb 100644\n--- a/studio/backend/core/inference/prequant_safetensors.py\n+++ b/studio/backend/core/inference/prequant_safetensors.py\n@@ -135,6 +135,58 @@ def safetensors_prequant_supported() -> bool:\n     return True\n \n \n+def plain_safetensors_supported() -> bool:\n+    """The layerwise-cast encoder format stores plain tensors, without torchao subclasses."""\n+    try:\n+        from safetensors import safe_open  # noqa: F401\n+    except ImportError:\n+        return False\n+    return True\n+\n+\n+def load_plain_prequant_safetensors(path: str, *, device: str = "cpu") -> dict:\n+    """Read a plain-tensor prequant checkpoint without importing torchao.\n+\n+    Refuse subclass metadata and unaccounted tensors before reading weights. The\n+    caller still validates the component, scheme, base model and state-dict keys.\n+    """\n+    from safetensors import safe_open\n+\n+    with safe_open(path, framework = "pt", device = device) as handle:\n+        raw = handle.metadata() or {}\n+        fmt = raw.get(UNSLOTH_FORMAT_KEY)\n+        if not fmt:\n+            raise ValueError(f"{path} is not an Unsloth pre-quant checkpoint")\n+        metadata = json.loads(raw.get(UNSLOTH_METADATA_KEY) or "{}")\n+        names = json.loads(raw.get("tensor_names") or "null")\n+        if not isinstance(metadata, dict):\n+            raise ValueError(f"{path} has invalid pre-quant metadata")\n+        if (\n+            not isinstance(names, list)\n+            or not all(isinstance(name, str) and name for name in names)\n+            or len(names) != len(set(names))\n+        ):\n+            raise ValueError(f"{path} has invalid tensor_names")\n+        keys = set(handle.keys())\n+        roots = {key for key in keys if key.startswith(UNSLOTH_ROOT_PREFIX)}\n+        root_names = {key[len(UNSLOTH_ROOT_PREFIX) :] for key in roots}\n+        if (\n+            any(not name or "." in name for name in root_names)\n+            or root_names.intersection(names)\n+            or set(names).intersection(roots)\n+            or set(names) != keys - roots\n+        ):\n+            raise ValueError(f"{path} has tensors its header does not account for")\n+        for name in names:\n+            if json.loads(raw.get(name) or "null") != {"_type": "Tensor"}:\n+                raise ValueError(f"{path} requires a tensor-subclass reader for {name!r}")\n+        state_dict = {name: handle.get_tensor(name) for name in names}\n+        state_dict.update(\n+            (key[len(UNSLOTH_ROOT_PREFIX) :], handle.get_tensor(key)) for key in roots\n+        )\n+    return {"format": str(fmt), "state_dict": state_dict, "metadata": metadata}\n+\n+\n def _first(value: Any) -> Any:\n     """Both torchao helpers return a 2-tuple whose first element is the dict we want.\n \ndiff --git a/studio/backend/tests/test_prequant_safetensors.py b/studio/backend/tests/test_prequant_safetensors.py\nindex 74c507d35c..ca07a89e6b 100644\n--- a/studio/backend/tests/test_prequant_safetensors.py\n+++ b/studio/backend/tests/test_prequant_safetensors.py\n@@ -594,3 +594,90 @@ def test_torchao_older_than_the_floor_is_not_safetensors_support(monkeypatch):\n     monkeypatch.setattr(ps, "_torchao_version", lambda: "0.14.0")\n     assert ps._torchao_helpers() is None\n     assert ps.safetensors_prequant_supported() is False\n+\n+\n+@pytest.fixture\n+def plain_checkpoint(tmp_path, monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    save_file = pytest.importorskip("safetensors.torch").save_file\n+    monkeypatch.setattr(ps, "_torchao_helpers", lambda: None)\n+\n+    def write(*, tensors = None, header = None):\n+        tensors = {"encoder.weight": torch.ones(2, 3)} if tensors is None else tensors\n+        metadata = {\n+            ps.UNSLOTH_FORMAT_KEY: "unsloth_prequant_text_encoder_state_dict_v1",\n+            ps.UNSLOTH_METADATA_KEY: json.dumps({"scheme": "fp8", "component": "text_encoder"}),\n+            "tensor_names": json.dumps(["encoder.weight"]),\n+            "encoder.weight": json.dumps({"_type": "Tensor"}),\n+        }\n+        metadata.update(header or {})\n+        path = str(tmp_path / "encoder.safetensors")\n+        save_file(tensors, path, metadata = metadata)\n+        return path\n+\n+    return write\n+\n+\n+def test_plain_encoder_needs_no_torchao(plain_checkpoint):\n+    import core.inference.diffusion_te_prequant as te\n+    import torch\n+\n+    path = plain_checkpoint(tensors = {"encoder.weight": torch.ones(2, 3).to(torch.float8_e4m3fn)})\n+    assert te.te_candidate_is_readable(path)\n+    assert not ps.safetensors_prequant_supported()\n+    loaded = ps.load_plain_prequant_safetensors(path)\n+    assert loaded["state_dict"]["encoder.weight"].dtype == torch.float8_e4m3fn\n+    assert torch.equal(loaded["state_dict"]["encoder.weight"].float(), torch.ones(2, 3))\n+    assert loaded["metadata"]["scheme"] == "fp8"\n+\n+\n+@pytest.mark.parametrize(\n+    "header",\n+    [\n+        {"tensor_names": \'["encoder.weight", "encoder.weight"]\'},\n+        {"tensor_names": \'["missing.weight"]\'},\n+        {"tensor_names": \'"encoder.weight"\'},\n+        {"tensor_names": "[1]"},\n+        {"tensor_names": "invalid"},\n+        {"encoder.weight": \'{"_type":"Float8Tensor"}\'},\n+        {"encoder.weight": \'{"_type":"Tensor","unexpected":true}\'},\n+        {ps.UNSLOTH_METADATA_KEY: "[]"},\n+        {ps.UNSLOTH_FORMAT_KEY: ""},\n+    ],\n+)\n+def test_plain_reader_rejects_invalid_headers(plain_checkpoint, header):\n+    with pytest.raises(ValueError):\n+        ps.load_plain_prequant_safetensors(plain_checkpoint(header = header))\n+\n+\n+def test_plain_reader_rejects_unaccounted_tensor(plain_checkpoint):\n+    import torch\n+    path = plain_checkpoint(\n+        tensors = {"encoder.weight": torch.ones(2), "extra.weight": torch.ones(2)}\n+    )\n+    with pytest.raises(ValueError, match = "does not account"):\n+        ps.load_plain_prequant_safetensors(path)\n+\n+\n+def test_plain_reader_restores_root_buffers(plain_checkpoint):\n+    import torch\n+\n+    path = plain_checkpoint(\n+        tensors = {\n+            "encoder.weight": torch.ones(2),\n+            ps.UNSLOTH_ROOT_PREFIX + "buffer": torch.zeros(1),\n+        }\n+    )\n+    state = ps.load_plain_prequant_safetensors(path)["state_dict"]\n+    assert set(state) == {"encoder.weight", "buffer"}\n+    assert torch.equal(state["buffer"], torch.zeros(1))\n+\n+\n+def test_plain_reader_rejects_root_collision(plain_checkpoint):\n+    import torch\n+    path = plain_checkpoint(\n+        tensors = {"buffer": torch.ones(2), ps.UNSLOTH_ROOT_PREFIX + "buffer": torch.zeros(1)},\n+        header = {"tensor_names": \'["buffer"]\', "buffer": \'{"_type":"Tensor"}\'},\n+    )\n+    with pytest.raises(ValueError, match = "does not account"):\n+        ps.load_plain_prequant_safetensors(path)\n')
-        subprocess.run(['git','-C',str(root/'code'),'worktree','add','--detach',str(root/'code-encoder'),'HEAD'],check=True)
-        subprocess.run(['git','-C',str(root/'code-encoder'),'apply','--check',str(p)],check=True)
-        subprocess.run(['git','-C',str(root/'code-encoder'),'apply',str(p)],check=True)
-        p=root/'attention.patch'
-        p.write_bytes(b'diff --git a/studio/backend/core/inference/diffusion_qwenimage21_rocm.py b/studio/backend/core/inference/diffusion_qwenimage21_rocm.py\nnew file mode 100644\nindex 0000000000..dc187210b3\n--- /dev/null\n+++ b/studio/backend/core/inference/diffusion_qwenimage21_rocm.py\n@@ -0,0 +1,158 @@\n+# SPDX-License-Identifier: AGPL-3.0-only\n+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0\n+\n+"""Bound large Qwen-Image-2.1 query batches on measured ROCm GPUs.\n+\n+On gfx1151, native flash attention slows sharply above 8192 image tokens. Query\n+rows are independent for unmasked, noncausal attention, so each chunk can retain\n+all keys and values. Prefill, masks and explicit alternative backends stay stock.\n+"""\n+\n+from __future__ import annotations\n+\n+import functools\n+import os\n+from typing import Any\n+\n+QUERY_CHUNK_ENV = "UNSLOTH_QWEN_IMAGE_ROCM_QUERY_CHUNKING"\n+QUERY_CHUNK_SIZE = 512\n+MIN_QUERY_TOKENS = 8192\n+\n+\n+def _device_supported(target: Any) -> bool:\n+    if getattr(target, "backend", None) != "rocm" or getattr(target, "device", None) != "cuda":\n+        return False\n+    setting = (os.environ.get(QUERY_CHUNK_ENV) or "auto").strip().lower()\n+    if setting in ("0", "false", "off", "no"):\n+        return False\n+    import torch\n+\n+    if not getattr(torch.version, "hip", None):\n+        return False\n+    if setting in ("1", "true", "on", "yes"):\n+        return True\n+    ordinal = getattr(target, "ordinal", None)\n+    props = torch.cuda.get_device_properties(\n+        torch.cuda.current_device() if ordinal is None else ordinal\n+    )\n+    return str(getattr(props, "gcnArchName", "")).split(":", 1)[0] == "gfx1151"\n+\n+\n+def _native_backend(processor: Any) -> bool:\n+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry\n+\n+    backend = processor._attention_backend\n+    if backend is None:\n+        backend, _ = _AttentionBackendRegistry.get_active_backend()\n+    return backend == "native"\n+\n+\n+def _can_chunk(processor, attn, hidden_states, attention_mask, segments, key_valid) -> bool:\n+    import torch\n+    return not (\n+        segments is not None\n+        or attention_mask is not None\n+        or key_valid is not None\n+        or processor._parallel_config is not None\n+        or hidden_states.device.type != "cuda"\n+        or hidden_states.dtype != torch.bfloat16\n+        or hidden_states.shape[1] < MIN_QUERY_TOKENS\n+        or attn.heads != 32\n+        or attn.inner_dim != 4096\n+        or torch.is_grad_enabled()\n+        or torch.compiler.is_compiling()\n+        or not _native_backend(processor)\n+    )\n+\n+\n+def _chunk_attention(query: Any, key: Any, value: Any, dispatch: Any, **kwargs: Any) -> Any:\n+    import torch\n+    return torch.cat(\n+        [\n+            dispatch(query[:, start : start + QUERY_CHUNK_SIZE], key, value, **kwargs)\n+            for start in range(0, query.shape[1], QUERY_CHUNK_SIZE)\n+        ],\n+        dim = 1,\n+    )\n+\n+\n+@functools.lru_cache(maxsize = 1)\n+def _processor_class() -> type:\n+    import torch\n+    from diffusers.models.transformers.transformer_qwenimage21 import (\n+        QwenImage21AttnProcessor,\n+        _qwenimage21_prepare_qkv,\n+        dispatch_attention_fn,\n+    )\n+\n+    class ChunkedQwenImage21AttnProcessor(QwenImage21AttnProcessor):\n+        def __call__(\n+            self,\n+            attn,\n+            hidden_states,\n+            attention_mask = None,\n+            rotary_emb = None,\n+            layer_cache = None,\n+            kv_cache_mode = None,\n+            cache_write_slice = None,\n+            segments = None,\n+            key_valid = None,\n+        ):\n+            if not _can_chunk(self, attn, hidden_states, attention_mask, segments, key_valid):\n+                return super().__call__(\n+                    attn,\n+                    hidden_states,\n+                    attention_mask,\n+                    rotary_emb,\n+                    layer_cache,\n+                    kv_cache_mode,\n+                    cache_write_slice,\n+                    segments,\n+                    key_valid,\n+                )\n+            query, key, value, seq_len_q = _qwenimage21_prepare_qkv(\n+                attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice\n+            )\n+            output = _chunk_attention(\n+                query,\n+                key,\n+                value,\n+                dispatch_attention_fn,\n+                attn_mask = None,\n+                dropout_p = 0.0,\n+                backend = self._attention_backend,\n+                parallel_config = self._parallel_config,\n+            )\n+            output = output[:, :seq_len_q].flatten(2, 3).type_as(query)\n+            return attn.to_out[1](attn.to_out[0](output))\n+\n+    return ChunkedQwenImage21AttnProcessor\n+\n+\n+def install(\n+    pipe: Any,\n+    target: Any,\n+    logger: Any = None,\n+) -> bool:\n+    """Replace only this pipeline\'s stock Qwen-Image-2.1 processors, before placement."""\n+    if not _device_supported(target):\n+        return False\n+    transformer = getattr(pipe, "transformer", None)\n+    if type(transformer).__name__ != "QwenImage21Transformer2DModel":\n+        return False\n+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21AttnProcessor\n+\n+    cls = _processor_class()\n+    installed = False\n+    for module in transformer.modules():\n+        processor = getattr(module, "processor", None)\n+        if type(processor) is cls:\n+            installed = True\n+        elif type(processor) is QwenImage21AttnProcessor:\n+            replacement = cls()\n+            replacement.__dict__.update(processor.__dict__)\n+            module.set_processor(replacement)\n+            installed = True\n+    if installed and logger is not None:\n+        logger.info("diffusion.qwenimage21: large ROCm decode queries use 512-row chunks")\n+    return installed\ndiff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py\nindex 0f8bc24695..0836c85ea1 100644\n--- a/studio/backend/core/inference/diffusion_speed.py\n+++ b/studio/backend/core/inference/diffusion_speed.py\n@@ -445,6 +445,7 @@ def apply_speed_optims(\n         "fused_qkv": False,\n         "compiled": False,\n         "compiled_dequant": False,\n+        "rocm_query_chunks": False,\n         "compiled_vae_decode": False,\n         "cuda_graph": False,\n     }\n@@ -454,6 +455,13 @@ def apply_speed_optims(\n     if mode == SPEED_OFF:\n         return applied\n \n+    if getattr(target, "backend", None) == "rocm":\n+        try:\n+            from .diffusion_qwenimage21_rocm import install as install_rocm_query_chunks\n+            applied["rocm_query_chunks"] = install_rocm_query_chunks(pipe, target, logger)\n+        except Exception as exc:  # noqa: BLE001 - keep stock attention on unsupported installs\n+            _warn(logger, "qwen-image-2.1 ROCm query chunks", exc)\n+\n     on_cuda = getattr(target, "device", None) == "cuda"\n     family_allows_compile = bool(getattr(family, "supports_torch_compile", True))\n \ndiff --git a/studio/backend/tests/test_diffusion_qwenimage21_rocm.py b/studio/backend/tests/test_diffusion_qwenimage21_rocm.py\nnew file mode 100644\nindex 0000000000..9160e069d8\n--- /dev/null\n+++ b/studio/backend/tests/test_diffusion_qwenimage21_rocm.py\n@@ -0,0 +1,139 @@\n+# SPDX-License-Identifier: AGPL-3.0-only\n+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0\n+\n+from types import SimpleNamespace\n+\n+import pytest\n+\n+from core.inference import diffusion_qwenimage21_rocm as chunks\n+\n+\n+@pytest.mark.parametrize(\n+    "architecture,setting,expected",\n+    [\n+        ("gfx1151", "auto", True),\n+        ("gfx1151:sramecc-", "auto", True),\n+        ("gfx1100", "auto", False),\n+        ("gfx942", "auto", False),\n+        ("gfx1100", "1", True),\n+        ("gfx1151", "0", False),\n+    ],\n+)\n+def test_device_scope(monkeypatch, architecture, setting, expected):\n+    torch = pytest.importorskip("torch")\n+    monkeypatch.setenv(chunks.QUERY_CHUNK_ENV, setting)\n+    monkeypatch.setattr(torch.version, "hip", "7.13")\n+    monkeypatch.setattr(\n+        torch.cuda, "get_device_properties", lambda i: SimpleNamespace(gcnArchName = architecture)\n+    )\n+    target = SimpleNamespace(backend = "rocm", device = "cuda", ordinal = 1)\n+    assert chunks._device_supported(target) is expected\n+    assert not chunks._device_supported(SimpleNamespace(backend = "cuda", device = "cuda"))\n+    assert not chunks._device_supported(SimpleNamespace(backend = "cpu", device = "cpu"))\n+\n+\n+@pytest.mark.parametrize(\n+    "reason",\n+    [\n+        "eligible",\n+        "cpu",\n+        "fp32",\n+        "small",\n+        "heads",\n+        "mask",\n+        "segments",\n+        "key_valid",\n+        "parallel",\n+        "grad",\n+        "compile",\n+        "backend",\n+    ],\n+)\n+def test_runtime_scope(monkeypatch, reason):\n+    torch = pytest.importorskip("torch")\n+    hidden = SimpleNamespace(\n+        device = SimpleNamespace(type = "cuda"), dtype = torch.bfloat16, shape = (1, 8192, 4096)\n+    )\n+    processor = SimpleNamespace(_parallel_config = None)\n+    attn = SimpleNamespace(heads = 32, inner_dim = 4096)\n+    mask = segments = key_valid = None\n+    if reason == "cpu":\n+        hidden.device.type = "cpu"\n+    if reason == "fp32":\n+        hidden.dtype = torch.float32\n+    if reason == "small":\n+        hidden.shape = (1, 4096, 4096)\n+    if reason == "heads":\n+        attn.heads = 16\n+    if reason == "mask":\n+        mask = object()\n+    if reason == "segments":\n+        segments = []\n+    if reason == "key_valid":\n+        key_valid = object()\n+    if reason == "parallel":\n+        processor._parallel_config = object()\n+    monkeypatch.setattr(torch, "is_grad_enabled", lambda: reason == "grad")\n+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: reason == "compile")\n+    monkeypatch.setattr(chunks, "_native_backend", lambda p: reason != "backend")\n+    assert chunks._can_chunk(processor, attn, hidden, mask, segments, key_valid) is (\n+        reason == "eligible"\n+    )\n+\n+\n+def test_chunks_keep_all_keys_and_values():\n+    torch = pytest.importorskip("torch")\n+    torch.manual_seed(12)\n+    q = torch.randn(2, 1100, 2, 8)\n+    k = torch.randn(2, 1200, 2, 8)\n+    v = torch.randn_like(k)\n+    calls = []\n+\n+    def dispatch(qpart, key, value, **kwargs):\n+        calls.append((qpart.shape[1], key, value, kwargs))\n+        return torch.nn.functional.scaled_dot_product_attention(\n+            qpart.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), **kwargs\n+        ).transpose(1, 2)\n+\n+    expected = dispatch(q, k, v, scale = 0.2)\n+    calls.clear()\n+    actual = chunks._chunk_attention(q, k, v, dispatch, scale = 0.2)\n+    torch.testing.assert_close(actual, expected)\n+    assert [c[0] for c in calls] == [512, 512, 76]\n+    assert all(c[1] is k and c[2] is v and c[3] == {"scale": 0.2} for c in calls)\n+\n+\n+def test_processor_output_and_stock_fallback(monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    module = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")\n+    torch.manual_seed(8)\n+    attn = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    stock = module.QwenImage21AttnProcessor()\n+    patched = chunks._processor_class()()\n+    hidden = torch.randn(1, 1100, 16)\n+    with torch.inference_mode():\n+        expected = stock(attn, hidden)\n+        monkeypatch.setattr(chunks, "_can_chunk", lambda *a: True)\n+        torch.testing.assert_close(patched(attn, hidden), expected)\n+        monkeypatch.setattr(chunks, "_can_chunk", lambda *a: False)\n+        mask = torch.ones(1, 1, 1100, 1100, dtype = torch.bool).tril()\n+        torch.testing.assert_close(\n+            patched(attn, hidden, attention_mask = mask), stock(attn, hidden, attention_mask = mask)\n+        )\n+\n+\n+def test_install_is_local_and_idempotent(monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    module = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")\n+    monkeypatch.setattr(chunks, "_device_supported", lambda target: True)\n+    attn = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    untouched = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    transformer = type("QwenImage21Transformer2DModel", (), {"modules": lambda self: [attn]})()\n+    pipe = SimpleNamespace(transformer = transformer)\n+    stock = attn.processor\n+    assert chunks.install(pipe, None)\n+    installed = attn.processor\n+    assert chunks.install(pipe, None)\n+    assert attn.processor is installed\n+    assert type(untouched.processor) is type(stock)\n+    assert type(installed) is chunks._processor_class()\ndiff --git a/studio/backend/tests/test_diffusion_speed.py b/studio/backend/tests/test_diffusion_speed.py\nindex 9c94c416ed..99346c5e94 100644\n--- a/studio/backend/tests/test_diffusion_speed.py\n+++ b/studio/backend/tests/test_diffusion_speed.py\n@@ -434,6 +434,7 @@ def test_speed_off_applies_nothing(monkeypatch):\n         "fused_qkv": False,\n         "compiled": False,\n         "compiled_dequant": False,\n+        "rocm_query_chunks": False,\n         "compiled_vae_decode": False,\n         "fp16_accum": False,\n         "cuda_graph": False,\n')
-        subprocess.run(['git','-C',str(root/'code'),'worktree','add','--detach',str(root/'code-attention'),'HEAD'],check=True)
-        subprocess.run(['git','-C',str(root/'code-attention'),'apply','--check',str(p)],check=True)
-        subprocess.run(['git','-C',str(root/'code-attention'),'apply',str(p)],check=True)
-        (root/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\nemit_lock = threading.Lock()\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    with emit_lock:\n        print(\'PROBE \' + line, flush=True)\n        with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n            f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\ntry:\n    from core.inference import diffusion_qwenimage21_rocm as qchunks\nexcept ImportError:\n    qchunks=None\nchunk_calls=[0]\nif qchunks is not None:\n    real_chunks=qchunks._chunk_attention\n    def counted_chunks(*a,**kw):\n        chunk_calls[0]+=1\n        return real_chunks(*a,**kw)\n    qchunks._chunk_attention=counted_chunks\nemit(\'source\', backend_file=studio_main.__file__, patch_present=qchunks is not None)\n\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nemit(\'blas_backend\', value=str(torch.backends.cuda.preferred_blas_library()), cudnn_benchmark=torch.backends.cudnn.benchmark)\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'encoder-base-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages(group_by_input_shape=True).table(sort_by=\'self_device_time_total\', row_limit=80))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'query_chunk_calls\',count=chunk_calls[0])\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n',encoding='utf-8')
-    - name: warmup
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+    - name: default-cold
       shell: python3 -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='warmup'
+        root=Path(os.environ['WORK_ROOT']);case='default-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*[]]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=2040)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence warmup
+    - name: Evidence default-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-warmup
-        path: ${{ env.WORK_ROOT }}/out/warmup*
+        name: vae-linux-default-cold
+        path: ${{ env.WORK_ROOT }}/out/default-cold
         retention-days: 14
-    - name: encoder-base
+    - name: default-warm-disk
       shell: python3 -X utf8 {0}
       timeout-minutes: 15
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-base'
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-disk';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'both']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-base
+    - name: Evidence default-warm-disk
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-encoder-base
-        path: ${{ env.WORK_ROOT }}/out/encoder-base*
+        name: vae-linux-default-warm-disk
+        path: ${{ env.WORK_ROOT }}/out/default-warm-disk
         retention-days: 14
-    - name: encoder-patch
+    - name: default-warm-kernels
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 35
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-kernels';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'kernels']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=2040)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence default-warm-kernels
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-default-warm-kernels
+        path: ${{ env.WORK_ROOT }}/out/default-warm-kernels
+        retention-days: 14
+    - name: default-warm-db
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 35
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-db';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'db']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=2040)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence default-warm-db
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-linux-default-warm-db
+        path: ${{ env.WORK_ROOT }}/out/default-warm-db
+        retention-days: 14
+    - name: fast-cold
       shell: python3 -X utf8 {0}
       timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-patch'
+        root=Path(os.environ['WORK_ROOT']);case='fast-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-encoder'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'encoder'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-patch
+    - name: Evidence fast-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-encoder-patch
-        path: ${{ env.WORK_ROOT }}/out/encoder-patch*
+        name: vae-linux-fast-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-cold
         retention-days: 14
-    - name: attention-base4
+    - name: trust-verify-cold
       shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-base4'
+        root=Path(os.environ['WORK_ROOT']);case='trust-verify-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'TRUST_VERIFY']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-base4
+    - name: Evidence trust-verify-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-attention-base4
-        path: ${{ env.WORK_ROOT }}/out/attention-base4*
+        name: vae-linux-trust-verify-cold
+        path: ${{ env.WORK_ROOT }}/out/trust-verify-cold
         retention-days: 14
-    - name: attention-patch4
+    - name: default-tiled-cold
       shell: python3 -X utf8 {0}
-      timeout-minutes: 25
+      timeout-minutes: 30
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch4'
+        root=Path(os.environ['WORK_ROOT']);case='default-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
+         try:rc=p.wait(timeout=1740)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-patch4
+    - name: Evidence default-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-attention-patch4
-        path: ${{ env.WORK_ROOT }}/out/attention-patch4*
+        name: vae-linux-default-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/default-tiled-cold
         retention-days: 14
-    - name: attention-base40
+    - name: fast-tiled-cold
       shell: python3 -X utf8 {0}
-      timeout-minutes: 65
+      timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-base40'
+        root=Path(os.environ['WORK_ROOT']);case='fast-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--width', '1536', '--height', '1536', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST', '--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=3840)
+         try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-base40
+    - name: Evidence fast-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-attention-base40
-        path: ${{ env.WORK_ROOT }}/out/attention-base40*
+        name: vae-linux-fast-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-tiled-cold
         retention-days: 14
-    - name: attention-patch40
+    - name: native-conv-cold
       shell: python3 -X utf8 {0}
-      timeout-minutes: 40
+      timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch40'
+        root=Path(os.environ['WORK_ROOT']);case='native-conv-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--width', '1536', '--height', '1536', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-cudnn']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2340)
+         try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-patch40
+    - name: Evidence native-conv-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-attention-patch40
-        path: ${{ env.WORK_ROOT }}/out/attention-patch40*
+        name: vae-linux-native-conv-cold
+        path: ${{ env.WORK_ROOT }}/out/native-conv-cold
         retention-days: 14
-    - name: attention-patch1024
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 15
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch1024'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=840)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence attention-patch1024
+    - name: Environment evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-attention-patch1024
-        path: ${{ env.WORK_ROOT }}/out/attention-patch1024*
-        retention-days: 14
-    - name: reference-base
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-base'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2', '--reference']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence reference-base
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-reference-base
-        path: ${{ env.WORK_ROOT }}/out/reference-base*
-        retention-days: 14
-    - name: reference-patch
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-patch'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2', '--reference']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence reference-patch
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-reference-patch
-        path: ${{ env.WORK_ROOT }}/out/reference-patch*
-        retention-days: 14
-    - name: Verify all cases
-      if: always()
-      shell: python3 -X utf8 {0}
-      run: |
-        import os,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])/'out'
-        rows=[json.loads(p.read_text()) for p in root.glob('*-exit.json')]
-        print(rows)
-        assert len(rows)==10 and all(d['returncode']==0 for d in rows)
-    - name: All evidence
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-all
-        path: ${{ env.WORK_ROOT }}/out
+        name: vae-linux-environment
+        path: ${{ env.WORK_ROOT }}/out/*.txt
         retention-days: 14
   windows:
     runs-on:
@@ -410,7 +368,7 @@ jobs:
     - Windows
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 360
+    timeout-minutes: 300
     env:
       UNSLOTH_IS_PRESENT: '1'
       PYTHONUNBUFFERED: '1'
@@ -469,337 +427,295 @@ jobs:
         run([py,'-c',"import main; import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
 
         run([py,"-m","pip","install","pytest"])
-    - name: Prepare separate baseline and patched checkouts
+    - name: Prepare probe
       shell: python -X utf8 {0}
       run: |
-        import os,subprocess
+        import os
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        p=root/'encoder.patch'
-        p.write_bytes(b'diff --git a/studio/backend/core/inference/diffusion_te_prequant.py b/studio/backend/core/inference/diffusion_te_prequant.py\nindex e9943bc719..51e76f9a54 100644\n--- a/studio/backend/core/inference/diffusion_te_prequant.py\n+++ b/studio/backend/core/inference/diffusion_te_prequant.py\n@@ -212,15 +212,14 @@ def te_candidate_is_readable(name: Optional[str]) -> bool:\n     NOT the transformer\'s ``restricted_prequant_load_supported``: this state dict is plain\n     tensors, read under a bare ``weights_only`` load with no constructor allowlist, so a ``.pt``\n     is always readable and asking the DiT\'s question would refuse one on every install whose\n-    torchao lacks some DiT scheme\'s constructors. Only the safetensors container has a\n-    requirement, and a plan that drops the dense encoder for an artifact this install cannot open\n-    leaves the load with neither.\n+    torchao lacks some DiT scheme\'s constructors. The safetensors container needs only\n+    safetensors, not torchao. Check that dependency before planning without dense shards.\n     """\n     if not name:\n         return False\n-    from .prequant_safetensors import is_safetensors_checkpoint, safetensors_prequant_supported\n+    from .prequant_safetensors import is_safetensors_checkpoint, plain_safetensors_supported\n \n-    return safetensors_prequant_supported() if is_safetensors_checkpoint(name) else True\n+    return plain_safetensors_supported() if is_safetensors_checkpoint(name) else True\n \n \n def family_te_prequant_repo(fam: Any, scheme: str, component: str) -> Optional[str]:\n@@ -419,15 +418,15 @@ def load_prequant_text_encoder(\n \n         import torch\n \n-        from .prequant_safetensors import is_safetensors_checkpoint, load_prequant_safetensors\n+        from .prequant_safetensors import is_safetensors_checkpoint, load_plain_prequant_safetensors\n \n         # The layerwise-fp8 state dict is plain tensors, so weights_only=True suffices and no pickle code runs even for\n         # a local path. A future torchao-subclass scheme needs a format bump AND the DiT module\'s allowlist.\n-        # A ``.safetensors`` artifact is read through the shared reader instead, which returns the same dict shape, so\n+        # A ``.safetensors`` artifact is read through the plain-tensor reader instead, which returns the same dict shape, so\n         # ``_validate_checkpoint`` and everything after it are unchanged. Dispatch is on the extension the resolver\n         # asked the Hub for, never on sniffing the bytes.\n         if is_safetensors_checkpoint(path):\n-            ckpt = load_prequant_safetensors(path)\n+            ckpt = load_plain_prequant_safetensors(path)\n         else:\n             ckpt = torch.load(path, weights_only = True, map_location = "cpu")\n         if not _validate_checkpoint(ckpt, scheme, component, base, logger):\ndiff --git a/studio/backend/core/inference/prequant_safetensors.py b/studio/backend/core/inference/prequant_safetensors.py\nindex 2307fca8d0..74d99184bb 100644\n--- a/studio/backend/core/inference/prequant_safetensors.py\n+++ b/studio/backend/core/inference/prequant_safetensors.py\n@@ -135,6 +135,58 @@ def safetensors_prequant_supported() -> bool:\n     return True\n \n \n+def plain_safetensors_supported() -> bool:\n+    """The layerwise-cast encoder format stores plain tensors, without torchao subclasses."""\n+    try:\n+        from safetensors import safe_open  # noqa: F401\n+    except ImportError:\n+        return False\n+    return True\n+\n+\n+def load_plain_prequant_safetensors(path: str, *, device: str = "cpu") -> dict:\n+    """Read a plain-tensor prequant checkpoint without importing torchao.\n+\n+    Refuse subclass metadata and unaccounted tensors before reading weights. The\n+    caller still validates the component, scheme, base model and state-dict keys.\n+    """\n+    from safetensors import safe_open\n+\n+    with safe_open(path, framework = "pt", device = device) as handle:\n+        raw = handle.metadata() or {}\n+        fmt = raw.get(UNSLOTH_FORMAT_KEY)\n+        if not fmt:\n+            raise ValueError(f"{path} is not an Unsloth pre-quant checkpoint")\n+        metadata = json.loads(raw.get(UNSLOTH_METADATA_KEY) or "{}")\n+        names = json.loads(raw.get("tensor_names") or "null")\n+        if not isinstance(metadata, dict):\n+            raise ValueError(f"{path} has invalid pre-quant metadata")\n+        if (\n+            not isinstance(names, list)\n+            or not all(isinstance(name, str) and name for name in names)\n+            or len(names) != len(set(names))\n+        ):\n+            raise ValueError(f"{path} has invalid tensor_names")\n+        keys = set(handle.keys())\n+        roots = {key for key in keys if key.startswith(UNSLOTH_ROOT_PREFIX)}\n+        root_names = {key[len(UNSLOTH_ROOT_PREFIX) :] for key in roots}\n+        if (\n+            any(not name or "." in name for name in root_names)\n+            or root_names.intersection(names)\n+            or set(names).intersection(roots)\n+            or set(names) != keys - roots\n+        ):\n+            raise ValueError(f"{path} has tensors its header does not account for")\n+        for name in names:\n+            if json.loads(raw.get(name) or "null") != {"_type": "Tensor"}:\n+                raise ValueError(f"{path} requires a tensor-subclass reader for {name!r}")\n+        state_dict = {name: handle.get_tensor(name) for name in names}\n+        state_dict.update(\n+            (key[len(UNSLOTH_ROOT_PREFIX) :], handle.get_tensor(key)) for key in roots\n+        )\n+    return {"format": str(fmt), "state_dict": state_dict, "metadata": metadata}\n+\n+\n def _first(value: Any) -> Any:\n     """Both torchao helpers return a 2-tuple whose first element is the dict we want.\n \ndiff --git a/studio/backend/tests/test_prequant_safetensors.py b/studio/backend/tests/test_prequant_safetensors.py\nindex 74c507d35c..ca07a89e6b 100644\n--- a/studio/backend/tests/test_prequant_safetensors.py\n+++ b/studio/backend/tests/test_prequant_safetensors.py\n@@ -594,3 +594,90 @@ def test_torchao_older_than_the_floor_is_not_safetensors_support(monkeypatch):\n     monkeypatch.setattr(ps, "_torchao_version", lambda: "0.14.0")\n     assert ps._torchao_helpers() is None\n     assert ps.safetensors_prequant_supported() is False\n+\n+\n+@pytest.fixture\n+def plain_checkpoint(tmp_path, monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    save_file = pytest.importorskip("safetensors.torch").save_file\n+    monkeypatch.setattr(ps, "_torchao_helpers", lambda: None)\n+\n+    def write(*, tensors = None, header = None):\n+        tensors = {"encoder.weight": torch.ones(2, 3)} if tensors is None else tensors\n+        metadata = {\n+            ps.UNSLOTH_FORMAT_KEY: "unsloth_prequant_text_encoder_state_dict_v1",\n+            ps.UNSLOTH_METADATA_KEY: json.dumps({"scheme": "fp8", "component": "text_encoder"}),\n+            "tensor_names": json.dumps(["encoder.weight"]),\n+            "encoder.weight": json.dumps({"_type": "Tensor"}),\n+        }\n+        metadata.update(header or {})\n+        path = str(tmp_path / "encoder.safetensors")\n+        save_file(tensors, path, metadata = metadata)\n+        return path\n+\n+    return write\n+\n+\n+def test_plain_encoder_needs_no_torchao(plain_checkpoint):\n+    import core.inference.diffusion_te_prequant as te\n+    import torch\n+\n+    path = plain_checkpoint(tensors = {"encoder.weight": torch.ones(2, 3).to(torch.float8_e4m3fn)})\n+    assert te.te_candidate_is_readable(path)\n+    assert not ps.safetensors_prequant_supported()\n+    loaded = ps.load_plain_prequant_safetensors(path)\n+    assert loaded["state_dict"]["encoder.weight"].dtype == torch.float8_e4m3fn\n+    assert torch.equal(loaded["state_dict"]["encoder.weight"].float(), torch.ones(2, 3))\n+    assert loaded["metadata"]["scheme"] == "fp8"\n+\n+\n+@pytest.mark.parametrize(\n+    "header",\n+    [\n+        {"tensor_names": \'["encoder.weight", "encoder.weight"]\'},\n+        {"tensor_names": \'["missing.weight"]\'},\n+        {"tensor_names": \'"encoder.weight"\'},\n+        {"tensor_names": "[1]"},\n+        {"tensor_names": "invalid"},\n+        {"encoder.weight": \'{"_type":"Float8Tensor"}\'},\n+        {"encoder.weight": \'{"_type":"Tensor","unexpected":true}\'},\n+        {ps.UNSLOTH_METADATA_KEY: "[]"},\n+        {ps.UNSLOTH_FORMAT_KEY: ""},\n+    ],\n+)\n+def test_plain_reader_rejects_invalid_headers(plain_checkpoint, header):\n+    with pytest.raises(ValueError):\n+        ps.load_plain_prequant_safetensors(plain_checkpoint(header = header))\n+\n+\n+def test_plain_reader_rejects_unaccounted_tensor(plain_checkpoint):\n+    import torch\n+    path = plain_checkpoint(\n+        tensors = {"encoder.weight": torch.ones(2), "extra.weight": torch.ones(2)}\n+    )\n+    with pytest.raises(ValueError, match = "does not account"):\n+        ps.load_plain_prequant_safetensors(path)\n+\n+\n+def test_plain_reader_restores_root_buffers(plain_checkpoint):\n+    import torch\n+\n+    path = plain_checkpoint(\n+        tensors = {\n+            "encoder.weight": torch.ones(2),\n+            ps.UNSLOTH_ROOT_PREFIX + "buffer": torch.zeros(1),\n+        }\n+    )\n+    state = ps.load_plain_prequant_safetensors(path)["state_dict"]\n+    assert set(state) == {"encoder.weight", "buffer"}\n+    assert torch.equal(state["buffer"], torch.zeros(1))\n+\n+\n+def test_plain_reader_rejects_root_collision(plain_checkpoint):\n+    import torch\n+    path = plain_checkpoint(\n+        tensors = {"buffer": torch.ones(2), ps.UNSLOTH_ROOT_PREFIX + "buffer": torch.zeros(1)},\n+        header = {"tensor_names": \'["buffer"]\', "buffer": \'{"_type":"Tensor"}\'},\n+    )\n+    with pytest.raises(ValueError, match = "does not account"):\n+        ps.load_plain_prequant_safetensors(path)\n')
-        subprocess.run(['git','-C',str(root/'code'),'worktree','add','--detach',str(root/'code-encoder'),'HEAD'],check=True)
-        subprocess.run(['git','-C',str(root/'code-encoder'),'apply','--check',str(p)],check=True)
-        subprocess.run(['git','-C',str(root/'code-encoder'),'apply',str(p)],check=True)
-        p=root/'attention.patch'
-        p.write_bytes(b'diff --git a/studio/backend/core/inference/diffusion_qwenimage21_rocm.py b/studio/backend/core/inference/diffusion_qwenimage21_rocm.py\nnew file mode 100644\nindex 0000000000..dc187210b3\n--- /dev/null\n+++ b/studio/backend/core/inference/diffusion_qwenimage21_rocm.py\n@@ -0,0 +1,158 @@\n+# SPDX-License-Identifier: AGPL-3.0-only\n+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0\n+\n+"""Bound large Qwen-Image-2.1 query batches on measured ROCm GPUs.\n+\n+On gfx1151, native flash attention slows sharply above 8192 image tokens. Query\n+rows are independent for unmasked, noncausal attention, so each chunk can retain\n+all keys and values. Prefill, masks and explicit alternative backends stay stock.\n+"""\n+\n+from __future__ import annotations\n+\n+import functools\n+import os\n+from typing import Any\n+\n+QUERY_CHUNK_ENV = "UNSLOTH_QWEN_IMAGE_ROCM_QUERY_CHUNKING"\n+QUERY_CHUNK_SIZE = 512\n+MIN_QUERY_TOKENS = 8192\n+\n+\n+def _device_supported(target: Any) -> bool:\n+    if getattr(target, "backend", None) != "rocm" or getattr(target, "device", None) != "cuda":\n+        return False\n+    setting = (os.environ.get(QUERY_CHUNK_ENV) or "auto").strip().lower()\n+    if setting in ("0", "false", "off", "no"):\n+        return False\n+    import torch\n+\n+    if not getattr(torch.version, "hip", None):\n+        return False\n+    if setting in ("1", "true", "on", "yes"):\n+        return True\n+    ordinal = getattr(target, "ordinal", None)\n+    props = torch.cuda.get_device_properties(\n+        torch.cuda.current_device() if ordinal is None else ordinal\n+    )\n+    return str(getattr(props, "gcnArchName", "")).split(":", 1)[0] == "gfx1151"\n+\n+\n+def _native_backend(processor: Any) -> bool:\n+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry\n+\n+    backend = processor._attention_backend\n+    if backend is None:\n+        backend, _ = _AttentionBackendRegistry.get_active_backend()\n+    return backend == "native"\n+\n+\n+def _can_chunk(processor, attn, hidden_states, attention_mask, segments, key_valid) -> bool:\n+    import torch\n+    return not (\n+        segments is not None\n+        or attention_mask is not None\n+        or key_valid is not None\n+        or processor._parallel_config is not None\n+        or hidden_states.device.type != "cuda"\n+        or hidden_states.dtype != torch.bfloat16\n+        or hidden_states.shape[1] < MIN_QUERY_TOKENS\n+        or attn.heads != 32\n+        or attn.inner_dim != 4096\n+        or torch.is_grad_enabled()\n+        or torch.compiler.is_compiling()\n+        or not _native_backend(processor)\n+    )\n+\n+\n+def _chunk_attention(query: Any, key: Any, value: Any, dispatch: Any, **kwargs: Any) -> Any:\n+    import torch\n+    return torch.cat(\n+        [\n+            dispatch(query[:, start : start + QUERY_CHUNK_SIZE], key, value, **kwargs)\n+            for start in range(0, query.shape[1], QUERY_CHUNK_SIZE)\n+        ],\n+        dim = 1,\n+    )\n+\n+\n+@functools.lru_cache(maxsize = 1)\n+def _processor_class() -> type:\n+    import torch\n+    from diffusers.models.transformers.transformer_qwenimage21 import (\n+        QwenImage21AttnProcessor,\n+        _qwenimage21_prepare_qkv,\n+        dispatch_attention_fn,\n+    )\n+\n+    class ChunkedQwenImage21AttnProcessor(QwenImage21AttnProcessor):\n+        def __call__(\n+            self,\n+            attn,\n+            hidden_states,\n+            attention_mask = None,\n+            rotary_emb = None,\n+            layer_cache = None,\n+            kv_cache_mode = None,\n+            cache_write_slice = None,\n+            segments = None,\n+            key_valid = None,\n+        ):\n+            if not _can_chunk(self, attn, hidden_states, attention_mask, segments, key_valid):\n+                return super().__call__(\n+                    attn,\n+                    hidden_states,\n+                    attention_mask,\n+                    rotary_emb,\n+                    layer_cache,\n+                    kv_cache_mode,\n+                    cache_write_slice,\n+                    segments,\n+                    key_valid,\n+                )\n+            query, key, value, seq_len_q = _qwenimage21_prepare_qkv(\n+                attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice\n+            )\n+            output = _chunk_attention(\n+                query,\n+                key,\n+                value,\n+                dispatch_attention_fn,\n+                attn_mask = None,\n+                dropout_p = 0.0,\n+                backend = self._attention_backend,\n+                parallel_config = self._parallel_config,\n+            )\n+            output = output[:, :seq_len_q].flatten(2, 3).type_as(query)\n+            return attn.to_out[1](attn.to_out[0](output))\n+\n+    return ChunkedQwenImage21AttnProcessor\n+\n+\n+def install(\n+    pipe: Any,\n+    target: Any,\n+    logger: Any = None,\n+) -> bool:\n+    """Replace only this pipeline\'s stock Qwen-Image-2.1 processors, before placement."""\n+    if not _device_supported(target):\n+        return False\n+    transformer = getattr(pipe, "transformer", None)\n+    if type(transformer).__name__ != "QwenImage21Transformer2DModel":\n+        return False\n+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21AttnProcessor\n+\n+    cls = _processor_class()\n+    installed = False\n+    for module in transformer.modules():\n+        processor = getattr(module, "processor", None)\n+        if type(processor) is cls:\n+            installed = True\n+        elif type(processor) is QwenImage21AttnProcessor:\n+            replacement = cls()\n+            replacement.__dict__.update(processor.__dict__)\n+            module.set_processor(replacement)\n+            installed = True\n+    if installed and logger is not None:\n+        logger.info("diffusion.qwenimage21: large ROCm decode queries use 512-row chunks")\n+    return installed\ndiff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py\nindex 0f8bc24695..0836c85ea1 100644\n--- a/studio/backend/core/inference/diffusion_speed.py\n+++ b/studio/backend/core/inference/diffusion_speed.py\n@@ -445,6 +445,7 @@ def apply_speed_optims(\n         "fused_qkv": False,\n         "compiled": False,\n         "compiled_dequant": False,\n+        "rocm_query_chunks": False,\n         "compiled_vae_decode": False,\n         "cuda_graph": False,\n     }\n@@ -454,6 +455,13 @@ def apply_speed_optims(\n     if mode == SPEED_OFF:\n         return applied\n \n+    if getattr(target, "backend", None) == "rocm":\n+        try:\n+            from .diffusion_qwenimage21_rocm import install as install_rocm_query_chunks\n+            applied["rocm_query_chunks"] = install_rocm_query_chunks(pipe, target, logger)\n+        except Exception as exc:  # noqa: BLE001 - keep stock attention on unsupported installs\n+            _warn(logger, "qwen-image-2.1 ROCm query chunks", exc)\n+\n     on_cuda = getattr(target, "device", None) == "cuda"\n     family_allows_compile = bool(getattr(family, "supports_torch_compile", True))\n \ndiff --git a/studio/backend/tests/test_diffusion_qwenimage21_rocm.py b/studio/backend/tests/test_diffusion_qwenimage21_rocm.py\nnew file mode 100644\nindex 0000000000..9160e069d8\n--- /dev/null\n+++ b/studio/backend/tests/test_diffusion_qwenimage21_rocm.py\n@@ -0,0 +1,139 @@\n+# SPDX-License-Identifier: AGPL-3.0-only\n+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0\n+\n+from types import SimpleNamespace\n+\n+import pytest\n+\n+from core.inference import diffusion_qwenimage21_rocm as chunks\n+\n+\n+@pytest.mark.parametrize(\n+    "architecture,setting,expected",\n+    [\n+        ("gfx1151", "auto", True),\n+        ("gfx1151:sramecc-", "auto", True),\n+        ("gfx1100", "auto", False),\n+        ("gfx942", "auto", False),\n+        ("gfx1100", "1", True),\n+        ("gfx1151", "0", False),\n+    ],\n+)\n+def test_device_scope(monkeypatch, architecture, setting, expected):\n+    torch = pytest.importorskip("torch")\n+    monkeypatch.setenv(chunks.QUERY_CHUNK_ENV, setting)\n+    monkeypatch.setattr(torch.version, "hip", "7.13")\n+    monkeypatch.setattr(\n+        torch.cuda, "get_device_properties", lambda i: SimpleNamespace(gcnArchName = architecture)\n+    )\n+    target = SimpleNamespace(backend = "rocm", device = "cuda", ordinal = 1)\n+    assert chunks._device_supported(target) is expected\n+    assert not chunks._device_supported(SimpleNamespace(backend = "cuda", device = "cuda"))\n+    assert not chunks._device_supported(SimpleNamespace(backend = "cpu", device = "cpu"))\n+\n+\n+@pytest.mark.parametrize(\n+    "reason",\n+    [\n+        "eligible",\n+        "cpu",\n+        "fp32",\n+        "small",\n+        "heads",\n+        "mask",\n+        "segments",\n+        "key_valid",\n+        "parallel",\n+        "grad",\n+        "compile",\n+        "backend",\n+    ],\n+)\n+def test_runtime_scope(monkeypatch, reason):\n+    torch = pytest.importorskip("torch")\n+    hidden = SimpleNamespace(\n+        device = SimpleNamespace(type = "cuda"), dtype = torch.bfloat16, shape = (1, 8192, 4096)\n+    )\n+    processor = SimpleNamespace(_parallel_config = None)\n+    attn = SimpleNamespace(heads = 32, inner_dim = 4096)\n+    mask = segments = key_valid = None\n+    if reason == "cpu":\n+        hidden.device.type = "cpu"\n+    if reason == "fp32":\n+        hidden.dtype = torch.float32\n+    if reason == "small":\n+        hidden.shape = (1, 4096, 4096)\n+    if reason == "heads":\n+        attn.heads = 16\n+    if reason == "mask":\n+        mask = object()\n+    if reason == "segments":\n+        segments = []\n+    if reason == "key_valid":\n+        key_valid = object()\n+    if reason == "parallel":\n+        processor._parallel_config = object()\n+    monkeypatch.setattr(torch, "is_grad_enabled", lambda: reason == "grad")\n+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: reason == "compile")\n+    monkeypatch.setattr(chunks, "_native_backend", lambda p: reason != "backend")\n+    assert chunks._can_chunk(processor, attn, hidden, mask, segments, key_valid) is (\n+        reason == "eligible"\n+    )\n+\n+\n+def test_chunks_keep_all_keys_and_values():\n+    torch = pytest.importorskip("torch")\n+    torch.manual_seed(12)\n+    q = torch.randn(2, 1100, 2, 8)\n+    k = torch.randn(2, 1200, 2, 8)\n+    v = torch.randn_like(k)\n+    calls = []\n+\n+    def dispatch(qpart, key, value, **kwargs):\n+        calls.append((qpart.shape[1], key, value, kwargs))\n+        return torch.nn.functional.scaled_dot_product_attention(\n+            qpart.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), **kwargs\n+        ).transpose(1, 2)\n+\n+    expected = dispatch(q, k, v, scale = 0.2)\n+    calls.clear()\n+    actual = chunks._chunk_attention(q, k, v, dispatch, scale = 0.2)\n+    torch.testing.assert_close(actual, expected)\n+    assert [c[0] for c in calls] == [512, 512, 76]\n+    assert all(c[1] is k and c[2] is v and c[3] == {"scale": 0.2} for c in calls)\n+\n+\n+def test_processor_output_and_stock_fallback(monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    module = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")\n+    torch.manual_seed(8)\n+    attn = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    stock = module.QwenImage21AttnProcessor()\n+    patched = chunks._processor_class()()\n+    hidden = torch.randn(1, 1100, 16)\n+    with torch.inference_mode():\n+        expected = stock(attn, hidden)\n+        monkeypatch.setattr(chunks, "_can_chunk", lambda *a: True)\n+        torch.testing.assert_close(patched(attn, hidden), expected)\n+        monkeypatch.setattr(chunks, "_can_chunk", lambda *a: False)\n+        mask = torch.ones(1, 1, 1100, 1100, dtype = torch.bool).tril()\n+        torch.testing.assert_close(\n+            patched(attn, hidden, attention_mask = mask), stock(attn, hidden, attention_mask = mask)\n+        )\n+\n+\n+def test_install_is_local_and_idempotent(monkeypatch):\n+    torch = pytest.importorskip("torch")\n+    module = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")\n+    monkeypatch.setattr(chunks, "_device_supported", lambda target: True)\n+    attn = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    untouched = module.QwenImage21Attention(dim = 16, heads = 2, dim_head = 8)\n+    transformer = type("QwenImage21Transformer2DModel", (), {"modules": lambda self: [attn]})()\n+    pipe = SimpleNamespace(transformer = transformer)\n+    stock = attn.processor\n+    assert chunks.install(pipe, None)\n+    installed = attn.processor\n+    assert chunks.install(pipe, None)\n+    assert attn.processor is installed\n+    assert type(untouched.processor) is type(stock)\n+    assert type(installed) is chunks._processor_class()\ndiff --git a/studio/backend/tests/test_diffusion_speed.py b/studio/backend/tests/test_diffusion_speed.py\nindex 9c94c416ed..99346c5e94 100644\n--- a/studio/backend/tests/test_diffusion_speed.py\n+++ b/studio/backend/tests/test_diffusion_speed.py\n@@ -434,6 +434,7 @@ def test_speed_off_applies_nothing(monkeypatch):\n         "fused_qkv": False,\n         "compiled": False,\n         "compiled_dequant": False,\n+        "rocm_query_chunks": False,\n         "compiled_vae_decode": False,\n         "fp16_accum": False,\n         "cuda_graph": False,\n')
-        subprocess.run(['git','-C',str(root/'code'),'worktree','add','--detach',str(root/'code-attention'),'HEAD'],check=True)
-        subprocess.run(['git','-C',str(root/'code-attention'),'apply','--check',str(p)],check=True)
-        subprocess.run(['git','-C',str(root/'code-attention'),'apply',str(p)],check=True)
-        (root/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\nemit_lock = threading.Lock()\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    with emit_lock:\n        print(\'PROBE \' + line, flush=True)\n        with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n            f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\ntry:\n    from core.inference import diffusion_qwenimage21_rocm as qchunks\nexcept ImportError:\n    qchunks=None\nchunk_calls=[0]\nif qchunks is not None:\n    real_chunks=qchunks._chunk_attention\n    def counted_chunks(*a,**kw):\n        chunk_calls[0]+=1\n        return real_chunks(*a,**kw)\n    qchunks._chunk_attention=counted_chunks\nemit(\'source\', backend_file=studio_main.__file__, patch_present=qchunks is not None)\n\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nemit(\'blas_backend\', value=str(torch.backends.cuda.preferred_blas_library()), cudnn_benchmark=torch.backends.cudnn.benchmark)\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'encoder-base-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages(group_by_input_shape=True).table(sort_by=\'self_device_time_total\', row_limit=80))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'query_chunk_calls\',count=chunk_calls[0])\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n',encoding='utf-8')
-    - name: warmup
+        (Path(os.environ['WORK_ROOT'])/'vae_probe.py').write_text("import argparse,os,json,time,traceback,sys,threading,shutil\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--case',required=True);p.add_argument('--mode',default='default');p.add_argument('--cache',default='cold');p.add_argument('--tiling',action='store_true');p.add_argument('--no-cudnn',action='store_true');p.add_argument('--size',type=int,default=1024);p.add_argument('--ballast',type=float,default=4.7);p.add_argument('--cap',type=float,default=19);p.add_argument('--repeats',type=int,default=2)\na=p.parse_args();root=Path(os.environ['WORK_ROOT']);out=root/'out';case=out/a.case;case.mkdir(exist_ok=True)\ncache=root/'cache'/('vae-'+a.case);cache.mkdir(exist_ok=True)\nfor kind in ('db','kernels'):\n target=cache/kind\n source=root/'cache/vae-default-cold'/kind\n if a.cache in ('both',kind) and source.exists():shutil.copytree(source,target,dirs_exist_ok=True)\n target.mkdir(exist_ok=True)\nos.environ['MIOPEN_USER_DB_PATH']=str(cache/'db');os.environ['MIOPEN_CUSTOM_CACHE_DIR']=str(cache/'kernels')\nfor k in ('MIOPEN_FIND_MODE','MIOPEN_FIND_ENFORCE'):os.environ.pop(k,None)\nif a.mode!='default':os.environ['MIOPEN_FIND_MODE']=a.mode\nos.environ.update(MIOPEN_ENABLE_LOGGING='1',MIOPEN_LOG_LEVEL='6',MIOPEN_ENABLE_LOGGING_ELAPSED_TIME='1')\nlock=threading.Lock()\ndef emit(event,**fields):\n d=dict(event=event,time=time.time(),case=a.case,**fields);s=json.dumps(d,default=str)\n with lock:\n  print('PROBE '+s,flush=True)\n  with (case/'events.jsonl').open('a') as f:f.write(s+'\\n')\ndef cache_state(label):\n records=[dict(path=str(x.relative_to(cache)),size=x.stat().st_size) for x in cache.rglob('*') if x.is_file()]\n emit('cache',label=label,files=records)\ncache_state('before')\nimport main\nimport torch,psutil\nfrom diffusers import AutoencoderKLQwenImage21\nemit('hardware',torch=torch.__version__,hip=torch.version.hip,props=str(torch.cuda.get_device_properties(0)),host=psutil.virtual_memory()._asdict(),env={k:v for k,v in os.environ.items() if k.startswith('MIOPEN_')},args=vars(a))\ntorch.backends.cudnn.benchmark=False\nif a.no_cudnn:torch.backends.cudnn.enabled=False\nprops=torch.cuda.get_device_properties(0);torch.cuda.set_per_process_memory_fraction(a.cap*2**30/props.total_memory)\nprocess=psutil.Process();stop=threading.Event()\ndef memory():return dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved(),peak=torch.cuda.max_memory_allocated(),rss=process.memory_info().rss,host_free=psutil.virtual_memory().available)\ndef sample():\n while not stop.wait(10):emit('sample',memory=memory(),cpu=process.cpu_percent())\nthreading.Thread(target=sample,daemon=True).start()\ntry:\n start=time.perf_counter();vae=AutoencoderKLQwenImage21.from_pretrained('Qwen/Qwen-Image-2.1',subfolder='vae',torch_dtype=torch.bfloat16).to('cuda').eval()\n if a.tiling:vae.enable_tiling()\n ballast=torch.empty(int(a.ballast*2**30),device='cuda',dtype=torch.uint8);ballast.fill_(0)\n emit('loaded',seconds=time.perf_counter()-start,config=dict(vae.config),memory=memory(),cudnn_enabled=torch.backends.cudnn.enabled,cudnn_benchmark=torch.backends.cudnn.benchmark)\n z=torch.randn((1,vae.config.z_dim,1,a.size//vae.spatial_compression_ratio,a.size//vae.spatial_compression_ratio),generator=torch.Generator().manual_seed(42)).to(device='cuda',dtype=vae.dtype)\n mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);std=torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype).view(1,-1,1,1,1);z=z*std+mean\n # Capture slow convolution shapes and distinguish CPU dispatch time from GPU completion.\n original=torch.nn.functional.conv2d;conv_index=0\n def conv(*args,**kw):\n  global conv_index\n  index=conv_index;conv_index+=1;torch.cuda.synchronize();t=time.perf_counter()\n  try:r=original(*args,**kw)\n  except Exception as e:\n   emit('conv_error',index=index,shape=list(args[0].shape),weight=list(args[1].shape),error=str(e),memory=memory());raise\n  dispatched=time.perf_counter()-t;torch.cuda.synchronize();elapsed=time.perf_counter()-t\n  emit('conv',index=index,shape=list(args[0].shape),weight=list(args[1].shape),stride=kw.get('stride',args[3] if len(args)>3 else 1),dispatch_seconds=dispatched,seconds=elapsed,memory=memory())\n  return r\n torch.nn.functional.conv2d=conv\n with torch.inference_mode():\n  for i in range(a.repeats):\n   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();t=time.perf_counter();decoded=vae.decode(z,return_dict=False)[0];torch.cuda.synchronize();elapsed=time.perf_counter()-t\n   emit('decode',index=i,seconds=elapsed,shape=list(decoded.shape),finite=bool(torch.isfinite(decoded).all()),memory=memory())\n   torch.save(decoded.cpu(),case/f'decoded-{i}.pt');del decoded\n   cache_state('after-'+str(i))\n torch.nn.functional.conv2d=original\n emit('complete',success=True)\nexcept Exception as e:\n emit('failure',error=str(e),traceback=traceback.format_exc(),memory=memory());raise\nfinally:\n stop.set();cache_state('final')\n shutil.make_archive(str(case/'miopen-cache'),'zip',cache)\n",encoding='utf-8')
+    - name: default-cold
       shell: python -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='warmup'
+        root=Path(os.environ['WORK_ROOT']);case='default-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*[]]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=2040)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence warmup
+    - name: Evidence default-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-warmup
-        path: ${{ env.WORK_ROOT }}/out/warmup*
+        name: vae-windows-default-cold
+        path: ${{ env.WORK_ROOT }}/out/default-cold
         retention-days: 14
-    - name: encoder-base
+    - name: default-warm-disk
       shell: python -X utf8 {0}
       timeout-minutes: 15
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-base'
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-disk';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'both']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=840)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-base
+    - name: Evidence default-warm-disk
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-encoder-base
-        path: ${{ env.WORK_ROOT }}/out/encoder-base*
+        name: vae-windows-default-warm-disk
+        path: ${{ env.WORK_ROOT }}/out/default-warm-disk
         retention-days: 14
-    - name: encoder-patch
+    - name: default-warm-kernels
+      shell: python -X utf8 {0}
+      timeout-minutes: 35
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-kernels';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'kernels']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=2040)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence default-warm-kernels
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-default-warm-kernels
+        path: ${{ env.WORK_ROOT }}/out/default-warm-kernels
+        retention-days: 14
+    - name: default-warm-db
+      shell: python -X utf8 {0}
+      timeout-minutes: 35
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT']);case='default-warm-db';out=root/'out'/case;out.mkdir(exist_ok=True)
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--cache', 'db']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try:rc=p.wait(timeout=2040)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else:p.kill()
+          p.wait();rc=124
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
+        sys.exit(rc)
+    - name: Evidence default-warm-db
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vae-windows-default-warm-db
+        path: ${{ env.WORK_ROOT }}/out/default-warm-db
+        retention-days: 14
+    - name: fast-cold
       shell: python -X utf8 {0}
       timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='encoder-patch'
+        root=Path(os.environ['WORK_ROOT']);case='fast-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-encoder'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'encoder'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence encoder-patch
+    - name: Evidence fast-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-encoder-patch
-        path: ${{ env.WORK_ROOT }}/out/encoder-patch*
+        name: vae-windows-fast-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-cold
         retention-days: 14
-    - name: attention-base4
+    - name: trust-verify-cold
       shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-base4'
+        root=Path(os.environ['WORK_ROOT']);case='trust-verify-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'TRUST_VERIFY']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try:rc=p.wait(timeout=1440)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-base4
+    - name: Evidence trust-verify-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-attention-base4
-        path: ${{ env.WORK_ROOT }}/out/attention-base4*
+        name: vae-windows-trust-verify-cold
+        path: ${{ env.WORK_ROOT }}/out/trust-verify-cold
         retention-days: 14
-    - name: attention-patch4
+    - name: default-tiled-cold
       shell: python -X utf8 {0}
-      timeout-minutes: 25
+      timeout-minutes: 30
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch4'
+        root=Path(os.environ['WORK_ROOT']);case='default-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
+         try:rc=p.wait(timeout=1740)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-patch4
+    - name: Evidence default-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-attention-patch4
-        path: ${{ env.WORK_ROOT }}/out/attention-patch4*
+        name: vae-windows-default-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/default-tiled-cold
         retention-days: 14
-    - name: attention-base40
+    - name: fast-tiled-cold
       shell: python -X utf8 {0}
-      timeout-minutes: 65
+      timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-base40'
+        root=Path(os.environ['WORK_ROOT']);case='fast-tiled-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--width', '1536', '--height', '1536', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--mode', 'FAST', '--tiling']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=3840)
+         try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-base40
+    - name: Evidence fast-tiled-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-attention-base40
-        path: ${{ env.WORK_ROOT }}/out/attention-base40*
+        name: vae-windows-fast-tiled-cold
+        path: ${{ env.WORK_ROOT }}/out/fast-tiled-cold
         retention-days: 14
-    - name: attention-patch40
+    - name: native-conv-cold
       shell: python -X utf8 {0}
-      timeout-minutes: 40
+      timeout-minutes: 20
       continue-on-error: true
       run: |
-        import os,sys,subprocess,json
+        import os,sys,subprocess,json,time
         from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch40'
+        root=Path(os.environ['WORK_ROOT']);case='native-conv-cold';out=root/'out'/case;out.mkdir(exist_ok=True)
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--width', '1536', '--height', '1536', '--repeats', '1']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+        cmd=[str(py),'-u',str(root/'vae_probe.py'),'--case',case,*['--no-cudnn']]
+        start=time.time()
+        with (out/'full.log').open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=2340)
+         try:rc=p.wait(timeout=1140)
          except subprocess.TimeoutExpired:
           if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
           else:p.kill()
           p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
+        (out/'exit.json').write_text(json.dumps({'returncode':rc,'elapsed':time.time()-start}))
+        with (out/'full.log').open(encoding='utf-8',errors='replace') as f:
+         from collections import deque
+         print(''.join(deque(f,maxlen=40)))
+        print('CASE_RESULT',case,rc,flush=True)
         sys.exit(rc)
-    - name: Evidence attention-patch40
+    - name: Evidence native-conv-cold
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-attention-patch40
-        path: ${{ env.WORK_ROOT }}/out/attention-patch40*
+        name: vae-windows-native-conv-cold
+        path: ${{ env.WORK_ROOT }}/out/native-conv-cold
         retention-days: 14
-    - name: attention-patch1024
-      shell: python -X utf8 {0}
-      timeout-minutes: 15
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='attention-patch1024'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1024', '--height', '1024', '--repeats', '3']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=840)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence attention-patch1024
+    - name: Environment evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-attention-patch1024
-        path: ${{ env.WORK_ROOT }}/out/attention-patch1024*
-        retention-days: 14
-    - name: reference-base
-      shell: python -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-base'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2', '--reference']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'base'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence reference-base
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-reference-base
-        path: ${{ env.WORK_ROOT }}/out/reference-base*
-        retention-days: 14
-    - name: reference-patch
-      shell: python -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT']);case='reference-patch'
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        code=root/'code-attention'
-        os.environ['PYTHONPATH']=str(code/'studio/backend')
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '4', '--width', '1536', '--height', '1536', '--repeats', '2', '--reference']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try:rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else:p.kill()
-          p.wait();rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case,'variant':'attention'}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-14000:])
-        sys.exit(rc)
-    - name: Evidence reference-patch
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-reference-patch
-        path: ${{ env.WORK_ROOT }}/out/reference-patch*
-        retention-days: 14
-    - name: Verify all cases
-      if: always()
-      shell: python -X utf8 {0}
-      run: |
-        import os,json
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])/'out'
-        rows=[json.loads(p.read_text()) for p in root.glob('*-exit.json')]
-        print(rows)
-        assert len(rows)==10 and all(d['returncode']==0 for d in rows)
-    - name: All evidence
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-all
-        path: ${{ env.WORK_ROOT }}/out
+        name: vae-windows-environment
+        path: ${{ env.WORK_ROOT }}/out/*.txt
         retention-days: 14
