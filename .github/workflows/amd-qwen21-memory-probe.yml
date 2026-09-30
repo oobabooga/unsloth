@@ -1,4 +1,4 @@
-name: Qwen image AMD Windows and Linux reproduction
+name: Qwen image AMD encoder and memory pressure follow-up
 'on':
   push:
     branches:
@@ -62,47 +62,19 @@ jobs:
         run([py,'-m','pip','install','-c',str(constraints),'-r',str(root/'code/studio/backend/requirements/studio.txt'),'-r',str(root/'code/studio/backend/requirements/diffusers-main.txt'),'transformers==5.5.0','accelerate>=1.0','peft>=0.18','sentencepiece','psutil','protobuf','scipy','einops','Pillow','pyyaml','ninja','safetensors'])
         run([py,'-m','pip','install','--no-deps','unsloth-zoo==2026.9.8'])
         run([py,'-m','pip','install','-c',str(constraints),'tyro','hf_transfer','msgspec','wheel'])
+        run([py,'-m','pip','install','--no-deps',str(root/'code')])
         # Match the Studio installer's torch 2.11 selection. Windows source package is pure Python.
         run([py,'-m','pip','install','--no-deps','torchao==0.17.0'])
         with (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)
-        run([py,'-c',"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
+        run([py,'-c',"import main; import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
     - name: Write measurement harness
       shell: python3 -X utf8 {0}
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
-    - name: free19-default
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 45
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-default'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '20']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=2640)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-default
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-free19-default
-        path: ${{ env.WORK_ROOT }}/out/free19-default*
-        retention-days: 7
-    - name: free19-math-attention
+        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'stock19-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'plain_te_experiment.py').write_text('"""Diagnostic-only reader for a validated plain-tensor TE artifact, not a general torchao replacement."""\ndef install(emit):\n    import json\n    from safetensors import safe_open\n    from core.inference import prequant_safetensors as ps\n    from core.inference import diffusion_te_prequant as te\n    original_readable = te.te_candidate_is_readable\n    original_load = ps.load_prequant_safetensors\n    target_name = \'Qwen-Image-2.1-text_encoder-FP8.safetensors\'\n    def readable(name):\n        return True if name == target_name else original_readable(name)\n    def load(path):\n        # Inspect the real container before bypassing torchao. Refuse all subclass metadata.\n        with safe_open(path, framework=\'pt\', device=\'cpu\') as f:\n            md = f.metadata() or {}\n            if md.get(\'unsloth_format\') != te.TE_PREQUANT_FORMAT:\n                return original_load(path)\n            names = json.loads(md.get(\'tensor_names\',\'[]\'))\n            keys = list(f.keys())\n            assert names and len(names)==len(set(names)) and set(names)==set(keys)\n            assert all(json.loads(md[n]) == {\'_type\':\'Tensor\'} for n in names)\n            meta = json.loads(md[\'unsloth_metadata\'])\n            assert meta[\'scheme\']==\'fp8\' and meta[\'component\']==\'text_encoder\'\n            state = {n:f.get_tensor(n) for n in names}\n        emit(\'plain_te_loaded\', count=len(state), bytes=sum(t.numel()*t.element_size() for t in state.values()))\n        return {\'format\':md[\'unsloth_format\'],\'metadata\':meta,\'state_dict\':state}\n    te.te_candidate_is_readable = readable\n    ps.load_prequant_safetensors = load\n    emit(\'experimental_plain_te_reader\', description=\'Only plain Tensor TE containers are accepted; normal metadata validation remains enabled\')\n', encoding='utf-8')
+    - name: stock19
       shell: python3 -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
@@ -111,9 +83,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-math-attention'
+        case='stock19'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--math-attention']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1740)
@@ -125,74 +97,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-math-attention
+    - name: Evidence stock19
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free19-math-attention
-        path: ${{ env.WORK_ROOT }}/out/free19-math-attention*
+        name: linux-stock19
+        path: ${{ env.WORK_ROOT }}/out/stock19*
         retention-days: 7
-    - name: free19-eager
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-eager'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--speed', 'eager']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-eager
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-free19-eager
-        path: ${{ env.WORK_ROOT }}/out/free19-eager*
-        retention-days: 7
-    - name: free19-off
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-off'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--speed', 'off']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-off
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-free19-off
-        path: ${{ env.WORK_ROOT }}/out/free19-off*
-        retention-days: 7
-    - name: free16-auto
+    - name: plain19
       shell: python3 -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
@@ -201,9 +113,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free16-auto'
+        case='plain19'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--trace']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1740)
@@ -215,14 +127,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free16-auto
+    - name: Evidence plain19
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free16-auto
-        path: ${{ env.WORK_ROOT }}/out/free16-auto*
+        name: linux-plain19
+        path: ${{ env.WORK_ROOT }}/out/plain19*
         retention-days: 7
-    - name: free12-auto
+    - name: stock16
       shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -231,9 +143,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free12-auto'
+        case='stock16'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '12']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -245,14 +157,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free12-auto
+    - name: Evidence stock16
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free12-auto
-        path: ${{ env.WORK_ROOT }}/out/free12-auto*
+        name: linux-stock16
+        path: ${{ env.WORK_ROOT }}/out/stock16*
         retention-days: 7
-    - name: free16-low
+    - name: plain16
       shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -261,9 +173,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free16-low'
+        case='plain16'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--memory-mode', 'low_vram']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--plain-te']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -275,14 +187,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free16-low
+    - name: Evidence plain16
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free16-low
-        path: ${{ env.WORK_ROOT }}/out/free16-low*
+        name: linux-plain16
+        path: ${{ env.WORK_ROOT }}/out/plain16*
         retention-days: 7
-    - name: free19-dense-te
+    - name: plain19-resident-tiled
       shell: python3 -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -291,9 +203,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-dense-te'
+        case='plain19-resident-tiled'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--te', 'off']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--force-resident', '--tiling']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -305,14 +217,104 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-dense-te
+    - name: Evidence plain19-resident-tiled
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free19-dense-te
-        path: ${{ env.WORK_ROOT }}/out/free19-dense-te*
+        name: linux-plain19-resident-tiled
+        path: ${{ env.WORK_ROOT }}/out/plain19-resident-tiled*
         retention-days: 7
-    - name: free19-large
+    - name: plain19-reference
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='plain19-reference'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--reference']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence plain19-reference
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-plain19-reference
+        path: ${{ env.WORK_ROOT }}/out/plain19-reference*
+        retention-days: 7
+    - name: stock19-host64
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='stock19-host64'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--host-available-gib', '64']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence stock19-host64
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-stock19-host64
+        path: ${{ env.WORK_ROOT }}/out/stock19-host64*
+        retention-days: 7
+    - name: plain19-host64
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='plain19-host64'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--host-available-gib', '64']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence plain19-host64
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-plain19-host64
+        path: ${{ env.WORK_ROOT }}/out/plain19-host64*
+        retention-days: 7
+    - name: stock19-repeat8
       shell: python3 -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
@@ -321,9 +323,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-large'
+        case='stock19-repeat8'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--width', '1536', '--height', '1536']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--repeats', '8']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=2040)
@@ -335,74 +337,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-large
+    - name: Evidence stock19-repeat8
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-free19-large
-        path: ${{ env.WORK_ROOT }}/out/free19-large*
+        name: linux-stock19-repeat8
+        path: ${{ env.WORK_ROOT }}/out/stock19-repeat8*
         retention-days: 7
-    - name: free19-resident-tiled
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 30
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-resident-tiled'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--force-resident', '--tiling']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1740)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-resident-tiled
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-free19-resident-tiled
-        path: ${{ env.WORK_ROOT }}/out/free19-resident-tiled*
-        retention-days: 7
-    - name: free19-resident-untiled
-      shell: python3 -X utf8 {0}
-      timeout-minutes: 30
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-resident-untiled'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--force-resident']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1740)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-resident-untiled
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-free19-resident-untiled
-        path: ${{ env.WORK_ROOT }}/out/free19-resident-untiled*
-        retention-days: 7
-    - name: native-default
+    - name: plain19-repeat8
       shell: python3 -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
@@ -411,9 +353,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='native-default'
+        case='plain19-repeat8'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*[]]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--repeats', '8']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=2040)
@@ -425,12 +367,72 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence native-default
+    - name: Evidence plain19-repeat8
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-native-default
-        path: ${{ env.WORK_ROOT }}/out/native-default*
+        name: linux-plain19-repeat8
+        path: ${{ env.WORK_ROOT }}/out/plain19-repeat8*
+        retention-days: 7
+    - name: low16-default40
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 40
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='low16-default40'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--memory-mode', 'low_vram', '--steps', '40', '--repeats', '1']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=2340)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence low16-default40
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-low16-default40
+        path: ${{ env.WORK_ROOT }}/out/low16-default40*
+        retention-days: 7
+    - name: stock19-default40
+      shell: python3 -X utf8 {0}
+      timeout-minutes: 40
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='stock19-default40'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--repeats', '1']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=2340)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence stock19-default40
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-stock19-default40
+        path: ${{ env.WORK_ROOT }}/out/stock19-default40*
         retention-days: 7
     - name: Summarize
       shell: python3 -X utf8 {0}
@@ -512,47 +514,19 @@ jobs:
         run([py,'-m','pip','install','-c',str(constraints),'-r',str(root/'code/studio/backend/requirements/studio.txt'),'-r',str(root/'code/studio/backend/requirements/diffusers-main.txt'),'transformers==5.5.0','accelerate>=1.0','peft>=0.18','sentencepiece','psutil','protobuf','scipy','einops','Pillow','pyyaml','ninja','safetensors'])
         run([py,'-m','pip','install','--no-deps','unsloth-zoo==2026.9.8'])
         run([py,'-m','pip','install','-c',str(constraints),'tyro','hf_transfer','msgspec','wheel'])
+        run([py,'-m','pip','install','--no-deps',str(root/'code')])
         # Match the Studio installer's torch 2.11 selection. Windows source package is pure Python.
         run([py,'-m','pip','install','--no-deps','torchao==0.17.0'])
         with (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)
-        run([py,'-c',"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
+        run([py,'-c',"import main; import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
     - name: Write measurement harness
       shell: python -X utf8 {0}
       run: |
         import os
         from pathlib import Path
-        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    return dict(allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
-    - name: free19-default
-      shell: python -X utf8 {0}
-      timeout-minutes: 45
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-default'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '20']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=2640)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-default
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-free19-default
-        path: ${{ env.WORK_ROOT }}/out/free19-default*
-        retention-days: 7
-    - name: free19-math-attention
+        (Path(os.environ['WORK_ROOT'])/'probe.py').write_text('"""Live Studio Qwen-Image-2.1 probe; capped cases simulate capacity, not a discrete GPU."""\nimport argparse\nimport collections\nimport functools\nimport importlib.metadata\nimport json\nimport os\nfrom pathlib import Path\ntry:\n    import resource\nexcept ImportError:\n    resource = None\nimport sys\nimport threading\nimport time\nimport traceback\n\np = argparse.ArgumentParser()\np.add_argument(\'--case\', required=True)\np.add_argument(\'--free-gib\', type=float, default=0)\np.add_argument(\'--memory-mode\', default=\'auto\')\np.add_argument(\'--output\', required=True)\np.add_argument(\'--speed\', default=\'default\')\np.add_argument(\'--te\', default=\'auto\')\np.add_argument(\'--width\', type=int, default=1024)\np.add_argument(\'--height\', type=int, default=1024)\np.add_argument(\'--steps\', type=int, default=4)\np.add_argument(\'--repeats\', type=int, default=2)\np.add_argument(\'--force-resident\', action=\'store_true\')\np.add_argument(\'--tiling\', action=\'store_true\')\np.add_argument(\'--trace\', action=\'store_true\')\np.add_argument(\'--math-attention\', action=\'store_true\')\np.add_argument(\'--plain-te\', action=\'store_true\')\np.add_argument(\'--reference\', action=\'store_true\')\np.add_argument(\'--host-available-gib\', type=float, default=0)\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\n\ndef emit(event, **fields):\n    row = dict(event=event, case=args.case, time=time.time(), **fields)\n    line = json.dumps(row, default=str)\n    print(\'PROBE \' + line, flush=True)\n    with (out / (args.case + \'.jsonl\')).open(\'a\') as f:\n        f.write(line + \'\\n\')\n\nos.environ.setdefault(\'CUDA_DEVICE_ORDER\',\'PCI_BUS_ID\')\nos.environ[\'TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\'] = \'0\' if args.math_attention else \'1\'\nimport main as studio_main\nemit(\'studio_startup_imported\', module=studio_main.__file__)\nimport torch\nimport psutil\nassert torch.cuda.is_available(), \'AMD GPU unavailable\'\nassert torch.version.hip or \'rocm\' in torch.__version__.lower(), \'ROCm torch required\'\ntorch.cuda.set_device(0)\ntorch.cuda.init()\nprops = torch.cuda.get_device_properties(0)\nversions = {}\nfor name in (\'torch\', \'torchvision\', \'triton\', \'transformers\', \'diffusers\', \'accelerate\', \'peft\', \'gguf\', \'torchao\', \'unsloth_zoo\'):\n    try:\n        versions[name] = importlib.metadata.version(name)\n    except importlib.metadata.PackageNotFoundError:\n        versions[name] = None\nemit(\'hardware\', name=props.name, properties=str(props), hip=torch.version.hip,\n     architecture=getattr(props, \'gcnArchName\', None), versions=versions,\n     physical_total_bytes=props.total_memory, physical_mem_get_info=torch.cuda.mem_get_info(),\n     host_memory=psutil.virtual_memory()._asdict(),\n     integrated=getattr(props, \'integrated\', getattr(props, \'is_integrated\', None)))\n# A real HIP operation verifies the wheel\'s kernel coverage before downloading models.\nx = torch.randn((1024, 1024), device=\'cuda\', dtype=torch.bfloat16)\ny = x @ x\ntorch.cuda.synchronize()\nassert torch.isfinite(y).all().item()\ndel x, y\ntorch.cuda.empty_cache()\n\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference import diffusion_memory as dm\nfrom core.inference import diffusion as d\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\nemit(\'configuration\', arguments=vars(args), platform=sys.platform)\nif args.plain_te:\n    from plain_te_experiment import install\n    install(emit)\nfrom core.inference.prequant_safetensors import safetensors_prequant_supported\nfrom core._torchao_stub import is_stubbed\nfrom core.inference.diffusion_patch_backend import _helpers\ntry:\n    helpers = _helpers()\n    emit(\'patch_helpers\', available=bool(helpers))\n    if not helpers:\n        from unsloth_zoo.temporary_patches.utils import patch_function\nexcept Exception as exc:\n    emit(\'patch_helper_failure\', error=repr(exc), traceback=traceback.format_exc())\nemit(\'prequant_support\', supported=safetensors_prequant_supported(), torchao_stub=is_stubbed(\'torchao\'))\nimport importlib.util\nemit(\'package_origin\', unsloth=str(importlib.util.find_spec(\'unsloth\')), zoo=str(importlib.util.find_spec(\'unsloth_zoo\')))\ntarget = resolve_diffusion_device_target()\nemit(\'device_target\', target=target.as_public_dict(), native_snapshot=dm.snapshot_device_memory(target).as_public_dict())\nif args.free_gib:\n    # Limit the HIP caching allocator AND feed the planner a corresponding synthetic reading.\n    # No physical allocations are made to imitate a desktop. Shared-memory transfer bandwidth\n    # and this GPU\'s compute performance remain those of the actual Strix Halo runner.\n    cap = int(args.free_gib * 2**30)\n    assert cap < props.total_memory\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n    def virtual_memory(backend):\n        physical_free, _ = torch.cuda.mem_get_info()\n        remaining = max(0, cap - torch.cuda.memory_reserved())\n        return min(physical_free, remaining) // 2**20, 20 * 1024, \'discrete_vram\'\n    dm._cuda_memory = virtual_memory\n    emit(\'synthetic_capacity\', total_gib=20, initial_free_gib=args.free_gib,\n         allocator_cap_bytes=cap, warning=\'Capacity experiment on an APU, not a 7900 XT hardware reproduction\')\n\nplans = []\noriginal_plan = d.plan_diffusion_memory\ndef record_plan(**kwargs):\n    plan = original_plan(**kwargs)\n    if args.force_resident:\n        import dataclasses\n        plan = dataclasses.replace(plan, offload_policy=\'none\', vae_tiling=args.tiling,\n                                   stream_transformer=False, stream_text_encoders=False)\n        emit(\'experimental_override\', description=\'Force resident under allocator cap; not an exposed Studio setting\')\n    plans.append(plan)\n    emit(\'plan\', plan=plan.as_public_dict(), stream_transformer=plan.stream_transformer,\n         stream_text_encoders=plan.stream_text_encoders)\n    for mode in (\'auto\', \'fast\', \'balanced\', \'low_vram\'):\n        other = original_plan(**dict(kwargs, requested_mode=mode))\n        emit(\'planner_comparison\', mode=mode, policy=other.offload_policy,\n             stream_transformer=other.stream_transformer,\n             stream_text_encoders=other.stream_text_encoders, tiling=other.vae_tiling,\n             reasons=other.reasons)\n    return plan\nd.plan_diffusion_memory = record_plan\n\nprocess = psutil.Process()\ndef memory():\n    try:\n        host_stats = dict(torch.cuda.memory.host_memory_stats())\n    except Exception as exc:\n        host_stats = {\'unavailable\':repr(exc)}\n    return dict(host_allocator=host_stats, allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved(),\n                peak_allocated_bytes=torch.cuda.max_memory_allocated(),\n                peak_reserved_bytes=torch.cuda.max_memory_reserved(), rss_bytes=process.memory_info().rss,\n                max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else getattr(process.memory_info(), \'peak_wset\', process.memory_info().rss),\n                host_available_bytes=psutil.virtual_memory().available, swap=psutil.swap_memory()._asdict(), process_memory=process.memory_info()._asdict(), cpu_percent=process.cpu_percent())\n\nhost_pressure = []\nif args.host_available_gib:\n    # Real, bounded host-memory pressure; this is NOT a system RAM limit.\n    # Leave at least the requested available RAM and never consume over 64 GiB.\n    import numpy as np\n    goal = max(48, args.host_available_gib) * 2**30\n    while psutil.virtual_memory().available > goal + 2**30 and len(host_pressure) < 64:\n        buf = np.empty(2**30, dtype=np.uint8)\n        buf.fill(17)\n        host_pressure.append(buf)\n    emit(\'host_pressure\', bytes=len(host_pressure)*2**30, available=psutil.virtual_memory().available)\ndef memory_maps(phase):\n    try:\n        rows=[m._asdict() for m in process.memory_maps(grouped=True)]\n        rows.sort(key=lambda m:m.get(\'rss\',0),reverse=True)\n        emit(\'memory_maps\', phase=phase, largest=rows[:25])\n    except Exception as exc:\n        emit(\'memory_maps_unavailable\', error=repr(exc))\nbackend = d.DiffusionBackend()\nstop = threading.Event()\ndef monitor():\n    while not stop.wait(5):\n        emit(\'sample\', memory=memory(), progress=backend.generate_progress())\nthreading.Thread(target=monitor, daemon=True).start()\ntry:\n    start = time.perf_counter()\n    backend.begin_load(\'unsloth/Qwen-Image-2.1-GGUF\', gguf_filename=\'qwen-image-2.1-Q4_K_M.gguf\',\n                       family_override=\'qwen-image-2.1\', memory_mode=args.memory_mode, speed_mode=args.speed,\n                       **({} if args.te == \'auto\' else {\'text_encoder_quant\': args.te}))\n    deadline = time.monotonic() + 2400\n    while True:\n        progress = backend.load_progress()\n        emit(\'load_progress\', progress=progress)\n        if progress.get(\'error\'):\n            raise RuntimeError(progress[\'error\'])\n        if progress.get(\'phase\') == \'ready\':\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError(\'Model load exceeded 40 minutes\')\n        time.sleep(10)\n    torch.cuda.synchronize()\n    state = backend._state\n    pipe = state.pipe\n    emit(\'loaded\', seconds=time.perf_counter()-start, status=backend.status(), memory=memory())\n    memory_maps(\'loaded\')\n    for name, component in pipe.components.items():\n        if not isinstance(component, torch.nn.Module):\n            continue\n        counts = collections.Counter()\n        seen = set()\n        for tensor in list(component.parameters()) + list(component.buffers()):\n            if tensor.device.type == \'meta\':\n                counts[\'meta\'] += tensor.numel() * tensor.element_size()\n                continue\n            storage = tensor.untyped_storage()\n            key = (str(tensor.device), storage.data_ptr())\n            if key in seen:\n                continue\n            seen.add(key)\n            counts[str(tensor.device) + \':\' + str(tensor.dtype)] += storage.nbytes()\n        emit(\'component_storage\', component=name, bytes_by_device_and_dtype=dict(counts))\n\n    # First two passes have no forward wrappers or additional GPU synchronizations inside\n    # inference. Different prompts avoid the prompt-embedding cache hiding encoder cost.\n    prompts = [\n        \'A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n        \'A green ceramic teapot on a wooden table beside a window, soft daylight, photograph.\',\n    ]\n    prompts += [\'A \'+color+\' ceramic teapot on a wooden table beside a window, soft daylight, photograph.\' for color in [\'yellow\',\'purple\',\'orange\',\'white\',\'black\']]\n    phase_records = collections.defaultdict(list)\n    def instrument(obj, method, phase):\n        if isinstance(obj, torch.nn.Module) and method == \'forward\':\n            active = []\n            def before(module, inputs):\n                torch.cuda.synchronize()\n                active.append((time.perf_counter(), torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()))\n            def after(module, inputs, output):\n                torch.cuda.synchronize()\n                began, allocated, peak = active.pop()\n                record=dict(seconds=time.perf_counter()-began, allocated_before=allocated,\n                            allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n            obj.register_forward_pre_hook(before)\n            obj.register_forward_hook(after, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            began = time.perf_counter()\n            before = torch.cuda.memory_allocated()\n            peak_before = torch.cuda.max_memory_allocated()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                record = dict(seconds=time.perf_counter()-began, allocated_before=before,\n                              allocated_after=torch.cuda.memory_allocated(), peak_allocated=torch.cuda.max_memory_allocated(), peak_before=peak_before)\n                phase_records[phase].append(record)\n                emit(\'phase_call\', phase=phase, **record)\n        setattr(obj, method, measured)\n    for i, prompt in enumerate(prompts[:args.repeats]):\n        profiled = True\n        if i == 0:\n            instrument(pipe, \'encode_prompt\', \'encode_prompt\')\n            instrument(pipe.transformer, \'forward\', \'transformer_forward\')\n            instrument(pipe.vae, \'decode\', \'vae_decode\')\n        phase_records.clear()\n        torch.cuda.synchronize()\n        torch.cuda.reset_peak_memory_stats()\n        began = time.perf_counter()\n        conditioning = {}\n        if args.reference:\n            import base64\n            source=out/\'stock19-0-0.png\'\n            conditioning={\'init_image\':base64.b64encode(source.read_bytes()).decode(), \'reference_resolution\':1024}\n            prompt=\'Change the teapot to \'+(\'blue\' if i==0 else \'green\')+\'. Keep the room unchanged.\'\n        result = backend.generate(prompt=prompt, width=args.width, height=args.height, steps=args.steps, guidance=1.0, seed=42, **conditioning)\n        torch.cuda.synchronize()\n        elapsed = time.perf_counter()-began\n        for j, picture in enumerate(result[\'images\']):\n            picture.save(out / f\'{args.case}-{i}-{j}.png\')\n        emit(\'phase_totals\', index=i, phases={k:dict(calls=len(v),seconds=sum(x[\'seconds\'] for x in v)) for k,v in phase_records.items()})\n        emit(\'render\', index=i, cold=(i == 0), profiled=profiled, seconds=time.perf_counter()-began,\n             inference_seconds=elapsed, memory=memory(), result_keys=list(result), status=backend.status())\n    emit(\'phase_totals\', phases={name: dict(calls=len(rows), seconds=sum(r[\'seconds\'] for r in rows))\n                                for name, rows in phase_records.items()})\n    memory_maps(\'after_generation\')\n    from core.inference.diffusion_gguf_compile import is_compiled_dequant_installed\n    emit(\'compile_status\', installed=is_compiled_dequant_installed())\n    if args.trace:\n        try:\n            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], profile_memory=True) as prof:\n                backend.generate(prompt=\'A yellow teapot on a table.\', width=args.width, height=args.height, steps=2, guidance=1.0, seed=42)\n                torch.cuda.synchronize()\n            prof.export_chrome_trace(str(out / (args.case + \'-trace.json\')))\n            (out / (args.case + \'-operators.txt\')).write_text(prof.key_averages().table(sort_by=\'self_device_time_total\', row_limit=60))\n            emit(\'trace_complete\')\n        except Exception as exc:\n            emit(\'trace_failure\', error=repr(exc))\n    emit(\'complete\', success=True)\nexcept Exception as exc:\n    emit(\'failure\', error=repr(exc), traceback=traceback.format_exc(), memory=memory())\n    raise\nfinally:\n    stop.set()\n    backend.unload()\n', encoding='utf-8')
+        (Path(os.environ['WORK_ROOT'])/'plain_te_experiment.py').write_text('"""Diagnostic-only reader for a validated plain-tensor TE artifact, not a general torchao replacement."""\ndef install(emit):\n    import json\n    from safetensors import safe_open\n    from core.inference import prequant_safetensors as ps\n    from core.inference import diffusion_te_prequant as te\n    original_readable = te.te_candidate_is_readable\n    original_load = ps.load_prequant_safetensors\n    target_name = \'Qwen-Image-2.1-text_encoder-FP8.safetensors\'\n    def readable(name):\n        return True if name == target_name else original_readable(name)\n    def load(path):\n        # Inspect the real container before bypassing torchao. Refuse all subclass metadata.\n        with safe_open(path, framework=\'pt\', device=\'cpu\') as f:\n            md = f.metadata() or {}\n            if md.get(\'unsloth_format\') != te.TE_PREQUANT_FORMAT:\n                return original_load(path)\n            names = json.loads(md.get(\'tensor_names\',\'[]\'))\n            keys = list(f.keys())\n            assert names and len(names)==len(set(names)) and set(names)==set(keys)\n            assert all(json.loads(md[n]) == {\'_type\':\'Tensor\'} for n in names)\n            meta = json.loads(md[\'unsloth_metadata\'])\n            assert meta[\'scheme\']==\'fp8\' and meta[\'component\']==\'text_encoder\'\n            state = {n:f.get_tensor(n) for n in names}\n        emit(\'plain_te_loaded\', count=len(state), bytes=sum(t.numel()*t.element_size() for t in state.values()))\n        return {\'format\':md[\'unsloth_format\'],\'metadata\':meta,\'state_dict\':state}\n    te.te_candidate_is_readable = readable\n    ps.load_prequant_safetensors = load\n    emit(\'experimental_plain_te_reader\', description=\'Only plain Tensor TE containers are accepted; normal metadata validation remains enabled\')\n', encoding='utf-8')
+    - name: stock19
       shell: python -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
@@ -561,9 +535,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-math-attention'
+        case='stock19'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--math-attention']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1740)
@@ -575,74 +549,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-math-attention
+    - name: Evidence stock19
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free19-math-attention
-        path: ${{ env.WORK_ROOT }}/out/free19-math-attention*
+        name: windows-stock19
+        path: ${{ env.WORK_ROOT }}/out/stock19*
         retention-days: 7
-    - name: free19-eager
-      shell: python -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-eager'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--speed', 'eager']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-eager
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-free19-eager
-        path: ${{ env.WORK_ROOT }}/out/free19-eager*
-        retention-days: 7
-    - name: free19-off
-      shell: python -X utf8 {0}
-      timeout-minutes: 25
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-off'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--speed', 'off']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1440)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-off
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-free19-off
-        path: ${{ env.WORK_ROOT }}/out/free19-off*
-        retention-days: 7
-    - name: free16-auto
+    - name: plain19
       shell: python -X utf8 {0}
       timeout-minutes: 30
       continue-on-error: true
@@ -651,9 +565,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free16-auto'
+        case='plain19'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--trace']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1740)
@@ -665,14 +579,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free16-auto
+    - name: Evidence plain19
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free16-auto
-        path: ${{ env.WORK_ROOT }}/out/free16-auto*
+        name: windows-plain19
+        path: ${{ env.WORK_ROOT }}/out/plain19*
         retention-days: 7
-    - name: free12-auto
+    - name: stock16
       shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -681,9 +595,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free12-auto'
+        case='stock16'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '12']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -695,14 +609,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free12-auto
+    - name: Evidence stock16
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free12-auto
-        path: ${{ env.WORK_ROOT }}/out/free12-auto*
+        name: windows-stock16
+        path: ${{ env.WORK_ROOT }}/out/stock16*
         retention-days: 7
-    - name: free16-low
+    - name: plain16
       shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -711,9 +625,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free16-low'
+        case='plain16'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--memory-mode', 'low_vram']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--plain-te']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -725,14 +639,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free16-low
+    - name: Evidence plain16
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free16-low
-        path: ${{ env.WORK_ROOT }}/out/free16-low*
+        name: windows-plain16
+        path: ${{ env.WORK_ROOT }}/out/plain16*
         retention-days: 7
-    - name: free19-dense-te
+    - name: plain19-resident-tiled
       shell: python -X utf8 {0}
       timeout-minutes: 25
       continue-on-error: true
@@ -741,9 +655,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-dense-te'
+        case='plain19-resident-tiled'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--te', 'off']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--force-resident', '--tiling']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=1440)
@@ -755,14 +669,104 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-dense-te
+    - name: Evidence plain19-resident-tiled
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free19-dense-te
-        path: ${{ env.WORK_ROOT }}/out/free19-dense-te*
+        name: windows-plain19-resident-tiled
+        path: ${{ env.WORK_ROOT }}/out/plain19-resident-tiled*
         retention-days: 7
-    - name: free19-large
+    - name: plain19-reference
+      shell: python -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='plain19-reference'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--reference']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence plain19-reference
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-plain19-reference
+        path: ${{ env.WORK_ROOT }}/out/plain19-reference*
+        retention-days: 7
+    - name: stock19-host64
+      shell: python -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='stock19-host64'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--host-available-gib', '64']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence stock19-host64
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-stock19-host64
+        path: ${{ env.WORK_ROOT }}/out/stock19-host64*
+        retention-days: 7
+    - name: plain19-host64
+      shell: python -X utf8 {0}
+      timeout-minutes: 30
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='plain19-host64'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--host-available-gib', '64']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=1740)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence plain19-host64
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-plain19-host64
+        path: ${{ env.WORK_ROOT }}/out/plain19-host64*
+        retention-days: 7
+    - name: stock19-repeat8
       shell: python -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
@@ -771,9 +775,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-large'
+        case='stock19-repeat8'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--width', '1536', '--height', '1536']]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--repeats', '8']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=2040)
@@ -785,74 +789,14 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence free19-large
+    - name: Evidence stock19-repeat8
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-free19-large
-        path: ${{ env.WORK_ROOT }}/out/free19-large*
+        name: windows-stock19-repeat8
+        path: ${{ env.WORK_ROOT }}/out/stock19-repeat8*
         retention-days: 7
-    - name: free19-resident-tiled
-      shell: python -X utf8 {0}
-      timeout-minutes: 30
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-resident-tiled'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--force-resident', '--tiling']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1740)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-resident-tiled
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-free19-resident-tiled
-        path: ${{ env.WORK_ROOT }}/out/free19-resident-tiled*
-        retention-days: 7
-    - name: free19-resident-untiled
-      shell: python -X utf8 {0}
-      timeout-minutes: 30
-      continue-on-error: true
-      run: |
-        import os,sys,subprocess,json,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='free19-resident-untiled'
-        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--force-resident']]
-        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
-         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
-         try: rc=p.wait(timeout=1740)
-         except subprocess.TimeoutExpired:
-          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
-          else: p.kill()
-          p.wait()
-          rc=124
-        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
-        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
-        sys.exit(rc)
-    - name: Evidence free19-resident-untiled
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-free19-resident-untiled
-        path: ${{ env.WORK_ROOT }}/out/free19-resident-untiled*
-        retention-days: 7
-    - name: native-default
+    - name: plain19-repeat8
       shell: python -X utf8 {0}
       timeout-minutes: 35
       continue-on-error: true
@@ -861,9 +805,9 @@ jobs:
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
         py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
-        case='native-default'
+        case='plain19-repeat8'
         os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
-        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*[]]
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--plain-te', '--repeats', '8']]
         with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
          p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
          try: rc=p.wait(timeout=2040)
@@ -875,12 +819,72 @@ jobs:
         (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
         print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
         sys.exit(rc)
-    - name: Evidence native-default
+    - name: Evidence plain19-repeat8
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-native-default
-        path: ${{ env.WORK_ROOT }}/out/native-default*
+        name: windows-plain19-repeat8
+        path: ${{ env.WORK_ROOT }}/out/plain19-repeat8*
+        retention-days: 7
+    - name: low16-default40
+      shell: python -X utf8 {0}
+      timeout-minutes: 40
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='low16-default40'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '16', '--memory-mode', 'low_vram', '--steps', '40', '--repeats', '1']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=2340)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence low16-default40
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-low16-default40
+        path: ${{ env.WORK_ROOT }}/out/low16-default40*
+        retention-days: 7
+    - name: stock19-default40
+      shell: python -X utf8 {0}
+      timeout-minutes: 40
+      continue-on-error: true
+      run: |
+        import os,sys,subprocess,json,time
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        py=root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python')
+        case='stock19-default40'
+        os.environ['TORCHINDUCTOR_CACHE_DIR']=str(root/'cache/inductor')
+        cmd=[str(py),'-u',str(root/'probe.py'),'--case',case,'--output',str(root/'out'),*['--free-gib', '19', '--steps', '40', '--repeats', '1']]
+        with (root/'out'/(case+'.log')).open('w',encoding='utf-8') as f:
+         p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)
+         try: rc=p.wait(timeout=2340)
+         except subprocess.TimeoutExpired:
+          if sys.platform=='win32': subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])
+          else: p.kill()
+          p.wait()
+          rc=124
+        (root/'out'/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'case':case}))
+        print((root/'out'/(case+'.log')).read_text(encoding='utf-8',errors='replace')[-12000:])
+        sys.exit(rc)
+    - name: Evidence stock19-default40
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-stock19-default40
+        path: ${{ env.WORK_ROOT }}/out/stock19-default40*
         retention-days: 7
     - name: Summarize
       shell: python -X utf8 {0}
