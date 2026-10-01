@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--out", default = None)
     a = ap.parse_args()
     base = f"http://127.0.0.1:{a.port}"
-    log = open(os.path.join(a.home, "probe_studio.log"), "w")
+    log = open(os.path.join(a.home, "probe_studio.log"), "w", encoding = "utf-8")
     env = {**os.environ, "UNSLOTH_STUDIO_HOME": a.home}
     proc = subprocess.Popen(
         [a.bin, "studio", "-p", str(a.port)], stdout = log, stderr = subprocess.STDOUT,
@@ -72,7 +72,7 @@ def main():
             time.sleep(1)
         new_pw = "probe-11591-pass"
         if os.path.exists(boot):
-            pw = open(boot).read().strip()
+            pw = open(boot, encoding = "utf-8").read().strip()
             st, tok = call(base, "/api/auth/login", {"username": "unsloth", "password": pw})
             assert st == 200, (st, tok)
             call(base, "/api/auth/change-password", {"current_password": pw, "new_password": new_pw},
@@ -155,7 +155,7 @@ def main():
     print("PROBE_RESULT " + json.dumps(result), flush = True)
     if not passed:
         print("---- studio log tail ----")
-        print(open(os.path.join(a.home, "probe_studio.log")).read()[-4000:])
+        print(open(os.path.join(a.home, "probe_studio.log"), encoding = "utf-8", errors = "replace").read()[-4000:])
     sys.exit(0 if passed else 1)
 
 
