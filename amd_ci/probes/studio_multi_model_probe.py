@@ -17,6 +17,42 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
+WRAPPER = """#!/usr/bin/env bash
+# The HIP device multiplier must fool only Studio's placement probe. Inherited by llama-server it
+# shows the child two "GPUs" and llama.cpp splits a model over the phantom pair, which the shim
+# cannot serve. Record what Studio asked for, fold phantom ordinals onto the real GPU (as the shim
+# does for torch), and run the real binary without the shim.
+{
+  printf '%s HIP=%s ROCR=%s CUDA=%s ARGS=%s\\n' "$(date +%s)" "${HIP_VISIBLE_DEVICES-unset}" \\
+    "${ROCR_VISIBLE_DEVICES-unset}" "${CUDA_VISIBLE_DEVICES-unset}" "$*"
+} >> "__LOG__"
+fold() { local out="" t; IFS=',' read -ra toks <<< "$1"; for t in "${toks[@]}"; do
+  [[ "$t" =~ ^[0-9]+$ ]] && (( t >= __REAL__ )) && t=0
+  [[ ",$out," == *",$t,"* ]] || out="${out:+$out,}$t"; done; printf '%s' "$out"; }
+for v in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
+  [ -n "${!v+x}" ] && export "$v=$(fold "${!v}")"
+done
+unset LD_PRELOAD SHIM_EXTRA_DEVICES
+exec "__REAL_BIN__" "$@"
+"""
+
+
+def wrap_llama_server(home: Path, log: Path) -> str:
+    """Put WRAPPER in front of every llama-server under the Studio home; returns what it did."""
+    real = os.environ.get("AMD_CI_REAL_GPUS", "1")
+    done = []
+    for binary in home.glob("**/llama-server"):
+        if not binary.is_file() or binary.name.endswith(".real"):
+            continue
+        moved = binary.with_name("llama-server.real")
+        binary.rename(moved)
+        binary.write_text(WRAPPER.replace("__LOG__", str(log)).replace("__REAL__", real)
+                          .replace("__REAL_BIN__", str(moved)), encoding = "utf-8")
+        binary.chmod(0o755)
+        done.append(str(binary))
+    return ",".join(done) or "no llama-server found"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -49,6 +85,9 @@ def main() -> int:
     obs["install_tail"] = log.read_text(encoding = "utf-8", errors = "replace")[-3000:]
     cli = home / "unsloth_studio" / "bin" / "unsloth"
     obs["cli_exists"] = cli.exists()
+    launches = tmp / f"llama_launches_{args.state}.log"
+    if cli.exists() and os.environ.get("AMD_CI_SPOOFED_DEVICES") and os.name != "nt":
+        obs["llama_wrapper"] = wrap_llama_server(home, launches)
     if cli.exists():
         res = tmp / f"probe_{args.state}.json"
         p = subprocess.run([sys.executable, str(HERE / "multi_model_probe.py"), "--bin", str(cli),
@@ -58,6 +97,8 @@ def main() -> int:
         obs["probe_tail"] = (p.stdout or "")[-4000:]
         if res.exists():
             obs["probe"] = json.loads(res.read_text(encoding = "utf-8"))
+    if launches.exists():
+        obs["llama_launches"] = launches.read_text(encoding = "utf-8", errors = "replace").splitlines()[-20:]
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
 
