@@ -47,7 +47,12 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
         out.append((f"{name}: install.sh --local succeeded", v.get("install_rc") == 0 and v.get("cli_exists"),
                     f"rc={v.get('install_rc')} backend={v.get('llama_backend_forced')} spoof={v.get('spoofed_devices')}"))
         c = _checks(v).get("load_A") or {}
-        out.append((f"{name}: a GGUF loads and serves", bool(c.get("ok")), c.get("detail", "no probe")))
+        after = (_probe(v).get("info") or {}).get("status_after_A")
+        serving = isinstance(after, dict) and bool(after.get("active_model"))
+        # A load that returns 200 but leaves nothing serving (llama-server died in warmup) is no
+        # environment to measure placement in: gate it rather than read it as the PR's defect.
+        out.append((f"{name}: a GGUF loads and is still serving after the load", bool(c.get("ok")) and serving,
+                    f"status after load: {after}"))
     head = obs.get("head") or {}
     n = _gpus_seen(head)
     out.append(("head: Studio saw at least two GPUs (spoof reached the placement path)", n >= 2, f"{n} GPUs in its free list"))

@@ -120,6 +120,9 @@ def main():
 
         st, r = load(A, False)
         check("load_A", st == 200, r if st != 200 else "")
+        sa = status()
+        info["status_after_A"] = ({k: sa.get(k) for k in ("active_model", "loaded", "offloaded_layers",
+                                   "cpu_fallback_reason")} if isinstance(sa, dict) else sa)
         st, r = load(B, True)
         check("load_B_alongside", st == 200, r if st != 200 else r.get("evicted"))
         s = status()
