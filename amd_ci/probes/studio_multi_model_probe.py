@@ -37,6 +37,8 @@ def main() -> int:
         "HF_XET_CACHE": str(hf / "xet"),
         "HUGGINGFACE_HUB_CACHE": str(hf / "hub"),
     }
+    obs["llama_backend_forced"] = os.environ.get("UNSLOTH_LLAMA_CPP_BACKEND")
+    obs["spoofed_devices"] = os.environ.get("AMD_CI_SPOOFED_DEVICES")
     t = time.time()
     log = tmp / f"install_{args.state}.log"
     with open(log, "w", encoding = "utf-8") as fh:

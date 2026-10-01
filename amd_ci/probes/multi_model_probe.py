@@ -8,6 +8,7 @@ unloading one leaves the other answering, a plain (non-alongside) load replaces 
 
 import argparse
 import json
+import re
 import os
 import signal
 import subprocess
@@ -80,11 +81,28 @@ def main():
         assert st == 200, (st, tok)
         tok = tok["access_token"]
 
+        studio_log = os.path.join(a.home, "probe_studio.log")
+
+        def log_size():
+            try:
+                return os.path.getsize(studio_log)
+            except OSError:
+                return 0
+
         def load(m, alongside):
+            # Studio's own placement line for this load: "GPUs free: [...], selected: [...]".
+            before = log_size()
             t = time.time()
             st, r = call(base, "/api/inference/load",
                          {"model_path": m[0], "gguf_variant": m[1], "alongside": alongside}, tok, timeout = 1800)
             info[f"load_{m[0]}_{alongside}_s"] = round(time.time() - t, 1)
+            with open(studio_log, encoding = "utf-8", errors = "replace") as fh:
+                fh.seek(before)
+                new = fh.read()
+            info.setdefault("placements", []).append({
+                "model": m[0], "alongside": alongside,
+                "lines": re.findall(r"GPUs free: .*?selected: (?:\[[^\]]*\]|None)", new)[-3:],
+            })
             return st, r
 
         def chat(m):
