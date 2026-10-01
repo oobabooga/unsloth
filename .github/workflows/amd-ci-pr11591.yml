@@ -156,3 +156,85 @@ jobs:
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
+
+  windows_e2e:
+    name: "PR 11591 Windows end-to-end: two GGUFs in a real Studio (exclusive)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    # Uncomment when the job actually measures the GPU. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    # Loads models on the GPU, so it serialises with other Windows GPU measurements.
+    concurrency:
+      group: amd-ci-gfx1151-gpu-windows
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr11591-windows-e2e"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          $extra = @()
+          if ($env:MERGED -eq "1") { $extra += "--merged" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Differential
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/studio_multi_model_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/studio_multi_model.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows_e2e" `
+            --python "$env:AMD_CI_PY"
+          Get-Content "$env:AMD_CI_WORK\out\windows_e2e\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
+            "$env:AMD_CI_WORK\out\windows_e2e"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr11591-windows-e2e
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
