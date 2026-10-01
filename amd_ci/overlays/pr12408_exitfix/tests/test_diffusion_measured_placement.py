@@ -12,6 +12,7 @@ check are stubbed. The partial-residency mechanics need a CUDA device and real d
 
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
@@ -261,30 +262,14 @@ def test_compact_layer_cache_frees_full_storage(monkeypatch):
     assert q21.compact_kv_enabled()
 
 
-@pytest.fixture
-def _release_cuda_offload_state():
-    """Drop each streamed-offload test's copy streams, recorded events and pinned host blocks before the next test.
-    Left to interpreter exit, the Windows ROCm runtime hangs in teardown after the run has finished."""
-    yield
-    import gc
-
-    import torch
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        host_empty = getattr(torch._C, "_host_emptyCache", None)
-        if callable(host_empty):
-            host_empty()
-
-
 def _cuda_offload_model():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA-only: diffusers group offloading with a copy stream")
+    if sys.platform == "win32" and getattr(torch.version, "hip", None):
+        # Measured on Windows 11 gfx1151, ROCm torch 2.11: after these streamed-offload tests run in a session the
+        # pytest process finishes and then never exits (stuck in native HIP teardown), which hangs the whole run.
+        pytest.skip("Windows ROCm: a streamed group-offload session hangs the process at exit")
     pytest.importorskip("diffusers.hooks")
 
     class Net(torch.nn.Module):
@@ -307,7 +292,6 @@ def _cuda_offload_model():
 
 
 @pytest.mark.parametrize("keep_blocks", [0, 2, 6])
-@pytest.mark.usefixtures("_release_cuda_offload_state")
 def test_partial_residency_bit_identical_and_placed(keep_blocks, monkeypatch):
     torch, net = _cuda_offload_model()
     from diffusers.hooks import apply_group_offloading
@@ -346,7 +330,6 @@ def test_partial_residency_bit_identical_and_placed(keep_blocks, monkeypatch):
     assert placed[keep_blocks:] == want[keep_blocks:]
 
 
-@pytest.mark.usefixtures("_release_cuda_offload_state")
 def test_partial_residency_kill_switch(monkeypatch):
     torch, net = _cuda_offload_model()
     from diffusers.hooks import apply_group_offloading
@@ -422,7 +405,6 @@ def test_resident_group_keeps_copy_stream_wait(monkeypatch):
     assert Stream.waits == 3
 
 
-@pytest.mark.usefixtures("_release_cuda_offload_state")
 def test_oversized_request_streams_resident_groups_and_restores_them(monkeypatch):
     """A request past the measured reserve streams the kept groups again (the flat plan's placement), stays
     bit-identical, and the groups are resident again afterwards."""
