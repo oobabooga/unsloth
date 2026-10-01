@@ -80,14 +80,17 @@ def main() -> int:
     # stderr is where pytest writes usage errors. Not capturing it is what made
     # this failure invisible.
     obs["stderr_tail"] = (err or "")[-2000:]
-    obs["failed"] = sorted(set(re.findall(r"^FAILED\s+(\S+)", tail, re.M)))
-    obs["errors"] = sorted(set(re.findall(r"^ERROR\s+(\S+)", tail, re.M)))
-    m = re.search(r"(\d+) failed", tail)
-    obs["n_failed"] = int(m.group(1)) if m else 0
-    m = re.search(r"(\d+) passed", tail)
-    obs["n_passed"] = int(m.group(1)) if m else 0
-    m = re.search(r"(\d+) skipped", tail)
-    obs["n_skipped"] = int(m.group(1)) if m else 0
+    # Parse the whole stdout, not the tail: a test that floods log lines pushed the summary
+    # out of a 20 KB tail and read as "0 collected" on both states (PR 11591 run 36832738715).
+    full = out or ""
+    obs["failed"] = sorted(set(re.findall(r"^FAILED\s+(\S+)", full, re.M)))
+    obs["errors"] = sorted(set(re.findall(r"^ERROR\s+(\S+)", full, re.M)))
+    summaries = re.findall(r"^.*\d+ (?:passed|failed|errors?|skipped)\b.* in [\d.]+s.*$", full, re.M)
+    summary = summaries[-1] if summaries else ""
+    obs["summary"] = summary
+    for key, word in (("n_failed", "failed"), ("n_passed", "passed"), ("n_skipped", "skipped")):
+        m = re.search(rf"(\d+) {word}", summary)
+        obs[key] = int(m.group(1)) if m else 0
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
 
