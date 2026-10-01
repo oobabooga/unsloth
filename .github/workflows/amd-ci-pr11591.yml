@@ -90,7 +90,7 @@ jobs:
             --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/suites" \
             --python "${AMD_CI_PY:-python3}" \
-            -- --tests tests/test_multi_model_serving.py
+            -- --tests tests/test_multi_model_serving.py tests/test_gpu_memory_mode.py tests/test_audio_device_guards.py tests/test_gpu_init_crash_message.py tests/test_orchestrator_unload_cancel.py tests/test_cache_inventory_path_boundary.py tests/test_gpu_selection.py tests/test_llama_cpp_placement.py tests/test_gpu_order_preserved.py tests/test_amd_apu_unified_memory.py tests/test_unified_memory_carve_out_vram.py tests/test_health_reports_unified_memory.py tests/test_gpu_arch_gate_os_matrix_7624.py
           cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
