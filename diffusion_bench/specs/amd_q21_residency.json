@@ -1,0 +1,76 @@
+{
+ "name": "amd_q21_residency",
+ "description": "Qwen-Image-2.1 default (auto) load on gfx1151 unified memory, base vs fix: the residency / prefetch planner change must not move the unified-memory placement (plan 'none': offload frees nothing there), the output, or the timing. tiny_q21 = plumbing only. heavy_q21_auto = the default click (no quant / memory / speed overrides), 1024x1024, 20 steps, guidance 1.",
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "speed_mode": "default",
+   "memory_mode": "auto",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "models": {
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "tiny_qwenimage21_pipe": {
+   "repo": "hf-internal-testing/tiny-qwenimage21-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-qwenimage21-pipe"
+  }
+ },
+ "cells": [
+  {
+   "tag": "tiny_q21",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "heavy_q21_auto",
+   "model": "@qwen_image_21",
+   "ref": "heavy_q21_auto",
+   "width": 1024,
+   "height": 1024,
+   "steps": 20,
+   "short_steps": 0,
+   "n": 2,
+   "guidance": 1.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1"
+   }
+  }
+ ],
+ "baseline": {}
+}
