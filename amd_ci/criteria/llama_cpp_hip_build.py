@@ -58,11 +58,15 @@ def table(obs: dict) -> str:
         links = v.get("links") or {}
         linked = ",".join(k for k, b in links.items() if b) or "-"
         cache = (v.get("cmake_cache_before_rm") or v.get("cmake_cache_after_fail") or {}).get("GGML_HIP", "-")
-        ld = (v.get("list_devices") or {}).get("out", "")
+        ld = (v.get("cli_list_devices") or v.get("list_devices") or {}).get("out", "")
         dev = " / ".join(l.strip() for l in ld.splitlines() if "ROCm" in l or "CUDA" in l)[:160] or "-"
         rows.append(f"| {n} | `{flags or '-'}` | {v.get('configure_ok')} | {v.get('build_cmd_ok')} | "
                     f"{v.get('install_ok')} | {linked} | `{cache}` | {v.get('ggml_hip_dir_built')} | {dev} |")
     rows.append("")
+    for n, v in _states(obs).items():
+        if v.get("install_ok"):
+            rows.append(f"- {n}: llama-quantize --help {v.get('llama_quantize_help')}; nm -D hip symbols {v.get('nm_hip_symbols')}; "
+                        f"strings {v.get('strings_hip')}; ldd hip={v.get('links')}; cache={v.get('cmake_cache_before_rm')}")
     for n, v in _states(obs).items():
         if not v.get("install_ok"):
             rows.append(f"- {n} exception: `{str(v.get('exception_head'))[:600]!s}`")
@@ -79,7 +83,7 @@ def head_is_fixed(head: dict):
     cl = head.get("configure_line") or ""
     links = head.get("links") or {}
     cache = (head.get("cmake_cache_before_rm") or {}).get("GGML_HIP", "")
-    hip_evidence = bool(links.get("libamdhip64")) or "GGML_HIP:BOOL=ON" in cache
+    hip_evidence = "GGML_HIP:BOOL=ON" in cache and (bool(links.get("libamdhip64")) or bool(head.get("nm_hip_symbols")))
     fixed = ("-DGGML_HIP=ON" in cl and "-DGGML_CUDA=ON" not in cl and bool(head.get("configure_ok"))
              and bool(head.get("build_cmd_ok")) and bool(head.get("install_ok")) and hip_evidence)
     return fixed, f"configure={cl[:200]!r} build={head.get('build_cmd_ok')} hip_evidence={hip_evidence}"

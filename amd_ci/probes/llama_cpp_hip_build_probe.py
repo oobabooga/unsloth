@@ -214,6 +214,20 @@ def main() -> int:
         obs["ldd_llama_quantize"] = ldd
         out = ldd["out"]
         obs["links"] = {k: (k in out) for k in ("libamdhip64", "libhipblas", "librocblas", "libcudart", "libcublas")}
+        qh = _run([str(q), "--help"], timeout = 60)
+        obs["llama_quantize_help"] = {"rc": qh["rc"], "usage_line": next(
+            (l for l in qh["out"].splitlines() if "usage" in l.lower()), qh["out"][:200])}
+        nmd = _run(["nm", "-D", "--undefined-only", str(q)])
+        obs["nm_hip_symbols"] = sorted({l.split()[-1] for l in nmd["out"].splitlines()
+                                        if l.split() and l.split()[-1].startswith(("hip", "hipblas", "rocblas"))})[:20]
+        try:
+            data = q.read_bytes()
+            obs["strings_hip"] = {s: (s.encode() in data) for s in ("ROCm", "hipMalloc", "ggml_cuda_init", "GGML_HIP")}
+        except Exception as e:  # noqa: BLE001
+            obs["strings_hip"] = {"_error": str(e)}
+        cli = folder / "llama-cli"
+        if cli.is_file():
+            obs["cli_list_devices"] = _run([str(cli), "--list-devices"], timeout = 120)
         srv = folder / "llama-server"
         if srv.is_file():
             obs["llama_server_ldd_hip"] = "libamdhip64" in _run(["ldd", str(srv)])["out"]
