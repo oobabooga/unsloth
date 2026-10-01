@@ -33,7 +33,7 @@ dump = open(sys.argv[1], "w", encoding="utf-8")
 faulthandler.dump_traceback_later(float(sys.argv[2]), exit=True, file=dump)
 import pytest
 t0 = time.time()
-rc = pytest.main(["-q", "-p", "no:cacheprovider", "-p", "no:faulthandler", *sys.argv[3:]])
+rc = pytest.main(["-q", "-p", "no:cacheprovider", "-p", "no:faulthandler", "--continue-on-collection-errors", *sys.argv[3:]])
 print(f"PYTEST_DONE rc={int(rc)} s={time.time() - t0:.1f}", flush=True)
 alive = [{"name": t.name, "daemon": t.daemon, "cls": type(t).__name__}
          for t in threading.enumerate() if t is not threading.main_thread()]
@@ -46,24 +46,49 @@ sys.exit(int(rc))
 """
 
 
+def _native_stack(pid: int) -> str:
+    """py-spy's native + Python stack of a live process: the only view into a hang that sits
+    after Py_Finalize, where faulthandler's watchdog has already been cancelled."""
+    try:
+        import shutil
+        exe = Path(sys.executable).parent / ("py-spy.exe" if os.name == "nt" else "py-spy")
+        spy = str(exe) if exe.is_file() else (shutil.which("py-spy") or "py-spy")
+        p = subprocess.run([spy, "dump", "--native", "--pid", str(pid)],
+                           capture_output = True, text = True, encoding = "utf-8", errors = "replace",
+                           timeout = 120)
+        return ((p.stdout or "") + "\n" + (p.stderr or ""))[-12000:]
+    except Exception as exc:  # noqa: BLE001
+        return f"py-spy failed: {type(exc).__name__}: {exc}"
+
+
 def run_one(python: str, workdir: Path, tests: list[str], tag: str, out_dir: Path,
-            dump_after: int, timeout: int) -> dict:
+            dump_after: int, timeout: int, exit_grace: int = 60) -> dict:
     dump = out_dir / f"hangdump_{tag}.txt"
+    log = out_dir / f"hangrun_{tag}.log"
     t0 = time.time()
     rec: dict = {"tests": tests}
-    try:
-        p = subprocess.run([python, "-c", WRAPPER, str(dump), str(dump_after), *tests],
-                           cwd = workdir, capture_output = True, text = True, encoding = "utf-8",
-                           errors = "replace", timeout = timeout,
-                           env = {**os.environ, "UNSLOTH_SETTLE_DELAY_S": "0",
-                                  "PYTHONIOENCODING": "utf-8"})
-        rec["returncode"] = p.returncode
-        out = p.stdout or ""
-        rec["stderr_tail"] = (p.stderr or "")[-1500:]
-    except subprocess.TimeoutExpired as exc:
-        rec["returncode"] = None
-        rec["outer_timeout"] = True
-        out = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")
+    with open(log, "w", encoding = "utf-8") as fh:
+        proc = subprocess.Popen([python, "-c", WRAPPER, str(dump), str(dump_after), *tests],
+                                cwd = workdir, stdout = fh, stderr = subprocess.STDOUT,
+                                env = {**os.environ, "UNSLOTH_SETTLE_DELAY_S": "0",
+                                       "PYTHONIOENCODING": "utf-8"})
+        done_at = None
+        while True:
+            if proc.poll() is not None:
+                break
+            text = log.read_text(encoding = "utf-8", errors = "replace")
+            if done_at is None and "FINALIZING" in text:
+                done_at = time.time()
+            if (done_at is not None and time.time() - done_at > exit_grace) or time.time() - t0 > timeout:
+                rec["native_stack"] = _native_stack(proc.pid)
+                proc.kill()
+                proc.wait()
+                rec["killed"] = True
+                break
+            time.sleep(2)
+        rec["returncode"] = None if rec.get("killed") else proc.returncode
+        rec["seconds_after_finalizing"] = round(time.time() - done_at, 1) if done_at else None
+    out = log.read_text(encoding = "utf-8", errors = "replace")
     rec["wall_s"] = round(time.time() - t0, 1)
     done = [ln for ln in out.splitlines() if ln.startswith("PYTEST_DONE")]
     rec["pytest_done"] = done[0] if done else None
@@ -72,15 +97,12 @@ def run_one(python: str, workdir: Path, tests: list[str], tag: str, out_dir: Pat
         rec["threads_at_return"] = json.loads(threads[0][8:]) if threads else None
     except ValueError:
         rec["threads_at_return"] = threads[0] if threads else None
-    if "STACKS_AT_RETURN_BEGIN" in out:
-        rec["stacks_at_return"] = out.split("STACKS_AT_RETURN_BEGIN", 1)[1].split("STACKS_AT_RETURN_END", 1)[0][-6000:]
     summary = [ln for ln in out.splitlines() if (" passed" in ln or " failed" in ln) and " in " in ln]
     rec["summary"] = summary[-1] if summary else None
     text = dump.read_text(encoding = "utf-8", errors = "replace") if dump.is_file() else ""
-    # The watchdog fired: the process was still alive dump_after seconds in, after (or during) pytest.
     rec["watchdog_fired"] = bool(text.strip())
-    rec["watchdog_dump"] = text[-8000:]
-    rec["hung_after_tests"] = bool(rec["pytest_done"]) and (rec["watchdog_fired"] or rec.get("outer_timeout", False))
+    rec["watchdog_dump"] = text[-8000:] or rec.get("native_stack", "")
+    rec["hung_after_tests"] = bool(rec["pytest_done"]) and bool(rec.get("killed") or rec["watchdog_fired"])
     return rec
 
 
@@ -94,6 +116,8 @@ def main() -> int:
     ap.add_argument("--dump-after", type = int, default = 240,
                     help = "seconds after start at which a still-running process dumps stacks and exits")
     ap.add_argument("--skip-states", default = "merge")
+    ap.add_argument("--leave-one-out", action = "store_true",
+                    help = "selections: all, then all minus each file (instead of each file alone)")
     ap.add_argument("--tests", nargs = "+", required = True)
     args = ap.parse_args()
     args.out = args.out.resolve()
@@ -117,10 +141,16 @@ def main() -> int:
     if subprocess.run([args.python, "-c", "import pytest"], capture_output = True).returncode != 0:
         subprocess.run([args.python, "-m", "pip", "install", "-q", "pytest", "pytest-asyncio"],
                        capture_output = True)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "py-spy"], capture_output = True, text = True)
+    obs["py_spy_install_rc"] = r.returncode
 
     runs: dict = {}
     obs["runs"] = runs
-    selections = [("all", args.tests)] + [(Path(t).stem, [t]) for t in args.tests]
+    if args.leave_one_out:
+        selections = [("all", args.tests)] + [("minus_" + Path(t).stem, [x for x in args.tests if x != t])
+                                              for t in args.tests]
+    else:
+        selections = [("all", args.tests)] + [(Path(t).stem, [t]) for t in args.tests]
     for tag, tests in selections:
         runs[tag] = run_one(args.python, workdir, tests, f"{args.state}_{tag}", args.out.parent,
                             args.dump_after, args.dump_after + 120)
