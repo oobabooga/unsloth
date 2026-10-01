@@ -150,7 +150,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_exit_hang_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_exit_hang.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --leave-one-out --dump-after 900 --tests tests/test_diffusion_measured_placement.py tests/test_diffusion_offload_seed_balanced.py tests/test_diffusion_offload_seed_balanced_behaviour.py tests/test_diffusion_int8_stream_torchao17.py tests/test_diffusion_memory.py tests/test_diffusion_offload_precision.py
+            --python "$env:AMD_CI_PY" -- --leave-one-out --extra-overlay amd_ci/overlays/pr12408_exitfix --dump-after 900 --tests tests/test_diffusion_measured_placement.py tests/test_diffusion_offload_seed_balanced.py tests/test_diffusion_offload_seed_balanced_behaviour.py tests/test_diffusion_int8_stream_torchao17.py tests/test_diffusion_memory.py tests/test_diffusion_offload_precision.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

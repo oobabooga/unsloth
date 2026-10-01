@@ -118,6 +118,9 @@ def main() -> int:
     ap.add_argument("--skip-states", default = "merge")
     ap.add_argument("--leave-one-out", action = "store_true",
                     help = "selections: all, then all minus each file (instead of each file alone)")
+    ap.add_argument("--extra-overlay", default = None,
+                    help = "directory (relative to the CI branch root) whose files are copied onto EVERY state's "
+                           "--subdir after the head overlay: a candidate test fix, applied to base and head alike")
     ap.add_argument("--tests", nargs = "+", required = True)
     args = ap.parse_args()
     args.out = args.out.resolve()
@@ -137,6 +140,19 @@ def main() -> int:
         return 0
     is_head = workdir.resolve() == head_dir.resolve()
     obs["overlay"] = None if is_head else overlay(head_dir, workdir, args.tests)
+    if args.extra_overlay:
+        import shutil
+        src_root = Path(__file__).resolve().parents[2] / args.extra_overlay
+        copied = []
+        for src in sorted(src_root.rglob("*")):
+            if src.is_file():
+                rel = src.relative_to(src_root)
+                (workdir / rel).parent.mkdir(parents = True, exist_ok = True)
+                shutil.copyfile(src, workdir / rel)
+                copied.append(str(rel))
+        obs["extra_overlay"] = {"from": str(src_root), "copied": copied}
+        if not copied:
+            obs["error"] = f"--extra-overlay {src_root} copied nothing"
     write()
     if subprocess.run([args.python, "-c", "import pytest"], capture_output = True).returncode != 0:
         subprocess.run([args.python, "-m", "pip", "install", "-q", "pytest", "pytest-asyncio"],
