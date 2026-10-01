@@ -49,9 +49,9 @@ jobs:
     # The cost is that the group holds one runner plus one waiter,
     # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
     # the job already running, not the one queued behind it. Re-run the job.
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
+    # No shared GPU group here: this job measures nothing timing-sensitive. It only reads the
+    # device's gfx arch (torch) and runs `llama-server --list-devices`; the work is a CPU
+    # build, like the suites job. Two attempts were evicted waiting on amd-ci-gfx1151-gpu.
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
