@@ -55,6 +55,70 @@ def _cmake_cache_keys(cache: Path) -> dict:
     return keys
 
 
+GGUF_URL = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+
+
+def _gen(folder: Path, model: Path, ngl: int) -> dict:
+    import re  # noqa: PLC0415
+    comp = folder / "llama-completion"
+    if comp.is_file():
+        cmd = [str(comp), "-m", str(model), "-no-cnv", "-n", "32", "-p", "Once upon a time",
+               "-ngl", str(ngl), "--temp", "0", "-s", "0"]
+    else:
+        cmd = [str(folder / "llama-cli"), "-m", str(model), "-st", "-lv", "3", "-n", "32",
+               "-p", "Once upon a time", "-ngl", str(ngl), "--temp", "0", "-s", "0"]
+    r: dict = {"cmd": " ".join(cmd)}
+    try:
+        p = subprocess.run(cmd, capture_output = True, text = True, timeout = 600,
+                           stdin = subprocess.DEVNULL, errors = "replace")
+        out, err = p.stdout or "", p.stderr or ""
+        r["rc"] = p.returncode
+    except Exception as e:  # noqa: BLE001
+        out, err = "", f"{type(e).__name__}: {e}"
+        r["rc"] = None
+    both = out + "\n" + err
+    r["buffer_lines"] = [l.strip() for l in both.splitlines() if "model buffer size" in l][:6]
+    m = [l for l in r["buffer_lines"] if "ROCm0" in l]
+    r["rocm0_buffer_line"] = m[0] if m else None
+    mb = re.search(r"ROCm0 model buffer size\s*=\s*([0-9.]+)\s*MiB", both)
+    r["rocm0_buffer_mib"] = float(mb.group(1)) if mb else 0.0
+    off = re.search(r"offloaded (\d+)/(\d+) layers to GPU", both)
+    r["offloaded_line"] = off.group(0) if off else None
+    r["offloaded"] = [int(off.group(1)), int(off.group(2))] if off else None
+    tm = re.search(r"Prompt:\s*([0-9.]+) t/s \| Generation:\s*([0-9.]+) t/s", both)
+    ev = re.search(r"eval time.*?([0-9.]+) tokens per second\)", both.split("prompt eval time")[-1]) if "eval time" in both else None
+    r["prompt_tps"] = float(tm.group(1)) if tm else None
+    r["gen_tps"] = float(tm.group(2)) if tm else (float(ev.group(1)) if ev else None)
+    r["timing_line"] = tm.group(0) if tm else None
+    r["stdout_tail"] = _tail(out, 1500)
+    r["stderr_tail"] = _tail(err, 2500)
+    text = out
+    if "Once upon a time" in text:
+        text = text.split("Once upon a time", 1)[1]
+    text = re.split(r"\n\[ Prompt:", text)[0]
+    r["generated_text"] = text.strip()[:600]
+    return r
+
+
+def run_model_checks(folder: Path, work: Path) -> dict:
+    res: dict = {"model_url": GGUF_URL}
+    model = work / "model-q4_k_m.gguf"
+    dl = _run(["curl", "-fsSL", "--retry", "3", "-o", str(model), GGUF_URL], timeout = 1200)
+    res["download_rc"] = dl["rc"]
+    res["model_bytes"] = model.stat().st_size if model.is_file() else 0
+    if not res["model_bytes"]:
+        res["download_err"] = dl["out"]
+        return res
+    res["gpu"] = _gen(folder, model, 99)
+    res["cpu"] = _gen(folder, model, 0)
+    q_out = work / "model-q4_0.gguf"
+    qcmd = [str(folder / "llama-quantize"), "--allow-requantize", str(model), str(q_out), "Q4_0"]
+    q = _run(qcmd, timeout = 600)
+    res["quantize"] = {"cmd": " ".join(qcmd), "rc": q["rc"], "tail": _tail(q["out"], 800),
+                       "out_bytes": q_out.stat().st_size if q_out.is_file() else 0}
+    return res
+
+
 def toolkit_facts() -> dict:
     f: dict = {}
     rp = os.environ.get("ROCM_PATH")
@@ -228,6 +292,7 @@ def main() -> int:
         cli = folder / "llama-cli"
         if cli.is_file():
             obs["cli_list_devices"] = _run([str(cli), "--list-devices"], timeout = 120)
+        obs["model_checks"] = run_model_checks(folder, arm_dir)
         srv = folder / "llama-server"
         if srv.is_file():
             obs["llama_server_ldd_hip"] = "libamdhip64" in _run(["ldd", str(srv)])["out"]

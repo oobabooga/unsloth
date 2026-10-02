@@ -64,6 +64,14 @@ def table(obs: dict) -> str:
                     f"{v.get('install_ok')} | {linked} | `{cache}` | {v.get('ggml_hip_dir_built')} | {dev} |")
     rows.append("")
     for n, v in _states(obs).items():
+        mc = v.get("model_checks")
+        if mc:
+            g, cpu, q = mc.get("gpu") or {}, mc.get("cpu") or {}, mc.get("quantize") or {}
+            rows.append(f"- {n} model {mc.get('model_url')} ({mc.get('model_bytes')} bytes): "
+                        f"GPU `{g.get('rocm0_buffer_line')}` / `{g.get('offloaded_line')}` / `{g.get('timing_line')}` rc={g.get('rc')}; "
+                        f"CPU `{cpu.get('timing_line')}` rc={cpu.get('rc')}; GPU text: {g.get('generated_text', '')[:200]!r}; "
+                        f"quantize rc={q.get('rc')} out_bytes={q.get('out_bytes')}")
+    for n, v in _states(obs).items():
         if v.get("install_ok"):
             rows.append(f"- {n}: llama-quantize --help {v.get('llama_quantize_help')}; nm -D hip symbols {v.get('nm_hip_symbols')}; "
                         f"strings {v.get('strings_hip')}; ldd hip={v.get('links')}; cache={v.get('cmake_cache_before_rm')}")
@@ -84,6 +92,9 @@ def head_is_fixed(head: dict):
     links = head.get("links") or {}
     cache = (head.get("cmake_cache_before_rm") or {}).get("GGML_HIP", "")
     hip_evidence = "GGML_HIP:BOOL=ON" in cache and (bool(links.get("libamdhip64")) or bool(head.get("nm_hip_symbols")))
-    fixed = ("-DGGML_HIP=ON" in cl and "-DGGML_CUDA=ON" not in cl and bool(head.get("configure_ok"))
+    g = (head.get("model_checks") or {}).get("gpu") or {}
+    off = g.get("offloaded") or [0, 0]
+    runs_on_gpu = (g.get("rocm0_buffer_mib") or 0) > 0 and off[0] > 0 and bool(g.get("generated_text"))
+    fixed = runs_on_gpu and ("-DGGML_HIP=ON" in cl and "-DGGML_CUDA=ON" not in cl and bool(head.get("configure_ok"))
              and bool(head.get("build_cmd_ok")) and bool(head.get("install_ok")) and hip_evidence)
     return fixed, f"configure={cl[:200]!r} build={head.get('build_cmd_ok')} hip_evidence={hip_evidence}"
