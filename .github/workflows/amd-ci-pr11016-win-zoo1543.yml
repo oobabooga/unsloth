@@ -129,7 +129,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # Same ROCm torch install.ps1 picks for gfx1151 (AMD multi-arch index).
-          & $py -m pip install -q --index-url "https://repo.amd.com/rocm/whl-multi-arch/" `
+          & $py -m pip install -q --retries 10 --timeout 120 --index-url "https://repo.amd.com/rocm/whl-multi-arch/" `
             --extra-index-url "https://pypi.org/simple" `
             "torch[device-gfx1151]==2.11.0+rocm7.14.1" "torchvision[device-gfx1151]==0.26.0+rocm7.14.1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

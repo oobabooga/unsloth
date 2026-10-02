@@ -93,18 +93,18 @@ def main() -> int:
         Path(vsite.strip(), "_studio_layer.pth").write_text(studio_site + "\n", encoding = "utf-8")
         rc, _, err = run([py, "-m", "ensurepip", "-q"])
         spec = f"{args.checkout}[huggingfacenotorch]"
-        rc, so, err = run([py, "-m", "pip", "install", "-q", "--upgrade", "--upgrade-strategy", "only-if-needed",
+        rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "--upgrade", "--upgrade-strategy", "only-if-needed",
                            spec, "transformers", "trl"])
         obs["install_rc"] = rc
         if rc:
             raise RuntimeError(f"install: {(so + err)[-2000:]}")
         if os.name == "nt":
             # Studio's setup.ps1 adds this on Windows x64; unsloth_zoo.compiler imports triton.
-            rc, so, err = run([py, "-m", "pip", "install", "-q", "triton-windows<3.7"])
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "triton-windows<3.7"])
             obs["triton_windows_rc"] = rc
         if args.zoo_spec:
             # Same version string as the released zoo, so force it over whatever the resolver picked.
-            rc, so, err = run([py, "-m", "pip", "install", "-q", "--force-reinstall", "--no-deps", args.zoo_spec])
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "--force-reinstall", "--no-deps", args.zoo_spec])
             obs["zoo_spec"], obs["zoo_install_rc"] = args.zoo_spec, rc
             if rc:
                 raise RuntimeError(f"zoo install: {(so + err)[-2000:]}")
