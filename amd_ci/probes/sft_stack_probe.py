@@ -76,6 +76,7 @@ def main() -> int:
     ap.add_argument("--checkout", required = True)
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--python", default = sys.executable)
+    ap.add_argument("--env", action = "append", default = [], help = "KEY=VALUE set for the training runs")
     ap.add_argument("--zoo-spec", default = "",
                     help = "pip spec for unsloth_zoo installed into every state (e.g. a git ref under review)")
     args = ap.parse_args()
@@ -114,6 +115,8 @@ def main() -> int:
                                                      "unsloth", "unsloth-zoo", "unsloth_zoo", "torch")}
         env = dict(os.environ, PYTHONPATH = args.checkout, UNSLOTH_DISABLE_AUTO_UPDATES = "1",
                    UNSLOTH_COMPILE_LOCATION = str(root / "cc"))
+        env.update(kv.split("=", 1) for kv in args.env)
+        obs["extra_env"] = args.env
         obs["runs"] = {}
         for name, model in MODELS.items():
             work = root / f"run_{name}"

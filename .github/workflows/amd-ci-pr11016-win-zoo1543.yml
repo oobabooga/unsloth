@@ -145,7 +145,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/sft_stack_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/sft_stack_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --zoo-spec 'unsloth_zoo @ https://github.com/unslothai/unsloth-zoo/archive/d0ae13163af381db8d8df85261d11f34e52526d3.zip'
+            --python "$env:AMD_CI_PY" -- --zoo-spec 'unsloth_zoo @ https://github.com/unslothai/unsloth-zoo/archive/d0ae13163af381db8d8df85261d11f34e52526d3.zip' --env UNSLOTH_COMPILE_DISABLE=1 --env TORCHDYNAMO_DISABLE=1 --env AMD_SERIALIZE_KERNEL=3
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
