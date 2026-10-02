@@ -99,8 +99,8 @@ def main() -> int:
         if rc:
             raise RuntimeError(f"install: {(so + err)[-2000:]}")
         if os.name == "nt":
-            # Studio's setup.ps1 adds this on Windows x64; unsloth_zoo.compiler imports triton.
-            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "triton-windows<3.7"])
+            # Studio's setup.ps1 adds these on Windows x64: unsloth_zoo imports triton and checks bitsandbytes.
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "triton-windows<3.7", "bitsandbytes"])
             obs["triton_windows_rc"] = rc
         if args.zoo_spec:
             # Same version string as the released zoo, so force it over whatever the resolver picked.
