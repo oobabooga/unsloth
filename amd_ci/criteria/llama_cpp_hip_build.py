@@ -94,7 +94,11 @@ def head_is_fixed(head: dict):
     hip_evidence = "GGML_HIP:BOOL=ON" in cache and (bool(links.get("libamdhip64")) or bool(head.get("nm_hip_symbols")))
     g = (head.get("model_checks") or {}).get("gpu") or {}
     off = g.get("offloaded") or [0, 0]
-    runs_on_gpu = (g.get("rocm0_buffer_mib") or 0) > 0 and off[0] > 0 and bool(g.get("generated_text"))
+    import re  # noqa: PLC0415
+    # llama-cli logs a 0.00 MiB ROCm0 line from its memory-fit dry pass before the real load: take the max.
+    bufs = [float(m.group(1)) for l in g.get("buffer_lines") or []
+            for m in [re.search(r"ROCm0 model buffer size\s*=\s*([0-9.]+)", l)] if m]
+    runs_on_gpu = max(bufs, default = 0.0) > 0 and off[0] > 0 and bool(g.get("generated_text"))
     fixed = runs_on_gpu and ("-DGGML_HIP=ON" in cl and "-DGGML_CUDA=ON" not in cl and bool(head.get("configure_ok"))
              and bool(head.get("build_cmd_ok")) and bool(head.get("install_ok")) and hip_evidence)
     return fixed, f"configure={cl[:200]!r} build={head.get('build_cmd_ok')} hip_evidence={hip_evidence}"
