@@ -1,0 +1,89 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-probe:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - name: Backend A/B
+        run: |
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/tmp"
+          export TMPDIR="$W/tmp"
+          bash ci/ci/checkouts.sh "$W"
+          python3 -m venv "$W/venv"
+          "$W/venv/bin/pip" -q install httpx structlog
+          SRC_MAIN="$W/main" SRC_FIX="$W/fix" WORK="$W" OUT="$W/out" "$W/venv/bin/python" -u ci/ci/probe.py
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-probe
+          path: ${{ runner.temp }}/w/out
+          if-no-files-found: warn
+
+  windows-probe:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - name: Backend A/B
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force $W | Out-Null
+          git -c core.autocrlf=false clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\main"
+          git -C "$W\main" checkout -q (Get-Content ci\ci\base.txt).Trim()
+          Copy-Item -Recurse "$W\main" "$W\fix"
+          git -C "$W\fix" apply --whitespace=nowarn "$PWD\ci\ci\fix.patch"
+          if ($LASTEXITCODE) { throw "the patch did not apply" }
+          git -C "$W\fix" status --short
+          python -m venv "$W\venv"
+          & "$W\venv\Scripts\python.exe" -m pip -q install httpx structlog
+          $env:SRC_MAIN = "$W\main"; $env:SRC_FIX = "$W\fix"; $env:WORK = $W; $env:OUT = "$W\out"
+          $env:PYTHONIOENCODING = "utf-8"
+          & "$W\venv\Scripts\python.exe" -u ci\ci\probe.py
+          # Daniel's model on Daniel's OS, through dropped connections.
+          $env:VARIANTS = "fix"; $env:SCENARIOS = "big"; $env:OUT = "$W\out\big"
+          & "$W\venv\Scripts\python.exe" -u ci\ci\probe.py
+          exit $LASTEXITCODE
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-probe
+          path: ${{ runner.temp }}\w\out
+          if-no-files-found: warn
+
+  linux-ui:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - name: Setup
+        run: bash ci/ci/setup.sh
+      - name: A/B
+        run: |
+          W="$RUNNER_TEMP/w"
+          export TMPDIR="$W/tmp" PLAYWRIGHT_BROWSERS_PATH="$W/cache/pw" HF_HUB_DISABLE_XET=1
+          W="$W" OUT="$W/out" PY="$W/inst/unsloth_studio/bin/python" PW_PY="$W/pw/bin/python" \
+            "$W/pw/bin/python" -u ci/ci/ab_run.py
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-ui
+          path: |
+            ${{ runner.temp }}/w/out
+            ${{ runner.temp }}/w/install.log
+          if-no-files-found: warn

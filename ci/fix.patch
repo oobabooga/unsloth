@@ -1,0 +1,2598 @@
+diff --git a/studio/backend/core/inference/flm_files.py b/studio/backend/core/inference/flm_files.py
+new file mode 100644
+index 0000000000..1f7a8464de
+--- /dev/null
++++ b/studio/backend/core/inference/flm_files.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Download a FastFlowLM model's files with resume, into the folder FastFlowLM reads.
++
++FastFlowLM's own pull cannot resume. It writes each file straight to its final name, starts a
++failed file over from zero (three tries), must finish each file within an hour, and takes a file a
++killed pull left half-written as complete. Studio downloads the files here instead: each one goes
++to ``<name>.partial``, continues from there with a Range request after any interruption, and is
++renamed only once its hash matches. lemond's pull then finds every file present and only
++registers the model.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import re
++import time
++from dataclasses import dataclass
++from functools import lru_cache
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++import httpx
++
++logger = logging.getLogger(__name__)
++
++_CHUNK = 1 << 20
++# Attempts in a row that get no further into the file before a download gives up.
++_MAX_STALLED_ATTEMPTS = 5
++_RETRY_DELAY_SECONDS = 2.0
++_RETRIED_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
++
++
++class FlmDownloadError(RuntimeError):
++    """A file could not be downloaded; the message is safe to show the user."""
++
++
++@dataclass(frozen = True)
++class FlmFile:
++    name: str
++    url: str
++    size: int
++    # sha256 of the content for LFS files, git's blob sha1 otherwise: what FastFlowLM checks.
++    digest: str
++    lfs: bool
++
++
++@dataclass(frozen = True)
++class FlmModelFiles:
++    folder: Path
++    files: tuple[FlmFile, ...]
++
++    @property
++    def total(self) -> int:
++        return sum(file.size for file in self.files)
++
++    def resume_percent(self) -> Optional[int]:
++        """How much of the model an interrupted download left on disk, or None if nothing."""
++        done = 0
++        for file in self.files:
++            for path in (self.folder / file.name, _partial(self.folder / file.name)):
++                try:
++                    done += min(path.stat().st_size, file.size)
++                    break
++                except OSError:
++                    continue
++        return done * 100 // self.total if done and self.total else None
++
++
++def _partial(path: Path) -> Path:
++    return path.with_name(path.name + ".partial")
++
++
++@lru_cache(maxsize = 4)
++def _parsed(path: Path, stamp: tuple[int, int]) -> Any:
++    return json.loads(path.read_text(encoding = "utf-8"))
++
++
++def _load(path: Path) -> Any:
++    """Parsed once per version of the file: the catalog reads it for every model it lists."""
++    info = path.stat()
++    return _parsed(path, (info.st_mtime_ns, info.st_size))
++
++
++def read_model_files(
++    flm_binary: Optional[Path], flm_model_path: Path, checkpoint: str
++) -> Optional[FlmModelFiles]:
++    """The files FastFlowLM expects for ``checkpoint`` (``family:size``), from the manifests it
++    ships next to its binary. None when they cannot be read, so the caller falls back to lemond.
++    """
++    if flm_binary is None or ":" not in checkpoint:
++        return None
++    family, size = checkpoint.split(":", 1)
++    try:
++        listing = _load(flm_binary.parent / "model_list.json")
++        hashes = _load(flm_binary.parent / "model_info.json")
++        entry = listing["models"][family][size]
++        known = {row["path"]: row for row in hashes[checkpoint]}
++        base = entry["url"].rstrip("/")
++        # FastFlowLM's own rule: a url naming a revision already ends in /resolve/<revision>.
++        if "/resolve" not in base:
++            base += "/resolve/main"
++        files = []
++        for name in entry["files"]:
++            row = known.get(name)
++            if row is None:  # FastFlowLM skips a file its hash list does not name.
++                continue
++            lfs = isinstance(row.get("lfs"), dict)
++            files.append(
++                FlmFile(
++                    name = name,
++                    url = f"{base}/{name}?download=true",
++                    size = int(row["size"]),
++                    digest = row["lfs"]["oid"] if lfs else row["oid"],
++                    lfs = lfs,
++                )
++            )
++        folder = flm_model_path / listing["model_path"] / entry["name"]
++    except (OSError, ValueError, KeyError, TypeError) as exc:
++        logger.debug("Could not read FastFlowLM's file list for %s: %s", checkpoint, exc)
++        return None
++    if not files:
++        return None
++    return FlmModelFiles(folder = folder, files = tuple(files))
++
++
++def _hasher(file: FlmFile):
++    if file.lfs:
++        return hashlib.sha256()
++    digest = hashlib.sha1()
++    digest.update(f"blob {file.size}\0".encode())
++    return digest
++
++
++def download_files(
++    model: FlmModelFiles, client: Optional[httpx.Client] = None
++) -> Iterator[dict[str, Any]]:
++    """Download every missing file, yielding progress over the whole model as its percent moves.
++
++    Raises FlmDownloadError when a file stops making progress or fails its hash check. Whatever
++    was written stays in ``.partial`` files, so the next call continues from there.
++    """
++    model.folder.mkdir(parents = True, exist_ok = True)
++    owned = client is None
++    client = client or httpx.Client(follow_redirects = True, timeout = httpx.Timeout(30.0, read = 120.0))
++    total = model.total
++    completed = 0  # bytes of the files already in place
++    # One event per percent and per file: a follower replays them all, and a pull can take hours.
++    reported = None
++    try:
++        for file in model.files:
++            final = model.folder / file.name
++            partial = _partial(final)
++            try:
++                have = final.stat().st_size
++            except FileNotFoundError:
++                have = None
++            if have == file.size:
++                partial.unlink(missing_ok = True)
++                completed += file.size
++                continue
++            if have is not None:
++                # A killed FastFlowLM pull leaves a prefix under the final name: continue it.
++                if have < file.size:
++                    final.replace(partial)
++                else:
++                    final.unlink()
++            for offset in _download_file(client, file, partial):
++                done = completed + offset
++                percent = min(99, done * 100 // total)
++                if (file.name, percent) != reported:
++                    reported = (file.name, percent)
++                    yield {
++                        "event": "progress",
++                        "file": file.name,
++                        "bytes_downloaded": done,
++                        "bytes_total": total,
++                        "percent": percent,
++                    }
++            partial.replace(final)
++            completed += file.size
++    finally:
++        if owned:
++            client.close()
++
++
++def _resumed_from(response: httpx.Response) -> Optional[int]:
++    """The first byte a 206 answer carries, from ``Content-Range: bytes <start>-<end>/<size>``."""
++    match = re.match(r"bytes (\d+)-", response.headers.get("Content-Range", ""))
++    return int(match.group(1)) if match else None
++
++
++def _download_file(client: httpx.Client, file: FlmFile, partial: Path) -> Iterator[int]:
++    """Bring ``partial`` up to the whole file and check its hash, yielding its size as it grows."""
++    digest = _hasher(file)
++    offset = 0
++    try:
++        with open(partial, "rb") as handle:
++            while chunk := handle.read(_CHUNK):
++                digest.update(chunk)
++                offset += len(chunk)
++    except FileNotFoundError:
++        pass
++    if offset > file.size:
++        partial.unlink()
++        digest, offset = _hasher(file), 0
++    yield offset
++    # Progress is a byte never reached before: a server that ignores Range restarts the file, and
++    # fetching the same prefix again must still count toward giving up.
++    furthest = offset
++    stalled = 0
++    while offset < file.size:
++        try:
++            headers = {"Range": f"bytes={offset}-"} if offset else {}
++            with client.stream("GET", file.url, headers = headers) as response:
++                status = response.status_code
++                if status == 200 and offset:
++                    # The server ignored the Range header and sent the whole file.
++                    digest, offset = _hasher(file), 0
++                    yield offset
++                elif status == 206 and _resumed_from(response) != offset:
++                    raise httpx.RemoteProtocolError(
++                        f"asked for byte {offset}, got {response.headers.get('Content-Range')}"
++                    )
++                elif status not in (200, 206):
++                    if status not in _RETRIED_STATUSES:
++                        raise FlmDownloadError(f"Downloading {file.name} failed: HTTP {status}")
++                    raise httpx.HTTPStatusError(
++                        f"HTTP {status}", request = response.request, response = response
++                    )
++                with open(partial, "ab" if offset else "wb") as handle:
++                    for chunk in response.iter_bytes():
++                        handle.write(chunk)
++                        digest.update(chunk)
++                        offset += len(chunk)
++                        yield offset
++            if offset < file.size:
++                raise httpx.RemoteProtocolError("the connection closed before the file ended")
++        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
++            stalled = 0 if offset > furthest else stalled + 1
++            furthest = max(furthest, offset)
++            if stalled >= _MAX_STALLED_ATTEMPTS:
++                raise FlmDownloadError(f"Downloading {file.name} failed: {exc}") from exc
++            logger.warning(
++                "Downloading %s stopped at %d of %d bytes (%s); resuming",
++                file.name,
++                offset,
++                file.size,
++                exc,
++            )
++            time.sleep(_RETRY_DELAY_SECONDS * max(stalled, 1))
++    if offset != file.size or digest.hexdigest() != file.digest:
++        partial.unlink(missing_ok = True)
++        raise FlmDownloadError(
++            f"{file.name} did not match its published hash; it was removed, so try again."
++        )
+diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
+index 3f414f554a..51f5081c10 100644
+--- a/studio/backend/core/inference/npu_backend.py
++++ b/studio/backend/core/inference/npu_backend.py
+@@ -19,6 +19,12 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Iterator, Optional
+ 
++from core.inference.flm_files import (
++    FlmDownloadError,
++    FlmModelFiles,
++    download_files,
++    read_model_files,
++)
+ from core.inference.lemonade_server import LemonadeServer, LemonadeUnavailable
+ from utils.hardware.npu import detect_amd_npu
+ from utils.native_path_leases import child_env_without_native_path_secret
+@@ -77,6 +83,8 @@ class NpuModel:
+     downloaded: bool
+     labels: tuple[str, ...]
+     max_context_length: Optional[int]
++    # How much of a model an interrupted download left on disk, which the next one continues.
++    resume_percent: Optional[int] = None
+ 
+     @property
+     def vision(self) -> bool:
+@@ -106,6 +114,7 @@ class NpuModel:
+             "supports_reasoning": self.reasoning,
+             "supports_tools": self.tools,
+             "max_context_length": self.max_context_length,
++            "resume_percent": self.resume_percent,
+         }
+ 
+ 
+@@ -228,6 +237,11 @@ class LemonadeNpuBackend:
+     def root(self) -> Path:
+         return self._root if self._root is not None else _npu_root()
+ 
++    @property
++    def _flm_model_dir(self) -> Path:
++        """FastFlowLM's FLM_MODEL_PATH, where its models and Studio's downloads of them live."""
++        return self.root / "flm"
++
+     def _installed_lemond(self) -> Optional[Path]:
+         try:
+             return _installer_module().installed_lemond(self.root)
+@@ -317,7 +331,7 @@ class LemonadeNpuBackend:
+             binary,
+             cache_dir = self.root / "cache",
+             config_dir = self.root / "config",
+-            flm_model_dir = self.root / "flm",
++            flm_model_dir = self._flm_model_dir,
+         )
+ 
+     def _require_supported(self) -> None:
+@@ -395,7 +409,7 @@ class LemonadeNpuBackend:
+         if binary is None:
+             return {"ready": False, "problems": ["FastFlowLM was not found after installing it."]}
+         env = child_env_without_native_path_secret()
+-        env["FLM_MODEL_PATH"] = str(self.root / "flm")
++        env["FLM_MODEL_PATH"] = str(self._flm_model_dir)
+         env["FLM_DISABLE_UPDATE_CHECK"] = "1"
+         if self._closing.is_set():
+             return {"ready": False, "problems": ["Unsloth is shutting down."]}
+@@ -469,6 +483,7 @@ class LemonadeNpuBackend:
+         if _failed(response):
+             raise NpuError(f"Listing NPU models failed: {_error_message(response)}")
+         models: list[NpuModel] = []
++        flm_binary = self._flm_binary()
+         for row in response.json().get("data") or []:
+             if not isinstance(row, dict) or row.get("recipe") != "flm":
+                 continue
+@@ -476,18 +491,25 @@ class LemonadeNpuBackend:
+             if "chat" not in labels or _EXCLUDED_LABELS.intersection(labels):
+                 continue
+             size = row.get("size")
++            checkpoint = str(row.get("checkpoint") or "")
++            downloaded = bool(row.get("downloaded"))
++            files = None if downloaded else self._model_files(checkpoint, flm_binary)
+             models.append(
+                 NpuModel(
+                     id = str(row.get("id")),
+-                    checkpoint = str(row.get("checkpoint") or ""),
++                    checkpoint = checkpoint,
+                     size_gb = float(size) if isinstance(size, (int, float)) else None,
+-                    downloaded = bool(row.get("downloaded")),
++                    downloaded = downloaded,
+                     labels = labels,
+                     max_context_length = _positive_int(row.get("max_context_window")),
++                    resume_percent = files.resume_percent() if files else None,
+                 )
+             )
+         return sorted(models, key = lambda model: (not model.downloaded, model.id))
+ 
++    def _model_files(self, checkpoint: str, flm_binary: Optional[Path]) -> Optional[FlmModelFiles]:
++        return read_model_files(flm_binary, self._flm_model_dir, checkpoint)
++
+     def _model(self, model_id: str) -> NpuModel:
+         for model in self.catalog():
+             if model.id == model_id:
+@@ -505,16 +527,40 @@ class LemonadeNpuBackend:
+         return model
+ 
+     def download(self, model_id: str) -> Iterator[dict[str, Any]]:
+-        """Pull a model, yielding lemond's progress events, then a final ``complete`` one.
++        """Download a model, yielding progress events, then a final ``complete`` one.
++
++        Studio fetches the files itself when it can read FastFlowLM's file list, which lets an
++        interrupted download continue where it stopped; lemond's pull then only registers the
++        model. Otherwise lemond downloads it and its events are relayed.
+ 
+         Raises unless lemond sent its ``complete`` event: a stream cut short leaves a partial model.
+         """
+         model = self._model(model_id)
+         server = self._ensure_running()
++        files = (
++            None if model.downloaded else self._model_files(model.checkpoint, self._flm_binary())
++        )
++        if files is not None:
++            try:
++                yield from download_files(files)
++            except FlmDownloadError as exc:
++                raise NpuError(str(exc)) from exc
++        elif not model.downloaded:
++            logger.warning(
++                "FastFlowLM's file list is unreadable; lemond downloads %s, without resume",
++                model.id,
++            )
++            # FastFlowLM keeps the partial file of an interrupted pull, and the next pull skips it
++            # as complete, leaving a truncated model. Clear it so this pull starts whole. The
++            # answer is not checked: with nothing to clear, or a refusal, the pull runs as before.
++            server.request("POST", "/v1/delete", json_body = {"model_name": model.id})
+         event = "progress"
+         completed = False
+         with server.stream(
+-            "POST", "/v1/pull", json_body = {"model_name": model.id, "stream": True}
++            "POST",
++            "/v1/pull",
++            # Not --force, which would hash every file FastFlowLM already has once more.
++            json_body = {"model_name": model.id, "stream": True, "do_not_upgrade": True},
+         ) as response:
+             if response.status_code != 200:
+                 response.read()
+@@ -539,7 +585,9 @@ class LemonadeNpuBackend:
+                 if isinstance(data, dict) and data.get("status") == "error":
+                     raise NpuError(f"Downloading {model.id} failed: {data.get('message') or data}")
+                 completed = completed or event == "complete"
+-                if isinstance(data, dict):
++                # After Studio's own download lemond has nothing left to fetch, and its percent,
++                # which restarts with each file, would only move the bar backwards.
++                if isinstance(data, dict) and (files is None or event == "complete"):
+                     yield {"event": event, **data}
+                 event = "progress"
+         if not completed:
+diff --git a/studio/backend/routes/models.py b/studio/backend/routes/models.py
+index cbc30a6dd5..0301f8d520 100644
+--- a/studio/backend/routes/models.py
++++ b/studio/backend/routes/models.py
+@@ -2260,9 +2260,13 @@ async def get_model_config(
+     """Get configuration for a specific model (wraps load_model_defaults)."""
+     # An API-key caller is shown a filesystem-backed row under an opaque `ref:` handle and hands
+     # it back here, where it would otherwise read as a Hugging Face id.
++    from core.inference.npu_backend import is_npu_model_path
+     from models.inference import resolve_inventory_handle
+ 
+     model_name = resolve_inventory_handle(model_name)
++    # Lemonade owns NPU models; they have no Hugging Face repo or local folder to inspect.
++    if is_npu_model_path(model_name):
++        return ModelDetails(id = model_name, model_name = model_name, model_type = "text")
+     if local_path:
+         local_path = resolve_inventory_handle(local_path)
+     if local_path:
+diff --git a/studio/backend/routes/npu.py b/studio/backend/routes/npu.py
+index 26cdfddc1c..93531e0d99 100644
+--- a/studio/backend/routes/npu.py
++++ b/studio/backend/routes/npu.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import threading
++from typing import Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException
+ from fastapi.responses import StreamingResponse
+@@ -20,8 +21,10 @@ from auth import policy
+ from auth.authentication import get_current_subject
+ from core.inference.npu_backend import NpuError, get_npu_backend
+ from hub.services.models import account_access
++from loggers import get_logger
+ 
+ router = APIRouter()
++logger = get_logger(__name__)
+ 
+ _MANAGED_ACCOUNT_STATUS = {
+     "supported": False,
+@@ -56,6 +59,13 @@ class _Download:
+             self.events.append(event)
+             self.changed.notify_all()
+ 
++    def percent(self) -> Optional[float]:
++        with self.changed:
++            for event in reversed(self.events):
++                if isinstance(event.get("percent"), (int, float)):
++                    return event["percent"]
++        return None
++
+     def follow(self):
+         """Every event so far, then each new one, until the pull ends."""
+         seen = 0
+@@ -83,18 +93,30 @@ def _start_download(npu, model_id: str) -> _Download:
+         job = _Download()
+         _downloads[model_id] = job
+ 
++    def _progress() -> str:
++        percent = job.percent()
++        return "" if percent is None else f" at {percent}%"
++
+     def _run() -> None:
++        logger.info(f"Downloading NPU model {model_id}")
+         try:
+             for event in npu.download(model_id):
+                 job.publish(event)
++            logger.info(f"Downloaded NPU model {model_id}")
+         except NpuError as exc:
++            logger.warning(f"NPU model download of {model_id} failed{_progress()}: {exc}")
+             job.publish({"event": "error", "error": str(exc)})
+         except Exception as exc:  # noqa: BLE001 -- reported on the stream, not lost in a thread
++            logger.exception(f"NPU model download of {model_id} failed{_progress()}")
+             job.publish({"event": "error", "error": f"Downloading {model_id} failed: {exc}"})
+         finally:
+             with job.changed:
+                 job.finished = True
+                 job.changed.notify_all()
++            # Followers hold their own reference; nothing else reads a finished pull.
++            with _downloads_lock:
++                if _downloads.get(model_id) is job:
++                    del _downloads[model_id]
+ 
+     threading.Thread(target = _run, daemon = True, name = "npu-pull").start()
+     return job
+@@ -126,14 +148,17 @@ async def list_npu_models():
+     return {"models": [model.to_json() for model in models]}
+ 
+ 
+-@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
+-async def download_npu_model(model_id: str):
+-    """Stream download progress through a final complete or error event.
++@router.get("/downloads", dependencies = [Depends(_require_installation_owner)])
++async def list_npu_downloads():
++    """Pulls still running, so a reopened page can follow them again."""
++    with _downloads_lock:
++        running = [(model_id, job) for model_id, job in _downloads.items() if not job.finished]
++    return {
++        "downloads": [{"model": model_id, "percent": job.percent()} for model_id, job in running]
++    }
+ 
+-    Disconnecting stops progress updates, not the download.
+-    """
+-    job = _start_download(get_npu_backend(), model_id)
+ 
++def _event_stream(job: _Download) -> StreamingResponse:
+     def _events():
+         for event in job.follow():
+             yield f"data: {json.dumps(event)}\n\n"
+@@ -145,6 +170,25 @@ async def download_npu_model(model_id: str):
+     )
+ 
+ 
++@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
++async def download_npu_model(model_id: str):
++    """Stream download progress through a final complete or error event.
++
++    Disconnecting stops progress updates, not the download.
++    """
++    return _event_stream(_start_download(get_npu_backend(), model_id))
++
++
++@router.get("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
++async def follow_npu_download(model_id: str):
++    """The running pull's progress, from its first event. Never starts or retries one."""
++    with _downloads_lock:
++        job = _downloads.get(model_id)
++    if job is None or job.finished:
++        raise HTTPException(status_code = 404, detail = f"{model_id} is not downloading.")
++    return _event_stream(job)
++
++
+ @router.delete("/models/{model_id}", dependencies = [Depends(_require_installation_owner)])
+ async def delete_npu_model(model_id: str):
+     try:
+diff --git a/studio/backend/tests/test_flm_files.py b/studio/backend/tests/test_flm_files.py
+new file mode 100644
+index 0000000000..8bdd89360b
+--- /dev/null
++++ b/studio/backend/tests/test_flm_files.py
+@@ -0,0 +1,288 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Resumable FastFlowLM file downloads against a local server that can drop connections."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from core.inference import flm_files as ff
++
++WEIGHTS = os.urandom(3 * (1 << 20) + 123)
++CONFIG = b'{"flm_version": "1.0.3"}'
++
++
++class _Files:
++    """Serves WEIGHTS and CONFIG, honouring Range unless told not to."""
++
++    def __init__(self) -> None:
++        self.ranges: list[str | None] = []
++        # Bytes each successive response sends before closing the connection; None sends it all.
++        self.cut_after: list[int | None] = []
++        self.ignore_range = False
++        # Answers a Range request with 206 from byte 0, as a broken cache might.
++        self.wrong_range = False
++        self.status: int | None = None
++        files = self
++
++        class Handler(BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"
++
++            def log_message(self, *args) -> None:
++                return
++
++            def do_GET(self) -> None:  # noqa: N802
++                name = self.path.split("?")[0].rsplit("/", 1)[-1]
++                body = {"model.q4nx": WEIGHTS, "config.json": CONFIG}.get(name)
++                if files.status is not None or body is None:
++                    self.send_response(files.status or 404)
++                    self.send_header("Content-Length", "0")
++                    self.end_headers()
++                    return
++                requested = self.headers.get("Range")
++                files.ranges.append(requested)
++                start = 0
++                if requested and not files.ignore_range:
++                    start = (
++                        0
++                        if files.wrong_range
++                        else int(requested.removeprefix("bytes=").rstrip("-"))
++                    )
++                    self.send_response(206)
++                    self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
++                else:
++                    self.send_response(200)
++                self.send_header("Content-Length", str(len(body) - start))
++                self.end_headers()
++                cut = files.cut_after.pop(0) if files.cut_after else None
++                self.wfile.write(body[start:] if cut is None else body[start : start + cut])
++                if cut is not None:
++                    self.close_connection = True
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        threading.Thread(target = self.server.serve_forever, daemon = True).start()
++        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/FastFlowLM/Tiny-NPU2"
++
++    def model(
++        self,
++        folder: Path,
++        weights_digest: str | None = None,
++    ) -> ff.FlmModelFiles:
++        blob = hashlib.sha1(f"blob {len(CONFIG)}\0".encode() + CONFIG).hexdigest()
++        return ff.FlmModelFiles(
++            folder = folder,
++            files = (
++                ff.FlmFile("config.json", f"{self.url}/config.json", len(CONFIG), blob, False),
++                ff.FlmFile(
++                    "model.q4nx",
++                    f"{self.url}/model.q4nx",
++                    len(WEIGHTS),
++                    weights_digest or hashlib.sha256(WEIGHTS).hexdigest(),
++                    True,
++                ),
++            ),
++        )
++
++
++@pytest.fixture
++def files(monkeypatch):
++    monkeypatch.setattr(ff, "_RETRY_DELAY_SECONDS", 0.0)
++    server = _Files()
++    yield server
++    server.server.shutdown()
++    server.server.server_close()
++
++
++def _percents(events) -> list[int]:
++    return [event["percent"] for event in events]
++
++
++def test_files_land_whole_with_progress_over_the_model(files, tmp_path):
++    events = list(ff.download_files(files.model(tmp_path)))
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++    assert (tmp_path / "config.json").read_bytes() == CONFIG
++    assert not list(tmp_path.glob("*.partial"))
++    percents = _percents(events)
++    assert percents == sorted(percents) and percents[-1] == 99
++    # One event per percent, over the whole model; lemond's pull then brings the 100.
++    assert len(events) <= 100 + 2
++    assert {event["bytes_total"] for event in events} == {len(WEIGHTS) + len(CONFIG)}
++
++
++def test_a_dropped_connection_continues_from_the_byte_it_reached(files, tmp_path):
++    files.cut_after = [None, 1 << 20, 5000]  # config.json whole, then the weights in three goes
++    list(ff.download_files(files.model(tmp_path)))
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++    assert files.ranges == [None, None, f"bytes={1 << 20}-", f"bytes={(1 << 20) + 5000}-"]
++
++
++def test_an_interrupted_download_resumes_in_the_next_one(files, tmp_path):
++    model = files.model(tmp_path)
++    downloading = ff.download_files(model)
++    for event in downloading:
++        if event["file"] == "model.q4nx" and event["bytes_downloaded"] > len(CONFIG) + (1 << 20):
++            break
++    downloading.close()
++    kept = (tmp_path / "model.q4nx.partial").stat().st_size
++    assert not (tmp_path / "model.q4nx").exists()
++    assert model.resume_percent() == (len(CONFIG) + kept) * 100 // model.total
++
++    events = list(ff.download_files(model))
++    assert files.ranges[-1] == f"bytes={kept}-"
++    assert events[0]["percent"] == (len(CONFIG) + kept) * 100 // model.total
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++
++
++def test_a_prefix_fastflowlm_left_under_the_final_name_is_continued(files, tmp_path):
++    # A killed `flm pull` leaves this, and FastFlowLM would then take the model as complete.
++    (tmp_path / "config.json").write_bytes(CONFIG)
++    (tmp_path / "model.q4nx").write_bytes(WEIGHTS[:4096])
++    list(ff.download_files(files.model(tmp_path)))
++    assert files.ranges == ["bytes=4096-"]
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++
++
++def test_a_server_that_ignores_range_sends_the_file_again(files, tmp_path):
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS[:4096])
++    files.ignore_range = True
++    list(ff.download_files(files.model(tmp_path)))
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++
++
++def test_refetching_the_same_prefix_is_not_progress(files, tmp_path):
++    # A server that ignores Range and drops every connection early restarts the file each time,
++    # never passing the byte already reached; that must count as stalled, not loop forever.
++    (tmp_path / "config.json").write_bytes(CONFIG)
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS[:4096])
++    files.ignore_range = True
++    files.cut_after = [1000] * 20
++    with pytest.raises(ff.FlmDownloadError, match = "model.q4nx failed"):
++        list(ff.download_files(files.model(tmp_path)))
++    assert len(files.ranges) == ff._MAX_STALLED_ATTEMPTS
++
++
++def test_a_restart_that_passes_the_furthest_byte_is_progress(files, tmp_path):
++    (tmp_path / "config.json").write_bytes(CONFIG)
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS[:4096])
++    files.ignore_range = True
++    # Four stalls, a restart that gets past byte 4096, then four more stalls before it lands.
++    files.cut_after = [1000] * 4 + [6000] + [1000] * 4
++    list(ff.download_files(files.model(tmp_path)))
++    assert len(files.ranges) == 10
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++
++
++def test_a_206_from_the_wrong_byte_is_not_appended(files, tmp_path):
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS[:4096])
++    files.wrong_range = True
++    with pytest.raises(ff.FlmDownloadError, match = "asked for byte 4096"):
++        list(ff.download_files(files.model(tmp_path)))
++    assert (tmp_path / "model.q4nx.partial").read_bytes() == WEIGHTS[:4096]
++
++
++def test_an_oversized_partial_starts_over_and_is_counted_once(files, tmp_path):
++    (tmp_path / "config.json").write_bytes(CONFIG)
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS + b"stale tail")
++    events = list(ff.download_files(files.model(tmp_path)))
++    assert files.ranges == [None]
++    assert max(event["bytes_downloaded"] for event in events) <= events[0]["bytes_total"]
++    assert (tmp_path / "model.q4nx").read_bytes() == WEIGHTS
++
++
++def test_a_complete_file_drops_a_leftover_partial(files, tmp_path):
++    (tmp_path / "config.json").write_bytes(CONFIG)
++    (tmp_path / "model.q4nx").write_bytes(WEIGHTS)
++    (tmp_path / "model.q4nx.partial").write_bytes(WEIGHTS[:4096])
++    assert list(ff.download_files(files.model(tmp_path))) == []
++    assert not (tmp_path / "model.q4nx.partial").exists()
++
++
++def test_a_file_that_fails_its_hash_is_removed(files, tmp_path):
++    with pytest.raises(ff.FlmDownloadError, match = "did not match its published hash"):
++        list(ff.download_files(files.model(tmp_path, weights_digest = "0" * 64)))
++    assert not (tmp_path / "model.q4nx").exists()
++    assert not (tmp_path / "model.q4nx.partial").exists()
++
++
++def test_a_missing_file_fails_without_retrying(files, tmp_path):
++    files.status = 404
++    with pytest.raises(ff.FlmDownloadError, match = "HTTP 404"):
++        list(ff.download_files(files.model(tmp_path)))
++    assert files.ranges == []
++
++
++def test_a_download_that_stops_progressing_gives_up(files, tmp_path):
++    files.status = 503
++    with pytest.raises(ff.FlmDownloadError, match = "503"):
++        list(ff.download_files(files.model(tmp_path)))
++
++
++def test_the_file_list_comes_from_fastflowlm_manifests(tmp_path):
++    flm = tmp_path / "bin" / "flm"
++    flm.parent.mkdir()
++    (flm.parent / "model_list.json").write_text(
++        json.dumps(
++            {
++                "model_path": "models",
++                "models": {
++                    "qwen3.6-moe": {
++                        "35b-a3b": {
++                            "name": "Qwen3.6-35B-A3B-NPU2",
++                            "url": "https://huggingface.co/FastFlowLM/Qwen3.6-35B-A3B-NPU2/resolve/flm_q4k_high_precision",
++                            "files": ["config.json", "model.q4nx", "unlisted.bin"],
++                        }
++                    },
++                    "llama3.2": {
++                        "1b": {
++                            "name": "Llama-3.2-1B-NPU2",
++                            "url": "https://huggingface.co/FastFlowLM/Llama-3.2-1B-NPU2",
++                            "files": ["config.json"],
++                        }
++                    },
++                },
++            }
++        )
++    )
++    (flm.parent / "model_info.json").write_text(
++        json.dumps(
++            {
++                "qwen3.6-moe:35b-a3b": [
++                    {"path": "config.json", "size": 4017, "oid": "663d"},
++                    {"path": "model.q4nx", "size": 21, "oid": "db25", "lfs": {"oid": "a763"}},
++                ],
++                "llama3.2:1b": [{"path": "config.json", "size": 10, "oid": "aa"}],
++            }
++        )
++    )
++    model = ff.read_model_files(flm, tmp_path / "flm", "qwen3.6-moe:35b-a3b")
++    assert model.folder == tmp_path / "flm" / "models" / "Qwen3.6-35B-A3B-NPU2"
++    assert model.files == (
++        ff.FlmFile(
++            "config.json",
++            "https://huggingface.co/FastFlowLM/Qwen3.6-35B-A3B-NPU2/resolve/flm_q4k_high_precision/config.json?download=true",
++            4017,
++            "663d",
++            False,
++        ),
++        ff.FlmFile(
++            "model.q4nx",
++            "https://huggingface.co/FastFlowLM/Qwen3.6-35B-A3B-NPU2/resolve/flm_q4k_high_precision/model.q4nx?download=true",
++            21,
++            "a763",
++            True,
++        ),
++    )
++    llama = ff.read_model_files(flm, tmp_path / "flm", "llama3.2:1b")
++    assert llama.files[0].url == (
++        "https://huggingface.co/FastFlowLM/Llama-3.2-1B-NPU2/resolve/main/config.json?download=true"
++    )
++    assert ff.read_model_files(flm, tmp_path / "flm", "gemma3:4b") is None
++    assert ff.read_model_files(None, tmp_path / "flm", "llama3.2:1b") is None
+diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
+index 5d75a5ea2d..c316d937f2 100644
+--- a/studio/backend/tests/test_npu_backend.py
++++ b/studio/backend/tests/test_npu_backend.py
+@@ -8,6 +8,7 @@ POSIX only: the stub executable is a shell script.
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import sys
+@@ -17,6 +18,7 @@ from pathlib import Path
+ 
+ import pytest
+ 
++from core.inference import flm_files as ff
+ from core.inference import npu_backend as nb
+ from core.inference.lemonade_server import LemonadeServer, LemonadeUnavailable
+ 
+@@ -156,6 +158,7 @@ def test_catalog_keeps_flm_chat_models_only(npu):
+ 
+ 
+ def test_download_relays_progress_then_completes(npu):
++    # No FastFlowLM file list to read, so lemond downloads the model and its events are relayed.
+     npu.enable()
+     events = list(npu.download("qwen3-0.6b-FLM"))
+     assert events[0]["percent"] == 40
+@@ -163,6 +166,103 @@ def test_download_relays_progress_then_completes(npu):
+     assert {m.id: m.downloaded for m in npu.catalog()}["qwen3-0.6b-FLM"] is True
+ 
+ 
++@pytest.mark.parametrize("delete_fails", [False, True])
++def test_a_pull_clears_what_an_interrupted_one_left(npu, monkeypatch, delete_fails):
++    # FastFlowLM would skip the partial file as complete and report the model downloaded.
++    if delete_fails:
++        monkeypatch.setenv("FAKE_LEMOND_DELETE_FAILS", "1")
++    npu.enable()
++    assert list(npu.download("qwen3-0.6b-FLM"))[-1]["event"] == "complete"
++    paths = [r["path"] for r in _requests(npu) if r["path"] in ("/v1/delete", "/v1/pull")]
++    assert paths == ["/v1/delete", "/v1/pull"]
++
++
++def test_pulling_a_downloaded_model_keeps_its_files(npu, monkeypatch):
++    monkeypatch.setenv("FAKE_LEMOND_DOWNLOADED", '["qwen3-0.6b-FLM"]')
++    npu.enable()
++    list(npu.download("qwen3-0.6b-FLM"))
++    assert "/v1/delete" not in [r["path"] for r in _requests(npu)]
++
++
++@pytest.fixture
++def flm_manifest(npu, monkeypatch):
++    """FastFlowLM's file list for qwen3:0.6b, pointing at a local server, next to the fake flm."""
++    from .test_flm_files import CONFIG, WEIGHTS, _Files
++
++    monkeypatch.setattr(ff, "_RETRY_DELAY_SECONDS", 0.0)
++    server = _Files()
++    npu.enable()
++    bin_dir = npu._flm_binary().parent
++    (bin_dir / "model_list.json").write_text(
++        json.dumps(
++            {
++                "model_path": "models",
++                "models": {
++                    "qwen3": {
++                        "0.6b": {
++                            "name": "Qwen3-0.6B-NPU2",
++                            "url": server.url,
++                            "files": ["config.json", "model.q4nx"],
++                        }
++                    }
++                },
++            }
++        )
++    )
++    blob = hashlib.sha1(f"blob {len(CONFIG)}\0".encode() + CONFIG).hexdigest()
++    (bin_dir / "model_info.json").write_text(
++        json.dumps(
++            {
++                "qwen3:0.6b": [
++                    {"path": "config.json", "size": len(CONFIG), "oid": blob},
++                    {
++                        "path": "model.q4nx",
++                        "size": len(WEIGHTS),
++                        "oid": "unused",
++                        "lfs": {"oid": hashlib.sha256(WEIGHTS).hexdigest()},
++                    },
++                ]
++            }
++        )
++    )
++    yield server
++    server.server.shutdown()
++    server.server.server_close()
++
++
++def test_studio_downloads_the_files_and_lemond_only_registers_them(npu, flm_manifest):
++    from .test_flm_files import WEIGHTS
++
++    events = list(npu.download("qwen3-0.6b-FLM"))
++    folder = npu.root / "flm" / "models" / "Qwen3-0.6B-NPU2"
++    assert (folder / "model.q4nx").read_bytes() == WEIGHTS
++    percents = [event["percent"] for event in events]
++    # lemond's own percent (40, for one file) never reaches the stream.
++    assert percents == sorted(percents) and percents[-1] == 100
++    assert events[-1] == {"event": "complete", "model": "qwen3-0.6b-FLM", "percent": 100}
++    pulls = [r for r in _requests(npu) if r["path"] in ("/v1/delete", "/v1/pull")]
++    assert pulls == [
++        {
++            "path": "/v1/pull",
++            "body": {"model_name": "qwen3-0.6b-FLM", "stream": True, "do_not_upgrade": True},
++        }
++    ]
++    assert {m.id: m.downloaded for m in npu.catalog()}["qwen3-0.6b-FLM"] is True
++
++
++def test_the_catalog_offers_to_resume_an_interrupted_download(npu, flm_manifest):
++    flm_manifest.cut_after = [None, 1 << 20] + [0] * 10
++    with pytest.raises(nb.NpuError, match = "model.q4nx failed"):
++        list(npu.download("qwen3-0.6b-FLM"))
++    by_id = {m.id: m for m in npu.catalog()}
++    assert by_id["qwen3-0.6b-FLM"].resume_percent == 33
++    assert by_id["gemma3-4b-FLM"].resume_percent is None
++    flm_manifest.cut_after = []
++    assert list(npu.download("qwen3-0.6b-FLM"))[-1]["event"] == "complete"
++    assert flm_manifest.ranges[-1] == f"bytes={1 << 20}-"
++    assert {m.id: m.resume_percent for m in npu.catalog()}["qwen3-0.6b-FLM"] is None
++
++
+ @pytest.mark.parametrize(
+     "pull, message", [("truncated", "ended before it completed"), ("error", "disk full")]
+ )
+diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
+index 8d6173acd9..275eb8a18f 100644
+--- a/studio/backend/tests/test_npu_chat_route.py
++++ b/studio/backend/tests/test_npu_chat_route.py
+@@ -14,6 +14,7 @@ import socket
+ import threading
+ import time
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from types import SimpleNamespace
+ 
+ import httpx
+ import pytest
+@@ -911,6 +912,109 @@ def test_a_second_download_request_follows_the_running_pull(monkeypatch):
+     assert started == ["gemma3-4b-FLM"]
+ 
+ 
++def _wait_for(condition) -> None:
++    deadline = time.monotonic() + 10
++    while not condition():
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++
++
++def test_running_downloads_are_listed_until_they_end(monkeypatch):
++    from routes import npu as npu_routes
++
++    release = threading.Event()
++
++    class _Npu:
++        def download(self, model_id):
++            yield {"event": "progress", "percent": 12}
++            yield {"event": "progress", "bytes_downloaded": 5}
++            assert release.wait(10)
++            yield {"event": "complete", "model": model_id, "percent": 100}
++
++    job = npu_routes._start_download(_Npu(), "lfm2-1.2b-FLM")
++    _wait_for(lambda: len(job.events) == 2)
++    listed = asyncio.run(npu_routes.list_npu_downloads())["downloads"]
++    assert {"model": "lfm2-1.2b-FLM", "percent": 12} in listed
++    release.set()
++    _wait_for(lambda: job.finished)
++    listed = asyncio.run(npu_routes.list_npu_downloads())["downloads"]
++    assert all(row["model"] != "lfm2-1.2b-FLM" for row in listed)
++
++
++def test_following_a_download_never_starts_one(monkeypatch):
++    from routes import npu as npu_routes
++
++    started: list[str] = []
++    release = threading.Event()
++
++    class _Npu:
++        def download(self, model_id):
++            started.append(model_id)
++            yield {"event": "progress", "percent": 30}
++            assert release.wait(10)
++            yield {"event": "complete", "model": model_id, "percent": 100}
++
++    monkeypatch.setattr(npu_routes, "get_npu_backend", lambda: _Npu())
++    with pytest.raises(HTTPException) as missing:
++        asyncio.run(npu_routes.follow_npu_download("qwen3-1.7b-FLM"))
++    assert missing.value.status_code == 404 and started == []
++
++    job = npu_routes._start_download(_Npu(), "qwen3-1.7b-FLM")
++    _wait_for(lambda: len(job.events) == 1)
++
++    async def follow():
++        response = await npu_routes.follow_npu_download("qwen3-1.7b-FLM")
++        release.set()
++        return [chunk async for chunk in response.body_iterator]
++
++    chunks = asyncio.run(follow())
++    assert '"percent": 30' in chunks[0] and '"complete"' in chunks[-1]
++    assert started == ["qwen3-1.7b-FLM"]
++    _wait_for(lambda: "qwen3-1.7b-FLM" not in npu_routes._downloads)
++    with pytest.raises(HTTPException):
++        asyncio.run(npu_routes.follow_npu_download("qwen3-1.7b-FLM"))
++
++
++def test_a_failed_download_is_logged(monkeypatch):
++    from routes import npu as npu_routes
++
++    warnings: list[str] = []
++    monkeypatch.setattr(
++        npu_routes,
++        "logger",
++        SimpleNamespace(info = lambda message: None, warning = warnings.append),
++    )
++
++    class _Npu:
++        def download(self, model_id):
++            yield {"event": "progress", "percent": 37}
++            raise nb.NpuError(f"Downloading {model_id} failed: connection reset")
++
++    job = npu_routes._start_download(_Npu(), "llama3.2-1b-FLM")
++    assert [event["event"] for event in job.follow()] == ["progress", "error"]
++    assert warnings == [
++        "NPU model download of llama3.2-1b-FLM failed at 37%: "
++        "Downloading llama3.2-1b-FLM failed: connection reset"
++    ]
++
++
++def test_npu_model_config_does_not_reach_hugging_face(monkeypatch):
++    from routes import models as models_route
++
++    def _hub(*args, **kwargs):
++        raise AssertionError("an NPU model id reached Hugging Face handling")
++
++    monkeypatch.setattr(models_route, "_get_model_size_bytes", _hub)
++    monkeypatch.setattr(models_route, "_require_model_access_or_caller_token", _hub)
++    result = asyncio.run(
++        models_route.get_model_config(
++            model_name = "lemonade:qwen3.5-9b-FLM", hf_token = None, current_subject = "tester"
++        )
++    )
++    assert result.id == "lemonade:qwen3.5-9b-FLM"
++    assert result.max_position_embeddings is None and not result.is_vision
++
++
+ @pytest.mark.parametrize("stream", [True, False])
+ def test_a_reply_cut_short_is_recorded_failed(flm, stream):
+     from core.inference.api_monitor import api_monitor
+diff --git a/studio/frontend/src/features/hub/catalog/models-toolbar.tsx b/studio/frontend/src/features/hub/catalog/models-toolbar.tsx
+index 36d90393e0..7eebb5abf1 100644
+--- a/studio/frontend/src/features/hub/catalog/models-toolbar.tsx
++++ b/studio/frontend/src/features/hub/catalog/models-toolbar.tsx
+@@ -76,6 +76,7 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+   onManageLocalFolders,
+   onFreeUpSpace,
+   onOpenFineTune,
++  npuAvailable = false,
+ }: {
+   tab: ModelsTab;
+   onTabChange: (tab: ModelsTab) => void;
+@@ -98,6 +99,8 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+   /** Opens the curated "Fine-tune ready" channel (discover only). Exposed as a
+    *  format-dropdown option rather than a standalone feed section. */
+   onOpenFineTune: () => void;
++  /** This machine has a supported NPU, so its models get a format of their own. */
++  npuAvailable?: boolean;
+ }) {
+   // Recent searches surface while the empty search field is focused, only on
+   // Discover (on-device search is a local filter and isn't recorded).
+@@ -136,6 +139,8 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+   }, [showRecentSearches]);
+ 
+   const isDataset = resourceType === "datasets";
++  // The NPU catalog is short and has no Hub metadata to filter or sort by.
++  const npuList = formatFilter === "npu" && !isDataset;
+   const hasTrailing = Boolean(query) || (isDiscover && isLoading);
+   const formatOptions = useMemo<HubOption<FormatMenuValue>[]>(() => {
+     const options: HubOption<FormatMenuValue>[] = FORMAT_FILTER_OPTIONS.filter(
+@@ -160,6 +165,20 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+         </>
+       ),
+     }));
++    if (npuAvailable) {
++      options.push({
++        value: "npu",
++        triggerLabel: "NPU",
++        label: (
++          <>
++            <span className="flex size-3.5 shrink-0 items-center justify-center">
++              <span className="size-1.5 rounded-full bg-format-npu" />
++            </span>
++            NPU
++          </>
++        ),
++      });
++    }
+     // "Fine-tune ready" is a curated channel (bnb-4bit checkpoints), not a
+     // format: it opens the channel rather than setting the filter (onValueChange).
+     if (tab === "discover") {
+@@ -179,7 +198,7 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+       });
+     }
+     return options;
+-  }, [tab]);
++  }, [tab, npuAvailable]);
+   const capabilityOptions = useMemo<HubOption<CapabilityFilter>[]>(
+     () =>
+       CAPABILITY_FILTER_OPTIONS.map((option) => ({
+@@ -406,7 +425,7 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+           />
+         )}
+ 
+-        {tab === "discover" && !isDataset && (
++        {tab === "discover" && !isDataset && !npuList && (
+           <HubOptionMenu
+             value={capabilityFilter}
+             options={capabilityOptions}
+@@ -416,7 +435,7 @@ export const ModelsToolbar = memo(function ModelsToolbar({
+           />
+         )}
+ 
+-        {tab === "discover" && (
++        {tab === "discover" && !npuList && (
+           <HubOptionMenu
+             value={sortBy}
+             options={sortOptions}
+diff --git a/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
+new file mode 100644
+index 0000000000..2cb9fb03e2
+--- /dev/null
++++ b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { Button } from "@/components/ui/button";
++import { Spinner } from "@/components/ui/spinner";
++import {
++  type NpuModel,
++  type NpuPickerSource,
++  NpuSetupNotice,
++  npuDownloadLabel,
++  npuResumeLabel,
++  npuRowsFor,
++  npuSizeLabel,
++  useNpuCatalog,
++} from "@/features/npu";
++import { toast } from "@/lib/toast";
++import { useState } from "react";
++import { DeleteConfirmDialog } from "./download-card";
++
++/** The Hub's NPU format: Lemonade's FastFlowLM catalog, the same models the chat picker lists. */
++export function NpuCatalogList({
++  source,
++  query,
++  onDevice,
++  onRun,
++}: {
++  source: NpuPickerSource;
++  query: string;
++  /** On Device tab: downloaded models only. */
++  onDevice: boolean;
++  onRun: (model: NpuModel) => void;
++}) {
++  const catalog = useNpuCatalog(source);
++  if (!catalog) return null;
++
++  const body = () => {
++    if (!catalog.ready) return <NpuSetupNotice catalog={catalog} />;
++    if (catalog.listError) {
++      return (
++        <p className="px-3 text-ui-13 text-destructive">{catalog.listError}</p>
++      );
++    }
++    if (catalog.models === null)
++      return <Spinner className="mx-auto mt-6 size-5" />;
++    const rows = npuRowsFor(catalog.models, { onDevice, query });
++    if (rows.length === 0) {
++      return (
++        <p className="px-3 pt-6 text-center text-ui-13 text-muted-foreground">
++          {onDevice
++            ? "No NPU models on this device yet."
++            : "No matching NPU models."}
++        </p>
++      );
++    }
++    return rows.map((model) => (
++      <NpuCatalogRow
++        key={model.id}
++        model={model}
++        progress={catalog.downloads[model.id]}
++        downloading={model.id in catalog.downloads}
++        onDownload={() => void catalog.download(model)}
++        onRun={() => onRun(model)}
++        onRemove={() => catalog.remove(model)}
++      />
++    ));
++  };
++
++  return (
++    <div
++      data-testid="hub-npu-catalog"
++      className="mx-auto flex min-h-0 w-full max-w-[var(--hub-measure)] flex-1 flex-col gap-0.5 overflow-y-auto px-3 py-3"
++    >
++      {body()}
++    </div>
++  );
++}
++
++function NpuCatalogRow({
++  model,
++  progress,
++  downloading,
++  onDownload,
++  onRun,
++  onRemove,
++}: {
++  model: NpuModel;
++  progress: number | null | undefined;
++  downloading: boolean;
++  onDownload: () => void;
++  onRun: () => void;
++  onRemove: () => Promise<void>;
++}) {
++  const [confirming, setConfirming] = useState(false);
++  const [deleting, setDeleting] = useState(false);
++  const details = [
++    model.checkpoint,
++    npuSizeLabel(model.size_gb),
++    model.supports_vision ? "Vision" : null,
++    model.supports_reasoning ? "Reasoning" : null,
++    model.supports_tools ? "Tools" : null,
++    downloading ? null : npuResumeLabel(model),
++  ].filter(Boolean);
++
++  const remove = async () => {
++    setDeleting(true);
++    try {
++      await onRemove();
++      toast.success(`Deleted ${model.id}`);
++      setConfirming(false);
++    } catch (error) {
++      toast.error(
++        error instanceof Error ? error.message : "Failed to delete model",
++      );
++    } finally {
++      setDeleting(false);
++    }
++  };
++
++  return (
++    <div
++      data-testid="hub-npu-row"
++      data-model={model.id}
++      className="flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-accent/50"
++    >
++      <span
++        aria-hidden={true}
++        className="size-1.5 shrink-0 rounded-full bg-format-npu"
++      />
++      <div className="min-w-0 flex-1">
++        <div className="truncate text-ui-13 font-medium text-foreground">
++          {model.id}
++        </div>
++        <div className="truncate text-ui-12 text-muted-foreground">
++          {details.join(" · ")}
++        </div>
++      </div>
++      {downloading ? (
++        <span className="shrink-0 text-ui-12 tabular-nums text-muted-foreground">
++          {npuDownloadLabel(progress)}
++        </span>
++      ) : model.downloaded ? (
++        <>
++          <span className="flex shrink-0 items-center gap-1.5 text-ui-12 text-muted-foreground">
++            <span
++              aria-hidden={true}
++              className="size-1.5 rounded-full bg-status-success"
++            />
++            On device
++          </span>
++          <Button size="sm" variant="outline" onClick={onRun}>
++            Run
++          </Button>
++          <Button size="sm" variant="ghost" onClick={() => setConfirming(true)}>
++            Delete
++          </Button>
++          <DeleteConfirmDialog
++            open={confirming}
++            onOpenChange={setConfirming}
++            title={`Delete ${model.id}?`}
++            description="This removes the model's NPU files from this device."
++            deleting={deleting}
++            onConfirm={() => void remove()}
++          />
++        </>
++      ) : (
++        <Button size="sm" variant="outline" onClick={onDownload}>
++          {model.resume_percent == null ? "Download" : "Resume"}
++        </Button>
++      )}
++    </div>
++  );
++}
+diff --git a/studio/frontend/src/features/hub/download-manager/download-manager-state.ts b/studio/frontend/src/features/hub/download-manager/download-manager-state.ts
+index f47836b6f5..14e2b8e18e 100644
+--- a/studio/frontend/src/features/hub/download-manager/download-manager-state.ts
++++ b/studio/frontend/src/features/hub/download-manager/download-manager-state.ts
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+-import { isTauri } from "@/lib/api-base";
++import { reportDownloadsActive } from "@/lib/downloads-activity";
+ import { create } from "zustand";
+ import { createJSONStorage, persist } from "zustand/middleware";
+ import { INVENTORY_HINT_KIND } from "../inventory/constants";
+@@ -350,8 +350,7 @@ export const useDownloadManagerStore = create<DownloadManagerState>()(
+ export const setState = useDownloadManagerStore.setState;
+ export const getState = useDownloadManagerStore.getState;
+ 
+-/**
+- * A Tauri quit never fires beforeunload, and only this store knows a backend download is in flight. */
++/** Whether a Hub download is in flight, for the desktop quit warning (see downloads-activity). */
+ export function hasActiveDownloadJob(
+   jobs: Record<string, ManagedDownload>,
+ ): boolean {
+@@ -359,22 +358,8 @@ export function hasActiveDownloadJob(
+   return Object.values(jobs).some((job) => ACTIVE_STATES.has(job.state));
+ }
+ 
+-function publishDownloadsActive(active: boolean): void {
+-  if (!isTauri) return;
+-  void import("@tauri-apps/api/core")
+-    .then(({ invoke }) =>
+-      invoke("set_renderer_activity", { kind: "downloads", active }),
+-    )
+-    .catch(() => {});
+-}
+-
+-let lastPublishedDownloadsActive: boolean | null = null;
+-
+ function syncDownloadsActivity(state: DownloadManagerState): void {
+-  const active = hasActiveDownloadJob(state.jobs);
+-  if (active === lastPublishedDownloadsActive) return;
+-  lastPublishedDownloadsActive = active;
+-  publishDownloadsActive(active);
++  reportDownloadsActive("hub", hasActiveDownloadJob(state.jobs));
+ }
+ 
+ syncDownloadsActivity(getState());
+diff --git a/studio/frontend/src/features/hub/hub-page.tsx b/studio/frontend/src/features/hub/hub-page.tsx
+index 205b116f23..b1fe71c780 100644
+--- a/studio/frontend/src/features/hub/hub-page.tsx
++++ b/studio/frontend/src/features/hub/hub-page.tsx
+@@ -16,12 +16,14 @@ import {
+ import { useHubInfiniteScroll } from "@/features/hub";
+ import { useOnlineStatus } from "@/features/hub/hooks/use-online-status";
+ import {
++  type ModelConfigHandoffRequest,
+   clearModelConfigHandoff,
+   createModelConfigHandoffRequestId,
+   hfModelFitsDevice,
+   loadScopedGpu,
+   requestModelConfigHandoff,
+ } from "@/features/model-picker";
++import { type NpuModel, type NpuPickerSource, useNpuStatus } from "@/features/npu";
+ import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
+ import { GuidedTour, useGuidedTourController } from "@/features/tour";
+ import { useDebouncedValue } from "@/hooks/use-debounced-value";
+@@ -62,6 +64,7 @@ import {
+   ResultListHeader,
+ } from "./catalog/models-table";
+ import { ModelsToolbar } from "./catalog/models-toolbar";
++import { NpuCatalogList } from "./catalog/npu-catalog-list";
+ import { OnDeviceFoldersDialog } from "./catalog/on-device-folders-dialog";
+ import { OwnerScopeToggle } from "./catalog/owner-scope-toggle";
+ import { useDiscoverSearch } from "./hooks/use-discover-search";
+@@ -584,7 +587,14 @@ export function ModelsPage() {
+     () => findChannel(activeChannelId),
+     [activeChannelId],
+   );
++  const [npuStatus, setNpuStatus] = useNpuStatus();
++  const npuSource: NpuPickerSource | undefined = npuStatus?.supported
++    ? { status: npuStatus, onStatusChange: setNpuStatus }
++    : undefined;
+   const formatFilter = isDiscoverTab ? discoverFormat : downloadedFormat;
++  const npuCatalogSource =
++    formatFilter === "npu" && !isDatasetMode ? npuSource : undefined;
++  const showNpuCatalog = npuCatalogSource !== undefined;
+   const setFormatFilter = useCallback(
+     (next: ModelFormatFilter) => {
+       if (isDiscoverTab) {
+@@ -842,7 +852,8 @@ export function ModelsPage() {
+   } = useDiscoverSearch({
+     debouncedQuery,
+     accessToken: apiHfToken,
+-    isDiscoverTab,
++    // The NPU list replaces the Hub results, so they are not fetched behind it.
++    isDiscoverTab: isDiscoverTab && !showNpuCatalog,
+     isDatasetMode,
+     sortBy: effectiveSort,
+     direction: effectiveDirection,
+@@ -1456,6 +1467,39 @@ export function ModelsPage() {
+     },
+     [navigate, setModelsTab, setOwnerScope],
+   );
++  // A new chat opens with the model's run settings, where Load starts it.
++  const openRunSettingsInChat = useCallback(
++    (request: ModelConfigHandoffRequest) => {
++      clearNewChatDraft();
++      const chatRuntime = useChatRuntimeStore.getState();
++      chatRuntime.setActiveThreadId(null);
++      chatRuntime.setActiveProjectId(null);
++      chatRuntime.setIncognito(false);
++      requestModelConfigHandoff(request);
++      const { requestId } = request;
++      void navigate({ to: "/chat", search: { new: requestId } }).catch(() => {
++        clearModelConfigHandoff(requestId);
++      });
++    },
++    [navigate],
++  );
++
++  const handleRunNpu = useCallback(
++    (model: NpuModel) =>
++      openRunSettingsInChat({
++        requestId: createModelConfigHandoffRequestId(),
++        id: model.model_path,
++        displayName: model.id,
++        meta: {
++          source: "local",
++          isLora: false,
++          isDownloaded: true,
++          isVision: model.supports_vision,
++        },
++      }),
++    [openRunSettingsInChat],
++  );
++
+   const handleRun = useCallback(
+     async (
+       selection: HubModelRunSelection,
+@@ -1498,15 +1542,7 @@ export function ModelsPage() {
+           });
+           return;
+         }
+-        clearNewChatDraft();
+-        const chatRuntime = useChatRuntimeStore.getState();
+-        chatRuntime.setActiveThreadId(null);
+-        chatRuntime.setActiveProjectId(null);
+-        chatRuntime.setIncognito(false);
+-        requestModelConfigHandoff(request);
+-        void navigate({ to: "/chat", search: { new: requestId } }).catch(() => {
+-          clearModelConfigHandoff(requestId);
+-        });
++        openRunSettingsInChat(request);
+       } finally {
+         runConfigOpenCoordinator.finish(controller);
+         setRunConfigOpening((current) =>
+@@ -1516,6 +1552,7 @@ export function ModelsPage() {
+     },
+     [
+       navigate,
++      openRunSettingsInChat,
+       refreshResidentModelStatus,
+       runConfigOpenCoordinator,
+       selectedModel,
+@@ -1789,8 +1826,9 @@ export function ModelsPage() {
+     isDatasetMode,
+   ]);
+ 
+-  const detailOpen = urlModel !== null;
+-  const splitMode = allModelsView === "split";
++  // NPU rows have no detail view; one left open would cover their list.
++  const detailOpen = urlModel !== null && !showNpuCatalog;
++  const splitMode = allModelsView === "split" && !showNpuCatalog;
+   // Unreachable under the full-page detail overlay.
+   const catalogCovered = detailOpen && !splitMode;
+ 
+@@ -1832,6 +1870,7 @@ export function ModelsPage() {
+           onManageLocalFolders={handleManageLocalFolders}
+           onFreeUpSpace={handleFreeUpSpace}
+           onOpenFineTune={() => handleOpenList("finetune")}
++          npuAvailable={npuSource !== undefined}
+         />
+       </HubTopBar>
+ 
+@@ -1859,16 +1898,25 @@ export function ModelsPage() {
+           aria-hidden={catalogCovered || undefined}
+           inert={catalogCovered || undefined}
+         >
+-          <ModelsCatalog
+-            state={catalogState}
+-            pagination={catalogPagination}
+-            handlers={catalogHandlers}
+-            header={catalogHeader}
+-            downloadedHeader={downloadedHeader}
+-            resetScrollKey={filterResetSignature}
+-            discoverView={allModelsView}
+-            inventorySort={inventorySort}
+-          />
++          {npuCatalogSource ? (
++            <NpuCatalogList
++              source={npuCatalogSource}
++              query={query}
++              onDevice={!isDiscoverTab}
++              onRun={handleRunNpu}
++            />
++          ) : (
++            <ModelsCatalog
++              state={catalogState}
++              pagination={catalogPagination}
++              handlers={catalogHandlers}
++              header={catalogHeader}
++              downloadedHeader={downloadedHeader}
++              resetScrollKey={filterResetSignature}
++              discoverView={allModelsView}
++              inventorySort={inventorySort}
++            />
++          )}
+         </div>
+ 
+         {splitMode ? (
+diff --git a/studio/frontend/src/features/hub/lib/format-filters.ts b/studio/frontend/src/features/hub/lib/format-filters.ts
+index 7b8e73bb0a..4f7ca0f1d1 100644
+--- a/studio/frontend/src/features/hub/lib/format-filters.ts
++++ b/studio/frontend/src/features/hub/lib/format-filters.ts
+@@ -9,7 +9,7 @@ export type FormatFilterModelFormat =
+   | "mlx"
+   | "unknown";
+ 
+-export type FormatFilterValue = "all" | "gguf" | "checkpoint" | "mlx";
++export type FormatFilterValue = "all" | "gguf" | "checkpoint" | "mlx" | "npu";
+ 
+ export function matchesFormat(
+   modelFormat: boolean | FormatFilterModelFormat | null | undefined,
+@@ -24,6 +24,8 @@ export function matchesFormat(
+       : modelFormat;
+   if (formatFilter === "gguf") return normalized === "gguf";
+   if (formatFilter === "mlx") return normalized === "mlx";
++  // NPU models come from Lemonade's catalog, never from a Hub repo or the disk scan.
++  if (formatFilter === "npu") return false;
+   return normalized === "safetensors" || normalized === "checkpoint";
+ }
+ 
+diff --git a/studio/frontend/src/features/hub/types.ts b/studio/frontend/src/features/hub/types.ts
+index ac20f096c8..55fe65ad95 100644
+--- a/studio/frontend/src/features/hub/types.ts
++++ b/studio/frontend/src/features/hub/types.ts
+@@ -23,7 +23,8 @@ export type ResourceTypeFilter = "models" | "datasets";
+ 
+ export type HubModelType = "text" | "vision" | "audio" | "embeddings";
+ 
+-export type ModelFormatFilter = "all" | "gguf" | "checkpoint" | "mlx";
++/** "npu" lists Lemonade's NPU catalog in place of Hub repos. */
++export type ModelFormatFilter = "all" | "gguf" | "checkpoint" | "mlx" | "npu";
+ 
+ export type CapabilityFilter = "all" | CapabilityKey;
+ 
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+index e8186ce2da..3ce88d5488 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+@@ -81,7 +81,10 @@ import {
+   type NpuModel,
+   type NpuPickerSource,
+   NpuSetupNotice,
++  npuDownloadLabel,
++  npuResumeLabel,
+   npuRowsFor,
++  npuSizeLabel,
+   useNpuCatalog,
+ } from "@/features/npu";
+ import {
+@@ -6501,12 +6504,11 @@ export function HubModelPicker({
+     const isLoaded = loadedModelId === model.model_path;
+     const downloading = model.id in npuCatalog.downloads;
+     const progress = npuCatalog.downloads[model.id];
+-    const size =
+-      model.size_gb == null
+-        ? null
+-        : model.size_gb < 1
+-          ? `${Math.round(model.size_gb * 1000)} MB`
+-          : `${model.size_gb.toFixed(1)} GB`;
++    const details = [
++      "NPU",
++      npuSizeLabel(model.size_gb),
++      npuResumeLabel(model),
++    ].filter(Boolean);
+     const pick = () =>
+       onSelect(model.model_path, {
+         source: "local",
+@@ -6518,8 +6520,8 @@ export function HubModelPicker({
+         label={model.id}
+         meta={
+           downloading
+-            ? `NPU · Downloading${progress == null ? "" : ` ${Math.round(progress)}%`}`
+-            : `NPU${size ? ` · ${size}` : ""}`
++            ? `NPU · ${npuDownloadLabel(progress)}`
++            : details.join(" · ")
+         }
+         selected={isSelected}
+         loaded={isLoaded}
+diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
+index 3c6d860409..10d4987738 100644
+--- a/studio/frontend/src/features/npu/api.ts
++++ b/studio/frontend/src/features/npu/api.ts
+@@ -3,6 +3,7 @@
+ 
+ import { authFetch } from "@/features/auth";
+ import { readFastApiError } from "@/lib/format-fastapi-error";
++import { readSseJsonEvents } from "@/lib/sse-json-events";
+ 
+ /** Model paths the backend loads onto the NPU (`lemonade:<Lemonade model id>`). */
+ export const NPU_MODEL_PREFIX = "lemonade:";
+@@ -52,6 +53,8 @@ export interface NpuModel {
+   supports_reasoning: boolean;
+   supports_tools: boolean;
+   max_context_length: number | null;
++  /** Percent an interrupted download left on disk; the next download continues from it. */
++  resume_percent: number | null;
+ }
+ 
+ export function npuRowsFor(
+@@ -73,6 +76,23 @@ export function npuRowsFor(
+   );
+ }
+ 
++export function npuSizeLabel(sizeGb: number | null): string | null {
++  if (sizeGb == null) return null;
++  return sizeGb < 1
++    ? `${Math.round(sizeGb * 1000)} MB`
++    : `${sizeGb.toFixed(1)} GB`;
++}
++
++export function npuResumeLabel(model: NpuModel): string | null {
++  return model.resume_percent == null
++    ? null
++    : `${model.resume_percent}% downloaded`;
++}
++
++export function npuDownloadLabel(percent: number | null | undefined): string {
++  return `Downloading${percent == null ? "" : ` ${Math.round(percent)}%`}`;
++}
++
+ export interface NpuDownloadEvent {
+   event: string;
+   percent?: number;
+@@ -114,6 +134,23 @@ export async function listNpuModels(): Promise<NpuModel[]> {
+   return ((await response.json()) as { models: NpuModel[] }).models;
+ }
+ 
++export interface NpuRunningDownload {
++  model: string;
++  percent: number | null;
++}
++
++/** Pulls the backend is still running, including ones no open page follows. */
++export async function listNpuDownloads(): Promise<NpuRunningDownload[]> {
++  const response = await authFetch("/api/npu/downloads");
++  if (!response.ok) {
++    throw new Error(
++      await readFastApiError(response, "Could not list NPU downloads"),
++    );
++  }
++  return ((await response.json()) as { downloads: NpuRunningDownload[] })
++    .downloads;
++}
++
+ export async function deleteNpuModel(id: string): Promise<void> {
+   const response = await authFetch(
+     `/api/npu/models/${encodeURIComponent(id)}`,
+@@ -142,26 +179,39 @@ export async function downloadNpuModel(
+       await readFastApiError(response, "Could not download the model"),
+     );
+   }
+-  const reader = response.body.getReader();
+-  const decoder = new TextDecoder();
+-  let buffer = "";
+-  for (;;) {
+-    const { done, value } = await reader.read();
+-    if (done) break;
+-    buffer += decoder.decode(value, { stream: true });
+-    let boundary = buffer.indexOf("\n\n");
+-    while (boundary >= 0) {
+-      const frame = buffer.slice(0, boundary);
+-      buffer = buffer.slice(boundary + 2);
+-      boundary = buffer.indexOf("\n\n");
+-      if (!frame.startsWith("data:")) continue;
+-      const event = JSON.parse(frame.slice(5).trim()) as NpuDownloadEvent;
+-      if (event.event === "error") {
+-        throw new Error(event.error || "The download failed");
+-      }
+-      onProgress(event);
+-      if (event.event === "complete") return;
++  await readDownloadStream(response.body, onProgress);
++}
++
++/** Follow a pull already running on the backend; resolves at once when none is. */
++export async function followNpuModelDownload(
++  id: string,
++  onProgress: (event: NpuDownloadEvent) => void,
++): Promise<void> {
++  const response = await authFetch(
++    `/api/npu/models/${encodeURIComponent(id)}/download`,
++  );
++  if (response.status === 404) return;
++  if (!response.ok || !response.body) {
++    throw new Error(
++      await readFastApiError(response, "Could not follow the download"),
++    );
++  }
++  await readDownloadStream(response.body, onProgress);
++}
++
++/** The backend reported the download itself failed, as opposed to its progress stream breaking. */
++export class NpuDownloadError extends Error {}
++
++async function readDownloadStream(
++  body: ReadableStream<Uint8Array>,
++  onProgress: (event: NpuDownloadEvent) => void,
++): Promise<void> {
++  for await (const event of readSseJsonEvents<NpuDownloadEvent>(body)) {
++    if (event.event === "error") {
++      throw new NpuDownloadError(event.error || "The download failed");
+     }
++    onProgress(event);
++    if (event.event === "complete") return;
+   }
+   throw new Error("The download ended before it completed");
+ }
+diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
+index 71292a456b..d93ef768ca 100644
+--- a/studio/frontend/src/features/npu/index.ts
++++ b/studio/frontend/src/features/npu/index.ts
+@@ -6,7 +6,10 @@ export {
+   NPU_MODEL_PREFIX,
+   type NpuModel,
+   type NpuStatus,
++  npuDownloadLabel,
++  npuResumeLabel,
+   npuRowsFor,
++  npuSizeLabel,
+ } from "./api";
+ export { NpuSetupNotice } from "./npu-setup-notice";
+ export {
+diff --git a/studio/frontend/src/features/npu/npu-catalog-store.ts b/studio/frontend/src/features/npu/npu-catalog-store.ts
+new file mode 100644
+index 0000000000..77a1ed6ec8
+--- /dev/null
++++ b/studio/frontend/src/features/npu/npu-catalog-store.ts
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { reportDownloadsActive } from "@/lib/downloads-activity";
++import { toast } from "@/lib/toast";
++import { create } from "zustand";
++import {
++  NpuDownloadError,
++  type NpuModel,
++  downloadNpuModel,
++  followNpuModelDownload,
++  listNpuDownloads,
++  listNpuModels,
++} from "./api";
++
++interface NpuCatalogState {
++  models: NpuModel[] | null;
++  listError: string | null;
++  /** Model id to percent; null until the pull reports one. */
++  progress: Record<string, number | null>;
++}
++
++// Outside the picker, which unmounts on close, so a pull's progress outlives it.
++export const useNpuCatalogStore = create<NpuCatalogState>(() => ({
++  models: null,
++  listError: null,
++  progress: {},
++}));
++
++// Quitting the desktop app stops the backend and its pulls, so it warns while one runs.
++useNpuCatalogStore.subscribe((state) =>
++  reportDownloadsActive("npu", Object.keys(state.progress).length > 0),
++);
++
++let latestListing = 0;
++
++export async function refreshNpuModels(): Promise<void> {
++  // Only the newest answer lands: an older one could still list a finished pull as missing.
++  const listing = ++latestListing;
++  try {
++    const models = await listNpuModels();
++    if (listing === latestListing) {
++      useNpuCatalogStore.setState({ models, listError: null });
++    }
++  } catch (error) {
++    if (listing === latestListing) {
++      useNpuCatalogStore.setState({
++        listError: error instanceof Error ? error.message : String(error),
++      });
++    }
++  }
++}
++
++function setProgress(id: string, percent: number | null): void {
++  useNpuCatalogStore.setState((state) =>
++    state.progress[id] === percent
++      ? state
++      : { progress: { ...state.progress, [id]: percent } },
++  );
++}
++
++const following = new Map<string, Promise<boolean>>();
++// Reconnects in a row that move the percent no further before a running pull is given up on.
++const MAX_SILENT_RECONNECTS = 5;
++const RECONNECT_DELAY_MS = 1000;
++
++/**
++ * Whether the backend still runs the model's pull: its percent if so, null if it runs none,
++ * undefined when the backend could not be asked.
++ */
++async function runningPull(
++  id: string,
++): Promise<{ percent: number | null } | null | undefined> {
++  try {
++    const running = await listNpuDownloads();
++    return running.find((download) => download.model === id) ?? null;
++  } catch {
++    return undefined;
++  }
++}
++
++function listedDownloaded(id: string): boolean {
++  return (
++    useNpuCatalogStore.getState().models?.find((model) => model.id === id)
++      ?.downloaded === true
++  );
++}
++
++/**
++ * Show a model's pull until it ends, one stream per model. `follow` only joins a pull the
++ * backend is already running, which replays its earlier progress; otherwise this starts one.
++ * A broken stream does not end a pull that the backend keeps running: it is followed again.
++ * Resolves true once the model is downloaded.
++ */
++export function followNpuDownload(
++  id: string,
++  {
++    follow = false,
++    percent = null,
++  }: { follow?: boolean; percent?: number | null } = {},
++): Promise<boolean> {
++  const current = following.get(id);
++  if (current) return current;
++  setProgress(id, percent);
++
++  const run = async (): Promise<boolean> => {
++    let joined = follow;
++    let completed = false;
++    // A followed stream replays every earlier event, so only a higher percent is progress.
++    let best = percent ?? -1;
++    let silentReconnects = 0;
++    for (;;) {
++      let advanced = false;
++      const onProgress = (event: { event: string; percent?: number }) => {
++        completed ||= event.event === "complete";
++        if (typeof event.percent === "number" && event.percent > best) {
++          best = event.percent;
++          advanced = true;
++          setProgress(id, event.percent);
++        }
++      };
++      try {
++        await (joined ? followNpuModelDownload : downloadNpuModel)(
++          id,
++          onProgress,
++        );
++        // Listed before the progress clears, so the row never reads as not downloaded.
++        await refreshNpuModels();
++        // A followed pull can end, either way, before its stream opens; the list says how.
++        return completed || listedDownloaded(id);
++      } catch (error) {
++        silentReconnects = advanced ? 0 : silentReconnects + 1;
++        if (
++          !(error instanceof NpuDownloadError) &&
++          silentReconnects <= MAX_SILENT_RECONNECTS
++        ) {
++          const running = await runningPull(id);
++          // Still running, or the backend could not be asked yet: follow it again.
++          if (running !== null) {
++            if (running?.percent != null && running.percent > best) {
++              best = running.percent;
++              setProgress(id, running.percent);
++            }
++            joined = true;
++            await new Promise((resolve) =>
++              setTimeout(resolve, RECONNECT_DELAY_MS),
++            );
++            continue;
++          }
++        }
++        // Also lists what a failed download left, which the next one continues from.
++        await refreshNpuModels();
++        // The pull may have finished while its stream was broken.
++        if (listedDownloaded(id)) return true;
++        toast.error(`Could not download ${id}`, {
++          description: error instanceof Error ? error.message : String(error),
++        });
++        return false;
++      }
++    }
++  };
++
++  const job = run().finally(() => {
++    following.delete(id);
++    useNpuCatalogStore.setState((state) => {
++      const progress = { ...state.progress };
++      delete progress[id];
++      return { progress };
++    });
++  });
++  following.set(id, job);
++  return job;
++}
+diff --git a/studio/frontend/src/features/npu/use-npu-catalog.ts b/studio/frontend/src/features/npu/use-npu-catalog.ts
+index fbc24af428..46ec0c4872 100644
+--- a/studio/frontend/src/features/npu/use-npu-catalog.ts
++++ b/studio/frontend/src/features/npu/use-npu-catalog.ts
+@@ -7,11 +7,15 @@ import {
+   type NpuModel,
+   type NpuStatus,
+   deleteNpuModel,
+-  downloadNpuModel,
+   enableNpu,
+   getNpuStatus,
+-  listNpuModels,
++  listNpuDownloads,
+ } from "./api";
++import {
++  followNpuDownload,
++  refreshNpuModels,
++  useNpuCatalogStore,
++} from "./npu-catalog-store";
+ 
+ export interface NpuPickerSource {
+   status: NpuStatus;
+@@ -33,42 +37,27 @@ export interface NpuCatalog {
+ export function useNpuCatalog(
+   source: NpuPickerSource | undefined,
+ ): NpuCatalog | null {
+-  const [models, setModels] = useState<NpuModel[] | null>(null);
+-  const [listError, setListError] = useState<string | null>(null);
++  const models = useNpuCatalogStore((state) => state.models);
++  const listError = useNpuCatalogStore((state) => state.listError);
++  const downloads = useNpuCatalogStore((state) => state.progress);
+   const [enabling, setEnabling] = useState(false);
+-  const [downloads, setDownloads] = useState<Record<string, number | null>>({});
+   const status = source?.status;
+   const onStatusChange = source?.onStatusChange;
+   // Listing starts lemond, so wait for a validated runtime.
+   const ready = status?.ready === true;
+ 
+-  const refresh = useCallback(async () => {
+-    try {
+-      setModels(await listNpuModels());
+-      setListError(null);
+-    } catch (error) {
+-      setListError(error instanceof Error ? error.message : String(error));
+-    }
+-  }, []);
+-
+   useEffect(() => {
+     if (!ready) return;
+-    let live = true;
+-    listNpuModels().then(
+-      (next) => {
+-        if (!live) return;
+-        setModels(next);
+-        setListError(null);
+-      },
+-      (error) => {
+-        if (live) {
+-          setListError(error instanceof Error ? error.message : String(error));
++    void refreshNpuModels();
++    // A pull outlives the page that started it; show any still running.
++    listNpuDownloads().then(
++      (running) => {
++        for (const { model, percent } of running) {
++          void followNpuDownload(model, { follow: true, percent });
+         }
+       },
++      () => undefined,
+     );
+-    return () => {
+-      live = false;
+-    };
+   }, [ready]);
+ 
+   const enable = useCallback(async () => {
+@@ -76,7 +65,7 @@ export function useNpuCatalog(
+     setEnabling(true);
+     try {
+       onStatusChange(await enableNpu());
+-      await refresh();
++      await refreshNpuModels();
+     } catch (error) {
+       toast.error("Could not enable the NPU", {
+         description: error instanceof Error ? error.message : String(error),
+@@ -85,51 +74,25 @@ export function useNpuCatalog(
+     } finally {
+       setEnabling(false);
+     }
+-  }, [onStatusChange, refresh]);
++  }, [onStatusChange]);
+ 
+   const download = useCallback(
+-    async (model: NpuModel) => {
+-      setDownloads((current) => ({ ...current, [model.id]: null }));
+-      try {
+-        await downloadNpuModel(model.id, (event) => {
+-          if (typeof event.percent === "number") {
+-            setDownloads((current) => ({
+-              ...current,
+-              [model.id]: event.percent ?? null,
+-            }));
+-          }
+-        });
+-        await refresh();
+-        return true;
+-      } catch (error) {
+-        toast.error(`Could not download ${model.id}`, {
+-          description: error instanceof Error ? error.message : String(error),
+-        });
+-        return false;
+-      } finally {
+-        setDownloads((current) => {
+-          const next = { ...current };
+-          delete next[model.id];
+-          return next;
+-        });
+-      }
+-    },
+-    [refresh],
++    (model: NpuModel) =>
++      followNpuDownload(model.id, { percent: model.resume_percent }),
++    [],
+   );
+ 
+-  const remove = useCallback(
+-    async (model: NpuModel) => {
+-      await deleteNpuModel(model.id);
+-      await refresh();
+-    },
+-    [refresh],
+-  );
++  const remove = useCallback(async (model: NpuModel) => {
++    await deleteNpuModel(model.id);
++    await refreshNpuModels();
++  }, []);
+ 
+   if (!status) return null;
+   return {
+     status,
+     ready: status.ready,
+-    models,
++    // The store outlives this hook; a runtime that is not ready lists nothing.
++    models: ready ? models : null,
+     listError,
+     enabling,
+     downloads,
+diff --git a/studio/frontend/src/lib/downloads-activity.ts b/studio/frontend/src/lib/downloads-activity.ts
+new file mode 100644
+index 0000000000..14c6c00a20
+--- /dev/null
++++ b/studio/frontend/src/lib/downloads-activity.ts
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import { isTauri } from "@/lib/api-base";
++
++// A Tauri quit never fires beforeunload, so the desktop close button asks Rust whether any
++// backend download is in flight. Each source reports here and Rust gets one combined answer:
++// two sources writing the flag directly would overwrite each other.
++type DownloadSource = "hub" | "npu";
++
++const activeSources = new Set<DownloadSource>();
++let published: boolean | null = null;
++
++export function reportDownloadsActive(
++  source: DownloadSource,
++  active: boolean,
++): void {
++  if (active) {
++    activeSources.add(source);
++  } else {
++    activeSources.delete(source);
++  }
++  const anyActive = activeSources.size > 0;
++  if (anyActive === published) return;
++  published = anyActive;
++  if (!isTauri) return;
++  void import("@tauri-apps/api/core")
++    .then(({ invoke }) =>
++      invoke("set_renderer_activity", { kind: "downloads", active: anyActive }),
++    )
++    .catch(() => {});
++}
+diff --git a/studio/frontend/tests/downloads-activity.test.ts b/studio/frontend/tests/downloads-activity.test.ts
+new file mode 100644
+index 0000000000..7e58f95ef5
+--- /dev/null
++++ b/studio/frontend/tests/downloads-activity.test.ts
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import type * as DownloadsActivity from "../src/lib/downloads-activity.ts";
++import { loadWithStubs } from "./helpers/module-stubs.ts";
++
++test("the desktop quit warning sees a download from any source, sent once per change", async () => {
++  const sent: boolean[] = [];
++  const activity = loadWithStubs<typeof DownloadsActivity>(
++    new URL("../src/lib/downloads-activity.ts", import.meta.url),
++    {
++      "@/lib/api-base": { isTauri: true },
++      "@tauri-apps/api/core": {
++        invoke: async (
++          command: string,
++          args: { kind: string; active: boolean },
++        ) => {
++          assert.equal(command, "set_renderer_activity");
++          assert.equal(args.kind, "downloads");
++          sent.push(args.active);
++        },
++      },
++    },
++  );
++  const flush = () => new Promise((resolve) => setImmediate(resolve));
++
++  activity.reportDownloadsActive("hub", false);
++  activity.reportDownloadsActive("npu", true);
++  activity.reportDownloadsActive("hub", true);
++  // A Hub download ending while an NPU pull runs must not clear the warning.
++  activity.reportDownloadsActive("hub", false);
++  activity.reportDownloadsActive("npu", false);
++  await flush();
++  assert.deepEqual(sent, [false, true, false]);
++});
+diff --git a/studio/frontend/tests/hub-npu-format.test.ts b/studio/frontend/tests/hub-npu-format.test.ts
+new file mode 100644
+index 0000000000..a52a7d1869
+--- /dev/null
++++ b/studio/frontend/tests/hub-npu-format.test.ts
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import { matchesFormat } from "../src/features/hub/lib/format-filters.ts";
++
++test("the NPU format holds no Hub repo or scanned folder: those models come from Lemonade", () => {
++  for (const format of [
++    true,
++    false,
++    "gguf",
++    "safetensors",
++    "checkpoint",
++    "mlx",
++    "adapter",
++    "unknown",
++    null,
++  ] as const) {
++    assert.equal(matchesFormat(format, "npu"), false, String(format));
++  }
++});
+diff --git a/studio/frontend/tests/npu-api.test.ts b/studio/frontend/tests/npu-api.test.ts
+index 14d5f06df0..ef514464f6 100644
+--- a/studio/frontend/tests/npu-api.test.ts
++++ b/studio/frontend/tests/npu-api.test.ts
+@@ -6,6 +6,7 @@ import test from "node:test";
+ import { matchesFormatFilter } from "../src/features/model-picker/components/model-selector/recommended-fit.ts";
+ import type * as NpuApi from "../src/features/npu/api.ts";
+ import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
++import * as sseJsonEvents from "../src/lib/sse-json-events.ts";
+ import { loadWithStubs } from "./helpers/module-stubs.ts";
+ 
+ function client(response: () => Response) {
+@@ -20,6 +21,7 @@ function client(response: () => Response) {
+         },
+       },
+       "@/lib/format-fastapi-error": formatFastApiError,
++      "@/lib/sse-json-events": sseJsonEvents,
+     },
+   );
+   return { api, requests };
+@@ -80,6 +82,34 @@ test("download rejects a stream that ends before completing", async () => {
+   );
+ });
+ 
++test("following a download reads the running pull and never starts one", async () => {
++  const c = client(() =>
++    sse([
++      'data: {"event":"progress","percent":30}\n\n',
++      'data: {"event":"complete"}\n\n',
++    ]),
++  );
++  const seen: number[] = [];
++  await c.api.followNpuModelDownload("gemma3-4b-FLM", (event) => {
++    if (typeof event.percent === "number") seen.push(event.percent);
++  });
++  assert.deepEqual(seen, [30]);
++  assert.equal(c.requests[0].path, "/api/npu/models/gemma3-4b-FLM/download");
++  assert.equal(c.requests[0].init?.method, undefined);
++});
++
++test("following a pull that already ended resolves without an error", async () => {
++  const c = client(() =>
++    Response.json(
++      { detail: "gemma3-4b-FLM is not downloading." },
++      { status: 404 },
++    ),
++  );
++  await c.api.followNpuModelDownload("gemma3-4b-FLM", () => {
++    throw new Error("no progress expected");
++  });
++});
++
+ test("enable surfaces the backend's reason", async () => {
+   const c = client(() =>
+     Response.json(
+@@ -103,6 +133,7 @@ test("NPU rows: downloaded ones on device, all of them to browse, by query", ()
+     supports_reasoning: false,
+     supports_tools: false,
+     max_context_length: null,
++    resume_percent: null,
+   });
+   const models = [model("qwen3-0.6b-FLM", true), model("gemma3-4b-FLM", false)];
+   const ids = (onDevice: boolean, query: string) =>
+@@ -114,6 +145,14 @@ test("NPU rows: downloaded ones on device, all of them to browse, by query", ()
+   assert.deepEqual(api.npuRowsFor(null, { onDevice: false, query: "" }), []);
+ });
+ 
++test("an interrupted NPU download says how much it kept", () => {
++  const { api } = client(() => new Response(null));
++  const model = (resume_percent: number | null) =>
++    ({ resume_percent }) as Parameters<typeof api.npuResumeLabel>[0];
++  assert.equal(api.npuResumeLabel(model(37)), "37% downloaded");
++  assert.equal(api.npuResumeLabel(model(null)), null);
++});
++
+ test("the picker's NPU format holds no Hub repo", () => {
+   for (const [id, gguf] of [
+     ["unsloth/Qwen3-0.6B-GGUF", true],
+diff --git a/studio/frontend/tests/npu-catalog-store.test.ts b/studio/frontend/tests/npu-catalog-store.test.ts
+new file mode 100644
+index 0000000000..cfc7a85e92
+--- /dev/null
++++ b/studio/frontend/tests/npu-catalog-store.test.ts
+@@ -0,0 +1,278 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++import assert from "node:assert/strict";
++import test from "node:test";
++import * as zustand from "zustand";
++import type * as NpuCatalogStore from "../src/features/npu/npu-catalog-store.ts";
++import { loadWithStubs } from "./helpers/module-stubs.ts";
++
++type Progress = (event: { event: string; percent?: number }) => void;
++type Pull = {
++  id: string;
++  follow: boolean;
++  onProgress: Progress;
++  finish: (error?: Error) => void;
++};
++
++function deferred<T>() {
++  let resolve!: (value: T) => void;
++  const promise = new Promise<T>((r) => {
++    resolve = r;
++  });
++  return { promise, resolve };
++}
++
++function harness() {
++  const pulls: Pull[] = [];
++  const listings: ReturnType<typeof deferred<{ id: string }[]>>[] = [];
++  const toasts: string[] = [];
++  const activity: boolean[] = [];
++  // What GET /api/npu/downloads answers: the pulls the backend is still running.
++  const running: { model: string; percent: number | null }[] = [];
++  const backend = { reachable: true };
++  const pull = (follow: boolean) => (id: string, onProgress: Progress) =>
++    new Promise<void>((resolve, reject) => {
++      pulls.push({
++        id,
++        follow,
++        onProgress,
++        finish: (error) => (error ? reject(error) : resolve()),
++      });
++    });
++  const store = loadWithStubs<typeof NpuCatalogStore>(
++    new URL("../src/features/npu/npu-catalog-store.ts", import.meta.url),
++    {
++      zustand,
++      "@/lib/toast": {
++        toast: { error: (title: string) => toasts.push(title) },
++      },
++      "@/lib/downloads-activity": {
++        reportDownloadsActive: (source: string, active: boolean) => {
++          if (source === "npu") activity.push(active);
++        },
++      },
++      "./api": {
++        NpuDownloadError,
++        listNpuDownloads: async () => {
++          if (!backend.reachable) throw new Error("Failed to fetch");
++          return running;
++        },
++        downloadNpuModel: pull(false),
++        followNpuModelDownload: pull(true),
++        listNpuModels: () => {
++          const listing = deferred<{ id: string }[]>();
++          listings.push(listing);
++          return listing.promise;
++        },
++      },
++    },
++  );
++  return { store, pulls, listings, toasts, activity, running, backend };
++}
++
++const tick = () => new Promise((resolve) => setImmediate(resolve));
++
++class NpuDownloadError extends Error {}
++
++async function until(condition: () => boolean): Promise<void> {
++  for (let i = 0; i < 300 && !condition(); i++) {
++    await new Promise((resolve) => setTimeout(resolve, 10));
++  }
++  assert.ok(condition());
++}
++
++test("a broken stream follows the pull the backend still runs, and the quit warning holds", async () => {
++  const { store, pulls, listings, toasts, activity, running } = harness();
++  const job = store.followNpuDownload("qwen3.6-moe-35b-a3b-FLM");
++  pulls[0].onProgress({ event: "progress", percent: 12 });
++  running.push({ model: "qwen3.6-moe-35b-a3b-FLM", percent: 30 });
++  pulls[0].finish(new Error("network error"));
++  await until(() => pulls.length === 2);
++  assert.equal(pulls[1].follow, true);
++  assert.deepEqual(toasts, []);
++  assert.equal(activity.at(-1), true);
++  assert.equal(
++    store.useNpuCatalogStore.getState().progress["qwen3.6-moe-35b-a3b-FLM"],
++    30,
++  );
++  pulls[1].finish();
++  await tick();
++  listings[0].resolve([
++    { id: "qwen3.6-moe-35b-a3b-FLM", downloaded: true },
++  ] as never);
++  assert.equal(await job, true);
++  assert.equal(activity.at(-1), false);
++});
++
++test("a backend that cannot be asked yet is followed again, not given up on", async () => {
++  const { store, pulls, toasts, activity, backend } = harness();
++  void store.followNpuDownload("qwen3-8b-FLM");
++  backend.reachable = false;
++  pulls[0].finish(new TypeError("Failed to fetch"));
++  await until(() => pulls.length === 2);
++  assert.equal(pulls[1].follow, true);
++  assert.deepEqual(toasts, []);
++  assert.equal(activity.at(-1), true);
++});
++
++test("replayed progress does not reset the reconnect limit", async () => {
++  const { store, pulls, listings, toasts, running } = harness();
++  running.push({ model: "lfm2-1.2b-FLM", percent: 20 });
++  const job = store.followNpuDownload("lfm2-1.2b-FLM");
++  pulls[0].onProgress({ event: "progress", percent: 20 });
++  pulls[0].finish(new Error("network error"));
++  // Each reconnect replays the same percent and breaks again: five are allowed after the
++  // last one that moved it.
++  for (let i = 1; i <= 6; i++) {
++    await until(() => pulls.length === i + 1);
++    pulls[i].onProgress({ event: "progress", percent: 20 });
++    pulls[i].finish(new Error("network error"));
++  }
++  await until(() => listings.length === 1);
++  listings[0].resolve([]);
++  assert.equal(await job, false);
++  assert.equal(pulls.length, 7);
++  assert.deepEqual(toasts, ["Could not download lfm2-1.2b-FLM"]);
++});
++
++test("a pull that finished while its stream was broken is not reported failed", async () => {
++  const { store, pulls, listings, toasts } = harness();
++  const job = store.followNpuDownload("phi4-mini-it-4b-FLM");
++  pulls[0].finish(new Error("network error"));
++  await until(() => listings.length === 1);
++  listings[0].resolve([
++    { id: "phi4-mini-it-4b-FLM", downloaded: true },
++  ] as never);
++  assert.equal(await job, true);
++  assert.deepEqual(toasts, []);
++});
++
++test("a complete event counts even if the list refresh after it goes stale", async () => {
++  const { store, pulls, listings, running } = harness();
++  running.push({ model: "qwen3-4b-FLM", percent: 90 });
++  const job = store.followNpuDownload("qwen3-4b-FLM");
++  pulls[0].finish(new Error("network error"));
++  await until(() => pulls.length === 2);
++  pulls[1].onProgress({ event: "complete", percent: 100 });
++  pulls[1].finish();
++  await until(() => listings.length === 1);
++  listings[0].resolve([]);
++  assert.equal(await job, true);
++});
++
++test("a download the backend reports failed is not followed again", async () => {
++  const { store, pulls, listings, toasts, running } = harness();
++  running.push({ model: "gemma3-4b-FLM", percent: 50 });
++  const job = store.followNpuDownload("gemma3-4b-FLM");
++  pulls[0].finish(new NpuDownloadError("disk full"));
++  await until(() => listings.length === 1);
++  listings[0].resolve([]);
++  assert.equal(await job, false);
++  assert.equal(pulls.length, 1);
++  assert.deepEqual(toasts, ["Could not download gemma3-4b-FLM"]);
++});
++
++test("progress outlives the picker and one stream serves every follower", async () => {
++  const { store, pulls, listings } = harness();
++  const first = store.followNpuDownload("qwen3-0.6b-FLM");
++  // A remounted picker asking again reuses the running stream.
++  assert.equal(store.followNpuDownload("qwen3-0.6b-FLM"), first);
++  assert.equal(pulls.length, 1);
++  assert.equal(pulls[0].follow, false);
++  pulls[0].onProgress({ event: "progress", percent: 42 });
++  assert.equal(
++    store.useNpuCatalogStore.getState().progress["qwen3-0.6b-FLM"],
++    42,
++  );
++  // downloadNpuModel resolves only after the stream's complete event.
++  pulls[0].onProgress({ event: "complete", percent: 100 });
++  pulls[0].finish();
++  await tick();
++  // Still downloading until the refreshed list says otherwise, so the row never flickers back.
++  assert.equal(
++    "qwen3-0.6b-FLM" in store.useNpuCatalogStore.getState().progress,
++    true,
++  );
++  listings[0].resolve([{ id: "qwen3-0.6b-FLM" }]);
++  assert.equal(await first, true);
++  const state = store.useNpuCatalogStore.getState();
++  assert.deepEqual(state.progress, {});
++  assert.deepEqual(state.models, [{ id: "qwen3-0.6b-FLM" }]);
++});
++
++test("a repeated percent leaves the store untouched", () => {
++  const { store, pulls } = harness();
++  void store.followNpuDownload("gemma3-4b-FLM");
++  pulls[0].onProgress({ event: "progress", percent: 7 });
++  let notified = 0;
++  const stop = store.useNpuCatalogStore.subscribe(() => notified++);
++  pulls[0].onProgress({ event: "progress", percent: 7 });
++  pulls[0].onProgress({ event: "progress" });
++  stop();
++  assert.equal(notified, 0);
++});
++
++test("following a backend pull never starts one and opens at its last percent", () => {
++  const { store, pulls } = harness();
++  void store.followNpuDownload("gemma3-4b-FLM", { follow: true, percent: 61 });
++  assert.equal(pulls[0].follow, true);
++  assert.equal(
++    store.useNpuCatalogStore.getState().progress["gemma3-4b-FLM"],
++    61,
++  );
++});
++
++test("a followed pull that ended before its stream opened reports how it ended", async () => {
++  const { store, pulls, listings } = harness();
++  const failed = store.followNpuDownload("gemma3-4b-FLM", { follow: true });
++  // The backend answers 404 once the pull is over, which the API reads as the stream ending.
++  pulls[0].finish();
++  await tick();
++  listings[0].resolve([{ id: "gemma3-4b-FLM", downloaded: false }] as never);
++  assert.equal(await failed, false);
++  const finished = store.followNpuDownload("gemma3-4b-FLM", { follow: true });
++  pulls[1].finish();
++  await tick();
++  listings[1].resolve([{ id: "gemma3-4b-FLM", downloaded: true }] as never);
++  assert.equal(await finished, true);
++});
++
++test("a failed pull is reported once, clears its progress, and the next try streams anew", async () => {
++  const { store, pulls, listings, toasts } = harness();
++  const job = store.followNpuDownload("llama3.2-1b-FLM");
++  void store.followNpuDownload("llama3.2-1b-FLM");
++  pulls[0].finish(new Error("connection reset"));
++  // Relisted, so the row offers to resume from what the failed pull kept.
++  await until(() => listings.length === 1);
++  listings[0].resolve([]);
++  assert.equal(await job, false);
++  assert.deepEqual(toasts, ["Could not download llama3.2-1b-FLM"]);
++  assert.deepEqual(store.useNpuCatalogStore.getState().progress, {});
++  void store.followNpuDownload("llama3.2-1b-FLM");
++  assert.equal(pulls.length, 2);
++});
++
++test("an older list answer never overwrites a newer one", async () => {
++  const { store, listings } = harness();
++  const older = store.refreshNpuModels();
++  const newer = store.refreshNpuModels();
++  listings[1].resolve([{ id: "downloaded" }]);
++  await newer;
++  listings[0].resolve([]);
++  await older;
++  assert.deepEqual(store.useNpuCatalogStore.getState().models, [
++    { id: "downloaded" },
++  ]);
++});
++
++test("a running pull counts as a download for the desktop quit warning", async () => {
++  const { store, pulls, listings, activity } = harness();
++  const job = store.followNpuDownload("qwen3-0.6b-FLM");
++  assert.equal(activity.at(-1), true);
++  pulls[0].finish();
++  await tick();
++  listings[0].resolve([]);
++  await job;
++  assert.equal(activity.at(-1), false);
++});
