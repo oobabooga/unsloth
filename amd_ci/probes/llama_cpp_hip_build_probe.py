@@ -65,7 +65,7 @@ def _gen(folder: Path, model: Path, ngl: int) -> dict:
         cmd = [str(comp), "-m", str(model), "-no-cnv", "-n", "32", "-p", "Once upon a time",
                "-ngl", str(ngl), "--temp", "0", "-s", "0"]
     else:
-        cmd = [str(folder / "llama-cli"), "-m", str(model), "-st", "-lv", "3", "-n", "32",
+        cmd = [str(folder / "llama-cli"), "-m", str(model), "-st", "-v", "-n", "32",
                "-p", "Once upon a time", "-ngl", str(ngl), "--temp", "0", "-s", "0"]
     r: dict = {"cmd": " ".join(cmd)}
     try:
