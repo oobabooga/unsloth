@@ -36,6 +36,8 @@ from trl import SFTConfig, SFTTrainer
 out = {"versions": {m.__name__: m.__version__ for m in (torch, transformers, trl, peft, unsloth)},
        "hip": getattr(torch.version, "hip", None), "device": torch.cuda.get_device_name(0),
        "unsloth_file": unsloth.__file__}
+import unsloth_zoo
+out["unsloth_zoo_file"] = unsloth_zoo.__file__
 model, tok = FastLanguageModel.from_pretrained(sys.argv[1], max_seq_length = 256, load_in_4bit = False,
                                                dtype = torch.bfloat16)
 model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, random_state = 3407,
@@ -92,11 +94,16 @@ def main() -> int:
         rc, _, err = run([py, "-m", "ensurepip", "-q"])
         spec = f"{args.checkout}[huggingfacenotorch]"
         rc, so, err = run([py, "-m", "pip", "install", "-q", "--upgrade", "--upgrade-strategy", "only-if-needed",
-                           spec, "transformers", "trl"] + ([args.zoo_spec] if args.zoo_spec else []))
+                           spec, "transformers", "trl"])
         obs["install_rc"] = rc
-        obs["zoo_spec"] = args.zoo_spec
         if rc:
             raise RuntimeError(f"install: {(so + err)[-2000:]}")
+        if args.zoo_spec:
+            # Same version string as the released zoo, so force it over whatever the resolver picked.
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--force-reinstall", "--no-deps", args.zoo_spec])
+            obs["zoo_spec"], obs["zoo_install_rc"] = args.zoo_spec, rc
+            if rc:
+                raise RuntimeError(f"zoo install: {(so + err)[-2000:]}")
         rc, freeze, _ = run([py, "-m", "pip", "list", "--format=json"])
         obs["installed"] = {d["name"].lower(): d["version"] for d in json.loads(freeze)
                             if d["name"].lower() in ("transformers", "trl", "peft", "datasets", "accelerate",
