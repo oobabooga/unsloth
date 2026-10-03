@@ -153,9 +153,14 @@ jobs:
           Write-Host "Studio venv python: $($py.FullName)"
           $env:PATH = "$(Split-Path $py.FullName);$env:PATH"
           Set-Location "$env:AMD_CI_WORK\tmp"
-          & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_moe_diag.py" sweep *>&1 |
-            Out-File -FilePath "$env:AMD_CI_WORK\out\win_moe_diag_sweep.log" -Encoding utf8
-          Select-String -Path "$env:AMD_CI_WORK\out\win_moe_diag_sweep.log" -Pattern "WIN_MOE_DIAG" | ForEach-Object { $_.Line.Substring(0, [Math]::Min(3000, $_.Line.Length)) }
+          & $py.FullName -m pip install -q --retries 10 --timeout 120 --no-deps --force-reinstall `
+            "unsloth @ https://github.com/unslothai/unsloth/archive/0ef43a67561dcce2dd5b45a8e46f8a50d194b5d7.zip"
+          $env:TORCHDYNAMO_DISABLE = "1"
+          foreach ($m in @("hf-internal-testing/tiny-random-MixtralForCausalLM")) {
+            & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_sdpa_trip.py" $m *>&1 |
+              Out-File -FilePath "$env:AMD_CI_WORK\out\win_sdpa_trip.log" -Encoding utf8
+          }
+          Select-String -Path "$env:AMD_CI_WORK\out\win_sdpa_trip.log" -Pattern "TRIP_|SDPA|Error" | Select-Object -Last 30 | ForEach-Object { $_.Line }
           exit 0
 
       - name: Differential
