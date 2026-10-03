@@ -32,27 +32,71 @@ if os.environ.get("DIAG_MODEL"):
 out["model"], out["attn"] = MODEL, ATTN
 
 if which in ("all", "sdpa"):
-    # Standalone SDPA, synchronized, per head_dim and backend: tiny Mixtral has head_dim 16, tiny Qwen3 128.
+    # Standalone SDPA, synchronized: per backend, head_dim and call shape. Fused kernels are AOTriton on ROCm.
     import torch
     import torch.nn.functional as F
     from torch.nn.attention import SDPBackend, sdpa_kernel
-    for hd in (16, 32, 64, 128):
-        for name, be in (("flash", SDPBackend.FLASH_ATTENTION), ("efficient", SDPBackend.EFFICIENT_ATTENTION),
-                         ("math", SDPBackend.MATH), ("default", None)):
-            key = f"sdpa_hd{hd}_{name}"
-            try:
-                q, k, v = (torch.randn(4, 4, 12, hd, device = "cuda", dtype = torch.bfloat16, requires_grad = True) for _ in range(3))
-                if be is None:
-                    o = F.scaled_dot_product_attention(q, k, v, is_causal = True)
-                else:
-                    with sdpa_kernel([be]):
-                        o = F.scaled_dot_product_attention(q, k, v, is_causal = True)
-                o.float().sum().backward(); torch.cuda.synchronize()
-                out[key] = "ok"
-            except Exception as e:
-                out[key] = err(e)
-                try: torch.cuda.synchronize()
-                except Exception: pass
+    out["aotriton_experimental_env"] = os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL")
+    out["arch"] = torch.cuda.get_device_properties(0).gcnArchName
+    for fn in ("is_flash_attention_available",):
+        try: out[fn] = getattr(torch.backends.cuda, fn)()
+        except Exception as e: out[fn] = err(e)
+    def call(variant, hd):
+        dev, dt = "cuda", torch.bfloat16
+        q = torch.randn(4, 4, 12, hd, device = dev, dtype = dt, requires_grad = True)
+        nkv = 2 if variant == "gqa" else 4
+        k = torch.randn(4, nkv, 12, hd, device = dev, dtype = dt, requires_grad = True)
+        v = torch.randn(4, nkv, 12, hd, device = dev, dtype = dt, requires_grad = True)
+        kw = {"is_causal": variant in ("causal_fwd", "causal_bwd", "gqa")}
+        if variant == "gqa": kw["enable_gqa"] = True
+        if variant == "bool_mask": kw["attn_mask"] = torch.ones(4, 1, 12, 12, device = dev, dtype = torch.bool).tril()
+        o = F.scaled_dot_product_attention(q, k, v, **kw)
+        torch.cuda.synchronize()
+        if variant in ("causal_bwd", "gqa"):
+            o.float().sum().backward(); torch.cuda.synchronize()
+    for name, be in (("flash", SDPBackend.FLASH_ATTENTION), ("efficient", SDPBackend.EFFICIENT_ATTENTION),
+                     ("default", None)):
+        for hd in (64, 128):
+            for variant in ("causal_fwd", "causal_bwd", "noncausal_fwd", "bool_mask", "gqa"):
+                key = f"sdpa_{name}_hd{hd}_{variant}"
+                try:
+                    if be is None:
+                        call(variant, hd)
+                    else:
+                        with sdpa_kernel([be]):
+                            call(variant, hd)
+                    out[key] = "ok"
+                except Exception as e:
+                    out[key] = err(e)
+                    try: torch.cuda.synchronize()
+                    except Exception as e2: out[key] += f" | sync after: {err(e2)}"
+
+if which == "trace_sdpa":
+    # What the dense path that trains actually sends to SDPA.
+    import torch, torch.nn.functional as F
+    calls = []
+    _orig = F.scaled_dot_product_attention
+    def traced(q, k, v, *a, **kw):
+        if len(calls) < 4:
+            m_ = kw.get("attn_mask")
+            calls.append({"q": list(q.shape), "k": list(k.shape), "dtype": str(q.dtype), "q_contig": q.is_contiguous(),
+                          "mask": None if m_ is None else [list(m_.shape), str(m_.dtype)],
+                          **{x: kw[x] for x in ("is_causal", "enable_gqa", "dropout_p", "scale") if x in kw}})
+        return _orig(q, k, v, *a, **kw)
+    F.scaled_dot_product_attention = traced
+    import unsloth
+    from unsloth import FastLanguageModel
+    try:
+        m, tok = FastLanguageModel.from_pretrained(MODEL, max_seq_length = 256, load_in_4bit = False, dtype = torch.bfloat16)
+        m = FastLanguageModel.get_peft_model(m, r = 8, lora_alpha = 16, target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"])
+        b = batch(tok, "cuda")
+        loss = m(**b, labels = b["input_ids"]).loss
+        loss.backward(); torch.cuda.synchronize()
+        out["trace"] = f"ok loss={loss.item():.4f}"
+    except Exception as e:
+        out["trace"] = err(e)
+    out["sdpa_calls"] = calls
+
 if which in ("all", "plain"):
     try:
         import torch, transformers, peft
