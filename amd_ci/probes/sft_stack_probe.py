@@ -122,7 +122,10 @@ def main() -> int:
             raise RuntimeError(f"install: {(so + err)[-2000:]}")
         if os.name == "nt":
             # Studio's setup.ps1 adds these on Windows x64: unsloth_zoo imports triton and checks bitsandbytes.
-            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "triton-windows<3.7", "bitsandbytes"])
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "triton-windows<3.7",
+                                    # Studio's Windows ROCm bitsandbytes (studio/install_python_stack.py).
+                                    "bitsandbytes @ https://github.com/bitsandbytes-foundation/bitsandbytes/releases/"
+                                    "download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-win_amd64.whl"])
             obs["triton_windows_rc"] = rc
         if args.zoo_spec:
             # Same version string as the released zoo, so force it over whatever the resolver picked.
