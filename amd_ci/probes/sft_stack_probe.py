@@ -23,6 +23,7 @@ from pathlib import Path
 MODELS = {
     "dense": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "moe": "hf-internal-testing/tiny-random-MixtralForCausalLM",
+    "moe_qwen3": "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
 }
 
 _TRAIN = r'''

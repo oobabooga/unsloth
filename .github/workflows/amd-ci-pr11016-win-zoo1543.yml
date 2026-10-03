@@ -151,29 +151,23 @@ jobs:
             Where-Object { $_.FullName -match '\\Scripts\\python\.exe$' } | Select-Object -First 1
           if ($null -eq $py) { Write-Host "No Studio venv python found under $env:UNSLOTH_STUDIO_HOME"; exit 0 }
           Write-Host "Studio venv python: $($py.FullName)"
-          if ($false) {  # answered in run 37123451459: dense trains, MoE fails
           & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
             --python $py.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train.json" `
             --work "$env:AMD_CI_WORK\studio_train"
-          }
-          # MoE hipErrorInvalidValue: plain transformers + PEFT vs Unsloth, then the LoRA matmul replayed.
+          # HEAD arm: the same venv with the fused-SDPA fix branch over Studio's unsloth.
           $env:PATH = "$(Split-Path $py.FullName);$env:PATH"
+          & $py.FullName -m pip install -q --retries 10 --timeout 120 --no-deps --force-reinstall `
+            "unsloth @ https://github.com/unslothai/unsloth/archive/0ef43a67561dcce2dd5b45a8e46f8a50d194b5d7.zip"
+          Write-Host "fix install exit: $LASTEXITCODE"
+          & $py.FullName -m pip install -q --retries 10 --timeout 120 pytest
           Set-Location "$env:AMD_CI_WORK\tmp"
-          # name, mode, attn implementation ("" = model default), model ("" = tiny Mixtral),
-          # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL ("" = unset; unsloth's import sets 1 only when unset)
-          $q3 = "trl-internal-testing/tiny-Qwen3ForCausalLM"
-          $cases = @(
-            @("trace_dense", "trace_sdpa", "", $q3, "", ""),
-            @("trace_mixtral", "trace_sdpa", "", "", "", ""),
-            @("unsloth_mathsdp", "unsloth", "", "", "", "1"),
-            @("unsloth_qwen3moe_mathsdp", "unsloth", "", "trl-internal-testing/tiny-Qwen3MoeForCausalLM", "", "1")
-          )
-          foreach ($c in $cases) {
-            $env:DIAG_ATTN = $c[2]; $env:DIAG_MODEL = $c[3]; $env:TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL = $c[4]; $env:DIAG_MATH_SDP = $c[5]
-            & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_moe_diag.py" $c[1] *>&1 |
-              Out-File -FilePath "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Encoding utf8
-            Select-String -Path "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Pattern "WIN_MOE_DIAG" | ForEach-Object { $_.Line }
-          }
+          & $py.FullName -c "import unsloth, unsloth.import_fixes as f; print('FIX_FILE', unsloth.__file__, hasattr(f, 'fix_rocm_windows_fused_sdpa'))"
+          & $py.FullName -m pytest -q -p no:cacheprovider "$env:GITHUB_WORKSPACE\amd_ci\probes\test_rocm_windows_fused_sdpa.py" *>&1 |
+            Out-File -FilePath "$env:AMD_CI_WORK\out\fix_pytest.log" -Encoding utf8
+          Get-Content "$env:AMD_CI_WORK\out\fix_pytest.log" -Tail 15
+          & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
+            --python $py.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train_fix.json" `
+            --work "$env:AMD_CI_WORK\studio_train_fix"
           exit 0
 
       - name: Differential
