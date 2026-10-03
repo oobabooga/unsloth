@@ -42,7 +42,25 @@ if which in ("all", "plain"):
     except Exception as e:
         out["plain_hf_peft"] = err(e); out["plain_tb"] = traceback.format_exc()[-1500:]
 
-if which in ("all", "unsloth"):
+if which in ("all", "grouped_mm"):
+    # The same dummy call zoo's _check_torch_grouped_mm_supported makes, but synchronized and at a real shape.
+    import torch
+    for label, (m_, k_, n_, e_) in {"zoo_probe": (1, 8, 8, 1), "tiny_mixtral": (64, 32, 64, 8)}.items():
+        for dt in (torch.float16, torch.bfloat16):
+            key = f"grouped_mm_{label}_{str(dt)[6:]}"
+            try:
+                x = torch.randn((m_, k_), device = "cuda", dtype = dt)
+                w = torch.randn((e_, k_, n_), device = "cuda", dtype = dt)
+                offs = torch.linspace(m_ / e_, m_, e_, device = "cuda").round().to(torch.int32)
+                y = torch._grouped_mm(x, w, offs = offs); torch.cuda.synchronize()
+                ref = torch.cat([x[a:b] @ w[i] for i, (a, b) in enumerate(zip([0] + offs.tolist()[:-1], offs.tolist()))])
+                out[key] = f"ok maxdiff={(y.float() - ref.float()).abs().max().item():.3g}"
+            except Exception as e:
+                out[key] = err(e)
+
+if which in ("all", "unsloth", "unsloth_native"):
+    if which == "unsloth_native":
+        os.environ["UNSLOTH_MOE_BACKEND"] = "native_torch"
     captured = []
     try:
         import unsloth
@@ -71,6 +89,11 @@ if which in ("all", "unsloth"):
         out["unsloth"] = f"ok loss={loss.item():.4f}"
     except Exception as e:
         out["unsloth"] = err(e); out["unsloth_tb"] = traceback.format_exc()[-2500:]
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import select_moe_backend
+        out["moe_backend"] = select_moe_backend()
+    except Exception as e:
+        out["moe_backend"] = err(e)
     out["captured_last"] = captured[-6:]
     if captured:
         c = captured[-1]
