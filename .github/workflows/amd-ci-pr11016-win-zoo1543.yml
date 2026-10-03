@@ -165,7 +165,7 @@ jobs:
             --work "$env:AMD_CI_WORK\studio_train"
           # HEAD arm: the same venv with the fix branch over Studio's unsloth.
           & $py.FullName -m pip install -q --retries 10 --timeout 120 --no-deps --force-reinstall `
-            "unsloth @ https://github.com/unslothai/unsloth/archive/e91a1d6e7e56b682b72f8d12453a0a09d55bce52.zip"
+            "unsloth @ https://github.com/unslothai/unsloth/archive/b05fce7ca38f1ef150fdb585b363687393084cc2.zip"
           Write-Host "fix install exit: $LASTEXITCODE"
           & $py.FullName -m pytest -q -p no:cacheprovider "$env:GITHUB_WORKSPACE\amd_ci\probes\test_rocm_windows_fused_sdpa.py" *>&1 |
             Out-File -FilePath "$env:AMD_CI_WORK\out\pytest_head.log" -Encoding utf8
