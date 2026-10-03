@@ -95,7 +95,8 @@ def main() -> int:
     try:
         rc, site, err = run([args.python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"])
         studio_site = site.strip()
-        rc, _, err = run([args.python, "-m", "venv", "--without-pip", str(venv)])
+        # A venv of its own (no layer) needs real pip; ensurepip into a --without-pip venv fails on Windows.
+        rc, _, err = run([args.python, "-m", "venv", *([] if args.own_torch else ["--without-pip"]), str(venv)])
         if rc:
             raise RuntimeError(f"venv: {err[-800:]}")
         py = str(venv / "Scripts" / "python.exe") if os.name == "nt" else str(venv / "bin" / "python")
@@ -103,6 +104,9 @@ def main() -> int:
         if not args.own_torch:
             Path(vsite.strip(), "_studio_layer.pth").write_text(studio_site + "\n", encoding = "utf-8")
         rc, _, err = run([py, "-m", "ensurepip", "-q"])
+        rc, _, err = run([py, "-m", "pip", "--version"])
+        if rc:
+            raise RuntimeError(f"no pip in the state venv: {err[-800:]}")
         if args.own_torch:
             idx = ["--index-url", args.torch_index, "--extra-index-url", "https://pypi.org/simple"] if args.torch_index else []
             rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", *idx,
