@@ -163,16 +163,13 @@ jobs:
           # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL ("" = unset; unsloth's import sets 1 only when unset)
           $q3 = "trl-internal-testing/tiny-Qwen3ForCausalLM"
           $cases = @(
-            @("sdpa_exp_unset", "sdpa", "", "", ""),
-            @("sdpa_exp0", "sdpa", "", "", "0"),
-            @("sdpa_exp1", "sdpa", "", "", "1"),
-            @("trace_dense", "trace_sdpa", "", $q3, ""),
-            @("trace_mixtral", "trace_sdpa", "", "", ""),
-            @("plain_exp0", "plain", "", "", "0"),
-            @("unsloth_exp0", "unsloth", "", "", "0")
+            @("trace_dense", "trace_sdpa", "", $q3, "", ""),
+            @("trace_mixtral", "trace_sdpa", "", "", "", ""),
+            @("unsloth_mathsdp", "unsloth", "", "", "", "1"),
+            @("unsloth_qwen3moe_mathsdp", "unsloth", "", "trl-internal-testing/tiny-Qwen3MoeForCausalLM", "", "1")
           )
           foreach ($c in $cases) {
-            $env:DIAG_ATTN = $c[2]; $env:DIAG_MODEL = $c[3]; $env:TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL = $c[4]
+            $env:DIAG_ATTN = $c[2]; $env:DIAG_MODEL = $c[3]; $env:TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL = $c[4]; $env:DIAG_MATH_SDP = $c[5]
             & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_moe_diag.py" $c[1] *>&1 |
               Out-File -FilePath "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Encoding utf8
             Select-String -Path "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Pattern "WIN_MOE_DIAG" | ForEach-Object { $_.Line }

@@ -76,10 +76,15 @@ if which == "trace_sdpa":
     import torch, torch.nn.functional as F
     calls = []
     _orig = F.scaled_dot_product_attention
+    import functools
+    @functools.wraps(_orig)
     def traced(q, k, v, *a, **kw):
         if len(calls) < 4:
+            fr = sys._getframe(1)
             m_ = kw.get("attn_mask")
-            calls.append({"q": list(q.shape), "k": list(k.shape), "dtype": str(q.dtype), "q_contig": q.is_contiguous(),
+            calls.append({"caller": f"{os.path.basename(fr.f_code.co_filename)}:{fr.f_code.co_name}:{fr.f_lineno}",
+                          "grad": torch.is_grad_enabled() and q.requires_grad, "args": len(a),
+                          "q": list(q.shape), "k": list(k.shape), "dtype": str(q.dtype), "q_contig": q.is_contiguous(),
                           "mask": None if m_ is None else [list(m_.shape), str(m_.dtype)],
                           **{x: kw[x] for x in ("is_causal", "enable_gqa", "dropout_p", "scale") if x in kw}})
         return _orig(q, k, v, *a, **kw)
@@ -96,6 +101,13 @@ if which == "trace_sdpa":
     except Exception as e:
         out["trace"] = err(e)
     out["sdpa_calls"] = calls
+    if not calls:
+        # No SDPA call at all: name the attention forward that ran instead.
+        try:
+            out["attn_forward"] = {n: type(mod).forward.__module__ + "." + type(mod).forward.__qualname__
+                                   for n, mod in m.named_modules() if n.endswith("layers.0.self_attn")}
+        except Exception as e:
+            out["attn_forward"] = err(e)
 
 if which in ("all", "plain"):
     try:
@@ -149,6 +161,11 @@ if which in ("all", "unsloth", "unsloth_native"):
         import unsloth
         from unsloth import FastLanguageModel
         import torch
+        if os.environ.get("DIAG_MATH_SDP") == "1":
+            # Candidate fix: route SDPA to the math kernel only.
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            out["math_sdp_only"] = True
         m, tok = FastLanguageModel.from_pretrained(MODEL, max_seq_length = 256, load_in_4bit = False,
                                                    dtype = torch.bfloat16,
                                                    **({"attn_implementation": ATTN} if ATTN else {}))
