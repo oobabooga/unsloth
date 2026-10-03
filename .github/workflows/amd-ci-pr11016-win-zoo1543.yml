@@ -137,6 +137,25 @@ jobs:
             --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_rocm.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Studio install, then Core training in the Studio venv
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Set-Location "$env:AMD_CI_WORK\states\head"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local --skip-autostart --no-rollback *>&1 |
+            Out-File -FilePath "$env:AMD_CI_WORK\out\studio_install.log" -Encoding utf8
+          Write-Host "install.ps1 exit: $LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\studio_install.log" -Tail 40
+          $py = Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME" -Recurse -Filter python.exe -Depth 3 -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\Scripts\\python\.exe$' } | Select-Object -First 1
+          if ($null -eq $py) { Write-Host "No Studio venv python found under $env:UNSLOTH_STUDIO_HOME"; exit 0 }
+          Write-Host "Studio venv python: $($py.FullName)"
+          & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
+            --python $py.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train.json" `
+            --work "$env:AMD_CI_WORK\studio_train"
+          exit 0
+
       - name: Differential
         run: |
           $ErrorActionPreference = "Continue"
