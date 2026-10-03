@@ -145,7 +145,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/sft_stack_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/sft_stack_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --zoo-spec 'unsloth_zoo @ https://github.com/unslothai/unsloth-zoo/archive/d0ae13163af381db8d8df85261d11f34e52526d3.zip' --env UNSLOTH_COMPILE_DISABLE=1 --env TORCHDYNAMO_DISABLE=1 --env AMD_SERIALIZE_KERNEL=3
+            --python "$env:AMD_CI_PY" -- --zoo-spec 'unsloth_zoo @ https://github.com/unslothai/unsloth-zoo/archive/750548b5db267d54ed0d6e0fe3b2b7949bc0d6be.zip' --env TORCHDYNAMO_DISABLE=1 --own-torch 'torch[device-gfx1151]==2.11.0+rocm7.14.1 torchvision[device-gfx1151]==0.26.0+rocm7.14.1' --torch-index 'https://repo.amd.com/rocm/whl-multi-arch/'
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

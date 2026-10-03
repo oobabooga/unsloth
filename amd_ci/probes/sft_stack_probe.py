@@ -38,6 +38,11 @@ out = {"versions": {m.__name__: m.__version__ for m in (torch, transformers, trl
        "unsloth_file": unsloth.__file__}
 import unsloth_zoo
 out["unsloth_zoo_file"] = unsloth_zoo.__file__
+try:
+    from triton.runtime.build import get_cc
+    out["triton_cc"] = get_cc()
+except Exception as e:
+    out["triton_cc"] = f"{type(e).__name__}: {e}"
 model, tok = FastLanguageModel.from_pretrained(sys.argv[1], max_seq_length = 256, load_in_4bit = False,
                                                dtype = torch.bfloat16)
 model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, random_state = 3407,
@@ -77,6 +82,10 @@ def main() -> int:
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--python", default = sys.executable)
     ap.add_argument("--env", action = "append", default = [], help = "KEY=VALUE set for the training runs")
+    ap.add_argument("--own-torch", default = "",
+                    help = "space-separated torch specs installed INTO each state's venv instead of layering "
+                           "the runner venv (Windows: triton-windows finds ROCm's clang-cl only in its own venv)")
+    ap.add_argument("--torch-index", default = "", help = "index URL for --own-torch")
     ap.add_argument("--zoo-spec", default = "",
                     help = "pip spec for unsloth_zoo installed into every state (e.g. a git ref under review)")
     args = ap.parse_args()
@@ -91,8 +100,16 @@ def main() -> int:
             raise RuntimeError(f"venv: {err[-800:]}")
         py = str(venv / "Scripts" / "python.exe") if os.name == "nt" else str(venv / "bin" / "python")
         rc, vsite, err = run([py, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"])
-        Path(vsite.strip(), "_studio_layer.pth").write_text(studio_site + "\n", encoding = "utf-8")
+        if not args.own_torch:
+            Path(vsite.strip(), "_studio_layer.pth").write_text(studio_site + "\n", encoding = "utf-8")
         rc, _, err = run([py, "-m", "ensurepip", "-q"])
+        if args.own_torch:
+            idx = ["--index-url", args.torch_index, "--extra-index-url", "https://pypi.org/simple"] if args.torch_index else []
+            rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", *idx,
+                               *args.own_torch.split()])
+            obs["own_torch_rc"] = rc
+            if rc:
+                raise RuntimeError(f"torch install: {(so + err)[-2000:]}")
         spec = f"{args.checkout}[huggingfacenotorch]"
         rc, so, err = run([py, "-m", "pip", "install", "-q", "--retries", "10", "--timeout", "120", "--upgrade", "--upgrade-strategy", "only-if-needed",
                            spec, "transformers", "trl"])
