@@ -39,10 +39,24 @@ out = {"versions": {m.__name__: m.__version__ for m in (torch, transformers, trl
 import unsloth_zoo
 out["unsloth_zoo_file"] = unsloth_zoo.__file__
 try:
+    a = torch.randn(16, 32, device = "cuda", dtype = torch.bfloat16)
+    b = torch.randn(32, 8, device = "cuda", dtype = torch.bfloat16)
+    (a @ b).sum().item()
+    out["bf16_matmul"] = "ok"
+except Exception as e:
+    out["bf16_matmul"] = f"{type(e).__name__}: {e}"[:400]
+try:
     from triton.runtime.build import get_cc
     out["triton_cc"] = get_cc()
 except Exception as e:
     out["triton_cc"] = f"{type(e).__name__}: {e}"
+try:
+    import triton
+    triton.runtime.driver.active.utils  # builds hip_utils with the C compiler above
+    out["triton_driver"] = "ok"
+except Exception as e:
+    out["triton_driver"] = f"{type(e).__name__}: {e}"[-600:]
+print("SFT_STACK_DIAG " + json.dumps(out), flush = True)
 model, tok = FastLanguageModel.from_pretrained(sys.argv[1], max_seq_length = 256, load_in_4bit = False,
                                                dtype = torch.bfloat16)
 model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, random_state = 3407,
@@ -150,7 +164,12 @@ def main() -> int:
             rc, so, err = run([py, str(script), model], env = dict(env, PWD = str(work)), timeout = 2400)
             line = [l for l in so.splitlines() if l.startswith("SFT_STACK_RESULT ")]
             obs["runs"][name] = json.loads(line[-1].split(" ", 1)[1]) if line else \
-                {"error": f"rc={rc}: {(so + err)[-2500:]}"}
+                {"error": f"rc={rc}: {(so + err)[-2500:]}",
+                 # The compiler's own message sits far above the traceback tail.
+                 "diag": next((json.loads(l.split(" ", 1)[1]) for l in so.splitlines()
+                               if l.startswith("SFT_STACK_DIAG ")), None),
+                 "error_lines": [l for l in (so + err).splitlines()
+                                 if any(k in l.lower() for k in ("error", "fatal", "warning: unable", "cannot open"))][:60]}
     except Exception as e:  # noqa: BLE001
         obs["error"] = f"{type(e).__name__}: {e}"
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
