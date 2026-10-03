@@ -71,6 +71,35 @@ if which in ("all", "sdpa"):
                     try: torch.cuda.synchronize()
                     except Exception as e2: out[key] += f" | sync after: {err(e2)}"
 
+if which == "sweep":
+    # Which shapes fail: the fused kernels ran a (1, 2, 16, 64) probe fine but fail at (4, 4, 12, 64).
+    import torch
+    import torch.nn.functional as F
+    res = {}
+    for b, h in ((1, 2), (4, 4), (1, 4), (4, 2)):
+        for S in (1, 2, 4, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 48, 64, 100, 128, 256):
+            for hd in (64, 128):
+                for kind in ("bwd", "gqa", "mask"):
+                    key = f"b{b}h{h}_S{S}_hd{hd}_{kind}"
+                    try:
+                        q = torch.randn(b, h, S, hd, device = "cuda", dtype = torch.bfloat16, requires_grad = kind == "bwd")
+                        kvh = max(1, h // 2) if kind == "gqa" else h
+                        k = torch.randn(b, kvh, S, hd, device = "cuda", dtype = torch.bfloat16)
+                        v = torch.randn(b, kvh, S, hd, device = "cuda", dtype = torch.bfloat16)
+                        kw = {"is_causal": kind != "mask"}
+                        if kind == "gqa": kw["enable_gqa"] = True
+                        if kind == "mask": kw["attn_mask"] = torch.ones(S, S, device = "cuda", dtype = torch.bool).tril()
+                        o = F.scaled_dot_product_attention(q, k, v, **kw)
+                        if kind == "bwd": o.float().sum().backward()
+                        torch.cuda.synchronize()
+                        res[key] = 1
+                    except Exception as e:
+                        res[key] = 0
+                        try: torch.cuda.synchronize()
+                        except Exception: pass
+    out["sweep_fail"] = sorted(k for k, v in res.items() if not v)
+    out["sweep_ok"] = sorted(k for k, v in res.items() if v)
+
 if which == "trace_sdpa":
     # What the dense path that trains actually sends to SDPA.
     import torch, torch.nn.functional as F
