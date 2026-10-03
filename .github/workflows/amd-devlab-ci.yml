@@ -1,0 +1,78 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-npu-metrics-probe]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 3ebc7bf8e0
+  MODEL: qwen3-0.6b-FLM
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install Studio at main
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/npu-probe-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "HF_HOME=$W/hf" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$W/uv" >> "$GITHUB_ENV"
+          echo "UNSLOTH_STUDIO_HOME=$W/studio" >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git checkout -q "$BASE_SHA"
+          UNSLOTH_SKIP_AUTOSTART=1 ./install.sh --local --no-torch --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -20 "$W/install.log"
+      - name: Probe
+        run: |
+          set -uxo pipefail
+          cd "$W/src/studio/backend"
+          "$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python" "$GITHUB_WORKSPACE/harness/probe.py" "$MODEL"
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install Studio at main
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "npu-probe-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\tmp","$W\hf","$W\uv" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
+          git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          Set-Location "$W\src"
+          git config core.autocrlf false
+          git checkout -q $env:BASE_SHA
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          $ErrorActionPreference = 'Continue'
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\install.log" -Tail 30
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+      - name: Probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-Location "$env:W\src\studio\backend"
+          & "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\probe.py" $env:MODEL
+          exit $LASTEXITCODE
