@@ -1,0 +1,174 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-npu-metrics-ab]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 3ebc7bf8e0
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install main and main plus this change
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/npu-ab-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "HF_HOME=$W/hf" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$W/uv" >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv"
+          for side in main pr; do
+            git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W/$side"
+            git -C "$W/$side" checkout -q "$BASE_SHA"
+          done
+          git -C "$W/pr" apply "$GITHUB_WORKSPACE/harness/npu.patch"
+          git -C "$W/pr" status --short
+          for side in main pr; do
+            (cd "$W/$side" && UNSLOTH_STUDIO_HOME="$W/home-$side" UNSLOTH_SKIP_AUTOSTART=1 ./install.sh --local --no-torch --no-rollback > "$W/install-$side.log" 2>&1) || { tail -150 "$W/install-$side.log"; exit 1; }
+            tail -5 "$W/install-$side.log"
+            test -f "$W/$side/studio/frontend/dist/index.html"
+          done
+          python3 -m venv "$W/pw"
+          "$W/pw/bin/pip" install -q 'playwright>=1.45,<2'
+          "$W/pw/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1 || { tail -30 "$W/pw-install.log"; exit 1; }
+      - name: A/B on the NPU
+        shell: bash {0}
+        run: |
+          set -uxo pipefail
+          PW="npu-ab-$GITHUB_RUN_ID-Pw1"
+          for side in main pr; do
+            PY="$W/home-$side/unsloth_studio/bin/python"
+            PORT=$(shuf -i 18800-18899 -n 1)
+            pushd "$W/$side/studio/backend" > /dev/null
+            UNSLOTH_STUDIO_HOME="$W/home-$side" nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --frontend "$W/$side/studio/frontend/dist" --password "$PW" > "$W/studio-$side.log" 2>&1 &
+            SPID=$!
+            popd > /dev/null
+            for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" > /dev/null && break; sleep 1; done
+            curl -sf "http://127.0.0.1:$PORT/api/health" || tail -60 "$W/studio-$side.log"
+            "$W/pw/bin/python" "$GITHUB_WORKSPACE/harness/ab_ui.py" "http://127.0.0.1:$PORT" "$PW" "$W/out/$side" "$side"
+            kill -TERM "$SPID"
+            for i in $(seq 1 60); do kill -0 "$SPID" 2>/dev/null || break; sleep 1; done
+            kill -KILL "$SPID" 2>/dev/null || true
+            pkill -KILL -f "$W/home-$side/lemonade" || true
+            sleep 3
+            grep -iE "error|traceback" "$W/studio-$side.log" | tail -20
+          done
+          mkdir -p "$GITHUB_WORKSPACE/ab-out"
+          cp -r "$W/out/." "$GITHUB_WORKSPACE/ab-out/"
+          python3 - "$W/out" <<'PY'
+          import json, sys, pathlib
+          out = pathlib.Path(sys.argv[1])
+          for side in ("main", "pr"):
+              r = json.loads((out / side / "results.json").read_text())
+              chunk = r.get("api_closing_chunk") or {}
+              print(f"==== {side}")
+              for key in ("recommended_gear", "on_device_gear", "gear_tooltip", "settings_context_shown",
+                          "settings_engine_picker", "loaded_context_length", "badge", "metrics", "sidebar_label",
+                          "sidebar_value", "sidebar_reload_context_length", "ui_error", "page_errors"):
+                  print(f"{key}: {r.get(key)!r}")
+              print("api timings:", chunk.get("timings"))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-ab-linux
+          path: ab-out
+          if-no-files-found: ignore
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install main and main plus this change
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "npu-ab-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\tmp","$W\hf","$W\uv" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"
+          foreach ($side in 'main','pr') {
+            git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\$side"
+            Set-Location "$W\$side"
+            git config core.autocrlf false
+            git checkout -q $env:BASE_SHA
+          }
+          Set-Location "$W\pr"
+          # The changed files whole: a patch fights the runner's line-ending conversion.
+          tar -xzf "$env:GITHUB_WORKSPACE\harness\npu-files.tar.gz"
+          if ($LASTEXITCODE -ne 0) { throw "files did not extract" }
+          git status --short
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          foreach ($side in 'main','pr') {
+            Set-Location "$W\$side"
+            $env:UNSLOTH_STUDIO_HOME = "$W\home-$side"
+            $ErrorActionPreference = 'Continue'
+            powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install-$side.log"
+            $rc = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            Get-Content "$W\install-$side.log" -Tail 8
+            if ($rc -ne 0) { Get-Content "$W\install-$side.log" -Tail 80; throw "install.ps1 exited $rc for $side" }
+            if (-not (Test-Path "$W\$side\studio\frontend\dist\index.html")) {
+              Write-Host "Building the $side frontend"
+              Set-Location "$W\$side\studio\frontend"
+              $ErrorActionPreference = 'Continue'
+              npm ci --no-audit --no-fund *> "$W\npm-$side.log"
+              npm run build *>> "$W\npm-$side.log"
+              $ErrorActionPreference = 'Stop'
+              if (-not (Test-Path "$W\$side\studio\frontend\dist\index.html")) { Get-Content "$W\npm-$side.log" -Tail 60; throw "no frontend for $side" }
+            }
+          }
+          python -m venv "$W\pw"
+          & "$W\pw\Scripts\pip.exe" install -q 'playwright>=1.45,<2'
+          & "$W\pw\Scripts\python.exe" -m playwright install chromium *> "$W\pw-install.log"
+          if ($LASTEXITCODE -ne 0) { Get-Content "$W\pw-install.log" -Tail 30; throw "playwright install failed" }
+      - name: A/B on the NPU
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = $env:W
+          $PW = "npu-ab-$env:GITHUB_RUN_ID-Pw1"
+          foreach ($side in 'main','pr') {
+            $env:UNSLOTH_STUDIO_HOME = "$W\home-$side"
+            $PY = "$W\home-$side\unsloth_studio\Scripts\python.exe"
+            $PORT = Get-Random -Minimum 18800 -Maximum 18899
+            $argList = @('run.py','--host','127.0.0.1','--port',"$PORT",'--frontend',"$W\$side\studio\frontend\dist",'--password',$PW)
+            $proc = Start-Process -FilePath $PY -ArgumentList $argList -WorkingDirectory "$W\$side\studio\backend" -RedirectStandardOutput "$W\studio-$side.out" -RedirectStandardError "$W\studio-$side.err" -PassThru -WindowStyle Hidden
+            $up = $false
+            for ($i = 0; $i -lt 300; $i++) { try { Invoke-RestMethod "http://127.0.0.1:$PORT/api/health" | Out-Null; $up = $true; break } catch { Start-Sleep 1 } }
+            if (-not $up) { Get-Content "$W\studio-$side.out","$W\studio-$side.err" -Tail 60 -ErrorAction SilentlyContinue }
+            & "$W\pw\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\ab_ui.py" "http://127.0.0.1:$PORT" $PW "$W\out\$side" $side
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep 3
+            Get-Process | Where-Object { $_.ProcessName -match '^(lemond|flm)$' } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 3
+          }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\ab-out" | Out-Null
+          Copy-Item -Recurse -Force "$W\out\*" "$env:GITHUB_WORKSPACE\ab-out\"
+          foreach ($side in 'main','pr') {
+            Write-Host "==== $side"
+            Get-Content "$W\out\$side\results.json" -Raw | Write-Host
+          }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-ab-windows
+          path: ab-out
+          if-no-files-found: ignore

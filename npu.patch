@@ -1,0 +1,727 @@
+diff --git a/studio/backend/core/inference/external_provider.py b/studio/backend/core/inference/external_provider.py
+index 324ccf80f6..ad43ac5176 100644
+--- a/studio/backend/core/inference/external_provider.py
++++ b/studio/backend/core/inference/external_provider.py
+@@ -9,6 +9,7 @@ import base64
+ import contextlib
+ import io
+ import json as _json
++import math
+ import mimetypes
+ import random
+ import re
+@@ -1987,8 +1988,11 @@ class ExternalProviderClient:
+                                                         continue
+                                                     for ann in envelope.get("annotations") or []:
+                                                         _record_or_url_citation(ann)
+-                        if self.provider_type == "lemonade" and line.startswith("{"):
+-                            line = _bare_json_error_as_sse(line) or line
++                        if self.provider_type == "lemonade":
++                            if line.startswith("{"):
++                                line = _bare_json_error_as_sse(line) or line
++                            else:
++                                line = _with_fastflowlm_timings(line)
+                         # Verbatim relay, minus Unsloth's own UI control protocol: the frames this server writes to
+                         # paint tool cards ride the same stream, so an endpoint that echoes them forges a card for a
+                         # tool that never ran.
+@@ -7324,6 +7328,74 @@ def _bare_json_error_as_sse(line: str) -> Optional[str]:
+     return "data: " + _json.dumps({"error": error})
+ 
+ 
++def _seconds_or_rate(value: Any) -> Optional[float]:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    try:
++        value = float(value)
++    except OverflowError:
++        return None
++    return value if math.isfinite(value) and value >= 0 else None
++
++
++def _count(value: Any) -> Optional[int]:
++    return value if isinstance(value, int) and not isinstance(value, bool) else None
++
++
++def _fastflowlm_timings(usage: Any) -> Optional[dict[str, Any]]:
++    """Restate the prefill and decode FastFlowLM measures, sent in ``usage``, as llama-server's
++    ``timings``: the shape the chat's speed readout and the API monitor read."""
++    if not isinstance(usage, dict):
++        return None
++    prefill_s = _seconds_or_rate(usage.get("prefill_duration_ttft"))
++    decode_s = _seconds_or_rate(usage.get("decoding_duration"))
++    if prefill_s is None and decode_s is None:
++        return None
++    timings: dict[str, Any] = {}
++    prompt_tokens = _count(usage.get("prompt_tokens"))
++    details = usage.get("prompt_tokens_details")
++    cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
++    if prefill_s is not None:
++        timings["prompt_ms"] = prefill_s * 1000.0
++        if prompt_tokens is not None:
++            # FastFlowLM counts a cached prefix in prompt_tokens but not in its prefill speed.
++            timings["prompt_n"] = max(prompt_tokens - (cached or 0), 0)
++        rate = _seconds_or_rate(usage.get("prefill_speed_tps"))
++        if rate is not None:
++            timings["prompt_per_second"] = rate
++        if cached is not None:
++            timings["cache_n"] = cached
++    if decode_s is not None:
++        timings["predicted_ms"] = decode_s * 1000.0
++        completion_tokens = _count(usage.get("completion_tokens"))
++        if completion_tokens is not None:
++            timings["predicted_n"] = completion_tokens
++        rate = _seconds_or_rate(usage.get("decoding_speed_tps"))
++        if rate is not None:
++            timings["predicted_per_second"] = rate
++    return timings
++
++
++def _with_fastflowlm_timings(line: str) -> str:
++    """The chunk FastFlowLM ends a reply with, given the ``timings`` restated from its ``usage``."""
++    # Only the closing chunk carries these, so the rest skip the parse.
++    if '"decoding_duration"' not in line and '"prefill_duration_ttft"' not in line:
++        return line
++    if not line.startswith("data:"):
++        return line
++    try:
++        chunk = _json.loads(line[len("data:") :])
++    except ValueError:
++        return line
++    if not isinstance(chunk, dict) or "timings" in chunk:
++        return line
++    timings = _fastflowlm_timings(chunk.get("usage"))
++    if timings is None:
++        return line
++    chunk["timings"] = timings
++    return "data: " + _json.dumps(chunk)
++
++
+ def _error_sse_line(
+     status_code: int,
+     message: str,
+diff --git a/studio/backend/core/inference/studio_tool_loop.py b/studio/backend/core/inference/studio_tool_loop.py
+index 5ce648fce1..03fba7447c 100644
+--- a/studio/backend/core/inference/studio_tool_loop.py
++++ b/studio/backend/core/inference/studio_tool_loop.py
+@@ -1152,18 +1152,22 @@ def _merge_usage(totals: dict[str, Any], usage: Any) -> None:
+                 bucket[detail] = bucket.get(detail, 0) + count
+ 
+ 
+-def _usage_chunk_line(model: str, totals: dict[str, Any]) -> str | None:
++def _usage_chunk_line(
++    model: str, totals: dict[str, Any], timings: dict[str, Any] | None
++) -> str | None:
+     if not totals:
+         return None
+-    return _sse(
+-        {
+-            "id": "chatcmpl-external-tools",
+-            "object": "chat.completion.chunk",
+-            "model": model,
+-            "choices": [],
+-            "usage": totals,
+-        }
+-    )
++    chunk: dict[str, Any] = {
++        "id": "chatcmpl-external-tools",
++        "object": "chat.completion.chunk",
++        "model": model,
++        "choices": [],
++        "usage": totals,
++    }
++    if timings is not None:
++        # The last turn's, as the local loops report: speeds do not sum across turns.
++        chunk["timings"] = timings
++    return _sse(chunk)
+ 
+ 
+ def _is_usage_only(payload: dict[str, Any]) -> bool:
+@@ -1300,6 +1304,7 @@ async def stream_with_studio_tools(
+     executed_any = False
+     model_name = run.model or "external"
+     usage_totals: dict[str, Any] = {}
++    last_timings: dict[str, Any] | None = None
+     # Dedup, one-shot tracking and the force-final-answer transition are the same ledger the local loops keep, so an
+     # external model cannot spend the budget repeating one call and a terminal no-op still ends the loop.
+     controller = ToolLoopController(
+@@ -1387,14 +1392,19 @@ async def stream_with_studio_tools(
+                     model_name = upstream_model
+                 if "usage" in payload:
+                     _merge_usage(usage_totals, payload.get("usage"))
++                    # A turn without timings must not inherit an earlier turn's.
++                    timings = payload.get("timings")
++                    last_timings = timings if isinstance(timings, dict) else None
+                     if _is_usage_only(payload):
+                         # Withheld: one summed chunk is sent once the loop ends, so a multi-turn answer does not
+                         # report a burst of partial counts.
+                         continue
+                     # Some providers hang usage off a chunk that also carries a choice, which cannot be withheld
+                     # wholesale without losing the content. Drop just the usage: it is already in the totals, and
+-                    # leaving it here makes a client that sums chunks count this turn twice.
++                    # leaving it here makes a client that sums chunks count this turn twice. Its timings ride the
++                    # summed chunk instead.
+                     payload.pop("usage", None)
++                    payload.pop("timings", None)
+                     line = "data: " + json.dumps(payload, separators = (",", ":"))
+                 choices = payload.get("choices")
+                 choice = choices[0] if isinstance(choices, list) and choices else {}
+@@ -1996,6 +2006,6 @@ async def stream_with_studio_tools(
+             # offered
+             _append_user_turn(conversation, _BUDGET_EXHAUSTED_NUDGE)
+ 
+-    usage_line = _usage_chunk_line(model_name, usage_totals)
++    usage_line = _usage_chunk_line(model_name, usage_totals, last_timings)
+     if usage_line is not None:
+         yield usage_line
+diff --git a/studio/backend/tests/test_external_tool_name_and_usage.py b/studio/backend/tests/test_external_tool_name_and_usage.py
+index a020ff1eed..0636334eb3 100644
+--- a/studio/backend/tests/test_external_tool_name_and_usage.py
++++ b/studio/backend/tests/test_external_tool_name_and_usage.py
+@@ -316,3 +316,71 @@ def test_usage_totals_still_sum_across_turns(executed):
+     reports = _usage_chunks(out)
+     assert len(reports) == 1
+     assert reports[0]["usage"]["total_tokens"] == 5
++
++
++def test_the_summed_usage_carries_the_last_turns_timings(executed):
++    """Speeds do not sum, so the loop's usage chunk reports the last turn's, as the local loops do."""
++    first = {"predicted_per_second": 10.0, "predicted_n": 3}
++    last = {"predicted_per_second": 90.0, "predicted_n": 1}
++    turn_one = "data: " + json.dumps(
++        {
++            "choices": [],
++            "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
++            "timings": first,
++        }
++    )
++    turn_two = "data: " + json.dumps(
++        {
++            "choices": [{"index": 0, "delta": {"content": "a"}}],
++            "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10},
++            "timings": last,
++        }
++    )
++    transport = FakeTransport(
++        [
++            [
++                _name_fragment(0, "web_search"),
++                _arguments(0, '{"query": "x"}'),
++                _finish(),
++                turn_one,
++            ],
++            [turn_two, _finish("stop")],
++            [_DONE],
++        ]
++    )
++    out = _run(transport)
++    reports = _usage_chunks(out)
++    assert len(reports) == 1
++    assert reports[0]["usage"]["total_tokens"] == 17
++    assert reports[0]["timings"] == last
++    # The content chunk gave its timings up to the summed chunk.
++    assert not any('"timings"' in line for line in out if '"content"' in line)
++
++
++def test_a_last_turn_without_timings_reports_none(executed):
++    """An earlier turn's speeds must not be passed off as the answer's."""
++    turn_one = "data: " + json.dumps(
++        {
++            "choices": [],
++            "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
++            "timings": {"predicted_per_second": 10.0},
++        }
++    )
++    turn_two = "data: " + json.dumps(
++        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10}}
++    )
++    transport = FakeTransport(
++        [
++            [
++                _name_fragment(0, "web_search"),
++                _arguments(0, '{"query": "x"}'),
++                _finish(),
++                turn_one,
++            ],
++            [_finish("stop"), turn_two],
++            [_DONE],
++        ]
++    )
++    reports = _usage_chunks(_run(transport))
++    assert len(reports) == 1
++    assert "timings" not in reports[0]
+diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
+index 275eb8a18f..7598aa7ec0 100644
+--- a/studio/backend/tests/test_npu_chat_route.py
++++ b/studio/backend/tests/test_npu_chat_route.py
+@@ -44,6 +44,29 @@ def _chunk(
+ 
+ 
+ _USAGE = {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
++# What FastFlowLM behind Lemonade 11.9.0 ends a reply with on a Strix Halo NPU: its own prefill and
++# decode measurements, in seconds and tokens per second, inside usage.
++_FLM_USAGE = {
++    "prompt_tokens": 20,
++    "completion_tokens": 39,
++    "total_tokens": 59,
++    "active_kv_tokens": 59,
++    "max_kv_token_capacity": 8192,
++    "kv_token_occupancy_rate_percentage": 0.72021484375,
++    "load_duration": 5.2e-07,
++    "prefill_duration_ttft": 0.46033728,
++    "decoding_duration": 0.424696,
++    "prefill_speed_tps": 43.44640520967583,
++    "decoding_speed_tps": 91.83039162130089,
++}
++_FLM_TIMINGS = {
++    "prompt_n": 20,
++    "prompt_ms": pytest.approx(460.33728),
++    "prompt_per_second": pytest.approx(43.44640520967583),
++    "predicted_n": 39,
++    "predicted_ms": pytest.approx(424.696),
++    "predicted_per_second": pytest.approx(91.83039162130089),
++}
+ 
+ 
+ def _script(prompt: str) -> str:
+@@ -71,6 +94,8 @@ def _script(prompt: str) -> str:
+             + _chunk({"content": "ND hidden"}, "stop", _USAGE)
+             + "data: [DONE]\n\n"
+         )
++    if "TIMED" in prompt:
++        return _chunk({"content": "The moon."}) + _chunk({}, "stop", _FLM_USAGE) + "data: [DONE]\n\n"
+     if "THINK" in prompt:
+         return (
+             _chunk({"reasoning_content": "Let me add."})
+@@ -341,6 +366,48 @@ def test_streaming_rewrites_the_model_name(flm):
+     )
+ 
+ 
++def test_a_streamed_reply_carries_fastflowlm_speeds_as_timings(flm):
++    flm()
++    status, lines = _call(stream = True, messages = [{"role": "user", "content": "TIMED"}])
++    assert status == 200
++    closing = [chunk for chunk in _data(lines) if chunk.get("usage")]
++    assert len(closing) == 1
++    assert closing[0]["usage"] == _FLM_USAGE
++    assert closing[0]["timings"] == _FLM_TIMINGS
++    assert closing[0]["choices"][0]["finish_reason"] == "stop"
++
++
++def test_the_monitor_rates_an_npu_reply_from_fastflowlm_speeds(flm):
++    from core.inference.api_monitor import api_monitor
++
++    if not api_monitor.enabled:
++        pytest.skip("API monitor disabled")
++    flm()
++    _call(stream = True, messages = [{"role": "user", "content": "TIMED"}])
++    entry = api_monitor._entries[0]
++    assert entry.tok_per_sec == pytest.approx(91.83039162130089)
++    assert entry.prompt_tok_per_sec == pytest.approx(43.44640520967583)
++    assert entry.prompt_ms == pytest.approx(460.33728)
++    assert entry.decode_ms == pytest.approx(424.696)
++
++
++def test_a_reply_without_fastflowlm_speeds_gets_no_timings(flm):
++    flm()
++    _, lines = _call(stream = True)
++    assert not any("timings" in chunk for chunk in _data(lines))
++
++
++def test_fastflowlm_timings_leave_a_cached_prefix_out_of_the_prompt():
++    usage = dict(_FLM_USAGE, prompt_tokens = 120, prompt_tokens_details = {"cached_tokens": 100})
++    timings = ep_mod._fastflowlm_timings(usage)
++    assert timings["prompt_n"] == 20
++    assert timings["cache_n"] == 100
++    assert ep_mod._fastflowlm_timings(_USAGE) is None
++    assert ep_mod._fastflowlm_timings({"decoding_duration": True}) is None
++    assert ep_mod._fastflowlm_timings({"decoding_duration": float("nan")}) is None
++    assert ep_mod._fastflowlm_timings({"decoding_duration": 10**400}) is None
++
++
+ @pytest.mark.parametrize("stream", [True, False])
+ def test_stop_is_enforced_across_chunks(flm, stream):
+     flm()
+diff --git a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+index 1a4dadeb62..668250c170 100644
+--- a/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
++++ b/studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts
+@@ -167,6 +167,7 @@ import {
+   normalizeMaxSeqLength,
+   residentIsServedByMlx,
+   resolveInitialConfig,
++  savedContextPin,
+   type PerModelConfig,
+   loadedContextFields,
+ } from "@/features/model-picker";
+@@ -3536,9 +3537,10 @@ export function useChatModelRuntime() {
+         return;
+       }
+       // Context length is the one setting FastFlowLM takes; null (Auto) sends 0 for its default.
+-      const contextLength = (
+-        reload?.config ?? resolveInitialConfig(modelPath).config
+-      ).customContextLength;
++      // Either field: a record saved as a non-GGUF Max Seq Length pins it too.
++      const contextLength = savedContextPin(
++        reload?.config ?? resolveInitialConfig(modelPath).config,
++      );
+       if (loadingModelRef.current ?? store.loadingModelPick) {
+         toast.info("Another model is already loading", {
+           description: "Wait for it to finish or cancel it first.",
+diff --git a/studio/frontend/src/features/model-picker/components/model-config-page.tsx b/studio/frontend/src/features/model-picker/components/model-config-page.tsx
+index 50111249f9..21167c652f 100644
+--- a/studio/frontend/src/features/model-picker/components/model-config-page.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-config-page.tsx
+@@ -189,6 +189,7 @@ import {
+   vramPercentToFraction,
+ } from "../model-config/per-model-config";
+ import { isAudioRuntimeGguf } from "../../audio/audio-cpp-catalog";
++import { isNpuModelId, NPU_DEFAULT_CONTEXT_LENGTH } from "../../npu";
+ import {
+   type RunConfigImport,
+   SharedRunConfigControls,
+@@ -455,6 +456,7 @@ function MaxSeqLengthSetting({
+   pinned,
+   fittedToMemory,
+   windowUnknown,
++  hint,
+ }: {
+   value: number;
+   max: number;
+@@ -465,6 +467,7 @@ function MaxSeqLengthSetting({
+   pinned?: boolean;
+   fittedToMemory?: boolean;
+   windowUnknown?: boolean;
++  hint?: string;
+ }) {
+   // MLX sizes itself when unpinned, so the control is the GGUF path's Context Length and
+   // shows the length that will be served, not "Auto". A dash only while it is unknown.
+@@ -475,13 +478,13 @@ function MaxSeqLengthSetting({
+         <div className="flex min-w-0 items-center gap-1.5">
+           <span className={LABEL_CLASS}>{label}</span>
+           <InfoHint>
+-            {isMlx
++            {hint ?? (isMlx
+               ? "Tokens of context the model is sized for." +
+                 (fittedToMemory
+                   ? " Fitted to this machine's memory, which is less than the model's own " +
+                     "window. Set a length to ask for a different one."
+                   : "")
+-              : "Maximum context window in tokens. Applies on load."}
++              : "Maximum context window in tokens. Applies on load.")}
+           </InfoHint>
+         </div>
+         <NumericValueInput
+@@ -2084,6 +2087,8 @@ export function ModelConfigPage({
+   );
+   // What settings are stored under, which is not always what loads; the probes keep target.id.
+   const configId = target.configId ?? target.id;
++  // FastFlowLM on the NPU takes a context length and nothing else.
++  const targetIsNpu = isNpuModelId(target.id);
+   const gpuDevices = useGpuDevices();
+   const resolveInitial = () => {
+     const resolved = resolveInitialConfig(configId, target.ggufVariant);
+@@ -2264,7 +2269,7 @@ export function ModelConfigPage({
+   );
+   const modelMaxPosition = useModelMaxPositionEmbeddings(
+     target.id,
+-    !target.isGguf,
++    !target.isGguf && !targetIsNpu,
+   );
+   const hasLoadedDefaultTemplate =
+     isActiveModel && loadedDefaultChatTemplate != null;
+@@ -2775,6 +2780,8 @@ export function ModelConfigPage({
+     platform.deviceType,
+     platform.chatOnlyReason,
+   );
++  // Backends that pin in customContextLength as GGUF does, so unpinned sends nothing.
++  const pinsContextLength = targetIsMlx || targetIsNpu;
+   const atBaseline = perModelConfigsEqual(config, baseline, {
+     followGlobal: true,
+   });
+@@ -2791,8 +2798,11 @@ export function ModelConfigPage({
+       DEFAULT_PER_MODEL_CONFIG,
+     );
+   const nativeMaxSeqLength =
+-    floorMaxSeqLength(modelMaxPosition.maxPositionEmbeddings) ??
+-    MAX_SEQ_LENGTH_MAX;
++    floorMaxSeqLength(
++      targetIsNpu
++        ? target.meta.contextLength
++        : modelMaxPosition.maxPositionEmbeddings,
++    ) ?? MAX_SEQ_LENGTH_MAX;
+   // The pin, else the length a self-sizing backend would serve, so the control states a
+   // context rather than declining to. Only an unread window falls back to the app default,
+   // and Reset clears the pin to null so no fallback may rebuild one from a runtime value.
+@@ -2912,9 +2922,15 @@ export function ModelConfigPage({
+     mlxFittedWindow,
+     mlxProspectiveWindow,
+   );
++  // Auto on the NPU is FastFlowLM's default held to the model's limit, or what the resident got.
++  const npuServedWindow = targetIsNpu
++    ? ((isActiveModel ? servedWindow(loadedContextLength) : null) ??
++      Math.min(NPU_DEFAULT_CONTEXT_LENGTH, nativeMaxSeqLength))
++    : null;
+   const maxSeqLengthValue =
+     servedWindow(savedContextPin(config)) ??
+     mlxServedWindow ??
++    npuServedWindow ??
+     clampMaxSeqLength(DEFAULT_MAX_SEQ_LENGTH, nativeMaxSeqLength);
+   const maxSeqLengthMax = Math.min(
+     MAX_SEQ_LENGTH_MAX,
+@@ -3300,10 +3316,8 @@ export function ModelConfigPage({
+     if (!saved) {
+       toast.error("Couldn't save these settings, loading with them anyway.");
+     }
+-    // MLX pins in customContextLength as GGUF does, so unpinned sends nothing.
+-    const effectiveLoadConfig = target.isGguf
+-      ? effectiveRuntimeConfig
+-      : targetIsMlx
++    const effectiveLoadConfig =
++      target.isGguf || pinsContextLength
+         ? effectiveRuntimeConfig
+         : { ...effectiveRuntimeConfig, maxSeqLength: effectiveMaxSeqLengthValue };
+     // Same reason as the numeric commits above: the budget row flushes on unmount,
+@@ -3393,7 +3407,7 @@ export function ModelConfigPage({
+         inert={customActive ? true : undefined}
+         className={`min-w-0 space-y-5 ${customActive ? "opacity-50" : ""}`}
+       >
+-        {!target.isGguf && !targetIsMlx && !classifiedIsDiffusion && !target.meta.isLora && !target.meta.audioType && (
++        {!target.isGguf && !targetIsMlx && !targetIsNpu && !classifiedIsDiffusion && !target.meta.isLora && !target.meta.audioType && (
+           <InferenceEnginePicker parallelism={config.engineParallelism ?? "tensor"} onParallelismChange={engineParallelism => update({ engineParallelism })} precision={config.enginePrecision ?? "auto"} onPrecisionChange={enginePrecision => update({ enginePrecision })} value={config.engine ?? "auto"} onChange={engine => update({ engine })} onReadyChange={setEngineReady} onUse={handleRun} gpuIds={config.selectedGpuIds} onGpuChange={ids => update({ selectedGpuIds: ids, selectedGpuIndexKind: "physical" })} />
+         )}
+         {audioRuntimeGguf ? (
+@@ -3541,31 +3555,44 @@ export function ModelConfigPage({
+             <MaxSeqLengthSetting
+               value={maxSeqLengthValue}
+               max={maxSeqLengthMax}
+-              inputMax={MAX_SEQ_LENGTH_MAX}
++              inputMax={targetIsNpu ? maxSeqLengthMax : MAX_SEQ_LENGTH_MAX}
+               inputRef={maxSeqLengthInputRef}
+-              isMlx={targetIsMlx}
++              isMlx={pinsContextLength}
+               pinned={savedContextPin(config) != null}
+               fittedToMemory={
+                 savedContextPin(config) == null && mlxFittedWindow != null
+               }
+               windowUnknown={
+-                savedContextPin(config) == null && mlxServedWindow == null
++                savedContextPin(config) == null &&
++                mlxServedWindow == null &&
++                npuServedWindow == null
++              }
++              hint={
++                targetIsNpu
++                  ? `Tokens of context FastFlowLM loads the model with. Unset, it loads ${NPU_DEFAULT_CONTEXT_LENGTH.toLocaleString()}, or the model's limit if that is lower.`
++                  : undefined
++              }
++              onChange={(value) =>
++                update(contextPinPatch(value, pinsContextLength))
+               }
+-              onChange={(value) => update(contextPinPatch(value, targetIsMlx))}
+-            />
+-            <AdvancedSettingsToggle
+-              checked={showAdvanced}
+-              onCheckedChange={toggleAdvanced}
+             />
+-            {showAdvanced && (
+-              <MlxAdvancedSettings
+-                config={config}
+-                update={update}
+-                outcome={mlxKvQuantOutcome}
+-                servedByMlx={servedByMlx}
+-                onEditTemplate={() => setTemplateOpen(true)}
+-                templateOutcome={chatTemplateOutcome}
+-              />
++            {!targetIsNpu && (
++              <>
++                <AdvancedSettingsToggle
++                  checked={showAdvanced}
++                  onCheckedChange={toggleAdvanced}
++                />
++                {showAdvanced && (
++                  <MlxAdvancedSettings
++                    config={config}
++                    update={update}
++                    outcome={mlxKvQuantOutcome}
++                    servedByMlx={servedByMlx}
++                    onEditTemplate={() => setTemplateOpen(true)}
++                    templateOutcome={chatTemplateOutcome}
++                  />
++                )}
++              </>
+             )}
+           </>
+         )}
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector.tsx b/studio/frontend/src/features/model-picker/components/model-selector.tsx
+index 029795bf5f..97b85dd823 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector.tsx
+@@ -15,7 +15,7 @@ import type { CapabilityKey } from "@/features/hub";
+ import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
+ // eslint-disable-next-line no-restricted-imports -- The settings barrel imports this feature back.
+ import { useSettingsDialogStore } from "@/features/settings/stores/settings-dialog-store";
+-import { useNpuStatus } from "@/features/npu";
++import { isNpuModelId, NPU_MODEL_PREFIX, useNpuStatus } from "@/features/npu";
+ import { useT } from "@/i18n";
+ import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
+ import { cn } from "@/lib/utils";
+@@ -502,7 +502,11 @@ function ModelSelectorContent({
+   }
+ 
+   const openConfigPage = (id: string, meta: ModelSelectorChangeMeta) => {
+-    setConfigTarget(modelConfigTarget(id, meta));
++    // Named as its row is: by the Lemonade id, without the lemonade: routing prefix.
++    const displayName = isNpuModelId(id)
++      ? id.slice(NPU_MODEL_PREFIX.length)
++      : undefined;
++    setConfigTarget(modelConfigTarget(id, meta, displayName));
+   };
+   const requestedConfigTarget = useMemo(
+     () =>
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+index 6c814199a4..818dd8c075 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+@@ -6546,12 +6546,12 @@ export function HubModelPicker({
+       npuSizeLabel(model.size_gb),
+       npuResumeLabel(model),
+     ].filter(Boolean);
+-    const pick = () =>
+-      onSelect(model.model_path, {
+-        source: "local",
+-        isLora: false,
+-        isDownloaded: true,
+-      });
++    const meta = {
++      source: "local",
++      isLora: false,
++      isDownloaded: true,
++    } as const;
++    const pick = () => onSelect(model.model_path, meta);
+     const row = (
+       <ModelRow
+         label={model.id}
+@@ -6592,19 +6592,38 @@ export function HubModelPicker({
+         className={onDevice ? downloadedRowButtonClassName : undefined}
+       />
+     );
+-    if (!onDevice) return <div key={model.id}>{row}</div>;
++    // A pull loads nothing, so only a downloaded model has run settings to open.
++    const settings =
++      onConfigure && model.downloaded && !downloading ? (
++        <ModelLoadSettingsAction
++          ariaLabel={`Inference settings for ${model.id}`}
++          onConfigure={() =>
++            onConfigure(model.model_path, {
++              ...meta,
++              contextLength: model.max_context_length,
++            })
++          }
++        />
++      ) : null;
++    if (!onDevice && !onConfigure) return <div key={model.id}>{row}</div>;
+     return (
+       <div key={model.id} className={downloadedRowShellClassName(isSelected)}>
+         <div className="min-w-0 flex-1">{row}</div>
+-        <span className={cn(ROW_ACTIONS_CLASS, "h-6")}>
+-          <ModelDeleteAction
+-            ariaLabel={`Delete ${model.id}`}
+-            title={`Delete ${model.id}?`}
+-            description="This removes the model's NPU files from this device."
+-            successMessage={`Deleted ${model.id}`}
+-            disabled={isLoaded}
+-            onConfirm={() => npuCatalog.remove(model)}
+-          />
++        <span
++          className={cn(ROW_ACTIONS_CLASS, onDevice && "h-6")}
++          aria-hidden={settings || onDevice ? undefined : true}
++        >
++          {settings}
++          {onDevice && (
++            <ModelDeleteAction
++              ariaLabel={`Delete ${model.id}`}
++              title={`Delete ${model.id}?`}
++              description="This removes the model's NPU files from this device."
++              successMessage={`Deleted ${model.id}`}
++              disabled={isLoaded}
++              onConfirm={() => npuCatalog.remove(model)}
++            />
++          )}
+         </span>
+       </div>
+     );
+diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
+index 31f0b1ffc3..279c8a5612 100644
+--- a/studio/frontend/src/features/npu/api.ts
++++ b/studio/frontend/src/features/npu/api.ts
+@@ -8,6 +8,9 @@ import { readSseJsonEvents } from "@/lib/sse-json-events";
+ /** Model paths the backend loads onto the NPU (`lemonade:<Lemonade model id>`). */
+ export const NPU_MODEL_PREFIX = "lemonade:";
+ 
++/** What FastFlowLM loads on Auto, held to the model's limit: npu_backend's DEFAULT_CONTEXT_LENGTH. */
++export const NPU_DEFAULT_CONTEXT_LENGTH = 8192;
++
+ export function isNpuModelId(
+   value: string | null | undefined,
+ ): value is string {
+diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
+index d93ef768ca..f298794e5a 100644
+--- a/studio/frontend/src/features/npu/index.ts
++++ b/studio/frontend/src/features/npu/index.ts
+@@ -3,6 +3,7 @@
+ 
+ export {
+   isNpuModelId,
++  NPU_DEFAULT_CONTEXT_LENGTH,
+   NPU_MODEL_PREFIX,
+   type NpuModel,
+   type NpuStatus,
+diff --git a/studio/frontend/tests/npu-run-settings.test.ts b/studio/frontend/tests/npu-run-settings.test.ts
+new file mode 100644
+index 0000000000..093aa91afd
+--- /dev/null
++++ b/studio/frontend/tests/npu-run-settings.test.ts
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++// FastFlowLM takes one load setting, the context length. The picker's gear and the loaded model's
++// settings both write it, and the NPU load must read it from whichever field it was saved in.
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const source = (path: string) =>
++  readFileSync(fileURLToPath(new URL(`../src/${path}`, import.meta.url)), "utf8");
++
++const runtime = source("features/chat/hooks/use-chat-model-runtime.ts");
++const npuLoad = runtime.slice(
++  runtime.indexOf("const loadNpuModel = useCallback("),
++  runtime.indexOf("const ejectModel = useCallback("),
++);
++const pickers = source("features/model-picker/components/model-selector/pickers.tsx");
++const npuRow = pickers.slice(
++  pickers.indexOf("const renderNpuRow = "),
++  pickers.indexOf("const npuBrowseForcedOpen = "),
++);
++const configPage = source("features/model-picker/components/model-config-page.tsx");
++
++test("an NPU load reads a context pinned in either field", () => {
++  assert.match(npuLoad, /const contextLength = savedContextPin\(/);
++});
++
++test("a downloaded NPU row opens run settings with the model's context limit", () => {
++  assert.match(npuRow, /onConfigure && model\.downloaded && !downloading/);
++  assert.match(npuRow, /<ModelLoadSettingsAction/);
++  assert.match(npuRow, /contextLength: model\.max_context_length/);
++});
++
++test("NPU run settings pin customContextLength and offer nothing FastFlowLM ignores", () => {
++  assert.match(configPage, /const targetIsNpu = isNpuModelId\(target\.id\);/);
++  assert.match(configPage, /const pinsContextLength = targetIsMlx \|\| targetIsNpu;/);
++  assert.match(configPage, /contextPinPatch\(value, pinsContextLength\)/);
++  assert.match(configPage, /!target\.isGguf && !targetIsMlx && !targetIsNpu && /);
++  // Unpinned sends nothing, so FastFlowLM picks its own default rather than a Max Seq Length.
++  assert.match(configPage, /target\.isGguf \|\| pinsContextLength\s+\? effectiveRuntimeConfig/);
++});
