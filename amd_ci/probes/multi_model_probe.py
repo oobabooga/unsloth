@@ -81,6 +81,13 @@ def main():
         st, tok = call(base, "/api/auth/login", {"username": "unsloth", "password": new_pw})
         assert st == 200, (st, tok)
         tok = tok["access_token"]
+        # Head gates alongside behind a Settings switch that is off by default; base has no route (404).
+        st, r = call(base, "/api/settings/multi-model", token = tok)
+        info["multi_model_setting"] = r if st == 200 else st
+        if st == 200:
+            check("multi_model_off_by_default", r.get("enabled") is False, json.dumps(r))
+            st, r = call(base, "/api/settings/multi-model", {"enabled": True}, tok, method = "PUT")
+            check("multi_model_turned_on", st == 200 and r.get("enabled") is True, json.dumps(r))
 
         def load(m, alongside):
             t = time.time()
@@ -127,6 +134,15 @@ def main():
         info["status_after_plain"] = {k: s.get(k) for k in ("active_model", "loaded")} if isinstance(s, dict) else s
         check("plain_load_replaces", isinstance(s, dict) and len(s.get("loaded") or []) <= 1
               and "qwen3" not in json.dumps(s.get("loaded")).lower() and "gemma" in str(s.get("active_model")).lower(), info["status_after_plain"])
+        if "multi_model_turned_on" in checks:
+            st, r = call(base, "/api/settings/multi-model", {"enabled": False}, tok, method = "PUT")
+            check("multi_model_turned_off", st == 200 and r.get("enabled") is False, json.dumps(r))
+            st, r = load(A, True)
+            s = status()
+            info["status_after_off"] = {k: s.get(k) for k in ("active_model", "loaded")} if isinstance(s, dict) else s
+            check("alongside_replaces_when_off", st == 200 and isinstance(s, dict)
+                  and len(s.get("loaded") or []) <= 1 and "gemma" not in json.dumps(s.get("loaded")).lower(),
+                  info["status_after_off"])
     except Exception as e:
         check("probe_ran", False, repr(e))
     finally:
