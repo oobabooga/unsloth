@@ -165,6 +165,30 @@ def visible_gpu() -> Optional[str]:
     return "0"
 
 
+def _amdgpu_sysfs(device: Optional[str]) -> dict:
+    """{used_mib, total_mib, util, name, vram_mib, gtt_mib} from /sys/class/drm/card*/device for the device-th amdgpu
+    card (render-node order), or {} when sysfs has no amdgpu memory counters."""
+    try:
+        cards = sorted(p for p in Path("/sys/class/drm").glob("card[0-9]*")
+                       if (p / "device" / "mem_info_gtt_used").is_file() and "-" not in p.name)
+        if not cards:
+            return {}
+        d = cards[min(int(device or 0), len(cards) - 1)] / "device"
+
+        def rd(name: str) -> int:
+            try:
+                return int((d / name).read_text(encoding = "utf-8").strip())
+            except Exception:  # noqa: BLE001
+                return 0
+
+        vram, gtt = rd("mem_info_vram_used"), rd("mem_info_gtt_used")
+        total = rd("mem_info_vram_total") + rd("mem_info_gtt_total")
+        return {"used_mib": (vram + gtt) >> 20, "total_mib": total >> 20, "util": rd("gpu_busy_percent"),
+                "name": "amd", "vram_mib": vram >> 20, "gtt_mib": gtt >> 20}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def gpu_query(device: Optional[str] = None) -> dict:
     """{used_mib, total_mib, util, name} for one device, or {} when there is no SMI to ask."""
     device = device or visible_gpu()
@@ -179,6 +203,12 @@ def gpu_query(device: Optional[str] = None) -> dict:
             ).stdout.strip().splitlines()[0]
             used, total, util, name = [x.strip() for x in out.split(",", 3)]
             return {"used_mib": int(used), "total_mib": int(total), "util": int(util), "name": name}
+        if vendor == "amd":
+            # amdgpu sysfs: VRAM + GTT. On a unified-memory APU (Strix Halo) most allocations land in GTT, which
+            # amd-smi's used_vram does not count, so the SMI view reads ~0 there.
+            sysfs = _amdgpu_sysfs(device)
+            if sysfs:
+                return sysfs
         if vendor == "amd" and shutil.which("amd-smi"):
             raw = subprocess.run(["amd-smi", "metric", "-g", device, "--json"], capture_output = True,
                                  text = True, timeout = 10).stdout
@@ -213,6 +243,7 @@ class GpuSampler(threading.Thread):
         self.interval, self.device = interval, device or visible_gpu()
         self.peak_mib = 0
         self.own_peak_mib = 0
+        self.tree_rss_peak_mib = 0  # RSS of this process + children + backend servers (ComfyUI's lives there)
         self.baseline_mib = gpu_query(self.device).get("used_mib", 0)
         self._stop = threading.Event()
 
@@ -239,7 +270,33 @@ class GpuSampler(threading.Thread):
             if q:
                 self.peak_mib = max(self.peak_mib, q["used_mib"])
             self.own_peak_mib = max(self.own_peak_mib, self._own_mib())
+            self.tree_rss_peak_mib = max(self.tree_rss_peak_mib, self._tree_rss_mib())
             self._stop.wait(self.interval)
+
+    def _tree_rss_mib(self) -> int:
+        try:
+            import psutil
+
+            me = psutil.Process()
+            procs = [me] + me.children(recursive = True)
+            for pid in self.extra_pids() or []:
+                try:
+                    p = psutil.Process(pid)
+                    procs += [p] + p.children(recursive = True)
+                except Exception:  # noqa: BLE001
+                    pass
+            seen, total = set(), 0
+            for p in procs:
+                if p.pid in seen:
+                    continue
+                seen.add(p.pid)
+                try:
+                    total += p.memory_info().rss
+                except Exception:  # noqa: BLE001
+                    pass
+            return total >> 20
+        except Exception:  # noqa: BLE001
+            return 0
 
     def reset(self) -> None:
         # Seeded with a reading, so a cell shorter than one interval does not report 0.

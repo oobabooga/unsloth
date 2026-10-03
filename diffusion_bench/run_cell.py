@@ -113,6 +113,7 @@ def run(cell: dict, out_root: Path, quiet: bool = False) -> dict:
         rec["peak_smi_delta_gib"] = round(max(0, sampler.peak_mib - sampler.baseline_mib) / 1024, 3)
         # This process and the servers it launched only (NVIDIA): the figure to compare on a shared device.
         rec["peak_own_gib"] = round(sampler.own_peak_mib / 1024, 3)
+        rec["peak_tree_rss_gib"] = round(sampler.tree_rss_peak_mib / 1024, 3)
         rec["host_end"] = C.host_memory()
         try:
             rec["env"] = C.env_fingerprint(backend.trees() if backend else None)

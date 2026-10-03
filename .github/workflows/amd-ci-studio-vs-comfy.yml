@@ -101,8 +101,14 @@ jobs:
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)
@@ -154,7 +160,7 @@ jobs:
             --probe diffusion_bench/amd/diffusion_probe.py \
             --criteria diffusion_bench/amd/criteria_differential.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_studio_vs_comfy.json --budget-min 420.0 --cell-timeout 5400.0 --only 'zimg_*' --only klein_s_def --only 'klein_c_*' --state-only 'head=zimg_s_*' --state-only 'head=klein_s_*' --defect slow:zimg_s_flash:zimg_s_def:0.9
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_studio_vs_comfy.json --budget-min 420.0 --cell-timeout 5400.0 --only 'zimg_*' --only 'klein_*' --state-only 'head=zimg_s_*' --state-only 'head=klein_s_*' --defect slow:zimg_s_flash:zimg_s_def:0.9
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 
@@ -268,8 +274,14 @@ jobs:
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)
@@ -321,7 +333,7 @@ jobs:
             --probe diffusion_bench/amd/diffusion_probe.py \
             --criteria diffusion_bench/amd/criteria_differential.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_studio_vs_comfy.json --budget-min 420.0 --cell-timeout 5400.0 --only 'flux1_*' --only sdxl_s_def --only 'sdxl_c_*' --state-only 'head=flux1_s_*' --state-only 'head=sdxl_s_*' --defect slow:flux1_s_flash:flux1_s_def:0.9
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_studio_vs_comfy.json --budget-min 420.0 --cell-timeout 5400.0 --only 'flux1_*' --only 'sdxl_*' --state-only 'head=flux1_s_*' --state-only 'head=sdxl_s_*' --defect slow:flux1_s_flash:flux1_s_def:0.9
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 
@@ -435,8 +447,14 @@ jobs:
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)
@@ -602,8 +620,14 @@ jobs:
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)
@@ -769,8 +793,14 @@ jobs:
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)

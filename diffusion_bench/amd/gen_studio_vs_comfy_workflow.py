@@ -26,9 +26,9 @@ BRANCH = "amd-ci-studio-vs-comfy"
 JOBS = [
     # id, title, base --only, head --state-only, criteria, defect
     ("j1_zimg_klein", "Z-Image-Turbo + FLUX.2-klein-4B",
-     ["zimg_*", "klein_s_def", "klein_c_*"], ["zimg_s_*", "klein_s_*"], "differential", "slow:zimg_s_flash:zimg_s_def:0.9"),
+     ["zimg_*", "klein_*"], ["zimg_s_*", "klein_s_*"], "differential", "slow:zimg_s_flash:zimg_s_def:0.9"),
     ("j2_flux1_sdxl", "FLUX.1-schnell + SDXL",
-     ["flux1_*", "sdxl_s_def", "sdxl_c_*"], ["flux1_s_*", "sdxl_s_*"], "differential", "slow:flux1_s_flash:flux1_s_def:0.9"),
+     ["flux1_*", "sdxl_*"], ["flux1_s_*", "sdxl_s_*"], "differential", "slow:flux1_s_flash:flux1_s_def:0.9"),
     ("j3_q21", "Qwen-Image-2.1", ["q21_*"], ["q21_s_*"], "differential", "slow:q21_s_flash:q21_s_def:0.9"),
     ("j4_wan", "Wan2.2-TI2V-5B short clip", ["wan_*"], ["wan_s_*"], "differential", "slow:wan_s_flash:wan_s_def:0.9"),
     ("j5_h3", "MiniMax-H3 (ComfyUI int8_convrot vs Studio GGUF)", ["h3_s_def", "h3_c_*"], ["h3_s_def"],
@@ -140,8 +140,14 @@ JOB = """
           echo "flash-attn into Studio venv: rc=$rc"
           tail -3 "$AMD_CI_WORK/out/fa_studio_build.log"
           "$AMD_CI_PY" -c "import torch; print('studio torch after', torch.__version__)"
+          # Three views of the same kernels: SDPA as torch ships it, with the AOTriton opt-in Studio's server and
+          # ComfyUI both set, and with CK preferred for SDPA.
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" \\
-            --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+            --out "$AMD_CI_WORK/out/fa_smoke_studio_noflag.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 "$AMD_CI_PY" \\
+            "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_aotriton.json"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_ROCM_FA_PREFER_CK=1 \\
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio_ck.json"
           exit 0
 
       - name: ComfyUI (README ROCm install, own venv)

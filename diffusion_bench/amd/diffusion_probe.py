@@ -359,6 +359,7 @@ def cell_facts(run_dir: Path, tag: str, score_row: Optional[dict]) -> dict:
         "peak_alloc_gib": rec.get("peak_alloc_gib"), "peak_smi_gib": rec.get("peak_smi_gib"),
         "peak_smi_delta_gib": rec.get("peak_smi_delta_gib"),
         "peak_rss_gib": (rec.get("host_end") or {}).get("peak_rss_gib"),
+        "peak_tree_rss_gib": rec.get("peak_tree_rss_gib"),
         "host_after_load": rec.get("host_after_load"), "host_end": rec.get("host_end"),
         "long_s": rec.get("long"), "short_s": rec.get("short"),
         "self_step_s": [r.get("step_s") for r in rec.get("renders", [])],

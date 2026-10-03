@@ -33,7 +33,8 @@ MODELS = {
         "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
         "split_files/text_encoders/qwen_3_4b.safetensors", "split_files/vae/ae.safetensors"]}},
     "flux2_klein_4b": {"repo": "black-forest-labs/FLUX.2-klein-4B", "download": {"ignore": ["*.png", "*.jpg"]}},
-    "comfy_klein": {"repo": "Comfy-Org/flux2-klein-4B", "download": {"allow": [
+    "comfy_klein": {"repo": "Comfy-Org/vae-text-encorder-for-flux-klein-4b",  # canonical id of Comfy-Org/flux2-klein-4B (renamed; the runner mirror 404s on the redirect)
+                     "download": {"allow": [
         "split_files/diffusion_models/flux-2-klein-4b.safetensors",
         "split_files/text_encoders/qwen_3_4b.safetensors", "split_files/vae/flux2-vae.safetensors"]}},
     # One download serves both sides: diffusers folders for Studio, the single-file checkpoint for ComfyUI.
@@ -133,11 +134,15 @@ def cells() -> list:
     for fam, f in FAMILIES.items():
         sopts = {"family_override": f["studio_family"], "model_kind": "pipeline", **(f.get("studio_options") or {})}
         base = common(f)
+        # Studio's server sets TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 at the top of studio/backend/main.py (and
+        # unsloth/__init__.py does too); the in-process backend imports neither, so set it here as the product does.
+        # Without it torch's SDPA on gfx1151 refuses flash / efficient and runs math (run 37130594778, job 1).
+        senv = {"DBENCH_ATTN_PROFILE": "1", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"}
         out.append({"tag": f"{fam}_s_def", "backend": "studio", "model": f["studio_model"], "ref": f"{fam}_s_def",
-                    **base, "options": sopts, "env": {"DBENCH_ATTN_PROFILE": "1"}})
+                    **base, "options": sopts, "env": dict(senv)})
         out.append({"tag": f"{fam}_s_flash", "backend": "studio", "model": f["studio_model"], "ref": f"{fam}_s_def",
                     **base, "options": {**sopts, "attention_backend": "flash"},
-                    "env": {"DBENCH_ATTN_PROFILE": "1", "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}})
+                    "env": {**senv, "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}})
         arms = {"c_def": ("def", None, {}), "c_rock": ("rock", None, {}),
                 "c_flash": ("rock", "--use-flash-attention --enable-dynamic-vram",
                             {"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}),
