@@ -157,14 +157,24 @@ jobs:
           # MoE hipErrorInvalidValue: plain transformers + PEFT vs Unsloth, then the LoRA matmul replayed.
           $env:PATH = "$(Split-Path $py.FullName);$env:PATH"
           Set-Location "$env:AMD_CI_WORK\tmp"
-          foreach ($mode in @("grouped_mm", "plain", "unsloth", "unsloth_native")) {
-            & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_moe_diag.py" $mode *>&1 |
-              Out-File -FilePath "$env:AMD_CI_WORK\out\win_moe_diag_$mode.log" -Encoding utf8
-            Select-String -Path "$env:AMD_CI_WORK\out\win_moe_diag_$mode.log" -Pattern "WIN_MOE_DIAG" | ForEach-Object { $_.Line }
+          # name, mode, attn implementation ("" = model default), model ("" = tiny Mixtral)
+          $cases = @(
+            @("sdpa", "sdpa", "", ""),
+            @("plain", "plain", "", ""),
+            @("plain_eager", "plain", "eager", ""),
+            @("unsloth_eager", "unsloth", "eager", ""),
+            @("unsloth_qwen3moe", "unsloth", "", "trl-internal-testing/tiny-Qwen3MoeForCausalLM")
+          )
+          foreach ($c in $cases) {
+            $env:DIAG_ATTN = $c[2]; $env:DIAG_MODEL = $c[3]
+            & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\win_moe_diag.py" $c[1] *>&1 |
+              Out-File -FilePath "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Encoding utf8
+            Select-String -Path "$env:AMD_CI_WORK\out\win_moe_diag_$($c[0]).log" -Pattern "WIN_MOE_DIAG" | ForEach-Object { $_.Line }
           }
           exit 0
 
       - name: Differential
+        if: ${{ false }}  # answered in run 37123451459 (dense trains at base and head); MoE diagnosis only
         run: |
           $ErrorActionPreference = "Continue"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `

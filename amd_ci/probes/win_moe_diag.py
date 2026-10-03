@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Diagnose the Windows ROCm hipErrorInvalidValue in a LoRA matmul on tiny Mixtral (observe only).
 
-Runs with AMD_SERIALIZE_KERNEL=3 so the failing call is the reported one. Steps, each recorded:
+Errors surface asynchronously, so the plain run synchronizes after every module to name the first failing one. Steps, each recorded:
 plain transformers + PEFT forward (no Unsloth); Unsloth forward with the shapes, strides and dtypes
 of every LoRA input captured; then the captured failing matmul replayed standalone in variants.
 """
 import json, math, os, sys, traceback
 
-os.environ.setdefault("AMD_SERIALIZE_KERNEL", "3")
+os.environ.setdefault("AMD_SERIALIZE_KERNEL", "3")  # the HIP runtime reads 3; torch warns it is not 0/1
 os.environ.setdefault("HIP_LAUNCH_BLOCKING", "1")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("UNSLOTH_DISABLE_AUTO_UPDATES", "1")
@@ -26,15 +26,54 @@ def batch(tok, device):
 
 
 which = sys.argv[1] if len(sys.argv) > 1 else "all"
+ATTN = os.environ.get("DIAG_ATTN") or None
+if os.environ.get("DIAG_MODEL"):
+    MODEL = os.environ["DIAG_MODEL"]
+out["model"], out["attn"] = MODEL, ATTN
+
+if which in ("all", "sdpa"):
+    # Standalone SDPA, synchronized, per head_dim and backend: tiny Mixtral has head_dim 16, tiny Qwen3 128.
+    import torch
+    import torch.nn.functional as F
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    for hd in (16, 32, 64, 128):
+        for name, be in (("flash", SDPBackend.FLASH_ATTENTION), ("efficient", SDPBackend.EFFICIENT_ATTENTION),
+                         ("math", SDPBackend.MATH), ("default", None)):
+            key = f"sdpa_hd{hd}_{name}"
+            try:
+                q, k, v = (torch.randn(4, 4, 12, hd, device = "cuda", dtype = torch.bfloat16, requires_grad = True) for _ in range(3))
+                if be is None:
+                    o = F.scaled_dot_product_attention(q, k, v, is_causal = True)
+                else:
+                    with sdpa_kernel([be]):
+                        o = F.scaled_dot_product_attention(q, k, v, is_causal = True)
+                o.float().sum().backward(); torch.cuda.synchronize()
+                out[key] = "ok"
+            except Exception as e:
+                out[key] = err(e)
+                try: torch.cuda.synchronize()
+                except Exception: pass
 if which in ("all", "plain"):
     try:
         import torch, transformers, peft
         tok = transformers.AutoTokenizer.from_pretrained(MODEL)
-        m = transformers.AutoModelForCausalLM.from_pretrained(MODEL, dtype = torch.bfloat16).to("cuda")
+        m = transformers.AutoModelForCausalLM.from_pretrained(MODEL, dtype = torch.bfloat16,
+                                                              **({"attn_implementation": ATTN} if ATTN else {})).to("cuda")
         m = peft.get_peft_model(m, peft.LoraConfig(r = 8, lora_alpha = 16,
                                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]))
+        last = []
+        def sync_hook(name):
+            def f(mod, args, output):
+                out["plain_sync_module"] = name
+                torch.cuda.synchronize(); last[:] = [name]
+            return f
+        for n, mod in m.named_modules():
+            if n: mod.register_forward_hook(sync_hook(n))
         b = batch(tok, "cuda")
-        loss = m(**b, labels = b["input_ids"]).loss
+        try:
+            loss = m(**b, labels = b["input_ids"]).loss
+        finally:
+            out["plain_last_ok_module"] = last[0] if last else None
         loss.backward(); torch.cuda.synchronize()
         out["plain_hf_peft"] = f"ok loss={loss.item():.4f}"
         out["plain_config"] = {k: getattr(m.config, k, None) for k in ("hidden_size", "num_attention_heads",
@@ -67,7 +106,8 @@ if which in ("all", "unsloth", "unsloth_native"):
         from unsloth import FastLanguageModel
         import torch
         m, tok = FastLanguageModel.from_pretrained(MODEL, max_seq_length = 256, load_in_4bit = False,
-                                                   dtype = torch.bfloat16)
+                                                   dtype = torch.bfloat16,
+                                                   **({"attn_implementation": ATTN} if ATTN else {}))
         m = FastLanguageModel.get_peft_model(m, r = 8, lora_alpha = 16, random_state = 3407,
                                              target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"])
         def hook(name):
