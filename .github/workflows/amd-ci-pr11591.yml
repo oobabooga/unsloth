@@ -38,7 +38,6 @@ env:
 jobs:
 
   suites:
-    if: false  # verdict already on 5ae2e742e (run 36855775833)
     name: "PR 11591 suites, base vs head"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 120
@@ -105,7 +104,6 @@ jobs:
           if-no-files-found: warn
 
   gpu:
-    if: false  # verdict already on 5ae2e742e (run 36855775833)
     name: "PR 11591 GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
@@ -190,7 +188,7 @@ jobs:
 
   gpu_rocm:
     needs: gpu
-    if: false  # verdict already on 5ae2e742e (run 36855775833)
+    if: always()
     name: "PR 11591 diagnostic: ROCm llama.cpp, one real GPU, no spoof"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
