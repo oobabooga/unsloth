@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 env:
-  PR: "11016"
+  PR: "12670"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
@@ -117,41 +117,52 @@ jobs:
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Fused SDPA across torch versions
-        timeout-minutes: 150
+      - name: Studio install from the PR head (fresh) and over main (update)
+        timeout-minutes: 240
         run: |
           $ErrorActionPreference = "Continue"
-          # name | index | spec (gfx1151, cp312 Windows wheels)
-          $stable = "https://repo.amd.com/rocm/whl-multi-arch/"
-          $next = "https://stable.repo.amd.com/rocm/whl-next/"
-          $nightly = "https://nightly.repo.amd.com/rocm/whl-next/"
-          $cases = @(
-            @("2.11_rocm7.14.1", $stable, "torch[device-gfx1151]==2.11.0+rocm7.14.1"),
-            @("2.11_rocm7.14.0", $stable, "torch[device-gfx1151]==2.11.0+rocm7.14.0"),
-            @("2.12_rocm7.14.1", $stable, "torch[device-gfx1151]==2.12.0+rocm7.14.1"),
-            @("2.11_rocm10.0.0", $next, "torch[device-gfx1151]==2.11.0+rocm10.0.0"),
-            @("2.12_rocm10.0.0", $next, "torch[device-gfx1151]==2.12.0+rocm10.0.0"),
-            @("2.13_rocm10.0.0", $next, "torch[device-gfx1151]==2.13.0+rocm10.0.0"),
-            @("2.14_rocm10.2nightly", $nightly, "torch[device-gfx1151]==2.14.0+rocm10.2.0a20261003")
-          )
-          foreach ($c in $cases) {
-            $name = $c[0]
-            $venv = "$env:AMD_CI_WORK\venv_$name"
-            $log = "$env:AMD_CI_WORK\out\torch_$name.log"
-            & $env:AMD_CI_PY -m venv $venv
-            $py = "$venv\Scripts\python.exe"
-            & $py -m pip install -q --upgrade pip *>&1 | Out-File -FilePath $log -Encoding utf8
-            & $py -m pip install -q --pre --retries 10 --timeout 120 --index-url $c[1] --extra-index-url "https://pypi.org/simple" $c[2] numpy *>&1 |
-              Out-File -FilePath $log -Append -Encoding utf8
-            Write-Host "torch $name install exit: $LASTEXITCODE"
-            $env:PATH_SAVE = $env:PATH
-            $env:PATH = "$venv\Scripts;$env:PATH"
-            & $py -c "import torch; print('TORCH', torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else None)" *>&1 |
-              Out-File -FilePath $log -Append -Encoding utf8
-            & $py "$env:GITHUB_WORKSPACE\amd_ci\probes\win_sdpa_cases.py" *>&1 | Out-File -FilePath $log -Append -Encoding utf8
-            $env:PATH = $env:PATH_SAVE
-            Select-String -Path $log -Pattern "^TORCH|^\{" | ForEach-Object { "[$name] " + $_.Line }
+          function Install-Studio([string]$Home_, [string]$Tree, [string]$Log) {
+            $env:UNSLOTH_STUDIO_HOME = $Home_
+            Push-Location $Tree
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local --skip-autostart --no-rollback *>&1 |
+              Out-File -FilePath $Log -Encoding utf8
+            Write-Host "install.ps1 ($Tree -> $Home_) exit: $LASTEXITCODE"
+            Pop-Location
+            $py = Get-ChildItem -Path $Home_ -Recurse -Filter python.exe -Depth 3 -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\Scripts\\python\.exe$' } | Select-Object -First 1
+            return $py
           }
+          function Report([string]$Name, $Py) {
+            if ($null -eq $Py) { Write-Host "[$Name] no Studio venv"; return }
+            $p = $Py.FullName
+            $env:PATH = "$(Split-Path $p);$env:PATH_BASE"
+            Set-Location "$env:AMD_CI_WORK\tmp"
+            & $p -c "import torch; print('TORCH', torch.__version__, torch.version.hip)" *>&1 |
+              Out-File -FilePath "$env:AMD_CI_WORK\out\$Name.versions.log" -Encoding utf8
+            & $p -m pip list --format=freeze *>&1 | Select-String -Pattern "^(torch|torchvision|torchaudio|amd-torch|rocm)" |
+              ForEach-Object { $_.Line } | Out-File -FilePath "$env:AMD_CI_WORK\out\$Name.versions.log" -Append -Encoding utf8
+            & $p -c "import unsloth, torch; print('SDPA_FLAGS flash', torch.backends.cuda.flash_sdp_enabled(), 'mem_efficient', torch.backends.cuda.mem_efficient_sdp_enabled())" *>&1 |
+              Select-String -Pattern "SDPA_FLAGS|Windows ROCm" | ForEach-Object { $_.Line } |
+              Out-File -FilePath "$env:AMD_CI_WORK\out\$Name.versions.log" -Append -Encoding utf8
+            & $p "$env:GITHUB_WORKSPACE\amd_ci\probes\win_sdpa_cases.py" *>&1 | Out-File -FilePath "$env:AMD_CI_WORK\out\$Name.sdpa.log" -Encoding utf8
+            Get-Content "$env:AMD_CI_WORK\out\$Name.versions.log" | ForEach-Object { "[$Name] $_" }
+          }
+          $env:PATH_BASE = $env:PATH
+          # 1. Fresh install from the PR head, then the SFT probe in that venv.
+          $head = Install-Studio "$env:AMD_CI_WORK\studio_head" "$env:AMD_CI_WORK\states\head" "$env:AMD_CI_WORK\out\install_head.log"
+          Report "fresh_head" $head
+          if ($null -ne $head) {
+            & $head.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
+              --python $head.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train_head.json" `
+              --work "$env:AMD_CI_WORK\studio_train_head"
+          }
+          # 2. Update: install main first, then the PR head over the same Studio home.
+          $env:PATH = $env:PATH_BASE
+          $base = Install-Studio "$env:AMD_CI_WORK\studio_upd" "$env:AMD_CI_WORK\states\base" "$env:AMD_CI_WORK\out\install_upd_base.log"
+          Report "update_before" $base
+          $env:PATH = $env:PATH_BASE
+          $upd = Install-Studio "$env:AMD_CI_WORK\studio_upd" "$env:AMD_CI_WORK\states\head" "$env:AMD_CI_WORK\out\install_upd_head.log"
+          Report "update_after" $upd
           exit 0
 
       - name: Differential
