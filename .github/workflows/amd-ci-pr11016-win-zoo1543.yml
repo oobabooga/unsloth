@@ -117,62 +117,35 @@ jobs:
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Test environment
-        timeout-minutes: 60
+      - name: Fused SDPA across torch versions
+        timeout-minutes: 150
         run: |
           $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
-          & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
-          # Same ROCm torch install.ps1 picks for gfx1151 (AMD multi-arch index).
-          & $py -m pip install -q --retries 10 --timeout 120 --index-url "https://repo.amd.com/rocm/whl-multi-arch/" `
-            --extra-index-url "https://pypi.org/simple" `
-            "torch[device-gfx1151]==2.11.0+rocm7.14.1" "torchvision[device-gfx1151]==0.26.0+rocm7.14.1"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu `
-            --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_rocm.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Studio install, then Core training in the Studio venv
-        timeout-minutes: 120
-        run: |
-          $ErrorActionPreference = "Continue"
-          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
-          Set-Location "$env:AMD_CI_WORK\states\head"
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local --skip-autostart --no-rollback *>&1 |
-            Out-File -FilePath "$env:AMD_CI_WORK\out\studio_install.log" -Encoding utf8
-          Write-Host "install.ps1 exit: $LASTEXITCODE"
-          Get-Content "$env:AMD_CI_WORK\out\studio_install.log" -Tail 40
-          $py = Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME" -Recurse -Filter python.exe -Depth 3 -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\Scripts\\python\.exe$' } | Select-Object -First 1
-          if ($null -eq $py) { Write-Host "No Studio venv python found under $env:UNSLOTH_STUDIO_HOME"; exit 0 }
-          Write-Host "Studio venv python: $($py.FullName)"
-          $env:PATH = "$(Split-Path $py.FullName);$env:PATH"
-          Set-Location "$env:AMD_CI_WORK\tmp"
-          $env:PATH = "$(Split-Path $py.FullName);$env:PATH"
-          & $py.FullName -m pip install -q --retries 10 --timeout 120 pytest
-          Set-Location "$env:AMD_CI_WORK\tmp"
-          # BASE arm: Studio's venv as installed.
-          & $py.FullName -m pytest -q -p no:cacheprovider "$env:GITHUB_WORKSPACE\amd_ci\probes\test_rocm_windows_fused_sdpa.py" *>&1 |
-            Out-File -FilePath "$env:AMD_CI_WORK\out\pytest_base.log" -Encoding utf8
-          Get-Content "$env:AMD_CI_WORK\out\pytest_base.log" -Tail 12
-          & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
-            --python $py.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train.json" `
-            --work "$env:AMD_CI_WORK\studio_train"
-          # HEAD arm: the same venv with the fix branch over Studio's unsloth.
-          & $py.FullName -m pip install -q --retries 10 --timeout 120 --no-deps --force-reinstall `
-            "unsloth @ https://github.com/unslothai/unsloth/archive/02b81c8fd93524618f0b2b1ba0a4199c8a5b33a8.zip"
-          Write-Host "fix install exit: $LASTEXITCODE"
-          & $py.FullName -m pytest -q -p no:cacheprovider "$env:GITHUB_WORKSPACE\amd_ci\probes\test_rocm_windows_fused_sdpa.py" *>&1 |
-            Out-File -FilePath "$env:AMD_CI_WORK\out\pytest_head.log" -Encoding utf8
-          Get-Content "$env:AMD_CI_WORK\out\pytest_head.log" -Tail 12
-          & $py.FullName "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_venv_train.py" `
-            --python $py.FullName --out "$env:AMD_CI_WORK\out\studio_venv_train_fix.json" `
-            --work "$env:AMD_CI_WORK\studio_train_fix"
+          # name | index | spec (gfx1151, cp312 Windows wheels)
+          $cases = @(
+            @("2.11", "https://repo.amd.com/rocm/whl-multi-arch/", "torch[device-gfx1151]==2.11.0+rocm7.14.1"),
+            @("2.12", "https://repo.amd.com/rocm/whl-multi-arch/", "torch[device-gfx1151]==2.12.0+rocm7.14.1"),
+            @("2.13", "https://rocm.nightlies.amd.com/whl-multi-arch/", "torch[device-gfx1151]==2.13.0+rocm10.1.0a20260822"),
+            @("2.14", "https://rocm.nightlies.amd.com/whl-multi-arch/", "torch[device-gfx1151]==2.14.0a0+rocm10.1.0a20260807")
+          )
+          foreach ($c in $cases) {
+            $name = $c[0]
+            $venv = "$env:AMD_CI_WORK\venv_$name"
+            $log = "$env:AMD_CI_WORK\out\torch_$name.log"
+            & $env:AMD_CI_PY -m venv $venv
+            $py = "$venv\Scripts\python.exe"
+            & $py -m pip install -q --upgrade pip *>&1 | Out-File -FilePath $log -Encoding utf8
+            & $py -m pip install -q --pre --retries 10 --timeout 120 --index-url $c[1] --extra-index-url "https://pypi.org/simple" $c[2] numpy *>&1 |
+              Out-File -FilePath $log -Append -Encoding utf8
+            Write-Host "torch $name install exit: $LASTEXITCODE"
+            $env:PATH_SAVE = $env:PATH
+            $env:PATH = "$venv\Scripts;$env:PATH"
+            & $py -c "import torch; print('TORCH', torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else None)" *>&1 |
+              Out-File -FilePath $log -Append -Encoding utf8
+            & $py "$env:GITHUB_WORKSPACE\amd_ci\probes\win_sdpa_cases.py" *>&1 | Out-File -FilePath $log -Append -Encoding utf8
+            $env:PATH = $env:PATH_SAVE
+            Select-String -Path $log -Pattern "^TORCH|^\{" | ForEach-Object { "[$name] " + $_.Line }
+          }
           exit 0
 
       - name: Differential
