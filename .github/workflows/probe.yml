@@ -1,0 +1,31 @@
+name: AMD vLLM probe 2
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-probe2]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - name: Install
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{tmp,hf,uvc}
+          export TMPDIR="$W/tmp" UV_CACHE_DIR="$W/uvc"
+          python3 -m venv "$W/boot"; "$W/boot/bin/pip" -q install uv
+          UV="$W/boot/bin/uv"
+          "$UV" venv --python 3.12 "$W/env"
+          "$UV" pip install --python "$W/env/bin/python" --index-url https://pypi.org/simple \
+            --extra-index-url https://wheels.vllm.ai/rocm/0.30.0/rocm723 'vllm==0.30.0+rocm723' bitsandbytes==0.49.2 torchao==0.17.0 2>&1 | grep -E 'torch|bitsandbytes|vllm|error' || true
+          curl -sfL -o "$W/cases.py" "https://raw.githubusercontent.com/oobabooga/unsloth/amd-vllm-k7q2xz-probe2/probe2_cases.py"
+          "$W/env/bin/python" -c "import bitsandbytes, torchao, torch; print('bnb', bitsandbytes.__version__, 'torchao', torchao.__version__, torch.__version__)" 2>&1 | tail -5
+          ls "$W"/env/lib/python3.12/site-packages/bitsandbytes/ | grep -E '\.so' || true
+      - name: Cases
+        run: |
+          W="$RUNNER_TEMP/w"
+          export HF_HOME="$W/hf" TMPDIR="$W/tmp" VLLM_CACHE_ROOT="$W/vc"
+          "$W/env/bin/python" "$W/cases.py" "$W/env/bin/python" "$W"
