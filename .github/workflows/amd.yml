@@ -1,0 +1,78 @@
+name: AMD DevLab vLLM Windows WSL probe
+
+on:
+  push:
+    branches: [amd-vllm-w0-17289f9b]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Windows, driver and WSL state
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [System.Environment]::OSVersion.Version
+          Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion,DriverDate,AdapterRAM,PNPDeviceID
+          Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory
+          Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform,Microsoft-Windows-Subsystem-Linux | Format-List FeatureName,State
+          wsl.exe --version
+          wsl.exe --status
+          wsl.exe --list --verbose
+          Get-Content "$env:USERPROFILE\.wslconfig" -ErrorAction SilentlyContinue
+          Get-ItemProperty 'HKLM:\SOFTWARE\AMD\CN' -ErrorAction SilentlyContinue | Format-List
+          Get-ChildItem "C:\Windows\System32\lxss\lib" -ErrorAction SilentlyContinue | Select-Object Name,Length
+          exit 0
+      - name: Import a throwaway Ubuntu 24.04 distro and look for the GPU
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "w0-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\distro" | Out-Null
+          $rootfs = "$W\rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz' -OutFile $rootfs
+          (Get-FileHash $rootfs -Algorithm SHA256).Hash
+          $name = "Unsloth-Probe-$env:GITHUB_RUN_ID"
+          wsl.exe --import $name "$W\distro" $rootfs --version 2
+          "import exit $LASTEXITCODE"
+          wsl.exe --list --verbose
+          wsl.exe -d $name -u root -- sh -c 'uname -a; cat /etc/os-release | head -2; ls -l /dev/dxg /dev/kfd /dev/dri 2>&1; ls -la /usr/lib/wsl/lib 2>&1 | head -40; nproc; free -g; df -h / | tail -1'
+          "probe exit $LASTEXITCODE"
+          "$name" | Out-File -Encoding ascii "$W\name.txt"
+      - name: ROCm userspace inside the distro (AMD apt repo) and rocminfo over DXG
+        shell: powershell
+        timeout-minutes: 50
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "w0-$env:GITHUB_RUN_ID"
+          $name = (Get-Content "$W\name.txt").Trim()
+          $script = @'
+          set -x
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -q >/dev/null
+          apt-get install -y -q wget gpg ca-certificates >/dev/null
+          mkdir -p /etc/apt/keyrings
+          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.1 noble main" > /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' > /etc/apt/preferences.d/rocm-pin-600
+          apt-get update -q >/dev/null
+          apt-cache policy hsa-rocr rocm-hip-runtime | head -20
+          apt-cache search librocdxg | head
+          apt-cache show rocm-hip-libraries 2>/dev/null | grep -E '^(Depends|Installed-Size)' | head -3
+          time apt-get install -y -q --no-install-recommends rocm-hip-runtime rocminfo > /tmp/apt.log 2>&1; echo "apt exit $?"; tail -5 /tmp/apt.log
+          ls /opt/rocm/lib | grep -iE 'dxg|hsa' | head
+          HSA_ENABLE_DXG_DETECTION=1 /opt/rocm/bin/rocminfo 2>&1 | grep -E 'Name:|Marketing|gfx|error|Error' | head -20
+          echo "rocminfo exit $?"
+          '@
+          $script | wsl.exe -d $name -u root -- bash -s
+          "exit $LASTEXITCODE"
+      - name: Unregister the probe distro
+        if: always()
+        shell: powershell
+        run: |
+          $W = Join-Path $env:RUNNER_TEMP "w0-$env:GITHUB_RUN_ID"
+          if (Test-Path "$W\name.txt") { $name = (Get-Content "$W\name.txt").Trim(); wsl.exe --unregister $name; wsl.exe --list --verbose }
+          exit 0
