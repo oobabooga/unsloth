@@ -1,0 +1,86 @@
+name: AMD DevLab vLLM probe
+
+on:
+  push:
+    branches: [amd-vllm-p0-17289f9b]
+
+permissions: {}
+
+jobs:
+  amd:
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm: ["0.30.0", "0.31.0"]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 75
+    steps:
+      - name: Hardware and ROCm inventory
+        run: |
+          uname -a
+          cat /etc/os-release | head -3
+          ldd --version | head -1
+          free -h
+          df -h "$RUNNER_TEMP" / | cat
+          cat /opt/rocm/.info/version 2>/dev/null || true
+          ls -d /opt/rocm* 2>/dev/null || true
+          readlink -f /opt/rocm || true
+          hipconfig --version 2>/dev/null || true
+          rocminfo 2>/dev/null | grep -E 'Marketing Name:|Name: +gfx' | head -10 || true
+          ls /opt/rocm/lib | grep -E '^lib(amdhip64|MIOpen|rocblas|hipblaslt|rccl|hipsparselt|hipsolver|rocsolver|hipfft|hiprand|hipsparse|hiprtc|hipblas)\.so' || true
+          ls /opt/rocm/lib/hipblaslt/library 2>/dev/null | grep -c gfx1151 || true
+          ls /opt/rocm/lib/rocblas/library 2>/dev/null | grep -c gfx1151 || true
+          which python3 python3.12 uv || true
+          id; ls -l /dev/kfd /dev/dri | head
+      - name: Install vLLM ${{ matrix.vllm }} ROCm wheel
+        run: |
+          set -x
+          W="$RUNNER_TEMP/w-${{ matrix.vllm }}"
+          mkdir -p "$W"/{tmp,hf,uvc}
+          python3 -m venv "$W/boot"
+          "$W/boot/bin/pip" -q install uv
+          UV="$W/boot/bin/uv"
+          export UV_CACHE_DIR="$W/uvc" TMPDIR="$W/tmp" UV_PYTHON_INSTALL_DIR="$W/py"
+          "$UV" venv --python 3.12 "$W/venv"
+          time "$UV" pip install --python "$W/venv/bin/python" "vllm==${{ matrix.vllm }}+rocm723" \
+            --extra-index-url "https://wheels.vllm.ai/rocm/${{ matrix.vllm }}/rocm723" \
+            --index-strategy unsafe-best-match 2>&1 | tail -40
+          "$UV" pip freeze --python "$W/venv/bin/python" | grep -iE '^(torch|triton|vllm|amd|flash|transformers|torchao|bitsandbytes)' || true
+          du -sh "$W/venv"
+      - name: Torch kernel smoke
+        run: |
+          W="$RUNNER_TEMP/w-${{ matrix.vllm }}"
+          "$W/venv/bin/python" - <<'EOF'
+          import torch
+          print("torch", torch.__version__, "hip", torch.version.hip, "cuda", torch.version.cuda)
+          print("avail", torch.cuda.is_available(), torch.cuda.device_count())
+          p = torch.cuda.get_device_properties(0)
+          print(p.name, getattr(p, "gcnArchName", None), p.total_memory >> 20, "MiB")
+          print("mem_get_info", [x >> 20 for x in torch.cuda.mem_get_info()])
+          a = torch.randn(1024, 1024, device = "cuda", dtype = torch.bfloat16)
+          print("matmul", (a @ a).float().abs().mean().item())
+          c = torch.nn.functional.conv2d(torch.randn(1, 3, 32, 32, device = "cuda"), torch.randn(8, 3, 3, 3, device = "cuda"))
+          print("conv2d", c.shape)
+          EOF
+          "$W/venv/bin/python" -c "import vllm, vllm._C; print('vllm', vllm.__version__)"
+          "$W/venv/bin/python" -c "import amdsmi; amdsmi.amdsmi_init(); print([amdsmi.amdsmi_get_gpu_asic_info(h)['market_name'] for h in amdsmi.amdsmi_get_processor_handles()])" || true
+      - name: vllm serve Qwen2.5-0.5B-Instruct
+        run: |
+          W="$RUNNER_TEMP/w-${{ matrix.vllm }}"
+          export HF_HOME="$W/hf" TMPDIR="$W/tmp" VLLM_CACHE_ROOT="$W/vc"
+          serve() {
+            "$W/venv/bin/python" -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-0.5B-Instruct \
+              --max-model-len 4096 --gpu-memory-utilization 0.3 --host 127.0.0.1 --port 8011 "$@" > "$W/serve.log" 2>&1 &
+            PID=$!
+            for i in $(seq 1 240); do
+              if curl -sf http://127.0.0.1:8011/health >/dev/null; then echo "healthy after $((i*5))s"; break; fi
+              if ! kill -0 $PID 2>/dev/null; then echo "server died"; break; fi
+              sleep 5
+            done
+            curl -s http://127.0.0.1:8011/v1/chat/completions -H 'Content-Type: application/json' \
+              -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"max_tokens":16,"temperature":0}' ; echo
+            kill $PID 2>/dev/null; wait $PID 2>/dev/null
+            grep -vE 'GET /health' "$W/serve.log" | tail -60
+          }
+          echo "=== default"; serve
+          echo "=== enforce-eager"; serve --enforce-eager
