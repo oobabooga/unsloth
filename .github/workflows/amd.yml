@@ -1,0 +1,49 @@
+name: AMD DevLab vLLM ROCm-on-WSL probe
+
+on:
+  push:
+    branches: [amd-vllm-w1-17289f9b]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Import a throwaway Ubuntu 24.04 distro
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "w1-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\distro" | Out-Null
+          $rootfs = "$W\rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz' -OutFile $rootfs
+          $name = "Unsloth-Probe-$env:GITHUB_RUN_ID"
+          wsl.exe --import $name "$W\distro" $rootfs --version 2
+          "import exit $LASTEXITCODE"
+          "$name" | Out-File -Encoding ascii "$W\name.txt"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Select-Object Name
+      - name: ROCm on WSL, then vLLM ROCm serve
+        shell: powershell
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "w1-$env:GITHUB_RUN_ID"
+          $name = (Get-Content "$W\name.txt").Trim()
+          $harness = (Join-Path $env:GITHUB_WORKSPACE 'harness') -replace '\\', '/'
+          $guest = '/mnt/' + $harness.Substring(0, 1).ToLower() + $harness.Substring(2)
+          wsl.exe -d $name -u root -- bash -c "tr -d '\r' < '$guest/probe_wsl.sh' > /root/probe.sh && cp '$guest/install_rocm_wsl_strixhalo.sh' '$guest/rocprofiler_stub.c' '$guest/alloc_probe.py' /root/ && bash /root/probe.sh"
+          "exit $LASTEXITCODE"
+      - name: Unregister the probe distro
+        if: always()
+        shell: powershell
+        run: |
+          $W = Join-Path $env:RUNNER_TEMP "w1-$env:GITHUB_RUN_ID"
+          if (Test-Path "$W\name.txt") { $name = (Get-Content "$W\name.txt").Trim(); wsl.exe --unregister $name }
+          Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue
+          exit 0
