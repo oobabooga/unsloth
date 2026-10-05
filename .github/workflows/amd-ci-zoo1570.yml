@@ -80,7 +80,7 @@ jobs:
           python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
           # Pin: the PR head moved once mid-validation; refuse to measure anything else.
-          python3 -c "import json,sys; c=json.load(open(sys.argv[1]))['commits']; print(c); sys.exit(0 if c['head'].startswith('551870279') and c['base'].startswith('3fd5632e') else 1)" "$AMD_CI_WORK/out/states.json"
+          python3 -c "import json,sys; c=json.load(open(sys.argv[1]))['commits']; print(c); sys.exit(0 if c['head'].startswith('d744b0b12') and c['base'].startswith('3fd5632e') else 1)" "$AMD_CI_WORK/out/states.json"
 
       - name: Environment and real gate
         timeout-minutes: 60
