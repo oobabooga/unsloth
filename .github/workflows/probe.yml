@@ -1,0 +1,64 @@
+name: AMD vLLM Windows probe 4
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-probew4]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - name: Import distro
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = Join-Path $env:RUNNER_TEMP ("w4-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $tar = Join-Path $d "rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing "https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz" -OutFile $tar
+          $name = "UnslothW4" + (Get-Random)
+          wsl.exe --import $name (Join-Path $d "vm") $tar --version 2
+          "import rc=$LASTEXITCODE"
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/amd-vllm-k7q2xz-probew4/w4_guest.sh" -OutFile (Join-Path $d "guest.sh")
+          $g = (wsl.exe -d $name -u root -- wslpath -a ($d -replace '\\','/')) + "/guest.sh"
+          Add-Content -Path $env:GITHUB_ENV -Value "DISTRO=$name"
+          Add-Content -Path $env:GITHUB_ENV -Value "GUEST=$g"
+      - name: Studio ROCm setup script
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST rocm
+          exit 0
+      - name: vLLM install and checks
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST vllm
+          exit 0
+      - name: vLLM serve (as shipped)
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve
+          exit 0
+      - name: WSL amd-smi
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST amdsmi
+          exit 0
+      - name: vLLM serve (ROCM_PATH=/opt/rocm-wsl)
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve ROCM_PATH=/opt/rocm-wsl
+          exit 0
+      - name: vLLM serve (LD_LIBRARY_PATH=/opt/rocm-wsl/lib)
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve LD_LIBRARY_PATH=/opt/rocm-wsl/lib
+          exit 0
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          wsl.exe --unregister $env:DISTRO
+          exit 0
