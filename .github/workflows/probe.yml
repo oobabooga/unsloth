@@ -1,0 +1,52 @@
+name: AMD vLLM Windows probe 1
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-probew1]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - name: Host
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate, AdapterRAM | Format-List
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber | Format-List
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Select-Object Name
+          $ErrorActionPreference = "Continue"
+          foreach ($f in @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")) { Get-WindowsOptionalFeature -Online -FeatureName $f | Select-Object FeatureName, State }
+          (Get-CimInstance Win32_ComputerSystem).HypervisorPresent
+          Get-ChildItem "$env:SystemRoot\System32\lxss\lib" -ErrorAction SilentlyContinue | Select-Object Name
+          Get-ChildItem "$env:SystemRoot\System32\DriverStore\FileRepository" -Directory -Filter "u0*" -ErrorAction SilentlyContinue | Select-Object -First 5 Name
+          Get-ChildItem -Recurse "$env:SystemRoot\System32\DriverStore\FileRepository" -Filter "librocdxg*" -ErrorAction SilentlyContinue | Select-Object FullName
+          Get-ChildItem -Recurse "$env:SystemRoot\System32\DriverStore\FileRepository" -Filter "libdxcore*" -ErrorAction SilentlyContinue | Select-Object -First 3 FullName
+          echo "RUNNER_TEMP=$env:RUNNER_TEMP"
+          exit 0
+      - name: WSL status
+        shell: cmd
+        run: |
+          wsl --version
+          wsl --status
+          wsl -l -v
+          exit /b 0
+      - name: Import a test distro and look for dxg
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = Join-Path $env:RUNNER_TEMP ("wslprobe-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $tar = Join-Path $d "rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing "https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz" -OutFile $tar
+          $name = "UnslothProbe" + (Get-Random)
+          wsl.exe --import $name (Join-Path $d "vm") $tar --version 2
+          "import rc=$LASTEXITCODE"
+          wsl.exe -d $name -u root -- sh -c "uname -a; ls -l /dev/dxg; ls /usr/lib/wsl/lib; ls /usr/lib/wsl/drivers 2>/dev/null | head; cat /proc/cpuinfo | grep -m1 'model name'; free -g; nproc"
+          "probe rc=$LASTEXITCODE"
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP "probe_distro.txt") -Value $name
+          wsl.exe --unregister $name
+          exit 0
