@@ -130,7 +130,7 @@ jobs:
           & $py -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==2.11.0+rocm7.13.0" torchvision
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Head's dependencies; the probe runs from each checkout, so the tree under test wins on sys.path.
-          & $py -m pip install "$env:AMD_CI_WORK\states\head"
+          & $py -m pip install "$env:AMD_CI_WORK\states\head[huggingfacenotorch]" "unsloth_zoo>=2026.9.9"
           Write-Host "head install rc=$LASTEXITCODE"
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda_available', torch.cuda.is_available())"
           & $py -m pip list
