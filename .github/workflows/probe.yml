@@ -1,0 +1,52 @@
+name: AMD vLLM Windows probe 7
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-probew7]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - name: Import distro
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = Join-Path $env:RUNNER_TEMP ("w7-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $tar = Join-Path $d "rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing "https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz" -OutFile $tar
+          $name = "UnslothW7" + (Get-Random)
+          wsl.exe --import $name (Join-Path $d "vm") $tar --version 2
+          "import rc=$LASTEXITCODE"
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/amd-vllm-k7q2xz-probew7/w7_guest.sh" -OutFile (Join-Path $d "guest.sh")
+          $g = (wsl.exe -d $name -u root -- wslpath -a ($d -replace '\\','/')) + "/guest.sh"
+          Add-Content -Path $env:GITHUB_ENV -Value "DISTRO=$name"
+          Add-Content -Path $env:GITHUB_ENV -Value "GUEST=$g"
+      - name: Setup
+        shell: powershell
+        run: |
+          $env:RAW = "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}"
+          $env:WSLENV = "RAW/u"
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST setup
+          exit 0
+      - name: Serve at 0.3 of device memory
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve 0.3
+          exit 0
+      - name: Serve at 0.85 of device memory (Studio's budget)
+        timeout-minutes: 20
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve 0.85
+          exit 0
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          wsl.exe --unregister $env:DISTRO
+          exit 0
