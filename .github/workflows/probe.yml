@@ -1,0 +1,50 @@
+name: AMD vLLM Windows probe 2
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-probew2]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - name: Import distro
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = Join-Path $env:RUNNER_TEMP ("w2-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $tar = Join-Path $d "rootfs.tar.gz"
+          Invoke-WebRequest -UseBasicParsing "https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz" -OutFile $tar
+          $name = "UnslothW2" + (Get-Random)
+          wsl.exe --import $name (Join-Path $d "vm") $tar --version 2
+          "import rc=$LASTEXITCODE"
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/amd-vllm-k7q2xz-probew2/w2_guest.sh" -OutFile (Join-Path $d "guest.sh")
+          $g = (wsl.exe -d $name -u root -- wslpath -a ($d -replace '\\','/')) + "/guest.sh"
+          "guest script: $g"
+          Add-Content -Path $env:GITHUB_ENV -Value "DISTRO=$name"
+          Add-Content -Path $env:GITHUB_ENV -Value "GUEST=$g"
+      - name: ROCm-on-WSL
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST rocm
+          exit 0
+      - name: vLLM install
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST vllm
+          exit 0
+      - name: vLLM serve
+        shell: powershell
+        run: |
+          wsl.exe -d $env:DISTRO -u root -- bash $env:GUEST serve
+          exit 0
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          wsl.exe --unregister $env:DISTRO
+          exit 0
