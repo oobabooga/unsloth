@@ -1,0 +1,103 @@
+name: AMD DevLab vLLM A/B
+
+on:
+  push:
+    branches: [amd-vllm-ab-17289f9b]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: d4bfbd9f8d36e92a8d413dd6ada4462955a536f2
+  MODEL: unsloth/Qwen2.5-0.5B-Instruct
+  MATRIX: 1
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [main, branch]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Install Studio (${{ matrix.arm }})
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/vllm-ab-$GITHUB_RUN_ID-${{ matrix.arm }}"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          for kv in "W=$W" "TMPDIR=$W/tmp" "HF_HOME=$W/hf" "UV_CACHE_DIR=$W/uv" "UNSLOTH_STUDIO_HOME=$W/studio"; do echo "$kv" >> "$GITHUB_ENV"; done
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git checkout -q "$BASE_SHA"
+          if [ "${{ matrix.arm }}" = branch ]; then
+            git apply --index "$GITHUB_WORKSPACE/harness/vllm-amd.patch"
+            git -c user.name=ci -c user.email=ci@example.invalid commit -q -m "vLLM on AMD"
+          fi
+          git log --oneline -1
+          cat /opt/rocm/.info/version; rocminfo | grep -m1 -E 'Name: +gfx'
+          UNSLOTH_SKIP_AUTOSTART=1 ./install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -200 "$W/install.log"; exit 1; }
+          tail -60 "$W/install.log"
+          "$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python" -c "import torch; print('studio torch', torch.__version__, torch.version.hip)"
+          ls studio/frontend/dist/index.html
+      - name: Studio UI, install vLLM and load a model (${{ matrix.arm }})
+        shell: bash {0}
+        run: |
+          set -uxo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          # A user's default: vLLM binds ZMQ IPC sockets under TMPDIR, and a socket path is capped at 107 bytes.
+          export TMPDIR=/tmp
+          export UNSLOTH_STUDIO_MAX_EXCEPTION_CHARS=400000
+          which uv; uv --version
+          cd "$W/src"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PW="vllm-ab-$GITHUB_RUN_ID-Pw1"
+          PORT=$(shuf -i 18800-18899 -n 1)
+          pushd studio/backend > /dev/null
+          nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --frontend "$PWD/../frontend/dist" --password "$PW" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          popd > /dev/null
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" || { echo "Studio did not start"; tail -80 "$W/studio.log"; exit 1; }
+          python3 -m venv "$W/pw" && "$W/pw/bin/pip" install -q 'playwright>=1.45,<2' && "$W/pw/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1
+          "$W/pw/bin/python" "$GITHUB_WORKSPACE/harness/vllm_ui.py" "http://127.0.0.1:$PORT" "$PW" "$W/ui" "${{ matrix.arm }}" "$MODEL"
+          echo "======== engine processes"; pgrep -af "vllm|engines/vllm" | grep -v pgrep | cut -c1-300 || echo "no vLLM process"
+          for p in $(pgrep -f "engines/vllm/env-.*/bin/python"); do echo "pid $p:"; tr '\0' '\n' < /proc/$p/environ | grep -E '^(HIP|CUDA|ROCR)_VISIBLE_DEVICES=|^HSA_|^VLLM_CACHE_ROOT=' ; done
+          echo "======== engine directory"; ls -la "$UNSLOTH_STUDIO_HOME/engines" "$UNSLOTH_STUDIO_HOME/engines/vllm" 2>/dev/null; cat "$UNSLOTH_STUDIO_HOME/engines/vllm/active.json" 2>/dev/null; echo
+          du -sh "$UNSLOTH_STUDIO_HOME"/engines/vllm/env-* 2>/dev/null
+          echo "======== studio.log (engine lines)"; grep -iE "vllm|engine|rocm|hip|error|traceback" "$W/studio.log" | grep -v "GET /api" | tail -150
+          mkdir -p "$GITHUB_WORKSPACE/ui-shots" && cp -r "$W/ui/." "$GITHUB_WORKSPACE/ui-shots/" && cp "$W/studio.log" "$GITHUB_WORKSPACE/ui-shots/" || true
+          if [ "${{ matrix.arm }}" = branch ] && [ "${{ env.MATRIX }}" = 1 ]; then
+            "$W/pw/bin/pip" install -q httpx
+            "$W/pw/bin/python" "$GITHUB_WORKSPACE/harness/vllm_matrix.py" "http://127.0.0.1:$PORT" "$PW" "$W/matrix.json" \
+              "$MODEL:int8" "$MODEL:fp8" "$MODEL:int4" unsloth/Qwen2.5-VL-3B-Instruct
+            cp "$W/matrix.json" "$W/studio.log" "$GITHUB_WORKSPACE/ui-shots/" || true
+          fi
+          kill "$(cat "$W/studio.pid")"; sleep 15; pgrep -af "engines/vllm" | grep -v pgrep && echo "engine survived Studio shutdown" || echo "engine stopped with Studio"
+          if [ "${{ matrix.arm }}" = branch ] && [ "${{ env.MATRIX }}" = 1 ]; then
+            # A restarted Studio keeps the engine and loads straight away.
+            pushd studio/backend > /dev/null
+            nohup "$PY" run.py --host 127.0.0.1 --port "$PORT" --frontend "$PWD/../frontend/dist" > "$W/studio-restart.log" 2>&1 &
+            echo $! > "$W/studio.pid"
+            popd > /dev/null
+            for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+            "$W/pw/bin/python" "$GITHUB_WORKSPACE/harness/vllm_matrix.py" "http://127.0.0.1:$PORT" "$PW" "$W/matrix-restart.json" "$MODEL"
+            cp "$W/matrix-restart.json" "$W/studio-restart.log" "$GITHUB_WORKSPACE/ui-shots/" || true
+            kill "$(cat "$W/studio.pid")"; sleep 15
+          fi
+          python3 - "$W/ui/ui-results.json" <<'PY'
+          import json, sys
+          rows = json.load(open(sys.argv[1]))
+          print(json.dumps(rows, indent = 1))
+          sys.exit(0 if rows and all(r["ok"] for r in rows) else 1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vllm-ui-${{ matrix.arm }}
+          path: ui-shots
+          if-no-files-found: ignore
