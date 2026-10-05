@@ -1,0 +1,117 @@
+name: AMD DevLab vLLM Windows A/B
+
+on:
+  push:
+    branches: [amd-vllm-wab-17289f9b]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: d4bfbd9f8d36e92a8d413dd6ada4462955a536f2
+  MODEL: unsloth/Qwen2.5-0.5B-Instruct
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        arm: [branch, main]
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: wsl.exe -- versus --exec on a throwaway distro
+        if: matrix.arm == 'branch'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $T = Join-Path $env:RUNNER_TEMP "sep-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$T\distro" | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz' -OutFile "$T\rootfs.tar.gz"
+          $name = "Unsloth-Sep-$env:GITHUB_RUN_ID"
+          wsl.exe --import $name "$T\distro" "$T\rootfs.tar.gz" --version 2
+          python "$env:GITHUB_WORKSPACE\harness\wsl_separator.py" $name
+          wsl.exe --unregister $name
+          Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
+          exit 0
+      - name: Install Studio (${{ matrix.arm }})
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "vllm-wab-$env:GITHUB_RUN_ID-${{ matrix.arm }}"
+          New-Item -ItemType Directory -Force -Path "$W\hf","$W\uv" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
+          git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          Set-Location "$W\src"
+          git config core.autocrlf false
+          git checkout -q $env:BASE_SHA
+          if ('${{ matrix.arm }}' -eq 'branch') {
+            # The branch's changed files, whole: a patch fights the runner's line-ending conversion.
+            tar -xzf "$env:GITHUB_WORKSPACE\harness\vllm-amd-files.tar.gz"
+            if ($LASTEXITCODE -ne 0) { throw "files did not extract" }
+          }
+          git status --short | Select-Object -First 40
+          Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion
+          wsl.exe --list --verbose
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          $ErrorActionPreference = 'Continue'
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-rollback *> "$W\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\install.log" -Tail 60
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+          & "$W\studio\unsloth_studio\Scripts\python.exe" -c "import torch; print('studio torch', torch.__version__, torch.version.hip, torch.cuda.is_available())"
+          Test-Path "$W\src\studio\frontend\dist\index.html"
+      - name: Studio UI, install vLLM and load a model (${{ matrix.arm }})
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = $env:W
+          $PY = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          $PW = "vllm-wab-$env:GITHUB_RUN_ID-Pw1"
+          $PORT = Get-Random -Minimum 18800 -Maximum 18899
+          $argList = @('run.py','--host','127.0.0.1','--port',"$PORT",'--frontend',"$W\src\studio\frontend\dist",'--password',$PW)
+          $proc = Start-Process -FilePath $PY -ArgumentList $argList -WorkingDirectory "$W\src\studio\backend" -RedirectStandardOutput "$W\studio.out" -RedirectStandardError "$W\studio.err" -PassThru -WindowStyle Hidden
+          $up = $false
+          for ($i = 0; $i -lt 300; $i++) { try { Invoke-RestMethod "http://127.0.0.1:$PORT/api/health" | Out-Null; $up = $true; break } catch { Start-Sleep 1 } }
+          if (-not $up) { Write-Host "Studio did not start"; Get-Content "$W\studio.out","$W\studio.err" -Tail 80 -ErrorAction SilentlyContinue; exit 1 }
+          python -m venv "$W\pw"
+          & "$W\pw\Scripts\python.exe" -m pip install -q 'playwright>=1.45,<2' httpx
+          & "$W\pw\Scripts\python.exe" -m playwright install chromium *> "$W\pw-install.log"
+          & "$W\pw\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\vllm_ui.py" "http://127.0.0.1:$PORT" $PW "$W\ui" '${{ matrix.arm }}' $env:MODEL
+          wsl.exe --list --verbose
+          Get-ChildItem "$env:UNSLOTH_STUDIO_HOME\engines" -Recurse -Depth 1 -ErrorAction SilentlyContinue | Select-Object FullName
+          Get-Content "$env:UNSLOTH_STUDIO_HOME\engines\vllm\active.json" -ErrorAction SilentlyContinue
+          Get-Content "$env:UNSLOTH_STUDIO_HOME\engines\wsl\state.json" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\ui-shots" | Out-Null
+          Copy-Item -Recurse -Force "$W\ui\*" "$env:GITHUB_WORKSPACE\ui-shots\" -ErrorAction SilentlyContinue
+          Copy-Item -Force "$W\studio.out","$W\studio.err" "$env:GITHUB_WORKSPACE\ui-shots\" -ErrorAction SilentlyContinue
+          Select-String -Path "$W\studio.out","$W\studio.err" -Pattern 'vllm|engine|rocm|wsl|error|traceback' | Where-Object { $_.Line -notmatch 'GET /api' } | Select-Object -Last 120 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(600, $_.Line.Length)) }
+          Stop-Process -Id $proc.Id -Force
+          Start-Sleep 20
+          $distros = (wsl.exe --list --quiet) -replace "`0", '' | Where-Object { $_ -match 'Unsloth-Engines' }
+          foreach ($d in $distros) { Write-Host "== $d processes"; wsl.exe -d $d -u root -- sh -c "pgrep -af 'engines/vllm' || echo 'no engine process'" }
+          $rows = Get-Content "$W\ui\ui-results.json" -Raw | ConvertFrom-Json
+          $rows | Format-Table name, ok | Out-String | Write-Host
+          $failed = @($rows | Where-Object { -not $_.ok }).Count
+          if ($failed -or -not $rows) { exit 1 }
+      - name: Unregister Studio's engine distro
+        if: always()
+        shell: powershell
+        run: |
+          $distros = (wsl.exe --list --quiet) -replace "`0", '' | Where-Object { $_ -match 'Unsloth-Engines' }
+          foreach ($d in $distros) { wsl.exe --unregister $d }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vllm-ui-windows-${{ matrix.arm }}
+          path: ui-shots
+          if-no-files-found: ignore
