@@ -1,0 +1,112 @@
+name: AMD vLLM Studio A/B
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-ab]
+
+permissions: {}
+
+env:
+  BASE_SHA: d4bfbd9f8d
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  ab:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 200
+    steps:
+      - name: Host facts
+        run: |
+          cat /opt/rocm/.info/version; rocminfo | grep -m2 -E 'Marketing Name|gfx1'
+          dpkg -S libmpi_cxx.so.40 2>/dev/null || echo "libmpi_cxx.so.40 not from a package"
+          ldconfig -p | grep -E 'libmpi_cxx|libmpi\.so' || true
+          dpkg -l | grep -iE 'openmpi' | head -5 || true
+      - name: Checkouts (A = main, B = main + branch patch)
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/ab"; mkdir -p "$W"/{tmp,hf,out/A,out/B}
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W/A"
+          git -C "$W/A" checkout -q "$BASE_SHA"
+          curl -sfL -o "$W/branch.patch" "$RAW/branch.patch"
+          curl -sfL -o "$W/ui_vllm.py" "$RAW/ui_vllm.py"
+          curl -sfL -o "$W/matrix.py" "$RAW/matrix.py"
+          cp -a "$W/A" "$W/B"
+          git -C "$W/B" apply --whitespace=nowarn "$W/branch.patch"
+          git -C "$W/B" status --short
+          git -C "$W/B" add -A
+          test "$(git -C "$W/B" write-tree)" = 2be8c06faa5c0b30d2605766411a81d83eb6abe2; echo "B tree matches commit f487d0a4b4"
+      - name: Install Studio from A
+        run: |
+          W="$RUNNER_TEMP/ab"
+          cd "$W/A"
+          export UNSLOTH_STUDIO_HOME="$W/home" UNSLOTH_SKIP_AUTOSTART=1 HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          ./install.sh --local > "$W/out/install.log" 2>&1; rc=$?
+          tail -40 "$W/out/install.log"
+          echo "install rc=$rc"
+          ls -la "$HOME/.local/bin/uv" || command -v uv || true
+          "$W/home/unsloth_studio/bin/python" -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+          ls "$W/A/studio/frontend/dist/index.html"
+          exit $rc
+      - name: Build B frontend
+        run: |
+          W="$RUNNER_TEMP/ab"
+          NODE="$(dirname "$(find "$W/home" -path '*node/bin/node' -type f | head -1)")"
+          export PATH="$NODE:$PATH"
+          cd "$W/B/studio/frontend"
+          npm ci --no-audit --no-fund > "$W/out/B-npm.log" 2>&1 && npm run build >> "$W/out/B-npm.log" 2>&1; rc=$?
+          tail -5 "$W/out/B-npm.log"; exit $rc
+      - name: Playwright
+        run: |
+          W="$RUNNER_TEMP/ab"
+          python3 -m venv "$W/pw"
+          "$W/pw/bin/pip" -q install playwright==1.55.0 matplotlib
+          # The runner has no system fonts, so the browser would draw every label with zero width.
+          mkdir -p "$HOME/.local/share/fonts"
+          cp "$W"/pw/lib/python3*/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVu*.ttf "$HOME/.local/share/fonts/"
+          fc-cache -f "$HOME/.local/share/fonts" 2>/dev/null || true
+          fc-list 2>/dev/null | head -3 || true
+          PLAYWRIGHT_BROWSERS_PATH="$W/browsers" "$W/pw/bin/playwright" install chromium 2>&1 | tail -3
+          ls /opt/xilinx/xrt/lib | head -40 || true
+          env -u LD_LIBRARY_PATH PLAYWRIGHT_BROWSERS_PATH="$W/browsers" "$W/pw/bin/python" -c "from playwright.sync_api import sync_playwright as s; p=s().start(); b=p.chromium.launch(); print('chromium', b.version); b.close(); p.stop()"
+      - name: A (main) as a user
+        run: |
+          W="$RUNNER_TEMP/ab"; side=A; port=8901
+          cd "$W/$side/studio/backend"
+          # uv lands in ~/.local/bin, which a login shell has on PATH and this step shell does not.
+          PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" nohup "$W/home/unsloth_studio/bin/python" run.py --host 127.0.0.1 --port $port --frontend "$W/$side/studio/frontend/dist" > "$W/out/$side-backend.log" 2>&1 &
+          echo $! > "$W/$side.pid"
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+          set +e
+          # The runner exports LD_LIBRARY_PATH=/opt/xilinx/xrt/lib, which Chromium must not load.
+          env -u LD_LIBRARY_PATH FORCE_SYSTEM_FONT=1 BOOTSTRAP_FILE="$W/home/auth/.bootstrap_password" PLAYWRIGHT_BROWSERS_PATH="$W/browsers" \
+            "$W/pw/bin/python" "$W/ui_vllm.py" http://127.0.0.1:$port "$W/out/$side" inspect; rc=$?
+          kill "$(cat "$W/$side.pid")"; sleep 5
+          echo "A rc=$rc"
+      - name: B (branch) as a user
+        run: |
+          W="$RUNNER_TEMP/ab"; side=B; port=8902
+          cd "$W/$side/studio/backend"
+          # uv lands in ~/.local/bin, which a login shell has on PATH and this step shell does not.
+          PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" nohup "$W/home/unsloth_studio/bin/python" run.py --host 127.0.0.1 --port $port --frontend "$W/$side/studio/frontend/dist" > "$W/out/$side-backend.log" 2>&1 &
+          echo $! > "$W/$side.pid"
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+          set +e
+          env -u LD_LIBRARY_PATH FORCE_SYSTEM_FONT=1 BOOTSTRAP_FILE="$W/home/auth/.bootstrap_password" PLAYWRIGHT_BROWSERS_PATH="$W/browsers" \
+            "$W/pw/bin/python" "$W/ui_vllm.py" http://127.0.0.1:$port "$W/out/$side" full; rc=$?
+          echo "B UI rc=$rc"
+          BOOTSTRAP_FILE="$W/home/auth/.bootstrap_password" "$W/pw/bin/python" "$W/matrix.py" http://127.0.0.1:$port "$W/out/$side" all; mrc=$?
+          kill "$(cat "$W/$side.pid")"; sleep 10
+          # Restart Studio and load once more through vLLM.
+          PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" nohup "$W/home/unsloth_studio/bin/python" run.py --host 127.0.0.1 --port $port --frontend "$W/$side/studio/frontend/dist" > "$W/out/$side-backend-restart.log" 2>&1 &
+          echo $! > "$W/$side.pid"
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+          mkdir -p "$W/out/$side-reload"
+          BOOTSTRAP_FILE="$W/home/auth/.bootstrap_password" "$W/pw/bin/python" "$W/matrix.py" http://127.0.0.1:$port "$W/out/$side-reload" reload; rrc=$?
+          kill "$(cat "$W/$side.pid")"; sleep 5
+          echo "B rc=$rc matrix rc=$mrc reload rc=$rrc"; exit $(( rc || mrc || rrc ))
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-vllm-ab-linux
+          path: ${{ runner.temp }}/ab/out
