@@ -65,7 +65,15 @@ kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session))
 winsta = ctypes.create_unicode_buffer(256)
 user32.GetUserObjectInformationW(user32.GetProcessWindowStation(), 2, winsta, 512, None)
 print(f"python {sys.version.split()[0]}  session {session.value}  window station {winsta.value}")
-print(f"parent error mode {kernel32.GetErrorMode():#x}")
+print(f"runner error mode {kernel32.GetErrorMode():#x}")
+# The runner service hands its children SEM_FAILCRITICALERRORS, which would hide the dialog from main's probe too.
+# A Studio started from a desktop session has mode 0 (the reporter's dialog proves it), and children inherit it.
+kernel32.SetErrorMode(0)
+child_mode = subprocess.run(
+    [sys.executable, "-c", "import ctypes; print(hex(ctypes.WinDLL('kernel32').GetErrorMode()))"],
+    capture_output = True, text = True,
+).stdout.strip()
+print(f"harness error mode {kernel32.GetErrorMode():#x}, inherited by a child python as {child_mode}")
 sys32 = os.path.join(os.environ["SystemRoot"], "System32")
 for dll in ("vulkan-1.dll", "msvcp140.dll", "vcruntime140.dll"):
     print(f"System32\\{dll}: {os.path.isfile(os.path.join(sys32, dll))}")
@@ -238,7 +246,8 @@ for loader, bindir in (("good", good), ("old", old)):
 
 
 def popped(r):
-    return bool(r["windows"] or r["events"])
+    # A visible window, a logged Application Popup, or a child left blocked until the 15 s timeout.
+    return bool(r["windows"] or r["events"] or r["rc"] == "timeout")
 
 
 A_old = [results[("old", "A main", i)] for i in (1, 2)]
