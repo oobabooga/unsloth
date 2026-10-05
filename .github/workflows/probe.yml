@@ -1,0 +1,129 @@
+name: AMD vLLM Studio A/B (Windows)
+
+on:
+  push:
+    branches: [amd-vllm-k7q2xz-abw]
+
+permissions: {}
+
+env:
+  BASE_SHA: d4bfbd9f8d
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  ab:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    steps:
+      - name: Checkouts (A = main, B = main + branch patch)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = Join-Path $env:RUNNER_TEMP ("abw-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force "$W\out\A", "$W\out\B", "$W\hf" | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "W=$W"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\A"
+          git -C "$W\A" checkout -q $env:BASE_SHA
+          Invoke-WebRequest -UseBasicParsing "$env:RAW/branch.patch" -OutFile "$W\branch.patch"
+          Invoke-WebRequest -UseBasicParsing "$env:RAW/ui_vllm.py" -OutFile "$W\ui_vllm.py"
+          Invoke-WebRequest -UseBasicParsing "$env:RAW/matrix.py" -OutFile "$W\matrix.py"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\B"
+          git -C "$W\B" checkout -q $env:BASE_SHA
+          git -C "$W\B" apply --whitespace=nowarn "$W\branch.patch"
+          git -C "$W\B" status --short
+          git -C "$W\B" add -A
+          $tree = git -C "$W\B" write-tree
+          if ($tree -ne "2be8c06faa5c0b30d2605766411a81d83eb6abe2") { Write-Host "B tree $tree differs from commit f487d0a4b4" } else { Write-Host "B tree matches commit f487d0a4b4" }
+      - name: Install Studio from A
+        shell: powershell
+        run: |
+          $env:UNSLOTH_STUDIO_HOME = "$env:W\home"
+          $env:UNSLOTH_SKIP_AUTOSTART = "1"
+          $env:HF_HOME = "$env:W\hf"
+          Set-Location "$env:W\A"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 --local *> "$env:W\out\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:W\out\install.log" -Tail 40
+          "install rc=$rc"
+          & "$env:W\home\unsloth_studio\Scripts\python.exe" -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())"
+          Test-Path "$env:W\A\studio\frontend\dist\index.html"
+          exit $rc
+      - name: Build B frontend
+        shell: powershell
+        run: |
+          $node = Get-ChildItem -Recurse -Filter node.exe "$env:W\home" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($node) { $env:PATH = "$($node.DirectoryName);$env:PATH" }
+          "node: $((Get-Command node).Source)"
+          Set-Location "$env:W\B\studio\frontend"
+          cmd /c "npm ci --no-audit --no-fund > $env:W\out\B-npm.log 2>&1 && npm run build >> $env:W\out\B-npm.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:W\out\B-npm.log" -Tail 5
+          exit $rc
+      - name: Playwright
+        shell: powershell
+        run: |
+          python -m venv "$env:W\pw"
+          & "$env:W\pw\Scripts\pip.exe" -q install playwright==1.55.0
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$env:W\browsers"
+          & "$env:W\pw\Scripts\playwright.exe" install chromium
+      - name: A (main) as a user
+        shell: powershell
+        run: |
+          $side = "A"; $port = 8911
+          $env:UNSLOTH_STUDIO_HOME = "$env:W\home"; $env:HF_HOME = "$env:W\hf"
+          $p = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory "$env:W\$side\studio\backend" `
+            -FilePath "$env:W\home\unsloth_studio\Scripts\python.exe" `
+            -ArgumentList "run.py", "--host", "127.0.0.1", "--port", "$port", "--frontend", "$env:W\$side\studio\frontend\dist" `
+            -RedirectStandardOutput "$env:W\out\$side-backend.log" -RedirectStandardError "$env:W\out\$side-backend.err.log"
+          for ($i = 0; $i -lt 180; $i++) { try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/api/health" | Out-Null; break } catch { Start-Sleep 2 } }
+          $env:BOOTSTRAP_FILE = "$env:W\home\auth\.bootstrap_password"
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$env:W\browsers"
+          & "$env:W\pw\Scripts\python.exe" "$env:W\ui_vllm.py" "http://127.0.0.1:$port" "$env:W\out\$side" inspect
+          "A rc=$LASTEXITCODE"
+          Stop-Process -Id $p.Id -Force; Start-Sleep 5
+          exit 0
+      - name: B (branch) as a user
+        shell: powershell
+        run: |
+          $side = "B"; $port = 8912
+          $env:UNSLOTH_STUDIO_HOME = "$env:W\home"; $env:HF_HOME = "$env:W\hf"
+          $p = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory "$env:W\$side\studio\backend" `
+            -FilePath "$env:W\home\unsloth_studio\Scripts\python.exe" `
+            -ArgumentList "run.py", "--host", "127.0.0.1", "--port", "$port", "--frontend", "$env:W\$side\studio\frontend\dist" `
+            -RedirectStandardOutput "$env:W\out\$side-backend.log" -RedirectStandardError "$env:W\out\$side-backend.err.log"
+          for ($i = 0; $i -lt 180; $i++) { try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/api/health" | Out-Null; break } catch { Start-Sleep 2 } }
+          $env:BOOTSTRAP_FILE = "$env:W\home\auth\.bootstrap_password"
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$env:W\browsers"
+          & "$env:W\pw\Scripts\python.exe" "$env:W\ui_vllm.py" "http://127.0.0.1:$port" "$env:W\out\$side" full
+          $rc = $LASTEXITCODE
+          "B UI rc=$rc"
+          & "$env:W\pw\Scripts\python.exe" "$env:W\matrix.py" "http://127.0.0.1:$port" "$env:W\out\$side" all
+          $mrc = $LASTEXITCODE
+          Stop-Process -Id $p.Id -Force; Start-Sleep 20
+          # Restart Studio and load once more through vLLM.
+          $p = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory "$env:W\$side\studio\backend" `
+            -FilePath "$env:W\home\unsloth_studio\Scripts\python.exe" `
+            -ArgumentList "run.py", "--host", "127.0.0.1", "--port", "$port", "--frontend", "$env:W\$side\studio\frontend\dist" `
+            -RedirectStandardOutput "$env:W\out\$side-backend-restart.log" -RedirectStandardError "$env:W\out\$side-backend-restart.err.log"
+          for ($i = 0; $i -lt 180; $i++) { try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/api/health" | Out-Null; break } catch { Start-Sleep 2 } }
+          New-Item -ItemType Directory -Force "$env:W\out\$side-reload" | Out-Null
+          & "$env:W\pw\Scripts\python.exe" "$env:W\matrix.py" "http://127.0.0.1:$port" "$env:W\out\$side-reload" reload
+          $rrc = $LASTEXITCODE
+          Stop-Process -Id $p.Id -Force; Start-Sleep 5
+          "B rc=$rc matrix rc=$mrc reload rc=$rrc"
+          if ($rc -or $mrc -or $rrc) { exit 1 }
+          exit 0
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-vllm-ab-windows
+          path: ${{ env.W }}\out
+      - name: Remove this run's WSL distro
+        if: always()
+        shell: powershell
+        run: |
+          $hash = & "$env:W\home\unsloth_studio\Scripts\python.exe" -c "import hashlib,os,sys; sys.path.insert(0, r'$env:W\B\studio\backend'); os.environ['UNSLOTH_STUDIO_HOME']=r'$env:W\home'; from utils.paths.storage_roots import studio_root; print(hashlib.sha256(str(studio_root()).encode()).hexdigest()[:8])"
+          "distro: Unsloth-Engines-$hash"
+          wsl.exe --unregister "Unsloth-Engines-$hash"
+          exit 0
