@@ -1,0 +1,23 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [devlab-vulkan-probe-dialog]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 30
+    steps:
+      - name: A/B the Vulkan probe against a loader missing vkGetPhysicalDeviceFeatures2
+        shell: powershell
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'rd590'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          git clone -q --depth 1 --branch devlab-vulkan-probe-dialog https://github.com/oobabooga/unsloth (Join-Path $work 'harness')
+          python -m venv (Join-Path $work 'venv')
+          & "$work\venv\Scripts\python.exe" -m pip install -q pefile
+          & "$work\venv\Scripts\python.exe" "$work\harness\ab.py" $work
+          exit $LASTEXITCODE
