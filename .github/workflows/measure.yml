@@ -1,4 +1,4 @@
-name: Complete Zoo Tests CI comparison
+name: Complete Zoo Tests CI comparison repeat
 'on':
   push:
     branches:
