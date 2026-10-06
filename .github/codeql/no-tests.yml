@@ -1,0 +1,6 @@
+name: no-tests
+paths-ignore:
+  - '**/tests/**'
+  - '**/test/**'
+  - '**/test_*.py'
+  - '**/*_test.py'
