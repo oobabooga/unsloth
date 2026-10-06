@@ -49,7 +49,8 @@ def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: i
         obs["note"] = "no selected tests exist at this state"
         return obs
     junit = out_dir / f"junit_{state}.xml"
-    cmd = [python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", f"--junitxml={junit}", *present]
+    cmd = [python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--continue-on-collection-errors",
+           f"--junitxml={junit}", *present]
     obs["cmd"] = " ".join(cmd)
     try:
         p = subprocess.run(cmd, cwd = checkout, env = _env(checkout), capture_output = True,

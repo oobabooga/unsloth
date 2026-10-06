@@ -151,11 +151,27 @@ def main() -> int:
         res["stage"] = "train"
         dump()
         losses, loss_reprs, expert_grad_max, per_step = [], [], [], []
+        dynamo_retries = []
+        res["dynamo_reset_retries"] = dynamo_retries
         for step in range(args.steps):
             c_before, l_before = dict(gq.CALLS), loop_calls["n"]
             opt.zero_grad(set_to_none = True)
-            with torch.autocast("cuda", dtype = dtype):
-                loss = model(input_ids = ids, labels = ids).loss
+            try:
+                with torch.autocast("cuda", dtype = dtype):
+                    loss = model(input_ids = ids, labels = ids).loss
+            except StopIteration as e:
+                # torch 2.11 dynamo: StopIteration in dict_keys_getitem while re-entering the compiled
+                # GptOssTopKRouter_forward (seen at step 3 at base and head alike). Recorded, caches reset,
+                # step retried once; the forward raised before any backward / optimizer update.
+                dynamo_retries.append({"step": step, "error": f"{type(e).__name__}: {e}",
+                                       "where": traceback.format_exc().strip().splitlines()[-3:]})
+                res["dynamo_reset_retries"] = dynamo_retries
+                torch._dynamo.reset()
+                gq.CALLS.update(c_before)
+                loop_calls["n"] = l_before
+                opt.zero_grad(set_to_none = True)
+                with torch.autocast("cuda", dtype = dtype):
+                    loss = model(input_ids = ids, labels = ids).loss
             loss.backward()
             eg = [float(p.grad.abs().max()) for n, p in lora if ".experts." in n and p.grad is not None]
             expert_grad_max.append(max(eg) if eg else None)

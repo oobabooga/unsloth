@@ -173,8 +173,8 @@ def _f(v):
 
 def table(obs):
     rows = ["| state | cell | stage | losses | lora digest | engaged | calls delta | LAST_DECLINE | readiness | grouped log | "
-            "grouped_mm supported | fp16 grouped available | expert dtypes (gate_up / down) |",
-            "|" + "---|" * 13]
+            "grouped_mm supported | fp16 grouped available | expert dtypes (gate_up / down) | dynamo reset retries |",
+            "|" + "---|" * 14]
     for name in ("base", "head", "merge"):
         for k, c in _cells(obs.get(name)).items():
             d = c.get("expert0_dtypes") or {}
@@ -182,7 +182,7 @@ def table(obs):
                         f"{', '.join(_f(x) for x in _l(c))} | {c.get('lora_digest')} | {c.get('engaged')} | {c.get('calls_delta')} | "
                         f"{c.get('last_decline')} | {c.get('grouped_ready')} | {'; '.join(c.get('grouped_log') or [])[:300]} | "
                         f"{c.get('grouped_mm_supported')} | {c.get('fp16_grouped_available')} {c.get('fp16_unavailable_reason') or ''} | "
-                        f"{d.get('gate_up')} / {d.get('down')} |")
+                        f"{d.get('gate_up')} / {d.get('down')} | {[r.get('step') for r in (c.get('dynamo_reset_retries') or [])]} |")
     rows += ["", "| state | pytest passed | failed | skipped | failing tests |", "|---|---|---|---|---|"]
     for name in ("base", "head", "merge"):
         p = (obs.get(name) or {}).get("pytest") or {}
