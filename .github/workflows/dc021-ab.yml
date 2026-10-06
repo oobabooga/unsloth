@@ -1,8 +1,7 @@
 name: DC-021 browser overlay A/B
 
 on:
-  push:
-    branches: [dc021-mac-ab]
+  workflow_dispatch:
 
 permissions:
   contents: read
