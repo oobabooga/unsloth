@@ -136,7 +136,9 @@ jobs:
             ( cd "$AMD_CI_WORK/d_$n" && env "$@" UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/d_$n/cc" timeout 1500 "$AMD_CI_PY" "$P/g4diag_model.py" "$O/model_$n.json" 32 > "$O/model_$n.log" 2>&1 )
             echo "== $n rc=$?"; tail -c 600 "$O/model_$n.json"; echo
           }
-          timeout 600 "$AMD_CI_PY" "$P/g4diag_kernels.py" "$O/kernels.json" > "$O/kernels.log" 2>&1; echo "kernels rc=$?"; cat "$O/kernels.json"
+          # The notebook's cell 2 (run 37413926138 skipped it: transformers 5.5.0 vs tokenizers 0.23.2).
+          uv pip install --python "$AMD_CI_PY" -qqq --upgrade --no-deps "transformers>=5.5.0" "huggingface_hub>=1.5.0,<2.0" "datasets==4.3.0" accelerate peft sentencepiece protobuf hf_transfer "trl>=0.28.0" timm
+          uv pip list --python "$AMD_CI_PY" 2>/dev/null | grep -iE '^(transformers|tokenizers|trl|torch) ' || true
           run base_default AMD_SERIALIZE_KERNEL=3
           run base_native UNSLOTH_MOE_BACKEND=native_torch AMD_SERIALIZE_KERNEL=3
           uv pip install --python "$AMD_CI_PY" --no-deps --force-reinstall --no-cache \
