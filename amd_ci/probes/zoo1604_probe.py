@@ -31,7 +31,10 @@ CELLS = [
     ("eager/r2", {"TORCHDYNAMO_DISABLE": "1"}, True),
     ("eager-forced/r1", {"TORCHDYNAMO_DISABLE": "1", "UNSLOTH_MOE_GROUPED_TRITON": "1"}, True),
     ("compiled/r1", {}, False),
+    ("compiled/r2", {}, False),
+    ("compiled/r3", {}, False),
 ]
+MERGE_CELLS = ("eager/r1", "eager-forced/r1", "compiled/r1")
 FAIL_MARKERS = ("WON'T CONVERT", "won't convert", "Backend compiler failed", "BackendCompilerFailed",
                 "torch._dynamo.exc", "Unsupported:")
 
@@ -144,6 +147,8 @@ def main() -> int:
     obs["borrowed_tests_from_head"] = borrowed
     obs["train"] = {}
     for key, extra, instrument in CELLS:
+        if args.state == "merge" and key not in MERGE_CELLS:
+            continue
         obs["train"][key] = run_cell(args.checkout, key, extra, instrument, out_dir, args.state, args.python)
         args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
     merge = args.state == "merge"   # merge: cells only, no pytest (time); base vs head is the comparison

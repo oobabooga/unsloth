@@ -4,12 +4,13 @@ HIP the gate must be OFF, so everything must be unchanged vs base. gfx1151 ROCm,
 
 Regression mode. Head is WORSE than base when any of:
   * the run is not on HIP (versions.hip is None in any head cell)
-  * a head training cell crashes or has a non-finite loss (compiled cell: only if the base compiled cell finished)
+  * a head training cell crashes or has a non-finite loss (compiled: only if a base compiled cell finished)
   * head moe_utils._triton_grouped_mm_max_rows(i, k) != 0 for any i in (0, None), k in (lora, many, few, dw), under
     the cell's env or with UNSLOTH_MOE_GROUPED_TRITON forced to "1" / "auto"
   * head moe_grouped_fp16.GENERIC_CALLS is not all-zero after training in any cell (eager, forced, compiled)
   * a head cell's per-step loss reprs, per-step LoRA-grad digests or final LoRA digest differ from the same base
-    cell (eager and forced: the base A/A pair is bit-stable, else beyond its spread)
+    cell (eager and forced: the base A/A pair is bit-stable, else beyond its spread); a compiled head cell that
+    is bit-identical to no base compiled run (r1..r3) and differs beyond the base compiled A/A loss spread
   * eager head calls torch._grouped_mm a different number of times than eager base (the path changed)
   * a test that passed at the base does not pass at the head, or a new test file fails (not skips) at the head
 
@@ -95,18 +96,35 @@ def head_is_worse(base, head):
     b1, b2 = bc.get("eager/r1") or {}, bc.get("eager/r2") or {}
     aa = _done(b1) and _done(b2) and _sig(b1) == _sig(b2)
     notes.append(f"base eager A/A bit-identical={aa}")
+    # compiled: Unsloth defaults (dynamo + inductor). Judged against the base compiled A/A set (r1..r3).
+    bcomp = [c for k, c in bc.items() if k.startswith("compiled") and _done(c)]
+    bsigs = [_sig(c) for c in bcomp]
+    caa = len(set(map(repr, bsigs))) <= 1
+    cspread = 0.0
+    for i in range(len(bcomp)):
+        for j in range(i + 1, len(bcomp)):
+            cspread = max([cspread] + [abs(float(x) - float(y)) for x, y in zip(bcomp[i].get("loss_reprs") or [], bcomp[j].get("loss_reprs") or [])])
+    notes.append(f"base compiled A/A: {len(bcomp)} finished, bit-identical={caa}, loss spread {cspread:.3g}")
     for k, h in hc.items():
         b = bc.get(k) or {}
         if k.startswith("compiled"):
-            if _done(b) and not _done(h):
-                problems.append(f"head {k} failed where base finished: {h.get('error') or h.get('stage')}")
-            elif not _done(b) and not _done(h):
-                notes.append(f"{k}: fails in both states (pre-existing): base {str(b.get('error'))[:150]} / head {str(h.get('error'))[:150]}")
+            if not _done(h):
+                (problems if bcomp else notes).append(f"head {k} failed: {str(h.get('error'))[:200]} (base compiled finished: {len(bcomp)})")
                 continue
-            elif not _done(b):
-                notes.append(f"{k}: base failed ({str(b.get('error'))[:150]}), head finished")
+            if not bcomp:
                 continue
-        elif not _done(h):
+            if _sig(h) in bsigs:
+                notes.append(f"{k}: head bit-identical to a base compiled run; GENERIC_CALLS {h.get('generic_calls_final')}")
+                continue
+            d = min(max((abs(float(x) - float(y)) for x, y in zip(h.get("loss_reprs") or [], c.get("loss_reprs") or [])), default = float("inf"))
+                    for c in bcomp)
+            if caa:
+                problems.append(f"{k}: head differs from base though base compiled A/A is bit-stable (loss diff {d:.3g})")
+            else:
+                (problems if d > cspread + 1e-7 else notes).append(
+                    f"{k}: head not bit-identical to any base compiled run; nearest loss diff {d:.3g} vs base compiled A/A spread {cspread:.3g}")
+            continue
+        if not _done(h):
             problems.append(f"head {k} did not finish: {h.get('error') or ('rc=' + str(h.get('rc')) + ' stage=' + str(h.get('stage')))}")
             continue
         if not _done(b):
