@@ -1,4 +1,4 @@
-name: "AMD CI: Gemma-4 26B-A4B notebooks, routed MoE before vs after"
+name: "AMD CI: Gemma-4 26B-A4B diagnostics"
 
 # Adapted from amd_ci/templates/workflow.yml (the ci_zoo1582 scaffold). One GPU job: the
 # notebook's own install cell builds one venv; differential.py probes base (PyPI unsloth
@@ -7,7 +7,7 @@ name: "AMD CI: Gemma-4 26B-A4B notebooks, routed MoE before vs after"
 
 on:
   push:
-    branches: [amd-ci-g4nb]
+    branches: [amd-ci-g4nb-diag]
   workflow_dispatch:
 
 permissions:
@@ -122,22 +122,36 @@ jobs:
           du -sh "$HF_HOME" || true
           df -h "$RUNNER_TEMP" | tail -1
 
-      - name: Differential
+      - name: Diagnostics
+        timeout-minutes: 120
         run: |
           set +e
-          "$AMD_CI_PY" amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/g4nb_probe.py \
-            --criteria amd_ci/criteria/g4nb_notebooks.py \
-            --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY"
-          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+          O="$AMD_CI_WORK/out/diag"; mkdir -p "$O"; cd "$AMD_CI_WORK"
+          unset CI
+          export TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING=0
+          P="$GITHUB_WORKSPACE/amd_ci/probes"
+          run() {  # name, then env assignments
+            n="$1"; shift
+            mkdir -p "$AMD_CI_WORK/d_$n"
+            ( cd "$AMD_CI_WORK/d_$n" && env "$@" UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/d_$n/cc" timeout 1500 "$AMD_CI_PY" "$P/g4diag_model.py" "$O/model_$n.json" 32 > "$O/model_$n.log" 2>&1 )
+            echo "== $n rc=$?"; tail -c 600 "$O/model_$n.json"; echo
+          }
+          timeout 600 "$AMD_CI_PY" "$P/g4diag_kernels.py" "$O/kernels.json" > "$O/kernels.log" 2>&1; echo "kernels rc=$?"; cat "$O/kernels.json"
+          run base_default AMD_SERIALIZE_KERNEL=3
+          run base_native UNSLOTH_MOE_BACKEND=native_torch AMD_SERIALIZE_KERNEL=3
+          uv pip install --python "$AMD_CI_PY" --no-deps --force-reinstall --no-cache \
+            "unsloth @ git+https://github.com/unslothai/unsloth@$HEAD_UNSLOTH_SHA" \
+            "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@$HEAD_ZOO_SHA" > "$O/head_install.log" 2>&1
+          echo "head install rc=$?"
+          run head_default AMD_SERIALIZE_KERNEL=3
+          run head_routed_off UNSLOTH_MOE_ROUTED_KERNEL=0 AMD_SERIALIZE_KERNEL=3
+          run head_native UNSLOTH_MOE_BACKEND=native_torch AMD_SERIALIZE_KERNEL=3
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: g4nb-gpu
+          name: g4diag-gpu
           path: |
             ${{ env.AMD_CI_WORK }}/out
             !${{ env.AMD_CI_WORK }}/out/**/*.pt
