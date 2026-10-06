@@ -22,7 +22,7 @@ jobs:
   gpu:
     name: "Gemma-4 26B-A4B notebooks GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
+    timeout-minutes: 360
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -101,8 +101,24 @@ jobs:
       - name: Prefetch model
         timeout-minutes: 60
         run: |
-          set -euo pipefail
-          "$AMD_CI_PY" -c "from huggingface_hub import snapshot_download as s; print(s('unsloth/gemma-4-26B-A4B-it'))"
+          set +e
+          set -uo pipefail
+          # Run 37402927596: the runner's HF_ENDPOINT mirror proxy timed out (10 s default read
+          # timeout) on the cold 26 GB shards. Try huggingface.co directly, then the mirror, with a
+          # long timeout and resume; export the endpoint that worked to the notebook steps.
+          echo "runner HF_ENDPOINT=${HF_ENDPOINT:-<unset>}" | tee "$AMD_CI_WORK/out/hf_endpoint.txt"
+          MIRROR="${HF_ENDPOINT:-}"
+          export HF_HUB_DOWNLOAD_TIMEOUT=300 HF_HUB_ETAG_TIMEOUT=60
+          ok=""
+          for ep in https://huggingface.co https://huggingface.co https://huggingface.co "$MIRROR" "$MIRROR"; do
+            [ -n "$ep" ] || continue
+            echo "== snapshot via $ep"
+            HF_ENDPOINT="$ep" "$AMD_CI_PY" -c "from huggingface_hub import snapshot_download as s; print(s('unsloth/gemma-4-26B-A4B-it'))" 2>&1 | tail -5
+            if [ "${PIPESTATUS[0]}" -eq 0 ]; then ok="$ep"; break; fi
+          done
+          [ -n "$ok" ] || { echo "FATAL: model download failed on every endpoint"; exit 1; }
+          echo "used HF_ENDPOINT=$ok" | tee -a "$AMD_CI_WORK/out/hf_endpoint.txt"
+          { echo "HF_ENDPOINT=$ok"; echo "HF_HUB_DOWNLOAD_TIMEOUT=300"; echo "HF_HUB_ETAG_TIMEOUT=60"; } >> "$GITHUB_ENV"
           du -sh "$HF_HOME" || true
           df -h "$RUNNER_TEMP" | tail -1
 
