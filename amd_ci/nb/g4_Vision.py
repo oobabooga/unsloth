@@ -226,7 +226,8 @@ gemma4_models = [
 
 model, processor = FastVisionModel.from_pretrained(
     "unsloth/gemma-4-26B-A4B-it",
-    load_in_4bit = True, # Use 4bit to reduce memory use. False for 16bit LoRA.
+    load_in_4bit = True,
+    attn_implementation = "eager",  # AMD-CI: SDPA NaN on gfx1151 # Use 4bit to reduce memory use. False for 16bit LoRA.
     use_gradient_checkpointing = "unsloth", # True or "unsloth" for long context
 )
 
@@ -486,7 +487,8 @@ if False:
 
     model, processor = FastVisionModel.from_pretrained(
         model_name = "gemma_4_lora",  # YOUR MODEL YOU USED FOR TRAINING
-        load_in_4bit = True,  # Set to False for 16bit LoRA
+        load_in_4bit = True,
+        attn_implementation = "eager",  # AMD-CI: SDPA NaN on gfx1151  # Set to False for 16bit LoRA
     )
 
 sample = dataset[1]

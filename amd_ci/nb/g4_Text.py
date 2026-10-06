@@ -230,7 +230,8 @@ model, tokenizer = FastModel.from_pretrained(
     model_name = "unsloth/gemma-4-26B-A4B-it",
     dtype = None, # None for auto detection
     max_seq_length = 8192, # Choose any for long context!
-    load_in_4bit = True,  # 4 bit quantization to reduce memory
+    load_in_4bit = True,
+    attn_implementation = "eager",  # AMD-CI: SDPA NaN on gfx1151  # 4 bit quantization to reduce memory
     full_finetuning = False, # [NEW!] We have full finetuning now!
     # token = "YOUR_HF_TOKEN", # HF Token for gated models
 )
@@ -514,6 +515,7 @@ if False:
         model_name = "gemma_4_lora", # YOUR MODEL YOU USED FOR TRAINING
         max_seq_length = 2048,
         load_in_4bit = True,
+        attn_implementation = "eager",  # AMD-CI: SDPA NaN on gfx1151
     )
 
 messages = [{
