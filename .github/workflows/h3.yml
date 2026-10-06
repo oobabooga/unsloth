@@ -1,39 +1,21 @@
-name: AMD H3 Windows HTTP setup retry
+name: AMD H3 tensor views native A/B
 'on':
   push:
     branches:
     - amd-h3-native-ci-20261006
 permissions: {}
 jobs:
-  windows:
+  linux:
     runs-on:
     - self-hosted
-    - Windows
+    - Linux
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 110
+    timeout-minutes: 130
     steps:
-    - name: Diagnostic A/B using HTTP source archive
-      shell: python {0}
-      timeout-minutes: 10
-      run: "import os, sys, subprocess, pathlib, base64\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'h3-diagnostics'\nroot.mkdir(exist_ok=True)\n\
-        src=root/'source'\nimport urllib.request, zipfile, shutil, socket\nsocket.setdefaulttimeout(120)\nurl='https://codeload.github.com/unslothai/unsloth/zip/662e65e60a6553913085b794d0a41bc19301ee1d'\n\
-        print('Downloading public source archive', url, flush=True)\nz=root/'source.zip'\nwith urllib.request.urlopen(url,timeout=120)\
-        \ as response, z.open('wb') as output:\n    shutil.copyfileobj(response,output)\nwith zipfile.ZipFile(z) as bundle:\n\
-        \    bundle.extractall(root/'unpacked')\nshutil.move(str(next((root/'unpacked').iterdir())),str(src))\nprint('Source\
-        \ archive extracted', flush=True)\nprobe=root/'probe.py'\nprobe.write_text('''import sys, pathlib\nfrom core.inference.sd_cpp_engine\
-        \ import SdCppEngine\nreason = \"CUDA error: no kernel image is available for execution on the device\"\nchild = \"\
-        import sys; print(\" + repr(reason) + \"); [print('#%d native_frame' % i) for i in range(80)]; sys.exit(6)\"\ntry:\n\
-        \    SdCppEngine(binary=sys.executable)._run([sys.executable, '-c', child], str(pathlib.Path(sys.argv[2])/'absent.png'),\
-        \ timeout=30, env=None, on_log=None)\nexcept RuntimeError as exc:\n    detail=str(exc)\n    found=reason in detail\n\
-        \    print(detail)\n    assert found == (sys.argv[1] == 'after'), (sys.argv[1], found)\n    assert '#79 native_frame'\
-        \ in detail\nelse:\n    raise AssertionError('Expected native process failure')\n''')\nenv=os.environ.copy();env['PYTHONPATH']=str(src/'studio'/'backend')\n\
-        subprocess.check_call([sys.executable,str(probe),'before',str(root)],env=env)\npatch=root/'candidate.patch'\npatch.write_bytes(base64.b64decode('ZGlmZiAtLWdpdCBhL3N0dWRpby9iYWNrZW5kL2NvcmUvaW5mZXJlbmNlL3NkX2NwcF9lbmdpbmUucHkgYi9zdHVkaW8vYmFja2VuZC9jb3JlL2luZmVyZW5jZS9zZF9jcHBfZW5naW5lLnB5CmluZGV4IDRkNTE2OTQxMmMuLjVlMzMxN2VjMGQgMTAwNjQ0Ci0tLSBhL3N0dWRpby9iYWNrZW5kL2NvcmUvaW5mZXJlbmNlL3NkX2NwcF9lbmdpbmUucHkKKysrIGIvc3R1ZGlvL2JhY2tlbmQvY29yZS9pbmZlcmVuY2Uvc2RfY3BwX2VuZ2luZS5weQpAQCAtMjQsNiArMjQsNyBAQCBpbXBvcnQgc3VicHJvY2VzcwogaW1wb3J0IHN5cwogaW1wb3J0IHRocmVhZGluZwogaW1wb3J0IHRpbWUKK2Zyb20gY29sbGVjdGlvbnMgaW1wb3J0IGRlcXVlCiBmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKIGZyb20gdHlwaW5nIGltcG9ydCBDYWxsYWJsZSwgSXRlcmF0b3IsIE9wdGlvbmFsCiAKQEAgLTQ5LDYgKzUwLDQwIEBAIGZyb20gY29yZS5pbmZlcmVuY2Uuc2RfY3BwX2FyZ3MgaW1wb3J0ICgKIAogbG9nZ2VyID0gbG9nZ2luZy5nZXRMb2dnZXIoX19uYW1lX18pCiAKKyMgTGluZXMgd29ydGgga2VlcGluZyBmcm9tIGEgZmFpbGVkIG5hdGl2ZSBwcm9jZXNzJ3Mgb3V0cHV0IHdoYXRldmVyIHRoZWlyIHBvc2l0aW9uLgorX0RJQUdOT1NUSUNfTUFSS0VSUyA9ICgKKyAgICAiZXJyb3IiLAorICAgICJhYm9ydCIsCisgICAgImFzc2VydCIsCisgICAgInVuc3VwcG9ydGVkIiwKKyAgICAibm90IGltcGxlbWVudGVkIiwKKyAgICAib3V0IG9mIG1lbW9yeSIsCisgICAgImZhaWxlZCIsCisgICAgImV4Y2VwdGlvbiIsCispCisKKworZGVmIF9kaWFnbm9zdGljX3RhaWwoCisgICAgbGluZXMsCisgICAgKiwKKyAgICBrZWVwOiBpbnQgPSAyMCwKKyAgICBsaW1pdDogaW50ID0gMTUwMCwKKykgLT4gc3RyOgorICAgICIiIlRoZSBtb3N0IHVzZWZ1bCBwYXJ0IG9mIHRoZSBjYXB0dXJlZCBvdXRwdXQsIG5vdCBtZXJlbHkgaXRzIGxhc3QgbGluZXMuCisKKyAgICBBIG5hdGl2ZSBhYm9ydCBwcmludHMgaXRzIFJFQVNPTiBmaXJzdCBhbmQgdGhlbiBhIGxvbmcgYmFja3RyYWNlLCBzbyB0YWtpbmcgdGhlIGxhc3QgTiBsaW5lcworICAgIHJlcG9ydGVkIG5vdGhpbmcgYnV0IHN0YWNrIGZyYW1lczogYSBNZXRhbCBob3N0IHRoYXQgZGllZCBvbiBhbiB1bmltcGxlbWVudGVkIG9wIHNob3dlZCB0d2VudHkKKyAgICBhZGRyZXNzZXMgYW5kIG5vIGNhdXNlLiBNYXJrZWQgbGluZXMgY29tZSBmaXJzdCAoaW4gb3JkZXIpLCB0aGVuIHRoZSBsYXN0IGZldyBsaW5lcyBmb3IKKyAgICBjb250ZXh0LCBkZWR1cGxpY2F0ZWQuIiIiCisgICAgY2FwdHVyZWQgPSBsaXN0KGxpbmVzKQorICAgIG1hcmtlZCA9IFtsaW5lIGZvciBsaW5lIGluIGNhcHR1cmVkIGlmIGFueShtIGluIGxpbmUubG93ZXIoKSBmb3IgbSBpbiBfRElBR05PU1RJQ19NQVJLRVJTKV0KKyAgICBjaG9zZW46IGxpc3Rbc3RyXSA9IFtdCisgICAgZm9yIGxpbmUgaW4gbWFya2VkWy1rZWVwOl0gKyBjYXB0dXJlZFstbWF4KGtlZXAgLy8gMiwgNCkgOl06CisgICAgICAgIGlmIGxpbmUgbm90IGluIGNob3NlbjoKKyAgICAgICAgICAgIGNob3Nlbi5hcHBlbmQobGluZSkKKyAgICByZXR1cm4gIlxuIi5qb2luKGNob3NlbilbOmxpbWl0XQorCisKICMgc2QtY2xpIChzZC1jbGkuZXhlIG9uIFdpbmRvd3MpOyBvbGRlciBidWlsZHMgc2hpcHBlZCBgYHNkYGAgLS0gYm90aCBwcm9iZWQgb24gUEFUSC4KIF9CSU5BUllfU1RFTSA9ICJzZC1jbGkiCiBfTEVHQUNZX1NURU0gPSAic2QiCkBAIC04NzAsNyArOTA1LDcgQEAgY2xhc3MgU2RDcHBFbmdpbmU6CiAgICAgICAgICMgbGluZSBpbiBwcm9jLnN0ZG91dGAgYmxvY2tzIHVudGlsIEVPRikuIExpbmVzLCB0aGVuIGEgTm9uZSBzZW50aW5lbCwgZ28gdG8gYSBxdWV1ZSB0aGUgbWFpbiBsb29wIHBvbGxzIGFnYWluc3QKICAgICAgICAgIyBhIHdhbGwtY2xvY2sgZGVhZGxpbmUuIGl0ZXJfc2RfY3BwX3JlY29yZHMgYWxzbyBzcGxpdHMgc2QtY2xpJ3MgaW4tcGxhY2UgcHJvZ3Jlc3MgcmVkcmF3cywgd2hpY2ggY2Fycnkgbm8KICAgICAgICAgIyBuZXdsaW5lIG9mIHRoZWlyIG93biwgc28gc2FtcGxpbmcgcHJvZ3Jlc3MgcmVhY2hlcyBvbl9sb2cgd2hpbGUgc2FtcGxpbmcgaXMgc3RpbGwgcnVubmluZy4KLSAgICAgICAgdGFpbDogbGlzdFtzdHJdID0gW10KKyAgICAgICAgdGFpbDogZGVxdWVbc3RyXSA9IGRlcXVlKG1heGxlbiA9IDIwMCkKICAgICAgICAgbGluZV9xOiAicXVldWUuUXVldWVbT3B0aW9uYWxbc3RyXV0iID0gcXVldWUuUXVldWUoKQogCiAgICAgICAgIGRlZiBfZHJhaW4oKSAtPiBOb25lOgpAQCAtOTA3LDggKzk0Miw2IEBAIGNsYXNzIFNkQ3BwRW5naW5lOgogICAgICAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgICB0YWlsLmFwcGVuZChsaW5lKQotICAgICAgICAgICAgICAgIGlmIGxlbih0YWlsKSA+IDQwOgotICAgICAgICAgICAgICAgICAgICB0YWlsLnBvcCgwKQogICAgICAgICAgICAgICAgIGlmIG9uX2xvZyBpcyBub3QgTm9uZToKICAgICAgICAgICAgICAgICAgICAgb25fbG9nKGxpbmUpCiAgICAgICAgICAgICByZXQgPSBwcm9jLndhaXQodGltZW91dCA9IDUuMCkKQEAgLTkxOSwxMSArOTUyLDExIEBAIGNsYXNzIFNkQ3BwRW5naW5lOgogICAgICAgICAgICAgICAgIGZvcmdldF9waWQocHJvYy5waWQpCiAKICAgICAgICAgaWYgcmV0ICE9IDA6Ci0gICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoZiJzZC1jbGkgZXhpdGVkIHtyZXR9LiBMYXN0IG91dHB1dDpcbiIgKyAiXG4iLmpvaW4odGFpbFstMTI6XSkpCisgICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoZiJzZC1jbGkgZXhpdGVkIHtyZXR9LiBMYXN0IG91dHB1dDpcbiIgKyBfZGlhZ25vc3RpY190YWlsKHRhaWwpKQogICAgICAgICBpZiBub3Qgb3V0LmlzX2ZpbGUoKToKICAgICAgICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigKICAgICAgICAgICAgICAgICBmInNkLWNsaSByZXBvcnRlZCBzdWNjZXNzIGJ1dCBubyBpbWFnZSBhdCB7b3V0fS4gTGFzdCBvdXRwdXQ6XG4iCi0gICAgICAgICAgICAgICAgKyAiXG4iLmpvaW4odGFpbFstMTI6XSkKKyAgICAgICAgICAgICAgICArIF9kaWFnbm9zdGljX3RhaWwodGFpbCkKICAgICAgICAgICAgICkKICAgICAgICAgZWxhcHNlZCA9IHRpbWUudGltZSgpIC0gdDAKICAgICAgICAgaWYgdmVyYm9zZV9sb2dzOgpkaWZmIC0tZ2l0IGEvc3R1ZGlvL2JhY2tlbmQvY29yZS9pbmZlcmVuY2Uvc2RfY3BwX3NlcnZlci5weSBiL3N0dWRpby9iYWNrZW5kL2NvcmUvaW5mZXJlbmNlL3NkX2NwcF9zZXJ2ZXIucHkKaW5kZXggOGQxZDIzYjU4Zi4uYmJjOTVhMjYzMyAxMDA2NDQKLS0tIGEvc3R1ZGlvL2JhY2tlbmQvY29yZS9pbmZlcmVuY2Uvc2RfY3BwX3NlcnZlci5weQorKysgYi9zdHVkaW8vYmFja2VuZC9jb3JlL2luZmVyZW5jZS9zZF9jcHBfc2VydmVyLnB5CkBAIC01Miw2ICs1Miw3IEBAIGZyb20gY29yZS5pbmZlcmVuY2Uuc2RfY3BwX2FyZ3MgaW1wb3J0IFNkQ3BwTW9kZWxGaWxlcywgYnVpbGRfc2RfY3BwX3NlcnZlcl9jb21tCiBmcm9tIGNvcmUuaW5mZXJlbmNlLnNkX2NwcF9lbmdpbmUgaW1wb3J0ICgKICAgICBOQVRJVkVfR0VORVJBVElPTl9USU1FT1VUX1MsCiAgICAgU2RDcHBDYW5jZWxsZWQsCisgICAgX2RpYWdub3N0aWNfdGFpbCwKICAgICBfc2RfY3BwX2NvbW1hbmRfZm9yX2xvZywKICAgICBfc2RfY3BwX2NvbW1hbmRfc3VtbWFyeSwKICAgICBfdmVyYm9zZV9uYXRpdmVfbG9ncywKQEAgLTk0LDQwICs5NSw2IEBAIF9URVJNSU5BTF9PSyA9ICJjb21wbGV0ZWQiCiBfVEVSTUlOQUxfRkFJTCA9ICJmYWlsZWQiCiBfVEVSTUlOQUxfQ0FOQ0VMTEVEID0gImNhbmNlbGxlZCIKIAotIyBMaW5lcyB3b3J0aCBrZWVwaW5nIGZyb20gYSBkZWFkIHNlcnZlcidzIG91dHB1dCB3aGF0ZXZlciB0aGVpciBwb3NpdGlvbi4KLV9ESUFHTk9TVElDX01BUktFUlMgPSAoCi0gICAgImVycm9yIiwKLSAgICAiYWJvcnQiLAotICAgICJhc3NlcnQiLAotICAgICJ1bnN1cHBvcnRlZCIsCi0gICAgIm5vdCBpbXBsZW1lbnRlZCIsCi0gICAgIm91dCBvZiBtZW1vcnkiLAotICAgICJmYWlsZWQiLAotICAgICJleGNlcHRpb24iLAotKQotCi0KLWRlZiBfZGlhZ25vc3RpY190YWlsKAotICAgIGxpbmVzLAotICAgICosCi0gICAga2VlcDogaW50ID0gMjAsCi0gICAgbGltaXQ6IGludCA9IDE1MDAsCi0pIC0+IHN0cjoKLSAgICAiIiJUaGUgbW9zdCB1c2VmdWwgcGFydCBvZiB0aGUgY2FwdHVyZWQgb3V0cHV0LCBub3QgbWVyZWx5IGl0cyBsYXN0IGxpbmVzLgotCi0gICAgQSBuYXRpdmUgYWJvcnQgcHJpbnRzIGl0cyBSRUFTT04gZmlyc3QgYW5kIHRoZW4gYSBsb25nIGJhY2t0cmFjZSwgc28gdGFraW5nIHRoZSBsYXN0IE4gbGluZXMKLSAgICByZXBvcnRlZCBub3RoaW5nIGJ1dCBzdGFjayBmcmFtZXM6IGEgTWV0YWwgaG9zdCB0aGF0IGRpZWQgb24gYW4gdW5pbXBsZW1lbnRlZCBvcCBzaG93ZWQgdHdlbnR5Ci0gICAgYWRkcmVzc2VzIGFuZCBubyBjYXVzZS4gTWFya2VkIGxpbmVzIGNvbWUgZmlyc3QgKGluIG9yZGVyKSwgdGhlbiB0aGUgbGFzdCBmZXcgbGluZXMgZm9yCi0gICAgY29udGV4dCwgZGVkdXBsaWNhdGVkLiIiIgotICAgIGNhcHR1cmVkID0gbGlzdChsaW5lcykKLSAgICBtYXJrZWQgPSBbbGluZSBmb3IgbGluZSBpbiBjYXB0dXJlZCBpZiBhbnkobSBpbiBsaW5lLmxvd2VyKCkgZm9yIG0gaW4gX0RJQUdOT1NUSUNfTUFSS0VSUyldCi0gICAgY2hvc2VuOiBsaXN0W3N0cl0gPSBbXQotICAgIGZvciBsaW5lIGluIG1hcmtlZFsta2VlcDpdICsgY2FwdHVyZWRbLW1heChrZWVwIC8vIDIsIDQpIDpdOgotICAgICAgICBpZiBsaW5lIG5vdCBpbiBjaG9zZW46Ci0gICAgICAgICAgICBjaG9zZW4uYXBwZW5kKGxpbmUpCi0gICAgcmV0dXJuICJcbiIuam9pbihjaG9zZW4pWzpsaW1pdF0KLQotCiAjIEdyYWNlIGZvciB0aGUgYmVzdC1lZmZvcnQgbmF0aXZlIGNhbmNlbCB0byBzaG93IGluIGpvYiBzdGF0dXM7IHdpdGhvdXQgdGhlIGNhcCBhIGxvc3QgY2FuY2VsIHdvdWxkIGhvbGQgdGhlIGdlbmVyYXRlCiAjIGxvY2sgdW50aWwgdGhlIGpvYiBlbmRzLgogX0NBTkNFTF9HUkFDRV9TID0gNS4wCg=='))\n\
-        subprocess.check_call(['git','-C',str(src),'apply',str(patch)])\nsubprocess.check_call([sys.executable,str(probe),'after',str(root)],env=env)\n\
-        print('Native child diagnostic A/B passed')\n"
-    - name: Prepare Vulkan and Q4 models
-      shell: python {0}
-      timeout-minutes: 45
+    - name: Prepare Q4 models
+      shell: python3 {0}
+      timeout-minutes: 35
       run: "import os, sys, subprocess, pathlib, urllib.request, zipfile, platform, time, json, concurrent.futures\nroot =\
         \ pathlib.Path(os.environ['RUNNER_TEMP']) / 'h3-native'\nroot.mkdir(exist_ok=True)\nos.environ['HF_ENDPOINT'] = 'https://huggingface.co'\n\
         os.environ['HF_HUB_ETAG_TIMEOUT'] = '180'\nos.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '300'\nos.environ['HF_HUB_DISABLE_XET']\
@@ -53,20 +35,32 @@ jobs:
         \ suffix='win-rocm-7.14.0-x64' if win else 'Linux-Ubuntu-24.04-x86_64-rocm-7.14.0'\n    z=root/(kind+'.zip'); urllib.request.urlretrieve(base+'sd-master-bfbef5b-bin-'+suffix+'.zip',z)\n\
         \    dest=root/kind; dest.mkdir(exist_ok=True)\n    with zipfile.ZipFile(z) as f: installer._safe_extractall(f,dest)\n\
         \    for f in dest.rglob('*'):\n        if f.is_file() and not win: f.chmod(0o755)\n    return str(next(dest.rglob('sd-cli.exe'\
-        \ if win else 'sd-cli')))\nsrc=root/'source'\nimport urllib.request, zipfile, shutil, socket\nsocket.setdefaulttimeout(120)\n\
-        url='https://codeload.github.com/unslothai/unsloth/zip/662e65e60a6553913085b794d0a41bc19301ee1d'\nprint('Downloading\
-        \ public source archive', url, flush=True)\nz=root/'source.zip'\nwith urllib.request.urlopen(url,timeout=120) as response,\
-        \ z.open('wb') as output:\n    shutil.copyfileobj(response,output)\nwith zipfile.ZipFile(z) as bundle:\n    bundle.extractall(root/'unpacked')\n\
-        shutil.move(str(next((root/'unpacked').iterdir())),str(src))\nprint('Source archive extracted', flush=True)\n\nsys.path.insert(0,str(src/'studio'))\n\
-        import install_sd_cpp_prebuilt as installer\nbinary=get_binary('vulkan')\nrun([binary,'--list-devices'],'vulkan-devices',60)\n\
-        run([binary,'--help'],'help',60)\nrocm=None\nfiles=['minimax_h3_fl2va_pruned-Q4_K.gguf','qwen3vl_32b_minimax_h3-Q4_K_M.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors']\n\
+        \ if win else 'sd-cli')))\nsrc=root/'source'\nsubprocess.check_call(['git','clone','--depth','1','https://github.com/unslothai/unsloth',str(src)])\n\
+        sys.path.insert(0,str(src/'studio'))\nimport install_sd_cpp_prebuilt as installer\nbinary=get_binary('vulkan')\nrun([binary,'--list-devices'],'vulkan-devices',60)\n\
+        run([binary,'--help'],'help',60)\nrocm=get_binary('rocm')\nrun([rocm,'--list-devices'],'rocm-devices',60)\nfiles=['minimax_h3_fl2va_pruned-Q4_K.gguf','qwen3vl_32b_minimax_h3-Q4_K_M.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors']\n\
         code=\"from huggingface_hub import snapshot_download; snapshot_download('unsloth/MiniMax-H3-GGUF',allow_patterns=\"\
         +repr(files)+\",local_dir=\"+repr(str(root/'models'))+\")\"\nsubprocess.check_call([py,'-c',code])\nmodels=root/'models'\n\
         common=[binary,'--mode','vid_gen','--diffusion-model',str(models/files[0]),'--llm',str(models/files[1]),'--vae',str(models/files[2]),'--audio-vae',str(models/files[3]),'--prompt','A\
-        \ red toy car drives along a road in sunlight.','--cfg-scale','1','--width','640','--height','384','--video-frames','25','--fps','24','--steps','2','--seed','42','--rng','cpu','-t','16']\n\
-        flags=['--offload-to-cpu','--diffusion-fa','--max-vram','-1','--stream-layers']\n(root/'config.json').write_text(json.dumps({'common':common,'flags':flags,'binary':binary,'rocm':rocm}))\n"
-    - name: small
-      shell: python {0}
+        \ red toy car drives along a road in sunlight.','--cfg-scale','1','--width','1344','--height','768','--video-frames','124','--fps','24','--steps','2','--seed','42','--rng','cpu','-t','16']\n\
+        flags=['--offload-to-cpu','--diffusion-fa','--max-vram','20','--stream-layers']\n(root/'config.json').write_text(json.dumps({'common':common,'flags':flags,'binary':binary,'rocm':rocm}))\n"
+    - name: Build identical baseline and candidate
+      shell: python3 {0}
+      timeout-minutes: 30
+      run: "\nimport os, pathlib, subprocess, urllib.request, zipfile, shutil, base64\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'h3-native'\n\
+        source=root/'native-source'\ndef archive(repo,sha,dest):\n    z=root/(dest.name+'.zip')\n    urllib.request.urlretrieve('https://codeload.github.com/'+repo+'/zip/'+sha,z)\n\
+        \    tmp=root/(dest.name+'-unpack')\n    with zipfile.ZipFile(z) as bundle: bundle.extractall(tmp)\n    if dest.exists():\
+        \ shutil.rmtree(dest)\n    shutil.move(str(next(tmp.iterdir())),str(dest))\narchive('leejet/stable-diffusion.cpp','bfbef5b7e64e89a0205894853de25d19a7ba54b9',source)\n\
+        archive('ggml-org/ggml','eced84c86f8b012c752c016f7fe789adea168e1e',source/'ggml')\npy=str(root/'venv/bin/python')\n\
+        subprocess.check_call([py,'-m','pip','install','cmake==3.31.6'])\ndebs=root/'debs';debs.mkdir(exist_ok=True)\nsubprocess.check_call(['apt-get','download','glslc','libshaderc1','libvulkan-dev','spirv-headers'],cwd=debs)\n\
+        tools=root/'tools';tools.mkdir(exist_ok=True)\nfor deb in debs.glob('*.deb'):subprocess.check_call(['dpkg-deb','-x',str(deb),str(tools)])\n\
+        env=os.environ.copy();env['LD_LIBRARY_PATH']=str(tools/'usr/lib/x86_64-linux-gnu')+':'+env.get('LD_LIBRARY_PATH','')\n\
+        cmake=str(root/'venv/bin/cmake');build=root/'build'\nsubprocess.check_call([cmake,'-S',str(source),'-B',str(build),'-DCMAKE_BUILD_TYPE=RelWithDebInfo','-DSD_VULKAN=ON','-DSD_BUILD_EXAMPLES=ON','-DSD_SERVER_BUILD_FRONTEND=OFF','-DSD_WEBP=OFF','-DSD_WEBM=OFF','-DGGML_NATIVE=OFF','-DVulkan_GLSLC_EXECUTABLE='+str(tools/'usr/bin/glslc'),'-DCMAKE_PREFIX_PATH='+str(tools/'usr'),'-DCMAKE_CXX_FLAGS=-I'+str(tools/'usr/include')],env=env)\n\
+        subprocess.check_call([cmake,'--build',str(build),'-j','12','--target','sd-cli'],env=env)\nshutil.copy2(build/'bin/sd-cli',root/'sd-cli-before')\n\
+        patch=root/'candidate.patch';patch.write_bytes(base64.b64decode('ZGlmZiAtLWdpdCBhL3NyYy9jb3JlL2dnbWxfZXh0ZW5kLmhwcCBiL3NyYy9jb3JlL2dnbWxfZXh0ZW5kLmhwcAppbmRleCBkMTRkMjg3Li4yOGYxNjZlIDEwMDY0NAotLS0gYS9zcmMvY29yZS9nZ21sX2V4dGVuZC5ocHAKKysrIGIvc3JjL2NvcmUvZ2dtbF9leHRlbmQuaHBwCkBAIC01LDYgKzUsNyBAQAogI2luY2x1ZGUgPGludHR5cGVzLmg+CiAjaW5jbHVkZSA8c3RkYXJnLmg+CiAjaW5jbHVkZSA8YWxnb3JpdGhtPgorI2luY2x1ZGUgPGFycmF5PgogI2luY2x1ZGUgPGF0b21pYz4KICNpbmNsdWRlIDxjc3RkbGliPgogI2luY2x1ZGUgPGNzdHJpbmc+CkBAIC0yNjcxLDggKzI2NzIsMTggQEAgcHJvdGVjdGVkOgogICAgICAgICB9CiAgICAgfQogCi0gICAgYm9vbCBiaW5kX3NlZ21lbnRfY2FjaGVkX2lucHV0cyhnZ21sX2NncmFwaCogZ2YsIGNvbnN0IEdyYXBoQ3V0U2VnbWVudCYgc2VnbWVudCkgeworICAgIHN0cnVjdCBHcmFwaEN1dFRlbnNvclRvcG9sb2d5IHsKKyAgICAgICAgZ2dtbF9vcCBvcDsKKyAgICAgICAgc3RkOjphcnJheTxnZ21sX3RlbnNvciosIEdHTUxfTUFYX1NSQz4gc291cmNlczsKKyAgICAgICAgZ2dtbF90ZW5zb3IqIHZpZXdfc3JjOworICAgICAgICBpbnQzMl90IGZsYWdzOworICAgIH07CisKKyAgICBib29sIGJpbmRfc2VnbWVudF9jYWNoZWRfaW5wdXRzKGdnbWxfY2dyYXBoKiBnZiwKKyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IEdyYXBoQ3V0U2VnbWVudCYgc2VnbWVudCwKKyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IHN0ZDo6dW5vcmRlcmVkX21hcDxnZ21sX3RlbnNvciosIEdyYXBoQ3V0VGVuc29yVG9wb2xvZ3k+JiB0b3BvbG9neSkgewogICAgICAgICBHR01MX0FTU0VSVChnZiAhPSBudWxscHRyKTsKKyAgICAgICAgc3RkOjp1bm9yZGVyZWRfbWFwPGdnbWxfdGVuc29yKiwgZ2dtbF90ZW5zb3IqPiBjYWNoZWRfdmlld19zb3VyY2VzOwogICAgICAgICBmb3IgKGNvbnN0IGF1dG8mIGlucHV0IDogc2VnbWVudC5pbnB1dF9yZWZzKSB7CiAgICAgICAgICAgICBnZ21sX3RlbnNvciogaW5wdXRfdGVuc29yID0gc2Q6OmdnbWxfZ3JhcGhfY3V0OjppbnB1dF90ZW5zb3IoZ2YsIGlucHV0KTsKICAgICAgICAgICAgIGlmIChpbnB1dF90ZW5zb3IgPT0gbnVsbHB0cikgewpAQCAtMjY4OCw2ICsyNjk5LDcgQEAgcHJvdGVjdGVkOgogICAgICAgICAgICAgICAgICAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgIGlmIChpbnB1dF90ZW5zb3ItPnZpZXdfc3JjICE9IG51bGxwdHIpIHsKKyAgICAgICAgICAgICAgICAgICAgICAgIGNhY2hlZF92aWV3X3NvdXJjZXNbdG9wb2xvZ3kuYXQoaW5wdXRfdGVuc29yKS52aWV3X3NyY10gPSBjYWNoZV90ZW5zb3I7CiAgICAgICAgICAgICAgICAgICAgICAgICBpbnB1dF90ZW5zb3ItPnZpZXdfc3JjID0gY2FjaGVfdGVuc29yOwogICAgICAgICAgICAgICAgICAgICAgICAgaW5wdXRfdGVuc29yLT5idWZmZXIgICA9IG51bGxwdHI7CiAgICAgICAgICAgICAgICAgICAgICAgICBpbnB1dF90ZW5zb3ItPmRhdGEgICAgID0gY2FjaGVfdGVuc29yLT5kYXRhID09IG51bGxwdHIKQEAgLTI3MTAsNiArMjcyMiwxNCBAQCBwcm90ZWN0ZWQ6CiAgICAgICAgICAgICAgICAgICAgIGJyZWFrOwogICAgICAgICAgICAgfQogICAgICAgICB9CisgICAgICAgIC8vIGdnbWwgZmxhdHRlbnMgdmlldyBjaGFpbnMsIHNvIGRlc2NlbmRhbnRzIGFsc28gbmVlZCB0aGUgY2FjaGVkIHJvb3QuCisgICAgICAgIGZvciAoaW50IG5vZGVfaWR4IDogc2VnbWVudC5pbnRlcm5hbF9ub2RlX2luZGljZXMpIHsKKyAgICAgICAgICAgIGdnbWxfdGVuc29yKiBub2RlID0gZ2dtbF9ncmFwaF9ub2RlKGdmLCBub2RlX2lkeCk7CisgICAgICAgICAgICBhdXRvIHNvdXJjZSA9IGNhY2hlZF92aWV3X3NvdXJjZXMuZmluZCh0b3BvbG9neS5hdChub2RlKS52aWV3X3NyYyk7CisgICAgICAgICAgICBpZiAoc291cmNlICE9IGNhY2hlZF92aWV3X3NvdXJjZXMuZW5kKCkpIHsKKyAgICAgICAgICAgICAgICBub2RlLT52aWV3X3NyYyA9IHNvdXJjZS0+c2Vjb25kOworICAgICAgICAgICAgfQorICAgICAgICB9CiAgICAgICAgIHJldHVybiB0cnVlOwogICAgIH0KIApAQCAtMjg5Miw2ICsyOTEyLDE0IEBAIHByb3RlY3RlZDoKICAgICAgICAgc3RkOjp1bm9yZGVyZWRfbWFwPGdnbWxfdGVuc29yKiwgUGVyc2lzdGVudEV4dGVybmFsQmluZGluZz4gcGVyc2lzdGVudF9leHRlcm5hbHM7CiAgICAgICAgIHNuYXBzaG90X3BlcnNpc3RlbnRfZXh0ZXJuYWxzKHBsYW4sIGdmLCBwZXJzaXN0ZW50X2V4dGVybmFscyk7CiAKKyAgICAgICAgc3RkOjp1bm9yZGVyZWRfbWFwPGdnbWxfdGVuc29yKiwgR3JhcGhDdXRUZW5zb3JUb3BvbG9neT4gdG9wb2xvZ3k7CisgICAgICAgIGZvciAoaW50IGkgPSAwOyBpIDwgZ2dtbF9ncmFwaF9uX25vZGVzKGdmKTsgKytpKSB7CisgICAgICAgICAgICBnZ21sX3RlbnNvciogbm9kZSA9IGdnbWxfZ3JhcGhfbm9kZShnZiwgaSk7CisgICAgICAgICAgICBHcmFwaEN1dFRlbnNvclRvcG9sb2d5IG9yaWdpbmFse25vZGUtPm9wLCB7fSwgbm9kZS0+dmlld19zcmMsIG5vZGUtPmZsYWdzfTsKKyAgICAgICAgICAgIHN0ZDo6Y29weShzdGQ6OmJlZ2luKG5vZGUtPnNyYyksIHN0ZDo6ZW5kKG5vZGUtPnNyYyksIG9yaWdpbmFsLnNvdXJjZXMuYmVnaW4oKSk7CisgICAgICAgICAgICB0b3BvbG9neS5lbXBsYWNlKG5vZGUsIG9yaWdpbmFsKTsKKyAgICAgICAgfQorCiAgICAgICAgIHN0ZDo6b3B0aW9uYWw8c2Q6OlRlbnNvcjxUPj4gb3V0cHV0ID0gc2Q6OlRlbnNvcjxUPigpOwogICAgICAgICBmb3IgKHNpemVfdCBzZWdfaWR4ID0gMDsgc2VnX2lkeCA8IHBsYW4uc2VnbWVudHMuc2l6ZSgpOyArK3NlZ19pZHgpIHsKICAgICAgICAgICAgIGNvbnN0IGF1dG8mIHNlZ21lbnQgICA9IHBsYW4uc2VnbWVudHNbc2VnX2lkeF07CkBAIC0yOTEyLDggKzI5NDAsMTYgQEAgcHJvdGVjdGVkOgogICAgICAgICAgICAgICAgICAgICAgICAgICBzZWdtZW50Lmdyb3VwX25hbWUuY19zdHIoKSk7CiAgICAgICAgICAgICB9CiAKKyAgICAgICAgICAgIC8vIENhY2hlZCBpbnB1dHMgYW5kIHRoZSBzY2hlZHVsZXIgbXV0YXRlIGdyYXBoIGxpbmtzLiBSZXN0b3JlIHRoZW0KKyAgICAgICAgICAgIC8vIGJlZm9yZSBiaW5kaW5nIHRoaXMgc2VnbWVudCwgd2hpbGUgdGhlIHByZXZpb3VzIGNhY2hlIGlzIHN0aWxsIGFsaXZlLgorICAgICAgICAgICAgZm9yIChjb25zdCBhdXRvJiBlbnRyeSA6IHRvcG9sb2d5KSB7CisgICAgICAgICAgICAgICAgZW50cnkuZmlyc3QtPm9wID0gZW50cnkuc2Vjb25kLm9wOworICAgICAgICAgICAgICAgIGVudHJ5LmZpcnN0LT52aWV3X3NyYyA9IGVudHJ5LnNlY29uZC52aWV3X3NyYzsKKyAgICAgICAgICAgICAgICBlbnRyeS5maXJzdC0+ZmxhZ3MgPSBlbnRyeS5zZWNvbmQuZmxhZ3M7CisgICAgICAgICAgICAgICAgc3RkOjpjb3B5KGVudHJ5LnNlY29uZC5zb3VyY2VzLmJlZ2luKCksIGVudHJ5LnNlY29uZC5zb3VyY2VzLmVuZCgpLCBzdGQ6OmJlZ2luKGVudHJ5LmZpcnN0LT5zcmMpKTsKKyAgICAgICAgICAgIH0KICAgICAgICAgICAgIHJlc2V0X3NlZ21lbnRfcnVudGltZV90ZW5zb3JzKHNlZ21lbnQsIGdmLCAmcGVyc2lzdGVudF9leHRlcm5hbHMpOwotICAgICAgICAgICAgaWYgKCFiaW5kX3NlZ21lbnRfY2FjaGVkX2lucHV0cyhnZiwgc2VnbWVudCkpIHsKKyAgICAgICAgICAgIGlmICghYmluZF9zZWdtZW50X2NhY2hlZF9pbnB1dHMoZ2YsIHNlZ21lbnQsIHRvcG9sb2d5KSkgewogICAgICAgICAgICAgICAgIGZyZWVfY2FjaGVfY3R4X2FuZF9idWZmZXIoKTsKICAgICAgICAgICAgICAgICBmcmVlX2NvbXB1dGVfYnVmZmVyKCk7CiAgICAgICAgICAgICAgICAgZnJlZV9jb21wdXRlX2N0eCgpOwo='))\n\
+        subprocess.check_call(['git','-C',str(source),'apply',str(patch)])\nsubprocess.check_call([cmake,'--build',str(build),'-j','12','--target','sd-cli'],env=env)\n\
+        shutil.copy2(build/'bin/sd-cli',root/'sd-cli-after')\n"
+    - name: before
+      shell: python3 {0}
       run: "import os, sys, subprocess, pathlib, urllib.request, zipfile, platform, time, json, concurrent.futures\nroot =\
         \ pathlib.Path(os.environ['RUNNER_TEMP']) / 'h3-native'\nroot.mkdir(exist_ok=True)\nos.environ['HF_ENDPOINT'] = 'https://huggingface.co'\n\
         os.environ['HF_HUB_ETAG_TIMEOUT'] = '180'\nos.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '300'\nos.environ['HF_HUB_DISABLE_XET']\
@@ -77,16 +71,17 @@ jobs:
         \        try: rc=p.wait(timeout=timeout)\n        except subprocess.TimeoutExpired: p.kill(); p.wait(); rc='timeout'\n\
         \    out=(logs/(name+'.log')).read_text(errors='replace')\n    print(out[-18000:],flush=True)\n    result={'name':name,'rc':rc,'seconds':round(time.monotonic()-t,2)}\n\
         \    with (logs/'results.jsonl').open('a') as f: f.write(json.dumps(result)+'\\n')\n    print('::notice title='+name+'::'+json.dumps(result),flush=True)\n\
-        \    return out\ncfg=json.loads((root/'config.json').read_text());common=cfg['common'];flags=cfg['flags']\n\nrun(common+flags+['--output',str(logs/'small.avi')],'small',1200)\n"
-    - name: Save small
+        \    return out\ncfg=json.loads((root/'config.json').read_text());common=cfg['common'];flags=cfg['flags'];common[0]=str(root/'sd-cli-before')\n\
+        run(common+flags+['-v','--output',str(logs/'before.avi')],'before',1500)\n"
+    - name: Save before
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: h3-windows-retry-small
+        name: h3-native-ab-before
         path: ${{ runner.temp }}/h3-native/results
         retention-days: 7
-    - name: full
-      shell: python {0}
+    - name: after
+      shell: python3 {0}
       run: "import os, sys, subprocess, pathlib, urllib.request, zipfile, platform, time, json, concurrent.futures\nroot =\
         \ pathlib.Path(os.environ['RUNNER_TEMP']) / 'h3-native'\nroot.mkdir(exist_ok=True)\nos.environ['HF_ENDPOINT'] = 'https://huggingface.co'\n\
         os.environ['HF_HUB_ETAG_TIMEOUT'] = '180'\nos.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '300'\nos.environ['HF_HUB_DISABLE_XET']\
@@ -97,12 +92,12 @@ jobs:
         \        try: rc=p.wait(timeout=timeout)\n        except subprocess.TimeoutExpired: p.kill(); p.wait(); rc='timeout'\n\
         \    out=(logs/(name+'.log')).read_text(errors='replace')\n    print(out[-18000:],flush=True)\n    result={'name':name,'rc':rc,'seconds':round(time.monotonic()-t,2)}\n\
         \    with (logs/'results.jsonl').open('a') as f: f.write(json.dumps(result)+'\\n')\n    print('::notice title='+name+'::'+json.dumps(result),flush=True)\n\
-        \    return out\ncfg=json.loads((root/'config.json').read_text());common=cfg['common'];flags=cfg['flags']\ncommon[common.index('--width')+1]='1344';common[common.index('--height')+1]='768';common[common.index('--video-frames')+1]='124';flags[flags.index('--max-vram')+1]='20'\n\
-        run(common+flags+['--output',str(logs/'full.avi')],'full',1200)\n"
-    - name: Save full
+        \    return out\ncfg=json.loads((root/'config.json').read_text());common=cfg['common'];flags=cfg['flags'];common[0]=str(root/'sd-cli-after')\n\
+        run(common+flags+['-v','--output',str(logs/'after.avi')],'after',1500)\n"
+    - name: Save after
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: h3-windows-retry-full
+        name: h3-native-ab-after
         path: ${{ runner.temp }}/h3-native/results
         retention-days: 7
