@@ -159,14 +159,19 @@ def main() -> int:
             try:
                 with torch.autocast("cuda", dtype = dtype):
                     loss = model(input_ids = ids, labels = ids).loss
-            except StopIteration as e:
-                # torch 2.11 dynamo: StopIteration in dict_keys_getitem while re-entering the compiled
-                # GptOssTopKRouter_forward (seen at step 3 at base and head alike). Recorded, caches reset,
-                # step retried once; the forward raised before any backward / optimizer update.
-                dynamo_retries.append({"step": step, "error": f"{type(e).__name__}: {e}",
+            except (StopIteration, RuntimeError) as e:
+                # torch 2.11 dynamo (ROCm runner): StopIteration in dict_keys_getitem while re-entering the
+                # compiled GptOssTopKRouter_forward at step 3, base and head alike; a fresh trace after
+                # torch._dynamo.reset() then dies in unsloth_zoo.utils.Version ("Could not get version").
+                # The router is untouched by the PR and the expert forward under test is compiler-disabled,
+                # so the step is retried once with dynamo off (eager) for the rest of the cell; recorded.
+                if not isinstance(e, StopIteration) and "Could not get version" not in str(e):
+                    raise
+                dynamo_retries.append({"step": step, "error": f"{type(e).__name__}: {str(e)[:300]}",
                                        "where": traceback.format_exc().strip().splitlines()[-3:]})
                 res["dynamo_reset_retries"] = dynamo_retries
                 torch._dynamo.reset()
+                torch._dynamo.config.disable = True
                 gq.CALLS.update(c_before)
                 loop_calls["n"] = l_before
                 opt.zero_grad(set_to_none = True)
