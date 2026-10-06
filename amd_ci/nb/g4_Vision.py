@@ -142,22 +142,23 @@ def _amd_cg(fn):
         return out
     return wrapper
 
-try:
-    from transformers import TrainerCallback as _AmdTCB
-except Exception:
-    _AmdTCB = object
-class _AmdStepTimer(_AmdTCB):
-    def on_step_begin(self, args, state, control, **kw):
-        import torch as _t
-        _t.cuda.synchronize(); self._t0 = _amd_time.perf_counter()
-    def on_step_end(self, args, state, control, **kw):
-        import torch as _t
-        _t.cuda.synchronize()
-        _AMD["steps"].append(round(_amd_time.perf_counter() - self._t0, 3)); _amd_dump()
-    def on_log(self, args, state, control, logs = None, **kw):
-        if logs and "loss" in logs:
-            _AMD["train"].setdefault("losses", []).append(logs["loss"])
-        _amd_dump()
+def _AmdStepTimer():
+    # Lazy: importing transformers at script start would pin the pre-upgrade transformers in this
+    # process (cell 2 upgrades it in a subprocess), unlike the notebook.
+    from transformers import TrainerCallback
+    class _T(TrainerCallback):
+        def on_step_begin(self, args, state, control, **kw):
+            import torch as _t
+            _t.cuda.synchronize(); self._t0 = _amd_time.perf_counter()
+        def on_step_end(self, args, state, control, **kw):
+            import torch as _t
+            _t.cuda.synchronize()
+            _AMD["steps"].append(round(_amd_time.perf_counter() - self._t0, 3)); _amd_dump()
+        def on_log(self, args, state, control, logs = None, **kw):
+            if logs and "loss" in logs:
+                _AMD["train"].setdefault("losses", []).append(logs["loss"])
+            _amd_dump()
+    return _T()
 
 def _amd_exit():
     try:
