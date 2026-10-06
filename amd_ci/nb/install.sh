@@ -17,4 +17,6 @@ uv pip install -U --force-reinstall \
 uv pip install cut-cross-entropy torchao --no-deps
 uv pip install -U --no-deps "unsloth[amd]==2026.9.14" "unsloth_zoo[amd]==2026.9.9"
 uv pip install --no-deps -r "$(python -c 'import pathlib,site;print(next(p for r in [*site.getsitepackages(),site.getusersitepackages()] if (p:=pathlib.Path(r,"studio/backend/requirements/no-torch-runtime.txt")).exists()))')" torchao
-uv pip install --no-deps -U "tokenizers>=0.22.0,<=0.23.0"
+uv pip install --no-deps -U "tokenizers>=0.22.0,<0.24.0"  # AMD-CI: was <=0.23.0
+# AMD-CI harness: requests (present in any Jupyter kernel)
+uv pip install requests
