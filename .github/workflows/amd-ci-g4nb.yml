@@ -65,15 +65,17 @@ jobs:
           export UV_INSTALL_DIR="$AMD_CI_WORK/uvbin"
           curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >/dev/null
           export PATH="$UV_INSTALL_DIR:$PATH"
-          # The runners' uv index (/etc/uv/uv.toml) is a lagging PyPI mirror; the notebook's
-          # torch line passes its own --index-url, which overrides this default.
-          export UV_DEFAULT_INDEX="https://pypi.org/simple"
+          # The runners' /etc/uv/uv.toml adds a PyPI-mirror index that uv ranks ABOVE the notebook's
+          # --index-url (run 37402692750: triton-rocm resolved to PyPI's cp310-only 3.0.0rc1). A clean
+          # AMD Dev Cloud box has no such config: ignore config files so the notebook's flags hold.
+          cat /etc/uv/uv.toml 2>/dev/null | tee "$AMD_CI_WORK/out/runner_uv_toml.txt" || true
+          export UV_NO_CONFIG=1
           export UV_CACHE_DIR="$AMD_CI_WORK/uvcache"
           uv venv -q --seed --python 3.12 "$AMD_CI_WORK/venv"
           V="$AMD_CI_WORK/venv"
           export VIRTUAL_ENV="$V" PATH="$V/bin:$PATH"
           {
-            echo "UV_DEFAULT_INDEX=$UV_DEFAULT_INDEX"
+            echo "UV_NO_CONFIG=1"
             echo "UV_CACHE_DIR=$UV_CACHE_DIR"
             echo "VIRTUAL_ENV=$V"
             echo "PATH=$V/bin:$UV_INSTALL_DIR:$PATH"
