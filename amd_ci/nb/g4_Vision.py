@@ -30,7 +30,33 @@ def _amd_dump():
     except Exception:
         pass
 
+def _amd_proxy_patch():
+    # Harness, both arms (run 37418984180: TRL SFTTrainer / transformers align_special_tokens write
+    # pad/eos_token_id through get_text_config(), the read-only _Gemma4KVSharedSafeProxy raises).
+    # Same two methods as the open unsloth-zoo PR #1583.
+    import sys as _s
+    if _AMD.get("proxy_patched"):
+        return
+    g4 = _s.modules.get("unsloth_zoo.temporary_patches.gemma4")
+    P = getattr(g4, "_Gemma4KVSharedSafeProxy", None)
+    if P is None:
+        return
+    if "__setattr__" not in P.__dict__:
+        def __setattr__(self, name, value):
+            if name == "_real":
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self._real, name, value)
+        def __delattr__(self, name):
+            delattr(self._real, name)
+        P.__setattr__ = __setattr__
+        P.__delattr__ = __delattr__
+        _AMD["proxy_patched"] = "applied"
+    else:
+        _AMD["proxy_patched"] = "native"
+
 def _amd_cell(k):
+    _amd_proxy_patch()
     _AMD["last_cell"] = k
     _AMD["cells_reached"].append(k)
     _amd_dump()
