@@ -1,4 +1,4 @@
-name: Windows browser parallelism with current Playwright
+name: Full Windows frontend workflow comparison
 'on':
   push:
     branches:
@@ -6,58 +6,131 @@ name: Windows browser parallelism with current Playwright
 permissions:
   contents: read
 jobs:
-  frontend:
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        variant:
-        - serial
-        - parallel
-        rep:
-        - 1
-        - 2
-    timeout-minutes: 45
+  serial:
+    name: Full Windows frontend serial r${{ matrix.rep }}
+    runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
-    env:
-      VARIANT: ${{ matrix.variant }}
-      BENCH_KIND: frontend
-    name: Windows browser gates ${{ matrix.variant }} r${{ matrix.rep }}
-    runs-on: windows-latest
+        working-directory: studio/frontend
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
+        persist-credentials: false
         repository: unslothai/unsloth
         ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
-        persist-credentials: false
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version: '22'
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Audit and install dependencies
-      run: 'python scripts/lockfile_supply_chain_audit.py
+    - name: Lockfile supply-chain audit (pre-install scan)
+      working-directory: ${{ github.workspace }}
+      run: python scripts/lockfile_supply_chain_audit.py
+    - run: npm ci --ignore-scripts --no-fund --no-audit
+    - name: Unit tests
+      run: npm test
+    - name: Install alignment test browsers
+      working-directory: ${{ github.workspace }}
+      timeout-minutes: 5
+      run: 'python -m pip install playwright==1.63.0
 
-        npm ci --prefix studio/frontend --ignore-scripts --no-fund --no-audit
+        python -m playwright install chromium firefox
 
-        python -m pip install playwright==1.63.0 pyyaml
-
-        python -m playwright install chromium firefox'
-    - name: Measure the existing browser gates
-      run: "cat > \"$RUNNER_TEMP/benchmark.py\" <<'PYBENCH'\n\nimport concurrent.futures as cf, json, os, pathlib, shlex, subprocess, time, sys, yaml\nroot=pathlib.Path.cwd()\nout=pathlib.Path(os.environ['RUNNER_TEMP'])/'measurements';out.mkdir(exist_ok=True)\nkind=os.environ['BENCH_KIND'];variant=os.environ['VARIANT']; rows=[]\nif kind=='zoo':\n    doc=yaml.safe_load(pathlib.Path('.github/workflows/consolidated-tests-ci.yml').read_text())\n    steps=doc['jobs']['repo-tests-cpu']['steps']; tasks=[]\n    for step in steps:\n        cmd=step.get('run','')\n        if 'python -m pytest' not in cmd:continue\n        for n,command in enumerate(cmd.replace('\\\\\\n',' ').strip().splitlines()):\n            if not command.strip() or command.lstrip().startswith('#'):continue\n            assert command.startswith('python -m pytest'),command\n            name=f'{len(tasks):02}'\n            args=shlex.split(command)+['--junitxml='+str(out/(name+'.xml')),'--durations=30']\n            tasks.append((name,step.get('name','')+f'\
-        \ [{n}]',args,{}))\nelse:\n    tasks=[('icons','Composer icon alignment',[sys.executable,'tests/studio/playwright_composer_icons.py','chromium','firefox'],{'PW_PORT':'5417'}),\n      ('chromium','Data settings Chromium',[sys.executable,'tests/studio/playwright_data_settings.py'],{'PW_PORT':'5420','PW_ENGINE':'chromium','PW_OUT':'logs/data_settings_report.json'}),\n      ('firefox','Data settings Firefox',[sys.executable,'tests/studio/playwright_data_settings.py'],{'PW_PORT':'5421','PW_ENGINE':'firefox','PW_OUT':'logs/data_settings_firefox_report.json'})]\n    if variant=='parallel':\n        p=pathlib.Path('studio/frontend/vite.config.ts');s=p.read_text();anchor='export default defineConfig({'\n        assert s.count(anchor)==1\n        p.write_text(s.replace(anchor,anchor+'\\n  cacheDir: process.env.VITE_TEST_CACHE_DIR || \"node_modules/.vite\",'))\ndef run(task):\n    name,label,args,extra=task;env=dict(os.environ,**extra)\n    if kind=='frontend' and variant=='parallel':env['VITE_TEST_CACHE_DIR']=str(out/('vite-'+name))\n\
-        \    start=time.time();print('START',name,label,flush=True)\n    with (out/(name+'.log')).open('w') as log:\n        try:rc=subprocess.run(args,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=1200).returncode\n        except subprocess.TimeoutExpired:rc=124\n    row=dict(id=name,label=label,args=args,seconds=time.time()-start,rc=rc)\n    print('RESULT',json.dumps(row),flush=True);return row\nstart=time.time()\nif variant=='serial':rows=[run(t) for t in tasks]\nelse:\n    # The existing heavyweight behavioral invocation runs beside the other invocations.\n    if kind=='zoo':\n        heavy=[t for t in tasks if 'behavioral gates' in t[1]];other=[t for t in tasks if t not in heavy]\n        def lane(ts):return [run(t) for t in ts]\n        with cf.ThreadPoolExecutor(2) as ex:rows=sum(list(ex.map(lane,[heavy,other])),[])\n    else:\n        # Composer is short and stays serial; two independent engines overlap afterwards.\n        rows=[run(tasks[0])]\n        with cf.ThreadPoolExecutor(2)\
-        \ as ex:rows+=list(ex.map(run,tasks[1:]))\nsummary=dict(kind=kind,variant=variant,seconds=time.time()-start,tasks=rows)\n(out/'summary.json').write_text(json.dumps(summary,indent=2));print(json.dumps(summary),flush=True)\nsys.exit(any(r['rc'] for r in rows))\n\nPYBENCH\npython \"$RUNNER_TEMP/benchmark.py\"\n"
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        '
+    - name: Composer icon alignment
+      working-directory: ${{ github.workspace }}
+      timeout-minutes: 3
+      run: python tests/studio/playwright_composer_icons.py chromium firefox
+    - name: Data settings deletion choices in Chromium
+      working-directory: ${{ github.workspace }}
+      run: python tests/studio/playwright_data_settings.py
+    - name: Data settings deletion choices in Firefox
+      working-directory: ${{ github.workspace }}
+      env:
+        PW_ENGINE: firefox
+        PW_OUT: logs/data_settings_firefox_report.json
+      run: python tests/studio/playwright_data_settings.py
+    - name: Upload alignment failure artifacts
       if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: frontend-${{ matrix.variant }}-${{ matrix.rep }}
-        path: '${{ runner.temp }}/measurements
+        name: frontend-exact-serial-${{ matrix.rep }}
+        path: 'logs/playwright-composer-icons
 
           logs/data_settings*
 
-          logs/playwright-composer-icons'
+          '
         retention-days: 1
+        if-no-files-found: ignore
+    strategy:
+      fail-fast: false
+      matrix:
+        rep:
+        - 1
+        - 2
+  parallel:
+    name: Full Windows frontend parallel r${{ matrix.rep }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: studio/frontend
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        repository: unslothai/unsloth
+        ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
+    - name: Apply candidate
+      working-directory: ${{ github.workspace }}
+      run: printf '%s' 'ZGlmZiAtLWdpdCBhLy5naXRodWIvd29ya2Zsb3dzL3N0dWRpby1mcm9udGVuZC1jaS55bWwgYi8uZ2l0aHViL3dvcmtmbG93cy9zdHVkaW8tZnJvbnRlbmQtY2kueW1sCmluZGV4IDI1NGQ3MzZiMWUuLmEwNjBkYzgwNmYgMTAwNjQ0Ci0tLSBhLy5naXRodWIvd29ya2Zsb3dzL3N0dWRpby1mcm9udGVuZC1jaS55bWwKKysrIGIvLmdpdGh1Yi93b3JrZmxvd3Mvc3R1ZGlvLWZyb250ZW5kLWNpLnltbApAQCAtNzAwLDE2ICs3MDAsMjggQEAgam9iczoKICAgICAgICAgdGltZW91dC1taW51dGVzOiAzCiAgICAgICAgIHJ1bjogcHl0aG9uIHRlc3RzL3N0dWRpby9wbGF5d3JpZ2h0X2NvbXBvc2VyX2ljb25zLnB5IGNocm9taXVtIGZpcmVmb3gKIAotICAgICAgLSBuYW1lOiBEYXRhIHNldHRpbmdzIGRlbGV0aW9uIGNob2ljZXMgaW4gQ2hyb21pdW0KKyAgICAgIC0gbmFtZTogRGF0YSBzZXR0aW5ncyBkZWxldGlvbiBjaG9pY2VzIGluIENocm9taXVtIGFuZCBGaXJlZm94CiAgICAgICAgIHdvcmtpbmctZGlyZWN0b3J5OiAke3sgZ2l0aHViLndvcmtzcGFjZSB9fQotICAgICAgICBydW46IHB5dGhvbiB0ZXN0cy9zdHVkaW8vcGxheXdyaWdodF9kYXRhX3NldHRpbmdzLnB5Ci0KLSAgICAgIC0gbmFtZTogRGF0YSBzZXR0aW5ncyBkZWxldGlvbiBjaG9pY2VzIGluIEZpcmVmb3gKLSAgICAgICAgd29ya2luZy1kaXJlY3Rvcnk6ICR7eyBnaXRodWIud29ya3NwYWNlIH19Ci0gICAgICAgIGVudjoKLSAgICAgICAgICBQV19FTkdJTkU6IGZpcmVmb3gKLSAgICAgICAgICBQV19PVVQ6IGxvZ3MvZGF0YV9zZXR0aW5nc19maXJlZm94X3JlcG9ydC5qc29uCi0gICAgICAgIHJ1bjogcHl0aG9uIHRlc3RzL3N0dWRpby9wbGF5d3JpZ2h0X2RhdGFfc2V0dGluZ3MucHkKKyAgICAgICAgcnVuOiB8CisgICAgICAgICAgbWtkaXIgLXAgbG9ncworICAgICAgICAgICMgRWFjaCBkcml2ZXIgb3ducyBpdHMgVml0ZSBzZXJ2ZXIsIG9wdGltaXplciBjYWNoZSBhbmQgcmVwb3J0LgorICAgICAgICAgIFBXX0VOR0lORT1jaHJvbWl1bSBQV19QT1JUPTU0MjAgUFdfT1VUPWxvZ3MvZGF0YV9zZXR0aW5nc19yZXBvcnQuanNvbiBcCisgICAgICAgICAgICBWSVRFX1RFU1RfQ0FDSEVfRElSPSIkUlVOTkVSX1RFTVAvdml0ZS1kYXRhLWNocm9taXVtIiBcCisgICAgICAgICAgICBweXRob24gdGVzdHMvc3R1ZGlvL3BsYXl3cmlnaHRfZGF0YV9zZXR0aW5ncy5weSA+IGxvZ3MvZGF0YV9zZXR0aW5nc19jaHJvbWl1bS5sb2cgMj4mMSAmCisgICAgICAgICAgY2hyb21pdW1fcGlkPSQhCisgICAgICAgICAgUFdfRU5HSU5FPWZpcmVmb3ggUFdfUE9SVD01NDIxIFBXX09VVD1sb2dzL2RhdGFfc2V0dGluZ3NfZmlyZWZveF9yZXBvcnQuanNvbiBcCisgICAgICAgICAgICBWSVRFX1RFU1RfQ0FDSEVfRElSPSIkUlVOTkVSX1RFTVAvdml0ZS1kYXRhLWZpcmVmb3giIFwKKyAgICAgICAgICAgIHB5dGhvbiB0ZXN0cy9zdHVkaW8vcGxheXdyaWdodF9kYXRhX3NldHRpbmdzLnB5ID4gbG9ncy9kYXRhX3NldHRpbmdzX2ZpcmVmb3gubG9nIDI+JjEgJgorICAgICAgICAgIGZpcmVmb3hfcGlkPSQhCisgICAgICAgICAgZmFpbGVkPTAKKyAgICAgICAgICB3YWl0ICIkY2hyb21pdW1fcGlkIiB8fCBmYWlsZWQ9MQorICAgICAgICAgIHdhaXQgIiRmaXJlZm94X3BpZCIgfHwgZmFpbGVkPTEKKyAgICAgICAgICBmb3IgZW5naW5lIGluIGNocm9taXVtIGZpcmVmb3g7IGRvCisgICAgICAgICAgICBlY2hvICI6Omdyb3VwOjpEYXRhIHNldHRpbmdzOiAkZW5naW5lIgorICAgICAgICAgICAgY2F0ICJsb2dzL2RhdGFfc2V0dGluZ3NfJGVuZ2luZS5sb2ciIHx8IGZhaWxlZD0xCisgICAgICAgICAgICBlY2hvICI6OmVuZGdyb3VwOjoiCisgICAgICAgICAgZG9uZQorICAgICAgICAgIGV4aXQgIiRmYWlsZWQiCiAKICAgICAgIC0gbmFtZTogVXBsb2FkIGFsaWdubWVudCBmYWlsdXJlIGFydGlmYWN0cwogICAgICAgICBpZjogZmFpbHVyZSgpCmRpZmYgLS1naXQgYS9zdHVkaW8vZnJvbnRlbmQvdml0ZS5jb25maWcudHMgYi9zdHVkaW8vZnJvbnRlbmQvdml0ZS5jb25maWcudHMKaW5kZXggMGIyNDc3Nzk1OC4uMmE2MWYwNjk2OCAxMDA2NDQKLS0tIGEvc3R1ZGlvL2Zyb250ZW5kL3ZpdGUuY29uZmlnLnRzCisrKyBiL3N0dWRpby9mcm9udGVuZC92aXRlLmNvbmZpZy50cwpAQCAtMjYsNiArMjYsOCBAQCBmdW5jdGlvbiBzbW9rZU1vZHVsZURlbGF5KCk6IFBsdWdpbiB7CiAKIC8vIGh0dHBzOi8vdml0ZS5kZXYvY29uZmlnLwogZXhwb3J0IGRlZmF1bHQgZGVmaW5lQ29uZmlnKHsKKyAgLy8gQ29uY3VycmVudCBicm93c2VyIGNoZWNrcyB1c2Ugc2VwYXJhdGUgZGVwZW5kZW5jeSBvcHRpbWl6ZXIgY2FjaGVzLgorICBjYWNoZURpcjogcHJvY2Vzcy5lbnYuVklURV9URVNUX0NBQ0hFX0RJUiB8fCAibm9kZV9tb2R1bGVzLy52aXRlIiwKICAgLy8gUmVhc29uaW5nJ3MgaGlnaGxpZ2h0ZXIgbG9hZHMgb25seSB0aGUgZ3JhbW1hciBpdCBuZWVkcyBpbiBpdHMgbW9kdWxlIHdvcmtlci4KICAgd29ya2VyOiB7IGZvcm1hdDogImVzIiB9LAogICBwbHVnaW5zOiBbcmVhY3QoKSwgdGFpbHdpbmRjc3MoKSwgc21va2VNb2R1bGVEZWxheSgpXSwKZGlmZiAtLWdpdCBhL3Rlc3RzL3N0dWRpby90ZXN0X2NpX3BhcmFsbGVsX2Jyb3dzZXJfcmVzdWx0cy5weSBiL3Rlc3RzL3N0dWRpby90ZXN0X2NpX3BhcmFsbGVsX2Jyb3dzZXJfcmVzdWx0cy5weQpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwMDAwLi44YTM3N2ZhNjgyCi0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvc3R1ZGlvL3Rlc3RfY2lfcGFyYWxsZWxfYnJvd3Nlcl9yZXN1bHRzLnB5CkBAIC0wLDAgKzEsNTMgQEAKKyMgU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEFHUEwtMy4wLW9ubHkKKyMgQ29weXJpZ2h0IDIwMjYtcHJlc2VudCB0aGUgVW5zbG90aCBBSSBJbmMuIHRlYW0uIEFsbCByaWdodHMgcmVzZXJ2ZWQuIFNlZSAvc3R1ZGlvL0xJQ0VOU0UuQUdQTC0zLjAKKworIiIiVGhlIGJyb3dzZXIgcGFpciBtdXN0IHJlcG9ydCBib3RoIGVuZ2luZXMgYW5kIGZhaWwgaWYgZWl0aGVyIGNoaWxkIGZhaWxzLiIiIgorCitpbXBvcnQgb3MKK2Zyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoraW1wb3J0IHNodXRpbAoraW1wb3J0IHN1YnByb2Nlc3MKKworaW1wb3J0IHB5dGVzdAoraW1wb3J0IHlhbWwKKworCitXT1JLRkxPVyA9IFBhdGgoX19maWxlX18pLnJlc29sdmUoKS5wYXJlbnRzWzJdIC8gIi5naXRodWIvd29ya2Zsb3dzL3N0dWRpby1mcm9udGVuZC1jaS55bWwiCitweXRlc3RtYXJrID0gcHl0ZXN0Lm1hcmsuc2tpcGlmKG5vdCBzaHV0aWwud2hpY2goImJhc2giKSwgcmVhc29uID0gInJlcXVpcmVzIGJhc2giKQorCisKK0BweXRlc3QubWFyay5wYXJhbWV0cml6ZSgiZmFpbGluZyIsIFsiIiwgImNocm9taXVtIiwgImZpcmVmb3giXSkKK2RlZiB0ZXN0X2Jyb3dzZXJfY2hpbGRyZW5fYXJlX2lzb2xhdGVkX2FuZF9ib3RoX3Jlc3VsdHNfZ2F0ZSh0bXBfcGF0aCwgZmFpbGluZyk6CisgICAgc3RlcHMgPSB5YW1sLnNhZmVfbG9hZChXT1JLRkxPVy5yZWFkX3RleHQoKSlbImpvYnMiXVsid2luZG93cyJdWyJzdGVwcyJdCisgICAgc2NyaXB0ID0gbmV4dCgKKyAgICAgICAgc1sicnVuIl0KKyAgICAgICAgZm9yIHMgaW4gc3RlcHMKKyAgICAgICAgaWYgcy5nZXQoIm5hbWUiKSA9PSAiRGF0YSBzZXR0aW5ncyBkZWxldGlvbiBjaG9pY2VzIGluIENocm9taXVtIGFuZCBGaXJlZm94IgorICAgICkKKyAgICBzdHViID0gciIiIgorcHl0aG9uKCkgeworICBwcmludGYgJyVzICVzICVzICVzXG4nICIkUFdfRU5HSU5FIiAiJFBXX1BPUlQiICIkUFdfT1VUIiAiJFZJVEVfVEVTVF9DQUNIRV9ESVIiCisgIHRvdWNoICIkUFdfRU5HSU5FLnJlYWR5IgorICBmb3IgYXR0ZW1wdCBpbiAkKHNlcSAxIDEwMCk7IGRvCisgICAgWyAtZSBjaHJvbWl1bS5yZWFkeSBdICYmIFsgLWUgZmlyZWZveC5yZWFkeSBdICYmIGJyZWFrCisgICAgc2xlZXAgMC4wMgorICBkb25lCisgIFsgLWUgY2hyb21pdW0ucmVhZHkgXSAmJiBbIC1lIGZpcmVmb3gucmVhZHkgXSB8fCByZXR1cm4gOQorICBbICIkUFdfRU5HSU5FIiAhPSAiJEZBSUxfRU5HSU5FIiBdIHx8IHJldHVybiA3Cit9CisiIiIKKyAgICByZXN1bHQgPSBzdWJwcm9jZXNzLnJ1bigKKyAgICAgICAgWyJiYXNoIiwgIi1lIiwgIi1vIiwgInBpcGVmYWlsIiwgIi1jIiwgc3R1YiArIHNjcmlwdF0sCisgICAgICAgIGN3ZCA9IHRtcF9wYXRoLAorICAgICAgICBlbnYgPSB7Kipvcy5lbnZpcm9uLCAiUlVOTkVSX1RFTVAiOiBzdHIodG1wX3BhdGgpLCAiRkFJTF9FTkdJTkUiOiBmYWlsaW5nfSwKKyAgICAgICAgdGV4dCA9IFRydWUsCisgICAgICAgIGNhcHR1cmVfb3V0cHV0ID0gVHJ1ZSwKKyAgICAgICAgdGltZW91dCA9IDE1LAorICAgICkKKyAgICBhc3NlcnQgcmVzdWx0LnJldHVybmNvZGUgPT0gYm9vbChmYWlsaW5nKSwgcmVzdWx0LnN0ZG91dCArIHJlc3VsdC5zdGRlcnIKKyAgICBhc3NlcnQgImNocm9taXVtIDU0MjAgbG9ncy9kYXRhX3NldHRpbmdzX3JlcG9ydC5qc29uIiBpbiByZXN1bHQuc3Rkb3V0CisgICAgYXNzZXJ0ICJmaXJlZm94IDU0MjEgbG9ncy9kYXRhX3NldHRpbmdzX2ZpcmVmb3hfcmVwb3J0Lmpzb24iIGluIHJlc3VsdC5zdGRvdXQKKyAgICBhc3NlcnQgZiJ7dG1wX3BhdGh9L3ZpdGUtZGF0YS1jaHJvbWl1bSIgaW4gcmVzdWx0LnN0ZG91dAorICAgIGFzc2VydCBmInt0bXBfcGF0aH0vdml0ZS1kYXRhLWZpcmVmb3giIGluIHJlc3VsdC5zdGRvdXQKKyAgICBhc3NlcnQgKHRtcF9wYXRoIC8gImNocm9taXVtLnJlYWR5IikuZXhpc3RzKCkKKyAgICBhc3NlcnQgKHRtcF9wYXRoIC8gImZpcmVmb3gucmVhZHkiKS5leGlzdHMoKQo='
+        | base64 --decode | git apply
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: '22'
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Lockfile supply-chain audit (pre-install scan)
+      working-directory: ${{ github.workspace }}
+      run: python scripts/lockfile_supply_chain_audit.py
+    - run: npm ci --ignore-scripts --no-fund --no-audit
+    - name: Unit tests
+      run: npm test
+    - name: Install alignment test browsers
+      working-directory: ${{ github.workspace }}
+      timeout-minutes: 5
+      run: 'python -m pip install playwright==1.63.0
+
+        python -m playwright install chromium firefox
+
+        '
+    - name: Composer icon alignment
+      working-directory: ${{ github.workspace }}
+      timeout-minutes: 3
+      run: python tests/studio/playwright_composer_icons.py chromium firefox
+    - name: Data settings deletion choices in Chromium and Firefox
+      working-directory: ${{ github.workspace }}
+      run: "mkdir -p logs\n# Each driver owns its Vite server, optimizer cache and report.\nPW_ENGINE=chromium PW_PORT=5420 PW_OUT=logs/data_settings_report.json \\\n  VITE_TEST_CACHE_DIR=\"$RUNNER_TEMP/vite-data-chromium\" \\\n  python tests/studio/playwright_data_settings.py > logs/data_settings_chromium.log 2>&1 &\nchromium_pid=$!\nPW_ENGINE=firefox PW_PORT=5421 PW_OUT=logs/data_settings_firefox_report.json \\\n  VITE_TEST_CACHE_DIR=\"$RUNNER_TEMP/vite-data-firefox\" \\\n  python tests/studio/playwright_data_settings.py > logs/data_settings_firefox.log 2>&1 &\nfirefox_pid=$!\nfailed=0\nwait \"$chromium_pid\" || failed=1\nwait \"$firefox_pid\" || failed=1\nfor engine in chromium firefox; do\n  echo \"::group::Data settings: $engine\"\n  cat \"logs/data_settings_$engine.log\" || failed=1\n  echo \"::endgroup::\"\ndone\nexit \"$failed\"\n"
+    - name: Upload alignment failure artifacts
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: frontend-exact-parallel-${{ matrix.rep }}
+        path: 'logs/playwright-composer-icons
+
+          logs/data_settings*
+
+          '
+        retention-days: 1
+        if-no-files-found: ignore
+    strategy:
+      fail-fast: false
+      matrix:
+        rep:
+        - 1
+        - 2
