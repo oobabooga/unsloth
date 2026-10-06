@@ -22,7 +22,8 @@ jobs:
       - name: Clone upstream at main
         shell: pwsh
         run: |
-          git clone --filter=blob:none https://github.com/unslothai/unsloth.git repo
+          git -c core.autocrlf=false clone --filter=blob:none https://github.com/unslothai/unsloth.git repo
+          git -C repo config core.autocrlf false
           git -C repo checkout --quiet $env:BASE_SHA
           git -C repo apply --check "$env:GITHUB_WORKSPACE/ci/fix.patch"
 
