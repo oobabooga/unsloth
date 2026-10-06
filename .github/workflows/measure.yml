@@ -1,4 +1,4 @@
-name: Exact shell workflow comparison
+name: Four pytest workers with bounded native threads
 'on':
   push:
     branches:
@@ -6,58 +6,164 @@ name: Exact shell workflow comparison
 permissions:
   contents: read
 jobs:
-  serial:
-    name: Exact shell serial r${{ matrix.rep }}
+  default:
+    name: default / ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - shard: studio-install
+          selection: tests/studio/install tests/studio/studiobench
+        - shard: studio
+          selection: tests/studio tests/python --ignore=tests/studio/install --ignore=tests/studio/studiobench --ignore=tests/studio/load_freeze --ignore=tests/studio/test_hardware_dispatch_matrix.py --ignore=tests/studio/test_is_mlx_dispatch_gate.py --ignore=tests/studio/test_xpu_spoof_pipeline.py --ignore=tests/studio/test_mlx_context_platform_matrix.py
+        - shard: rest
+          selection: tests/ --ignore=tests/studio --ignore=tests/python --ignore=tests/qlora --ignore=tests/saving --ignore=tests/utils --ignore=tests/sh --ignore=tests/vllm_compat --ignore=tests/version_compat --deselect tests/test_model_registry.py::test_model_registration --deselect tests/test_model_registry.py::test_all_model_registration
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
         repository: unslothai/unsloth
         ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
+    - name: Prepare measurements
+      run: 'mkdir -p "$RUNNER_TEMP/results"
+
+        lscpu
+
+        free -h'
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Shell installer tests
-      run: "mkdir -p \"$RUNNER_TEMP/exact\"\ncat > \"$RUNNER_TEMP/exact/run.sh\" <<'SUITES'\nset -e\nskip=\"test_install_rollback_lifecycle.sh\"\nfound=0\nfor s in tests/sh/test_*.sh; do\n    case \" $skip \" in\n        *\" $(basename \"$s\") \"*) echo \"skipping $s (see workflow comment)\"; continue ;;\n    esac\n    found=$((found + 1))\n    echo \"::group::$s\"\n    bash \"$s\"\n    echo \"::endgroup::\"\ndone\n[ \"$found\" -gt 0 ] || { echo \"::error::no shell tests discovered under tests/sh\"; exit 1; }\necho \"ran $found shell installer test files\"\nSUITES\nset -o pipefail\n/usr/bin/time -p bash \"$RUNNER_TEMP/exact/run.sh\" 2>&1 | tee \"$RUNNER_TEMP/exact/results.log\"\n"
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: '22'
+    - name: Install uv (for tests/python/* sandboxed venvs)
+      run: pip install uv
+    - name: Install deps (shared shape with backend pytest job)
+      run: "python -m pip install --upgrade pip\npip install -r studio/backend/requirements/studio.txt\npip install \\\n  python-multipart aiofiles sqlalchemy cryptography psutil \\\n  pyyaml jinja2 mammoth unpdf requests typer \\\n  'numpy<3' pytest pytest-asyncio pytest-xdist pytest-timeout httpx\n# pytest-timeout: the --timeout flag on the pytest step below. Same reason as the\n# backend pytest job -- without it a test that never returns is reported as the\n# job being \"cancelled\", naming nothing.\n# torchvision: unsloth_zoo.vision_utils imports it at module scope.\npip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \\\n  'torch>=2.4,<2.11' 'torchvision<0.26' 'torchaudio<2.11'\n# Tracks pyproject.toml's cap. sentence-transformers rides the transformers pin rather than a separate install, so\n# resolving it cannot bump transformers past the ceiling. It is an extra, not a core\n# dependency, and tests/test_st_modules_json_trust_gate.py\
+        \ skips without it, so\n# installing it here is what makes that gate run in this shard instead of skipping.\n# version-compat-ci's zoo-imports job runs the same file against the pinned\n# transformers matrix; this shard adds the core dependency set, where discovery\n# picks the file up and the importorskip would otherwise skip it for good.\npip install 'transformers>=4.51,<=5.17.0' sentence-transformers\n# bitsandbytes: hard import in unsloth/models/_utils.py. Recent\n# versions ship a CPU build that imports cleanly on Linux.\npip install 'bitsandbytes>=0.45'\n# zoo from git main (needed by the conftest preload), with deps so triton is installed.\nfor attempt in 1 2 3; do\n  if pip install \"unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@ea59995addd5ddbe5d6cedc32d6deb51eebbac1e\"; then\n    break\n  fi\n  [ \"$attempt\" -eq 3 ] && { echo \"::error::unsloth_zoo install failed after 3 attempts\"; exit 1; }\n  sleep $((5 * attempt))\ndone\npip install -e . --no-deps\n"
+    - name: Install the pinned ruff (formatter fixed-point guard)
+      run: "pin=\"$(python -c 'import sys; sys.path.insert(0, \"scripts\"); import run_ruff_format as r; print(r.pinned_ruff_version(r.CONFIG.read_text(encoding = \"utf-8\")) or \"\")')\"\nif [ -z \"$pin\" ]; then\n  echo \"::error::.pre-commit-config.yaml no longer pins a ruff for ruff-format-with-kwargs\"\n  exit 1\nfi\npip install \"ruff==$pin\"\n"
+    - name: Repo tests (CPU, auto-discovered)
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+      run: "timeout --signal=INT --kill-after=60 2100 \\\npython -m pytest ${{ matrix.selection }} -q --tb=short -n 4 --dist loadgroup --timeout=330 \\\n  -m 'not server and not e2e' --junitxml=\"$RUNNER_TEMP/results/6.xml\" --durations=30\n"
+    - name: Hardware-spoof tests (state-sensitive, run in isolation)
+      if: matrix.shard == 'studio'
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+      run: "python -m pytest -q --tb=short \\\n  tests/studio/test_hardware_dispatch_matrix.py \\\n  tests/studio/test_is_mlx_dispatch_gate.py \\\n  tests/studio/test_xpu_spoof_pipeline.py \\\n  tests/studio/test_mlx_context_platform_matrix.py --junitxml=\"$RUNNER_TEMP/results/7.xml\" --durations=30\n"
+    - name: Event-loop latency tests (wall clock, run without CPU contention)
+      if: matrix.shard == 'studio'
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+      run: 'python -m pytest tests/studio/load_freeze -q --tb=short --junitxml="$RUNNER_TEMP/results/8.xml" --durations=30
+
+        '
+    - name: CLI tests (unsloth_cli)
+      if: matrix.shard == 'rest'
+      run: 'python -m pytest unsloth_cli/tests -q --tb=short --junitxml="$RUNNER_TEMP/results/9.xml" --durations=30
+
+        '
+    - name: Docker JupyterLab/notebook feature validation
+      if: matrix.shard == 'rest'
+      run: python tests/validate_studio_features.py
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: always()
       with:
-        name: exact-serial-${{ matrix.rep }}
-        path: ${{ runner.temp }}/exact
+        name: default-${{ matrix.shard }}
+        path: ${{ runner.temp }}/results
         retention-days: 1
+  one-native-thread:
+    name: one-native-thread / ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        rep:
-        - 1
-        - 2
-  parallel:
-    name: Exact shell parallel r${{ matrix.rep }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+        include:
+        - shard: studio-install
+          selection: tests/studio/install tests/studio/studiobench
+        - shard: studio
+          selection: tests/studio tests/python --ignore=tests/studio/install --ignore=tests/studio/studiobench --ignore=tests/studio/load_freeze --ignore=tests/studio/test_hardware_dispatch_matrix.py --ignore=tests/studio/test_is_mlx_dispatch_gate.py --ignore=tests/studio/test_xpu_spoof_pipeline.py --ignore=tests/studio/test_mlx_context_platform_matrix.py
+        - shard: rest
+          selection: tests/ --ignore=tests/studio --ignore=tests/python --ignore=tests/qlora --ignore=tests/saving --ignore=tests/utils --ignore=tests/sh --ignore=tests/vllm_compat --ignore=tests/version_compat --deselect tests/test_model_registry.py::test_model_registration --deselect tests/test_model_registry.py::test_all_model_registration
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
         repository: unslothai/unsloth
         ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
+    - name: Prepare measurements
+      run: 'mkdir -p "$RUNNER_TEMP/results"
+
+        lscpu
+
+        free -h'
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Shell installer tests
-      run: "mkdir -p \"$RUNNER_TEMP/exact\"\ncat > \"$RUNNER_TEMP/exact/run.sh\" <<'SUITES'\nset -euo pipefail\nshopt -s nullglob\nskip=\"test_install_rollback_lifecycle.sh\"\nsuites=()\nfor s in tests/sh/test_*.sh; do\n    case \" $skip \" in\n        *\" $(basename \"$s\") \"*) echo \"skipping $s (see workflow comment)\"; continue ;;\n    esac\n    suites+=(\"$s\")\ndone\nfound=${#suites[@]}\n[ \"$found\" -gt 0 ] || { echo \"::error::no shell tests discovered under tests/sh\"; exit 1; }\nexport suite_logs\nsuite_logs=$(mktemp -d \"$RUNNER_TEMP/shell-suites.XXXXXX\")\n# Each suite already owns its fixtures. Keep its output and exit status\n# separate, then collect every result even when another suite fails.\nfailed=0\nprintf '%s\\0' \"${suites[@]}\" | xargs -0 -P 4 -n 1 bash -c '\n    s=$1\n    name=${s##*/}\n    echo \"Starting $s\"\n    rc=0\n    timeout --signal=TERM --kill-after=10s 480s bash \"$s\" > \"$suite_logs/$name.log\" 2>&1 || rc=$?\n    printf \"%s\\n\" \"$rc\" > \"$suite_logs/$name.status\"\
-        \n    echo \"Finished $s (exit $rc)\"\n' _ || failed=1\nfor s in \"${suites[@]}\"; do\n    name=${s##*/}\n    echo \"::group::$s\"\n    cat \"$suite_logs/$name.log\" || failed=1\n    rc=$(cat \"$suite_logs/$name.status\" 2>/dev/null) || rc=1\n    if [ \"$rc\" != 0 ]; then\n        echo \"::error::$s exited $rc (124 means the suite timed out)\"\n        failed=1\n    fi\n    echo \"::endgroup::\"\ndone\necho \"ran $found shell installer test files\"\nexit \"$failed\"\nSUITES\nset -o pipefail\n/usr/bin/time -p bash \"$RUNNER_TEMP/exact/run.sh\" 2>&1 | tee \"$RUNNER_TEMP/exact/results.log\"\n"
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: '22'
+    - name: Install uv (for tests/python/* sandboxed venvs)
+      run: pip install uv
+    - name: Install deps (shared shape with backend pytest job)
+      run: "python -m pip install --upgrade pip\npip install -r studio/backend/requirements/studio.txt\npip install \\\n  python-multipart aiofiles sqlalchemy cryptography psutil \\\n  pyyaml jinja2 mammoth unpdf requests typer \\\n  'numpy<3' pytest pytest-asyncio pytest-xdist pytest-timeout httpx\n# pytest-timeout: the --timeout flag on the pytest step below. Same reason as the\n# backend pytest job -- without it a test that never returns is reported as the\n# job being \"cancelled\", naming nothing.\n# torchvision: unsloth_zoo.vision_utils imports it at module scope.\npip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \\\n  'torch>=2.4,<2.11' 'torchvision<0.26' 'torchaudio<2.11'\n# Tracks pyproject.toml's cap. sentence-transformers rides the transformers pin rather than a separate install, so\n# resolving it cannot bump transformers past the ceiling. It is an extra, not a core\n# dependency, and tests/test_st_modules_json_trust_gate.py\
+        \ skips without it, so\n# installing it here is what makes that gate run in this shard instead of skipping.\n# version-compat-ci's zoo-imports job runs the same file against the pinned\n# transformers matrix; this shard adds the core dependency set, where discovery\n# picks the file up and the importorskip would otherwise skip it for good.\npip install 'transformers>=4.51,<=5.17.0' sentence-transformers\n# bitsandbytes: hard import in unsloth/models/_utils.py. Recent\n# versions ship a CPU build that imports cleanly on Linux.\npip install 'bitsandbytes>=0.45'\n# zoo from git main (needed by the conftest preload), with deps so triton is installed.\nfor attempt in 1 2 3; do\n  if pip install \"unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@ea59995addd5ddbe5d6cedc32d6deb51eebbac1e\"; then\n    break\n  fi\n  [ \"$attempt\" -eq 3 ] && { echo \"::error::unsloth_zoo install failed after 3 attempts\"; exit 1; }\n  sleep $((5 * attempt))\ndone\npip install -e . --no-deps\n"
+    - name: Install the pinned ruff (formatter fixed-point guard)
+      run: "pin=\"$(python -c 'import sys; sys.path.insert(0, \"scripts\"); import run_ruff_format as r; print(r.pinned_ruff_version(r.CONFIG.read_text(encoding = \"utf-8\")) or \"\")')\"\nif [ -z \"$pin\" ]; then\n  echo \"::error::.pre-commit-config.yaml no longer pins a ruff for ruff-format-with-kwargs\"\n  exit 1\nfi\npip install \"ruff==$pin\"\n"
+    - name: Repo tests (CPU, auto-discovered)
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+        OMP_NUM_THREADS: '1'
+        MKL_NUM_THREADS: '1'
+        OPENBLAS_NUM_THREADS: '1'
+        NUMEXPR_NUM_THREADS: '1'
+      run: "timeout --signal=INT --kill-after=60 2100 \\\npython -m pytest ${{ matrix.selection }} -q --tb=short -n 4 --dist loadgroup --timeout=330 \\\n  -m 'not server and not e2e' --junitxml=\"$RUNNER_TEMP/results/6.xml\" --durations=30\n"
+    - name: Hardware-spoof tests (state-sensitive, run in isolation)
+      if: matrix.shard == 'studio'
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+        OMP_NUM_THREADS: '1'
+        MKL_NUM_THREADS: '1'
+        OPENBLAS_NUM_THREADS: '1'
+        NUMEXPR_NUM_THREADS: '1'
+      run: "python -m pytest -q --tb=short \\\n  tests/studio/test_hardware_dispatch_matrix.py \\\n  tests/studio/test_is_mlx_dispatch_gate.py \\\n  tests/studio/test_xpu_spoof_pipeline.py \\\n  tests/studio/test_mlx_context_platform_matrix.py --junitxml=\"$RUNNER_TEMP/results/7.xml\" --durations=30\n"
+    - name: Event-loop latency tests (wall clock, run without CPU contention)
+      if: matrix.shard == 'studio'
+      env:
+        PYTHONPATH: ${{ github.workspace }}/studio
+        UNSLOTH_COMPILE_DISABLE: '1'
+        OMP_NUM_THREADS: '1'
+        MKL_NUM_THREADS: '1'
+        OPENBLAS_NUM_THREADS: '1'
+        NUMEXPR_NUM_THREADS: '1'
+      run: 'python -m pytest tests/studio/load_freeze -q --tb=short --junitxml="$RUNNER_TEMP/results/8.xml" --durations=30
+
+        '
+    - name: CLI tests (unsloth_cli)
+      if: matrix.shard == 'rest'
+      run: 'python -m pytest unsloth_cli/tests -q --tb=short --junitxml="$RUNNER_TEMP/results/9.xml" --durations=30
+
+        '
+      env:
+        OMP_NUM_THREADS: '1'
+        MKL_NUM_THREADS: '1'
+        OPENBLAS_NUM_THREADS: '1'
+        NUMEXPR_NUM_THREADS: '1'
+    - name: Docker JupyterLab/notebook feature validation
+      if: matrix.shard == 'rest'
+      run: python tests/validate_studio_features.py
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: always()
       with:
-        name: exact-parallel-${{ matrix.rep }}
-        path: ${{ runner.temp }}/exact
+        name: one-native-thread-${{ matrix.shard }}
+        path: ${{ runner.temp }}/results
         retention-days: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        rep:
-        - 1
-        - 2
