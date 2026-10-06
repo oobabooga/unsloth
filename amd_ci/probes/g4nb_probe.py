@@ -61,6 +61,12 @@ def run_nb(tag: str, state: str, python: str, root: Path, out_dir: Path, timeout
     env = dict(os.environ)
     env.update(AMD_NB_OUT = str(obs_path), UNSLOTH_COMPILE_LOCATION = str(wd / "unsloth_compiled_cache"),
                PYTHONUNBUFFERED = "1")
+    # GitHub Actions sets CI=true, and torch defaults functorch error_on_custom_op_aliasing to
+    # bool(os.getenv("CI")): the first-call aliasing analyzer then RAISES on inductor's own
+    # inductor::_alloc_from_pool (runs 37408657305 / 37410230820, both arms, first generate) where a
+    # user's machine only warns. Run the notebooks as a user would.
+    env.pop("CI", None)
+    env["TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING"] = "0"
     for k in ("UNSLOTH_MOE_ROUTED_KERNEL", "UNSLOTH_MOE_ROUTED_FUSED", "UNSLOTH_MOE_BACKEND", "UNSLOTH_COMPILE_DISABLE"):
         env.pop(k, None)
     t0 = time.time()

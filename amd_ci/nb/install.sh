@@ -12,7 +12,7 @@ esac
 pip install bitsandbytes
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${T}"
 uv pip install -U --force-reinstall \
-    "torch==2.12.1" "torchvision==0.27.1" torchaudio triton-rocm \
+    torch torchvision torchaudio triton-rocm \
     --index-url "$PYTORCH_INDEX_URL"
 uv pip install cut-cross-entropy torchao --no-deps
 uv pip install -U --no-deps "unsloth[amd]==2026.9.14" "unsloth_zoo[amd]==2026.9.9"
