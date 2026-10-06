@@ -16,13 +16,15 @@ permissions:
 env:
   HEAD_UNSLOTH_SHA: "61afc99cd54a5650990cfc3e38f55451373519b0"
   HEAD_ZOO_SHA: "58d20ca844481e01face5264c82c7d5a4f04811f"
+  # unsloth-zoo PR 1583 head (= 58d20ca8 + proxy setattr fix); third arm, unsloth stays at HEAD_UNSLOTH_SHA.
+  FIX_ZOO_SHA: "53d1e33f2a9febc7be2c2f3798f984f403e0cf11"
 
 jobs:
 
   gpu:
     name: "Gemma-4 26B-A4B notebooks GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 360
+    timeout-minutes: 420
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -45,14 +47,15 @@ jobs:
       - name: States
         run: |
           set -euo pipefail
-          mkdir -p "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head"
+          mkdir -p "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head" "$AMD_CI_WORK/states/after_fix"
           python3 - "$AMD_CI_WORK" <<'PY'
           import json, os, sys
           w = sys.argv[1]
           doc = {"pr": 0, "merged": False,
                  "commits": {"base": "pypi-unsloth-2026.9.14+zoo-2026.9.9",
-                             "head": "unsloth@" + os.environ["HEAD_UNSLOTH_SHA"][:9] + "+zoo@" + os.environ["HEAD_ZOO_SHA"][:8]},
-                 "paths": {"base": w + "/states/base", "head": w + "/states/head"}}
+                             "head": "unsloth@" + os.environ["HEAD_UNSLOTH_SHA"][:9] + "+zoo@" + os.environ["HEAD_ZOO_SHA"][:8],
+                             "after_fix": "unsloth@" + os.environ["HEAD_UNSLOTH_SHA"][:9] + "+zoo@" + os.environ["FIX_ZOO_SHA"][:8]},
+                 "paths": {"base": w + "/states/base", "head": w + "/states/head", "after_fix": w + "/states/after_fix"}}
           open(w + "/out/states.json", "w", encoding="utf-8").write(json.dumps(doc, indent=2))
           PY
           cat "$AMD_CI_WORK/out/states.json"

@@ -55,6 +55,14 @@ def gates(obs):
         out.append((f"{tag} passed in at least one arm", _nb(b, tag).get("passed") or _nb(h, tag).get("passed"),
                     f"base passed={_nb(b, tag).get('passed')} (cell {_nb(b, tag).get('failing_cell')}), "
                     f"head passed={_nb(h, tag).get('passed')} (cell {_nb(h, tag).get('failing_cell')})"))
+    f = obs.get("after_fix")
+    if f is not None:
+        fi = f.get("head_install") or {}
+        for tag in TAGS:
+            n = _nb(f, tag)
+            out.append((f"{tag} after_fix: zoo PR 1583 installed, proxy fix native (harness patch NOT applied), moe_routed present",
+                        fi.get("rc") == 0 and n.get("proxy_patched") == "native" and (n.get("census") or {}).get("module_present") is True,
+                        f"install rc={fi.get('rc')}, proxy={n.get('proxy_patched')}, moe_routed={(n.get('census') or {}).get('module_present')}"))
     return out
 
 
@@ -78,8 +86,10 @@ def table(obs):
             "|" + "---|" * 10]
     vers = {}
     for tag in TAGS:
-        for arm in ("base", "head"):
+        for arm in ("base", "head", "after_fix"):
             n = _nb(obs.get(arm), tag)
+            if not n:
+                continue
             c = (n.get("census") or {})
             g, o = c.get("generate") or {}, c.get("other") or {}
             vers.setdefault(arm, n.get("versions"))
@@ -89,11 +99,12 @@ def table(obs):
                         f"| {g.get('calls')}/{g.get('returned')}/{g.get('declined')}, {g.get('nf4_routed')}/{g.get('bf16_moe')} "
                         f"| {g.get('decline_reasons')} | {o.get('calls')}/{o.get('returned')}/{o.get('declined')} {o.get('decline_reasons')} "
                         f"| {[round(x, 3) for x in (n.get('train') or {}).get('losses', [])]} |")
+            rows[-1] += f" proxy={n.get('proxy_patched')}"
     for arm, v in vers.items():
         if v:
             rows.append(f"\n{arm} versions: " + ", ".join(f"{k}={v[k]}" for k in ("torch", "hip", "arch", "device", "rocm_info", "bitsandbytes", "bnb_lib",
                                                                                    "transformers", "trl", "peft", "unsloth", "unsloth_zoo", "triton") if k in v))
-    for arm in ("base", "head"):
+    for arm in ("base", "head", "after_fix"):
         for tag in TAGS:
             n = _nb(obs.get(arm), tag)
             if n and not n.get("passed"):

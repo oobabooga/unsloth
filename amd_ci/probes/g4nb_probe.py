@@ -53,6 +53,15 @@ def head_install(python: str, out_dir: Path) -> dict:
     return {"cmd": " ".join(cmd), "rc": p.returncode, "tail": (p.stderr or "")[-1500:]}
 
 
+def fix_install(python: str, out_dir: Path) -> dict:
+    zs = os.environ["FIX_ZOO_SHA"]
+    cmd = ["uv", "pip", "install", "--python", python, "--no-deps", "--force-reinstall", "--no-cache",
+           f"unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@{zs}"]
+    p = subprocess.run(cmd, capture_output = True, text = True)
+    (out_dir / "after_fix_install.log").write_text((p.stdout or "") + "\n--- stderr ---\n" + (p.stderr or ""), encoding = "utf-8")
+    return {"cmd": " ".join(cmd), "rc": p.returncode, "tail": (p.stderr or "")[-1500:]}
+
+
 def run_nb(tag: str, state: str, python: str, root: Path, out_dir: Path, timeout: int) -> dict:
     wd = root / "runs" / f"{state}_{tag}"
     wd.mkdir(parents = True, exist_ok = True)
@@ -109,6 +118,9 @@ def main() -> int:
     obs: dict = {"state": args.state}
     if args.state == "head":
         obs["head_install"] = head_install(args.python, out_dir)
+    elif args.state == "after_fix":
+        # Probed after head: the venv already holds unsloth @ HEAD_UNSLOTH_SHA; swap only the zoo.
+        obs["head_install"] = fix_install(args.python, out_dir)
     elif args.state != "base":
         obs["error"] = f"unknown state {args.state}"
     obs["pip"] = {k: v for k, v in pip_versions(args.python).items()
