@@ -130,24 +130,22 @@ jobs:
           unset CI
           export TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING=0
           P="$GITHUB_WORKSPACE/amd_ci/probes"
-          run() {  # name, then env assignments
-            n="$1"; shift
+          run() {  # name, attn, then env assignments
+            n="$1"; at="$2"; shift 2
             mkdir -p "$AMD_CI_WORK/d_$n"
-            ( cd "$AMD_CI_WORK/d_$n" && env "$@" UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/d_$n/cc" timeout 1500 "$AMD_CI_PY" "$P/g4diag_model.py" "$O/model_$n.json" 32 > "$O/model_$n.log" 2>&1 )
-            echo "== $n rc=$?"; tail -c 600 "$O/model_$n.json"; echo
+            ( cd "$AMD_CI_WORK/d_$n" && env "$@" UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/d_$n/cc" timeout 1500 "$AMD_CI_PY" "$P/g4diag2.py" "$O/d2_$n.json" $at > "$O/d2_$n.log" 2>&1 )
+            echo "== $n rc=$?"; tail -c 1500 "$O/d2_$n.json"; echo
           }
           # The notebook's cell 2 (run 37413926138 skipped it: transformers 5.5.0 vs tokenizers 0.23.2).
           uv pip install --python "$AMD_CI_PY" -qqq --upgrade --no-deps "transformers>=5.5.0" "huggingface_hub>=1.5.0,<2.0" "datasets==4.3.0" accelerate peft sentencepiece protobuf hf_transfer "trl>=0.28.0" timm
-          uv pip list --python "$AMD_CI_PY" 2>/dev/null | grep -iE '^(transformers|tokenizers|trl|torch) ' || true
-          run base_default AMD_SERIALIZE_KERNEL=3
-          run base_native UNSLOTH_MOE_BACKEND=native_torch AMD_SERIALIZE_KERNEL=3
+          run base_default "" X=1
           uv pip install --python "$AMD_CI_PY" --no-deps --force-reinstall --no-cache \
             "unsloth @ git+https://github.com/unslothai/unsloth@$HEAD_UNSLOTH_SHA" \
             "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@$HEAD_ZOO_SHA" > "$O/head_install.log" 2>&1
           echo "head install rc=$?"
-          run head_default AMD_SERIALIZE_KERNEL=3
-          run head_routed_off UNSLOTH_MOE_ROUTED_KERNEL=0 AMD_SERIALIZE_KERNEL=3
-          run head_native UNSLOTH_MOE_BACKEND=native_torch AMD_SERIALIZE_KERNEL=3
+          run head_default "" X=1
+          run head_nocompile "" UNSLOTH_COMPILE_DISABLE=1
+          run head_eager eager X=1
           exit 0
 
       - uses: actions/upload-artifact@v4
