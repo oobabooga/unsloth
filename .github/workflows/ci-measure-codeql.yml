@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [base, no-tests]
-        rep: [1, 2]
+        rep: [3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -31,3 +31,8 @@ jobs:
       - name: Count results
         if: always()
         run: python3 -c "import json,glob;print(sum(len(r['results']) for f in glob.glob('${{ runner.temp }}/sarif/*.sarif') for r in json.load(open(f))['runs']),'alerts')"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-${{ matrix.variant }}
+          path: ${{ runner.temp }}/sarif
