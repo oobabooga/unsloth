@@ -26,7 +26,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 NEW_TESTS = ["tests/test_moe_grouped_fp16.py"]
 PATTERNS = ("tests/test_gpt_oss*.py", "tests/test_gptoss*.py", "tests/test_moe_routed.py")
-CELLS = [(d, r) for d in ("bfloat16", "float16") for r in (1, 2)]
+# Eager cells (TORCHDYNAMO_DISABLE=1) carry the verdict: on the gfx1151 runner's torch 2.11 the compiled
+# GptOssTopKRouter_forward dies at step 3 in both states (dynamo StopIteration in dict_keys_getitem, then
+# unsloth_zoo.utils.Version raising). The MoE forward under test (GptOssMLP_forward, grouped_qlora_forward) is
+# compiler-disabled either way. One compiled cell per dtype still records that failure, base and head.
+CELLS = [(d, r, False) for d in ("bfloat16", "float16") for r in (1, 2)] + [(d, 1, True) for d in ("bfloat16", "float16")]
 FAIL_MARKERS = ("WON'T CONVERT", "won't convert", "Backend compiler failed", "BackendCompilerFailed",
                 "torch._dynamo.exc", "Unsupported:")
 
@@ -86,13 +90,17 @@ def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: i
     return obs
 
 
-def run_cell(checkout: str, dtype: str, rep: int, out_dir: Path, state: str, python: str, ckpt: Path) -> dict:
-    tag = f"{state}_{dtype}_r{rep}"
+def run_cell(checkout: str, dtype: str, rep: int, out_dir: Path, state: str, python: str, ckpt: Path,
+             compiled: bool = False) -> dict:
+    tag = f"{state}_{'compiled_' if compiled else ''}{dtype}_r{rep}"
+    env = _env(checkout)
+    if not compiled:
+        env["TORCHDYNAMO_DISABLE"] = "1"
     out, log = out_dir / f"train_{tag}.json", out_dir / f"train_{tag}.log"
     cmd = [python, "-u", str(HERE / "zoo1591_train.py"), "--model", str(ckpt), "--dtype", dtype, "--out", str(out)]
     with open(log, "wb") as fh:
         try:
-            rc = subprocess.run(cmd, cwd = checkout, env = _env(checkout), stdout = fh,
+            rc = subprocess.run(cmd, cwd = checkout, env = env, stdout = fh,
                                 stderr = subprocess.STDOUT, timeout = 1500).returncode
         except subprocess.TimeoutExpired:
             rc = "timeout"
@@ -142,10 +150,12 @@ def main() -> int:
         obs["ckpt_build"] = {"rc": mk.returncode, "tail": (mk.stdout + mk.stderr)[-2000:]}
     obs["train"] = {}
     merge = args.state == "merge"   # merge: one cell per dtype, no pytest (time); base vs head is the comparison
-    for dtype, rep in CELLS:
-        if merge and rep != 1:
+    for dtype, rep, compiled in CELLS:
+        if merge and (rep != 1 or compiled):
             continue
-        obs["train"][f"{dtype}/r{rep}"] = run_cell(args.checkout, dtype, rep, out_dir, args.state, args.python, ckpt)
+        key = f"{'compiled-' if compiled else ''}{dtype}/r{rep}"
+        obs["train"][key] = run_cell(args.checkout, dtype, rep, out_dir, args.state, args.python, ckpt, compiled)
+        obs["train"][key]["torchdynamo_disable"] = not compiled
         args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
     if not args.skip_pytest and not merge:
         obs["pytest"] = run_pytest(args.checkout, out_dir, args.state, args.python, args.timeout)

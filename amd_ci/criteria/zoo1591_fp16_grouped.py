@@ -92,6 +92,8 @@ def head_is_worse(base, head):
     problems, notes = [], []
     bc, hc = _cells(base), _cells(head)
     for k, c in hc.items():
+        if k.startswith("compiled-"):
+            continue
         if not _done(c):
             problems.append(f"head {k} did not finish: {c.get('error') or ('rc=' + str(c.get('rc')) + ' stage=' + str(c.get('stage')))}")
     # bf16: identical to base
@@ -145,6 +147,20 @@ def head_is_worse(base, head):
             continue
         lim = max(4 * (f_aa or 0.0), 1e-4 * max(abs(v) for v in _l(bf)))
         (problems if d is None or d > lim else notes).append(desc + f" -> grouped engaged (limit {lim:.3g})")
+    # compiled cells (informational unless the head alone fails or bf16 diverges on the steps both completed)
+    for dt in ("bfloat16", "float16"):
+        bcc, hcc = bc.get(f"compiled-{dt}/r1"), hc.get(f"compiled-{dt}/r1")
+        if not (bcc and hcc):
+            continue
+        berr, herr = (bcc.get("error") or "")[:120], (hcc.get("error") or "")[:120]
+        n = min(len(_l(bcc)), len(_l(hcc)))
+        same_prefix = bcc.get("loss_reprs", [])[:n] == hcc.get("loss_reprs", [])[:n]
+        msg = (f"compiled-{dt}: base {'done' if _done(bcc) else 'FAILED ' + berr} after {len(_l(bcc))} steps, head "
+               f"{'done' if _done(hcc) else 'FAILED ' + herr} after {len(_l(hcc))} steps; first {n} losses identical={same_prefix}")
+        if (_done(bcc) and not _done(hcc)) or (dt == "bfloat16" and not same_prefix):
+            problems.append(msg)
+        else:
+            notes.append(msg + (" (same failure in both states: pre-existing)" if not _done(bcc) and not _done(hcc) else ""))
     # pytest
     bp, hp = (base or {}).get("pytest") or {}, (head or {}).get("pytest") or {}
     bpass = set(bp.get("passed") or [])
