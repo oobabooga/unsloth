@@ -1,0 +1,127 @@
+name: "AMD CI: Gemma-4 26B-A4B notebooks, routed MoE before vs after"
+
+# Adapted from amd_ci/templates/workflow.yml (the ci_zoo1582 scaffold). One GPU job: the
+# notebook's own install cell builds one venv; differential.py probes base (PyPI unsloth
+# 2026.9.14 / unsloth_zoo 2026.9.9) then head (same venv + git unsloth@61afc99cd,
+# unsloth-zoo@58d20ca8, --no-deps --force-reinstall), same job, same host.
+
+on:
+  push:
+    branches: [amd-ci-g4nb]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HEAD_UNSLOTH_SHA: "61afc99cd54a5650990cfc3e38f55451373519b0"
+  HEAD_ZOO_SHA: "58d20ca844481e01face5264c82c7d5a4f04811f"
+
+jobs:
+
+  gpu:
+    name: "Gemma-4 26B-A4B notebooks GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "g4nb-gpu"
+
+      - name: Hardware gate (pre-venv)
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: States
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head"
+          python3 - "$AMD_CI_WORK" <<'PY'
+          import json, os, sys
+          w = sys.argv[1]
+          doc = {"pr": 0, "merged": False,
+                 "commits": {"base": "pypi-unsloth-2026.9.14+zoo-2026.9.9",
+                             "head": "unsloth@" + os.environ["HEAD_UNSLOTH_SHA"][:9] + "+zoo@" + os.environ["HEAD_ZOO_SHA"][:8]},
+                 "paths": {"base": w + "/states/base", "head": w + "/states/head"}}
+          open(w + "/out/states.json", "w", encoding="utf-8").write(json.dumps(doc, indent=2))
+          PY
+          cat "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment (notebook install cell) and real gate
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP" | tail -1
+          export UV_INSTALL_DIR="$AMD_CI_WORK/uvbin"
+          curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >/dev/null
+          export PATH="$UV_INSTALL_DIR:$PATH"
+          # The runners' uv index (/etc/uv/uv.toml) is a lagging PyPI mirror; the notebook's
+          # torch line passes its own --index-url, which overrides this default.
+          export UV_DEFAULT_INDEX="https://pypi.org/simple"
+          export UV_CACHE_DIR="$AMD_CI_WORK/uvcache"
+          uv venv -q --seed --python 3.12 "$AMD_CI_WORK/venv"
+          V="$AMD_CI_WORK/venv"
+          export VIRTUAL_ENV="$V" PATH="$V/bin:$PATH"
+          {
+            echo "UV_DEFAULT_INDEX=$UV_DEFAULT_INDEX"
+            echo "UV_CACHE_DIR=$UV_CACHE_DIR"
+            echo "VIRTUAL_ENV=$V"
+            echo "PATH=$V/bin:$UV_INSTALL_DIR:$PATH"
+            echo "AMD_CI_PY=$V/bin/python"
+            echo "HF_HOME=$AMD_CI_WORK/hf"
+            echo "HF_XET_HIGH_PERFORMANCE=1"
+            echo "UNSLOTH_DISABLE_AUTO_UPDATES=1"
+          } >> "$GITHUB_ENV"
+          set +e
+          bash amd_ci/nb/install.sh 2>&1 | tail -40
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || { echo "FATAL: notebook install cell rc=$rc"; exit "$rc"; }
+          # Harness-only: IPython for the Vision notebook's display() cell (a Jupyter kernel has it).
+          uv pip install -q ipython
+          {
+            echo "rocm: $(cat /opt/rocm/.info/version 2>/dev/null || echo unknown)"
+            uv pip list 2>/dev/null | grep -iE '^(torch|torchvision|triton|triton-rocm|pytorch-triton-rocm|bitsandbytes|peft|transformers|trl|unsloth|unsloth-zoo|unsloth_zoo|accelerate) ' || true
+          } | tee "$AMD_CI_WORK/out/env_versions.txt"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Prefetch model
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" -c "from huggingface_hub import snapshot_download as s; print(s('unsloth/gemma-4-26B-A4B-it'))"
+          du -sh "$HF_HOME" || true
+          df -h "$RUNNER_TEMP" | tail -1
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/g4nb_probe.py \
+            --criteria amd_ci/criteria/g4nb_notebooks.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY"
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: g4nb-gpu
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.pt
+          retention-days: 7
+          if-no-files-found: warn
