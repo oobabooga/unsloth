@@ -67,10 +67,11 @@ jobs:
           run_side() {
             side=$1
             rm -rf "$GITHUB_WORKSPACE/shots/tmp"; mkdir -p "$GITHUB_WORKSPACE/shots/tmp"
-            (cd repo/studio/frontend && npm run dev -- --port 5173 --strictPort > "$GITHUB_WORKSPACE/vite-$side.log" 2>&1) &
-            for i in $(seq 1 60); do curl -sf http://localhost:5173 >/dev/null && break; sleep 1; done
+            # The debug app embeds frontend/dist at compile time (custom-protocol is a default feature).
+            (cd repo/studio/frontend && npm run build > "$GITHUB_WORKSPACE/vite-$side.log" 2>&1)
+            (cd repo/studio/src-tauri && touch src/main.rs && cargo build 2>&1 | tail -3)
             ./repo/studio/src-tauri/target/debug/unsloth-studio > "$GITHUB_WORKSPACE/app-$side.log" 2>&1 &
-            for i in $(seq 1 600); do [ -f "$GITHUB_WORKSPACE/shots/tmp/DONE" ] && break; sleep 1; done
+            for i in $(seq 1 480); do [ -f "$GITHUB_WORKSPACE/shots/tmp/DONE" ] && break; sleep 1; done
             sleep 2
             mv "$GITHUB_WORKSPACE/shots/tmp" "$GITHUB_WORKSPACE/shots/$side"
             pkill -f target/debug/unsloth-studio || true
