@@ -1,0 +1,97 @@
+name: DC-021 browser overlay A/B
+
+on:
+  push:
+    branches: [dc021-mac-ab]
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      BASE_SHA: 8435a749be1d15368f14d3b526234d9366451ff7
+    steps:
+      - name: Screen capture probe
+        run: |
+          sw_vers
+          screencapture -x /tmp/probe.png && ls -la /tmp/probe.png
+          system_profiler SPDisplaysDataType | grep -i resolution || true
+
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Clone upstream at main
+        run: |
+          git clone --filter=blob:none https://github.com/unslothai/unsloth.git repo
+          git -C repo checkout --quiet "$BASE_SHA"
+          git -C repo apply --check "$GITHUB_WORKSPACE/ci/fix.patch"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Unsloth Studio backend (--local, --no-torch)
+        working-directory: repo
+        run: |
+          set -o pipefail
+          ./install.sh --local --no-torch 2>&1 | tail -40
+
+      - name: Build frontend dist and debug Tauri app
+        run: |
+          cd repo/studio/frontend
+          npm ci --no-fund --no-audit
+          npm run build
+          cd ../src-tauri
+          cargo build 2>&1 | tail -5
+
+      - name: Add the CI-only harness
+        run: |
+          cp ci/dc021-harness.ts repo/studio/frontend/src/dc021-harness.ts
+          echo 'import "./dc021-harness";' >> repo/studio/frontend/src/main.tsx
+
+      - name: A/B runs
+        run: |
+          set -x
+          python3 ci/helper.py "$GITHUB_WORKSPACE/shots/tmp" > helper.log 2>&1 &
+          run_side() {
+            side=$1
+            rm -rf "$GITHUB_WORKSPACE/shots/tmp"; mkdir -p "$GITHUB_WORKSPACE/shots/tmp"
+            (cd repo/studio/frontend && npm run dev -- --port 5173 --strictPort > "$GITHUB_WORKSPACE/vite-$side.log" 2>&1) &
+            for i in $(seq 1 60); do curl -sf http://localhost:5173 >/dev/null && break; sleep 1; done
+            ./repo/studio/src-tauri/target/debug/unsloth-studio > "$GITHUB_WORKSPACE/app-$side.log" 2>&1 &
+            for i in $(seq 1 600); do [ -f "$GITHUB_WORKSPACE/shots/tmp/DONE" ] && break; sleep 1; done
+            sleep 2
+            mv "$GITHUB_WORKSPACE/shots/tmp" "$GITHUB_WORKSPACE/shots/$side"
+            pkill -f target/debug/unsloth-studio || true
+            pkill -f "vite" || true
+            pkill -f "studio/backend/run.py|unsloth studio|api-only" || true
+            sleep 5
+          }
+          run_side A-main
+          git -C repo apply "$GITHUB_WORKSPACE/ci/fix.patch"
+          git -C repo diff --stat
+          run_side B-fix
+          cat helper.log
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dc021-ab
+          path: |
+            shots/
+            helper.log
+            vite-*.log
+            app-*.log
+            ~/.unsloth/studio/tauri.log

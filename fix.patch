@@ -1,0 +1,254 @@
+diff --git a/studio/frontend/src/features/browser/browser-panel.tsx b/studio/frontend/src/features/browser/browser-panel.tsx
+index 8bd5e717f9..9a36c4de0f 100644
+--- a/studio/frontend/src/features/browser/browser-panel.tsx
++++ b/studio/frontend/src/features/browser/browser-panel.tsx
+@@ -256,7 +256,7 @@ function IconButton({
+           )}
+         </button>
+       </TooltipTrigger>
+-      <TooltipContent side="bottom" className="tooltip-compact">
++      <TooltipContent side="top" className="tooltip-compact">
+         {shortcut ? (
+           <span className="flex items-center gap-1.5">
+             {label}
+@@ -884,7 +884,7 @@ function SiteIdentity({ address, tab }: { address: string; tab: BrowserTab | und
+               </button>
+             </PopoverTrigger>
+           </TooltipTrigger>
+-          <TooltipContent side="bottom" className="tooltip-compact">
++          <TooltipContent side="top" className="tooltip-compact">
+             {label}
+           </TooltipContent>
+         </Tooltip>
+@@ -1019,7 +1019,7 @@ function ZoomBadge({ tab }: { tab: BrowserTab | undefined }) {
+           {new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 0 }).format(zoom)}
+         </button>
+       </TooltipTrigger>
+-      <TooltipContent side="bottom" className="tooltip-compact">
++      <TooltipContent side="top" className="tooltip-compact">
+         {label}
+       </TooltipContent>
+     </Tooltip>
+@@ -1212,7 +1212,7 @@ function PanelMenu({ tab, children }: { tab: BrowserTab | undefined; children?:
+               </button>
+             </DropdownMenuTrigger>
+           </TooltipTrigger>
+-          <TooltipContent side="bottom" className="tooltip-compact">
++          <TooltipContent side="top" className="tooltip-compact">
+             {t("browser.more")}
+           </TooltipContent>
+         </Tooltip>
+@@ -1632,7 +1632,7 @@ function BrowserFileToolbar({
+                 {errorBadge}
+               </button>
+             </TooltipTrigger>
+-            <TooltipContent side="bottom" className="tooltip-compact">
++            <TooltipContent side="top" className="tooltip-compact">
+               {consoleLabel}
+             </TooltipContent>
+           </Tooltip>
+diff --git a/studio/frontend/src/features/browser/native-view.ts b/studio/frontend/src/features/browser/native-view.ts
+index 39e916be6f..b139ec15d1 100644
+--- a/studio/frontend/src/features/browser/native-view.ts
++++ b/studio/frontend/src/features/browser/native-view.ts
+@@ -3,7 +3,8 @@
+ 
+ /**
+  * Desktop app web pages: a native view per tab (src-tauri/src/browser_webview.rs) over its placeholder,
+- * so bot checks work. It sits above the DOM, so it hides while a menu or dialog covers it.
++ * so bot checks work. It sits above the DOM, so it hides while a menu or dialog covers it, leaving
++ * a snapshot of itself on the placeholder.
+  */
+ 
+ import { getLocale, translate } from "@/i18n";
+@@ -11,17 +12,22 @@ import type { TranslationKey } from "@/i18n";
+ import type { InterpolationValues } from "@/i18n";
+ import { openExternalLink } from "@/lib/open-link";
+ import { toast } from "@/lib/toast";
++import { BROWSER_PAGE_INSET_VAR } from "@/lib/toast-offset";
+ import { hostOf } from "./address";
+ import { proxiedFavicon } from "./favicon";
+ import { useBrowserHistoryStore } from "./history-store";
+ import { callNative as call, nativeClearing, onNativeViewsClosed } from "./native-support";
+-import { type BrowserTab, currentEntry, entryKey, useBrowserStore } from "./store";
++import { type BrowserEntry, type BrowserTab, currentEntry, entryKey, useBrowserStore } from "./store";
+ 
+ export { clearNativeBrowsingData, useNativeBrowser } from "./native-support";
+ 
+ const EVENT = "unsloth-browser";
+ const MAX_VIEWS = 4;
+ const DOCK_GAP = 8;
++// Longer leaves the menu under the page too long: hide without the snapshot.
++const SNAPSHOT_WAIT_MS = 250;
++// Sonner's toast width plus its edge offsets: the column toasts need beside the page.
++const TOAST_COLUMN = 380;
+ // Catches moves that resize nothing.
+ const RECHECK_MS = 300;
+ // Pages can open tabs without a click here: a few a minute across all pages, then the user decides.
+@@ -244,10 +250,10 @@ export async function nativeFind(tabId: string, query: string, backwards: boolea
+   return call<boolean>("browser_view_find", { tabId, query, backwards }).catch(() => false);
+ }
+ 
+-// Studio UI that covers the panel. Not tooltips, or every hover would blank the page; toasts only
+-// when they carry an action (a mailto: or popup prompt), which would be unclickable under the page.
++// Studio UI that covers the panel. Not tooltips, or every hover would hide the page (the toolbar's
++// open upward, clear of it). Toasts move beside a page at the right edge; one still over it hides it.
+ const OVERLAY_SELECTOR =
+-  '[data-radix-popper-content-wrapper], [role="dialog"], [role="alertdialog"], [data-slot$="-overlay"], [data-sonner-toast]:has([data-action])';
++  '[data-radix-popper-content-wrapper], [role="dialog"], [role="alertdialog"], [data-slot$="-overlay"], [data-sonner-toast]';
+ 
+ function intersects(a: DOMRect, b: DOMRect): boolean {
+   return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+@@ -281,19 +287,27 @@ function visibleRect(element: HTMLElement): DOMRect | null {
+   return new DOMRect(rect.left, rect.top, rect.width, bottom - rect.top);
+ }
+ 
+-type Desired = { tabId: string; url: string; entry: number; zoom: number; bounds: Bounds } | null;
++type Desired =
++  | { tabId: string; url: string; entry: number; zoom: number; bounds: Bounds }
++  | { tabId: string; covered: true }
++  | null;
++
++// Toasts can't draw over the page: while it fills the right edge, they move into the column beside it.
++function insetToasts(rect: DOMRect | null): void {
++  const style = document.documentElement.style;
++  if (rect && rect.right >= window.innerWidth - 2 && rect.left >= TOAST_COLUMN) {
++    style.setProperty(BROWSER_PAGE_INSET_VAR, `${Math.round(window.innerWidth - rect.left)}px`);
++  } else {
++    style.removeProperty(BROWSER_PAGE_INSET_VAR);
++  }
++}
+ 
+ function desiredView(): Desired {
+-  const state = useBrowserStore.getState();
+-  if (!state.open) return null;
+-  const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId);
+-  if (!tab || tab.nativeError) return null;
+-  const entry = currentEntry(tab);
+-  if (entry.kind !== "web") return null;
+-  const element = document.querySelector<HTMLElement>(`[data-native-page="${CSS.escape(tab.id)}"]`);
+-  if (!element || element.offsetParent === null) return null;
+-  const rect = visibleRect(element);
+-  if (!rect || covered(rect)) return null;
++  const page = pageRect();
++  insetToasts(page?.rect ?? null);
++  if (!page) return null;
++  const { tab, entry, rect } = page;
++  if (covered(rect)) return { tabId: tab.id, covered: true };
+   return {
+     tabId: tab.id,
+     url: entry.url,
+@@ -309,6 +323,20 @@ function desiredView(): Desired {
+   };
+ }
+ 
++/** Where the active tab's web page goes on screen, if it shows one. */
++function pageRect(): { tab: BrowserTab; entry: Extract<BrowserEntry, { kind: "web" }>; rect: DOMRect } | null {
++  const state = useBrowserStore.getState();
++  if (!state.open) return null;
++  const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId);
++  if (!tab || tab.nativeError) return null;
++  const entry = currentEntry(tab);
++  if (entry.kind !== "web") return null;
++  const element = document.querySelector<HTMLElement>(`[data-native-page="${CSS.escape(tab.id)}"]`);
++  if (!element || element.offsetParent === null) return null;
++  const rect = visibleRect(element);
++  return rect ? { tab, entry, rect } : null;
++}
++
+ function pruneViews(shown: string | null): void {
+   const tabs = new Map(useBrowserStore.getState().tabs.map((tab) => [tab.id, tab]));
+   for (const tabId of [...views.keys()]) {
+@@ -345,8 +373,38 @@ export function whenNativeViewShown(tabId: string, timeoutMs = 1500): Promise<bo
+   });
+ }
+ 
++// The page as it was when a menu hid it, painted on its placeholder so the panel doesn't go blank.
++let snapshot: { element: HTMLElement; url: string } | null = null;
++let shownBounds: Bounds | null = null;
++
++function clearSnapshot(): void {
++  if (!snapshot) return;
++  snapshot.element.style.removeProperty("background");
++  URL.revokeObjectURL(snapshot.url);
++  snapshot = null;
++}
++
++async function paintSnapshot(tabId: string): Promise<void> {
++  const bounds = shownBounds;
++  const element = document.querySelector<HTMLElement>(`[data-native-page="${CSS.escape(tabId)}"]`);
++  if (shownView !== tabId || !bounds || !element) return;
++  const png = await Promise.race([
++    call<ArrayBuffer>("browser_capture", { tabId }).catch(() => null),
++    new Promise<null>((resolve) => setTimeout(() => resolve(null), SNAPSHOT_WAIT_MS)),
++  ]);
++  if (!png?.byteLength || !element.isConnected) return;
++  clearSnapshot();
++  const url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
++  // The view can be trimmed short of its placeholder (by the chat dock): line the picture up with it.
++  const box = element.getBoundingClientRect();
++  element.style.background = `url(${url}) ${bounds.x - box.left}px ${bounds.y - box.top}px / ${bounds.width}px ${bounds.height}px no-repeat`;
++  snapshot = { element, url };
++}
++
+ async function applyView(desired: Desired): Promise<void> {
+-  if (!desired) {
++  if (!desired || "covered" in desired) {
++    if (desired) await paintSnapshot(desired.tabId);
++    else clearSnapshot();
+     setShownView(null);
+     await call("browser_view_show", { tabId: null });
+     return;
+@@ -364,6 +422,8 @@ async function applyView(desired: Desired): Promise<void> {
+   try {
+     await call("browser_view_show", { tabId, url: resumed?.entry === entry ? resumed.url : url, bounds });
+     if (stale()) return;
++    clearSnapshot();
++    shownBounds = bounds;
+     setShownView(tabId);
+     // A new address for an existing view. Recorded once it went through, so Retry tries again.
+     if (existed && loaded !== entry) {
+@@ -470,6 +530,8 @@ export function startNativeViews(): () => void {
+     generation += 1;
+     pending = null;
+     setShownView(null);
++    clearSnapshot();
++    insetToasts(null);
+     for (const tabId of [...views.keys()]) closeView(tabId);
+   };
+ }
+diff --git a/studio/frontend/src/lib/toast-offset.ts b/studio/frontend/src/lib/toast-offset.ts
+index 65f2a9d641..d83550cd3f 100644
+--- a/studio/frontend/src/lib/toast-offset.ts
++++ b/studio/frontend/src/lib/toast-offset.ts
+@@ -7,6 +7,8 @@ const HEADER_TOP_OFFSET = 52;
+ const DESKTOP_TITLEBAR_HEIGHT = 34;
+ 
+ export const CHAT_SETTINGS_INSET_VAR = "--studio-chat-settings-inset";
++// Set by the desktop browser panel while its native page sits at the right edge, which toasts can't draw over.
++export const BROWSER_PAGE_INSET_VAR = "--studio-browser-page-inset";
+ // Only the widest card scales with --ui-space-scale; the download panel and rail gutters do not.
+ const CORNER_CARD_MAX_WIDTH = 448;
+ const DOWNLOAD_PANEL_WIDTH = 400;
+@@ -66,7 +68,7 @@ export function insetPastChatSettings(offset: ToastOffset): {
+ } {
+   return {
+     top: offset.top,
+-    right: `calc(${offset.right}px + var(${CHAT_SETTINGS_INSET_VAR}, 0px))`,
++    right: `calc(${offset.right}px + var(${CHAT_SETTINGS_INSET_VAR}, 0px) + var(${BROWSER_PAGE_INSET_VAR}, 0px))`,
+   };
+ }
+ 
+diff --git a/studio/frontend/tests/toast-offset.test.ts b/studio/frontend/tests/toast-offset.test.ts
+index 198dd01f73..b443b6f187 100644
+--- a/studio/frontend/tests/toast-offset.test.ts
++++ b/studio/frontend/tests/toast-offset.test.ts
+@@ -129,7 +129,7 @@ test("the header offset follows the UI font size, the titlebar does not", () =>
+ test("desktop toasts shift left by the open Run settings panel", () => {
+   assert.deepEqual(insetPastChatSettings({ top: 52, right: 12 }), {
+     top: 52,
+-    right: "calc(12px + var(--studio-chat-settings-inset, 0px))",
++    right: "calc(12px + var(--studio-chat-settings-inset, 0px) + var(--studio-browser-page-inset, 0px))",
+   });
+ });
+ 
