@@ -1,4 +1,4 @@
-name: Shell suite parallelism measurements
+name: Exact shell workflow comparison
 'on':
   push:
     branches:
@@ -6,37 +6,58 @@ name: Shell suite parallelism measurements
 permissions:
   contents: read
 jobs:
-  shell:
-    name: Shell suites n${{ matrix.workers }} r${{ matrix.rep }}
+  serial:
+    name: Exact shell serial r${{ matrix.rep }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        workers:
-        - 1
-        - 4
-        rep:
-        - 1
-        - 2
-        - 3
-    env:
-      WORKERS: ${{ matrix.workers }}
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
+        persist-credentials: false
         repository: unslothai/unsloth
         ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
-        persist-credentials: false
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Measure all shell suites
-      run: "cat > \"$RUNNER_TEMP/measure-shell.py\" <<'PYBENCH'\n\nimport concurrent.futures as cf,json,os,pathlib,subprocess,time,signal\nroot=pathlib.Path.cwd();out=pathlib.Path(os.environ['RUNNER_TEMP'])/'shell-measurements';out.mkdir()\nfiles=sorted(root.glob('tests/sh/test_*.sh'))\nfiles=[p for p in files if p.name!='test_install_rollback_lifecycle.sh']\nassert files\nworkers=int(os.environ['WORKERS'])\ndef run(p):\n    start=time.monotonic()\n    with (out/(p.name+'.log')).open('w') as log:\n        proc=subprocess.Popen(['bash',str(p)],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)\n        try:rc=proc.wait(timeout=480)\n        except subprocess.TimeoutExpired:\n            os.killpg(proc.pid,signal.SIGKILL);rc=124;proc.wait()\n    text=(out/(p.name+'.log')).read_text(errors='replace')\n    row=dict(file=p.name,seconds=time.monotonic()-start,rc=rc,passes=text.count('PASS'))\n    print(json.dumps(row),flush=True);return row\nstart=time.monotonic()\nwith cf.ThreadPoolExecutor(workers)\
-        \ as ex:rows=list(ex.map(run,files))\nsummary=dict(workers=workers,seconds=time.monotonic()-start,results=rows)\n(out/'summary.json').write_text(json.dumps(summary,indent=2))\nprint('TOTAL',summary['seconds'],'FAILURES',sum(bool(r['rc']) for r in rows),flush=True)\nraise SystemExit(any(r['rc'] for r in rows))\n\nPYBENCH\npython \"$RUNNER_TEMP/measure-shell.py\"\n"
+    - name: Shell installer tests
+      run: "mkdir -p \"$RUNNER_TEMP/exact\"\ncat > \"$RUNNER_TEMP/exact/run.sh\" <<'SUITES'\nset -e\nskip=\"test_install_rollback_lifecycle.sh\"\nfound=0\nfor s in tests/sh/test_*.sh; do\n    case \" $skip \" in\n        *\" $(basename \"$s\") \"*) echo \"skipping $s (see workflow comment)\"; continue ;;\n    esac\n    found=$((found + 1))\n    echo \"::group::$s\"\n    bash \"$s\"\n    echo \"::endgroup::\"\ndone\n[ \"$found\" -gt 0 ] || { echo \"::error::no shell tests discovered under tests/sh\"; exit 1; }\necho \"ran $found shell installer test files\"\nSUITES\nset -o pipefail\n/usr/bin/time -p bash \"$RUNNER_TEMP/exact/run.sh\" 2>&1 | tee \"$RUNNER_TEMP/exact/results.log\"\n"
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: always()
       with:
-        name: shell-${{ matrix.workers }}-${{ matrix.rep }}
-        path: ${{ runner.temp }}/shell-measurements
+        name: exact-serial-${{ matrix.rep }}
+        path: ${{ runner.temp }}/exact
         retention-days: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        rep:
+        - 1
+        - 2
+  parallel:
+    name: Exact shell parallel r${{ matrix.rep }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        repository: unslothai/unsloth
+        ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Shell installer tests
+      run: "mkdir -p \"$RUNNER_TEMP/exact\"\ncat > \"$RUNNER_TEMP/exact/run.sh\" <<'SUITES'\nset -euo pipefail\nshopt -s nullglob\nskip=\"test_install_rollback_lifecycle.sh\"\nsuites=()\nfor s in tests/sh/test_*.sh; do\n    case \" $skip \" in\n        *\" $(basename \"$s\") \"*) echo \"skipping $s (see workflow comment)\"; continue ;;\n    esac\n    suites+=(\"$s\")\ndone\nfound=${#suites[@]}\n[ \"$found\" -gt 0 ] || { echo \"::error::no shell tests discovered under tests/sh\"; exit 1; }\nexport suite_logs\nsuite_logs=$(mktemp -d \"$RUNNER_TEMP/shell-suites.XXXXXX\")\n# Each suite already owns its fixtures. Keep its output and exit status\n# separate, then collect every result even when another suite fails.\nfailed=0\nprintf '%s\\0' \"${suites[@]}\" | xargs -0 -P 4 -n 1 bash -c '\n    s=$1\n    name=${s##*/}\n    echo \"Starting $s\"\n    rc=0\n    timeout --signal=TERM --kill-after=10s 480s bash \"$s\" > \"$suite_logs/$name.log\" 2>&1 || rc=$?\n    printf \"%s\\n\" \"$rc\" > \"$suite_logs/$name.status\"\
+        \n    echo \"Finished $s (exit $rc)\"\n' _ || failed=1\nfor s in \"${suites[@]}\"; do\n    name=${s##*/}\n    echo \"::group::$s\"\n    cat \"$suite_logs/$name.log\" || failed=1\n    rc=$(cat \"$suite_logs/$name.status\" 2>/dev/null) || rc=1\n    if [ \"$rc\" != 0 ]; then\n        echo \"::error::$s exited $rc (124 means the suite timed out)\"\n        failed=1\n    fi\n    echo \"::endgroup::\"\ndone\necho \"ran $found shell installer test files\"\nexit \"$failed\"\nSUITES\nset -o pipefail\n/usr/bin/time -p bash \"$RUNNER_TEMP/exact/run.sh\" 2>&1 | tee \"$RUNNER_TEMP/exact/results.log\"\n"
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: exact-parallel-${{ matrix.rep }}
+        path: ${{ runner.temp }}/exact
+        retention-days: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        rep:
+        - 1
+        - 2
