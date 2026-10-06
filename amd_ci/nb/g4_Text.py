@@ -203,7 +203,7 @@ _amd_atexit.register(_amd_exit)
 _amd_cell(2)
 import torch; torch._dynamo.config.recompile_limit = 64;
 subprocess.run('uv pip install -qqq --upgrade --no-deps "transformers>=5.5.0" "huggingface_hub>=1.5.0,<2.0" "datasets==4.3.0" accelerate peft sentencepiece protobuf hf_transfer "trl>=0.28.0" timm', shell=True)
-subprocess.run('uv pip install -qqq torchcodec', shell=True)
+pass  # AMD-CI: torchcodec install skipped (CUDA build, OSError at `import unsloth` on ROCm)
 
 # ### Unsloth
 # 
