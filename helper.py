@@ -15,8 +15,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         if url.path == "/shot":
             name = "".join(c for c in query.get("name", ["x"])[0] if c.isalnum() or c in "-_")
-            r = subprocess.run(["screencapture", "-x", str(out / f"{name}.png")], capture_output=True, text=True)
-            print(f"[shot] {name} rc={r.returncode} {r.stderr.strip()}", flush=True)
+            # The app window alone, so system prompts over the desktop stay out of the picture.
+            window = subprocess.run([sys.argv[2]], capture_output=True, text=True).stdout.strip()
+            target = ["-o", f"-l{window}"] if window else []
+            r = subprocess.run(["screencapture", "-x", *target, str(out / f"{name}.png")], capture_output=True, text=True)
+            print(f"[shot] {name} window={window or 'screen'} rc={r.returncode} {r.stderr.strip()}", flush=True)
         elif url.path == "/log":
             print(f"[log] {time.strftime('%H:%M:%S')} {query.get('m', [''])[0]}", flush=True)
         elif url.path == "/done":

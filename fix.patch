@@ -48,7 +48,7 @@ index 8bd5e717f9..9a36c4de0f 100644
              </TooltipContent>
            </Tooltip>
 diff --git a/studio/frontend/src/features/browser/native-view.ts b/studio/frontend/src/features/browser/native-view.ts
-index 39e916be6f..7cf8ba7f62 100644
+index 39e916be6f..b5c8af00fe 100644
 --- a/studio/frontend/src/features/browser/native-view.ts
 +++ b/studio/frontend/src/features/browser/native-view.ts
 @@ -3,7 +3,8 @@
@@ -166,12 +166,12 @@ index 39e916be6f..7cf8ba7f62 100644
  function pruneViews(shown: string | null): void {
    const tabs = new Map(useBrowserStore.getState().tabs.map((tab) => [tab.id, tab]));
    for (const tabId of [...views.keys()]) {
-@@ -345,8 +380,44 @@ export function whenNativeViewShown(tabId: string, timeoutMs = 1500): Promise<bo
+@@ -345,8 +380,45 @@ export function whenNativeViewShown(tabId: string, timeoutMs = 1500): Promise<bo
    });
  }
  
 +// The page as it was when a menu hid it, painted on its placeholder so the panel doesn't go blank.
-+let snapshot: { element: HTMLElement; url: string } | null = null;
++let snapshot: { tabId: string; element: HTMLElement; url: string } | null = null;
 +let shownBounds: Bounds | null = null;
 +
 +function clearSnapshot(): void {
@@ -201,18 +201,19 @@ index 39e916be6f..7cf8ba7f62 100644
 +  element.style.backgroundPosition = `${bounds.x - box.left}px ${bounds.y - box.top}px`;
 +  element.style.backgroundSize = `${bounds.width}px ${bounds.height}px`;
 +  element.style.backgroundRepeat = "no-repeat";
-+  snapshot = { element, url };
++  snapshot = { tabId, element, url };
 +}
 +
  async function applyView(desired: Desired): Promise<void> {
 -  if (!desired) {
 +  if (!desired || "covered" in desired) {
-+    clearSnapshot();
++    // Covered again before the page showed (a menu closed and reopened mid-capture): keep its picture.
++    if (!desired || shownView === desired.tabId || snapshot?.tabId !== desired.tabId) clearSnapshot();
 +    if (desired) await paintSnapshot(desired.tabId);
      setShownView(null);
      await call("browser_view_show", { tabId: null });
      return;
-@@ -364,6 +435,8 @@ async function applyView(desired: Desired): Promise<void> {
+@@ -364,6 +436,8 @@ async function applyView(desired: Desired): Promise<void> {
    try {
      await call("browser_view_show", { tabId, url: resumed?.entry === entry ? resumed.url : url, bounds });
      if (stale()) return;
@@ -221,7 +222,7 @@ index 39e916be6f..7cf8ba7f62 100644
      setShownView(tabId);
      // A new address for an existing view. Recorded once it went through, so Retry tries again.
      if (existed && loaded !== entry) {
-@@ -435,9 +508,7 @@ export function startNativeViews(): () => void {
+@@ -435,9 +509,7 @@ export function startNativeViews(): () => void {
      frame = 0;
      const desired = desiredView();
      pruneViews(desired?.tabId ?? null);
@@ -232,7 +233,7 @@ index 39e916be6f..7cf8ba7f62 100644
      if (element !== resized) {
        if (resized) resizeObserver.unobserve(resized);
        if (element) resizeObserver.observe(element);
-@@ -470,6 +541,8 @@ export function startNativeViews(): () => void {
+@@ -470,6 +542,8 @@ export function startNativeViews(): () => void {
      generation += 1;
      pending = null;
      setShownView(null);

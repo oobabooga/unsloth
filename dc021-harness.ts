@@ -35,7 +35,7 @@ function button(label: string): HTMLElement | null {
 
 function pageState(): string {
   const el = document.querySelector<HTMLElement>("[data-native-page]");
-  const bg = el?.style.background ? "snapshot" : "plain";
+  const bg = el?.style.backgroundImage ? "snapshot" : "plain";
   const inset =
     getComputedStyle(document.documentElement).getPropertyValue("--studio-browser-page-inset") || "none";
   const r = el?.getBoundingClientRect();

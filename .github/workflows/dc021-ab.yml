@@ -63,10 +63,15 @@ jobs:
       - name: A/B runs
         run: |
           set -x
-          python3 ci/helper.py "$GITHUB_WORKSPACE/shots/tmp" > helper.log 2>&1 &
+          swiftc -O ci/winid.swift -o winid
+          python3 ci/helper.py "$GITHUB_WORKSPACE/shots/tmp" "$GITHUB_WORKSPACE/winid" > helper.log 2>&1 &
+          STATE_DIR="$HOME/Library/Application Support/ai.unsloth.studio"
           run_side() {
             side=$1
             rm -rf "$GITHUB_WORKSPACE/shots/tmp"; mkdir -p "$GITHUB_WORKSPACE/shots/tmp"
+            # The same window size on both sides, whatever the previous run saved.
+            mkdir -p "$STATE_DIR"
+            echo '{"main":{"width":1280,"height":800,"x":0,"y":0,"prev_x":0,"prev_y":0,"maximized":false,"visible":true,"decorated":true,"fullscreen":false}}' > "$STATE_DIR/.window-state.json"
             # The debug app embeds frontend/dist at compile time (custom-protocol is a default feature).
             (cd repo/studio/frontend && npm run build > "$GITHUB_WORKSPACE/vite-$side.log" 2>&1)
             (cd repo/studio/src-tauri && touch src/main.rs && cargo build 2>&1 | tail -3)
