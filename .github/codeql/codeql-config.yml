@@ -1,0 +1,8 @@
+name: Unsloth CodeQL config
+
+# Test code is two thirds of the repository's Python and most of CodeQL's time on a
+# pull request, and an alert in a test is not a vulnerability that ships.
+paths-ignore:
+  - '**/tests/**'
+  - '**/test_*.py'
+  - '**/*_test.py'

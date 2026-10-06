@@ -10,6 +10,7 @@ must analyse all four.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -108,3 +109,53 @@ def test_an_early_match_in_a_long_list_is_not_lost(tmp_path):
     writer's SIGPIPE used to turn that match into a miss."""
     files = ["first.py"] + [f"docs/{'x' * 200}/{i}.md" for i in range(2998)]
     assert _pick(tmp_path, files) == ["python"]
+
+
+CONFIG = ROOT / ".github" / "codeql" / "codeql-config.yml"
+
+
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    out = ""
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+        elif pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile(out)
+
+
+def test_every_analysis_reads_the_config():
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding = "utf-8"))
+    inits = [
+        s
+        for s in doc["jobs"]["analyze"]["steps"]
+        if s.get("uses", "").startswith("github/codeql-action/init@")
+    ]
+    assert inits
+    for step in inits:
+        assert step["with"]["config-file"] == "./.github/codeql/codeql-config.yml"
+    assert CONFIG.is_file()
+
+
+def test_the_config_ignores_only_test_code():
+    """An ignore that matched product code would drop its alerts without any signal."""
+    patterns = yaml.safe_load(CONFIG.read_text(encoding = "utf-8"))["paths-ignore"]
+    regexes = [_glob_regex(p) for p in patterns]
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd = ROOT, capture_output = True, text = True, check = True
+    ).stdout.splitlines()
+    ignored = [f for f in tracked if any(r.fullmatch(f) for r in regexes)]
+    assert ignored, "the config ignores nothing; its patterns no longer match the layout"
+    test_path = re.compile(r"(^|/)tests/|(^|/)test_[^/]*\.py$|_test\.py$")
+    assert [f for f in ignored if not test_path.search(f)] == []
+    assert not any(r.fullmatch("studio/backend/routes/inference.py") for r in regexes)
+    assert not any(r.fullmatch("unsloth/models/llama.py") for r in regexes)
