@@ -80,7 +80,7 @@ jobs:
           python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
           # Pin: refuse to measure anything else.
-          python3 -c "import json,sys; c=json.load(open(sys.argv[1]))['commits']; print(c); sys.exit(0 if c['head'].startswith('210d262e') and c['base'].startswith('b3e52516') else 1)" "$AMD_CI_WORK/out/states.json"
+          python3 -c "import json,sys; c=json.load(open(sys.argv[1]))['commits']; print(c); sys.exit(0 if c['head'].startswith('b8a85e27') and c['base'].startswith('b3e52516') else 1)" "$AMD_CI_WORK/out/states.json"
 
       - name: Environment and real gate
         timeout-minutes: 60
