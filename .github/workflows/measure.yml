@@ -1,0 +1,42 @@
+name: Shell suite parallelism measurements
+'on':
+  push:
+    branches:
+    - ci-shell-ab-20261006
+permissions:
+  contents: read
+jobs:
+  shell:
+    name: Shell suites n${{ matrix.workers }} r${{ matrix.rep }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        workers:
+        - 1
+        - 4
+        rep:
+        - 1
+        - 2
+        - 3
+    env:
+      WORKERS: ${{ matrix.workers }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: unslothai/unsloth
+        ref: c17ca646c7ccae1032cba26103c32a9b6d32c8bb
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Measure all shell suites
+      run: "cat > \"$RUNNER_TEMP/measure-shell.py\" <<'PYBENCH'\n\nimport concurrent.futures as cf,json,os,pathlib,subprocess,time,signal\nroot=pathlib.Path.cwd();out=pathlib.Path(os.environ['RUNNER_TEMP'])/'shell-measurements';out.mkdir()\nfiles=sorted(root.glob('tests/sh/test_*.sh'))\nfiles=[p for p in files if p.name!='test_install_rollback_lifecycle.sh']\nassert files\nworkers=int(os.environ['WORKERS'])\ndef run(p):\n    start=time.monotonic()\n    with (out/(p.name+'.log')).open('w') as log:\n        proc=subprocess.Popen(['bash',str(p)],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)\n        try:rc=proc.wait(timeout=480)\n        except subprocess.TimeoutExpired:\n            os.killpg(proc.pid,signal.SIGKILL);rc=124;proc.wait()\n    text=(out/(p.name+'.log')).read_text(errors='replace')\n    row=dict(file=p.name,seconds=time.monotonic()-start,rc=rc,passes=text.count('PASS'))\n    print(json.dumps(row),flush=True);return row\nstart=time.monotonic()\nwith cf.ThreadPoolExecutor(workers)\
+        \ as ex:rows=list(ex.map(run,files))\nsummary=dict(workers=workers,seconds=time.monotonic()-start,results=rows)\n(out/'summary.json').write_text(json.dumps(summary,indent=2))\nprint('TOTAL',summary['seconds'],'FAILURES',sum(bool(r['rc']) for r in rows),flush=True)\nraise SystemExit(any(r['rc'] for r in rows))\n\nPYBENCH\npython \"$RUNNER_TEMP/measure-shell.py\"\n"
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: shell-${{ matrix.workers }}-${{ matrix.rep }}
+        path: ${{ runner.temp }}/shell-measurements
+        retention-days: 1
