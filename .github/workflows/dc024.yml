@@ -1,0 +1,56 @@
+name: DC-024 dropdown glow A/B
+
+on:
+  push:
+    branches: [dc024-ab-ci]
+
+permissions: {}
+
+jobs:
+  macos-headed:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Hardware
+        run: |
+          sw_vers; uname -m; sysctl -n machdep.cpu.brand_string; sysctl -n hw.ncpu hw.memsize
+      - name: A/B (headed)
+        env:
+          PW_HEADED: "1"
+        run: |
+          python -m pip install -q playwright==1.54.0
+          python -m playwright install webkit chromium
+          python dc024/run_ci.py webkit,chromium 100000,300000 5
+
+  windows-amd:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hardware
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber
+      - name: A/B
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m venv "$env:RUNNER_TEMP\venv"
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" -m pip install -q playwright==1.54.0
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" dc024\run_ci.py chromium,msedge
+          if ($LASTEXITCODE -ne 0) { exit 1 }
