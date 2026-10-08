@@ -123,7 +123,8 @@ def run_cell(checkout: str, key: str, extra: dict, out_dir: Path, state: str, py
 
 
 INF_CELLS = [("inf_only", {}), ("grad_then_inf", {}), ("inf_then_grad", {}),
-             ("inf_then_grad/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}), ("inf_only/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"})]
+             ("inf_then_grad/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}), ("inf_only/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}),
+             ("shapes_then_inf", {}), ("shapes_then_inf/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"})]
 
 
 def run_infmode(checkout: str, out_dir: Path, state: str, python: str) -> dict:
