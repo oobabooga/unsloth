@@ -1,0 +1,96 @@
+name: 'krileon E4: Windows fused SDPA guard A/B'
+'on':
+  push:
+    branches:
+    - amd-krileon-e4
+permissions:
+  contents: read
+jobs:
+  win:
+    strategy:
+      fail-fast: false
+      matrix:
+        stack:
+        - multiarch-7.14.1
+        - multiarch-7.14.0
+    runs-on:
+    - self-hosted
+    - Windows
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 300
+    env:
+      STACK: ${{ matrix.stack }}
+      UNSLOTH_IS_PRESENT: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONUTF8: '1'
+      HF_ENDPOINT: https://huggingface.co
+      HF_HUB_DISABLE_XET: '1'
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DOWNLOAD_TIMEOUT: '120'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Environment
+      shell: python -X utf8 {0}
+      timeout-minutes: 50
+      run: "\nimport os,sys,subprocess,platform\nfrom pathlib import Path\nroot=Path(os.environ['RUNNER_TEMP'])/'krileon-e1'\nfor name in ['out','tmp','cache/huggingface','cache/torch','cache/pip','studio','miopen/db','miopen/kernels']:\n\
+        \  (root/name).mkdir(parents=True,exist_ok=True)\nenv={'WORK_ROOT':str(root),'TMPDIR':str(root/'tmp'),'TEMP':str(root/'tmp'),'TMP':str(root/'tmp'),'HF_HOME':str(root/'cache/huggingface'),'HUGGINGFACE_HUB_CACHE':str(root/'cache/huggingface/hub'),'TORCH_HOME':str(root/'cache/torch'),'PIP_CACHE_DIR':str(root/'cache/pip'),'UNSLOTH_HOME':str(root/'unsloth'),'UNSLOTH_STUDIO_HOME':str(root/'unsloth/studio'),'PYTHONPATH':str(root/'code/studio/backend'),'MIOPEN_USER_DB_PATH':str(root/'miopen/db'),'MIOPEN_CUSTOM_CACHE_DIR':str(root/'miopen/kernels')}\n\
+        os.environ.update(env)\nwith open(os.environ['GITHUB_ENV'],'a') as f:\n  for k,v in env.items(): f.write(k+'='+v+'\\n')\ndef run(cmd,**kw):\n  print('RUN',cmd,flush=True); return subprocess.run(cmd,check=True,**kw)\n\
+        with (root/'out/host.txt').open('w') as f:\n  f.write(platform.platform()+'\\n')\n  subprocess.run(['powershell','-NoProfile','-Command','Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion;\
+        \ Get-CimInstance Win32_OperatingSystem | Format-List Caption,TotalVisibleMemorySize'],stdout=f,stderr=subprocess.STDOUT)\nrun(['git','init',str(root/'code')]); run(['git','-C',str(root/'code'),'config','core.autocrlf','false'])\n\
+        run(['git','-C',str(root/'code'),'remote','add','origin','https://github.com/unslothai/unsloth.git'])\nrun(['git','-C',str(root/'code'),'fetch','--depth=1','origin','53f8ff0a7dd14b137809d6a9d2702c8dd1ea431d']);\
+        \ run(['git','-C',str(root/'code'),'checkout','--detach','FETCH_HEAD'])\nrun([sys.executable,'-m','venv',str(root/'venv')])\npy=str(root/'venv/Scripts/python.exe')\nrun([py,'-m','pip','install','--upgrade','pip'])\n\
+        stack=os.environ['STACK']\nif stack.startswith('multiarch-'):\n  tag=stack.split('-',1)[1]\n  specs=['torch[device-gfx1151]==2.11.0+rocm'+tag,'torchvision[device-gfx1151]==0.26.0+rocm'+tag,'torchaudio==2.11.0+rocm'+tag]\n\
+        \  idx='https://repo.amd.com/rocm/whl-multi-arch/'\n  cons=['torch==2.11.0+rocm'+tag,'torchvision==0.26.0+rocm'+tag,'torchaudio==2.11.0+rocm'+tag]\nelse:\n  specs=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']\n\
+        \  idx='https://repo.amd.com/rocm/whl/gfx1151/'\n  cons=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']\nrun([py,'-m','pip','install','--index-url',idx,'--extra-index-url','https://pypi.org/simple',*specs])\n\
+        c=root/'torch-constraints.txt'; c.write_text('\\n'.join(cons)+'\\n')\nrq=root/'code/studio/backend/requirements'\nrun([py,'-m','pip','install','-c',str(c),'-r',str(rq/'studio.txt'),'-r',str(rq/'diffusers-pin.txt')])\n\
+        run([py,'-m','pip','install','-c',str(c),'-r',str(rq/'diffusers-main.txt')])\nrun([py,'-m','pip','install','-c',str(c),'transformers==5.5.0','accelerate>=1.0','peft>=0.18','sentencepiece','psutil','protobuf','scipy','einops','Pillow','pyyaml','safetensors','tyro','msgspec','wheel'])\n\
+        run([py,'-m','pip','install','--no-deps','unsloth-zoo>=2026.9.9'])\nrun([py,'-m','pip','install','--no-deps',str(root/'code')])\nrun([py,'-m','pip','install','--no-deps','torchao==0.17.0'])\nwith\
+        \ (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)\nrun([py,'-c',\"import main, torch; print(torch.__version__, torch.version.hip, torch.cuda.get_device_properties(0));\
+        \ x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS\
+        \ PASSED')\"])\n"
+    - name: base-auto19
+      shell: python -X utf8 {0}
+      timeout-minutes: 50
+      continue-on-error: true
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']); out=root/'out'; case='base-auto19'\npy=str(root/'venv/Scripts/python.exe')\n\
+        cmd=[py,'-u',os.path.join(os.environ['GITHUB_WORKSPACE'],'full_probe.py'),'--case',case,'--output',str(out),*[\"--free-gib\", \"19\", \"--steps\", \"4\", \"--repeats\", \"2\"]]\nt=time.time()\n\
+        with (out/(case+'.log')).open('w',encoding='utf-8') as f:\n  p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)\n  try: rc=p.wait(timeout=2940)\n  except subprocess.TimeoutExpired:\n    subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F']);\
+        \ p.wait(); rc=124\n(out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-t}))\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f: print(''.join(deque(f,maxlen=60)))\n\
+        sys.exit(rc)\n"
+    - name: Apply PR patch
+      shell: python -X utf8 {0}
+      run: 'import os,subprocess
+
+        from pathlib import Path
+
+        root=Path(os.environ[''WORK_ROOT''])
+
+        p=os.path.join(os.environ[''GITHUB_WORKSPACE''],''pr.patch'')
+
+        print(open(p,''rb'').read().count(b''\r\n''),''CRLF'')
+
+        subprocess.run([''git'',''-C'',str(root/''code''),''apply'',''--whitespace=nowarn'',p],check=True)
+
+        subprocess.run([''git'',''-C'',str(root/''code''),''diff'',''--stat''],check=True)
+
+        '
+    - name: pr-auto19
+      shell: python -X utf8 {0}
+      timeout-minutes: 50
+      continue-on-error: true
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']); out=root/'out'; case='pr-auto19'\npy=str(root/'venv/Scripts/python.exe')\n\
+        cmd=[py,'-u',os.path.join(os.environ['GITHUB_WORKSPACE'],'full_probe.py'),'--case',case,'--output',str(out),*[\"--free-gib\", \"19\", \"--steps\", \"4\", \"--repeats\", \"2\"]]\nt=time.time()\n\
+        with (out/(case+'.log')).open('w',encoding='utf-8') as f:\n  p=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT)\n  try: rc=p.wait(timeout=2940)\n  except subprocess.TimeoutExpired:\n    subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F']);\
+        \ p.wait(); rc=124\n(out/(case+'-exit.json')).write_text(json.dumps({'returncode':rc,'elapsed':time.time()-t}))\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace') as f: print(''.join(deque(f,maxlen=60)))\n\
+        sys.exit(rc)\n"
+    - name: Evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e4-${{ matrix.stack }}
+        path: ${{ env.WORK_ROOT }}/out
+        retention-days: 14
