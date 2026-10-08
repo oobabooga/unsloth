@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe for unslothai/unsloth#12044 on native Windows 11 x64, Python 3.12. Observes only.
 
-The git states (PR 12152 merge commit vs its parent) are labels: each state maps to the
+The git states (PR 12151 merge commit vs its parent) are labels: each state maps to the
 RELEASED unsloth / unsloth-zoo pair it corresponds to, installed from PyPI.
 
   base -> 2026.9.14 (torch cap <2.13.0)    head -> 2026.10.2 (torch cap <2.15.0)

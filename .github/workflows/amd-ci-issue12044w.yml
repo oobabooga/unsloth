@@ -1,4 +1,4 @@
-name: "AMD CI (Windows): validate PR 12152"
+name: "AMD CI (Windows): validate PR 12151"
 
 # Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
 #
@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 env:
-  PR: "12152"
+  PR: "12151"
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "1"
@@ -45,7 +45,7 @@ env:
 jobs:
 
   linux-control:
-    name: "PR 12152 linux control (selector diagnosis)"
+    name: "PR 12151 linux control (selector diagnosis)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 10
     env:
@@ -61,7 +61,7 @@ jobs:
           echo "selector matched no runner. If BOTH stay queued, the pool is busy."
 
   windows:
-    name: "PR 12152 on Windows (non-Docker)"
+    name: "PR 12151 on Windows (non-Docker)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 180
     # Uncomment when the job actually measures the GPU. It is off by default
@@ -81,7 +81,7 @@ jobs:
 
       - name: Preamble
         run: |
-          .\amd_ci\lib\preamble.ps1 -Name "pr12152-windows"
+          .\amd_ci\lib\preamble.ps1 -Name "pr12151-windows"
 
       - name: Locate the system Python
         run: |
@@ -159,7 +159,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr12152-windows
+          name: pr12151-windows
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
