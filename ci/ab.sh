@@ -2,7 +2,7 @@
 # The PR bundle vs what Studio main installs today on this host (upstream ROCm, then upstream Vulkan) and
 # vs the mirror's own Vulkan build, which a pin bump alone would give.
 set -uo pipefail
-W="$RUNNER_TEMP/w"; mkdir -p "$W"/{zips,b,m,out}; export TMPDIR="$W/tmp"
+W="$RUNNER_TEMP/sd14-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"; mkdir -p "$W"/{zips,b,m,out}; export TMPDIR="$W/tmp"
 OUT="$W/out"
 sec() { echo; echo "=================== $* ==================="; }
 cp "$W"/dist/*.zip "$W/zips/pr_rocm.zip" 2>/dev/null || echo "NO PR BUNDLE"

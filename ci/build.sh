@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduces build-linux-rocm from unslothai/stable-diffusion.cpp#14 (head d2ae8f8) on this box.
 set -euo pipefail
-W="$RUNNER_TEMP/w"; mkdir -p "$W"/{tmp,cache}; export TMPDIR="$W/tmp" PIP_CACHE_DIR="$W/cache/pip"
+W="$RUNNER_TEMP/sd14-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"; rm -rf "$W"; mkdir -p "$W"/{tmp,cache}; export TMPDIR="$W/tmp" PIP_CACHE_DIR="$W/cache/pip"
 cd "$W"
 PR=d2ae8f84e61753ebd8cc0bf5582d4217452f4dd9
 git clone -q https://github.com/unslothai/stable-diffusion.cpp src
