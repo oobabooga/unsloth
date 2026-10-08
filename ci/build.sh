@@ -5,7 +5,7 @@ W="$RUNNER_TEMP/sd14-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"; rm -rf "$W"; mkdir -p 
 cd "$W"
 PR=d2ae8f84e61753ebd8cc0bf5582d4217452f4dd9
 git clone -q https://github.com/unslothai/stable-diffusion.cpp src
-git -C src checkout -q "$PR"
+git -C src fetch -q origin "refs/pull/14/head"; git -C src checkout -q "$PR"
 git -C src submodule update -q --init --depth 1 ggml
 cp -r src tooling
 export ROCM_VERSION=7.14.0
