@@ -572,6 +572,10 @@ def test_scaffold_windows_emits_the_measured_selector() -> None:
         check("with shell: powershell", "shell: powershell" in text, text[:200])
         check("and the PowerShell preamble, not the bash one",
               "preamble.ps1" in text and "preamble.sh" not in text)
+        # The template referenced lib/preamble.ps1 while no such file shipped, so every
+        # Windows job died at its first step.
+        check("and that preamble ships in the scaffold",
+              (out / "amd_ci" / "lib" / "preamble.ps1").is_file())
         # A stalled Windows job and a busy pool look identical from the run list.
         check("a linux-control job ships with it", "linux-control:" in text)
         check("differing only in the OS label",

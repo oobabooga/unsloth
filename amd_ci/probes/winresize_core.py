@@ -209,7 +209,7 @@ def main():
     user32.SystemParametersInfoW(0x0026, 0, ctypes.byref(full), 0)
     rec["drag_full_windows"] = bool(full.value)
 
-    proc = subprocess.Popen([args.exe], stdout=open(os.path.join(args.out, tag + ".log"), "w"),
+    proc = subprocess.Popen([args.exe], stdout=open(os.path.join(args.out, tag + ".log"), "w", encoding="utf-8"),
                             stderr=subprocess.STDOUT)
     try:
         top, how = wait_window(proc, 180)
