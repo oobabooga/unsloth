@@ -1,0 +1,179 @@
+name: sd17 AMD DevLab
+
+on:
+  push:
+    branches: [sd17-amd-ci-u]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [rocm, vulkan]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    env:
+      PR_SHA: ca92d95ddf041bf885a36a7fdafbffd88706c28e
+      BASE_SHA: 6321a6935234c2bb09c77604874a439344faa7f6
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | head -20; free -h; df -h "$RUNNER_TEMP"
+          lspci -nn | grep -iE 'vga|display' || true
+          ls -l /dev/kfd /dev/dri 2>/dev/null || true
+          id; sudo -n true 2>/dev/null && echo "sudo: yes" || echo "sudo: no"
+          which vulkaninfo rocminfo glslc ffmpeg cmake ninja || true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: ci
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{models,tmp,hf}
+          echo "W=$W" >> "$GITHUB_ENV"; echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"; echo "HF_HOME=$W/hf" >> "$GITHUB_ENV"
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          pip install -q --upgrade pip
+          pip install -q cmake ninja numpy pillow huggingface_hub
+          echo "$W/venv/bin" >> "$GITHUB_PATH"
+      - name: ROCm (TheRock wheels)
+        if: matrix.backend == 'rocm'
+        run: |
+          set -euo pipefail
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel,device-gfx1151]==7.14.0"
+          R="$(rocm-sdk path --root)"
+          { echo "ROCM_PATH=$R"; echo "HIP_PATH=$R"; echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"; echo "LD_LIBRARY_PATH=$R/lib:${LD_LIBRARY_PATH:-}"; } >> "$GITHUB_ENV"
+          echo "$(rocm-sdk path --bin)" >> "$GITHUB_PATH"
+      - name: Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        run: |
+          set -euo pipefail
+          a="$W/vk.tar.xz"
+          curl -fsSL --retry 3 -o "$a" "https://sdk.lunarg.com/sdk/download/1.4.328.1/linux/vulkansdk-linux-x86_64-1.4.328.1.tar.xz"
+          echo "241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf  $a" | sha256sum --check --strict
+          mkdir -p "$W/vk"; tar -xJf "$a" -C "$W/vk" --strip-components=1
+          echo "VULKAN_SDK=$W/vk/x86_64" >> "$GITHUB_ENV"; echo "$W/vk/x86_64/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$W/vk/x86_64/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      - name: Models (background)
+        run: |
+          cd "$W/models"
+          nohup python -c "
+          from huggingface_hub import hf_hub_download as d
+          for f in ['minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors','qwen3vl_32b_minimax_h3-Q4_K_M.gguf']:
+              print(d('unsloth/MiniMax-H3-GGUF', f, local_dir='.'), flush=True)
+          print('DONE', flush=True)
+          " > dl.log 2>&1 &
+      - name: Sources
+        run: |
+          set -euo pipefail
+          cd "$W"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          git -C src fetch -q origin pull/17/head
+          git -C src submodule update --init --depth 1 ggml
+          for arm in master pr17; do
+            git -C src worktree add -q --detach "../$arm" $([ $arm = master ] && echo "$BASE_SHA" || echo "$PR_SHA")
+            rm -rf "$arm/ggml"; cp -r src/ggml "$arm/ggml"; rm -f "$arm/ggml/.git"
+          done
+          (cd pr17/ggml && git init -q && git add -A && git -c user.name=x -c user.email=x@x commit -qm base)
+          (cd pr17 && for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply --verbose "../$p"; done)
+          grep -c cpy_rows_vec4 pr17/ggml/src/ggml-cuda/cpy.cu
+          python "$GITHUB_WORKSPACE/ci/harness/add_cpy_tests.py" pr17/ggml/tests/test-backend-ops.cpp
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd "$W"
+          if [ "${{ matrix.backend }}" = rocm ]; then
+            DEF="-DSD_HIPBLAS=ON -DHIP_PLATFORM=amd -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang"
+          else
+            DEF="-DSD_VULKAN=ON"
+          fi
+          for arm in master pr17; do
+            T="sd-cli"; X=""
+            if [ $arm = pr17 ] && [ "${{ matrix.backend }}" = rocm ]; then T="sd-cli test-backend-ops"; X="-DGGML_BUILD_TESTS=ON"; fi
+            cmake -S $arm -B $arm/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF $DEF $X > $arm-cmake.log 2>&1 || { tail -50 $arm-cmake.log; exit 1; }
+            cmake --build $arm/build -j 32 --target $T > $arm-build.log 2>&1 || { grep -E "error|Error" $arm-build.log | head -40; tail -30 $arm-build.log; exit 1; }
+            echo "$arm built"
+          done
+      - name: test-backend-ops (copy kernels)
+        if: matrix.backend == 'rocm'
+        run: |
+          cd "$W"
+          B=$(find pr17/build -name test-backend-ops -type f | head -1)
+          $B -o CPY 2>&1 | grep -E "Backend|Device" | head -6
+          for rows in 1 0; do for op in CPY DUP CONT SET; do
+            echo "ROWS=$rows $op: $(GGML_CUDA_CPY_ROWS=$rows $B -o $op 2>&1 | grep -E 'tests passed|FAIL|not supported' | sort | uniq -c | tail -4 | tr '\n' ' ')"
+          done; done
+          if [ "${{ matrix.backend }}" = rocm ]; then
+            echo "MUL_MAT (min batch env forced, must be inert on AMD): $(GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=1 timeout 3600 $B -o MUL_MAT 2>&1 | grep -E 'tests passed|FAIL' | sort | uniq -c | tail -4 | tr '\n' ' ')"
+            for rows in 1 0; do echo "perf ROWS=$rows"; GGML_CUDA_CPY_ROWS=$rows $B perf -o CPY 2>&1 | grep -E "19108|16384|8192, 512|3072, 512" ; done
+          fi
+      - name: Tiling harness (GCC)
+        run: |
+          cd "$GITHUB_WORKSPACE/ci/harness"
+          F="-std=c++17 -O3 -Istub -Iinc"
+          g++ $F -Dprocess_tiles_2d=process_tiles_2d_old -c tiling_old.cpp -o old.o
+          g++ $F -Dprocess_tiles_2d=process_tiles_2d_new -c tiling_new.cpp -o new.o
+          g++ $F main.cpp old.o new.o parallel.cpp -o harness -lpthread
+          ./harness
+      - name: H3 renders
+        run: |
+          set -uo pipefail
+          cd "$W"
+          while ! grep -q DONE models/dl.log; do sleep 20; grep -qi error models/dl.log && { cat models/dl.log; exit 1; }; done
+          M="$W/models"
+          run() {
+            local name=$1 arm=$2; shift 2
+            mkdir -p "out/$name"
+            local t0=$(date +%s.%N)
+            env "$@" "$arm/build/bin/sd-cli" -M vid_gen --diffusion-model "$M/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" \
+              --vae "$M/vae/minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M/vae/minimax_h3_audio_vae_fp32.safetensors" \
+              --llm "$M/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" \
+              -p "A cute silver tabby kitten surfs on a tropical ocean wave on a white surfboard. Cinematic tracking shot, bright sunlight. Upbeat surf-rock music." \
+              --cfg-scale 1.0 --steps 4 -s 42 -W 640 -H 352 --video-frames 49 --fps 24 --rng cpu --diffusion-fa --offload-to-cpu \
+              -o "out/$name/%03d.png" -v > "out/$name.log" 2>&1
+            local rc=$?
+            local t1=$(date +%s.%N)
+            echo "$name rc=$rc wall=$(python -c "print(round($t1-$t0,1))")s"
+            grep -iE "decode.*(taken|completed|done| s$|ms)|decoding|sampling completed|generate_video completed|vae.*flash|Using flash" "out/$name.log" | head -12
+            [ $rc = 0 ] || tail -40 "out/$name.log"
+          }
+          run master   master
+          run pr17     pr17
+          run pr17_nofa pr17 SD_H3_VAE_FLASH_ATTN=0
+          run master2  master
+          run pr17_2   pr17
+          ls out/master | head -3; ls out/master | wc -l
+          for p in "master master2" "master pr17_nofa" "master pr17" "pr17 pr17_2"; do set -- $p; python "$GITHUB_WORKSPACE/ci/harness/psnr.py" out/$1 out/$2; done
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: logs-${{ matrix.backend }}
+          path: |
+            ${{ runner.temp }}/w/out/*.log
+            ${{ runner.temp }}/w/*-build.log
+          if-no-files-found: ignore
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: ci
+      - name: Tiling harness (MSVC)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VS=%%i
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cd ci\harness
+          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_old /c tiling_old.cpp /Foold.obj || exit /b 1
+          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_new /c tiling_new.cpp /Fonew.obj || exit /b 1
+          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc main.cpp old.obj new.obj parallel.cpp /Feharness.exe || exit /b 1
+          harness.exe
+          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_old /c tiling_old.cpp /Foold.obj || exit /b 1
+          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_new /c tiling_new.cpp /Fonew.obj || exit /b 1
+          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc main.cpp old.obj new.obj parallel.cpp /Feharness_fast.exe || exit /b 1
+          harness_fast.exe
