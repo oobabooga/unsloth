@@ -1,0 +1,265 @@
+name: AMD DevLab sd.cpp PR 18 ggml patches
+
+on:
+  push:
+    branches: [amd-sd18-ci]
+
+permissions: {}
+
+jobs:
+  hip:
+    name: linux-hip-${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, baseline]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Workdir and scripts
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"
+          mkdir -p "$W"/tmp "$W"/scripts "$W"/logs
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$W/pipcache" >> "$GITHUB_ENV"
+          for f in prep.sh inject.py run_tests.sh; do
+            curl -fsSL -o "$W/scripts/$f" "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/sd18/$f"
+          done
+          chmod +x "$W"/scripts/*.sh
+      - name: Hardware
+        run: |
+          uname -a; id; nproc; free -h; df -h "$RUNNER_TEMP"
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          ls -d /opt/rocm* 2>&1 || true
+          which rocminfo hipcc cmake ninja 2>&1 || true
+      - name: Install ROCm SDK (TheRock wheels, gfx1151), cmake, ninja
+        run: |
+          set -euo pipefail
+          python3 -m venv "$W/venv"
+          . "$W/venv/bin/activate"
+          pip install -q --upgrade pip
+          pip install -q cmake ninja
+          pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ --extra-index-url https://pypi.org/simple "rocm[libraries,devel,device-gfx1151]==10.1.0"
+          rocm-sdk init
+          R="$(rocm-sdk path --root)"
+          echo "ROCM_ROOT=$R" >> "$GITHUB_ENV"
+          echo "$W/venv/bin" >> "$GITHUB_PATH"
+          echo "$R/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$R/lib" >> "$GITHUB_ENV"
+          pip freeze | grep -i rocm
+          rocm-sdk targets || true
+          ls "$R" "$R/bin" | head -80
+          ls "$R/lib/llvm/bin" | head -20 || true
+          LD_LIBRARY_PATH="$R/lib" "$R/bin/rocminfo" | grep -E 'Marketing Name|Name: +gfx|Compute Unit' || true
+          "$R/bin/hipconfig" --full 2>&1 | head -40 || true
+      - name: Prepare sources (${{ matrix.variant }})
+        run: bash "$W/scripts/prep.sh" "${{ matrix.variant }}" "$W/src"
+      - name: Build test-backend-ops (GGML_HIP, gfx1151)
+        run: |
+          set -euo pipefail
+          cd "$W/src/sd"
+          export HIP_PATH="$ROCM_ROOT" ROCM_PATH="$ROCM_ROOT"
+          CLANG="$ROCM_ROOT/lib/llvm/bin/clang"
+          [ -x "$CLANG" ] || CLANG="$(hipconfig -l)/clang"
+          HIPCXX="$CLANG" cmake -S ggml -B "$W/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 \
+            -DCMAKE_PREFIX_PATH="$ROCM_ROOT" \
+            -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF 2>&1 | tail -n 40
+          time cmake --build "$W/build" --target test-backend-ops -j "$(nproc)"
+      - name: Devices
+        run: |
+          "$W/build/bin/test-backend-ops" support -o NO_SUCH_OP 2>&1 | head -40
+          "$W/build/bin/test-backend-ops" --list-ops 2>&1 | grep -E 'ROPE_PE_PERMUTE|MODULATE_ROWS|SWIGLU_SCALED' || echo "new ops not in this build"
+      - name: Epilogue kernel trace (HIP runtime log)
+        continue-on-error: true
+        run: |
+          B="$W/build/bin/test-backend-ops"
+          for fuse in 1 0; do
+            for p in 'mode=0,k=256,n=384,m=512,inplace=0' 'mode=1,k=256,n=384,m=512,inplace=0' 'mode=2,k=256,n=384,m=512,inplace=1' 'mode=0,k=128,n=64,m=4,inplace=0'; do
+              GGML_CUDA_CUBLAS_EPILOGUE_FUSION=$fuse AMD_LOG_LEVEL=4 "$B" test -b ROCm0 -o SD18_MM_EPILOGUE -p "$p" > "$W/logs/trace.log" 2>&1
+              echo "fusion=$fuse $p: result=$(grep -oE 'SD18_MM_EPILOGUE.*(OK|FAIL)' "$W/logs/trace.log" | sed 's/\x1b\[[0-9;]*m//g' | tail -n 1 | grep -oE '(OK|FAIL)$') epilogue_kernel_lines=$(grep -c k_cublas_f16_epilogue "$W/logs/trace.log") kernels=[$(grep -oE 'ShaderName : [^ ]+' "$W/logs/trace.log" | awk '{print $3}' | sed -E 's/^_Z[0-9]+//' | cut -c1-40 | sort | uniq -c | tr -s ' ' | tr '\n' ';')]"
+            done
+          done
+      - name: test-backend-ops ROCm0
+        run: bash "$W/scripts/run_tests.sh" "$W/build/bin/test-backend-ops" ROCm0 "${{ matrix.variant }}" "$W/logs/tbo"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-hip-${{ matrix.variant }}
+          path: ${{ runner.temp }}/w/logs
+          if-no-files-found: ignore
+
+  vulkan:
+    name: linux-vulkan-${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, baseline]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Workdir and scripts
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"
+          mkdir -p "$W"/tmp "$W"/scripts "$W"/logs
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$W/pipcache" >> "$GITHUB_ENV"
+          for f in prep.sh inject.py run_tests.sh; do
+            curl -fsSL -o "$W/scripts/$f" "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/sd18/$f"
+          done
+          chmod +x "$W"/scripts/*.sh
+      - name: Hardware and Vulkan driver probe
+        run: |
+          uname -a; id; nproc; free -h
+          ls -l /dev/dri 2>&1 || true
+          ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>&1 || true
+          dpkg -l | grep -iE 'vulkan|mesa' | head -20 || true
+          docker info 2>&1 | head -3 || true
+          ls /var/lib/apt/lists | head -5 || true
+      - name: Install cmake, ninja, LunarG Vulkan SDK
+        run: |
+          set -euo pipefail
+          python3 -m venv "$W/venv"
+          "$W/venv/bin/pip" install -q cmake ninja
+          echo "$W/venv/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 -o "$W/vk.tar.xz" https://sdk.lunarg.com/sdk/download/1.4.363.0/linux/vulkansdk-linux-x86_64-1.4.363.0.tar.xz \
+            || curl -fsSL --retry 3 -o "$W/vk.tar.xz" https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
+          mkdir -p "$W/vulkansdk"
+          tar -xf "$W/vk.tar.xz" -C "$W/vulkansdk"
+          SDK="$(ls -d "$W"/vulkansdk/*/x86_64 | head -n 1)"
+          echo "VULKAN_SDK=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/bin" >> "$GITHUB_PATH"
+          LDP="$SDK/lib"
+          if ! ls /usr/share/vulkan/icd.d/radeon_icd*.json /etc/vulkan/icd.d/radeon_icd*.json >/dev/null 2>&1; then
+            echo "No system RADV ICD, extracting mesa-vulkan-drivers without root"
+            mkdir -p "$W/mesa/debs" && cd "$W/mesa/debs"
+            pkgs="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances mesa-vulkan-drivers 2>/dev/null | grep -E '^[a-z0-9]' | sort -u || true)"
+            for p in $pkgs; do dpkg -s "$p" >/dev/null 2>&1 || apt-get download "$p" >/dev/null 2>&1 || echo "could not download $p"; done
+            for d in *.deb; do dpkg -x "$d" "$W/mesa/root"; done
+            J="$(ls "$W"/mesa/root/usr/share/vulkan/icd.d/radeon_icd*.json | head -n 1)"
+            sed "s#/usr/lib#$W/mesa/root/usr/lib#" "$J" > "$W/mesa/radeon_icd.json"
+            cat "$W/mesa/radeon_icd.json"
+            echo "VK_DRIVER_FILES=$W/mesa/radeon_icd.json" >> "$GITHUB_ENV"
+            LDP="$LDP:$W/mesa/root/usr/lib/x86_64-linux-gnu"
+          fi
+          echo "LD_LIBRARY_PATH=$LDP" >> "$GITHUB_ENV"
+      - name: vulkaninfo
+        run: vulkaninfo --summary 2>&1 | head -60 || true
+      - name: Prepare sources (${{ matrix.variant }})
+        run: bash "$W/scripts/prep.sh" "${{ matrix.variant }}" "$W/src"
+      - name: Build test-backend-ops (GGML_VULKAN)
+        run: |
+          set -euo pipefail
+          cd "$W/src/sd"
+          cmake -S ggml -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF 2>&1 | tail -n 30
+          time cmake --build "$W/build" --target test-backend-ops -j "$(nproc)"
+      - name: Devices
+        run: |
+          "$W/build/bin/test-backend-ops" support -o NO_SUCH_OP 2>&1 | head -40
+      - name: test-backend-ops Vulkan0
+        run: bash "$W/scripts/run_tests.sh" "$W/build/bin/test-backend-ops" Vulkan0 "${{ matrix.variant }}" "$W/logs/tbo"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-vulkan-${{ matrix.variant }}
+          path: ${{ runner.temp }}/w/logs
+          if-no-files-found: ignore
+
+  windows:
+    name: windows-vulkan-patched
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Workdir, scripts, probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP 'w'
+          New-Item -ItemType Directory -Force -Path "$W\scripts","$W\logs","$W\tmp" | Out-Null
+          foreach ($f in 'prep.sh','inject.py','run_tests.sh') {
+            Invoke-WebRequest -UseBasicParsing -OutFile "$W\scripts\$f" -Uri "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/sd18/$f"
+          }
+          Add-Content $env:GITHUB_ENV "W=$W"
+          Add-Content $env:GITHUB_ENV "TMP=$W\tmp"
+          Add-Content $env:GITHUB_ENV "TEMP=$W\tmp"
+          $git = (Get-Command git).Source
+          $gitRoot = Split-Path (Split-Path $git)
+          $bash = Join-Path $gitRoot 'bin\bash.exe'
+          Write-Host "git=$git bash=$bash exists=$(Test-Path $bash)"
+          Add-Content $env:GITHUB_ENV "GITBASH=$bash"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-Table -AutoSize
+          Get-ChildItem C:\Windows\System32\vulkan-1.dll
+          exit 0
+      - name: Install Vulkan SDK and ninja
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $installer = "$env:W\VulkanSDK-Installer.exe"
+          $sdkRoot = "$env:W\VulkanSDK"
+          curl.exe --fail --location --retry 3 --silent --show-error --output $installer "https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe"
+          if ($LASTEXITCODE -ne 0) {
+            curl.exe --fail --location --retry 3 --silent --show-error --output $installer "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $p = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+          python -m venv "$env:W\venv"
+          & "$env:W\venv\Scripts\python.exe" -m pip install -q ninja
+          Add-Content $env:GITHUB_PATH "$env:W\venv\Scripts"
+          & "$sdkRoot\Bin\glslc.exe" --version
+          & "$sdkRoot\Bin\vulkaninfoSDK.exe" --summary 2>&1 | Select-Object -First 40
+          exit 0
+      - name: Prepare sources (patched)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:PYTHON = 'python'
+          $Wu = $env:W -replace '\\','/'
+          & $env:GITBASH -l "$Wu/scripts/prep.sh" patched "$Wu/src"
+          exit $LASTEXITCODE
+      - name: Build sd-cli + sd-server (SD_VULKAN) and test-backend-ops (GGML_VULKAN)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSROOT=%%i
+          echo VSROOT=%VSROOT%
+          call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          where cmake ninja cl glslc
+          cd /d "%W%\src\sd"
+          cmake -S . -B "%W%\build-sd" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=/bigobj -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_VULKAN=ON -DGGML_NATIVE=OFF || exit /b 1
+          cmake --build "%W%\build-sd" --config Release -j 16 --target sd-cli sd-server || exit /b 1
+          dir "%W%\build-sd\bin"
+          cmake -S ggml -B "%W%\build-ggml" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF || exit /b 1
+          cmake --build "%W%\build-ggml" --config Release -j 16 --target test-backend-ops || exit /b 1
+          dir "%W%\build-ggml\bin"
+      - name: sd-cli smoke
+        shell: cmd
+        run: |
+          "%W%\build-sd\bin\sd-cli.exe" --help > "%W%\logs\sd-cli-help.txt" 2>&1
+          echo sd-cli --help exit %ERRORLEVEL%
+          powershell -Command "Get-Content '%W%\logs\sd-cli-help.txt' -TotalCount 8"
+          exit /b 0
+      - name: test-backend-ops Vulkan0
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & "$env:W\build-ggml\bin\test-backend-ops.exe" support -o NO_SUCH_OP 2>&1 | Select-Object -First 30
+          $Wu = $env:W -replace '\\','/'
+          & $env:GITBASH -l "$Wu/scripts/run_tests.sh" "$Wu/build-ggml/bin/test-backend-ops.exe" Vulkan0 patched "$Wu/logs/tbo"
+          exit $LASTEXITCODE
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-vulkan-patched
+          path: ${{ runner.temp }}/w/logs
+          if-no-files-found: ignore
