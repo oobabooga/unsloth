@@ -1,0 +1,330 @@
+name: PR 13059 engine check
+
+on:
+  push:
+    branches: [pr13059-engines-ci]
+
+permissions: {}
+
+env:
+  BASE_SHA: bc915c0563493c1db63ada7647126cb8f4bb37e1
+  PR_SHA: 93b30433bda77c09387307df18a02198ec4f3e32
+
+jobs:
+  engine:
+    name: ${{ matrix.engine }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, engine: chromium }
+          - { os: ubuntu-latest, engine: webkit }
+          - { os: macos-latest, engine: webkit }
+          - { os: windows-latest, engine: msedge }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch main and main + PR 13059 (studio/frontend only)
+        run: |
+          set -euo pipefail
+          for side in base pr; do
+            if [ "$side" = base ]; then url=https://github.com/unslothai/unsloth; sha=$BASE_SHA; else url=https://github.com/oobabooga/unsloth; sha=$PR_SHA; fi
+            git init -q "$side"
+            git -C "$side" sparse-checkout set --no-cone /studio/frontend/
+            git -C "$side" fetch -q --depth 1 --filter=blob:none "$url" "$sha"
+            git -C "$side" checkout -q FETCH_HEAD
+            echo "$side at $(git -C "$side" rev-parse HEAD)"
+          done
+          # Same harness page in both arms: the PR's agent-shaped, streaming smoke page.
+          cp pr/studio/frontend/smoke-thread-weight-main.tsx base/studio/frontend/smoke-thread-weight-main.tsx
+      - name: Build the smoke page for both arms (production)
+        run: |
+          set -euo pipefail
+          for side in base pr; do
+            (
+              cd "$side/studio/frontend"
+              npm ci --no-audit --no-fund --loglevel=error
+              cat > vite.ci.config.mts <<'CFGEOF'
+          import base from "./vite.config.ts";
+          import { mergeConfig } from "vite";
+          import { resolve } from "node:path";
+          const cfg = typeof base === "function" ? await (base as any)({ command: "build", mode: "production" }) : base;
+          export default mergeConfig(cfg, {
+            build: {
+              outDir: process.env.SMOKE_OUT,
+              emptyOutDir: true,
+              rollupOptions: {
+                input: resolve(process.cwd(), "smoke-thread-weight.html"),
+                onLog(level: any, log: any, handler: any) {
+                  if (log.code === "INEFFECTIVE_DYNAMIC_IMPORT") return;
+                  handler(level, log);
+                },
+              },
+            },
+          });
+          CFGEOF
+              SMOKE_OUT="$GITHUB_WORKSPACE/dist-$side" npx vite build --config vite.ci.config.mts > "$GITHUB_WORKSPACE/build-$side.log" 2>&1 || { tail -40 "$GITHUB_WORKSPACE/build-$side.log"; exit 1; }
+            )
+            ls "dist-$side/smoke-thread-weight.html"
+          done
+      - name: Install Playwright
+        run: |
+          set -euo pipefail
+          python -m pip install -q playwright==1.54.0
+          case "${{ matrix.engine }}" in
+            chromium) python -m playwright install --with-deps chromium ;;
+            webkit) if [ "$RUNNER_OS" = Linux ]; then python -m playwright install --with-deps webkit; else python -m playwright install webkit; fi ;;
+            msedge) echo "using the preinstalled Edge (the WebView2 engine)" ;;
+          esac
+      - name: Hardware
+        run: |
+          python -c "import os, platform; print(platform.platform(), os.cpu_count(), 'cpus')"
+      - name: Parity and timing, main vs main + PR 13059
+        run: |
+          set -euo pipefail
+          cat > engines_check.py <<'PYEOF'
+          """Base vs #13059 on one browser engine: render parity through the gated paths, then timing.
+
+          usage: engines_check.py ENGINE BASE_DIST PR_DIST [SIZES] [REPS]
+          ENGINE: chromium | webkit | msedge
+          Exits 1 if any parity check fails on either side or the two sides render differently.
+          """
+
+          import hashlib, json, statistics, subprocess, sys, time
+          from playwright.sync_api import sync_playwright
+
+          ENGINE, BASE_DIST, PR_DIST = sys.argv[1], sys.argv[2], sys.argv[3]
+          SIZES = [int(x) for x in (sys.argv[4] if len(sys.argv) > 4 else "800,2000").split(",")]
+          REPS = int(sys.argv[5]) if len(sys.argv) > 5 else 2
+          PORTS = {"base": 8791, "pr": 8792}
+          DIRS = {"base": BASE_DIST, "pr": PR_DIST}
+          AGENT = "{agent: {rounds: 3, compactionEvery: 4}}"
+          KEYS = "the quick brown fox jumps"
+          servers = [subprocess.Popen([sys.executable, "-m", "http.server", str(p), "--bind", "127.0.0.1", "--directory", DIRS[s]],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for s, p in PORTS.items()]
+          time.sleep(2)
+          failures = []
+
+
+          def check(side, name, ok, detail=""):
+              print(f"  [{side}] {'PASS' if ok else 'FAIL'} {name} {detail}", flush=True)
+              if not ok:
+                  failures.append(f"{side}: {name} {detail}")
+
+
+          def open_page(browser, side, n, stream=0):
+              ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
+              page = ctx.new_page()
+              page.set_default_timeout(15000)
+              errors = []
+              page.on("pageerror", lambda e: errors.append(str(e)))
+              q = "remote=1" + (f"&stream={stream}" if stream else "")
+              page.goto(f"http://127.0.0.1:{PORTS[side]}/smoke-thread-weight.html?{q}")
+              page.wait_for_function("window.__threadWeight !== undefined", timeout=120000)
+              page.evaluate(f"window.__threadWeight.seed({n}, {AGENT})")
+              page.wait_for_function(f"window.__threadWeight.messageCount() >= {n}", timeout=300000)
+              return ctx, page, errors
+
+
+          # Message content only: action bars, branch pickers and timestamps vary with hover and branch count.
+          CHROME = ".aui-user-message-footer, .aui-assistant-message-footer, .aui-user-action-bar-root, .aui-assistant-action-bar-root, .aui-user-branch-picker, [class*='branch-picker'], .aui-user-message-time, .aui-user-message-time-trigger"
+          ROWS_JS = """() => Array.from(document.querySelectorAll('[data-role]')).map(e => {
+            const c = e.cloneNode(true);
+            c.querySelectorAll(%r).forEach(x => x.remove());
+            return e.getAttribute('data-role') + '|' + c.textContent;
+          })""" % CHROME
+
+
+          def rows(page):
+              """Per-row text once two reads 1s apart agree (deferred renderers settle)."""
+              last = None
+              for _ in range(30):
+                  cur = page.evaluate(ROWS_JS)
+                  if cur == last:
+                      return cur
+                  last = cur
+                  page.wait_for_timeout(1000)
+              return last
+
+
+          def digest(items):
+              return hashlib.sha256("\n\x00".join(items).encode()).hexdigest()[:16]
+
+
+          def wait_idle(page, timeout=120000):
+              page.wait_for_function("!window.__threadWeight.isRunning()", timeout=timeout, polling=100)
+
+
+          def parity(browser, side):
+              out = {}
+              ctx, page, errors = open_page(browser, side, 120, stream=20)
+              r0 = rows(page)
+              out["seeded_rows"] = digest(r0)
+              out["notices"] = page.locator('[data-testid="compaction-notice"]').count()
+              check(side, "seeded 120 rows", len(r0) == 120, f"rows={len(r0)} notices={out['notices']}")
+              check(side, "compaction notices rendered", out["notices"] > 0, f"count={out['notices']}")
+
+              # 1. Thread composer keystrokes: the gate tells no row. Composer must still update, rows unchanged.
+              page.locator('[aria-label="Message input"]').first.click()
+              page.keyboard.type(KEYS)
+              page.wait_for_timeout(300)
+              check(side, "thread composer state", page.evaluate("window.__threadWeight.composerText()") == KEYS)
+              check(side, "thread composer textarea", page.locator('[aria-label="Message input"]').first.input_value() == KEYS)
+              check(side, "rows unchanged by typing", rows(page) == r0)
+              page.keyboard.press("ControlOrMeta+a")
+              page.keyboard.press("Backspace")
+
+              # 2. Hover and edit an EARLY user row (index 2): message-state change far from the tail.
+              user = page.locator(".aui-user-message-root").nth(1)
+              user.scroll_into_view_if_needed()
+              user.hover()
+              edit = user.locator(".aui-user-action-edit")
+              try:
+                  edit.wait_for(state="visible", timeout=5000)
+                  hovered = True
+              except Exception:
+                  hovered = False
+              check(side, "hover reveals early row's Edit", hovered)
+              if hovered:
+                  edit.click()
+                  box = page.locator(".aui-edit-composer-input").first
+                  box.wait_for(state="visible", timeout=5000)
+                  submit = page.locator(".aui-edit-composer-footer button[type=submit]").first
+                  box.fill("")
+                  page.wait_for_timeout(200)
+                  disabled_empty = submit.is_disabled()
+                  box.type("edited prompt")
+                  page.wait_for_timeout(200)
+                  enabled_text = submit.is_enabled()
+                  box.fill("")
+                  page.wait_for_timeout(200)
+                  disabled_again = submit.is_disabled()
+                  check(side, "edit Send disabled when empty", disabled_empty)
+                  check(side, "edit Send enabled after typing", enabled_text)
+                  check(side, "edit Send disabled after clearing", disabled_again)
+                  page.locator(".aui-edit-composer-footer button[type=button]").first.click()
+                  page.wait_for_timeout(500)
+                  check(side, "cancel restores rows", rows(page) == r0)
+
+              # 3. Stream a reply to completion (delta reaches only the last rows; completion reaches all).
+              page.evaluate("window.__threadWeight.send('stream one')")
+              page.wait_for_function("window.__threadWeight.isRunning()", timeout=30000)
+              wait_idle(page)
+              r1 = rows(page)
+              expected = " ".join(f"word{i}" for i in range(20))
+              check(side, "streamed reply complete", len(r1) == 122 and expected in r1[-1], f"rows={len(r1)}")
+              check(side, "earlier rows untouched by stream", r1[:120] == r0)
+              out["after_stream"] = digest(r1)
+
+              # 4. Same-length branch switch: edit the last user message, then go back to the first branch.
+              last_user = page.locator(".aui-user-message-root").last
+              last_user.scroll_into_view_if_needed()
+              last_user.hover()
+              last_user.locator(".aui-user-action-edit").click()
+              box = page.locator(".aui-edit-composer-input").first
+              box.fill("stream two")
+              page.locator(".aui-edit-composer-footer button[type=submit]").first.click()
+              page.wait_for_function("window.__threadWeight.isRunning()", timeout=30000)
+              wait_idle(page)
+              r2 = rows(page)
+              check(side, "edit made a sibling branch", len(r2) == 122 and "stream two" in r2[-2], f"rows={len(r2)}")
+              out["after_edit"] = digest(r2)
+              last_user = page.locator(".aui-user-message-root").last
+              last_user.scroll_into_view_if_needed()
+              last_user.hover()
+              prev = last_user.locator('[aria-label="Previous"]')
+              try:
+                  prev.click(timeout=5000)
+                  page.wait_for_timeout(800)
+                  r3 = rows(page)
+                  check(side, "same-length branch switch shows the first branch again", r3 == r1,
+                        f"rows={len(r3)} last_user_ok={'stream one' in r3[-2]}")
+                  state = last_user.locator(".aui-branch-picker-state").first.text_content(timeout=5000) or ""
+                  check(side, "branch picker reads 1/2 after switching back", state.replace(" ", "") == "1/2", repr(state))
+                  out["after_switch"] = digest(r3)
+              except Exception as e:
+                  check(side, "branch picker reachable", False, str(e)[:120])
+              check(side, "no page errors", not errors, "; ".join(errors[:3]))
+              ctx.close()
+              return out
+
+
+          def perf(browser, side, n):
+              ctx, page, _ = open_page(browser, side, n)
+              page.wait_for_timeout(2000)
+              page.locator('[aria-label="Message input"]').first.click()
+              times = []
+              for ch in KEYS:
+                  page.evaluate("window.__t0 = performance.now()")
+                  page.keyboard.press(ch if ch != " " else "Space")
+                  times.append(page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(performance.now() - window.__t0))))"))
+              typed_ok = page.evaluate("window.__threadWeight.composerText()") == KEYS
+              ctx.close()
+              ctx, page, _ = open_page(browser, side, n, stream=200)
+              page.wait_for_timeout(2000)
+              t0 = time.time()
+              page.evaluate("window.__threadWeight.send('go')")
+              page.wait_for_function("window.__threadWeight.isRunning()", timeout=30000)
+              wait_idle(page, timeout=900000)
+              wall = time.time() - t0
+              ctx.close()
+              return statistics.median(times), wall, typed_ok
+
+
+          try:
+              with sync_playwright() as p:
+                  if ENGINE == "webkit":
+                      browser = p.webkit.launch(headless=True)
+                  elif ENGINE == "msedge":
+                      browser = p.chromium.launch(channel="msedge", headless=True)
+                  else:
+                      browser = p.chromium.launch(headless=True)
+                  print(f"engine={ENGINE} version={browser.version}", flush=True)
+
+                  print("== parity (120 agent messages, compaction every 4, stream=20)", flush=True)
+                  res = {}
+                  for side in ("base", "pr"):
+                      try:
+                          res[side] = parity(browser, side)
+                      except Exception as e:
+                          check(side, "parity run crashed", False, str(e).splitlines()[0][:200])
+                          res[side] = {}
+                  for key in sorted(set(res["base"]) | set(res["pr"])):
+                      same = res["base"].get(key) == res["pr"].get(key)
+                      print(f"  base vs pr {key}: {'SAME' if same else 'DIFFERENT'} {res['base'].get(key)} {res['pr'].get(key)}", flush=True)
+                      if not same:
+                          failures.append(f"base vs pr differ on {key}")
+
+                  print("== timing (keystroke p50 to paint, 200-chunk stream wall time)", flush=True)
+                  timing = {}
+                  for n in SIZES:
+                      for rep in range(REPS):
+                          for side in (["base", "pr"] if rep % 2 == 0 else ["pr", "base"]):
+                              k, w, ok = perf(browser, side, n)
+                              timing.setdefault((n, side), []).append((k, w))
+                              print(f"  n={n} rep={rep} {side}: key_p50={k:.1f}ms stream200={w:.1f}s typed_ok={ok}", flush=True)
+                              if not ok:
+                                  failures.append(f"{side} n={n} typed text wrong")
+                  print("== summary", flush=True)
+                  for n in SIZES:
+                      b, q = timing[(n, "base")], timing[(n, "pr")]
+                      print(f"  {ENGINE} n={n}: key_p50 base {statistics.median(x[0] for x in b):.1f}ms -> pr {statistics.median(x[0] for x in q):.1f}ms | "
+                            f"stream200 base {statistics.median(x[1] for x in b):.1f}s -> pr {statistics.median(x[1] for x in q):.1f}s", flush=True)
+                  browser.close()
+          finally:
+              for s in servers:
+                  s.terminate()
+
+          print("FAILURES:\n  " + "\n  ".join(failures) if failures else "ALL PARITY CHECKS PASSED")
+          sys.exit(1 if failures else 0)
+          PYEOF
+          python -I engines_check.py "${{ matrix.engine }}" dist-base dist-pr 800,2000 2
