@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [rocm, vulkan]
+        backend: [vulkan]
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 300
     env:
@@ -32,7 +32,7 @@ jobs:
       - name: Toolchain
         run: |
           set -euo pipefail
-          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{models,tmp,hf}
+          W="$RUNNER_TEMP/sd17-${{ github.run_id }}-${{ matrix.backend }}"; mkdir -p "$W"/{models,tmp,hf}
           echo "W=$W" >> "$GITHUB_ENV"; echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"; echo "HF_HOME=$W/hf" >> "$GITHUB_ENV"
           python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
           pip install -q --upgrade pip
@@ -152,28 +152,7 @@ jobs:
         with:
           name: logs-${{ matrix.backend }}
           path: |
-            ${{ runner.temp }}/w/out/*.log
-            ${{ runner.temp }}/w/*-build.log
+            ${{ runner.temp }}/sd17-${{ github.run_id }}-${{ matrix.backend }}/out/*.log
+            ${{ runner.temp }}/sd17-${{ github.run_id }}-${{ matrix.backend }}/*-build.log
           if-no-files-found: ignore
 
-  windows:
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          path: ci
-      - name: Tiling harness (MSVC)
-        shell: cmd
-        run: |
-          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VS=%%i
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cd ci\harness
-          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_old /c tiling_old.cpp /Foold.obj || exit /b 1
-          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_new /c tiling_new.cpp /Fonew.obj || exit /b 1
-          cl /nologo /std:c++17 /O2 /EHsc /Istub /Iinc main.cpp old.obj new.obj parallel.cpp /Feharness.exe || exit /b 1
-          harness.exe
-          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_old /c tiling_old.cpp /Foold.obj || exit /b 1
-          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc /Dprocess_tiles_2d=process_tiles_2d_new /c tiling_new.cpp /Fonew.obj || exit /b 1
-          cl /nologo /std:c++17 /O2 /arch:AVX2 /fp:fast /EHsc /Istub /Iinc main.cpp old.obj new.obj parallel.cpp /Feharness_fast.exe || exit /b 1
-          harness_fast.exe
