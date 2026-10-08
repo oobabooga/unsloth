@@ -1,7 +1,18 @@
 diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
-index 7fdeb507f3..cf117c5ac4 100644
+index 7fdeb507f3..f4f50e31ab 100644
 --- a/studio/backend/core/inference/diffusion_attention.py
 +++ b/studio/backend/core/inference/diffusion_attention.py
+@@ -136,8 +136,8 @@ SDPA_MATH = "math"
+ _SDPA_SUBQUADRATIC = (SDPA_FLASH, SDPA_MEM_EFFICIENT, SDPA_CUDNN)
+ 
+ _SDPA_PROBE_LOCK = threading.Lock()
+-# (device type, dtype name) -> the kernels that ran. A kernel cannot appear or vanish under a running interpreter, so
+-# one probe per device/dtype for the life of the process.
++# (device type, dtype name) -> the kernels that ran. Kernels do not appear or vanish under a running interpreter; the
++# cache is cleared when guard_rocm_windows_fused_sdpa switches a backend off.
+ _SDPA_PROBE_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
+ 
+ 
 @@ -155,9 +155,15 @@ def _probe_sdpa_kernels(device: str, dtype: Any) -> tuple[str, ...]:
      # Small enough to be free, but shaped like real attention: the fused kernels reject head_dim they cannot serve, and
      # a degenerate 1-element tensor would not exercise that.
@@ -19,7 +30,7 @@ index 7fdeb507f3..cf117c5ac4 100644
              continue
          try:
              with sdpa_kernel([backend]):
-@@ -247,6 +253,109 @@ def warn_if_sdpa_math_only(target: Any, logger: Any = None) -> bool:
+@@ -247,6 +253,127 @@ def warn_if_sdpa_math_only(target: Any, logger: Any = None) -> bool:
      return True
  
  
@@ -27,6 +38,7 @@ index 7fdeb507f3..cf117c5ac4 100644
 +# kernel pack) fail with hipErrorInvalidValue, raised only at the next checked launch, so a generation dies on an
 +# unrelated op. `import unsloth` turns those backends off (fix_rocm_windows_fused_sdpa); this process never imports it.
 +ROCM_FUSED_SDPA_ALLOW_ENV = "UNSLOTH_ALLOW_ROCM_FUSED_SDPA"
++_ROCM_FUSED_SDPA_LOCK = threading.Lock()
 +# (device, dtype) -> fused backends that failed there. Only answers are cached.
 +_ROCM_FUSED_SDPA_BROKEN: dict[tuple[str, str], tuple[str, ...]] = {}
 +
@@ -38,20 +50,29 @@ index 7fdeb507f3..cf117c5ac4 100644
 +    from torch.nn.attention import SDPBackend, sdpa_kernel
 +
 +    # The denoiser's non-causal head-128 attention, a text encoder's causal one, and #12639's small probe.
-+    shapes = (((1, 4, 1024, 128), False), ((1, 4, 256, 128), True), ((1, 2, 16, 64), True))
++    g = torch.Generator(device = device).manual_seed(0)
++    cases = [
++        (
++            tuple(torch.randn(*shape, device = device, dtype = dtype, generator = g) for _ in range(3)),
++            causal,
++        )
++        for shape, causal in (
++            ((1, 4, 1024, 128), False),
++            ((1, 4, 256, 128), True),
++            ((1, 2, 16, 64), True),
++        )
++    ]
 +
-+    def attend(backend: Any, shape: tuple, causal: bool) -> Any:
-+        g = torch.Generator(device = device).manual_seed(0)
-+        q, k, v = (torch.randn(*shape, device = device, dtype = dtype, generator = g) for _ in range(3))
++    def attend(backend: Any, qkv: tuple, causal: bool) -> Any:
 +        with sdpa_kernel([backend]):
-+            out = F.scaled_dot_product_attention(q, k, v, is_causal = causal)
++            out = F.scaled_dot_product_attention(*qkv, is_causal = causal)
 +        out = out.float()  # checked launch: a failed attention launch raises here
 +        out.sum().item()
 +        return out
 +
 +    with torch.no_grad():
 +        try:
-+            reference = [attend(SDPBackend.MATH, shape, causal) for shape, causal in shapes]
++            reference = [attend(SDPBackend.MATH, qkv, causal) for qkv, causal in cases]
 +        except Exception:  # noqa: BLE001 - math fails too: nothing to learn about the fused kernels
 +            return None
 +        broken = []
@@ -59,9 +80,9 @@ index 7fdeb507f3..cf117c5ac4 100644
 +            (SDPA_FLASH, SDPBackend.FLASH_ATTENTION),
 +            (SDPA_MEM_EFFICIENT, SDPBackend.EFFICIENT_ATTENTION),
 +        ):
-+            for (shape, causal), ref in zip(shapes, reference):
++            for (qkv, causal), ref in zip(cases, reference):
 +                try:
-+                    ok = torch.allclose(attend(backend, shape, causal), ref, atol = 2e-2, rtol = 2e-2)
++                    ok = torch.allclose(attend(backend, qkv, causal), ref, atol = 2e-2, rtol = 2e-2)
 +                except Exception as exc:  # noqa: BLE001
 +                    # The dispatcher refusing a shape is not a broken kernel: it never picks it there.
 +                    ok = "No available kernel" in str(exc)
@@ -74,14 +95,15 @@ index 7fdeb507f3..cf117c5ac4 100644
 +def guard_rocm_windows_fused_sdpa(target: Any, logger: Any = None) -> tuple[str, ...]:
 +    """On Windows ROCm, turn off the fused SDPA backends that fail on ``target``, so attention runs on math.
 +
-+    Process-wide, like the flags it sets; probe-gated, so a healthy wheel keeps its kernels. Returns what it turned off.
-+    ``UNSLOTH_ALLOW_ROCM_FUSED_SDPA=1`` skips it."""
++    Process-wide, like the flags it sets, and re-applied on every load; probe-gated, so a healthy wheel keeps its
++    kernels. Returns what it turned off. ``UNSLOTH_ALLOW_ROCM_FUSED_SDPA=1`` skips it."""
 +    import sys
 +
 +    if sys.platform != "win32" or not _is_cuda_rocm(target):
 +        return ()
 +    if os.environ.get(ROCM_FUSED_SDPA_ALLOW_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
 +        return ()
++    fresh = False
 +    try:
 +        import torch
 +
@@ -92,27 +114,34 @@ index 7fdeb507f3..cf117c5ac4 100644
 +        if dtype not in (torch.float16, torch.bfloat16):
 +            # The fused kernels are half precision only; an fp32 pipeline still runs a half-precision text encoder.
 +            from core.inference.rocm_bf16 import rocm_bf16_supported
-+
-+            dtype = torch.bfloat16 if rocm_bf16_supported(torch, torch.device(device).index) else torch.float16
++            dtype = (
++                torch.bfloat16
++                if rocm_bf16_supported(torch, torch.device(device).index)
++                else torch.float16
++            )
 +        key = (device, str(dtype))
-+        broken = _ROCM_FUSED_SDPA_BROKEN.get(key)
-+        if broken is None:
-+            broken = _rocm_windows_failing_sdpa_backends(device, dtype)
++        with _ROCM_FUSED_SDPA_LOCK:
++            broken = _ROCM_FUSED_SDPA_BROKEN.get(key)
 +            if broken is None:
-+                return ()
-+            _ROCM_FUSED_SDPA_BROKEN[key] = broken
-+            if broken:
-+                # An earlier answer counted the backends being turned off now.
-+                with _SDPA_PROBE_LOCK:
-+                    _SDPA_PROBE_CACHE.clear()
-+        if SDPA_FLASH in broken:
-+            torch.backends.cuda.enable_flash_sdp(False)
-+        if SDPA_MEM_EFFICIENT in broken:
-+            torch.backends.cuda.enable_mem_efficient_sdp(False)
++                broken = _rocm_windows_failing_sdpa_backends(device, dtype)
++                if broken is None:
++                    return ()
++                _ROCM_FUSED_SDPA_BROKEN[key] = broken
++                fresh = True
++            if SDPA_FLASH in broken:
++                torch.backends.cuda.enable_flash_sdp(False)
++            if SDPA_MEM_EFFICIENT in broken:
++                torch.backends.cuda.enable_mem_efficient_sdp(False)
++        if fresh and broken:
++            # After the flags: a kernel list cached before them still counts what was just switched off.
++            with _SDPA_PROBE_LOCK:
++                _SDPA_PROBE_CACHE.clear()
 +    except Exception as exc:  # noqa: BLE001 - a probe is a guard, never a load failure
-+        _module_logger().info("diffusion.attention: skipped the Windows ROCm fused SDPA check (%s)", exc)
++        _module_logger().info(
++            "diffusion.attention: skipped the Windows ROCm fused SDPA check (%s)", exc
++        )
 +        return ()
-+    if broken:
++    if fresh and broken:
 +        names = " or ".join("flash" if b == SDPA_FLASH else "memory-efficient" for b in broken)
 +        (logger or _module_logger()).warning(
 +            "diffusion.attention: this Windows ROCm torch cannot run %s attention on %s (%s); using %s instead "
@@ -129,7 +158,7 @@ index 7fdeb507f3..cf117c5ac4 100644
  def select_attention_backend(
      target: Any,
      requested: Optional[str],
-@@ -1776,6 +1885,8 @@ def apply_attention_backend(
+@@ -1776,6 +1903,8 @@ def apply_attention_backend(
      a fresh transformer's processors follow it (default None). So a load wanting native must
      restore it explicitly, else it inherits a backend an earlier load pinned (e.g. cuDNN under a
      speed profile), breaking the ``off`` guarantee. Best-effort."""
@@ -139,10 +168,10 @@ index 7fdeb507f3..cf117c5ac4 100644
          s
          for s in (getattr(t, "set_attention_backend", None) for t in _attention_dits(pipe))
 diff --git a/studio/backend/tests/test_diffusion_attention.py b/studio/backend/tests/test_diffusion_attention.py
-index ce4bc63a44..dadef14673 100644
+index ce4bc63a44..59e5e740b4 100644
 --- a/studio/backend/tests/test_diffusion_attention.py
 +++ b/studio/backend/tests/test_diffusion_attention.py
-@@ -1065,3 +1065,158 @@ def test_an_unanswerable_probe_is_not_memoised(monkeypatch):
+@@ -1065,3 +1065,183 @@ def test_an_unanswerable_probe_is_not_memoised(monkeypatch):
      assert att.available_sdpa_kernels(_target()) == ("flash", "math")
      assert att.available_sdpa_kernels(_target()) == ("flash", "math")
      assert len(calls) == 2, "the answer must be memoised; the failure must not be"
@@ -155,7 +184,10 @@ index ce4bc63a44..dadef14673 100644
 +def _sdp_flags():
 +    """The guard flips process-wide torch flags; put them back."""
 +    torch = pytest.importorskip("torch")
-+    before = (torch.backends.cuda.flash_sdp_enabled(), torch.backends.cuda.mem_efficient_sdp_enabled())
++    before = (
++        torch.backends.cuda.flash_sdp_enabled(),
++        torch.backends.cuda.mem_efficient_sdp_enabled(),
++    )
 +    att._ROCM_FUSED_SDPA_BROKEN.clear()
 +    yield torch
 +    torch.backends.cuda.enable_flash_sdp(before[0])
@@ -163,9 +195,16 @@ index ce4bc63a44..dadef14673 100644
 +    att._ROCM_FUSED_SDPA_BROKEN.clear()
 +
 +
-+def _windows_rocm(monkeypatch, verdict, calls = None):
-+    monkeypatch.setattr(sys, "platform", "win32")
-+    monkeypatch.setattr(att, "_is_cuda_rocm", lambda target: True)
++def _windows_rocm(
++    monkeypatch,
++    verdict,
++    calls = None,
++    *,
++    platform = "win32",
++    rocm = True,
++):
++    monkeypatch.setattr(sys, "platform", platform)
++    monkeypatch.setattr(att, "_is_cuda_rocm", lambda target: rocm)
 +    monkeypatch.delenv(att.ROCM_FUSED_SDPA_ALLOW_ENV, raising = False)
 +
 +    def _failing(device, dtype):
@@ -181,15 +220,15 @@ index ce4bc63a44..dadef14673 100644
 +    # launch, so an image generation died on an unrelated op. The guard turns both off; math runs instead.
 +    torch = _sdp_flags
 +    calls: list = []
-+    _windows_rocm(monkeypatch, ("flash", "mem_efficient"), calls)
++    _windows_rocm(monkeypatch, (att.SDPA_FLASH, att.SDPA_MEM_EFFICIENT), calls)
 +    target = types.SimpleNamespace(device = "cuda:0", dtype = torch.bfloat16)
-+    assert att.guard_rocm_windows_fused_sdpa(target) == ("flash", "mem_efficient")
++    assert att.guard_rocm_windows_fused_sdpa(target) == (att.SDPA_FLASH, att.SDPA_MEM_EFFICIENT)
 +    assert not torch.backends.cuda.flash_sdp_enabled()
 +    assert not torch.backends.cuda.mem_efficient_sdp_enabled()
 +    # Something else turns them back on (another engine, a restore): the next load re-applies the cached verdict.
 +    torch.backends.cuda.enable_flash_sdp(True)
 +    torch.backends.cuda.enable_mem_efficient_sdp(True)
-+    assert att.guard_rocm_windows_fused_sdpa(target) == ("flash", "mem_efficient")
++    assert att.guard_rocm_windows_fused_sdpa(target) == (att.SDPA_FLASH, att.SDPA_MEM_EFFICIENT)
 +    assert not torch.backends.cuda.flash_sdp_enabled()
 +    assert calls == [("cuda:0", torch.bfloat16)]
 +
@@ -198,7 +237,7 @@ index ce4bc63a44..dadef14673 100644
 +    torch = _sdp_flags
 +    torch.backends.cuda.enable_flash_sdp(True)
 +    torch.backends.cuda.enable_mem_efficient_sdp(True)
-+    _windows_rocm(monkeypatch, ("flash",))
++    _windows_rocm(monkeypatch, (att.SDPA_FLASH,))
 +    att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = torch.bfloat16))
 +    assert not torch.backends.cuda.flash_sdp_enabled()
 +    assert torch.backends.cuda.mem_efficient_sdp_enabled()
@@ -209,25 +248,34 @@ index ce4bc63a44..dadef14673 100644
 +    torch.backends.cuda.enable_flash_sdp(True)
 +    torch.backends.cuda.enable_mem_efficient_sdp(True)
 +    _windows_rocm(monkeypatch, ())
-+    assert att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = torch.bfloat16)) == ()
-+    assert torch.backends.cuda.flash_sdp_enabled() and torch.backends.cuda.mem_efficient_sdp_enabled()
++    assert (
++        att.guard_rocm_windows_fused_sdpa(
++            types.SimpleNamespace(device = "cuda:0", dtype = torch.bfloat16)
++        )
++        == ()
++    )
++    assert (
++        torch.backends.cuda.flash_sdp_enabled() and torch.backends.cuda.mem_efficient_sdp_enabled()
++    )
 +
 +
 +@pytest.mark.parametrize("platform, rocm", [("linux", True), ("win32", False)])
 +def test_the_guard_never_probes_off_windows_rocm(monkeypatch, _sdp_flags, platform, rocm):
 +    calls: list = []
-+    _windows_rocm(monkeypatch, ("flash",), calls)
-+    monkeypatch.setattr(sys, "platform", platform)
-+    monkeypatch.setattr(att, "_is_cuda_rocm", lambda target: rocm)
-+    assert att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = None)) == ()
++    _windows_rocm(monkeypatch, (att.SDPA_FLASH,), calls, platform = platform, rocm = rocm)
++    assert (
++        att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = None)) == ()
++    )
 +    assert calls == []
 +
 +
 +def test_the_opt_out_keeps_the_fused_kernels(monkeypatch, _sdp_flags):
 +    calls: list = []
-+    _windows_rocm(monkeypatch, ("flash",), calls)
++    _windows_rocm(monkeypatch, (att.SDPA_FLASH,), calls)
 +    monkeypatch.setenv(att.ROCM_FUSED_SDPA_ALLOW_ENV, "1")
-+    assert att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = None)) == ()
++    assert (
++        att.guard_rocm_windows_fused_sdpa(types.SimpleNamespace(device = "cuda:0", dtype = None)) == ()
++    )
 +    assert calls == []
 +
 +
@@ -245,10 +293,14 @@ index ce4bc63a44..dadef14673 100644
 +
 +def test_apply_attention_backend_runs_the_guard_for_a_load(monkeypatch):
 +    seen: list = []
-+    monkeypatch.setattr(att, "guard_rocm_windows_fused_sdpa", lambda target, logger = None: seen.append(target))
++    monkeypatch.setattr(
++        att, "guard_rocm_windows_fused_sdpa", lambda target, logger = None: seen.append(target)
++    )
 +    monkeypatch.setattr(att, "warn_if_sdpa_math_only", lambda target, logger = None: False)
 +    target = types.SimpleNamespace(device = "cuda:0", dtype = None)
-+    apply_attention_backend(types.SimpleNamespace(transformer = _FakeTransformer()), None, target = target)
++    apply_attention_backend(
++        types.SimpleNamespace(transformer = _FakeTransformer()), None, target = target
++    )
 +    assert seen == [target]
 +
 +
@@ -259,7 +311,7 @@ index ce4bc63a44..dadef14673 100644
 +    def _sdpa(q, k, v, *a, **kw):
 +        if torch.backends.cuda.math_sdp_enabled():
 +            return real(q, k, v, *a, **kw)
-+        name = "flash" if torch.backends.cuda.flash_sdp_enabled() else "mem_efficient"
++        name = att.SDPA_FLASH if torch.backends.cuda.flash_sdp_enabled() else att.SDPA_MEM_EFFICIENT
 +        return behaviour.get(name, real)(q, k, v, *a, **kw)
 +
 +    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", _sdpa)
@@ -279,8 +331,10 @@ index ce4bc63a44..dadef14673 100644
 +        raise RuntimeError("No available kernel. Aborting execution.")
 +
 +    # A late hipErrorInvalidValue is broken; a dispatcher refusal is not (the dispatch never picks it there).
-+    _sdpa_by_backend(monkeypatch, torch, {"flash": _late_failure, "mem_efficient": _refused})
-+    assert att._rocm_windows_failing_sdpa_backends("cpu", torch.float32) == ("flash",)
++    _sdpa_by_backend(
++        monkeypatch, torch, {att.SDPA_FLASH: _late_failure, att.SDPA_MEM_EFFICIENT: _refused}
++    )
++    assert att._rocm_windows_failing_sdpa_backends("cpu", torch.float32) == (att.SDPA_FLASH,)
 +
 +
 +def test_the_failing_backend_probe_flags_wrong_output(monkeypatch):
@@ -290,13 +344,13 @@ index ce4bc63a44..dadef14673 100644
 +    def _garbage(q, k, v, *a, **kw):
 +        return torch.zeros_like(real(q, k, v, *a, **kw))
 +
-+    _sdpa_by_backend(monkeypatch, torch, {"mem_efficient": _garbage})
-+    assert att._rocm_windows_failing_sdpa_backends("cpu", torch.float32) == ("mem_efficient",)
++    _sdpa_by_backend(monkeypatch, torch, {att.SDPA_MEM_EFFICIENT: _garbage})
++    assert att._rocm_windows_failing_sdpa_backends("cpu", torch.float32) == (
++        att.SDPA_MEM_EFFICIENT,
++    )
 +
 +
 +def test_the_kernel_probe_skips_a_backend_the_guard_turned_off(monkeypatch, _sdp_flags):
-+    # sdpa_kernel overrides the process flags, so without this the math-only diagnosis would still count a
-+    # backend the native dispatch can no longer reach.
 +    torch = _sdp_flags
 +    torch.backends.cuda.enable_flash_sdp(False)
 +    torch.backends.cuda.enable_mem_efficient_sdp(False)
