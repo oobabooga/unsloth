@@ -155,6 +155,19 @@ jobs:
           cat "$AMD_CI_WORK/out/gpu_t4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu_t4"
 
+      - name: Proposed ROCm test-only fix (copy of head + amd_ci/patches/pr1640_rocm_test_fix.diff, t4 env)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          D="$AMD_CI_WORK/head_fix"
+          rm -rf "${D:?}"; cp -a "$AMD_CI_WORK/states/head" "$D"
+          git -C "$D" apply "$GITHUB_WORKSPACE/amd_ci/patches/pr1640_rocm_test_fix.diff" || { echo "patch did not apply"; exit 1; }
+          cd "$D"
+          for k in UNSLOTH_MOE_FAST_READY UNSLOTH_MOE_STACKED_LORA UNSLOTH_MOE_GROUPED_LORA; do unset $k; done
+          PYTHONPATH="$D" UNSLOTH_IS_PRESENT=1 "$AMD_CI_PY" -m pytest -q -rfEs -p no:cacheprovider \
+            --junitxml="$AMD_CI_WORK/out/junit_head_fix_t4.xml" tests/test_moe_ready_epoch.py 2>&1 | tail -40 | tee "$AMD_CI_WORK/out/head_fix_t4.log"
+          exit ${PIPESTATUS[0]}
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
