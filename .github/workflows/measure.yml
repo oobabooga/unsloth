@@ -1,0 +1,453 @@
+name: AMD Qwen placement and attention measurements
+'on':
+  push:
+    branches:
+    - amd-qwen-placement-20261008
+permissions: {}
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: Windows
+          python: python
+        - os: Linux
+          python: python3
+    runs-on:
+    - self-hosted
+    - ${{ matrix.os }}
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 300
+    env:
+      STACK: multiarch-7.14.0
+      UNSLOTH_IS_PRESENT: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONUTF8: '1'
+      HF_ENDPOINT: https://huggingface.co
+      HF_HUB_DISABLE_XET: '1'
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DOWNLOAD_TIMEOUT: '120'
+    steps:
+    - name: Environment
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,platform\nfrom pathlib import Path\nroot=Path(os.environ['RUNNER_TEMP'])/'qwen-placement'\n\
+        for name in ['out','tmp','cache/huggingface','cache/torch','cache/pip','studio','miopen/db','miopen/kernels']:\n \
+        \ (root/name).mkdir(parents=True,exist_ok=True)\nenv={'WORK_ROOT':str(root),'TMPDIR':str(root/'tmp'),'TEMP':str(root/'tmp'),'TMP':str(root/'tmp'),'HF_HOME':str(root/'cache/huggingface'),'HUGGINGFACE_HUB_CACHE':str(root/'cache/huggingface/hub'),'TORCH_HOME':str(root/'cache/torch'),'PIP_CACHE_DIR':str(root/'cache/pip'),'UNSLOTH_HOME':str(root/'unsloth'),'UNSLOTH_STUDIO_HOME':str(root/'unsloth/studio'),'PYTHONPATH':str(root/'code/studio/backend'),'MIOPEN_USER_DB_PATH':str(root/'miopen/db'),'MIOPEN_CUSTOM_CACHE_DIR':str(root/'miopen/kernels')}\n\
+        os.environ.update(env)\nwith open(os.environ['GITHUB_ENV'],'a') as f:\n  for k,v in env.items(): f.write(k+'='+v+'\\\
+        n')\ndef run(cmd,**kw):\n  print('RUN',cmd,flush=True); return subprocess.run(cmd,check=True,**kw)\nwith (root/'out/host.txt').open('w')\
+        \ as f:\n  f.write(platform.platform()+'\\n')\n  if sys.platform=='win32': subprocess.run(['powershell','-NoProfile','-Command','Get-CimInstance\
+        \ Win32_VideoController | Format-List Name,DriverVersion; Get-CimInstance Win32_OperatingSystem | Format-List Caption,TotalVisibleMemorySize'],stdout=f,stderr=subprocess.STDOUT)\n\
+        \  else: subprocess.run(['bash','-c','uname -a; lscpu; free -h; df -h'],stdout=f,stderr=subprocess.STDOUT)\nrun(['git','init',str(root/'code')]);\
+        \ run(['git','-C',str(root/'code'),'config','core.autocrlf','false'])\nrun(['git','-C',str(root/'code'),'remote','add','origin','https://github.com/unslothai/unsloth.git'])\n\
+        run(['git','-C',str(root/'code'),'fetch','--depth=1','origin','0aaea8b585b080a590bfa632d37d5d563064327f']); run(['git','-C',str(root/'code'),'checkout','--detach','FETCH_HEAD'])\n\
+        run([sys.executable,'-m','venv',str(root/'venv')])\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32'\
+        \ else 'venv/bin/python'))\nrun([py,'-m','pip','install','--upgrade','pip'])\nstack=os.environ['STACK']\nif stack=='multiarch-7.14.0':\n\
+        \  specs=['torch[device-gfx1151]==2.11.0+rocm7.14.0','torchvision[device-gfx1151]==0.26.0+rocm7.14.0','torchaudio==2.11.0+rocm7.14.0']\n\
+        \  idx='https://repo.amd.com/rocm/whl-multi-arch/'\n  cons=['torch==2.11.0+rocm7.14.0','torchvision==0.26.0+rocm7.14.0','torchaudio==2.11.0+rocm7.14.0']\n\
+        else:\n  specs=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']\n  idx='https://repo.amd.com/rocm/whl/gfx1151/'\n\
+        \  cons=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']\nrun([py,'-m','pip','install','--index-url',idx,'--extra-index-url','https://pypi.org/simple',*specs])\n\
+        c=root/'torch-constraints.txt'; c.write_text('\\n'.join(cons)+'\\n')\nrq=root/'code/studio/backend/requirements'\n\
+        run([py,'-m','pip','install','-c',str(c),'-r',str(rq/'studio.txt'),'-r',str(rq/'diffusers-pin.txt')])\nrun([py,'-m','pip','install','-c',str(c),'-r',str(rq/'diffusers-main.txt')])\n\
+        run([py,'-m','pip','install','-c',str(c),'transformers==5.5.0','accelerate>=1.0','peft>=0.18','sentencepiece','psutil','protobuf','scipy','einops','Pillow','pyyaml','safetensors','tyro','msgspec','wheel'])\n\
+        run([py,'-m','pip','install','--no-deps','unsloth-zoo>=2026.9.9'])\nrun([py,'-m','pip','install','--no-deps',str(root/'code')])\n\
+        run([py,'-m','pip','install','--no-deps','torchao==0.17.0'])\nwith (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)\n\
+        run([py,'-c',\"import main, torch; print(torch.__version__, torch.version.hip, torch.cuda.get_device_properties(0));\
+        \ x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion\
+        \ import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')\"])\n\n(root/\"generation_probe.py\"\
+        ).write_text('\"\"\"Studio\\'s own DiffusionBackend: Qwen-Image-2.1 GGUF Q4_K_M, Auto, optionally under a simulated\
+        \ 20 GB discrete card.\"\"\"\\nimport argparse\\nimport json\\nimport os\\nimport sys\\nimport threading\\nimport\
+        \ time\\nimport traceback\\nfrom pathlib import Path\\n\\np = argparse.ArgumentParser()\\np.add_argument(\"--placement\"\
+        , choices=[\"auto\",\"auto-tiled\",\"resident\",\"resident-tiled\",\"model\"], default=\"auto\")\\np.add_argument(\"\
+        --query-chunking\", default=\"auto\")\\np.add_argument(\"--case\", required=True)\\np.add_argument(\"--output\", required=True)\\\
+        np.add_argument(\"--free-gib\", type=float, default=0)\\np.add_argument(\"--te\", default=\"auto\")\\np.add_argument(\"\
+        --steps\", type=int, default=4)\\np.add_argument(\"--repeats\", type=int, default=2)\\np.add_argument(\"--size\",\
+        \ type=int, default=1024)\\np.add_argument(\"--serialize\", action=\"store_true\")\\np.add_argument(\"--disable-fused-sdpa\"\
+        , action=\"store_true\")\\np.add_argument(\"--memory-mode\", default=\"auto\")\\np.add_argument(\"--env\", action=\"\
+        append\", default=[])\\nargs = p.parse_args()\\nout = Path(args.output)\\nout.mkdir(parents=True, exist_ok=True)\\\
+        nlock = threading.Lock()\\n\\n\\ndef emit(event, **fields):\\n    line = json.dumps(dict(event=event, case=args.case,\
+        \ t=time.time(), **fields), default=str)\\n    with lock:\\n        print(\"PROBE \" + line, flush=True)\\n      \
+        \  with (out / (args.case + \".jsonl\")).open(\"a\", encoding=\"utf-8\") as f:\\n            f.write(line + \"\\\\\
+        n\")\\n\\n\\nfor kv in args.env:\\n    k, _, v = kv.partition(\"=\")\\n    os.environ[k] = v\\nif args.serialize:\\\
+        n    os.environ[\"AMD_SERIALIZE_KERNEL\"] = \"1\"\\n    os.environ[\"HIP_LAUNCH_BLOCKING\"] = \"1\"\\n    os.environ[\"\
+        CUDA_LAUNCH_BLOCKING\"] = \"1\"\\nos.environ[\"UNSLOTH_QWEN_IMAGE_ROCM_QUERY_CHUNKING\"] = args.query_chunking\\nos.environ[\"\
+        UNSLOTH_DIFFUSION_COND_CACHE_DIR\"] = str(out / (args.case + \"-conditioning\"))\\nimport main as studio_main  # Studio\\\
+        's own startup env (AOTriton opt-in, etc.)\\n\\nimport torch\\nimport psutil\\n\\nemit(\"env\", main=studio_main.__file__,\
+        \ torch=torch.__version__, hip=torch.version.hip,\\n     props=str(torch.cuda.get_device_properties(0)),\\n     env={k:\
+        \ os.environ.get(k) for k in (\"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\", \"MIOPEN_SEARCH_CUTOFF\",\\n          \
+        \                               \"AMD_SERIALIZE_KERNEL\", \"PYTORCH_ALLOC_CONF\", \"PYTORCH_HIP_ALLOC_CONF\")},\\\
+        n     sdp=dict(flash=torch.backends.cuda.flash_sdp_enabled(), mem=torch.backends.cuda.mem_efficient_sdp_enabled(),\\\
+        n              math=torch.backends.cuda.math_sdp_enabled()),\\n     blas=str(torch.backends.cuda.preferred_blas_library()))\\\
+        nif args.disable_fused_sdpa:\\n    torch.backends.cuda.enable_flash_sdp(False)\\n    torch.backends.cuda.enable_mem_efficient_sdp(False)\\\
+        nfrom utils.hardware import ensure_hardware_detected\\n\\nensure_hardware_detected()\\nemit(\"after_hw_detect\", env={k:\
+        \ os.environ.get(k) for k in (\"MIOPEN_SEARCH_CUTOFF\", \"MIOPEN_FIND_MODE\")})\\nfrom core.inference import diffusion\
+        \ as d\\nfrom core.inference import diffusion_memory as dm\\nfrom core.inference.diffusion_attention import available_sdpa_kernels\\\
+        nfrom core.inference.diffusion_device import resolve_diffusion_device_target\\n\\ntarget = resolve_diffusion_device_target()\\\
+        nemit(\"target\", target=target.as_public_dict(), studio_sdpa_probe=available_sdpa_kernels(target))\\nprops = torch.cuda.get_device_properties(0)\\\
+        nif args.free_gib:\\n    cap = int(args.free_gib * 2**30)\\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory,\
+        \ 0)\\n\\n    def virtual_memory(backend):\\n        physical_free, _ = torch.cuda.mem_get_info()\\n        return\
+        \ min(physical_free, max(0, cap - torch.cuda.memory_reserved())) // 2**20, 20 * 1024, \"discrete_vram\"\\n\\n    dm._cuda_memory\
+        \ = virtual_memory\\n    emit(\"synthetic_capacity\", total_gib=20, free_gib=args.free_gib)\\nfrom dataclasses import\
+        \ replace\\norig_plan = d.plan_diffusion_memory\\n\\n\\ndef record_plan(**kw):\\n    plan = orig_plan(**kw)\\n   \
+        \ if args.placement == \"auto-tiled\":\\n        plan = replace(plan, vae_tiling=True)\\n    elif args.placement in\
+        \ (\"resident\", \"resident-tiled\"):\\n        plan = replace(plan, offload_policy=\"none\", stream_text_encoders=False,\
+        \ stream_transformer=False,\\n                       vae_tiling=args.placement.endswith(\"tiled\"), resident_transformer_mib=None,\\\
+        n                       resident_text_encoder_mib=None, reasons=(\"experimental forced resident placement\",))\\n\
+        \    elif args.placement == \"model\":\\n        plan = replace(plan, offload_policy=\"model\", vae_tiling=True, stream_text_encoders=False,\\\
+        n                       stream_transformer=False, resident_transformer_mib=None, resident_text_encoder_mib=None,\\\
+        n                       reasons=(\"experimental whole-component placement\",))\\n    emit(\"plan\", plan=plan.as_public_dict())\\\
+        n    return plan\\n\\n\\nd.plan_diffusion_memory = record_plan\\nproc = psutil.Process()\\n\\n\\ndef mem():\\n   \
+        \ return dict(alloc=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved(),\\n                peak=torch.cuda.max_memory_allocated(),\
+        \ rss=proc.memory_info().rss)\\n\\n\\nbackend = d.DiffusionBackend()\\ntry:\\n    t0 = time.perf_counter()\\n    backend.begin_load(\"\
+        unsloth/Qwen-Image-2.1-GGUF\", gguf_filename=\"qwen-image-2.1-Q4_K_M.gguf\",\\n                       family_override=\"\
+        qwen-image-2.1\", memory_mode=args.memory_mode,\\n                       **({} if args.te == \"auto\" else {\"text_encoder_quant\"\
+        : args.te}))\\n    deadline = time.monotonic() + 3000\\n    while True:\\n        pr = backend.load_progress()\\n\
+        \        if pr.get(\"error\"):\\n            raise RuntimeError(pr[\"error\"])\\n        if pr.get(\"phase\") == \"\
+        ready\":\\n            break\\n        if time.monotonic() > deadline:\\n            raise TimeoutError(\"load > 50\
+        \ min\")\\n        time.sleep(10)\\n    emit(\"loaded\", seconds=time.perf_counter() - t0, status=backend.status(),\
+        \ mem=mem())\\n    import functools\\n    pipe = backend._state.pipe\\n    phase_rows = []\\n    def instrument(obj,\
+        \ method, phase):\\n        original = getattr(obj, method)\\n        @functools.wraps(original)\\n        def measured(*a,\
+        \ **kw):\\n            torch.cuda.synchronize()\\n            torch.cuda.reset_peak_memory_stats()\\n            before\
+        \ = mem()\\n            began = time.perf_counter()\\n            try:\\n                return original(*a, **kw)\\\
+        n            finally:\\n                torch.cuda.synchronize()\\n                row = dict(phase=phase, seconds=time.perf_counter()-began,\\\
+        n                           before=before, after=mem())\\n                phase_rows.append(row)\\n              \
+        \  emit(\"phase\", **row)\\n        setattr(obj, method, measured)\\n    instrument(pipe, \"encode_prompt\", \"encode\"\
+        )\\n    instrument(pipe.transformer, \"forward\", \"denoise\")\\n    instrument(pipe.vae, \"decode\", \"decode\")\\\
+        n    emit(\"placement\", policy=backend._state.offload_policy, tiling=getattr(pipe.vae,\"use_tiling\",None),\\n  \
+        \       components={name:dict(device=str(next(module.parameters()).device),\\n                              bytes=sum(p.numel()*p.element_size()\
+        \ for p in module.parameters()))\\n                     for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\\\
+        n    prompts = [\"A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n       \
+        \        \"A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n             \
+        \  \"A chalkboard menu that reads FRESH COFFEE 2.50 in a small cafe.\"]\\n    for i in range(args.repeats):\\n   \
+        \     phase_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i % len(prompts)],\
+        \ width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0, seed=42)\\n\
+        \        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out / f\"\
+        {args.case}-{i}-{j}.png\")\\n        emit(\"render\", index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
+        n             phase_seconds={ph:sum(r[\"seconds\"] for r in phase_rows if r[\"phase\"]==ph) for ph in (\"encode\"\
+        ,\"denoise\",\"decode\")},\\n             peak_allocated=max([r[\"after\"][\"peak\"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\\\
+        n    emit(\"complete\", success=True)\\nexcept Exception as exc:  # noqa: BLE001\\n    emit(\"failure\", error=repr(exc)[:2000],\
+        \ traceback=traceback.format_exc()[-8000:], mem=None)\\n    raise\\nfinally:\\n    try:\\n        backend.unload()\\\
+        n    except Exception:  # noqa: BLE001\\n        pass\\n',encoding=\"utf-8\")\n(root/\"sdpa_probe.py\").write_text('\"\
+        \"\"One SDPA case per process: a failed fused launch poisons the HIP context, so cases must not share one.\"\"\"\\\
+        nimport json\\nimport os\\nimport sys\\nimport traceback\\n\\ncase = sys.argv[1]\\nout_path = sys.argv[2]\\nos.environ.setdefault(\"\
+        TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\", \"1\")\\nimport torch\\nimport torch.nn.functional as F\\nfrom torch.nn.attention\
+        \ import SDPBackend, sdpa_kernel\\n\\nBACKENDS = {\\n    \"default\": None,\\n    \"flash\": SDPBackend.FLASH_ATTENTION,\\\
+        n    \"efficient\": SDPBackend.EFFICIENT_ATTENTION,\\n    \"math\": SDPBackend.MATH,\\n}\\n\\n\\ndef shapes(name):\\\
+        n    g = torch.Generator(device=\"cuda\").manual_seed(0)\\n    r = lambda *s, dt=torch.bfloat16: torch.randn(*s, device=\"\
+        cuda\", dtype=dt, generator=g)\\n    if name == \"studio_probe\":  # diffusion_attention._probe_sdpa_kernels\\n  \
+        \      q = torch.zeros((1, 2, 8, 64), device=\"cuda\", dtype=torch.float16)\\n        return dict(q=q, k=q, v=q)\\\
+        n    if name == \"dit_bhsd\":  # Qwen-Image-2.1 joint attention at 1024^2: 4096 image + ~256 text tokens, 32 x 128\\\
+        n        return dict(q=r(1, 32, 4352, 128), k=r(1, 32, 4352, 128), v=r(1, 32, 4352, 128))\\n    if name == \"dit_bshd_view\"\
+        :  # diffusers passes BSHD and transposes: non-contiguous views\\n        q, k, v = (r(1, 4352, 32, 128).transpose(1,\
+        \ 2) for _ in range(3))\\n        return dict(q=q, k=k, v=v)\\n    if name == \"te_causal_gqa\":  # Qwen3-VL-8B text:\
+        \ 32 q heads, 8 kv heads, 128\\n        return dict(q=r(1, 32, 300, 128), k=r(1, 8, 300, 128), v=r(1, 8, 300, 128),\
+        \ is_causal=True, enable_gqa=True)\\n    if name == \"te_causal_expanded\":  # GQA repeated to 32 heads, causal, no\
+        \ mask (eager repeat_kv style)\\n        return dict(q=r(1, 32, 300, 128), k=r(1, 32, 300, 128), v=r(1, 32, 300, 128),\
+        \ is_causal=True)\\n    if name == \"te_masked\":  # additive mask path (padding)\\n        m = torch.zeros(1, 1,\
+        \ 300, 300, device=\"cuda\", dtype=torch.bfloat16)\\n        m[..., 250:] = float(\"-inf\")\\n        return dict(q=r(1,\
+        \ 32, 300, 128), k=r(1, 32, 300, 128), v=r(1, 32, 300, 128), attn_mask=m)\\n    if name == \"vision_hd72\":  # Qwen3-VL\
+        \ vision tower: 16 heads x 72\\n        return dict(q=r(1, 16, 4096, 72), k=r(1, 16, 4096, 72), v=r(1, 16, 4096, 72))\\\
+        n    raise SystemExit(\"unknown shape \" + name)\\n\\n\\nshape, backend = case.split(\":\")\\nrow = dict(case=case,\
+        \ torch=torch.__version__, hip=torch.version.hip,\\n           arch=getattr(torch.cuda.get_device_properties(0), \"\
+        gcnArchName\", None),\\n           aotriton_exp=os.environ.get(\"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL\"))\\ntry:\\\
+        n    kw = shapes(shape)\\n    q, k, v = kw.pop(\"q\"), kw.pop(\"k\"), kw.pop(\"v\")\\n    ctx = sdpa_kernel([BACKENDS[backend]])\
+        \ if BACKENDS[backend] is not None else torch.no_grad()\\n    with ctx:\\n        out = F.scaled_dot_product_attention(q,\
+        \ k, v, **kw)\\n    # A failed fused launch only surfaces at the next CHECKED launch: run one, then read back.\\n\
+        \    y = (out.float() @ torch.ones(out.shape[-1], 8, device=\"cuda\")).contiguous()\\n    val = y.sum().item()\\n\
+        \    ref = None\\n    with sdpa_kernel([SDPBackend.MATH]):\\n        ref = F.scaled_dot_product_attention(q, k, v,\
+        \ **kw)\\n    row.update(ok=True, finite=bool(torch.isfinite(out).all().item()),\\n               max_abs_vs_math=float((out.float()\
+        \ - ref.float()).abs().max().item()), checksum=val)\\nexcept Exception as exc:  # noqa: BLE001\\n    row.update(ok=False,\
+        \ error=repr(exc)[:600], tb=traceback.format_exc()[-1500:])\\nprint(\"SDPA \" + json.dumps(row), flush=True)\\nwith\
+        \ open(out_path, \"a\", encoding=\"utf-8\") as f:\\n    f.write(json.dumps(row) + \"\\\\n\")\\n',encoding=\"utf-8\"\
+        )\n(root/\"guard.py\").write_text('ROCM_FUSED_SDPA_ALLOW_ENV = \"UNSLOTH_ALLOW_ROCM_FUSED_SDPA\"\\n_ROCM_FUSED_SDPA_LOCK\
+        \ = threading.Lock()\\n# (device, dtype) -> fused backends that failed there. Only answers are cached.\\n_ROCM_FUSED_SDPA_BROKEN:\
+        \ dict[tuple[str, str], tuple[str, ...]] = {}\\n\\n\\ndef _rocm_windows_failing_sdpa_backends(device: str, dtype:\
+        \ Any) -> Optional[tuple[str, ...]]:\\n    \"\"\"The fused SDPA backends that raise or disagree with math on ``device``;\
+        \ None when math itself fails.\"\"\"\\n    import torch\\n    import torch.nn.functional as F\\n    from torch.nn.attention\
+        \ import SDPBackend, sdpa_kernel\\n\\n    # The denoiser\\'s non-causal head-128 attention, a text encoder\\'s causal\
+        \ one, and #12639\\'s small probe.\\n    g = torch.Generator(device = device).manual_seed(0)\\n    cases = [\\n  \
+        \      (\\n            tuple(torch.randn(*shape, device = device, dtype = dtype, generator = g) for _ in range(3)),\\\
+        n            causal,\\n        )\\n        for shape, causal in (\\n            ((1, 4, 1024, 128), False),\\n   \
+        \         ((1, 4, 256, 128), True),\\n            ((1, 2, 16, 64), True),\\n        )\\n    ]\\n\\n    def attend(backend:\
+        \ Any, qkv: tuple, causal: bool) -> Any:\\n        with sdpa_kernel([backend]):\\n            out = F.scaled_dot_product_attention(*qkv,\
+        \ is_causal = causal)\\n        out = out.float()  # checked launch: a failed attention launch raises here\\n    \
+        \    out.sum().item()\\n        return out\\n\\n    with torch.no_grad():\\n        try:\\n            reference =\
+        \ [attend(SDPBackend.MATH, qkv, causal) for qkv, causal in cases]\\n        except Exception:  # noqa: BLE001 - math\
+        \ fails too: nothing to learn about the fused kernels\\n            return None\\n        broken = []\\n        for\
+        \ name, backend in (\\n            (SDPA_FLASH, SDPBackend.FLASH_ATTENTION),\\n            (SDPA_MEM_EFFICIENT, SDPBackend.EFFICIENT_ATTENTION),\\\
+        n        ):\\n            for (qkv, causal), ref in zip(cases, reference):\\n                try:\\n             \
+        \       ok = torch.allclose(attend(backend, qkv, causal), ref, atol = 2e-2, rtol = 2e-2)\\n                except\
+        \ Exception as exc:  # noqa: BLE001\\n                    # The dispatcher refusing a shape is not a broken kernel:\
+        \ it never picks it there.\\n                    ok = \"No available kernel\" in str(exc)\\n                if not\
+        \ ok:\\n                    broken.append(name)\\n                    break\\n    return tuple(broken)\\n\\n\\ndef\
+        \ guard_rocm_windows_fused_sdpa(target: Any, logger: Any = None) -> tuple[str, ...]:\\n    \"\"\"On Windows ROCm,\
+        \ turn off the fused SDPA backends that fail on ``target``, so attention runs on math.\\n\\n    Process-wide, like\
+        \ the flags it sets, and re-applied on every load; probe-gated, so a healthy wheel keeps its\\n    kernels. Returns\
+        \ what it turned off. ``UNSLOTH_ALLOW_ROCM_FUSED_SDPA=1`` skips it.\"\"\"\\n    import sys\\n\\n    if sys.platform\
+        \ != \"win32\" or not _is_cuda_rocm(target):\\n        return ()\\n    if os.environ.get(ROCM_FUSED_SDPA_ALLOW_ENV,\
+        \ \"\").strip().lower() in (\"1\", \"true\", \"yes\", \"on\"):\\n        return ()\\n    fresh = False\\n    try:\\\
+        n        import torch\\n\\n        device = _indexed_cuda_device(\\n            str(getattr(target, \"torch_device\"\
+        , None) or getattr(target, \"device\", None) or \"\")\\n        )\\n        dtype = getattr(target, \"dtype\", None)\\\
+        n        if dtype not in (torch.float16, torch.bfloat16):\\n            # The fused kernels are half precision only;\
+        \ an fp32 pipeline still runs a half-precision text encoder.\\n            from core.inference.rocm_bf16 import rocm_bf16_supported\\\
+        n            dtype = (\\n                torch.bfloat16\\n                if rocm_bf16_supported(torch, torch.device(device).index)\\\
+        n                else torch.float16\\n            )\\n        key = (device, str(dtype))\\n        with _ROCM_FUSED_SDPA_LOCK:\\\
+        n            broken = _ROCM_FUSED_SDPA_BROKEN.get(key)\\n            if broken is None:\\n                broken =\
+        \ _rocm_windows_failing_sdpa_backends(device, dtype)\\n                if broken is None:\\n                    return\
+        \ ()\\n                _ROCM_FUSED_SDPA_BROKEN[key] = broken\\n                fresh = True\\n            if SDPA_FLASH\
+        \ in broken:\\n                torch.backends.cuda.enable_flash_sdp(False)\\n            if SDPA_MEM_EFFICIENT in\
+        \ broken:\\n                torch.backends.cuda.enable_mem_efficient_sdp(False)\\n        if fresh and broken:\\n\
+        \            # After the flags: a kernel list cached before them still counts what was just switched off.\\n     \
+        \       with _SDPA_PROBE_LOCK:\\n                _SDPA_PROBE_CACHE.clear()\\n    except Exception as exc:  # noqa:\
+        \ BLE001 - a probe is a guard, never a load failure\\n        _module_logger().info(\\n            \"diffusion.attention:\
+        \ skipped the Windows ROCm fused SDPA check (%s)\", exc\\n        )\\n        return ()\\n    if fresh and broken:\\\
+        n        names = \" or \".join(\"flash\" if b == SDPA_FLASH else \"memory-efficient\" for b in broken)\\n        (logger\
+        \ or _module_logger()).warning(\\n            \"diffusion.attention: this Windows ROCm torch cannot run %s attention\
+        \ on %s (%s); using %s instead \"\\n            \"(set %s=1 to keep them)\",\\n            names,\\n            device,\\\
+        n            dtype,\\n            \"the math kernel\" if len(broken) == 2 else \"the remaining kernels\",\\n     \
+        \       ROCM_FUSED_SDPA_ALLOW_ENV,\\n        )\\n    return broken\\n\\n\\n',encoding=\"utf-8\")\n"
+      timeout-minutes: 50
+    - name: Attention package A/B
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,subprocess,json,sys\nfrom pathlib import Path\nroot=Path(os.environ['WORK_ROOT']); out=root/'out'\n\
+        py=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\nidx='https://repo.amd.com/rocm/whl-multi-arch/'\n\
+        pkg='amd-torch-device-gfx115x'\ndef run(cmd):\n print('RUN',cmd,flush=True)\n return subprocess.run(cmd,check=True)\n\
+        def probe(label):\n for be in ['math','flash','efficient']:\n  p=subprocess.run([py,'-u',str(root/'sdpa_probe.py'),'te_causal_expanded:'+be,str(out/(label+'-sdpa.jsonl'))],capture_output=True,text=True,timeout=180)\n\
+        \  (out/(label+'-'+be+'.log')).write_text(p.stdout+'\\n'+p.stderr,encoding='utf-8')\n  print(label,be,p.returncode,p.stdout[-900:],flush=True)\n\
+        probe('complete')\nrun([py,'-m','pip','uninstall','-y',pkg])\ntry:\n probe('missing-family')\n guard_code = \"import\
+        \ main, torch, pathlib; from core.inference import diffusion_attention as a; from core.inference.diffusion_device\
+        \ import resolve_diffusion_device_target; exec(pathlib.Path(\"+repr(str(root/'guard.py'))+\").read_text(),a.__dict__);\
+        \ t=resolve_diffusion_device_target(); print('guard',a.guard_rocm_windows_fused_sdpa(t)); q=torch.randn(1,4,256,128,device='cuda',dtype=torch.bfloat16);\
+        \ print('post_guard',torch.nn.functional.scaled_dot_product_attention(q,q,q).float().abs().sum().item())\"\n p=subprocess.run([py,'-u','-c',guard_code],capture_output=True,text=True,timeout=180)\n\
+        \ (out/'missing-family-guard.log').write_text(p.stdout+'\\n'+p.stderr,encoding='utf-8')\n print('guard',p.returncode,p.stdout[-1500:],p.stderr[-1000:],flush=True)\n\
+        finally:\n run([py,'-m','pip','install','--index-url',idx,'torch[device-gfx1151]==2.11.0+rocm7.14.0'])\nprobe('repaired')\n"
+      timeout-minutes: 15
+    - name: auto19-prime
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-prime'\n\
+        args=['--case', 'auto19-prime', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
+        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto19-prime
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto19-prime-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto19-prime*
+        retention-days: 14
+    - name: resident19-tiled
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-tiled'\n\
+        args=['--case', 'resident19-tiled', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ '4', '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence resident19-tiled
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: resident19-tiled-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/resident19-tiled*
+        retention-days: 14
+    - name: auto19-tiled
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-tiled'\n\
+        args=['--case', 'auto19-tiled', '--placement', 'auto-tiled', '--free-gib', '19', '--size', '1024', '--steps', '4',\
+        \ '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto19-tiled
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto19-tiled-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto19-tiled*
+        retention-days: 14
+    - name: resident19-untiled
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-untiled'\n\
+        args=['--case', 'resident19-untiled', '--placement', 'resident', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence resident19-untiled
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: resident19-untiled-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/resident19-untiled*
+        retention-days: 14
+    - name: model19
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='model19'\n\
+        args=['--case', 'model19', '--placement', 'model', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
+        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence model19
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: model19-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/model19*
+        retention-days: 14
+    - name: auto19-control
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-control'\n\
+        args=['--case', 'auto19-control', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
+        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto19-control
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto19-control-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto19-control*
+        retention-days: 14
+    - name: resident17-tiled
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident17-tiled'\n\
+        args=['--case', 'resident17-tiled', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence resident17-tiled
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: resident17-tiled-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/resident17-tiled*
+        retention-days: 14
+    - name: auto17
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto17'\n\
+        args=['--case', 'auto17', '--placement', 'auto', '--free-gib', '17', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
+        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto17
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto17-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto17*
+        retention-days: 14
+    - name: resident19-1536
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-1536'\n\
+        args=['--case', 'resident19-1536', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence resident19-1536
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: resident19-1536-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/resident19-1536*
+        retention-days: 14
+    - name: auto19-1536
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536'\n\
+        args=['--case', 'auto19-1536', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4', '--repeats',\
+        \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
+        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto19-1536
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto19-1536-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto19-1536*
+        retention-days: 14
+    - name: auto19-1536-unchunked
+      shell: ${{ matrix.python }} -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536-unchunked'\n\
+        args=['--case', 'auto19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4',\
+        \ '--repeats', '2', '--query-chunking', '0']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence auto19-1536-unchunked
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: auto19-1536-unchunked-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out/auto19-1536-unchunked*
+        retention-days: 14
+    - name: Environment evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: environment-${{ matrix.os }}
+        path: ${{ env.WORK_ROOT }}/out
+        retention-days: 14
