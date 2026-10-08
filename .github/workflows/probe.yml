@@ -2,7 +2,7 @@ name: SD14 AMD baseline probe (throwaway)
 on:
   push:
     branches:
-    - sd14-amd-probe
+    - sd14-amd-probe-u
 permissions: {}
 jobs:
   amd:
