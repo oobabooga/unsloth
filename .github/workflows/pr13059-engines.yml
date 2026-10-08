@@ -8,7 +8,7 @@ permissions: {}
 
 env:
   BASE_SHA: bc915c0563493c1db63ada7647126cb8f4bb37e1
-  PR_SHA: 93b30433bda77c09387307df18a02198ec4f3e32
+  PR_SHA: 6e552861875858e2c9716332ef19c1c46e678e53
 
 jobs:
   engine:
@@ -39,7 +39,7 @@ jobs:
           for side in base pr; do
             if [ "$side" = base ]; then url=https://github.com/unslothai/unsloth; sha=$BASE_SHA; else url=https://github.com/oobabooga/unsloth; sha=$PR_SHA; fi
             git init -q "$side"
-            git -C "$side" sparse-checkout set --no-cone /studio/frontend/
+            git -C "$side" sparse-checkout set studio/frontend
             git -C "$side" fetch -q --depth 1 --filter=blob:none "$url" "$sha"
             git -C "$side" checkout -q FETCH_HEAD
             echo "$side at $(git -C "$side" rev-parse HEAD)"
