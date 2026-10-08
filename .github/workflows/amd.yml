@@ -1,0 +1,128 @@
+name: AMD DevLab sd17
+
+on:
+  push:
+    branches: [amd-devlab-sd17]
+
+permissions: {}
+
+jobs:
+  linux-rocm:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | head -20; free -h; df -h "$RUNNER_TEMP"
+          rocminfo 2>/dev/null | grep -E 'Marketing Name:|gfx' | head -10 || true
+          ls -l /dev/kfd /dev/dri 2>/dev/null || true
+      - name: Setup + ROCm wheels
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{models,tmp,cache/hf}
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q cmake ninja huggingface_hub numpy pillow
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel,device-gfx1151]==7.14.0"
+          rocm-sdk path --root
+      - name: Fetch PR 17 source and apply ggml patch
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; cd "$W"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          cd src && git fetch -q origin pull/17/head && git checkout -q ca92d95ddf041bf885a36a7fdafbffd88706c28e
+          git submodule update --init --depth 1 ggml
+          for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply --verbose "../$p"; done
+          git -C ggml diff --stat
+      - name: Build (HIP, gfx1151)
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; . "$W/venv/bin/activate"
+          export ROCM_PATH="$(rocm-sdk path --root)"; export HIP_PATH="$ROCM_PATH"
+          export CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"; export LD_LIBRARY_PATH="$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          export PATH="$(rocm-sdk path --bin):$PATH"
+          cd "$W/src"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF \
+            -DSD_HIPBLAS=ON -DHIP_PLATFORM=amd -DGPU_TARGETS=gfx1151 -DGGML_BUILD_TESTS=ON
+          cmake --build build -j "$(nproc)" --target sd-cli test-backend-ops
+          ls -la build/bin
+      - name: test-backend-ops CPY (patched kernel on / off)
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/w"; . "$W/venv/bin/activate"
+          export ROCM_PATH="$(rocm-sdk path --root)"; export LD_LIBRARY_PATH="$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          T="$W/src/build/bin/test-backend-ops"
+          $T -o CPY 2>&1 | tail -n 5
+          GGML_CUDA_CPY_ROWS=0 $T -o CPY 2>&1 | tail -n 5
+          echo "== perf CPY rows on"; $T perf -o CPY 2>&1 | grep -E "CPY\(type_src=f32" | head -30
+          echo "== perf CPY rows off"; GGML_CUDA_CPY_ROWS=0 $T perf -o CPY 2>&1 | grep -E "CPY\(type_src=f32" | head -30
+      - name: Download MiniMax-H3
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; . "$W/venv/bin/activate"; export HF_HOME="$W/cache/hf"
+          python - <<PY
+          from huggingface_hub import hf_hub_download
+          for f in ["minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:
+              print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir="$W/models"), flush=True)
+          PY
+      - name: H3 A/B (VAE FA on, VAE FA off, VAE FA off + CPY_ROWS off)
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/w"; . "$W/venv/bin/activate"
+          export ROCM_PATH="$(rocm-sdk path --root)"; export LD_LIBRARY_PATH="$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          M="$W/models"; cd "$W"
+          run() { name="$1"; shift; mkdir -p "out_$name"
+            /usr/bin/time -v env "$@" "$W/src/build/bin/sd-cli" -M vid_gen --diffusion-model "$M/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" \
+              --vae "$M/vae/minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M/vae/minimax_h3_audio_vae_fp32.safetensors" \
+              --llm "$M/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" -p "a red fox runs through fresh snow in a pine forest, birds singing" \
+              --cfg-scale 1.0 --steps 4 -W 512 -H 288 --video-frames 25 --fps 24 --seed 42 --rng cpu --diffusion-fa --offload-to-cpu --vae-tiling \
+              -o "out_$name/f_%03d.png" > "log_$name.txt" 2>&1; echo "$name exit=$?"
+            grep -E "decode_first_stage completed|sampling completed|generate_video completed|Using flash|MiniMax-H3 video VAE|Elapsed|Maximum resident" "log_$name.txt" | tail -8; }
+          run fa_on   X=1
+          run fa_off  SD_H3_VAE_FLASH_ATTN=0
+          run all_off SD_H3_VAE_FLASH_ATTN=0 GGML_CUDA_CPY_ROWS=0
+          tail -n 30 log_fa_on.txt
+          python - <<PY
+          import glob, numpy as np
+          from PIL import Image
+          def load(d): return [np.asarray(Image.open(f)).astype(np.float64) for f in sorted(glob.glob(f"$W/out_{d}/f_*.png"))]
+          a, b, c = load("fa_on"), load("fa_off"), load("all_off")
+          print("frames", len(a), len(b), len(c))
+          def psnr(x, y):
+              m = np.mean([np.mean((p - q) ** 2) for p, q in zip(x, y)])
+              return float("inf") if m == 0 else 10 * np.log10(255 ** 2 / m)
+          print("fa_off vs all_off bitwise:", all(np.array_equal(p, q) for p, q in zip(b, c)), "PSNR", psnr(b, c))
+          print("fa_on vs fa_off PSNR dB:", psnr(a, b))
+          PY
+
+  windows-vulkan:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - name: Setup, master Vulkan prebuilt, models
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force -Path "$W\models" | Out-Null
+          python -m venv "$W\venv"; & "$W\venv\Scripts\python.exe" -m pip install -q huggingface_hub numpy pillow
+          $tag = "master-813-bfbef5b-u6321a69"
+          Invoke-WebRequest -Uri "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$tag/sd-$tag-bin-win-vulkan-x64.zip" -OutFile "$W\sd.zip"
+          Expand-Archive "$W\sd.zip" -DestinationPath "$W\sd"
+          Get-ChildItem -Recurse "$W\sd" | Select-Object -First 20 FullName
+          $env:HF_HOME = "$W\hf"
+          & "$W\venv\Scripts\python.exe" -c "from huggingface_hub import hf_hub_download as d; [print(d('unsloth/MiniMax-H3-GGUF', f, local_dir=r'$W\models')) for f in ['minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf','qwen3vl_32b_minimax_h3-Q4_K_M.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors']]"
+      - name: H3 decode with VAE FA (--fa) vs without (--diffusion-fa), master Vulkan
+        shell: powershell
+        run: |
+          $W = "$env:RUNNER_TEMP\w"; $M = "$W\models"
+          $cli = (Get-ChildItem -Recurse "$W\sd" -Filter sd-cli.exe | Select-Object -First 1).FullName
+          foreach ($arm in @("--diffusion-fa", "--fa")) {
+            $name = $arm.TrimStart("-"); New-Item -ItemType Directory -Force -Path "$W\out_$name" | Out-Null
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            & $cli -M vid_gen --diffusion-model "$M\minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" --vae "$M\vae\minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M\vae\minimax_h3_audio_vae_fp32.safetensors" --llm "$M\qwen3vl_32b_minimax_h3-Q4_K_M.gguf" -p "a red fox runs through fresh snow in a pine forest, birds singing" --cfg-scale 1.0 --steps 4 -W 512 -H 288 --video-frames 25 --fps 24 --seed 42 --rng cpu $arm --offload-to-cpu --vae-tiling -o "$W\out_$name\f_%03d.png" *> "$W\log_$name.txt"
+            $sw.Stop(); Write-Output "$arm exit=$LASTEXITCODE wall=$($sw.Elapsed.TotalSeconds)"
+            Select-String -Path "$W\log_$name.txt" -Pattern "decode_first_stage completed|sampling completed|flash attention|ggml_vulkan: 0|error" | Select-Object -Last 8 | ForEach-Object { $_.Line }
+          }
+          Get-Content "$W\log_fa.txt" -Tail 25
+          exit 0
