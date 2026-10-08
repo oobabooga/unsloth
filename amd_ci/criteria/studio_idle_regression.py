@@ -58,6 +58,8 @@ def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
     b, h = _busy(base), _busy(head)
     if b is None or h is None:
         return False, "no reading"
+    fixed = _busy(head, "fixed")
+    tail = f"; 903 with the candidate fix: {fixed:.2f}" if fixed is not None else ""
     if h >= HOT_CORES and h - b >= 1.0:
-        return True, f"idle 903 backend burns {h:.2f} cores vs {b:.2f} on 902"
-    return False, f"idle busy cores 902={b:.2f} 903={h:.2f}"
+        return True, f"idle 903 backend burns {h:.2f} cores vs {b:.2f} on 902{tail}"
+    return False, f"idle busy cores 902={b:.2f} 903={h:.2f}{tail}"

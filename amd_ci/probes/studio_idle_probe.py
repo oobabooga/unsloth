@@ -193,10 +193,14 @@ def idle_arm(py: Path, src: Path, work: Path, tag: str, arm: str, env_extra: dic
             pass
 
 
+# name: (env overrides, swap in the candidate fix, states that run it)
 ARMS = {
-    "default": {},
-    "no_torch_warm": {"UNSLOTH_STUDIO_DISABLE_TORCH_WARM": "1"},
+    "default": ({}, False, ("base", "head")),
+    "no_torch_warm": ({"UNSLOTH_STUDIO_DISABLE_TORCH_WARM": "1"}, False, ("base", "head")),
+    # The candidate fix: utils/cpu_threads.py is unchanged from 902 to main, so the patched file drops in.
+    "fixed": ({}, True, ("head",)),
 }
+FIXED_FILE = Path(__file__).with_name("fixed_cpu_threads.py")
 
 
 def main() -> int:
@@ -218,10 +222,20 @@ def main() -> int:
         tag = tags[args.state]
         obs["tag"] = tag
         py, src = build(work, tag, args.gfx, obs["build"])
-        for i, (arm, env_extra) in enumerate(ARMS.items()):
+        for i, (arm, (env_extra, patched, states)) in enumerate(ARMS.items()):
+            if args.state not in states:
+                continue
             print(f"[{args.state}] {tag} arm {arm}", flush = True)
-            r = idle_arm(py, src, work, tag, arm, env_extra, 8890 + i + (10 if args.state == "head" else 0),
-                         args.duration, args.interval, args.poll)
+            target = src / "studio" / "backend" / "utils" / "cpu_threads.py"
+            original = target.read_bytes()
+            if patched:
+                target.write_bytes(FIXED_FILE.read_bytes())
+            try:
+                r = idle_arm(py, src, work, tag, arm, env_extra, 8890 + i + (10 if args.state == "head" else 0),
+                             args.duration, args.interval, args.poll)
+            finally:
+                target.write_bytes(original)
+            r["patched"] = patched
             obs["arms"][arm] = r
             print(f"    busy_last60={r.get('busy_last60')} max={r.get('busy_max')} "
                   f"hot={r.get('threads_over_half_core')} err={r.get('error')}", flush = True)
