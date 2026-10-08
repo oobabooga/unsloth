@@ -1,0 +1,11 @@
+name: krileon pool health
+on:
+  push:
+    branches: [amd-krileon-pool]
+permissions: {}
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    steps:
+      - run: uname -a; free -h
