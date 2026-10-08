@@ -106,7 +106,14 @@ jobs:
         \ measured_decode_tile(vae, z):\\n        row = dict(shape=list(z.shape), ok=False)\\n        tile_rows.append(row)\\\
         n        try:\\n            result = original_decode_tile(vae, z)\\n            row[\"ok\"] = True\\n            return\
         \ result\\n        except Exception as exc:\\n            row[\"error\"] = type(exc).__name__\\n            raise\\\
-        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        original = getattr(obj,\
+        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        if method == \"forward\"\
+        :\\n            pending = []\\n            def before_forward(module, call_args):\\n                torch.cuda.synchronize()\\\
+        n                torch.cuda.reset_peak_memory_stats()\\n                pending.append((time.perf_counter(), mem()))\\\
+        n            def after_forward(module, call_args, output):\\n                if not pending:\\n                  \
+        \  return\\n                began, before = pending.pop()\\n                torch.cuda.synchronize()\\n          \
+        \      row = dict(phase=phase, seconds=time.perf_counter()-began, before=before, after=mem())\\n                phase_rows.append(row)\\\
+        n                emit(\"phase\", **row)\\n            obj.register_forward_pre_hook(before_forward)\\n           \
+        \ obj.register_forward_hook(after_forward, always_call=True)\\n            return\\n        original = getattr(obj,\
         \ method)\\n        @functools.wraps(original)\\n        def measured(*a, **kw):\\n            torch.cuda.synchronize()\\\
         n            torch.cuda.reset_peak_memory_stats()\\n            before = mem()\\n            began = time.perf_counter()\\\
         n            try:\\n                return original(*a, **kw)\\n            finally:\\n                torch.cuda.synchronize()\\\
@@ -619,7 +626,14 @@ jobs:
         \ measured_decode_tile(vae, z):\\n        row = dict(shape=list(z.shape), ok=False)\\n        tile_rows.append(row)\\\
         n        try:\\n            result = original_decode_tile(vae, z)\\n            row[\"ok\"] = True\\n            return\
         \ result\\n        except Exception as exc:\\n            row[\"error\"] = type(exc).__name__\\n            raise\\\
-        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        original = getattr(obj,\
+        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        if method == \"forward\"\
+        :\\n            pending = []\\n            def before_forward(module, call_args):\\n                torch.cuda.synchronize()\\\
+        n                torch.cuda.reset_peak_memory_stats()\\n                pending.append((time.perf_counter(), mem()))\\\
+        n            def after_forward(module, call_args, output):\\n                if not pending:\\n                  \
+        \  return\\n                began, before = pending.pop()\\n                torch.cuda.synchronize()\\n          \
+        \      row = dict(phase=phase, seconds=time.perf_counter()-began, before=before, after=mem())\\n                phase_rows.append(row)\\\
+        n                emit(\"phase\", **row)\\n            obj.register_forward_pre_hook(before_forward)\\n           \
+        \ obj.register_forward_hook(after_forward, always_call=True)\\n            return\\n        original = getattr(obj,\
         \ method)\\n        @functools.wraps(original)\\n        def measured(*a, **kw):\\n            torch.cuda.synchronize()\\\
         n            torch.cuda.reset_peak_memory_stats()\\n            before = mem()\\n            began = time.perf_counter()\\\
         n            try:\\n                return original(*a, **kw)\\n            finally:\\n                torch.cuda.synchronize()\\\
