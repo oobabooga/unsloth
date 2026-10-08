@@ -2,7 +2,7 @@ name: SD21 MSVC check
 
 on:
   push:
-    branches: [sd21-msvc-check]
+    branches: [sd21-msvc-check-u]
 
 permissions: {}
 
