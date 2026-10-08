@@ -1,0 +1,28 @@
+name: SD14 ROCm bundle on gfx1151 (throwaway)
+
+on:
+  push:
+    branches: [sd14-amd-d6]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; grep PRETTY /etc/os-release; nproc; free -h
+          lspci -nn | grep -iE 'vga|display' || true
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          ls -d /opt/rocm* 2>&1 || true
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
+          df -h "$RUNNER_TEMP"
+      - name: Fetch scripts
+        run: git clone -q --depth 1 --branch sd14-amd-d6 https://github.com/oobabooga/unsloth "$RUNNER_TEMP/ci"
+      - name: Build the PR ROCm bundle exactly as the leg does
+        run: bash "$RUNNER_TEMP/ci/ci/build.sh"
+      - name: A/B
+        if: ${{ !cancelled() }}
+        run: bash "$RUNNER_TEMP/ci/ci/ab.sh"
