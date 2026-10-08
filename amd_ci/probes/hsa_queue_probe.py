@@ -55,15 +55,28 @@ def kfd_gpu_nodes() -> list[dict]:
     return nodes
 
 
+# tag -> (spoofed max_waves_per_simd or None, HSA_USE_SVM value or None).
+# libhsakmt puts the CWSR area in an SVM range when the kernel supports it; amdkfd then
+# only checks that the range COVERS the expected size (kfd_queue_buffer_svm_get), so an
+# oversized area passes there. HSA_USE_SVM=0 forces the BO path, whose check is exact.
+MODES = {
+    "real": (None, None),
+    "real_nosvm": (None, "0"),
+    "spoof20": ("20", None),
+    "spoof20_nosvm": ("20", "0"),
+    "spoof8": ("8", None),
+}
+
+
 def run_once(bundle: Path, model: Path, shim: Path, work: Path, tag: str,
-             spoof: str | None, timeout: int) -> dict:
+             spoof: str | None, use_svm: str | None, timeout: int) -> dict:
     spoof_log = work / f"spoof_{tag}.log"
     ld_debug = work / f"lddebug_{tag}"
     for stale in [spoof_log, *work.glob(f"lddebug_{tag}.*")]:
         stale.unlink(missing_ok = True)
     env = {k: v for k, v in os.environ.items()
            if k not in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
-                        "HSA_OVERRIDE_GFX_VERSION", "AMD_CI_SPOOF_WAVES")}
+                        "HSA_OVERRIDE_GFX_VERSION", "AMD_CI_SPOOF_WAVES", "HSA_USE_SVM")}
     env.update({
         "LD_LIBRARY_PATH": str(bundle),
         "LD_PRELOAD": str(shim),  # loaded in BOTH modes; only the env var differs
@@ -73,9 +86,12 @@ def run_once(bundle: Path, model: Path, shim: Path, work: Path, tag: str,
     })
     if spoof is not None:
         env["AMD_CI_SPOOF_WAVES"] = spoof
+    if use_svm is not None:
+        env["HSA_USE_SVM"] = use_svm
+    # -v: this build logs "offloaded N/N layers to GPU" only above the default verbosity
     cmd = [str(bundle / "llama-completion"), "-m", str(model), "-p", PROMPT, "-n", "24",
-           "-ngl", "99", "--temp", "0", "--seed", "1", "-c", "256"]
-    res: dict = {"cmd": " ".join(cmd), "spoof_waves": spoof}
+           "-ngl", "99", "--temp", "0", "--seed", "1", "-c", "256", "-v"]
+    res: dict = {"cmd": " ".join(cmd), "spoof_waves": spoof, "hsa_use_svm": use_svm}
     try:
         p = subprocess.run(cmd, env = env, stdin = subprocess.DEVNULL, capture_output = True,
                            text = True, errors = "replace", timeout = timeout)
@@ -90,9 +106,15 @@ def run_once(bundle: Path, model: Path, shim: Path, work: Path, tag: str,
     res["queue_create_oom"] = bool(re.search(r"ROCm error: out of memory", both)) and \
         bool(re.search(r"hipStreamCreate", both))
     res["any_rocm_error"] = re.findall(r"ROCm error: [^\n]+", both)[:3]
+    # "offloaded N/N layers to GPU" is printed even when ROCm found no device and every
+    # layer went to the CPU, so placement is read from the per-layer lines and buffers.
     m = re.search(r"offloaded (\d+)/(\d+) layers to GPU", both)
-    res["offloaded"] = [int(m.group(1)), int(m.group(2))] if m else None
-    res["gpu_model_buffer"] = re.findall(r"ROCm\d+ model buffer size\s*=\s*([\d.]+ \w+)", both)[:2]
+    res["offloaded_line"] = [int(m.group(1)), int(m.group(2))] if m else None
+    res["layers_rocm"] = len(re.findall(r"layer\s+\d+ assigned to device ROCm\d+", both))
+    res["layers_cpu"] = len(re.findall(r"layer\s+\d+ assigned to device CPU", both))
+    res["rocm_model_buffer_mib"] = sum(
+        float(x) for x in re.findall(r"ROCm\d+ model buffer size\s*=\s*([\d.]+) MiB", both))
+    res["rocm_init_failed"] = "failed to initialize ROCm" in both
     # generated continuation (stdout echoes the prompt first)
     res["generated"] = out.split(PROMPT, 1)[1].strip()[:400] if PROMPT in out else ""
     # which libhsa-runtime64 the loader initialised (LD_DEBUG writes <prefix>.<pid>)
@@ -114,7 +136,6 @@ def main() -> int:
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--model", required = True, type = Path)
     ap.add_argument("--shim", required = True, type = Path)
-    ap.add_argument("--spoof-waves", default = "20")
     ap.add_argument("--timeout", type = int, default = 240)
     args = ap.parse_args()
 
@@ -128,9 +149,8 @@ def main() -> int:
         "model_sha256": sha256(args.model),
         "kfd_gpu_nodes": kfd_gpu_nodes(),
     }
-    obs["real"] = run_once(bundle, args.model, args.shim, work, "real", None, args.timeout)
-    obs["spoof"] = run_once(bundle, args.model, args.shim, work, "spoof", args.spoof_waves,
-                            args.timeout)
+    for tag, (spoof, use_svm) in MODES.items():
+        obs[tag] = run_once(bundle, args.model, args.shim, work, tag, spoof, use_svm, args.timeout)
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
 
