@@ -28,6 +28,11 @@ export default defineConfig([
         "warn",
         { allowConstantExport: true },
       ],
+      // useMessageMemo takes a deps array like useMemo; a missing dep serves a stale value.
+      "react-hooks/exhaustive-deps": [
+        "warn",
+        { additionalHooks: "^useMessageMemo$" },
+      ],
       // Import restrictions for architecture enforcement
       "no-restricted-imports": [
         "error",
