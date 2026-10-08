@@ -1,0 +1,30 @@
+name: SD21 MSVC check
+
+on:
+  push:
+    branches: [sd21-msvc-check]
+
+permissions: {}
+
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    steps:
+      - name: Build master and PR 21 sd-cli (CPU, MSVC)
+        shell: cmd
+        run: |
+          cd /d %RUNNER_TEMP%
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp sd || exit /b 1
+          cd sd
+          git fetch -q origin pull/21/head:pr21 || exit /b 1
+          git submodule update --init --depth 50 ggml thirdparty/libwebp || exit /b 1
+          for %%B in (origin/master pr21) do (
+            git checkout -q %%B || exit /b 1
+            git log --oneline -1
+            cmake -S . -B build-%%~nB -G "Visual Studio 17 2022" -A x64 -DSD_WEBM=OFF > cmake-%%~nB.log 2>&1 || (type cmake-%%~nB.log & exit /b 1)
+            cmake --build build-%%~nB --config Release --target sd-cli -j 16 > build-%%~nB.log 2>&1 || (type build-%%~nB.log & exit /b 1)
+            findstr /C:"tiling.cpp" /C:"backend_fit.cpp" build-%%~nB.log | findstr /I "warning error"
+            dir /s /b build-%%~nB\bin\Release\sd-cli.exe
+          )
+          exit /b 0
