@@ -1,0 +1,45 @@
+name: SD19 Windows MSVC
+
+on:
+  push:
+    branches: [sd19-amd-win]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - name: Source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force $W | Out-Null
+          git clone -q --filter=blob:none https://github.com/unslothai/stable-diffusion.cpp "$W\src"
+          cd "$W\src"
+          git checkout -q 338079e
+          git submodule update -q --init --depth 50 ggml
+          Get-ChildItem scripts\unsloth\ggml-patches\*.patch | ForEach-Object { git -C ggml apply "..\scripts\unsloth\ggml-patches\$($_.Name)"; if ($LASTEXITCODE -ne 0) { throw "patch $($_.Name)" } }
+          git log -1 --format="%h %s"
+          python -m pip -q install ninja
+      - name: Build (MSVC, CPU + Vulkan off)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath`) do set VS=%%i
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
+          cd /d "%RUNNER_TEMP%\w\src"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF -DGGML_BUILD_TESTS=ON > cmake.log 2>&1 || (type cmake.log & exit /b 1)
+          findstr /i "fused" cmake.log
+          cmake --build build -j 32 --target sd-cli test-backend-ops > build.log 2>&1
+          set RC=%ERRORLEVEL%
+          findstr /i /c:"error" /c:"warning C" build.log | findstr /i "tiling minimax_h3 ltx_audio model_manager ggml_runner rope-pe ops.cpp" 
+          echo build exit=%RC%
+          dir build\bin\*.exe
+          exit /b %RC%
+      - name: test-backend-ops CPU
+        shell: cmd
+        run: |
+          cd /d "%RUNNER_TEMP%\w\src"
+          build\bin\test-backend-ops.exe -l 2>&1 | findstr /i "backend"
+          exit /b 0
