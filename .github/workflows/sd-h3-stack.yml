@@ -1,0 +1,101 @@
+name: AMD DevLab sd.cpp H3 stack review (throwaway)
+
+on:
+  push:
+    branches: [amd-devlab-sd-h3-stack]
+
+permissions: {}
+
+env:
+  TOOLS_URL: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/tools
+
+jobs:
+  linux:
+    name: linux (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [hip, vulkan]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; nproc; free -g; df -h "$RUNNER_TEMP" | tail -1
+          rocminfo 2>/dev/null | grep -E 'Marketing Name:|gfx' | head -5 || true
+          ls /opt/rocm*/bin/hipcc 2>/dev/null || true
+      - name: Tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/w/tools"; cd "$RUNNER_TEMP/w/tools"
+          for f in linux.sh sdrev_dump.py cmpdump.py; do curl -fsSL "$TOOLS_URL/$f" -o $f; done; chmod +x linux.sh
+      - {name: Setup, run: '"$RUNNER_TEMP/w/tools/linux.sh" ${{ matrix.backend }} setup'}
+      - {name: Build, run: '"$RUNNER_TEMP/w/tools/linux.sh" ${{ matrix.backend }} build'}
+      - {name: test-backend-ops, run: '"$RUNNER_TEMP/w/tools/linux.sh" ${{ matrix.backend }} tbo'}
+      - {name: SD-Turbo smoke, run: '"$RUNNER_TEMP/w/tools/linux.sh" ${{ matrix.backend }} smoke'}
+      - {name: MiniMax-H3 dumps, run: '"$RUNNER_TEMP/w/tools/linux.sh" ${{ matrix.backend }} h3'}
+
+  windows:
+    name: windows (vulkan, MSVC)
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    steps:
+      - name: Setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force "$W\tmp","$W\models","$W\runs" | Out-Null
+          python -m venv "$W\venv"; & "$W\venv\Scripts\python.exe" -m pip install -q ninja numpy
+          curl.exe -fsSL "$env:TOOLS_URL/sdrev_dump.py" -o "$W\sdrev_dump.py"
+          $inst = "$W\vk.exe"
+          curl.exe -fsSL --retry 3 -o $inst "https://sdk.lunarg.com/sdk/download/1.4.328.1/windows/vulkansdk-windows-X64-1.4.328.1.exe"
+          if ((Get-FileHash $inst -Algorithm SHA256).Hash -ne 'a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c') { throw 'vk sha' }
+          $p = Start-Process -FilePath $inst -ArgumentList @('--root', "`"$W\VulkanSDK`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "vk install $($p.ExitCode)" }
+          git clone -q --filter=blob:none https://github.com/oobabooga/stable-diffusion.cpp "$W\src"
+          foreach ($r in @('m:6321a6935234c2bb09c77604874a439344faa7f6', 'pr20:aff34f1542edb66acf2f5bb5daae1c895db0afe4')) {
+            $n, $s = $r.Split(':')
+            git -C "$W\src" worktree add -q --detach "$W\$n" $s
+            git -C "$W\$n" submodule update -q --init --depth 1 ggml
+            Get-ChildItem "$W\$n\scripts\unsloth\ggml-patches\*.patch" -ErrorAction SilentlyContinue | ForEach-Object { git -C "$W\$n\ggml" apply $_.FullName; if ($LASTEXITCODE) { throw "patch $_" } }
+            & "$W\venv\Scripts\python.exe" "$W\sdrev_dump.py" "$W\$n"
+          }
+      - name: Build (MSVC + Vulkan)
+        shell: cmd
+        run: |
+          set W=%RUNNER_TEMP%\w
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath`) do set VSP=%%i
+          call "%VSP%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set VULKAN_SDK=%W%\VulkanSDK
+          set PATH=%W%\venv\Scripts;%W%\VulkanSDK\Bin;%PATH%
+          cmake -S %W%\m -B %W%\m\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=/bigobj -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_VULKAN=ON -DGGML_NATIVE=OFF || exit /b 1
+          cmake --build %W%\m\build -j 32 --target sd-cli || exit /b 1
+          cmake -S %W%\pr20 -B %W%\pr20\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=/bigobj -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BUILD_TESTS=ON || exit /b 1
+          cmake --build %W%\pr20\build -j 32 --target sd-cli sd-server test-backend-ops || exit /b 1
+      - name: test-backend-ops (Vulkan vs CPU)
+        shell: powershell
+        run: |
+          $W = "$env:RUNNER_TEMP\w"
+          foreach ($op in 'ROPE_PE_PERMUTE','MODULATE_ROWS','SWIGLU_SCALED','RMS_NORM','CPY','CONV_2D_DW','GLU','FLASH_ATTN_EXT','MUL_MAT') {
+            & "$W\pr20\build\bin\test-backend-ops.exe" test -o $op *> "$W\tbo_$op.log"; $rc = $LASTEXITCODE
+            $t = Get-Content "$W\tbo_$op.log"
+            "TBO $op rc=$rc ok=$(($t | Select-String ' OK$').Count) fail=$(($t | Select-String 'FAIL').Count) not_supported=$(($t | Select-String 'not supported').Count)"
+            $t | Select-String 'FAIL' | Select-Object -First 10
+          }
+          exit 0
+      - name: SD-Turbo smoke (master vs pr20)
+        shell: powershell
+        run: |
+          $W = "$env:RUNNER_TEMP\w"; $M = "$W\models\sd_turbo.gguf"
+          curl.exe -fsSL --retry 5 -o $M https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf
+          foreach ($n in 'm','pr20') {
+            $o = "$W\runs\sdt_$n"; New-Item -ItemType Directory -Force $o | Out-Null
+            $c = @('-m', $M, '-p', 'a red fox sitting in a snowy pine forest, detailed fur', '--steps', '2', '--cfg-scale', '1', '-W', '512', '-H', '512', '-s', '42', '--rng', 'cpu')
+            & "$W\$n\build\bin\sd-cli.exe" @c -o "$o\plain.png" *> "$o\plain.log"
+            & "$W\$n\build\bin\sd-cli.exe" @c --diffusion-fa --vae-tiling --vae-tile-size 24x16 -o "$o\fa_tiled.png" *> "$o\fa.log"
+            $env:SD_TILE_ASYNC_MERGE = '0'
+            & "$W\$n\build\bin\sd-cli.exe" @c --diffusion-fa --vae-tiling --vae-tile-size 24x16 -o "$o\fa_tiled_sync.png" *> "$o\fas.log"
+            Remove-Item Env:SD_TILE_ASYNC_MERGE
+            $h = foreach ($f in 'plain','fa_tiled','fa_tiled_sync') { if (Test-Path "$o\$f.png") { "$f=$((Get-FileHash "$o\$f.png").Hash.Substring(0,16))" } else { "$f=MISSING" } }
+            "SDT $n $($h -join ' ')"
+          }
+          exit 0
