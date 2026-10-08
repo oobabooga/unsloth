@@ -25,6 +25,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--scenario", required = True, choices = ("inf_only", "grad_then_inf", "inf_then_grad", "shapes_then_inf"))
+    ap.add_argument("--import-unsloth", action = "store_true",
+                    help = "import unsloth first, as tests/conftest.py does (global inductor config incl. memory_planning)")
     args = ap.parse_args()
     res: dict = {"scenario": args.scenario, "env_reuse": os.environ.get("UNSLOTH_FLEX_MASK_REUSE"), "calls": []}
 
@@ -32,8 +34,15 @@ def main() -> int:
         args.out.write_text(json.dumps(res, indent = 2, default = str), encoding = "utf-8")
 
     try:
+        if args.import_unsloth:
+            import unsloth  # noqa: F401
         import torch
         import unsloth_zoo
+        res["import_unsloth"] = bool(args.import_unsloth)
+        try:
+            res["inductor_memory_planning"] = bool(torch._inductor.config.memory_planning)
+        except Exception as e:  # noqa: BLE001
+            res["inductor_memory_planning"] = repr(e)
         from unsloth_zoo.flex_attention import utils as FU, attention_sink as AS
         res["unsloth_zoo_file"] = unsloth_zoo.__file__
         res["versions"] = {"torch": torch.__version__, "hip": getattr(torch.version, "hip", None)}

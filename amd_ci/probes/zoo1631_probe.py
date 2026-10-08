@@ -122,9 +122,10 @@ def run_cell(checkout: str, key: str, extra: dict, out_dir: Path, state: str, py
     return rec
 
 
-INF_CELLS = [("inf_only", {}), ("grad_then_inf", {}), ("inf_then_grad", {}),
-             ("inf_then_grad/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}), ("inf_only/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}),
-             ("shapes_then_inf", {}), ("shapes_then_inf/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"})]
+INF_CELLS = [("inf_only", {}), ("inf_then_grad", {}), ("shapes_then_inf", {}),
+             ("inf_only/unsloth", {}), ("inf_then_grad/unsloth", {}), ("shapes_then_inf/unsloth", {}),
+             ("inf_only/unsloth/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}),
+             ("shapes_then_inf/unsloth/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"})]
 
 
 def run_infmode(checkout: str, out_dir: Path, state: str, python: str) -> dict:
@@ -135,6 +136,8 @@ def run_infmode(checkout: str, out_dir: Path, state: str, python: str) -> dict:
         env = _env(checkout)
         env.update(extra)
         cmd = [python, "-u", str(HERE / "zoo1631_infmode.py"), "--scenario", key.split("/")[0], "--out", str(out)]
+        if "/unsloth" in key:
+            cmd.append("--import-unsloth")
         with open(log, "wb") as fh:
             try:
                 rc = subprocess.run(cmd, cwd = checkout, env = env, stdout = fh, stderr = subprocess.STDOUT,
