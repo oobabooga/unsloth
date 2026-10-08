@@ -1,0 +1,176 @@
+name: "AMD CI: issue 12205 ROCr CWSR wave count"
+
+# unslothai/unsloth#12205: the TheRock runtime bundled in the llama.cpp ROCm
+# prebuilts (10.1.0a20260822, rocm-systems d134b78) sizes the CWSR debug area from
+# topology waves/CU while amdkfd keeps 32, so a GPU whose firmware reports 20
+# waves/SIMD cannot create a HIP queue.
+#
+#   build  hosted ubuntu-22.04 (the prebuild workflow's own image): runs the proposed
+#          step end to end (manifest pin -> sparse fetch -> patch -> build -> gates),
+#          unpatched and patched with identical flags, plus the topology spoof shim.
+#   gpu    gfx1151, exclusive: each state runs llama-completion on the real topology
+#          and with max_waves_per_simd spoofed to 20 through the shim.
+#            A: stock bundle runtime      vs patched rebuild  (what users get)
+#            B: unpatched rebuild         vs patched rebuild  (the 2-line change alone)
+
+on:
+  push:
+    branches: [amd-ci-i12205]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NIGHTLY_URL: "https://rocm.nightlies.amd.com/tarball-multi-arch/therock-dist-linux-gfx1151-10.1.0a20260822.tar.gz"
+  BUNDLE_URL: "https://github.com/unslothai/llama.cpp/releases/download/b11160-mix-a6922cc/app-b11160-mix-a6922cc-linux-x64-rocm-gfx1151.tar.gz"
+  MODEL_URL: "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+  MODEL_SHA256: "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
+
+jobs:
+
+  build:
+    name: "Rebuild libhsa-runtime64 (proposed prebuild step)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+
+      - name: Fetch TheRock nightly and the stock bundle
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/rocm" "$W/bundle_stock"
+          echo "W=$W" >> "$GITHUB_ENV"
+          curl -fsSL --retry 5 "$NIGHTLY_URL" | tar -xz -C "$W/rocm"
+          curl -fsSL --retry 5 "$BUNDLE_URL" | tar -xz -C "$W/bundle_stock"
+          ls "$W/rocm/share/therock/"
+          df -h / | tail -1
+
+      - name: Proposed step - source
+        run: |
+          set -euo pipefail
+          ROCM="$W/rocm" WORK="$W" bash amd_ci/i12205/prepare_src.sh
+
+      - name: Proposed step - build and gates
+        run: |
+          set -euo pipefail
+          cp amd_ci/i12205/topo_spoof.c "$W/"
+          APT=1 ROCM="$W/rocm" WORK="$W" bash amd_ci/i12205/build_rocr.sh 2>&1 | tee "$W/build_rocr.out"
+          mkdir -p "$W/art"
+          cp "$W/bundle_unpatched/libhsa-runtime64.so.1" "$W/art/libhsa-runtime64.unpatched.so.1"
+          cp "$W/bundle_patched/libhsa-runtime64.so.1" "$W/art/libhsa-runtime64.patched.so.1"
+          cp "$W/topo_spoof.so" "$W"/build_rocr.out "$W"/cmake_*.log "$W/art/"
+          sha256sum "$W"/art/*.so*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: i12205-rocr
+          path: ${{ runner.temp }}/w/art
+          retention-days: 7
+          if-no-files-found: error
+
+  gpu:
+    name: "gfx1151 queue creation, real vs spoofed topology (exclusive)"
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "i12205-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: torch-free gate; GPU execution is proven per run by the offload check"
+          grep -h PRETTY_NAME /etc/os-release || true
+          ldd --version | head -1
+          for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            echo "== $p"; grep -E '^(simd_count|simd_per_cu|max_waves_per_simd|gfx_target_version|array_count|simd_arrays_per_engine|num_xcc) ' "$p" || true
+          done
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: i12205-rocr
+          path: ${{ env.AMD_CI_WORK }}/art
+
+      - name: Assemble states
+        run: |
+          set -euo pipefail
+          A="$AMD_CI_WORK"
+          mkdir -p "$A/stock"
+          curl -fsSL --retry 5 "$BUNDLE_URL" | tar -xz -C "$A/stock"
+          curl -fsSL --retry 5 -o "$A/stories260K.gguf" "$MODEL_URL"
+          echo "$MODEL_SHA256  $A/stories260K.gguf" | sha256sum -c -
+          for f in unpatched patched; do
+            rm -rf "${A:?}/rebuilt_$f"
+            cp -a "$A/stock" "$A/rebuilt_$f"
+            cp "$A/art/libhsa-runtime64.$f.so.1" "$A/rebuilt_$f/libhsa-runtime64.so.1"
+            LD_LIBRARY_PATH="$A/rebuilt_$f" ldd -r "$A/rebuilt_$f/llama-completion" 2>&1 \
+              | grep -E 'undefined symbol|not found' && { echo "FATAL: $f does not resolve"; exit 1; } || true
+          done
+          sha256sum "$A"/stock/libhsa-runtime64.so.1 "$A"/rebuilt_*/libhsa-runtime64.so.1
+          python3 - "$A" <<'PY'
+          import json, sys
+          a = sys.argv[1]
+          runs = {
+              "A_stock_vs_patched": ("stock", "rebuilt_patched",
+                                     "stock-therock-10.1.0a20260822", "rebuilt-patched"),
+              "B_unpatched_vs_patched": ("rebuilt_unpatched", "rebuilt_patched",
+                                         "rebuilt-unpatched", "rebuilt-patched"),
+          }
+          for name, (b, h, bl, hl) in runs.items():
+              json.dump({"paths": {"base": f"{a}/{b}", "head": f"{a}/{h}"},
+                         "commits": {"base": bl, "head": hl}},
+                        open(f"{a}/out/states_{name}.json", "w"), indent = 2)
+          PY
+
+      - name: Differential A (stock vs patched)
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_A_stock_vs_patched.json" \
+            --probe amd_ci/probes/hsa_queue_probe.py \
+            --criteria amd_ci/criteria/hsa_queue_create.py \
+            --out-dir "$AMD_CI_WORK/out/A_stock_vs_patched" \
+            --python python3 \
+            -- --model "$AMD_CI_WORK/stories260K.gguf" --shim "$AMD_CI_WORK/art/topo_spoof.so"
+          cat "$AMD_CI_WORK/out/A_stock_vs_patched/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/A_stock_vs_patched"
+
+      - name: Differential B (unpatched rebuild vs patched rebuild)
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_B_unpatched_vs_patched.json" \
+            --probe amd_ci/probes/hsa_queue_probe.py \
+            --criteria amd_ci/criteria/hsa_queue_create.py \
+            --out-dir "$AMD_CI_WORK/out/B_unpatched_vs_patched" \
+            --python python3 \
+            -- --model "$AMD_CI_WORK/stories260K.gguf" --shim "$AMD_CI_WORK/art/topo_spoof.so"
+          cat "$AMD_CI_WORK/out/B_unpatched_vs_patched/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/B_unpatched_vs_patched"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i12205-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
