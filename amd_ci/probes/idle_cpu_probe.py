@@ -31,7 +31,7 @@ import ctypes, json, os, sys, threading, time
 action = sys.argv[1]
 # Symbol renames seen in shipped OpenBLAS builds (numpy's is scipy_openblas_*64_).
 NAMINGS = [(p, s) for p in ("", "rocm_", "scipy_") for s in ("", "64_", "_64")]
-info = {"action": action, "env": {k: os.environ.get(k) for k in
+info = {"action": action, "pid": os.getpid(), "env": {k: os.environ.get(k) for k in
         ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "OMP_WAIT_POLICY", "MKL_NUM_THREADS")}}
 
 def openblas_report(tag):
@@ -92,7 +92,9 @@ def run():
     info["torch"] = torch.__version__
     info["hip"] = getattr(torch.version, "hip", None)
     info["torch_threads"] = torch.get_num_threads()
-    if action in ("gpu_init", "gpu_init_env1"):
+    if action == "import":
+        pass
+    elif action in ("gpu_init", "gpu_init_env1"):
         gpu_init()
     elif action in ("matmul", "matmul_env1", "matmul_omp1"):
         matmul()
@@ -191,7 +193,10 @@ def measure(py: Path, child: Path, arm: str, env_extra: dict, settle: float, win
             return rec
         rec["child"] = info
         rec["ready_s"] = round(time.time() - t0, 1)
-        p = psutil.Process(proc.pid)
+        # On Windows venv\Scripts\python.exe is a launcher that runs the base interpreter as a child,
+        # so sample the PID the interpreter reports, never the launcher's.
+        p = psutil.Process(info["pid"])
+        rec["launcher_pid"], rec["measured_pid"] = proc.pid, info["pid"]
         time.sleep(settle)
         c0 = p.cpu_times()
         th0 = {t.id: t.user_time + t.system_time for t in p.threads()}
@@ -212,6 +217,11 @@ def measure(py: Path, child: Path, arm: str, env_extra: dict, settle: float, win
         })
         return rec
     finally:
+        try:
+            for c in psutil.Process(proc.pid).children(recursive = True):
+                c.kill()
+        except psutil.Error:
+            pass
         proc.kill()
         proc.wait(timeout = 30)
 
@@ -224,7 +234,7 @@ def main() -> int:
     ap.add_argument("--gfx", default = "gfx1151")
     ap.add_argument("--repeats", type = int, default = 3)
     ap.add_argument("--settle", type = float, default = 5.0)
-    ap.add_argument("--window", type = float, default = 40.0)
+    ap.add_argument("--window", type = float, default = 30.0)
     args = ap.parse_args()
 
     work = Path(os.environ.get("AMD_CI_WORK") or args.out.parent)

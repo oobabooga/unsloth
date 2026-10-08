@@ -61,6 +61,10 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                if len(_busy(v, a)) < len((v.get("arms") or {})[a])]
     out.append(("every arm produced a reading", not missing and all(v.get("arms") for v in st.values()),
                 ", ".join(missing)))
+    thr = {k: max((r.get("threads") or 0 for r in (v.get("arms") or {}).get("import", [])), default = 0)
+           for k, v in st.items()}
+    out.append(("the sampled process is the interpreter (torch-imported arm has > 1 thread)",
+                all(t > 1 for t in thr.values()), str(thr)))
     mm = {k: _first_child(v, "matmul").get("matmul_ok") for k, v in st.items()}
     out.append(("the CPU matmul ran and is finite", all(mm.values()), str(mm)))
     return out
