@@ -1,0 +1,52 @@
+name: AMD DevLab CI (sd.cpp #20 HIP inertness)
+
+on:
+  push:
+    branches: [amd-devlab-ci-sd20]
+
+permissions: {}
+
+jobs:
+  hip:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | head -20; free -h
+          lspci -nn | grep -iE 'vga|display|processing accelerator' || true
+          ls /opt | head; which hipcc rocminfo cmake ninja || true
+          rocminfo 2>/dev/null | grep -E 'Marketing Name:|gfx' | head -10 || true
+      - name: Build and test
+        run: |
+          set -euxo pipefail
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{tmp,cache/pip}
+          export TMPDIR="$WORK_ROOT/tmp" PIP_CACHE_DIR="$WORK_ROOT/cache/pip"
+          python3 -m venv "$WORK_ROOT/venv"
+          . "$WORK_ROOT/venv/bin/activate"
+          pip install -q cmake ninja
+          if [ -x /opt/rocm/bin/hipcc ]; then
+            ROCM=/opt/rocm
+          else
+            pip install -q --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ "rocm[libraries,devel]"
+            ROCM="$(rocm-sdk path --root)"
+          fi
+          echo "ROCM=$ROCM"; ls "$ROCM/bin" | head -40
+          export PATH="$ROCM/bin:$ROCM/llvm/bin:$PATH" LD_LIBRARY_PATH="$ROCM/lib:${LD_LIBRARY_PATH:-}"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          cd src
+          git fetch -q origin pull/20/head:pr20
+          git checkout -q pr20
+          git log -1 --oneline
+          git submodule update --init --depth 1 ggml
+          for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; echo "applied $p"; done
+          cmake -S ggml -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HIP=ON -DGGML_CUDA_CUDNN=ON -DGPU_TARGETS=gfx1151 -DAMDGPU_TARGETS=gfx1151 \
+            -DGGML_BUILD_TESTS=ON -DGGML_NATIVE=OFF \
+            -DCMAKE_HIP_COMPILER="$ROCM/llvm/bin/clang++" -DCMAKE_PREFIX_PATH="$ROCM" -DROCM_PATH="$ROCM" -DHIP_PLATFORM=amd
+          cmake --build build -j 32 --target test-backend-ops
+          ls build/bin
+          ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 2>&1 | tail -40
+          ./build/bin/test-backend-ops -o SAGE_ATTN -b ROCm0 2>&1 | tail -10 || true
+          GGML_CUDA_CUDNN_ATTN_LOG=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 2>&1 | grep -ci cudnn || echo "no cudnn log lines (expected on HIP)"
