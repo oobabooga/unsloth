@@ -128,7 +128,7 @@ jobs:
             --probe amd_ci/probes/zoo1631_probe.py \
             --criteria amd_ci/criteria/zoo1631_regress.py \
             --out-dir "$AMD_CI_WORK/out/gpu_t5" \
-            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --leg t5 --pr 1631 --new-tests tests/test_flex_mask_reuse.py --train
+            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --leg t5 --pr 1631 --new-tests tests/test_flex_mask_reuse.py --infmode --only-new-tests
           cat "$AMD_CI_WORK/out/gpu_t5/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu_t5"
 
@@ -151,7 +151,7 @@ jobs:
             --probe amd_ci/probes/zoo1631_probe.py \
             --criteria amd_ci/criteria/zoo1631_regress.py \
             --out-dir "$AMD_CI_WORK/out/gpu_t4" \
-            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --leg t4 --pr 1631 --new-tests tests/test_flex_mask_reuse.py --train
+            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --leg t4 --pr 1631 --new-tests tests/test_flex_mask_reuse.py --infmode --only-new-tests
           cat "$AMD_CI_WORK/out/gpu_t4/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu_t4"
 

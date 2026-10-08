@@ -122,6 +122,43 @@ def run_cell(checkout: str, key: str, extra: dict, out_dir: Path, state: str, py
     return rec
 
 
+INF_CELLS = [("inf_only", {}), ("grad_then_inf", {}), ("inf_then_grad", {}),
+             ("inf_then_grad/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"}), ("inf_only/off", {"UNSLOTH_FLEX_MASK_REUSE": "0"})]
+
+
+def run_infmode(checkout: str, out_dir: Path, state: str, python: str) -> dict:
+    res = {}
+    for key, extra in INF_CELLS:
+        tag = f"{state}_{key.replace('/', '_')}"
+        out, log = out_dir / f"inf_{tag}.json", out_dir / f"inf_{tag}.log"
+        env = _env(checkout)
+        env.update(extra)
+        cmd = [python, "-u", str(HERE / "zoo1631_infmode.py"), "--scenario", key.split("/")[0], "--out", str(out)]
+        with open(log, "wb") as fh:
+            try:
+                rc = subprocess.run(cmd, cwd = checkout, env = env, stdout = fh, stderr = subprocess.STDOUT,
+                                    timeout = 900).returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+        rec = {"rc": rc, "extra_env": extra}
+        if out.is_file():
+            rec.update(json.loads(out.read_text(encoding = "utf-8")))
+        else:
+            rec["missing_output"] = True
+            rec["log_tail"] = log.read_text(encoding = "utf-8", errors = "replace")[-2000:]
+        res[key] = rec
+    # the PR's own test, isolated (fresh process, no earlier test in the session)
+    junit = out_dir / f"junit_isolated_{state}.xml"
+    t = "tests/test_flex_mask_reuse.py::test_inference_mode_mask_kept_apart"
+    try:
+        p = subprocess.run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", t],
+                           cwd = checkout, env = _env(checkout), capture_output = True, text = True, timeout = 900)
+        res["isolated_pytest"] = {"rc": p.returncode, "tail": (p.stdout or "")[-1500:]}
+    except subprocess.TimeoutExpired:
+        res["isolated_pytest"] = {"rc": "timeout"}
+    return res
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -135,6 +172,8 @@ def main() -> int:
     ap.add_argument("--pr", required = True)
     ap.add_argument("--new-tests", nargs = "+", required = True)
     ap.add_argument("--train", action = "store_true")
+    ap.add_argument("--infmode", action = "store_true")
+    ap.add_argument("--only-new-tests", action = "store_true")
     args = ap.parse_args()
     NEW_TESTS[:] = args.new_tests
     args.out = args.out.resolve()
@@ -155,6 +194,13 @@ def main() -> int:
         for key, extra in CELLS:
             obs["train"][key] = run_cell(args.checkout, key, extra, out_dir, args.state, args.python)
             args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
+    if args.only_new_tests:
+        global PATTERNS
+        PATTERNS = ("tests/*flex*.py",)
+    obs["infmode_enabled"] = bool(args.infmode)
+    if args.infmode and args.state != "merge":
+        obs["infmode"] = run_infmode(args.checkout, out_dir, args.state, args.python)
+        args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
     if not args.skip_pytest and args.state != "merge":
         obs["pytest"] = run_pytest(args.checkout, out_dir, args.state, args.python, args.timeout)
     args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")

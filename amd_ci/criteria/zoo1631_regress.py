@@ -82,6 +82,17 @@ def gates(obs):
             out.append((f"{name} train cells imported the state's unsloth_zoo",
                         bool(cells) and all(f and f.startswith(ck) for f in files), ", ".join(sorted(files)) or "no cells"))
             allc += [c for c in cells.values() if c.get("versions")]
+    if _meta(obs, "infmode_enabled"):
+        for name in ("base", "head"):
+            im = (obs.get(name) or {}).get("infmode") or {}
+            sc = {k: v for k, v in im.items() if k != "isolated_pytest"}
+            out.append((f"{name} inference-mode scenarios ran (no harness crash)",
+                        bool(sc) and all(v.get("done") and v.get("has_flex") for v in sc.values()),
+                        "; ".join(f"{k}: done={v.get('done')} err={str(v.get('error'))[:150]}" for k, v in sc.items())))
+            want = name == "head"
+            out.append((f"{name} reuse API presence as expected ({want})",
+                        bool(sc) and all(v.get("reuse_fn_present") is want for v in sc.values()),
+                        str({k: v.get("reuse_fn_present") for k, v in sc.items()})))
     if train:
         b, h = _cells(obs.get("base")), _cells(obs.get("head"))
         bad = [k for k in b if not _done(b[k])]
@@ -135,6 +146,16 @@ def head_is_worse(base, head):
                 line = (f"[{leg}] {k} head vs base bit-identical={same}, max |dloss| {_dloss(h, ref):.3g}, "
                         f"max |dlogit| {_dlogit(h, ref):.3g}; mask builds head {h.get('mask_builds_total')} base {ref.get('mask_builds_total')}")
                 (problems.append("HEAD != BASE " + line) if (baa and not same) or _dloss(h, ref) > DIVERGE else notes.append(line))
+    bi, hi = (base or {}).get("infmode") or {}, (head or {}).get("infmode") or {}
+    for k in [k for k in hi if k != "isolated_pytest"]:
+        def _fails(v):
+            return [f"{c['call']}: {str(c.get('error'))[:220]}" for c in (v or {}).get("calls") or [] if not c.get("ok")]
+        bf, hf = _fails(bi.get(k)), _fails(hi.get(k))
+        line = f"[{leg}] inference-mode scenario {k}: base {'FAIL ' + str(bf) if bf else 'ok'}; head {'FAIL ' + str(hf) if hf else 'ok'}"
+        (problems.append(line) if hf and not bf else notes.append(line))
+    if "isolated_pytest" in hi:
+        notes.append(f"[{leg}] isolated test_inference_mode_mask_kept_apart rc base {(bi.get('isolated_pytest') or {}).get('rc')} "
+                     f"head {(hi.get('isolated_pytest') or {}).get('rc')}: {str((hi.get('isolated_pytest') or {}).get('tail'))[-300:]}")
     bp, hp = (base or {}).get("pytest") or {}, (head or {}).get("pytest") or {}
     bpass = set(bp.get("passed") or [])
     hbad = set(hp.get("failed") or []) | set(hp.get("errors") or [])
