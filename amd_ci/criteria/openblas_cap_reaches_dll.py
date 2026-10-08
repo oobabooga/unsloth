@@ -51,18 +51,22 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                 all(x and all(e == "1" for e in x) for x in env1.values()), str(env1)))
     mm = {k: [(r.get("child") or {}).get("matmul_ok") for r in v.get("cap", [])] for k, v in st.items()}
     out.append(("the CPU matmul ran and is finite", all(x and all(x) for x in mm.values()), str(mm)))
+    wk = {k: (v.get("worker") or {}) for k, v in st.items()}
+    out.append(("the worker arm imported core.training.worker and loaded rocm-openblas.dll",
+                all(w.get("worker_import") == "ok" and w.get("dll_loaded") for w in wk.values()),
+                str({k: (w.get("worker_import"), w.get("dll_loaded"), w.get("error")) for k, w in wk.items()})[:600]))
     return out
 
 
 def table(obs: dict) -> str:
     rows = ["| state | wheel | DLL threads after configure_cpu_threads() | busy cores under sustained CPU BLAS (median, runs) "
-            "| Studio --api-only healthy s | idle busy cores (last 60 s, polled) |",
-            "|---|---|---|---|---|---|"]
+            "| Desktop-spawned worker: DLL threads | Studio --api-only healthy s | idle busy cores (last 60 s, polled) |",
+            "|---|---|---|---|---|---|---|"]
     for k, v in _states(obs).items():
         runs = [r.get("busy_cores_under_blas") for r in v.get("cap", [])]
         s = v.get("studio") or {}
-        rows.append(f"| {k} | {v.get('wheel')} | {_threads(v)} | {_busy(v)} {runs} | {s.get('healthy_s')} | "
-                    f"{s.get('busy_last60')} |")
+        rows.append(f"| {k} | {v.get('wheel')} | {_threads(v)} | {_busy(v)} {runs} | "
+                    f"{(v.get('worker') or {}).get('openblas_threads')} | {s.get('healthy_s')} | {s.get('busy_last60')} |")
     rows.append("")
     rows.append(f"Defect: > 1 DLL thread and >= {FANOUT_CORES} busy cores. Fixed: 1 thread, <= {CAPPED_CORES} busy "
                 f"cores, backend healthy and idle < {IDLE_CORES} cores.")
@@ -71,12 +75,14 @@ def table(obs: dict) -> str:
 
 def base_shows_defect(base: dict) -> bool:
     t, b = _threads(base), _busy(base)
-    return t is not None and b is not None and t > 1 and b >= FANOUT_CORES
+    w = (base.get("worker") or {}).get("openblas_threads")
+    return t is not None and b is not None and t > 1 and b >= FANOUT_CORES and w is not None and w > 1
 
 
 def head_is_fixed(head: dict) -> bool:
     t, b = _threads(head), _busy(head)
     s = head.get("studio") or {}
     idle = s.get("busy_last60")
-    return (t == 1 and b is not None and b <= CAPPED_CORES and s.get("healthy_s") is not None
+    return (t == 1 and b is not None and b <= CAPPED_CORES and (head.get("worker") or {}).get("openblas_threads") == 1
+            and s.get("healthy_s") is not None
             and not s.get("error") and idle is not None and idle < IDLE_CORES)

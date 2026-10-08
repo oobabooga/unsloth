@@ -56,6 +56,42 @@ time.sleep(100000)
 '''
 
 
+# A Desktop-spawned worker: no run.py, OPENBLAS_NUM_THREADS inherited from the backend, the worker module imported
+# first (as unpickling the spawn target does), then torch.
+WORKER = r'''
+import ctypes, json, os, sys
+sys.path.insert(0, os.getcwd())
+info = {"pid": os.getpid(), "env_openblas": os.environ.get("OPENBLAS_NUM_THREADS")}
+try:
+    import core.training.worker  # noqa: F401
+    info["worker_import"] = "ok"
+except Exception as e:
+    info["worker_import"] = repr(e)[:300]
+import torch
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+k32.GetModuleHandleW.restype = ctypes.c_void_p
+h = k32.GetModuleHandleW("rocm-openblas.dll")
+info["dll_loaded"] = bool(h)
+if h:
+    lib = ctypes.CDLL("rocm-openblas.dll", handle=h)
+    lib.openblas_get_num_threads.restype = ctypes.c_int
+    info["openblas_threads"] = lib.openblas_get_num_threads()
+print("WORKER " + json.dumps(info), flush=True)
+'''
+
+
+def worker_arm(py: Path, checkout: Path, work: Path) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("UNSLOTH_CPU_THREADS", "OMP_NUM_THREADS")}
+    env.update(OPENBLAS_NUM_THREADS = "1", UNSLOTH_STUDIO_HOME = str(work / "home_worker"), PYTHONUTF8 = "1")
+    r = subprocess.run([str(py), "-c", WORKER], cwd = str(checkout / "studio" / "backend"), env = env,
+                       capture_output = True, text = True, encoding = "utf-8", errors = "replace", timeout = 900)
+    for line in r.stdout.splitlines():
+        if line.startswith("WORKER "):
+            return json.loads(line[7:])
+    return {"error": f"rc={r.returncode}", "tail": (r.stdout + r.stderr)[-3000:]}
+
+
 def pinned(src: Path) -> tuple[str, str]:
     import re
     text = (src / "install.ps1").read_text(encoding = "utf-8", errors = "replace")
@@ -148,6 +184,8 @@ def main() -> int:
         if sip.run([str(py), str(checkout / "studio" / "install_python_stack.py")], obs["build"],
                    "install_python_stack", timeout = 3000, env = env, cwd = str(checkout / "studio")) != 0:
             raise SystemExit("install_python_stack failed")
+        obs["worker"] = worker_arm(py, checkout, work)
+        print(f"[{args.state}] worker: {obs['worker']}", flush = True)
         obs["studio"] = sip.idle_arm(py, checkout, work, args.state, "default", {},
                                      8870 + (10 if args.state == "head" else 0), args.idle, 5, 10)
     except BaseException as e:  # noqa: BLE001 -- recorded; the criteria gates turn it into INCONCLUSIVE
