@@ -79,8 +79,10 @@ jobs:
         nfrom core.inference.diffusion_device import resolve_diffusion_device_target\\n\\ntarget = resolve_diffusion_device_target()\\\
         nemit(\"target\", target=target.as_public_dict(), studio_sdpa_probe=available_sdpa_kernels(target))\\nprops = torch.cuda.get_device_properties(0)\\\
         nif args.free_gib:\\n    cap = int(args.free_gib * 2**30)\\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory,\
-        \ 0)\\n\\n    def virtual_memory(backend):\\n        physical_free, _ = torch.cuda.mem_get_info()\\n        return\
-        \ min(physical_free, max(0, cap - torch.cuda.memory_reserved())) // 2**20, 20 * 1024, \"discrete_vram\"\\n\\n    dm._cuda_memory\
+        \ 0)\\n\\n    real_memory_info = torch.cuda.mem_get_info\\n    def capped_memory_info(device=None):\\n        physical_free,\
+        \ _ = real_memory_info(device)\\n        return min(physical_free, max(0, cap - torch.cuda.memory_reserved(device))),\
+        \ 20 * 2**30\\n    torch.cuda.mem_get_info = capped_memory_info\\n    def virtual_memory(backend):\\n        free,\
+        \ total = capped_memory_info()\\n        return free // 2**20, total // 2**20, \"discrete_vram\"\\n\\n    dm._cuda_memory\
         \ = virtual_memory\\n    emit(\"synthetic_capacity\", total_gib=20, free_gib=args.free_gib)\\nfrom dataclasses import\
         \ replace\\norig_plan = d.plan_diffusion_memory\\n\\n\\ndef record_plan(**kw):\\n    plan = orig_plan(**kw)\\n   \
         \ if args.placement == \"auto-tiled\":\\n        plan = replace(plan, vae_tiling=True)\\n    elif args.placement in\
@@ -99,24 +101,30 @@ jobs:
         \        if pr.get(\"error\"):\\n            raise RuntimeError(pr[\"error\"])\\n        if pr.get(\"phase\") == \"\
         ready\":\\n            break\\n        if time.monotonic() > deadline:\\n            raise TimeoutError(\"load > 50\
         \ min\")\\n        time.sleep(10)\\n    emit(\"loaded\", seconds=time.perf_counter() - t0, status=backend.status(),\
-        \ mem=mem())\\n    import functools\\n    pipe = backend._state.pipe\\n    phase_rows = []\\n    def instrument(obj,\
-        \ method, phase):\\n        original = getattr(obj, method)\\n        @functools.wraps(original)\\n        def measured(*a,\
-        \ **kw):\\n            torch.cuda.synchronize()\\n            torch.cuda.reset_peak_memory_stats()\\n            before\
-        \ = mem()\\n            began = time.perf_counter()\\n            try:\\n                return original(*a, **kw)\\\
-        n            finally:\\n                torch.cuda.synchronize()\\n                row = dict(phase=phase, seconds=time.perf_counter()-began,\\\
-        n                           before=before, after=mem())\\n                phase_rows.append(row)\\n              \
-        \  emit(\"phase\", **row)\\n        setattr(obj, method, measured)\\n    instrument(pipe, \"encode_prompt\", \"encode\"\
-        )\\n    instrument(pipe.transformer, \"forward\", \"denoise\")\\n    instrument(pipe.vae, \"decode\", \"decode\")\\\
-        n    emit(\"placement\", policy=backend._state.offload_policy, tiling=getattr(pipe.vae,\"use_tiling\",None),\\n  \
-        \       components={name:dict(device=str(next(module.parameters()).device),\\n                              bytes=sum(p.numel()*p.element_size()\
-        \ for p in module.parameters()))\\n                     for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\\\
-        n    prompts = [\"A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n       \
-        \        \"A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n             \
-        \  \"A chalkboard menu that reads FRESH COFFEE 2.50 in a small cafe.\"]\\n    for i in range(args.repeats):\\n   \
-        \     phase_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i % len(prompts)],\
-        \ width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0, seed=42)\\n\
-        \        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out / f\"\
-        {args.case}-{i}-{j}.png\")\\n        emit(\"render\", index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
+        \ mem=mem())\\n    import functools\\n    pipe = backend._state.pipe\\n    phase_rows = []\\n    tile_rows = []\\\
+        n    from core.inference import diffusion_vae_tiling as vt\\n    original_decode_tile = vt._decode_tile\\n    def\
+        \ measured_decode_tile(vae, z):\\n        row = dict(shape=list(z.shape), ok=False)\\n        tile_rows.append(row)\\\
+        n        try:\\n            result = original_decode_tile(vae, z)\\n            row[\"ok\"] = True\\n            return\
+        \ result\\n        except Exception as exc:\\n            row[\"error\"] = type(exc).__name__\\n            raise\\\
+        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        original = getattr(obj,\
+        \ method)\\n        @functools.wraps(original)\\n        def measured(*a, **kw):\\n            torch.cuda.synchronize()\\\
+        n            torch.cuda.reset_peak_memory_stats()\\n            before = mem()\\n            began = time.perf_counter()\\\
+        n            try:\\n                return original(*a, **kw)\\n            finally:\\n                torch.cuda.synchronize()\\\
+        n                row = dict(phase=phase, seconds=time.perf_counter()-began,\\n                           before=before,\
+        \ after=mem())\\n                phase_rows.append(row)\\n                emit(\"phase\", **row)\\n        setattr(obj,\
+        \ method, measured)\\n    instrument(pipe, \"encode_prompt\", \"encode\")\\n    instrument(pipe.transformer, \"forward\"\
+        , \"denoise\")\\n    instrument(pipe.vae, \"decode\", \"decode\")\\n    emit(\"placement\", policy=backend._state.offload_policy,\
+        \ tiling=getattr(pipe.vae,\"use_tiling\",None),\\n         components={name:dict(device=str(next(module.parameters()).device),\\\
+        n                              bytes=sum(p.numel()*p.element_size() for p in module.parameters()))\\n            \
+        \         for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\\n    prompts = [\"A\
+        \ red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n               \"A blue ceramic\
+        \ teapot on a wooden table beside a window, soft daylight, photograph.\",\\n               \"A chalkboard menu that\
+        \ reads FRESH COFFEE 2.50 in a small cafe.\"]\\n    for i in range(args.repeats):\\n        phase_rows.clear()\\n\
+        \        tile_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i %\
+        \ len(prompts)], width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0,\
+        \ seed=42)\\n        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out\
+        \ / f\"{args.case}-{i}-{j}.png\")\\n        emit(\"render\", tiles=tile_rows, last_decode_tile=getattr(pipe.vae,\"\
+        _unsloth_last_decode_tile\",None), index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
         n             phase_seconds={ph:sum(r[\"seconds\"] for r in phase_rows if r[\"phase\"]==ph) for ph in (\"encode\"\
         ,\"denoise\",\"decode\")},\\n             peak_allocated=max([r[\"after\"][\"peak\"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\\\
         n    emit(\"complete\", success=True)\\nexcept Exception as exc:  # noqa: BLE001\\n    emit(\"failure\", error=repr(exc)[:2000],\
@@ -216,11 +224,18 @@ jobs:
         \ (out/'missing-family-guard.log').write_text(p.stdout+'\\n'+p.stderr,encoding='utf-8')\n print('guard',p.returncode,p.stdout[-1500:],p.stderr[-1000:],flush=True)\n\
         finally:\n run([py,'-m','pip','install','--index-url',idx,'torch[device-gfx1151]==2.11.0+rocm7.14.0'])\nprobe('repaired')\n"
       timeout-minutes: 15
-    - name: auto19-prime
+    - name: Attention evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: attention-v2-Windows
+        path: ${{ env.WORK_ROOT }}/out
+        retention-days: 14
+    - name: v2-auto19-prime
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-prime'\n\
-        args=['--case', 'auto19-prime', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-prime'\n\
+        args=['--case', 'v2-auto19-prime', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -229,18 +244,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-prime
+    - name: Evidence v2-auto19-prime
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-prime-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto19-prime*
+        name: v2-auto19-prime-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-prime*
         retention-days: 14
-    - name: resident19-tiled
+    - name: v2-resident19-tiled
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-tiled'\n\
-        args=['--case', 'resident19-tiled', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-tiled'\n\
+        args=['--case', 'v2-resident19-tiled', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024', '--steps',\
         \ '4', '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -249,18 +264,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-tiled
+    - name: Evidence v2-resident19-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-tiled-Windows
-        path: ${{ env.WORK_ROOT }}/out/resident19-tiled*
+        name: v2-resident19-tiled-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-tiled*
         retention-days: 14
-    - name: auto19-tiled
+    - name: v2-auto19-tiled
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-tiled'\n\
-        args=['--case', 'auto19-tiled', '--placement', 'auto-tiled', '--free-gib', '19', '--size', '1024', '--steps', '4',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-tiled'\n\
+        args=['--case', 'v2-auto19-tiled', '--placement', 'auto-tiled', '--free-gib', '19', '--size', '1024', '--steps', '4',\
         \ '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -269,19 +284,19 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-tiled
+    - name: Evidence v2-auto19-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-tiled-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto19-tiled*
+        name: v2-auto19-tiled-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-tiled*
         retention-days: 14
-    - name: resident19-untiled
+    - name: v2-resident19-untiled
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-untiled'\n\
-        args=['--case', 'resident19-untiled', '--placement', 'resident', '--free-gib', '19', '--size', '1024', '--steps',\
-        \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-untiled'\n\
+        args=['--case', 'v2-resident19-untiled', '--placement', 'resident', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ '4', '--repeats', '1', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
@@ -289,18 +304,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-untiled
+    - name: Evidence v2-resident19-untiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-untiled-Windows
-        path: ${{ env.WORK_ROOT }}/out/resident19-untiled*
+        name: v2-resident19-untiled-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-untiled*
         retention-days: 14
-    - name: model19
+    - name: v2-model19
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='model19'\n\
-        args=['--case', 'model19', '--placement', 'model', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-model19'\n\
+        args=['--case', 'v2-model19', '--placement', 'model', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
         \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -309,38 +324,38 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence model19
+    - name: Evidence v2-model19
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: model19-Windows
-        path: ${{ env.WORK_ROOT }}/out/model19*
+        name: v2-model19-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-model19*
         retention-days: 14
-    - name: auto19-control
+    - name: v2-auto19-control
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-control'\n\
-        args=['--case', 'auto19-control', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
-        \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
-        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-control'\n\
+        args=['--case', 'v2-auto19-control', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4',\
+        \ '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
         print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-control
+    - name: Evidence v2-auto19-control
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-control-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto19-control*
+        name: v2-auto19-control-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-control*
         retention-days: 14
-    - name: resident17-tiled
+    - name: v2-resident17-tiled
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident17-tiled'\n\
-        args=['--case', 'resident17-tiled', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident17-tiled'\n\
+        args=['--case', 'v2-resident17-tiled', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024', '--steps',\
         \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -349,18 +364,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident17-tiled
+    - name: Evidence v2-resident17-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident17-tiled-Windows
-        path: ${{ env.WORK_ROOT }}/out/resident17-tiled*
+        name: v2-resident17-tiled-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-resident17-tiled*
         retention-days: 14
-    - name: auto17
+    - name: v2-auto17
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto17'\n\
-        args=['--case', 'auto17', '--placement', 'auto', '--free-gib', '17', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto17'\n\
+        args=['--case', 'v2-auto17', '--placement', 'auto', '--free-gib', '17', '--size', '1024', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -369,18 +384,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto17
+    - name: Evidence v2-auto17
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto17-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto17*
+        name: v2-auto17-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto17*
         retention-days: 14
-    - name: resident19-1536
+    - name: v2-resident19-1536
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-1536'\n\
-        args=['--case', 'resident19-1536', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-1536'\n\
+        args=['--case', 'v2-resident19-1536', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536', '--steps',\
         \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -389,18 +404,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-1536
+    - name: Evidence v2-resident19-1536
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-1536-Windows
-        path: ${{ env.WORK_ROOT }}/out/resident19-1536*
+        name: v2-resident19-1536-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-1536*
         retention-days: 14
-    - name: auto19-1536
+    - name: v2-auto19-1536
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536'\n\
-        args=['--case', 'auto19-1536', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-1536'\n\
+        args=['--case', 'v2-auto19-1536', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -409,19 +424,19 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-1536
+    - name: Evidence v2-auto19-1536
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-1536-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto19-1536*
+        name: v2-auto19-1536-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-1536*
         retention-days: 14
-    - name: auto19-1536-unchunked
+    - name: v2-auto19-1536-unchunked
       shell: python -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536-unchunked'\n\
-        args=['--case', 'auto19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4',\
-        \ '--repeats', '2', '--query-chunking', '0']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-1536-unchunked'\n\
+        args=['--case', 'v2-auto19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '0']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
@@ -429,18 +444,78 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-1536-unchunked
+    - name: Evidence v2-auto19-1536-unchunked
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-1536-unchunked-Windows
-        path: ${{ env.WORK_ROOT }}/out/auto19-1536-unchunked*
+        name: v2-auto19-1536-unchunked-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-1536-unchunked*
+        retention-days: 14
+    - name: v2-math19-1024
+      shell: python -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1024'\n\
+        args=['--case', 'v2-math19-1024', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '2', '--query-chunking', 'auto', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1024
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1024-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1024*
+        retention-days: 14
+    - name: v2-math19-1536-chunked
+      shell: python -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1536-chunked'\n\
+        args=['--case', 'v2-math19-1536-chunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '1', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1536-chunked
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1536-chunked-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1536-chunked*
+        retention-days: 14
+    - name: v2-math19-1536-unchunked
+      shell: python -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1536-unchunked'\n\
+        args=['--case', 'v2-math19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '0', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1536-unchunked
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1536-unchunked-Windows
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1536-unchunked*
         retention-days: 14
     - name: Environment evidence
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: environment-Windows
+        name: environment-v2-Windows
         path: ${{ env.WORK_ROOT }}/out
         retention-days: 14
   linux:
@@ -517,8 +592,10 @@ jobs:
         nfrom core.inference.diffusion_device import resolve_diffusion_device_target\\n\\ntarget = resolve_diffusion_device_target()\\\
         nemit(\"target\", target=target.as_public_dict(), studio_sdpa_probe=available_sdpa_kernels(target))\\nprops = torch.cuda.get_device_properties(0)\\\
         nif args.free_gib:\\n    cap = int(args.free_gib * 2**30)\\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory,\
-        \ 0)\\n\\n    def virtual_memory(backend):\\n        physical_free, _ = torch.cuda.mem_get_info()\\n        return\
-        \ min(physical_free, max(0, cap - torch.cuda.memory_reserved())) // 2**20, 20 * 1024, \"discrete_vram\"\\n\\n    dm._cuda_memory\
+        \ 0)\\n\\n    real_memory_info = torch.cuda.mem_get_info\\n    def capped_memory_info(device=None):\\n        physical_free,\
+        \ _ = real_memory_info(device)\\n        return min(physical_free, max(0, cap - torch.cuda.memory_reserved(device))),\
+        \ 20 * 2**30\\n    torch.cuda.mem_get_info = capped_memory_info\\n    def virtual_memory(backend):\\n        free,\
+        \ total = capped_memory_info()\\n        return free // 2**20, total // 2**20, \"discrete_vram\"\\n\\n    dm._cuda_memory\
         \ = virtual_memory\\n    emit(\"synthetic_capacity\", total_gib=20, free_gib=args.free_gib)\\nfrom dataclasses import\
         \ replace\\norig_plan = d.plan_diffusion_memory\\n\\n\\ndef record_plan(**kw):\\n    plan = orig_plan(**kw)\\n   \
         \ if args.placement == \"auto-tiled\":\\n        plan = replace(plan, vae_tiling=True)\\n    elif args.placement in\
@@ -537,24 +614,30 @@ jobs:
         \        if pr.get(\"error\"):\\n            raise RuntimeError(pr[\"error\"])\\n        if pr.get(\"phase\") == \"\
         ready\":\\n            break\\n        if time.monotonic() > deadline:\\n            raise TimeoutError(\"load > 50\
         \ min\")\\n        time.sleep(10)\\n    emit(\"loaded\", seconds=time.perf_counter() - t0, status=backend.status(),\
-        \ mem=mem())\\n    import functools\\n    pipe = backend._state.pipe\\n    phase_rows = []\\n    def instrument(obj,\
-        \ method, phase):\\n        original = getattr(obj, method)\\n        @functools.wraps(original)\\n        def measured(*a,\
-        \ **kw):\\n            torch.cuda.synchronize()\\n            torch.cuda.reset_peak_memory_stats()\\n            before\
-        \ = mem()\\n            began = time.perf_counter()\\n            try:\\n                return original(*a, **kw)\\\
-        n            finally:\\n                torch.cuda.synchronize()\\n                row = dict(phase=phase, seconds=time.perf_counter()-began,\\\
-        n                           before=before, after=mem())\\n                phase_rows.append(row)\\n              \
-        \  emit(\"phase\", **row)\\n        setattr(obj, method, measured)\\n    instrument(pipe, \"encode_prompt\", \"encode\"\
-        )\\n    instrument(pipe.transformer, \"forward\", \"denoise\")\\n    instrument(pipe.vae, \"decode\", \"decode\")\\\
-        n    emit(\"placement\", policy=backend._state.offload_policy, tiling=getattr(pipe.vae,\"use_tiling\",None),\\n  \
-        \       components={name:dict(device=str(next(module.parameters()).device),\\n                              bytes=sum(p.numel()*p.element_size()\
-        \ for p in module.parameters()))\\n                     for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\\\
-        n    prompts = [\"A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n       \
-        \        \"A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n             \
-        \  \"A chalkboard menu that reads FRESH COFFEE 2.50 in a small cafe.\"]\\n    for i in range(args.repeats):\\n   \
-        \     phase_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i % len(prompts)],\
-        \ width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0, seed=42)\\n\
-        \        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out / f\"\
-        {args.case}-{i}-{j}.png\")\\n        emit(\"render\", index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
+        \ mem=mem())\\n    import functools\\n    pipe = backend._state.pipe\\n    phase_rows = []\\n    tile_rows = []\\\
+        n    from core.inference import diffusion_vae_tiling as vt\\n    original_decode_tile = vt._decode_tile\\n    def\
+        \ measured_decode_tile(vae, z):\\n        row = dict(shape=list(z.shape), ok=False)\\n        tile_rows.append(row)\\\
+        n        try:\\n            result = original_decode_tile(vae, z)\\n            row[\"ok\"] = True\\n            return\
+        \ result\\n        except Exception as exc:\\n            row[\"error\"] = type(exc).__name__\\n            raise\\\
+        n    vt._decode_tile = measured_decode_tile\\n    def instrument(obj, method, phase):\\n        original = getattr(obj,\
+        \ method)\\n        @functools.wraps(original)\\n        def measured(*a, **kw):\\n            torch.cuda.synchronize()\\\
+        n            torch.cuda.reset_peak_memory_stats()\\n            before = mem()\\n            began = time.perf_counter()\\\
+        n            try:\\n                return original(*a, **kw)\\n            finally:\\n                torch.cuda.synchronize()\\\
+        n                row = dict(phase=phase, seconds=time.perf_counter()-began,\\n                           before=before,\
+        \ after=mem())\\n                phase_rows.append(row)\\n                emit(\"phase\", **row)\\n        setattr(obj,\
+        \ method, measured)\\n    instrument(pipe, \"encode_prompt\", \"encode\")\\n    instrument(pipe.transformer, \"forward\"\
+        , \"denoise\")\\n    instrument(pipe.vae, \"decode\", \"decode\")\\n    emit(\"placement\", policy=backend._state.offload_policy,\
+        \ tiling=getattr(pipe.vae,\"use_tiling\",None),\\n         components={name:dict(device=str(next(module.parameters()).device),\\\
+        n                              bytes=sum(p.numel()*p.element_size() for p in module.parameters()))\\n            \
+        \         for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\\n    prompts = [\"A\
+        \ red ceramic teapot on a wooden table beside a window, soft daylight, photograph.\",\\n               \"A blue ceramic\
+        \ teapot on a wooden table beside a window, soft daylight, photograph.\",\\n               \"A chalkboard menu that\
+        \ reads FRESH COFFEE 2.50 in a small cafe.\"]\\n    for i in range(args.repeats):\\n        phase_rows.clear()\\n\
+        \        tile_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i %\
+        \ len(prompts)], width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0,\
+        \ seed=42)\\n        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out\
+        \ / f\"{args.case}-{i}-{j}.png\")\\n        emit(\"render\", tiles=tile_rows, last_decode_tile=getattr(pipe.vae,\"\
+        _unsloth_last_decode_tile\",None), index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
         n             phase_seconds={ph:sum(r[\"seconds\"] for r in phase_rows if r[\"phase\"]==ph) for ph in (\"encode\"\
         ,\"denoise\",\"decode\")},\\n             peak_allocated=max([r[\"after\"][\"peak\"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\\\
         n    emit(\"complete\", success=True)\\nexcept Exception as exc:  # noqa: BLE001\\n    emit(\"failure\", error=repr(exc)[:2000],\
@@ -654,11 +737,18 @@ jobs:
         \ (out/'missing-family-guard.log').write_text(p.stdout+'\\n'+p.stderr,encoding='utf-8')\n print('guard',p.returncode,p.stdout[-1500:],p.stderr[-1000:],flush=True)\n\
         finally:\n run([py,'-m','pip','install','--index-url',idx,'torch[device-gfx1151]==2.11.0+rocm7.14.0'])\nprobe('repaired')\n"
       timeout-minutes: 15
-    - name: auto19-prime
+    - name: Attention evidence
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: attention-v2-Linux
+        path: ${{ env.WORK_ROOT }}/out
+        retention-days: 14
+    - name: v2-auto19-prime
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-prime'\n\
-        args=['--case', 'auto19-prime', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-prime'\n\
+        args=['--case', 'v2-auto19-prime', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -667,18 +757,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-prime
+    - name: Evidence v2-auto19-prime
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-prime-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto19-prime*
+        name: v2-auto19-prime-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-prime*
         retention-days: 14
-    - name: resident19-tiled
+    - name: v2-resident19-tiled
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-tiled'\n\
-        args=['--case', 'resident19-tiled', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-tiled'\n\
+        args=['--case', 'v2-resident19-tiled', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024', '--steps',\
         \ '4', '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -687,18 +777,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-tiled
+    - name: Evidence v2-resident19-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-tiled-Linux
-        path: ${{ env.WORK_ROOT }}/out/resident19-tiled*
+        name: v2-resident19-tiled-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-tiled*
         retention-days: 14
-    - name: auto19-tiled
+    - name: v2-auto19-tiled
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-tiled'\n\
-        args=['--case', 'auto19-tiled', '--placement', 'auto-tiled', '--free-gib', '19', '--size', '1024', '--steps', '4',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-tiled'\n\
+        args=['--case', 'v2-auto19-tiled', '--placement', 'auto-tiled', '--free-gib', '19', '--size', '1024', '--steps', '4',\
         \ '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -707,19 +797,19 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-tiled
+    - name: Evidence v2-auto19-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-tiled-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto19-tiled*
+        name: v2-auto19-tiled-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-tiled*
         retention-days: 14
-    - name: resident19-untiled
+    - name: v2-resident19-untiled
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-untiled'\n\
-        args=['--case', 'resident19-untiled', '--placement', 'resident', '--free-gib', '19', '--size', '1024', '--steps',\
-        \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-untiled'\n\
+        args=['--case', 'v2-resident19-untiled', '--placement', 'resident', '--free-gib', '19', '--size', '1024', '--steps',\
+        \ '4', '--repeats', '1', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
@@ -727,18 +817,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-untiled
+    - name: Evidence v2-resident19-untiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-untiled-Linux
-        path: ${{ env.WORK_ROOT }}/out/resident19-untiled*
+        name: v2-resident19-untiled-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-untiled*
         retention-days: 14
-    - name: model19
+    - name: v2-model19
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='model19'\n\
-        args=['--case', 'model19', '--placement', 'model', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-model19'\n\
+        args=['--case', 'v2-model19', '--placement', 'model', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
         \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -747,38 +837,38 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence model19
+    - name: Evidence v2-model19
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: model19-Linux
-        path: ${{ env.WORK_ROOT }}/out/model19*
+        name: v2-model19-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-model19*
         retention-days: 14
-    - name: auto19-control
+    - name: v2-auto19-control
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-control'\n\
-        args=['--case', 'auto19-control', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
-        \ '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
-        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-control'\n\
+        args=['--case', 'v2-auto19-control', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4',\
+        \ '--repeats', '3', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
         print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-control
+    - name: Evidence v2-auto19-control
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-control-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto19-control*
+        name: v2-auto19-control-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-control*
         retention-days: 14
-    - name: resident17-tiled
+    - name: v2-resident17-tiled
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident17-tiled'\n\
-        args=['--case', 'resident17-tiled', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident17-tiled'\n\
+        args=['--case', 'v2-resident17-tiled', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024', '--steps',\
         \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -787,18 +877,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident17-tiled
+    - name: Evidence v2-resident17-tiled
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident17-tiled-Linux
-        path: ${{ env.WORK_ROOT }}/out/resident17-tiled*
+        name: v2-resident17-tiled-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-resident17-tiled*
         retention-days: 14
-    - name: auto17
+    - name: v2-auto17
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto17'\n\
-        args=['--case', 'auto17', '--placement', 'auto', '--free-gib', '17', '--size', '1024', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto17'\n\
+        args=['--case', 'v2-auto17', '--placement', 'auto', '--free-gib', '17', '--size', '1024', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -807,18 +897,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto17
+    - name: Evidence v2-auto17
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto17-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto17*
+        name: v2-auto17-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto17*
         retention-days: 14
-    - name: resident19-1536
+    - name: v2-resident19-1536
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='resident19-1536'\n\
-        args=['--case', 'resident19-1536', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-resident19-1536'\n\
+        args=['--case', 'v2-resident19-1536', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536', '--steps',\
         \ '4', '--repeats', '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -827,18 +917,18 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence resident19-1536
+    - name: Evidence v2-resident19-1536
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: resident19-1536-Linux
-        path: ${{ env.WORK_ROOT }}/out/resident19-1536*
+        name: v2-resident19-1536-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-resident19-1536*
         retention-days: 14
-    - name: auto19-1536
+    - name: v2-auto19-1536
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536'\n\
-        args=['--case', 'auto19-1536', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4', '--repeats',\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-1536'\n\
+        args=['--case', 'v2-auto19-1536', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4', '--repeats',\
         \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
         \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
@@ -847,19 +937,19 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-1536
+    - name: Evidence v2-auto19-1536
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-1536-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto19-1536*
+        name: v2-auto19-1536-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-1536*
         retention-days: 14
-    - name: auto19-1536-unchunked
+    - name: v2-auto19-1536-unchunked
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='auto19-1536-unchunked'\n\
-        args=['--case', 'auto19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps', '4',\
-        \ '--repeats', '2', '--query-chunking', '0']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-auto19-1536-unchunked'\n\
+        args=['--case', 'v2-auto19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '0']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
         \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
@@ -867,17 +957,77 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence auto19-1536-unchunked
+    - name: Evidence v2-auto19-1536-unchunked
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: auto19-1536-unchunked-Linux
-        path: ${{ env.WORK_ROOT }}/out/auto19-1536-unchunked*
+        name: v2-auto19-1536-unchunked-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-auto19-1536-unchunked*
+        retention-days: 14
+    - name: v2-math19-1024
+      shell: python3 -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1024'\n\
+        args=['--case', 'v2-math19-1024', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
+        \ '2', '--query-chunking', 'auto', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1024
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1024-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1024*
+        retention-days: 14
+    - name: v2-math19-1536-chunked
+      shell: python3 -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1536-chunked'\n\
+        args=['--case', 'v2-math19-1536-chunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '1', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1536-chunked
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1536-chunked-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1536-chunked*
+        retention-days: 14
+    - name: v2-math19-1536-unchunked
+      shell: python3 -X utf8 {0}
+      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='v2-math19-1536-unchunked'\n\
+        args=['--case', 'v2-math19-1536-unchunked', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '2', '--query-chunking', '0', '--disable-fused-sdpa']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8')\
+        \ as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
+        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
+        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
+        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
+        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
+        \ exit and result records.\n"
+      timeout-minutes: 25
+    - name: Evidence v2-math19-1536-unchunked
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: v2-math19-1536-unchunked-Linux
+        path: ${{ env.WORK_ROOT }}/out/v2-math19-1536-unchunked*
         retention-days: 14
     - name: Environment evidence
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: environment-Linux
+        name: environment-v2-Linux
         path: ${{ env.WORK_ROOT }}/out
         retention-days: 14
