@@ -28,7 +28,9 @@ import sys
 import time
 from pathlib import Path
 
+# unsloth-zoo publishes its own versions: 2026.9.14 never existed; unsloth 2026.9.14 declares zoo>=2026.9.9.
 PAIRS = {"base": "2026.9.14", "head": "2026.10.2"}
+ZOO = {"base": "2026.9.9", "head": "2026.10.2"}
 CU130 = "https://download.pytorch.org/whl/cu130"
 PYPI = "https://pypi.org/simple"
 ROCM_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"
@@ -162,7 +164,7 @@ def long_paths_enabled():
 
 
 def leg1(state: str, work: Path, log: Path) -> dict:
-    v = PAIRS[state]
+    v, zv = PAIRS[state], ZOO[state]
     env = spoof_free_env()
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -174,7 +176,7 @@ def leg1(state: str, work: Path, log: Path) -> dict:
         return res
     res["torch_install"] = run([py, "-m", "pip", "install", TORCH_CU130, VISION_CU130,
                                 "--index-url", CU130, "--extra-index-url", PYPI], env, log, 3600)
-    res["pair_install"] = run([py, "-m", "pip", "install", f"unsloth=={v}", f"unsloth-zoo=={v}",
+    res["pair_install"] = run([py, "-m", "pip", "install", f"unsloth=={v}", f"unsloth-zoo=={zv}",
                                TORCH_CU130, VISION_CU130, "--extra-index-url", CU130], env, log, 3600)
     t = res["pair_install"]["tail"]
     res["resolver_conflict"] = ("ResolutionImpossible" in t) or ("conflicting dependencies" in t) \
@@ -208,7 +210,7 @@ json.dump(sorted(set(out)), open(sys.argv[1], "w", encoding="utf-8"))
 
 
 def leg2(work: Path, log: Path) -> dict:
-    v = PAIRS["head"]
+    v, zv = PAIRS["head"], ZOO["head"]
     env = dict(os.environ)
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -220,14 +222,14 @@ def leg2(work: Path, log: Path) -> dict:
         return res
     idx = ["--index-url", ROCM_INDEX, "--extra-index-url", PYPI]
     res["torch_install"] = run([py, "-m", "pip", "install", ROCM_TORCH, ROCM_VISION, *idx], env, log, 3600)
-    res["pair_install"] = run([py, "-m", "pip", "install", f"unsloth=={v}", f"unsloth-zoo=={v}",
+    res["pair_install"] = run([py, "-m", "pip", "install", f"unsloth=={v}", f"unsloth-zoo=={zv}",
                                "torch==2.11.0+rocm7.14.0", "torchvision==0.26.0+rocm7.14.0", *idx],
                               env, log, 3600)
     res["pair_install_mode"] = "with_deps"
     if res["pair_install"]["rc"] != 0:
         # Keep the ROCm torch: install the pair without deps, then its runtime deps minus torch-family.
         res["pair_install_nodeps"] = run([py, "-m", "pip", "install", "--no-deps", f"unsloth=={v}",
-                                          f"unsloth-zoo=={v}", "packaging"], env, log, 1200)
+                                          f"unsloth-zoo=={zv}", "packaging"], env, log, 1200)
         reqs = _requires_without_torch(py, env, log, work)
         res["fallback_reqs"] = reqs
         res["fallback_install"] = run([py, "-m", "pip", "install", *reqs, "--extra-index-url", PYPI],
@@ -273,7 +275,7 @@ def main() -> int:
     work.mkdir(parents = True, exist_ok = True)
     log = args.out.parent / f"probe_detail_{args.state}.log"
     obs: dict = {
-        "state": args.state, "checkout": args.checkout, "pair": PAIRS.get(args.state),
+        "state": args.state, "checkout": args.checkout, "pair": PAIRS.get(args.state), "zoo": ZOO.get(args.state),
         "python": sys.version, "platform": sys.platform, "base_python": base_python(),
         "long_paths_enabled": long_paths_enabled(), "work": str(work),
     }

@@ -122,6 +122,27 @@ def _patch(torch):
     cuda.get_device_properties = get_device_properties
     cuda.get_device_name = get_device_name
     cuda.get_device_capability = get_device_capability
+
+    # torch.cuda queues its CUDA-build arch checks at import (before this patch runs). They parse
+    # sm_XX out of get_arch_list(), which on a ROCm build holds gfx names, so under the faked
+    # torch.version.cuda they raise IndexError at lazy init (DeferredCudaCallError). Run them as
+    # the real build would: a no-op on ROCm.
+    replaced = {}
+    for name in ("_check_capability", "_check_cubins"):
+        real_check = getattr(cuda, name, None)
+        if real_check is None:
+            continue
+
+        def as_real_build(_f = real_check):
+            if v._amd_ci_real_hip is not None:
+                return None
+            return _f()
+
+        replaced[real_check] = as_real_build
+        setattr(cuda, name, as_real_build)
+    queued = getattr(cuda, "_queued_calls", None)
+    if isinstance(queued, list):
+        queued[:] = [(replaced.get(call, call), *rest) for call, *rest in queued]
     torch._amd_ci_nvidia_identity = True
 
 

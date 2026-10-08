@@ -26,7 +26,9 @@ NEEDS: list[str] = ["windows", "nvidia", "discrete_gpu"]
 
 TORCH = "2.14.0+cu130"
 PAIR = {"base": "2026.9.14", "head": "2026.10.2"}
-NO_GPU_MSG = "cannot find any torch accelerator"
+# The accelerator gate words its refusal by what it sees: a box with an AMD GPU and a CUDA torch
+# build gets the ROCm wording. Both are the gate itself, which is where a GPU-less import must end.
+NO_GPU_MSGS = ("cannot find any torch accelerator", "has no usable hip accelerator")
 
 
 def _l1(o):
@@ -76,7 +78,11 @@ def base_shows_defect(base: dict):
     rc = _rc(l1.get("pair_install"))
     torch_v, uns = i.get("v_torch"), i.get("v_unsloth")
     if rc != 0:
-        return True, f"pip refused the {PAIR['base']} pair with torch {TORCH} (rc {rc})"
+        # Only a resolver conflict against the torch pin is the defect; anything else (a version
+        # that does not exist, a network error) means the base never tested the cap: VOID.
+        if l1.get("resolver_conflict"):
+            return True, f"pip refused the {PAIR['base']} pair with torch {TORCH} (rc {rc}, resolver conflict)"
+        return False, f"base pair install failed without a resolver conflict (rc {rc}): harness, not the cap"
     if torch_v != TORCH:
         return True, f"pair installed but torch moved to {torch_v}"
     if uns != PAIR["base"]:
@@ -102,7 +108,7 @@ def _leg1_head_problems(head: dict) -> list[str]:
     u = imps.get("unsloth") or {}
     if u.get("ok"):
         bad.append("import unsloth succeeded on a box with no NVIDIA GPU (unexpected; check the spoof was stripped)")
-    elif NO_GPU_MSG not in str(u.get("exc", "")).lower():
+    elif not any(m in str(u.get("exc", "")).lower() for m in NO_GPU_MSGS):
         bad.append(f"import unsloth failed BEFORE the accelerator check: {u.get('exc_type')}: "
                    f"{str(u.get('exc', ''))[:300]}")
     return bad
