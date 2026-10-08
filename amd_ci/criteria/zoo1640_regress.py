@@ -196,9 +196,23 @@ def head_is_worse(base, head):
     bpass = set(bp.get("passed") or [])
     hbad = set(hp.get("failed") or []) | set(hp.get("errors") or [])
     bbad = set(bp.get("failed") or []) | set(bp.get("errors") or [])
-    lost = sorted(t for t in bpass if t not in set(hp.get("passed") or []))
+    hall = set(hp.get("passed") or []) | hbad | set((hp.get("skipped") or {}).keys())
+    lost, renamed = [], []
+    for t in sorted(t for t in bpass if t not in set(hp.get("passed") or [])):
+        # The PR adds a leading parametrize axis to edited tests (f[x] -> f[0-x], f -> f[0]): the base ID is then
+        # absent at head. Count it as renamed only when every head variant exists and passes.
+        if t not in hall:
+            fn, _, prm = t.partition("[")
+            prm = prm.rstrip("]")
+            var = [h for h in hall if h.startswith(fn + "[") and (h.endswith("-" + prm + "]") if prm else True)]
+            if var and all(v in set(hp.get("passed") or []) for v in var):
+                renamed.append(f"{t} -> {len(var)} passing head variants")
+                continue
+        lost.append(t)
     if lost:
         problems.append(f"[{leg}] passed at base, not at head: {lost}")
+    if renamed:
+        notes.append(f"[{leg}] base IDs renamed at head by a new parametrize axis, all variants pass: {renamed}")
     new_head_fail = sorted(hbad - bbad)
     if new_head_fail:
         problems.append(f"[{leg}] failing at head, not at base: {new_head_fail}")
