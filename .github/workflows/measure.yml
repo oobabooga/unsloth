@@ -1,4 +1,4 @@
-name: AMD Qwen fixed VAE tile measurements
+name: AMD Qwen segmented prefill math attention validation
 'on':
   push:
     branches:
@@ -11,7 +11,7 @@ jobs:
     - Linux
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 100
+    timeout-minutes: 60
     env:
       STACK: multiarch-7.14.0
       UNSLOTH_IS_PRESENT: '1'
@@ -94,7 +94,28 @@ jobs:
         n                       reasons=(\"experimental whole-component placement\",))\\n    emit(\"plan\", plan=plan.as_public_dict())\\\
         n    return plan\\n\\n\\nd.plan_diffusion_memory = record_plan\\nproc = psutil.Process()\\n\\n\\ndef mem():\\n   \
         \ return dict(alloc=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved(),\\n                peak=torch.cuda.max_memory_allocated(),\
-        \ rss=proc.memory_info().rss)\\n\\n\\nbackend = d.DiffusionBackend()\\ntry:\\n    t0 = time.perf_counter()\\n    backend.begin_load(\"\
+        \ rss=proc.memory_info().rss)\\n\\n\\n\\nfrom diffusers.models.transformers import transformer_qwenimage21 as qmod\\\
+        noriginal_dispatch = qmod.dispatch_attention_fn\\nchunk_stats = dict(calls=0, shapes={})\\ndef bounded_dispatch(query,\
+        \ key, value, **kwargs):\\n    if query.shape[1] <= 512 or kwargs.get(\"parallel_config\") is not None or kwargs.get(\"\
+        dropout_p\", 0) != 0:\\n        return original_dispatch(query, key, value, **kwargs)\\n    mask = kwargs.get(\"attn_mask\"\
+        )\\n    if mask is not None and (not isinstance(mask, torch.Tensor) or mask.shape[-2] not in (1, query.shape[1])):\\\
+        n        return original_dispatch(query, key, value, **kwargs)\\n    if kwargs.get(\"is_causal\", False):\\n     \
+        \   return original_dispatch(query, key, value, **kwargs)\\n    chunk_stats[\"calls\"] += 1\\n    shape = str((tuple(query.shape),\
+        \ tuple(key.shape), None if mask is None else tuple(mask.shape)))\\n    chunk_stats[\"shapes\"][shape] = chunk_stats[\"\
+        shapes\"].get(shape,0) + 1\\n    outputs = []\\n    for start in range(0, query.shape[1], 512):\\n        kw = dict(kwargs)\\\
+        n        if mask is not None and mask.shape[-2] != 1:\\n            kw[\"attn_mask\"] = mask[..., start:start+512,\
+        \ :]\\n        outputs.append(original_dispatch(query[:,start:start+512],key,value,**kw))\\n    return torch.cat(outputs,dim=1)\\\
+        nqmod.dispatch_attention_fn = bounded_dispatch\\n# Numerical checks cover ordinary, broadcast-key-mask, and row-specific\
+        \ causal-mask calls.\\ng = torch.Generator(device=\"cuda\").manual_seed(731)\\nq=torch.randn(1,769,2,32,device=\"\
+        cuda\",dtype=torch.bfloat16,generator=g)\\nk=torch.randn(1,833,2,32,device=\"cuda\",dtype=torch.bfloat16,generator=g)\\\
+        nv=torch.randn(1,833,2,32,device=\"cuda\",dtype=torch.bfloat16,generator=g)\\nkey_mask=torch.ones(1,1,1,833,device=\"\
+        cuda\",dtype=torch.bool);key_mask[...,-5:]=False\\nrow_mask=(torch.arange(833,device=\"cuda\")[None,:] <= torch.arange(769,device=\"\
+        cuda\")[:,None]+64)[None,None]\\nfor label,mask in [(\"unmasked\",None),(\"key-mask\",key_mask),(\"row-mask\",row_mask)]:\\\
+        n    reference=original_dispatch(q,k,v,backend=\"native\",attn_mask=mask,dropout_p=0.0)\\n    actual=bounded_dispatch(q,k,v,backend=\"\
+        native\",attn_mask=mask,dropout_p=0.0)\\n    err=float((reference.float()-actual.float()).abs().max().item())\\n \
+        \   ok=bool(torch.allclose(reference,actual,atol=0.02,rtol=0.02))\\n    emit(\"chunk_validation\",label=label,max_abs_error=err,ok=ok)\\\
+        n    assert ok,(label,err)\\ndel q,k,v,reference,actual,key_mask,row_mask\\nchunk_stats[\"calls\"]=0;chunk_stats[\"\
+        shapes\"]={}\\n\\nbackend = d.DiffusionBackend()\\ntry:\\n    t0 = time.perf_counter()\\n    backend.begin_load(\"\
         unsloth/Qwen-Image-2.1-GGUF\", gguf_filename=\"qwen-image-2.1-Q4_K_M.gguf\",\\n                       family_override=\"\
         qwen-image-2.1\", memory_mode=args.memory_mode,\\n                       **({} if args.te == \"auto\" else {\"text_encoder_quant\"\
         : args.te}))\\n    deadline = time.monotonic() + 3000\\n    while True:\\n        pr = backend.load_progress()\\n\
@@ -130,7 +151,7 @@ jobs:
         \        tile_rows.clear()\\n        t1 = time.perf_counter()\\n        res = backend.generate(prompt=prompts[i %\
         \ len(prompts)], width=args.size, height=args.size,\\n                               steps=args.steps, guidance=1.0,\
         \ seed=42)\\n        torch.cuda.synchronize()\\n        for j, im in enumerate(res[\"images\"]):\\n            im.save(out\
-        \ / f\"{args.case}-{i}-{j}.png\")\\n        emit(\"render\", tiles=tile_rows, last_decode_tile=getattr(pipe.vae,\"\
+        \ / f\"{args.case}-{i}-{j}.png\")\\n        emit(\"render\", chunk_stats=chunk_stats, tiles=tile_rows, last_decode_tile=getattr(pipe.vae,\"\
         _unsloth_last_decode_tile\",None), index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\\\
         n             phase_seconds={ph:sum(r[\"seconds\"] for r in phase_rows if r[\"phase\"]==ph) for ph in (\"encode\"\
         ,\"denoise\",\"decode\")},\\n             peak_allocated=max([r[\"after\"][\"peak\"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\\\
@@ -216,32 +237,12 @@ jobs:
         n            dtype,\\n            \"the math kernel\" if len(broken) == 2 else \"the remaining kernels\",\\n     \
         \       ROCM_FUSED_SDPA_ALLOW_ENV,\\n        )\\n    return broken\\n\\n\\n',encoding=\"utf-8\")\n"
       timeout-minutes: 50
-    - name: tile-auto19
+    - name: math-prefill1536-cap19
       shell: python3 -X utf8 {0}
       run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='tile-auto19'\n\
-        args=['--case', 'tile-auto19', '--placement', 'auto', '--free-gib', '19', '--size', '1024', '--steps', '4', '--repeats',\
-        \ '2', '--query-chunking', 'auto']\n\nstart=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n\
-        \ p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
-        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
-        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
-        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
-        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
-        \ exit and result records.\n"
-      timeout-minutes: 25
-    - name: Evidence tile-auto19
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: tile-auto19-Linux
-        path: ${{ env.WORK_ROOT }}/out/tile-auto19*
-        retention-days: 14
-    - name: tile-resident19-fixed512
-      shell: python3 -X utf8 {0}
-      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='tile-resident19-fixed512'\n\
-        args=['--case', 'tile-resident19-fixed512', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1024',\
-        \ '--steps', '4', '--repeats', '3', '--query-chunking', 'auto']\n\nargs.extend(['--env','UNSLOTH_DIFFUSION_VAE_MAX_TILE=32'])\n\
+        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='math-prefill1536-cap19'\n\
+        args=['--case', 'math-prefill1536-cap19', '--placement', 'auto', '--free-gib', '19', '--size', '1536', '--steps',\
+        \ '4', '--repeats', '1', '--query-chunking', '0']\n\nargs.extend(['--disable-fused-sdpa','--env','UNSLOTH_DIFFUSION_VAE_MAX_TILE=32'])\n\
         start=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
         \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
         \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
@@ -249,57 +250,10 @@ jobs:
         \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
         \ exit and result records.\n"
       timeout-minutes: 25
-    - name: Evidence tile-resident19-fixed512
+    - name: Evidence
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: tile-resident19-fixed512-Linux
-        path: ${{ env.WORK_ROOT }}/out/tile-resident19-fixed512*
-        retention-days: 14
-    - name: tile-resident17-fixed512
-      shell: python3 -X utf8 {0}
-      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='tile-resident17-fixed512'\n\
-        args=['--case', 'tile-resident17-fixed512', '--placement', 'resident-tiled', '--free-gib', '17', '--size', '1024',\
-        \ '--steps', '4', '--repeats', '2', '--query-chunking', 'auto']\n\nargs.extend(['--env','UNSLOTH_DIFFUSION_VAE_MAX_TILE=32'])\n\
-        start=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
-        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
-        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
-        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
-        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
-        \ exit and result records.\n"
-      timeout-minutes: 25
-    - name: Evidence tile-resident17-fixed512
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: tile-resident17-fixed512-Linux
-        path: ${{ env.WORK_ROOT }}/out/tile-resident17-fixed512*
-        retention-days: 14
-    - name: tile-resident19-1536-fixed512
-      shell: python3 -X utf8 {0}
-      run: "\nimport os,sys,subprocess,json,time\nfrom pathlib import Path\nfrom collections import deque\nroot=Path(os.environ['WORK_ROOT']);\
-        \ out=root/'out'\npy=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))\ncase='tile-resident19-1536-fixed512'\n\
-        args=['--case', 'tile-resident19-1536-fixed512', '--placement', 'resident-tiled', '--free-gib', '19', '--size', '1536',\
-        \ '--steps', '4', '--repeats', '2', '--query-chunking', 'auto']\n\nargs.extend(['--env','UNSLOTH_DIFFUSION_VAE_MAX_TILE=32'])\n\
-        start=time.time()\nwith (out/(case+'.log')).open('w',encoding='utf-8') as f:\n p=subprocess.Popen([py,'-u',str(root/'generation_probe.py'),'--output',str(out),*args],stdout=f,stderr=subprocess.STDOUT)\n\
-        \ try: rc=p.wait(timeout=1440)\n except subprocess.TimeoutExpired:\n  if sys.platform=='win32':subprocess.run(['taskkill','/PID',str(p.pid),'/T','/F'])\n\
-        \  else:p.kill()\n  p.wait();rc=124\n(out/(case+'-exit.json')).write_text(json.dumps(dict(returncode=rc,seconds=time.time()-start)))\n\
-        print(case,'exit',rc,'seconds',time.time()-start,flush=True)\nwith (out/(case+'.log')).open(encoding='utf-8',errors='replace')\
-        \ as f:print(''.join(deque(f,maxlen=25)))\n# Expected OOMs remain evidence; the final interpretation uses per-case\
-        \ exit and result records.\n"
-      timeout-minutes: 25
-    - name: Evidence tile-resident19-1536-fixed512
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: tile-resident19-1536-fixed512-Linux
-        path: ${{ env.WORK_ROOT }}/out/tile-resident19-1536-fixed512*
-        retention-days: 14
-    - name: Environment evidence
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: environment-tiles-Linux
+        name: prefill-math-Linux
         path: ${{ env.WORK_ROOT }}/out
         retention-days: 14
