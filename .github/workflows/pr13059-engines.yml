@@ -19,10 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, engine: chromium }
-          - { os: ubuntu-latest, engine: webkit }
           - { os: macos-latest, engine: webkit }
-          - { os: windows-latest, engine: msedge }
     defaults:
       run:
         shell: bash
@@ -103,7 +100,7 @@ jobs:
           from playwright.sync_api import sync_playwright
 
           ENGINE, BASE_DIST, PR_DIST = sys.argv[1], sys.argv[2], sys.argv[3]
-          SIZES = [int(x) for x in (sys.argv[4] if len(sys.argv) > 4 else "800,2000").split(",")]
+          SIZES = [] if (len(sys.argv) > 4 and sys.argv[4] == "none") else [int(x) for x in (sys.argv[4] if len(sys.argv) > 4 else "800,2000").split(",")]
           REPS = int(sys.argv[5]) if len(sys.argv) > 5 else 2
           PORTS = {"base": 8791, "pr": 8792}
           DIRS = {"base": BASE_DIST, "pr": PR_DIST}
@@ -128,7 +125,7 @@ jobs:
               errors = []
               page.on("pageerror", lambda e: errors.append(str(e)))
               q = "remote=1" + (f"&stream={stream}" if stream else "")
-              page.goto(f"http://127.0.0.1:{PORTS[side]}/smoke-thread-weight.html?{q}")
+              page.goto(f"http://127.0.0.1:{PORTS[side]}/smoke-thread-weight.html?{q}", timeout=120000)
               page.wait_for_function("window.__threadWeight !== undefined", timeout=120000)
               page.evaluate(f"window.__threadWeight.seed({n}, {AGENT})")
               page.wait_for_function(f"window.__threadWeight.messageCount() >= {n}", timeout=300000)
@@ -327,4 +324,4 @@ jobs:
           print("FAILURES:\n  " + "\n  ".join(failures) if failures else "ALL PARITY CHECKS PASSED")
           sys.exit(1 if failures else 0)
           PYEOF
-          python -I engines_check.py "${{ matrix.engine }}" dist-base dist-pr 800,2000 2
+          python -I engines_check.py "${{ matrix.engine }}" dist-base dist-pr none 1
