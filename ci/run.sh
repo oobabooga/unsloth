@@ -59,6 +59,10 @@ for n in base head; do
   [ "$(git -C "$W/$n/ggml" rev-parse HEAD)" = "$g" ] || { log "ggml at wrong commit"; exit 1; }
   np=0; for p in "$W/$n"/scripts/unsloth/ggml-patches/*.patch; do [ -f "$p" ] || continue; git -C "$W/$n/ggml" apply "$p" || { log "PATCH FAIL $n $p"; exit 1; }; np=$((np+1)); done
   python "$CI/harness.py" "$W/$n/examples/cli/main.cpp" >/dev/null
+  if [ "$BACKEND" = hip ]; then  # test-only: upstream leejet#2020 gate so ROCm iGPUs can allocate (same in both arms)
+    sed -i 's/if (total_bytes > 0 \&\& free_bytes > total_bytes) {/if (total_bytes > 0 \&\& free_bytes > total_bytes \&\& sd_backend_is(backend, "Vulkan")) {/' "$W/$n/src/model_manager.cpp"
+    grep -q 'free_bytes > total_bytes && sd_backend_is(backend, "Vulkan")' "$W/$n/src/model_manager.cpp" && log "$n: applied upstream #2020 iGPU gate (test-only)"
+  fi
   log "$n $(git -C "$W/$n" log --oneline -1 | cut -c1-70) ggml=${g:0:8} patches=$np"
 done
 
