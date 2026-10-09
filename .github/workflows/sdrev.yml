@@ -7,54 +7,95 @@ on:
 permissions: {}
 
 jobs:
-  win:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: "stack-windows-diag"
-            backend: ""
-            base: "6321a69"
-            head: "1957123"
-            tbo: ""
-            tbo_env: ""
-            h3: "1"
-            h3_envs: "vaefa1:SD_H3_VAE_FLASH_ATTN=1;vaefa0:SD_H3_VAE_FLASH_ATTN=0;gf0:SD_H3_GRAPH_FAST=0;gf0dw0:SD_H3_GRAPH_FAST=0 SD_H3_AUDIO_DIRECT_DW=0"
-            zimg: ""
-            head_cmake: ""
-            src_repo: ""
-            script: "run.sh"
-            variants: ""
-            steps: ""
-            reps: ""
-            h3_steps: ""
-            h3_ab_reps: ""
-            zimg_cap: ""
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 360
+  cuda-leg:
+    name: cuda-leg
+    runs-on: ubuntu-22.04
+    env:
+      CUDA_VERSION: 12.8.1
+      CUDA_ARCHS: 70;75;80;86;89;90;100;120
     steps:
-      - name: Fetch harness
-        shell: powershell
-        run: |
-          $h = Join-Path $env:RUNNER_TEMP ("h-" + $env:GITHUB_RUN_ID + "-" + $PID)
-          git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth $h
-          Add-Content $env:GITHUB_ENV "H=$h"
-      - name: Run
-        shell: powershell
-        env:
-          BASE: ${{ matrix.base }}
-          HEAD: ${{ matrix.head }}
-          TBO_OPS: ${{ matrix.tbo }}
-          H3: ${{ matrix.h3 }}
-          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
-          ZIMG: ${{ matrix.zimg }}
-          HEAD_CMAKE: ${{ matrix.head_cmake }}
-        run: '& "$env:H\\ci\\run.ps1"'
-      - name: Upload
-        if: always() && env.ART != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ env.ART }}
-          if-no-files-found: ignore
+    - name: Checkout tree (tooling)
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: unslothai/stable-diffusion.cpp
+        ref: 1957123ab6a7c66836c3ea23cb238556d681a305
+        path: tooling
+        fetch-depth: 1
+    - name: Free disk for the toolkit
+      run: 'set -eux
+  
+        # The hosted image ships ~25 GB free; the toolkit plus a seven-architecture ggml-cuda
+  
+        # build does not fit beside the preinstalled Android and .NET trees.
+  
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+  
+        df -h /
+  
+        '
+    - name: Source tree (as resolve prepares it)
+      run: 'set -eux
+  
+        git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+  
+        cd src
+  
+        git checkout -q 1957123ab6a7c66836c3ea23cb238556d681a305
+  
+        git submodule update --init --recursive --depth 1 ggml
+  
+        for p in scripts/unsloth/ggml-patches/*.patch; do [ -e "$p" ] || continue; git -C ggml apply --verbose "../$p"; done
+  
+        git log --oneline -1
+  
+        '
+    - name: Install CUDA toolkit
+      id: cuda-toolkit
+      uses: Jimver/cuda-toolkit@95b5a29a2823ef87666dcd45ec236fc4f82498d0
+      with:
+        cuda: ${{ env.CUDA_VERSION }}
+        method: network
+        sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust", "nvrtc-dev"]'
+        non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+    - name: cuDNN headers (build time only)
+      run: "set -euo pipefail\n# ggml-cuda's cuDNN attention path (GGML_CUDA_CUDNN) compiles against cudnn.h, but the\n# library itself is opened with dlopen when the first attention op runs and is NOT\n\
+        # bundled: a host without a loadable libcudnn.so.9 keeps the ggml attention kernels.\n# Only the headers package is fetched (80 KB), pinned by version and checksum.\ndeb=libcudnn9-headers-cuda-12_9.27.0.42-1_amd64.deb\n\
+        curl -fsSL --retry 3 -o \"$RUNNER_TEMP/$deb\" \\\n  \"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/$deb\"\necho \"68243ab04422da565e0bafec00f64ac08cfd82d805c8015c0c503af7ab4dd1d6\
+        \  $RUNNER_TEMP/$deb\" | sha256sum -c -\ndpkg -x \"$RUNNER_TEMP/$deb\" \"$RUNNER_TEMP/cudnn-deb\"\n# The package ships cudnn*_v9.h; the unversioned names normally come from the -dev\n# package's alternatives,\
+        \ so link them here.\ninc=\"$RUNNER_TEMP/cudnn-include\"\nmkdir -p \"$inc\"\nfor f in \"$RUNNER_TEMP\"/cudnn-deb/usr/include/x86_64-linux-gnu/cudnn*_v9.h; do\n  b=\"$(basename \"$f\")\"\n  ln -s \"\
+        $f\" \"$inc/${b%_v9.h}.h\"\ndone\ntest -e \"$inc/cudnn.h\"\necho \"CUDNN_INCLUDE_DIR=$inc\" >> \"$GITHUB_ENV\"\n"
+    - name: Build sd-cli + sd-server (CUDA)
+      working-directory: src
+      run: "set -euo pipefail\n# Volta through Blackwell. V100 can run H3 with quantized weights and CPU offload,\n# but a device probe succeeds even when the binary has no sm_70 kernels. Include\n# sm_70\
+        \ so generation does not fail at the first CUDA kernel launch.\n#\n# The CUDA launcher matters more than the other two here: Jimver installs nvcc outside\n# the default search, and nvcc is nearly\
+        \ the whole build, so caching only C/CXX would\n# leave the expensive half uncached.\ncmake -B build \\\n  -DCMAKE_BUILD_TYPE=Release \\\n  -DSD_BUILD_EXAMPLES=ON \\\n  -DSD_SERVER_BUILD_FRONTEND=OFF\
+        \ \\\n  -DSD_WEBP=OFF -DSD_WEBM=OFF \\\n  -DGGML_NATIVE=OFF \\\n  -DSD_CUDA=ON \\\n  -DGGML_CUDA_CUDNN=ON \\\n  -DGGML_CUDA_CUDNN_INCLUDE_DIR=\"$CUDNN_INCLUDE_DIR\" \\\n  -DCMAKE_CUDA_ARCHITECTURES=\"\
+        $CUDA_ARCHS\"\ncmake --build build --config Release -j \"$(nproc)\" --target sd-cli sd-server\n# Diagnostic only, under set -e: never fail a good build over stats.\nccache --show-stats || true\n"
+    - name: Bundle the CUDA runtime beside the binaries
+      run: "set -euo pipefail\n# A Studio host has an NVIDIA driver but not necessarily a CUDA runtime, and Studio's\n# torch install keeps its own copies somewhere we must not depend on. Ship ours and\n\
+        # point the binaries at their own directory, or sd-cli dies on a missing libcublas.\nBIN=\"${GITHUB_WORKSPACE}/src/build/bin\"\nCUDA_ROOT=\"${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\"\nsudo apt-get\
+        \ update -qq && sudo apt-get install -y -qq patchelf\n# cudart lands under the toolkit root; the libcublas debs land in the system\n# multiarch dir. Search both rather than guess which is which.\n\
+        for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do\n  src=\"$(find \"$CUDA_ROOT\" /usr/lib/x86_64-linux-gnu -name \"${so}*\" -type f 2>/dev/null | sort | tail -1)\"\n  [ -n \"$src\" ]\
+        \ || { echo \"ERROR: $so not found under $CUDA_ROOT or /usr/lib/x86_64-linux-gnu\" >&2; exit 1; }\n  cp -L \"$src\" \"$BIN/$so\"\ndone\nfor exe in sd-cli sd-server; do\n  patchelf --set-rpath '$ORIGIN'\
+        \ \"$BIN/$exe\"\ndone\nldd \"$BIN/sd-cli\" | sed -n '1,40p'\n# cuDNN and NVRTC are opened at run time only; a link-time dependency would stop the binaries\n# loading on every host without it.\nfor\
+        \ exe in sd-cli sd-server; do\n  if readelf -d \"$BIN/$exe\" | grep -qE 'NEEDED.*(cudnn|nvrtc)'; then\n    echo \"ERROR: $exe links libcudnn or libnvrtc; they must stay run-time dlopens\" >&2\n  \
+        \  exit 1\n  fi\ndone\n"
+    - name: Package bundle
+      env:
+        BIN_DIR: ${{ github.workspace }}/src/build/bin
+        OUT_DIR: ${{ github.workspace }}/dist
+        TAG: sdrev20
+        LABEL: Linux-Ubuntu-22.04-x86_64-cuda12
+        COMMIT: 1957123ab6a7c66836c3ea23cb238556d681a305
+        SOURCE_REPO: ${{ github.repository }}
+        LICENSE_FILE: ${{ runner.temp }}/LICENSE
+      run: "set -euo pipefail\n# The binaries compile in cudnn-frontend's header-only templates, so its MIT notice ships too.\n{\n  cat src/LICENSE\n  printf '\\n\\n---- cudnn-frontend (https://github.com/NVIDIA/cudnn-frontend)\
+        \ ----\\n\\n'\n  cat src/build/_deps/ggml_cudnn_frontend-src/LICENSE.txt\n} > \"$LICENSE_FILE\"\npython3 tooling/scripts/unsloth/package_bundle.py\n"
+    - name: Upload bundle
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: sd-sdrev20-bin-Linux-Ubuntu-22.04-x86_64-cuda12
+        path: dist/sd-sdrev20-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
+        if-no-files-found: error
+        retention-days: 7
+    timeout-minutes: 360
