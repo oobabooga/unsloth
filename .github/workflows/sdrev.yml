@@ -7,35 +7,27 @@ on:
 permissions: {}
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth h
+          echo "matrix=$(jq -c . h/ci/jobs.json)" >> "$GITHUB_OUTPUT"
   ab:
+    needs: plan
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: pr17-hip
-            backend: hip
-            base: 6321a69
-            head: ca92d95
-            tbo: CPY,MUL_MAT
-            tbo_env: "CPY:GGML_CUDA_CPY_ROWS=0 MUL_MAT:GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=1"
-            h3: "1"
-            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
-            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
-          - name: pr17-vulkan
-            backend: vulkan
-            base: 6321a69
-            head: ca92d95
-            tbo: CPY
-            tbo_env: ""
-            h3: "1"
-            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
-            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
       - name: Fetch harness
-        run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h"
+        run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" && echo "H=$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" >> "$GITHUB_ENV"
       - name: Run
         env:
           BACKEND: ${{ matrix.backend }}
@@ -47,9 +39,9 @@ jobs:
           H3_HEAD_ENVS: ${{ matrix.h3_envs }}
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
-        run: bash "$RUNNER_TEMP/h/ci/run.sh"
+        run: bash "$H/ci/run.sh"
       - name: Upload
-        if: always()
+        if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.name }}

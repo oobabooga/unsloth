@@ -1,0 +1,4 @@
+[
+ {"name":"pr17-vulkan","backend":"vulkan","base":"6321a69","head":"ca92d95","tbo":"CPY","tbo_env":"","h3":"1",
+  "h3_envs":"vaefa0:SD_H3_VAE_FLASH_ATTN=0","zimg":"1024x1024:--vae-tiling 1008x1008:--vae-tiling","head_cmake":""}
+]
