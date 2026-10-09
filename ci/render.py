@@ -90,6 +90,7 @@ if win:
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
           H3_WARMUP: ${{ matrix.h3_warmup }}
+          SRC_REPO: ${{ matrix.src_repo }}
           H3_AB_REPS: ${{ matrix.h3_ab_reps }}
           H3_W: ${{ matrix.h3_w }}
           H3_H: ${{ matrix.h3_h }}

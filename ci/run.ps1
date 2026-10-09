@@ -47,7 +47,8 @@ cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object { 
 Log ("msvc " + (cl 2>&1 | Select-Object -First 1))
 
 # sources
-git clone -q --filter=blob:none https://github.com/unslothai/stable-diffusion.cpp "$W\src"
+$srcRepo = if ($env:SRC_REPO) { $env:SRC_REPO } else { "unslothai" }
+git clone -q --filter=blob:none "https://github.com/$srcRepo/stable-diffusion.cpp" "$W\src"
 git -C "$W\src" fetch -q origin $env:BASE $env:HEAD 2>$null
 git clone -q https://github.com/leejet/ggml "$W\ggml-clone"
 foreach ($n in "base","head") {

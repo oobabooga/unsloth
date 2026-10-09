@@ -8,29 +8,12 @@
   "h3_w": "640",
   "h3_h": "384",
   "h3_f": "56",
-  "h3_steps": "1",
+  "h3_steps": "2",
   "h3_prompt": "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing.",
   "h3_refcpu": "1",
   "h3_ab_reps": "1",
   "backend": "hip",
-  "name": "ref1-hip-s42",
-  "h3_seed": "42"
- },
- {
-  "base": "6321a69",
-  "head": "ae9429f",
-  "h3": "1",
-  "h3_envs": "",
-  "zimg": "",
-  "h3_w": "640",
-  "h3_h": "384",
-  "h3_f": "56",
-  "h3_steps": "1",
-  "h3_prompt": "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing.",
-  "h3_refcpu": "1",
-  "h3_ab_reps": "1",
-  "backend": "hip",
-  "name": "ref1-hip-s7",
+  "name": "ref2-hip-s7",
   "h3_seed": "7"
  },
  {
@@ -42,12 +25,24 @@
   "h3_w": "640",
   "h3_h": "384",
   "h3_f": "56",
-  "h3_steps": "1",
+  "h3_steps": "2",
   "h3_prompt": "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing.",
   "h3_refcpu": "1",
   "h3_ab_reps": "1",
   "backend": "hip",
-  "name": "ref1-hip-s1234",
+  "name": "ref2-hip-s1234",
   "h3_seed": "1234"
+ },
+ {
+  "name": "integ-windows",
+  "os": "windows",
+  "base": "6321a69",
+  "head": "beb28d6",
+  "src_repo": "oobabooga",
+  "tbo": "",
+  "h3": "1",
+  "h3_ab_reps": "2",
+  "h3_envs": "",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496"
  }
 ]
