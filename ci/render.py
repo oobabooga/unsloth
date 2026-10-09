@@ -3,7 +3,7 @@ import json
 jobs = json.load(open("ci/jobs.json"))
 [j.setdefault('script','run.sh') for j in jobs]
 lin = [j for j in jobs if j.get("os") != "windows" and not j.get("special") and not j.get("leg_file")]; win = [j for j in jobs if j.get("os") == "windows"]
-keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps","zimg_cap","h3_warmup","h3_w","h3_h","h3_f","h3_prompt","h3_refcpu"]
+keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps","zimg_cap","h3_warmup","h3_w","h3_h","h3_f","h3_prompt","h3_refcpu","h3_seed"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
 out = """name: sd.cpp PR A/B on AMD
@@ -52,6 +52,7 @@ if lin:
           H3_F: ${{ matrix.h3_f }}
           H3_PROMPT: ${{ matrix.h3_prompt }}
           H3_REFCPU: ${{ matrix.h3_refcpu }}
+          H3_SEED: ${{ matrix.h3_seed }}
         run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
@@ -95,6 +96,7 @@ if win:
           H3_F: ${{ matrix.h3_f }}
           H3_PROMPT: ${{ matrix.h3_prompt }}
           H3_REFCPU: ${{ matrix.h3_refcpu }}
+          H3_SEED: ${{ matrix.h3_seed }}
           H3_STEPS: ${{ matrix.h3_steps }}
         run: '& "$env:H\\\\ci\\\\run.ps1"'
       - name: Upload
