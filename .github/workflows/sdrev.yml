@@ -13,6 +13,57 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: "pr17fix-vulkan"
+            backend: "vulkan"
+            base: "6321a69"
+            head: "ff941a8"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "vaefa1:SD_H3_VAE_FLASH_ATTN=1"
+            zimg: ""
+            head_cmake: ""
+            src_repo: "oobabooga"
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+          - name: "pr17fix-hip"
+            backend: "hip"
+            base: "6321a69"
+            head: "ff941a8"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
+            zimg: ""
+            head_cmake: ""
+            src_repo: "oobabooga"
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+          - name: "pr18-hip-bisect"
+            backend: "hip"
+            base: ""
+            head: ""
+            tbo: ""
+            tbo_env: ""
+            h3: ""
+            h3_envs: ""
+            zimg: ""
+            head_cmake: ""
+            src_repo: ""
+            script: "bisect.sh"
+            variants: "a:ca92d95:all b:ca92d95:2:5f222b8 c:ca92d95:3:5f222b8 d:ca92d95:4:5f222b8 e:5f222b8:1 f:5f222b8:all"
+            steps: "2"
+            reps: "2"
+            h3_steps: ""
+            h3_ab_reps: ""
           - name: "pr18-hip-levers"
             backend: "hip"
             base: "ca92d95"
@@ -30,6 +81,23 @@ jobs:
             reps: ""
             h3_steps: "2"
             h3_ab_reps: "1"
+          - name: "pr19-hip"
+            backend: "hip"
+            base: "5f222b8"
+            head: "338079e"
+            tbo: "ROPE_PE_PERMUTE,RMS_NORM,CONV_2D_DW,FLASH_ATTN_EXT"
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "alloff:SD_H3_FAST_SAGE_QKV=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_H3_AUDIO_DIRECT_DW=0;dw0:SD_H3_AUDIO_DIRECT_DW=0"
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -53,6 +121,56 @@ jobs:
           H3_STEPS: ${{ matrix.h3_steps }}
           H3_AB_REPS: ${{ matrix.h3_ab_reps }}
         run: bash "$H/ci/${{ matrix.script }}"
+      - name: Upload
+        if: always() && env.ART != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ART }}
+          if-no-files-found: ignore
+  win:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "pr17-windows"
+            backend: ""
+            base: "6321a69"
+            head: "ca92d95"
+            tbo: "CPY"
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    steps:
+      - name: Fetch harness
+        shell: powershell
+        run: |
+          $h = Join-Path $env:RUNNER_TEMP ("h-" + $env:GITHUB_RUN_ID + "-" + $PID)
+          git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth $h
+          Add-Content $env:GITHUB_ENV "H=$h"
+      - name: Run
+        shell: powershell
+        env:
+          BASE: ${{ matrix.base }}
+          HEAD: ${{ matrix.head }}
+          TBO_OPS: ${{ matrix.tbo }}
+          H3: ${{ matrix.h3 }}
+          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
+          ZIMG: ${{ matrix.zimg }}
+          HEAD_CMAKE: ${{ matrix.head_cmake }}
+        run: '& "$env:H\\ci\\run.ps1"'
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
