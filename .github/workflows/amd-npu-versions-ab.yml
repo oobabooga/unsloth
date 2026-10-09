@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [Linux, Windows]
+        os: [Windows]
     runs-on: [self-hosted, "${{ matrix.os }}", strix-halo, devlab-dispatch]
     timeout-minutes: 120
     permissions:

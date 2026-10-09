@@ -54,10 +54,12 @@ def run(cmd, cwd = None, log = None, check = True, shell = False):
 
 a, b = WORK / "a", WORK / "b"
 if not a.exists():
-    run(["git", "init", "-q", str(a)])
+    # LF on Windows too: the patch is LF, and autocrlf would rewrite the checkout under it.
+    run(["git", "-c", "init.defaultBranch=main", "init", "-q", str(a)])
+    run(["git", "-C", str(a), "config", "core.autocrlf", "false"])
     run(["git", "-C", str(a), "fetch", "-q", "--depth", "1", "https://github.com/unslothai/unsloth", BASE_SHA])
     run(["git", "-C", str(a), "checkout", "-q", "FETCH_HEAD"])
-    run(["git", "clone", "-q", str(a), str(b)])
+    run(["git", "-c", "core.autocrlf=false", "clone", "-q", "--config", "core.autocrlf=false", str(a), str(b)])
     run(["git", "-C", str(b), "checkout", "-q", BASE_SHA])
     run(["git", "-C", str(b), "apply", str(HERE / "branch.patch")])
     run(["git", "-C", str(b), "diff", "--stat"])
