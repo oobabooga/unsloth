@@ -1,11 +1,13 @@
 [
  {
-  "name": "pr21-hip-cap2",
-  "backend": "hip",
+  "name": "stack-windows-diag",
+  "os": "windows",
   "base": "6321a69",
-  "head": "ee5829c",
-  "h3": "",
-  "zimg": "1008x1008:--offload-to-cpu",
-  "zimg_cap": "5.2:1008x1008:--offload-to-cpu 5.5:1008x1008:--offload-to-cpu 5.8:1008x1008:--offload-to-cpu"
+  "head": "1957123",
+  "tbo": "",
+  "h3": "1",
+  "h3_envs": "vaefa1:SD_H3_VAE_FLASH_ATTN=1;vaefa0:SD_H3_VAE_FLASH_ATTN=0;gf0:SD_H3_GRAPH_FAST=0;gf0dw0:SD_H3_GRAPH_FAST=0 SD_H3_AUDIO_DIRECT_DW=0",
+  "zimg": "",
+  "head_cmake": ""
  }
 ]

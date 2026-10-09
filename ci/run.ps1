@@ -95,6 +95,9 @@ function RunSd($name, $exe, $envs, $argv) {
   & $exe @argv *> "$W\runs\$name.log"; $rc = $LASTEXITCODE
   $sw.Stop(); foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
   Log ("run $name rc=$rc WALL " + [math]::Round($sw.Elapsed.TotalSeconds,1) + " s | " + (Times "$W\runs\$name.log"))
+  $fa = (Select-String -Path "$W\runs\$name.log" -Pattern "flash attention" | ForEach-Object { $_.Line -replace '.*\] ','' }) -join ' / '
+  Log ("   attention: $fa")
+  Copy-Item "$W\runs\$name.log" -Destination "$W\art\$name.log" -ErrorAction SilentlyContinue
 }
 $M = "$W\models"
 function H3Args($name) { @("-M","vid_gen","--diffusion-model","$M\minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf","--vae","$M\vae\minimax_h3_video_vae_fp16.safetensors","--audio-vae","$M\vae\minimax_h3_audio_vae_fp32.safetensors","--llm","$M\qwen3vl_32b_minimax_h3-Q2_K_M.gguf","-p","A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong.","--cfg-scale","1.0","-W","640","-H","384","--video-frames","56","--steps","4","--seed","42","--rng","cpu","--fps","24","--diffusion-fa","--offload-to-cpu","--max-vram","-1","-v","-o","$W\runs\$name\f_%03d.png") }
