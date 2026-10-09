@@ -1,0 +1,87 @@
+name: SAC 4551 WDAC probe
+
+on:
+  push:
+    branches: [sac4551-probe]
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Environment
+        shell: powershell
+        run: |
+          [Environment]::OSVersion | Format-List
+          Get-Command CiTool.exe -ErrorAction SilentlyContinue | Format-List
+          Get-Module -ListAvailable ConfigCI | Format-List Name, Version
+          python --version
+          Get-ChildItem "$env:windir\schemas\CodeIntegrity\ExamplePolicies" | Select-Object Name
+
+      - name: Make console-script launchers
+        shell: powershell
+        run: |
+          python -m venv C:\probe\v
+          C:\probe\v\Scripts\python.exe -m pip install --quiet typer
+          Get-ChildItem C:\probe\v\Scripts | Select-Object Name, Length
+          & C:\probe\v\Scripts\typer.exe --version
+          "typer.exe exit before policy: $LASTEXITCODE"
+
+      - name: Enforce a WDAC hash deny for typer.exe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = 'C:\probe\v\Scripts\typer.exe'
+          $work = 'C:\probe\policy'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item "$env:windir\schemas\CodeIntegrity\ExamplePolicies\AllowAll.xml" "$work\allowall.xml"
+          $rules = New-CIPolicyRule -DriverFilePath $target -Level Hash -Deny
+          $rules | Format-List | Out-String | Write-Host
+          Merge-CIPolicy -PolicyPaths "$work\allowall.xml" -OutputFilePath "$work\policy.xml" -Rules $rules | Out-Null
+          Set-RuleOption -FilePath "$work\policy.xml" -Option 3 -Delete
+          Set-RuleOption -FilePath "$work\policy.xml" -Option 0
+          Set-CIPolicyIdInfo -FilePath "$work\policy.xml" -ResetPolicyID -PolicyName 'sac4551 probe' | Write-Host
+          [xml]$xml = Get-Content "$work\policy.xml"
+          $id = $xml.SiPolicy.PolicyID
+          Write-Host "PolicyID $id BasePolicyID $($xml.SiPolicy.BasePolicyID)"
+          $xml.SiPolicy.Rules.Rule | ForEach-Object { $_.Option } | Write-Host
+          ConvertFrom-CIPolicy -XmlFilePath "$work\policy.xml" -BinaryFilePath "$work\$id.cip" | Out-Null
+          & CiTool.exe --update-policy "$work\$id.cip" -json
+          "CiTool exit $LASTEXITCODE"
+          & CiTool.exe --list-policies -json | Out-File "$work\policies.json"
+          Select-String -Path "$work\policies.json" -Pattern 'sac4551' -Context 2,8
+
+      - name: Observe the refusal
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 5
+          $code = @'
+          import subprocess, sys
+          for exe in sys.argv[1:]:
+              try:
+                  r = subprocess.run([exe, "--version"], capture_output=True, timeout=30)
+                  print(exe, "ran, returncode", r.returncode)
+              except OSError as e:
+                  print(exe, "OSError winerror", getattr(e, "winerror", None), repr(e))
+          '@
+          $code | Set-Content C:\probe\run.py
+          python C:\probe\run.py C:\probe\v\Scripts\typer.exe C:\probe\v\Scripts\pip.exe C:\probe\v\Scripts\python.exe
+          try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = 'C:\probe\v\Scripts\typer.exe'
+            $psi.Arguments = '--version'
+            $psi.UseShellExecute = $false
+            [System.Diagnostics.Process]::Start($psi).WaitForExit()
+            'PowerShell: started'
+          } catch {
+            $ex = $_.Exception
+            while ($ex) { "PS: $($ex.GetType().FullName) HResult=$($ex.HResult) Native=$($ex.NativeErrorCode)"; $ex = $ex.InnerException }
+          }
+          try { & C:\probe\v\Scripts\typer.exe --version } catch {
+            $ex = $_.Exception
+            while ($ex) { "PS&: $($ex.GetType().FullName) HResult=$($ex.HResult) Native=$($ex.NativeErrorCode)"; $ex = $ex.InnerException }
+          }
+          Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 10 |
+            Where-Object { $_.Id -in 3076, 3077 } | Format-List TimeCreated, Id, Message
