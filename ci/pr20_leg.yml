@@ -9,7 +9,7 @@ cuda-leg:
     uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
     with:
       repository: unslothai/stable-diffusion.cpp
-      ref: 1957123ab6a7c66836c3ea23cb238556d681a305
+      ref: 195712330b05c66836c3ea23cb238556d681a305
       path: tooling
       fetch-depth: 1
   - name: Free disk for the toolkit
@@ -31,7 +31,7 @@ cuda-leg:
 
       cd src
 
-      git checkout -q 1957123ab6a7c66836c3ea23cb238556d681a305
+      git checkout -q 195712330b05c66836c3ea23cb238556d681a305
 
       git submodule update --init --recursive --depth 1 ggml
 
@@ -77,7 +77,7 @@ cuda-leg:
       OUT_DIR: ${{ github.workspace }}/dist
       TAG: sdrev20
       LABEL: Linux-Ubuntu-22.04-x86_64-cuda12
-      COMMIT: 1957123ab6a7c66836c3ea23cb238556d681a305
+      COMMIT: 195712330b05c66836c3ea23cb238556d681a305
       SOURCE_REPO: ${{ github.repository }}
       LICENSE_FILE: ${{ runner.temp }}/LICENSE
     run: "set -euo pipefail\n# The binaries compile in cudnn-frontend's header-only templates, so its MIT notice ships too.\n{\n  cat src/LICENSE\n  printf '\\n\\n---- cudnn-frontend (https://github.com/NVIDIA/cudnn-frontend)\
