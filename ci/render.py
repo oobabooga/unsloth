@@ -2,7 +2,7 @@
 import json
 jobs = json.load(open("ci/jobs.json"))
 [j.setdefault('script','run.sh') for j in jobs]
-lin = [j for j in jobs if j.get("os") != "windows" and not j.get("special")]; win = [j for j in jobs if j.get("os") == "windows"]
+lin = [j for j in jobs if j.get("os") != "windows" and not j.get("special") and not j.get("leg_file")]; win = [j for j in jobs if j.get("os") == "windows"]
 keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps","zimg_cap"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
@@ -92,6 +92,9 @@ if win:
           path: ${{ env.ART }}
           if-no-files-found: ignore
 """
+for j in jobs:
+    if j.get("leg_file"):
+        out += "".join("  " + l + "\n" for l in open(j["leg_file"]).read().rstrip("\n").split("\n"))
 if any(j.get("special") == "pr14" for j in jobs):
     out += "".join("  " + l + "\n" for l in open("ci/pr14_leg.yml").read().rstrip("\n").split("\n"))
     out += """  rocm-test:
