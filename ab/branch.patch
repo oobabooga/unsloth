@@ -1,0 +1,279 @@
+diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
+index a8e8bc2bc8..b0a7b39d87 100644
+--- a/studio/backend/core/inference/npu_backend.py
++++ b/studio/backend/core/inference/npu_backend.py
+@@ -238,6 +238,7 @@ class LemonadeNpuBackend:
+         self._validation: Optional[dict[str, Any]] = None
+         self._state = "idle"
+         self._error: Optional[str] = None
++        self._flm_version_cache: Optional[tuple[tuple[str, int, int], str]] = None
+ 
+     @property
+     def root(self) -> Path:
+@@ -336,6 +337,39 @@ class LemonadeNpuBackend:
+             return None
+         return str(version).lstrip("v") if version else None
+ 
++    def _installed_flm_version(self) -> Optional[str]:
++        """``flm version`` of the installed binary, rerun only when that binary changes."""
++        binary = self._flm_binary()
++        try:
++            stat = binary.stat() if binary is not None else None
++        except OSError:
++            stat = None
++        if stat is None:
++            return None
++        key = (str(binary), stat.st_mtime_ns, stat.st_size)
++        cached = self._flm_version_cache
++        if cached is not None and cached[0] == key:
++            return cached[1]
++        version = self._flm_version()
++        if version:
++            self._flm_version_cache = (key, version)
++        return version
++
++    def _versions(self, binary: Optional[Path]) -> dict[str, Optional[str]]:
++        """Installed runtime versions. A pending upgrade reports the ones it will replace."""
++        # Running flm while Enable replaces it could block the update on Windows.
++        if self._state not in ("idle", "ready", "failed"):
++            return {"lemonade": None, "fastflowlm": None}
++        validated = self._validated_install()
++        lemond = binary or (Path(validated) if isinstance(validated, str) and validated else None)
++        lemonade = None
++        if lemond is not None:
++            try:
++                lemonade = _installer_module().installed_version(lemond)
++            except Exception as exc:  # noqa: BLE001 -- a missing version never hides the status
++                logger.warning("Could not read the Lemonade version: %s", exc)
++        return {"lemonade": lemonade, "fastflowlm": self._installed_flm_version()}
++
+     def status(self) -> dict[str, Any]:
+         hardware = self.hardware()
+         binary = self._installed_lemond()
+@@ -363,6 +397,7 @@ class LemonadeNpuBackend:
+             "loaded_model": resident.model.model_path if resident else None,
+             "context_length": resident.context_length if resident else None,
+             "loading_model": self._loading,
++            "versions": self._versions(binary),
+         }
+ 
+     def _server_for(self, binary: Path) -> LemonadeServer:
+diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
+index 6d0605791e..550d410b21 100644
+--- a/studio/backend/tests/test_npu_backend.py
++++ b/studio/backend/tests/test_npu_backend.py
+@@ -507,6 +507,33 @@ def test_an_enabled_npu_upgrades_on_first_use_after_the_pins_move(npu, monkeypat
+     assert again.status()["ready"] is True
+ 
+ 
++def test_the_status_names_the_installed_runtime_versions(npu, monkeypatch):
++    monkeypatch.setenv("FAKE_FLM_VERSION", "v1.0.7")
++    npu.installer.installed_version = lambda lemond: "2026.41.1"
++    real, runs = npu._flm_version, []
++    monkeypatch.setattr(npu, "_flm_version", lambda: runs.append(1) or real())
++    npu.enable()
++    assert npu.status()["versions"] == {"lemonade": "2026.41.1", "fastflowlm": "1.0.7"}
++    npu.status()
++    # The post-install check, then one status read: an unchanged flm binary is not rerun.
++    assert len(runs) == 2
++
++
++def test_a_pending_upgrade_reports_the_versions_it_replaces_until_first_use(npu, monkeypatch):
++    monkeypatch.setenv("FAKE_FLM_VERSION", "1.0.3")
++    restarted = _move_the_pins(npu, monkeypatch)
++    restarted.installer.installed_version = lambda lemond: (
++        "2026.41.1" if restarted.installer.current else "11.9.0"
++    )
++    try:
++        assert restarted.status()["versions"] == {"lemonade": "11.9.0", "fastflowlm": "1.0.3"}
++        monkeypatch.setenv("FAKE_FLM_VERSION", "1.0.7")
++        restarted.catalog()
++        assert restarted.status()["versions"] == {"lemonade": "2026.41.1", "fastflowlm": "1.0.7"}
++    finally:
++        restarted.shutdown()
++
++
+ def test_an_upgrade_that_fails_validation_asks_to_try_again(npu, monkeypatch):
+     restarted = _move_the_pins(npu, monkeypatch)
+     try:
+diff --git a/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
+index 30e9fd0264..ddb6a5de98 100644
+--- a/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
++++ b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
+@@ -6,6 +6,7 @@ import { Spinner } from "@/components/ui/spinner";
+ import {
+   type NpuModel,
+   type NpuPickerSource,
++  NpuPoweredBy,
+   NpuSetupNotice,
+   npuDownloadLabel,
+   npuResumeLabel,
+@@ -71,6 +72,11 @@ export function NpuCatalogList({
+       className="mx-auto flex min-h-0 w-full max-w-[var(--hub-measure)] flex-1 flex-col gap-0.5 overflow-y-auto px-3 py-3"
+     >
+       {body()}
++      {catalog.ready ? (
++        <div className="px-3 pt-3">
++          <NpuPoweredBy status={catalog.status} />
++        </div>
++      ) : null}
+     </div>
+   );
+ }
+diff --git a/studio/frontend/src/features/npu/api.ts b/studio/frontend/src/features/npu/api.ts
+index e1f3ae2b9b..174ca5942f 100644
+--- a/studio/frontend/src/features/npu/api.ts
++++ b/studio/frontend/src/features/npu/api.ts
+@@ -43,6 +43,8 @@ export interface NpuStatus {
+   loaded_model: string | null;
+   context_length: number | null;
+   loading_model: string | null;
++  /** Installed runtime versions; absent from servers that predate them. */
++  versions?: { lemonade: string | null; fastflowlm: string | null };
+ }
+ 
+ export interface NpuModel {
+diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
+index f298794e5a..0c7263e398 100644
+--- a/studio/frontend/src/features/npu/index.ts
++++ b/studio/frontend/src/features/npu/index.ts
+@@ -12,7 +12,7 @@ export {
+   npuRowsFor,
+   npuSizeLabel,
+ } from "./api";
+-export { NpuSetupNotice } from "./npu-setup-notice";
++export { NpuPoweredBy, NpuSetupNotice } from "./npu-setup-notice";
+ export {
+   type NpuCatalog,
+   type NpuPickerSource,
+diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
+index 64c9054116..ed00350162 100644
+--- a/studio/frontend/src/features/npu/npu-setup-notice.tsx
++++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
+@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
+ import { Spinner } from "@/components/ui/spinner";
+ import { AlertCircleIcon } from "@hugeicons/core-free-icons";
+ import { HugeiconsIcon } from "@hugeicons/react";
++import type { NpuStatus } from "./api";
+ import type { NpuCatalog } from "./use-npu-catalog";
+ 
+ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
+@@ -61,27 +62,40 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
+           <Spinner className="size-3.5 text-muted-foreground" />
+         </div>
+       ) : null}
+-      <p className="text-ui-11 text-muted-foreground">
+-        Powered by{" "}
+-        <a
+-          href="https://github.com/ROCm/FastFlowLM"
+-          target="_blank"
+-          rel="noreferrer"
+-          className="underline underline-offset-2"
+-        >
+-          FastFlowLM
+-        </a>{" "}
+-        and{" "}
+-        <a
+-          href="https://github.com/lemonade-sdk/lemonade"
+-          target="_blank"
+-          rel="noreferrer"
+-          className="underline underline-offset-2"
+-        >
+-          Lemonade
+-        </a>
+-        .
+-      </p>
++      <NpuPoweredBy status={status} />
+     </div>
+   );
+ }
++
++const version = (value: string | null | undefined) =>
++  value ? ` v${value}` : "";
++
++/** Credits the runtimes and names their installed versions, so a pin bump is visible. */
++export function NpuPoweredBy({ status }: { status: NpuStatus }) {
++  return (
++    <p
++      data-testid="npu-powered-by"
++      className="text-ui-11 text-muted-foreground"
++    >
++      Powered by{" "}
++      <a
++        href="https://github.com/ROCm/FastFlowLM"
++        target="_blank"
++        rel="noreferrer"
++        className="underline underline-offset-2"
++      >
++        FastFlowLM
++      </a>
++      {version(status.versions?.fastflowlm)} and{" "}
++      <a
++        href="https://github.com/lemonade-sdk/lemonade"
++        target="_blank"
++        rel="noreferrer"
++        className="underline underline-offset-2"
++      >
++        Lemonade
++      </a>
++      {version(status.versions?.lemonade)}.
++    </p>
++  );
++}
+diff --git a/studio/frontend/src/features/npu/use-npu-catalog.ts b/studio/frontend/src/features/npu/use-npu-catalog.ts
+index deda0609b0..5d0c33b625 100644
+--- a/studio/frontend/src/features/npu/use-npu-catalog.ts
++++ b/studio/frontend/src/features/npu/use-npu-catalog.ts
+@@ -54,14 +54,13 @@ export function useNpuCatalog(
+ 
+   useEffect(() => {
+     if (!ready) return;
+-    // This listing can run a pending upgrade; on failure re-read status to offer Try again.
+-    void refreshNpuModels().then((listed) => {
+-      if (listed) return;
++    // This listing can run a pending upgrade: re-read status for its versions, or for Try again.
++    void refreshNpuModels().then(() =>
+       getNpuStatus().then(
+         (next) => statusChange.current?.(next),
+         () => undefined,
+-      );
+-    });
++      ),
++    );
+     listNpuDownloads().then(
+       (running) => {
+         for (const { model, percent } of running) {
+diff --git a/studio/install_lemonade_prebuilt.py b/studio/install_lemonade_prebuilt.py
+index d7125fc070..a9c56894c6 100644
+--- a/studio/install_lemonade_prebuilt.py
++++ b/studio/install_lemonade_prebuilt.py
+@@ -92,6 +92,16 @@ def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
+     return binary if binary.is_file() else None
+ 
+ 
++def installed_version(lemond: Path) -> Optional[str]:
++    """The Lemonade version recorded beside an installed lemond, or None."""
++    try:
++        marker = json.loads((Path(lemond).parent / MARKER_NAME).read_text(encoding = "utf-8"))
++    except (OSError, ValueError):
++        return None
++    version = marker.get("version") if isinstance(marker, dict) else None
++    return str(version) if version else None
++
++
+ def _download(
+     url: str,
+     destination: Path,
+diff --git a/tests/studio/install/test_install_lemonade_prebuilt.py b/tests/studio/install/test_install_lemonade_prebuilt.py
+index 744cac0575..96049aac4f 100644
+--- a/tests/studio/install/test_install_lemonade_prebuilt.py
++++ b/tests/studio/install/test_install_lemonade_prebuilt.py
+@@ -112,6 +112,8 @@ def test_install_verifies_and_pins_fastflowlm(tmp_path, served):
+         "fastflowlm.tar.gz": "sha256:" + "ab" * 32
+     }
+     assert "other/repo" in versions["checksums"]["github"]
++    assert lp.installed_version(binary) == "9.9.9"
++    assert lp.installed_version(tmp_path / "elsewhere" / "lemond") is None
+ 
+ 
+ def test_a_complete_install_is_not_downloaded_again(tmp_path, served):

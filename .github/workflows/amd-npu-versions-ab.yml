@@ -1,0 +1,51 @@
+name: AMD NPU runtime versions A/B
+
+on:
+  push:
+    branches: [amd-npu-versions-ab]
+
+permissions: {}
+
+jobs:
+  ab:
+    name: A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Linux, Windows]
+    runs-on: [self-hosted, "${{ matrix.os }}", strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+      - name: Hardware and A/B (Linux)
+        if: matrix.os == 'Linux'
+        run: |
+          uname -a; free -h
+          ls -l /dev/accel* 2>/dev/null || true
+          echo "memlock: $(ulimit -l)"
+          lsmod | grep -i xdna || true
+          python3 ab/ab_run.py cc9128134156cc51f94eeb76d3d19f80bddbc8a7
+      - name: Hardware (Windows)
+        if: matrix.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'NPU' } | Select-Object Name, DeviceID, Status | Format-List
+          python --version
+      - name: A/B (Windows)
+        if: matrix.os == 'Windows'
+        shell: cmd
+        run: python ab\ab_run.py cc9128134156cc51f94eeb76d3d19f80bddbc8a7
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: npu-versions-ab-${{ matrix.os }}
+          path: ${{ runner.temp }}/npuv/out
+          if-no-files-found: warn
