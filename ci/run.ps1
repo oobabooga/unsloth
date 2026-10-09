@@ -124,10 +124,10 @@ if ($env:H3 -eq "1") {
 if ($env:ZIMG) {
   WaitModels
   foreach ($spec in ($env:ZIMG -split ' ')) {
-    $wh, $fl = $spec -split ':',2; $w, $h = $wh -split 'x'; $flags = @(); if ($fl) { $flags = $fl -split ',' }
+    $wh, $fl = $spec -split ':',2; $zw, $zh = $wh -split 'x'; $flags = @(); if ($fl) { $flags = $fl -split ',' }
     $k = "z_${wh}_" + (($fl -replace '[^a-z0-9]','')); 
     foreach ($n in "base","head") {
-      $argv = @("--diffusion-model","$M\z-image-turbo-Q4_K_M.gguf","--llm","$M\Qwen3-4B-Q4_K_M.gguf","--vae","$M\split_files\vae\ae.safetensors","-p","A lighthouse on a rocky coast at dusk, waves crashing, warm light in the windows, detailed photograph","--cfg-scale","1.0","--steps","8","-W",$w,"-H",$h,"--seed","7","--diffusion-fa") + $flags + @("-v","-o","$W\runs\${k}_$n\out.png")
+      $argv = @("--diffusion-model","$M\z-image-turbo-Q4_K_M.gguf","--llm","$M\Qwen3-4B-Q4_K_M.gguf","--vae","$M\split_files\vae\ae.safetensors","-p","A lighthouse on a rocky coast at dusk, waves crashing, warm light in the windows, detailed photograph","--cfg-scale","1.0","--steps","8","-W",$zw,"-H",$zh,"--seed","7","--diffusion-fa") + $flags + @("-v","-o","$W\runs\${k}_$n\out.png")
       RunSd "${k}_$n" $bin[$n] @() $argv }
     Log ("cmp ${k}: " + (& $py "$CI\compare.py" "$W\runs\${k}_base" "$W\runs\${k}_head"))
   }
