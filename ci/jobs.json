@@ -1,29 +1,36 @@
 [
  {
-  "name": "pr21fix-hip",
+  "name": "sync-hip",
   "backend": "hip",
-  "base": "ee5829c",
-  "head": "59c912a",
-  "h3": "",
-  "h3_envs": "",
-  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
+  "zimg_cap": "6.33:1024x1024:",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga",
+  "h3": "1",
+  "h3_ab_reps": "2",
+  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
  },
  {
-  "name": "pr21fix-vulkan",
+  "name": "sync-vulkan",
   "backend": "vulkan",
-  "base": "ee5829c",
-  "head": "59c912a",
-  "h3": "",
-  "h3_envs": "",
-  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga",
+  "h3": "1",
+  "h3_ab_reps": "2",
+  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
  },
  {
-  "name": "pr21fix-windows",
+  "name": "sync-windows",
   "os": "windows",
-  "base": "ee5829c",
-  "head": "59c912a",
-  "h3": "",
-  "h3_envs": "",
-  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga",
+  "h3": "1",
+  "h3_ab_reps": "2",
+  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
  }
 ]
