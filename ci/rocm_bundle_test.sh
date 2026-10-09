@@ -17,7 +17,10 @@ print("DONE", flush=True)
 PY
 ) > "$W/dl.log" 2>&1 &
 log "## #14 ROCm bundle on $(hostname), system ROCm $(cat /opt/rocm/.info/version 2>/dev/null)"
-cd "$W/B" && unzip -q "$BUNDLE_ZIP" && B="$(dirname "$(find "$W/B" -name sd-cli -type f | head -1)")"
+log "bundle zip: $(stat -c %s "$BUNDLE_ZIP") bytes sha256 $(sha256sum "$BUNDLE_ZIP" | cut -c1-64)"
+cd "$W/B" && { unzip -q "$BUNDLE_ZIP" || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$BUNDLE_ZIP" "$W/B"; }
+find "$W/B" -name sd-cli -type f -exec chmod +x {} \; ; find "$W/B" -name sd-server -type f -exec chmod +x {} \;
+B="$(dirname "$(find "$W/B" -name sd-cli -type f | head -1)")"
 curl -fsSL --retry 3 -o "$W/A.zip" https://github.com/leejet/stable-diffusion.cpp/releases/download/master-813-bfbef5b/sd-master-bfbef5b-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip
 cd "$W/A" && unzip -q "$W/A.zip" && A="$(dirname "$(find "$W/A" -name sd-cli -type f | head -1)")"
 chmod +x "$A/sd-cli" "$B/sd-cli" 2>/dev/null
