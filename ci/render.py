@@ -2,7 +2,7 @@
 import json
 jobs = json.load(open("ci/jobs.json"))
 [j.setdefault('script','run.sh') for j in jobs]
-lin = [j for j in jobs if j.get("os") != "windows"]; win = [j for j in jobs if j.get("os") == "windows"]
+lin = [j for j in jobs if j.get("os") != "windows" and not j.get("special")]; win = [j for j in jobs if j.get("os") == "windows"]
 keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
@@ -88,6 +88,31 @@ if win:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.name }}
+          path: ${{ env.ART }}
+          if-no-files-found: ignore
+"""
+if any(j.get("special") == "pr14" for j in jobs):
+    out += "".join("  " + l + "\n" for l in open("ci/pr14_leg.yml").read().rstrip("\n").split("\n"))
+    out += """  rocm-test:
+    name: pr14-rocm-test
+    needs: rocm-leg
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - name: Fetch harness
+        run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" && echo "H=$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" >> "$GITHUB_ENV"
+      - name: Download bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sd-sdrev14-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          path: ${{ runner.temp }}/bundle-${{ github.run_id }}
+      - name: Run
+        run: BUNDLE_ZIP="$(ls ${{ runner.temp }}/bundle-${{ github.run_id }}/*.zip)" bash "$H/ci/rocm_bundle_test.sh"
+      - name: Upload
+        if: always() && env.ART != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr14-rocm-test
           path: ${{ env.ART }}
           if-no-files-found: ignore
 """
