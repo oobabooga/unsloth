@@ -1,6 +1,5 @@
 [
- {"name":"pr17fix-vulkan","backend":"vulkan","base":"6321a69","head":"ff941a8","tbo":"","h3":"1","src_repo":"oobabooga",
-  "h3_envs":"vaefa1:SD_H3_VAE_FLASH_ATTN=1","zimg":""},
- {"name":"pr17fix-hip","backend":"hip","base":"6321a69","head":"ff941a8","tbo":"","h3":"1","src_repo":"oobabooga",
-  "h3_envs":"vaefa0:SD_H3_VAE_FLASH_ATTN=0","zimg":""}
+ {"name":"pr19-hip","backend":"hip","base":"5f222b8","head":"338079e",
+  "tbo":"ROPE_PE_PERMUTE,RMS_NORM,CONV_2D_DW,FLASH_ATTN_EXT","tbo_env":"",
+  "h3":"1","h3_envs":"alloff:SD_H3_FAST_SAGE_QKV=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_H3_AUDIO_DIRECT_DW=0;dw0:SD_H3_AUDIO_DIRECT_DW=0","zimg":"1024x1024:--vae-tiling 1008x1008:--vae-tiling"}
 ]
