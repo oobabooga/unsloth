@@ -110,7 +110,7 @@ h3() { # name tree [env...]
   /usr/bin/time -f "WALL %e s MAXRSS %M KB" env "$@" "$W/$tree/build/bin/sd-cli" -M vid_gen --diffusion-model "$M/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" \
     --vae "$M/vae/minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M/vae/minimax_h3_audio_vae_fp32.safetensors" \
     --llm "$M/qwen3vl_32b_minimax_h3-Q2_K_M.gguf" -p "A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong." \
-    --cfg-scale 1.0 -W 640 -H 384 --video-frames 56 --steps 4 --seed 42 --rng cpu --fps 24 --diffusion-fa --offload-to-cpu --max-vram -1 -v \
+    --cfg-scale 1.0 -W 640 -H 384 --video-frames 56 --steps ${H3_STEPS:-4} --seed 42 --rng cpu --fps 24 --diffusion-fa --offload-to-cpu --max-vram -1 -v \
     -o "$W/runs/$name/f_%03d.png" > "$W/runs/$name.log" 2>&1
   local rc=$?
   log "h3 $name rc=$rc $(grep WALL "$W/runs/$name.log") | $(times "$W/runs/$name.log")"
@@ -118,9 +118,12 @@ h3() { # name tree [env...]
 }
 if [ "${H3:-0}" = 1 ]; then
   wait_models
-  h3 base1 base; h3 head1 head; h3 base2 base; h3 head2 head
-  log "cmp base1 base2: $(python "$CI/compare.py" "$W/runs/base1" "$W/runs/base2")"
-  log "cmp head1 head2: $(python "$CI/compare.py" "$W/runs/head1" "$W/runs/head2")"
+  h3 base1 base; h3 head1 head
+  if [ "${H3_AB_REPS:-2}" -ge 2 ]; then
+    h3 base2 base; h3 head2 head
+    log "cmp base1 base2: $(python "$CI/compare.py" "$W/runs/base1" "$W/runs/base2")"
+    log "cmp head1 head2: $(python "$CI/compare.py" "$W/runs/head1" "$W/runs/head2")"
+  fi
   log "cmp base1 head1: $(python "$CI/compare.py" "$W/runs/base1" "$W/runs/head1")"
   IFS=';' read -ra ARMS <<< "${H3_HEAD_ENVS:-}"
   for a in "${ARMS[@]}"; do [ -z "$a" ] && continue; nm=${a%%:*}; ev=${a#*:}

@@ -13,21 +13,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "pr18-hip-bisect"
+          - name: "pr18-hip-levers"
             backend: "hip"
-            base: ""
-            head: ""
+            base: "ca92d95"
+            head: "5f222b8"
             tbo: ""
             tbo_env: ""
-            h3: ""
-            h3_envs: ""
+            h3: "1"
+            h3_envs: "alloff:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_fast_qkv:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=1 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_fast_mlp:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=1 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_fast_segments:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=1 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_fast_views:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=1 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_fa_longseq:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=1 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0;only_cublas_epilogue_fusion:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=1 GGML_CUDA_NORM_SMALL_ROWS=0;only_norm_small_rows:SD_H3_GRAPH_FAST=1 SD_H3_FAST_QKV=0 SD_H3_FAST_MLP=0 SD_H3_FAST_SEGMENTS=0 SD_H3_FAST_VIEWS=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=1"
             zimg: ""
             head_cmake: ""
             src_repo: ""
-            script: "bisect.sh"
-            variants: "a:ca92d95:all b:ca92d95:2:5f222b8 c:ca92d95:3:5f222b8 d:ca92d95:4:5f222b8 e:5f222b8:1 f:5f222b8:all"
-            steps: "2"
-            reps: "2"
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: "2"
+            h3_ab_reps: "1"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -48,6 +50,8 @@ jobs:
           VARIANTS: ${{ matrix.variants }}
           STEPS: ${{ matrix.steps }}
           REPS: ${{ matrix.reps }}
+          H3_STEPS: ${{ matrix.h3_steps }}
+          H3_AB_REPS: ${{ matrix.h3_ab_reps }}
         run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
