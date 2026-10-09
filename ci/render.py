@@ -1,4 +1,11 @@
-name: sd.cpp PR A/B on AMD
+# Render .github/workflows/sdrev.yml from ci/jobs.json (static matrices, DevLab runners only).
+import json
+jobs = json.load(open("ci/jobs.json"))
+lin = [j for j in jobs if j.get("os") != "windows"]; win = [j for j in jobs if j.get("os") == "windows"]
+keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake"]
+def mat(js):
+    return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
+out = """name: sd.cpp PR A/B on AMD
 
 on:
   push:
@@ -7,22 +14,15 @@ on:
 permissions: {}
 
 jobs:
-  ab:
+"""
+if lin:
+    out += """  ab:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "pr17-vulkan"
-            backend: "vulkan"
-            base: "6321a69"
-            head: "ca92d95"
-            tbo: "CPY"
-            tbo_env: ""
-            h3: "1"
-            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
-            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
-            head_cmake: ""
+""" + mat(lin) + """
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -47,22 +47,15 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ env.ART }}
           if-no-files-found: ignore
-  win:
+"""
+if win:
+    out += """  win:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "pr17-windows"
-            backend: ""
-            base: "6321a69"
-            head: "ca92d95"
-            tbo: "CPY"
-            tbo_env: ""
-            h3: "1"
-            h3_envs: "vaefa0:SD_H3_VAE_FLASH_ATTN=0"
-            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
-            head_cmake: ""
+""" + mat(win) + """
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -82,7 +75,7 @@ jobs:
           H3_HEAD_ENVS: ${{ matrix.h3_envs }}
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
-        run: '& "$env:H\\ci\\run.ps1"'
+        run: '& "$env:H\\\\ci\\\\run.ps1"'
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -90,3 +83,5 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ env.ART }}
           if-no-files-found: ignore
+"""
+open(".github/workflows/sdrev.yml","w").write(out)
