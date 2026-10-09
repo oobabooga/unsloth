@@ -141,8 +141,9 @@ def variant(label, checkout, port, *extra):
 results = {}
 results["A"] = variant("A", a, 18801)
 results["B"] = variant("B", b, 18802)
-# The weekly pin update, applied the way its PR would ship.
-run([str(py), "scripts/update_lemonade_pins.py", "--write"], cwd = b, check = False)
+# The weekly pin update, as its PR would ship. Generated beforehand with
+# scripts/update_lemonade_pins.py --write: the runner's shared IP hits the API's anonymous limit.
+shutil.copy(HERE / "bumped_pins.json", b / "studio/lemonade_prebuilt_pins.json")
 run(["git", "-C", str(b), "diff", "--", "studio/lemonade_prebuilt_pins.json"])
 pins = json.loads((b / "studio/lemonade_prebuilt_pins.json").read_text())
 lemonade = pins["lemonade"]["version"]
