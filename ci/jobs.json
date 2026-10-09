@@ -1,28 +1,24 @@
 [
  {
-  "name": "pr20-cuda-leg",
-  "leg_file": "ci/pr20_leg.yml"
+  "name": "stack-windows",
+  "os": "windows",
+  "base": "6321a69",
+  "head": "1957123",
+  "tbo": "ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,CONV_2D_DW,RMS_NORM",
+  "h3": "1",
+  "h3_envs": "vaefa1:SD_H3_VAE_FLASH_ATTN=1",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling",
+  "head_cmake": ""
  },
  {
-  "name": "pr20-hip",
-  "backend": "hip",
-  "base": "3c26b6a",
-  "head": "1957123",
-  "head_cmake": "-DGGML_CUDA_CUDNN=ON",
-  "tbo": "FLASH_ATTN_EXT",
-  "h3": "1",
+  "name": "pr21-windows",
+  "os": "windows",
+  "base": "6321a69",
+  "head": "ee5829c",
+  "tbo": "",
+  "h3": "",
   "h3_envs": "",
-  "zimg": "1024x1024:--vae-tiling"
- },
- {
-  "name": "pr20-vulkan",
-  "backend": "vulkan",
-  "base": "3c26b6a",
-  "head": "1957123",
-  "head_cmake": "-DGGML_CUDA_CUDNN=ON",
-  "tbo": "FLASH_ATTN_EXT",
-  "h3": "1",
-  "h3_envs": "",
-  "zimg": "1024x1024:--vae-tiling"
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496",
+  "head_cmake": ""
  }
 ]
