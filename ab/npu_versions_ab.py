@@ -37,6 +37,18 @@ secret = (home / "auth" / ".desktop_secret").read_text().strip()
 status, tokens = api("POST", "/api/auth/desktop-login", {"secret": secret})
 assert status == 200, (status, tokens)
 token = tokens["access_token"]
+# A fresh install sends the browser to /change-password: finish that first-run step.
+bootstrap = home / "auth" / ".bootstrap_password"
+if bootstrap.exists() and bootstrap.read_text().strip():
+    old = bootstrap.read_text().strip()
+    code, body = api(
+        "POST", "/api/auth/change-password",
+        {"current_password": old, "new_password": "ab-test-password-1"}, token = token,
+    )
+    print("first-run password change:", code)
+    status, tokens = api("POST", "/api/auth/desktop-login", {"secret": secret})
+    assert status == 200, (status, tokens)
+    token = tokens["access_token"]
 
 report = {"label": label}
 if not mock:
@@ -116,7 +128,12 @@ with sync_playwright() as p:
 
     # Hub > Discover > format NPU.
     page.goto(f"{base}/hub")
-    page.locator('[data-tour="hub-tabs"]').wait_for(timeout = 60_000)
+    try:
+        page.locator('[data-tour="hub-tabs"]').wait_for(timeout = 60_000)
+    except Exception:
+        page.screenshot(path = str(out / f"{label}-blocked.png"))
+        print("BLOCKED at", page.url, " ".join(page.locator("body").inner_text().split())[:600])
+        raise
     page.get_by_role("radio", name = "Discover").click()
     page.get_by_role("button", name = "Format filter").click()
     page.get_by_role("option", name = "NPU").click()
