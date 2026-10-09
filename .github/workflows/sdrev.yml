@@ -13,55 +13,55 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "sync-hip"
+          - name: "ref-hip"
             backend: "hip"
             base: "4a98feb"
             head: "8a48526"
-            tbo: "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW"
+            tbo: ""
             tbo_env: ""
             h3: "1"
             h3_envs: ""
-            zimg: "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
+            zimg: "1008x1008:--vae-tiling"
             head_cmake: ""
             src_repo: "oobabooga"
             script: "run.sh"
             variants: ""
             steps: ""
             reps: ""
-            h3_steps: ""
-            h3_ab_reps: "2"
-            zimg_cap: "6.33:1024x1024:"
+            h3_steps: "2"
+            h3_ab_reps: "1"
+            zimg_cap: "6.6:1024x1024: 6.9:1024x1024: 3.2:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6 2.4:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6"
             h3_warmup: ""
             h3_w: ""
             h3_h: ""
             h3_f: ""
             h3_prompt: ""
-            h3_refcpu: ""
+            h3_refcpu: "1"
             h3_seed: ""
-          - name: "sync-vulkan"
+          - name: "ref-vulkan"
             backend: "vulkan"
             base: "4a98feb"
             head: "8a48526"
-            tbo: "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW"
+            tbo: ""
             tbo_env: ""
             h3: "1"
             h3_envs: ""
-            zimg: "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
+            zimg: ""
             head_cmake: ""
             src_repo: "oobabooga"
             script: "run.sh"
             variants: ""
             steps: ""
             reps: ""
-            h3_steps: ""
-            h3_ab_reps: "2"
+            h3_steps: "2"
+            h3_ab_reps: "1"
             zimg_cap: ""
             h3_warmup: ""
             h3_w: ""
             h3_h: ""
             h3_f: ""
             h3_prompt: ""
-            h3_refcpu: ""
+            h3_refcpu: "1"
             h3_seed: ""
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
@@ -93,74 +93,6 @@ jobs:
           H3_REFCPU: ${{ matrix.h3_refcpu }}
           H3_SEED: ${{ matrix.h3_seed }}
         run: bash "$H/ci/${{ matrix.script }}"
-      - name: Upload
-        if: always() && env.ART != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ env.ART }}
-          if-no-files-found: ignore
-  win:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: "sync-windows"
-            backend: ""
-            base: "4a98feb"
-            head: "8a48526"
-            tbo: "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW"
-            tbo_env: ""
-            h3: "1"
-            h3_envs: ""
-            zimg: "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
-            head_cmake: ""
-            src_repo: "oobabooga"
-            script: "run.sh"
-            variants: ""
-            steps: ""
-            reps: ""
-            h3_steps: ""
-            h3_ab_reps: "2"
-            zimg_cap: ""
-            h3_warmup: ""
-            h3_w: ""
-            h3_h: ""
-            h3_f: ""
-            h3_prompt: ""
-            h3_refcpu: ""
-            h3_seed: ""
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 360
-    steps:
-      - name: Fetch harness
-        shell: powershell
-        run: |
-          $h = Join-Path $env:RUNNER_TEMP ("h-" + $env:GITHUB_RUN_ID + "-" + $PID)
-          git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth $h
-          Add-Content $env:GITHUB_ENV "H=$h"
-      - name: Run
-        shell: powershell
-        env:
-          BASE: ${{ matrix.base }}
-          HEAD: ${{ matrix.head }}
-          TBO_OPS: ${{ matrix.tbo }}
-          H3: ${{ matrix.h3 }}
-          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
-          ZIMG: ${{ matrix.zimg }}
-          HEAD_CMAKE: ${{ matrix.head_cmake }}
-          H3_WARMUP: ${{ matrix.h3_warmup }}
-          SRC_REPO: ${{ matrix.src_repo }}
-          H3_AB_REPS: ${{ matrix.h3_ab_reps }}
-          H3_W: ${{ matrix.h3_w }}
-          H3_H: ${{ matrix.h3_h }}
-          H3_F: ${{ matrix.h3_f }}
-          H3_PROMPT: ${{ matrix.h3_prompt }}
-          H3_REFCPU: ${{ matrix.h3_refcpu }}
-          H3_SEED: ${{ matrix.h3_seed }}
-          H3_STEPS: ${{ matrix.h3_steps }}
-        run: '& "$env:H\\ci\\run.ps1"'
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

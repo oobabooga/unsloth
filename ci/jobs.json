@@ -1,36 +1,26 @@
 [
  {
-  "name": "sync-hip",
+  "name": "ref-hip",
   "backend": "hip",
-  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
-  "zimg_cap": "6.33:1024x1024:",
+  "zimg": "1008x1008:--vae-tiling",
+  "zimg_cap": "6.6:1024x1024: 6.9:1024x1024: 3.2:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6 2.4:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6",
   "base": "4a98feb",
   "head": "8a48526",
   "src_repo": "oobabooga",
   "h3": "1",
-  "h3_ab_reps": "2",
-  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
+  "h3_refcpu": "1",
+  "h3_steps": "2",
+  "h3_ab_reps": "1"
  },
  {
-  "name": "sync-vulkan",
+  "name": "ref-vulkan",
   "backend": "vulkan",
-  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
   "base": "4a98feb",
   "head": "8a48526",
   "src_repo": "oobabooga",
   "h3": "1",
-  "h3_ab_reps": "2",
-  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
- },
- {
-  "name": "sync-windows",
-  "os": "windows",
-  "tbo": "FLASH_ATTN_EXT,CPY,MUL_MAT,RMS_NORM,ROPE,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,CONV_2D_DW",
-  "base": "4a98feb",
-  "head": "8a48526",
-  "src_repo": "oobabooga",
-  "h3": "1",
-  "h3_ab_reps": "2",
-  "zimg": "1024x1024 1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
+  "h3_refcpu": "1",
+  "h3_steps": "2",
+  "h3_ab_reps": "1"
  }
 ]

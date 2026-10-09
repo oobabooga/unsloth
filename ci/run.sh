@@ -149,7 +149,7 @@ zimg() { # name tree WxH flags
 }
 if [ -n "${ZIMG:-}" ]; then
   wait_models
-  for spec in $ZIMG; do wh=${spec%%:*}; fl=""; [ "$spec" != "$wh" ] && fl="${spec#*:}"; fl=${fl//,/ }
+  for spec in $ZIMG; do wh=${spec%%:*}; fl=""; [ "$spec" != "$wh" ] && fl="${spec#*:}"; fl=${fl//,/ }; fl=${fl//@W@/$W}
     k="z_${wh}_$(echo "$fl" | tr -dc 'a-z0-9')"
     zimg "${k}_base" base "$wh" $fl; zimg "${k}_head" head "$wh" $fl
     log "cmp $k: $(python "$CI/compare.py" "$W/runs/${k}_base" "$W/runs/${k}_head")"
@@ -160,7 +160,7 @@ fi
 if [ -n "${ZIMG_CAP:-}" ] && [ "$BACKEND" = hip ]; then
   wait_models
   hipcc -O2 -o "$W/ballast" "$CI/ballast.hip" > "$W/ballast-build.log" 2>&1 || { log "ballast build failed"; tail -5 "$W/ballast-build.log"; }
-  for spec in $ZIMG_CAP; do IFS=: read -r keep wh fl <<< "$spec"; fl=${fl//,/ }
+  for spec in $ZIMG_CAP; do IFS=: read -r keep wh fl <<< "$spec"; fl=${fl//,/ }; fl=${fl//@W@/$W}
     "$W/ballast" "$keep" > "$W/ballast.log" 2>&1 & bp=$!; sleep 20; log "ballast keep ${keep} GiB: $(tr '\n' ' ' < "$W/ballast.log")"
     k="cap${keep}_${wh}_$(echo "$fl" | tr -dc 'a-z0-9')"
     zimg "${k}_base" base "$wh" $fl; zimg "${k}_head" head "$wh" $fl
