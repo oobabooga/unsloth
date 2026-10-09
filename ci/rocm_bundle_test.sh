@@ -36,10 +36,22 @@ run() { # name dir args...
   local name=$1 d=$2; shift 2; mkdir -p "$W/runs/$name"
   ( cd "$W/tmp" && exec env -i PATH=/usr/bin:/bin HOME="$W/tmp" "$d/sd-cli" "$@" -o "$W/runs/$name/f_%03d.png" -v > "$W/runs/$name.log" 2>&1 ) &
   local pid=$! sys=0
-  while kill -0 $pid 2>/dev/null; do grep -q '/opt/rocm' /proc/$pid/maps 2>/dev/null && sys=1; sleep 5; done
+  : > "$W/maps-$name.txt"
+  while kill -0 $pid 2>/dev/null; do grep -o '/opt/rocm[^ ]*' /proc/$pid/maps 2>/dev/null >> "$W/maps-$name.txt" && sys=1; sleep 5; done
+  sort -u "$W/maps-$name.txt" -o "$W/maps-$name.txt"; [ -s "$W/maps-$name.txt" ] && log "   $name maps from /opt/rocm: $(xargs -n1 basename < "$W/maps-$name.txt" | sort -u | tr '\n' ' ')"
   wait $pid; local rc=$?
   log "$name rc=$rc system-rocm-mapped=$sys device=$(grep -oE 'Device 0: [^,]*, gfx[0-9a-f]+' "$W/runs/$name.log" | head -1) | $(grep -E 'generate_image completed|generate_video completed|sampling completed|no GPU|available 0.00 MB|ASSERT' "$W/runs/$name.log" | sed -E 's/.*\] //' | head -4 | tr '\n' ' ')"
 }
+# B in a clean ubuntu:24.04 container (no ROCm installed): only /dev/kfd and /dev/dri from the host.
+RG=$(getent group render | cut -d: -f3); VG=$(getent group video | cut -d: -f3)
+for t in z h3; do
+  if [ $t = z ]; then args="--diffusion-model /m/z-image-turbo-Q4_K_M.gguf --llm /m/Qwen3-4B-Q4_K_M.gguf --vae /m/split_files/vae/ae.safetensors -p lighthouse --cfg-scale 1.0 --steps 8 --seed 7 -W 1024 -H 1024 --diffusion-fa"
+  else args="-M vid_gen --diffusion-model /m/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf --vae /m/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /m/vae/minimax_h3_audio_vae_fp32.safetensors --llm /m/qwen3vl_32b_minimax_h3-Q2_K_M.gguf -p fox --cfg-scale 1.0 -W 640 -H 384 --video-frames 56 --steps 4 --seed 42 --rng cpu --fps 24 --diffusion-fa --offload-to-cpu --max-vram -1"; fi
+  docker run --rm --device=/dev/kfd --device=/dev/dri --group-add "$RG" --group-add "$VG" --security-opt seccomp=unconfined \
+    -v "$B":/b:ro -v "$W/models":/m:ro -v "$W/runs":/o ubuntu:24.04 bash -c \
+    "apt-get update -qq >/dev/null && apt-get install -y -qq libgomp1 >/dev/null; ls /opt 2>/dev/null; /b/sd-cli $args -v -o /o/ctr_$t.png" > "$W/runs/ctr_$t.log" 2>&1
+  log "container $t rc=$? device=$(grep -oE 'Device 0: [^,]*, gfx[0-9a-f]+' "$W/runs/ctr_$t.log" | head -1) | $(grep -E 'generate_image completed|generate_video completed|sampling completed|error|ASSERT|cannot open' "$W/runs/ctr_$t.log" | sed -E 's/.*\] //' | head -4 | tr '\n' ' ')"
+done
 for n in A B; do d=$([ $n = A ] && echo "$A" || echo "$B")
   run z_$n "$d" --diffusion-model "$M/z-image-turbo-Q4_K_M.gguf" --llm "$M/Qwen3-4B-Q4_K_M.gguf" --vae "$M/split_files/vae/ae.safetensors" \
     -p "A lighthouse on a rocky coast at dusk, waves crashing, detailed photograph" --cfg-scale 1.0 --steps 8 --seed 7 -W 1024 -H 1024 --diffusion-fa
