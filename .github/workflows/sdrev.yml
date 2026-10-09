@@ -7,16 +7,16 @@ on:
 permissions: {}
 
 jobs:
-  win:
+  ab:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "stack-windows-speed"
-            backend: ""
+          - name: "ref-hip"
+            backend: "hip"
             base: "6321a69"
-            head: "1957123"
+            head: "ae9429f"
             tbo: ""
             tbo_env: ""
             h3: "1"
@@ -28,10 +28,105 @@ jobs:
             variants: ""
             steps: ""
             reps: ""
-            h3_steps: ""
-            h3_ab_reps: "3"
+            h3_steps: "2"
+            h3_ab_reps: "1"
             zimg_cap: ""
-            h3_warmup: "1"
+            h3_warmup: ""
+            h3_w: "256"
+            h3_h: "160"
+            h3_f: "22"
+            h3_prompt: "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing."
+            h3_refcpu: "1"
+          - name: "ref-vulkan"
+            backend: "vulkan"
+            base: "6321a69"
+            head: "ae9429f"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: ""
+            zimg: ""
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: "2"
+            h3_ab_reps: "1"
+            zimg_cap: ""
+            h3_warmup: ""
+            h3_w: "256"
+            h3_h: "160"
+            h3_f: "22"
+            h3_prompt: "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing."
+            h3_refcpu: "1"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    steps:
+      - name: Fetch harness
+        run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" && echo "H=$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" >> "$GITHUB_ENV"
+      - name: Run
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BASE: ${{ matrix.base }}
+          HEAD: ${{ matrix.head }}
+          TBO_OPS: ${{ matrix.tbo }}
+          TBO_ENV_VARIANTS: ${{ matrix.tbo_env }}
+          H3: ${{ matrix.h3 }}
+          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
+          ZIMG: ${{ matrix.zimg }}
+          HEAD_CMAKE: ${{ matrix.head_cmake }}
+          SRC_REPO: ${{ matrix.src_repo }}
+          VARIANTS: ${{ matrix.variants }}
+          STEPS: ${{ matrix.steps }}
+          REPS: ${{ matrix.reps }}
+          H3_STEPS: ${{ matrix.h3_steps }}
+          H3_AB_REPS: ${{ matrix.h3_ab_reps }}
+          ZIMG_CAP: ${{ matrix.zimg_cap }}
+          H3_W: ${{ matrix.h3_w }}
+          H3_H: ${{ matrix.h3_h }}
+          H3_F: ${{ matrix.h3_f }}
+          H3_PROMPT: ${{ matrix.h3_prompt }}
+          H3_REFCPU: ${{ matrix.h3_refcpu }}
+        run: bash "$H/ci/${{ matrix.script }}"
+      - name: Upload
+        if: always() && env.ART != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ART }}
+          if-no-files-found: ignore
+  win:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ref-windows"
+            backend: ""
+            base: "6321a69"
+            head: "ae9429f"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: ""
+            zimg: ""
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: "2"
+            h3_ab_reps: "1"
+            zimg_cap: ""
+            h3_warmup: ""
+            h3_w: "256"
+            h3_h: "160"
+            h3_f: "22"
+            h3_prompt: "A street band plays upbeat brass funk on a sunny city corner, trumpet and saxophone solos over a driving drum groove and bass line, people dancing."
+            h3_refcpu: "1"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -53,6 +148,12 @@ jobs:
           HEAD_CMAKE: ${{ matrix.head_cmake }}
           H3_WARMUP: ${{ matrix.h3_warmup }}
           H3_AB_REPS: ${{ matrix.h3_ab_reps }}
+          H3_W: ${{ matrix.h3_w }}
+          H3_H: ${{ matrix.h3_h }}
+          H3_F: ${{ matrix.h3_f }}
+          H3_PROMPT: ${{ matrix.h3_prompt }}
+          H3_REFCPU: ${{ matrix.h3_refcpu }}
+          H3_STEPS: ${{ matrix.h3_steps }}
         run: '& "$env:H\\ci\\run.ps1"'
       - name: Upload
         if: always() && env.ART != ''

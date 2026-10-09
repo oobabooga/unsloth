@@ -100,12 +100,19 @@ function RunSd($name, $exe, $envs, $argv) {
   Copy-Item "$W\runs\$name.log" -Destination "$W\art\$name.log" -ErrorAction SilentlyContinue
 }
 $M = "$W\models"
-function H3Args($name) { @("-M","vid_gen","--diffusion-model","$M\minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf","--vae","$M\vae\minimax_h3_video_vae_fp16.safetensors","--audio-vae","$M\vae\minimax_h3_audio_vae_fp32.safetensors","--llm","$M\qwen3vl_32b_minimax_h3-Q2_K_M.gguf","-p","A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong.","--cfg-scale","1.0","-W","640","-H","384","--video-frames","56","--steps","4","--seed","42","--rng","cpu","--fps","24","--diffusion-fa","--offload-to-cpu","--max-vram","-1","-v","-o","$W\runs\$name\f_%03d.png") }
+function H3Args($name) { @("-M","vid_gen","--diffusion-model","$M\minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf","--vae","$M\vae\minimax_h3_video_vae_fp16.safetensors","--audio-vae","$M\vae\minimax_h3_audio_vae_fp32.safetensors","--llm","$M\qwen3vl_32b_minimax_h3-Q2_K_M.gguf","-p",$(if ($env:H3_PROMPT) { $env:H3_PROMPT } else { "A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong." }),"--cfg-scale","1.0","-W",$(if ($env:H3_W) { $env:H3_W } else { "640" }),"-H",$(if ($env:H3_H) { $env:H3_H } else { "384" }),"--video-frames",$(if ($env:H3_F) { $env:H3_F } else { "56" }),"--steps",$(if ($env:H3_STEPS) { $env:H3_STEPS } else { "4" }),"--seed","42","--rng","cpu","--fps","24","--diffusion-fa","--offload-to-cpu","--max-vram","-1","-v","-o","$W\runs\$name\f_%03d.png") }
 if ($env:H3 -eq "1") {
   WaitModels
   if ($env:H3_WARMUP -eq "1") { RunSd "warm" $bin.base @() (H3Args "warm") }
   $reps = if ($env:H3_AB_REPS) { [int]$env:H3_AB_REPS } else { 2 }
   for ($r = 1; $r -le $reps; $r++) { RunSd "base$r" $bin.base @() (H3Args "base$r"); RunSd "head$r" $bin.head @() (H3Args "head$r") }
+  if ($env:H3_REFCPU -eq "1") {
+    RunSd "ref_base" $bin.base @() ((H3Args "ref_base") + @("--backend","cpu")); RunSd "ref_head" $bin.head @() ((H3Args "ref_head") + @("--backend","cpu"))
+    Log ("REF cpu base vs cpu head: " + (& $py "$CI\compare.py" "$W\runs\ref_base" "$W\runs\ref_head"))
+    Log ("REF gpu base vs cpu base: " + (& $py "$CI\compare.py" "$W\runs\ref_base" "$W\runs\base1"))
+    Log ("REF gpu head vs cpu base: " + (& $py "$CI\compare.py" "$W\runs\ref_base" "$W\runs\head1"))
+    Log ("REF gpu head vs cpu head: " + (& $py "$CI\compare.py" "$W\runs\ref_head" "$W\runs\head1"))
+  }
   Log ("cmp base1 base2: " + (& $py "$CI\compare.py" "$W\runs\base1" "$W\runs\base2"))
   Log ("cmp head1 head2: " + (& $py "$CI\compare.py" "$W\runs\head1" "$W\runs\head2"))
   Log ("cmp base1 head1: " + (& $py "$CI\compare.py" "$W\runs\base1" "$W\runs\head1"))
