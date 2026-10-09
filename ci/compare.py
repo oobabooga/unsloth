@@ -31,10 +31,9 @@ out = []
 if len(fa) != len(fb) or not fa:
     out.append(f"frames: count {len(fa)} vs {len(fb)}")
 else:
-    same = sum(open(x, "rb").read() == open(y, "rb").read() for x, y in zip(fa, fb))
     ps = [psnr(np.asarray(Image.open(x).convert("RGB")), np.asarray(Image.open(y).convert("RGB"))) for x, y in zip(fa, fb)]
     fin = [p for p in ps if p != float("inf")]
-    out.append(f"frames {len(fa)}: identical {same}/{len(fa)}" + (f", PSNR mean {np.mean(fin):.2f} min {min(fin):.2f} dB" if fin else ", bit-identical"))
+    out.append(f"frames {len(fa)}: pixel-identical {len(ps)-len(fin)}/{len(fa)}" + (f", PSNR mean {np.mean(fin):.2f} min {min(fin):.2f} dB" if fin else ""))
 wa = sorted(glob.glob(os.path.join(A, "*.wav"))); wb = sorted(glob.glob(os.path.join(B, "*.wav")))
 if wa and wb:
     x, y = read_wav(wa[0]), read_wav(wb[0])
