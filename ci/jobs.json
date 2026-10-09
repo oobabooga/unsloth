@@ -1,13 +1,11 @@
 [
  {
-  "name": "stack-windows-speed2",
+  "name": "pr21-windows2",
   "os": "windows",
   "base": "6321a69",
-  "head": "ae9429f",
-  "h3": "1",
-  "h3_warmup": "1",
-  "h3_ab_reps": "4",
+  "head": "ee5829c",
+  "h3": "",
   "h3_envs": "",
-  "zimg": ""
+  "zimg": "496x496:--vae-tiling 496x496:--vae-tiling,-v 496x496"
  }
 ]

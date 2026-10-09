@@ -133,5 +133,5 @@ if ($env:ZIMG) {
   }
 }
 Get-ChildItem "$W\runs" -Filter *.log | Copy-Item -Destination "$W\art"
-Get-ChildItem "$W\runs" -Directory | ForEach-Object { $d = New-Item -ItemType Directory -Force -Path "$W\art\$($_.Name)"; Get-ChildItem $_.FullName -Filter *.png | Sort-Object Name | Where-Object { $i = [int]($_.BaseName -replace '\D',''); $_.Name -eq 'out.png' -or $i -eq 0 -or $i % 20 -eq 0 } | Copy-Item -Destination $d; Get-ChildItem $_.FullName -Filter *.wav | Copy-Item -Destination $d }
+foreach ($d in (Get-ChildItem "$W\runs" -Directory)) { New-Item -ItemType Directory -Force -Path "$W\art\$($d.Name)" | Out-Null; foreach ($f in (Get-ChildItem $d.FullName -File)) { if ($f.Name -eq "out.png" -or $f.Extension -eq ".wav" -or $f.Name -match '_(000|020|040)\.png$') { Copy-Item $f.FullName -Destination "$W\art\$($d.Name)\" } } }
 Get-Content $S
