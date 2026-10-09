@@ -1,4 +1,11 @@
 [
- {"name":"pr17-hip-render","backend":"hip","base":"6321a69","head":"ca92d95","tbo":"","h3":"1",
-  "h3_envs":"vaefa0:SD_H3_VAE_FLASH_ATTN=0","zimg":"1024x1024:--vae-tiling 1008x1008:--vae-tiling"}
+ {"name":"pr18-hip","backend":"hip","base":"ca92d95","head":"5f222b8",
+  "tbo":"FLASH_ATTN_EXT,RMS_NORM,MUL_MAT,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED,ADD,MUL,SWIGLU",
+  "tbo_env":"FLASH_ATTN_EXT:GGML_CUDA_FA_LONGSEQ=0 RMS_NORM:GGML_CUDA_NORM_SMALL_ROWS=0 MUL_MAT:GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0",
+  "h3":"1","h3_envs":"alloff:SD_H3_GRAPH_FAST=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0 GGML_CUDA_FA_LONGSEQ=0 GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 GGML_CUDA_NORM_SMALL_ROWS=0",
+  "zimg":"1024x1024:--vae-tiling 1008x1008:--vae-tiling"},
+ {"name":"pr18-vulkan","backend":"vulkan","base":"ca92d95","head":"5f222b8",
+  "tbo":"FLASH_ATTN_EXT,RMS_NORM,ROPE_PE_PERMUTE,MODULATE_ROWS,SWIGLU_SCALED","tbo_env":"",
+  "h3":"1","h3_envs":"alloff:SD_H3_GRAPH_FAST=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0",
+  "zimg":"1024x1024:--vae-tiling 1008x1008:--vae-tiling"}
 ]
