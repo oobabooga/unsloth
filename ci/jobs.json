@@ -1,11 +1,29 @@
 [
  {
-  "name": "pr21-windows2",
-  "os": "windows",
-  "base": "6321a69",
-  "head": "ee5829c",
+  "name": "pr21fix-hip",
+  "backend": "hip",
+  "base": "ee5829c",
+  "head": "59c912a",
   "h3": "",
   "h3_envs": "",
-  "zimg": "496x496:--vae-tiling 496x496:--vae-tiling,-v 496x496"
+  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+ },
+ {
+  "name": "pr21fix-vulkan",
+  "backend": "vulkan",
+  "base": "ee5829c",
+  "head": "59c912a",
+  "h3": "",
+  "h3_envs": "",
+  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+ },
+ {
+  "name": "pr21fix-windows",
+  "os": "windows",
+  "base": "ee5829c",
+  "head": "59c912a",
+  "h3": "",
+  "h3_envs": "",
+  "zimg": "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
  }
 ]

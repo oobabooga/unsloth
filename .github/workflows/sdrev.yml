@@ -7,21 +7,114 @@ on:
 permissions: {}
 
 jobs:
+  ab:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "pr21fix-hip"
+            backend: "hip"
+            base: "ee5829c"
+            head: "59c912a"
+            tbo: ""
+            tbo_env: ""
+            h3: ""
+            h3_envs: ""
+            zimg: "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+            zimg_cap: ""
+            h3_warmup: ""
+            h3_w: ""
+            h3_h: ""
+            h3_f: ""
+            h3_prompt: ""
+            h3_refcpu: ""
+            h3_seed: ""
+          - name: "pr21fix-vulkan"
+            backend: "vulkan"
+            base: "ee5829c"
+            head: "59c912a"
+            tbo: ""
+            tbo_env: ""
+            h3: ""
+            h3_envs: ""
+            zimg: "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+            zimg_cap: ""
+            h3_warmup: ""
+            h3_w: ""
+            h3_h: ""
+            h3_f: ""
+            h3_prompt: ""
+            h3_refcpu: ""
+            h3_seed: ""
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    steps:
+      - name: Fetch harness
+        run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" && echo "H=$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" >> "$GITHUB_ENV"
+      - name: Run
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BASE: ${{ matrix.base }}
+          HEAD: ${{ matrix.head }}
+          TBO_OPS: ${{ matrix.tbo }}
+          TBO_ENV_VARIANTS: ${{ matrix.tbo_env }}
+          H3: ${{ matrix.h3 }}
+          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
+          ZIMG: ${{ matrix.zimg }}
+          HEAD_CMAKE: ${{ matrix.head_cmake }}
+          SRC_REPO: ${{ matrix.src_repo }}
+          VARIANTS: ${{ matrix.variants }}
+          STEPS: ${{ matrix.steps }}
+          REPS: ${{ matrix.reps }}
+          H3_STEPS: ${{ matrix.h3_steps }}
+          H3_AB_REPS: ${{ matrix.h3_ab_reps }}
+          ZIMG_CAP: ${{ matrix.zimg_cap }}
+          H3_W: ${{ matrix.h3_w }}
+          H3_H: ${{ matrix.h3_h }}
+          H3_F: ${{ matrix.h3_f }}
+          H3_PROMPT: ${{ matrix.h3_prompt }}
+          H3_REFCPU: ${{ matrix.h3_refcpu }}
+          H3_SEED: ${{ matrix.h3_seed }}
+        run: bash "$H/ci/${{ matrix.script }}"
+      - name: Upload
+        if: always() && env.ART != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ART }}
+          if-no-files-found: ignore
   win:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "pr21-windows2"
+          - name: "pr21fix-windows"
             backend: ""
-            base: "6321a69"
-            head: "ee5829c"
+            base: "ee5829c"
+            head: "59c912a"
             tbo: ""
             tbo_env: ""
             h3: ""
             h3_envs: ""
-            zimg: "496x496:--vae-tiling 496x496:--vae-tiling,-v 496x496"
+            zimg: "1008x1008:--vae-tiling 496x496:--vae-tiling 1008x1008:--vae-tiling,--vae-tile-size,8x8,--vae-tile-overlap,0.01"
             head_cmake: ""
             src_repo: ""
             script: "run.sh"
