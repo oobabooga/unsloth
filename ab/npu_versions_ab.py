@@ -152,6 +152,9 @@ with sync_playwright() as p:
         report["hub_credit"] = " ".join(credit.inner_text().split())
         report["hub_text_tail"] = " ".join(hub.inner_text().split())[-300:]
         page.screenshot(path = str(out / f"{label}-hub-npu-after.png"))
+    if credit.count():
+        credit.scroll_into_view_if_needed()
+        credit.screenshot(path = str(out / f"{label}-hub-credit.png"))
 
     # Chat > model picker > NPU section.
     page.goto(f"{base}/chat")
@@ -164,6 +167,7 @@ with sync_playwright() as p:
     report["picker_credit"] = credit_text(page)
     page.wait_for_timeout(1500)
     page.screenshot(path = str(out / f"{label}-picker-npu.png"))
+    page.get_by_text("Powered by", exact = False).last.screenshot(path = str(out / f"{label}-picker-credit.png"))
     report["status_requests"] = len(seen)
     browser.close()
 
