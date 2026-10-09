@@ -1,1 +1,42 @@
-[{"name":"pr14-rocm","special":"pr14"}]
+[
+ {
+  "name": "pr18-vulkan2",
+  "backend": "vulkan",
+  "base": "ff941a8",
+  "head": "d2f58e3",
+  "h3": "1",
+  "h3_envs": "alloff:SD_H3_GRAPH_FAST=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+ },
+ {
+  "name": "pr19-vulkan",
+  "backend": "vulkan",
+  "base": "d2f58e3",
+  "head": "3c26b6a",
+  "tbo": "ROPE_PE_PERMUTE,CONV_2D_DW,RMS_NORM",
+  "h3": "1",
+  "h3_envs": "alloff:SD_H3_FAST_SAGE_QKV=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_H3_AUDIO_DIRECT_DW=0;dw0:SD_H3_AUDIO_DIRECT_DW=0",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+ },
+ {
+  "name": "pr21-hip",
+  "backend": "hip",
+  "base": "6321a69",
+  "head": "ee5829c",
+  "h3": "1",
+  "h3_ab_reps": "1",
+  "h3_envs": "",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496 1008x1008:--offload-to-cpu",
+  "zimg_cap": "5:1008x1008:--offload-to-cpu"
+ },
+ {
+  "name": "pr21-vulkan",
+  "backend": "vulkan",
+  "base": "6321a69",
+  "head": "ee5829c",
+  "h3": "1",
+  "h3_ab_reps": "1",
+  "h3_envs": "",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496 1008x1008:--offload-to-cpu"
+ }
+]

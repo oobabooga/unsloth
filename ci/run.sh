@@ -149,6 +149,20 @@ if [ -n "${ZIMG:-}" ]; then
   done
 fi
 
+# capped renders (HIP only): a ballast holds device memory so untiled VAE passes fail
+if [ -n "${ZIMG_CAP:-}" ] && [ "$BACKEND" = hip ]; then
+  wait_models
+  hipcc -O2 -o "$W/ballast" "$CI/ballast.hip" > "$W/ballast-build.log" 2>&1 || { log "ballast build failed"; tail -5 "$W/ballast-build.log"; }
+  for spec in $ZIMG_CAP; do IFS=: read -r keep wh fl <<< "$spec"; fl=${fl//,/ }
+    "$W/ballast" "$keep" > "$W/ballast.log" 2>&1 & bp=$!; sleep 20; log "ballast keep ${keep} GiB: $(tr '\n' ' ' < "$W/ballast.log")"
+    k="cap${keep}_${wh}_$(echo "$fl" | tr -dc 'a-z0-9')"
+    zimg "${k}_base" base "$wh" $fl; zimg "${k}_head" head "$wh" $fl
+    kill $bp; wait $bp 2>/dev/null
+    log "cap $k base: $(grep -iE 'retry|failed|num tiles' "$W/runs/${k}_base.log" | sed -E 's/.*\] //' | tr '\n' ' ' | cut -c1-300)"
+    log "cap $k head: $(grep -iE 'retry|failed|num tiles' "$W/runs/${k}_head.log" | sed -E 's/.*\] //' | tr '\n' ' ' | cut -c1-300)"
+  done
+fi
+
 # artifacts: logs, summary, a few frames
 cp "$S" "$W"/*.log "$W/art/" 2>/dev/null
 for d in "$W"/runs/*/; do n=$(basename "$d"); mkdir -p "$W/art/$n"; cp "$W/runs/$n.log" "$W/art/" 2>/dev/null; ls "$d"*.png 2>/dev/null | awk 'NR==1||NR%20==0' | xargs -r cp -t "$W/art/$n"; cp "$d"*.wav "$W/art/$n/" 2>/dev/null; done

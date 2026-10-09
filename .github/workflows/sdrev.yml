@@ -7,99 +7,112 @@ on:
 permissions: {}
 
 jobs:
-  rocm-leg:
-    name: pr14-rocm-leg
-    runs-on: ubuntu-24.04
-    env:
-      ROCM_VERSION: 7.14.0
-      GPU_TARGETS: gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201
-      CCACHE_COMPILERCHECK: content
-    steps:
-    - name: 'Checkout #14 tree (tooling)'
-      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      with:
-        repository: oobabooga/stable-diffusion.cpp
-        ref: sdrev-14
-        path: tooling
-        fetch-depth: 1
-    - name: Free disk for the ROCm wheels
-      run: "set -eux\nsudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \\\n  /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache\ndocker system prune -af || true\n\
-        df -h /\n"
-    - name: Source tree (as resolve prepares it)
-      run: 'set -eux
-  
-        git clone -q --branch sdrev-14 https://github.com/oobabooga/stable-diffusion.cpp src
-  
-        cd src
-  
-        git submodule update --init --recursive --depth 1 ggml
-  
-        for p in scripts/unsloth/ggml-patches/*.patch; do [ -e "$p" ] || continue; git -C ggml apply --verbose "../$p"; done
-  
-        git log --oneline -1
-  
-        '
-    - name: Install ROCm (TheRock wheels)
-      run: "set -euo pipefail\nsudo apt-get update -qq && sudo apt-get install -y -qq ninja-build patchelf\npython3 -m venv .rocm\n. .rocm/bin/activate\npython -m pip install -q --upgrade pip\n# libraries/devel\
-        \ carry no GPU code: rocBLAS/hipBLASLt kernels and kpack archives come\n# from one rocm-sdk-device-<gfx> wheel per target, linked into the devel tree by\n# `rocm-sdk path`.\nDEVICE=\"$(echo \"$GPU_TARGETS\"\
-        \ | sed 's/;/,device-/g; s/^/device-/')\"\npython -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \\\n  \"rocm[libraries,devel,${DEVICE}]==${ROCM_VERSION}\"\n\
-        ROCM_PATH=\"$(rocm-sdk path --root)\"\n{\n  echo \"ROCM_PATH=$ROCM_PATH\"\n  echo \"HIP_PATH=$ROCM_PATH\"\n  echo \"CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)\"\n  echo \"LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}\"\
-        \n} >> \"$GITHUB_ENV\"\necho \"$(rocm-sdk path --bin)\" >> \"$GITHUB_PATH\"\necho \"$(pwd)/.rocm/bin\" >> \"$GITHUB_PATH\"\n"
-    - name: Build sd-cli + sd-server (ROCm)
-      working-directory: src
-      run: "set -euo pipefail\ncmake -B build -G Ninja \\\n  -DCMAKE_BUILD_TYPE=Release \\\n  -DCMAKE_HIP_COMPILER=\"$(hipconfig -l)/clang\" \\\n  -DCMAKE_HIP_FLAGS=\"-mllvm --amdgpu-unroll-threshold-local=600\"\
-        \ \\\n  -DSD_BUILD_EXAMPLES=ON \\\n  -DSD_SERVER_BUILD_FRONTEND=OFF \\\n  -DSD_WEBP=OFF -DSD_WEBM=OFF \\\n  -DGGML_NATIVE=OFF \\\n  -DSD_HIPBLAS=ON \\\n  -DHIP_PLATFORM=amd \\\n  -DGPU_TARGETS=\"\
-        $GPU_TARGETS\"\ncmake --build build --config Release -j \"$(nproc)\" --target sd-cli sd-server\nccache --show-stats || true\n"
-    - name: Stage the bundle with the ROCm runtime
-      run: "set -euo pipefail\nBIN=\"${GITHUB_WORKSPACE}/src/build/bin\"\nSTAGE=\"${GITHUB_WORKSPACE}/rocm-bundle\"\nrm -rf \"$STAGE\" && mkdir -p \"$STAGE/lib\" \"$STAGE/.kpack\"\ncp \"$BIN/sd-cli\" \"$BIN/sd-server\"\
-        \ \"$STAGE/\"\n# ldd walks the closure and ggml is static here, so the two binaries are the whole list.\nldd \"$STAGE/sd-cli\" \"$STAGE/sd-server\" \\\n  | awk -v r=\"$ROCM_PATH/\" 'index($3, r) ==\
-        \ 1 { print $3 }' | sort -u > \"$RUNNER_TEMP/rocm-libs.txt\"\nif [ ! -s \"$RUNNER_TEMP/rocm-libs.txt\" ]; then\n  echo \"ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?\" >&2\n  exit\
-        \ 1\nfi\nwhile read -r so; do cp -L \"$so\" \"$STAGE/lib/\"; done < \"$RUNNER_TEMP/rocm-libs.txt\"\n# rocBLAS and hipBLASLt load kernels from <dir of the library>/<name>/library.\nfor t in rocblas\
-        \ hipblaslt; do\n  compgen -G \"$STAGE/lib/lib$t.so*\" > /dev/null || continue\n  mkdir -p \"$STAGE/lib/$t\"\n  cp -rL \"$ROCM_PATH/lib/$t/library\" \"$STAGE/lib/$t/\"\ndone\n# kpack-split libraries\
-        \ name their GPU code in .rocm_kpack_ref as\n# ../.kpack/<name>_@GFXARCH@.kpack, relative to the library, so lib/ and .kpack/ must\n# stay siblings in the bundle.\nfor so in \"$STAGE\"/lib/*.so*;\
-        \ do\n  objcopy -O binary --only-section=.rocm_kpack_ref \"$so\" \"$RUNNER_TEMP/kpack_ref.bin\"\n  for name in $(strings \"$RUNNER_TEMP/kpack_ref.bin\" | grep -o '\\.kpack/[A-Za-z0-9_]*_@GFXARCH@'\
-        \ \\\n      | sed 's#^\\.kpack/##; s#_@GFXARCH@$##' | sort -u); do\n    for gfx in ${GPU_TARGETS//;/ }; do\n      cp -L \"$ROCM_PATH/.kpack/${name}_${gfx}.kpack\" \"$STAGE/.kpack/\"\n    done\n  done\n\
-        done\npatchelf --set-rpath '$ORIGIN/lib' \"$STAGE/sd-cli\" \"$STAGE/sd-server\"\nfor f in \"$STAGE\"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' \"$f\"; done\necho \"bundled $(wc -l < \"$RUNNER_TEMP/rocm-libs.txt\"\
-        ) ROCm libraries, $(ls \"$STAGE/.kpack\" | wc -l) kpack archives\"\ndu -sh \"$STAGE\"\n# The proof the bundle stands alone: resolve with the wheel tree hidden.\nif LD_LIBRARY_PATH= ldd \"$STAGE/sd-cli\"\
-        \ \"$STAGE/sd-server\" | grep -i 'not found'; then\n  echo \"ERROR: unresolved libraries after bundling\" >&2\n  exit 1\nfi\n"
-    - name: Package bundle
-      env:
-        BIN_DIR: ${{ github.workspace }}/rocm-bundle
-        KEEP_LAYOUT: '1'
-        OUT_DIR: ${{ github.workspace }}/dist
-        TAG: sdrev14
-        LABEL: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
-        COMMIT: sdrev-14
-        SOURCE_REPO: ${{ github.repository }}
-        LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
-      run: python3 tooling/scripts/unsloth/package_bundle.py
-    - name: Upload bundle
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: sd-sdrev14-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
-        path: dist/sd-sdrev14-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip
-        if-no-files-found: error
-        retention-days: 7
-    timeout-minutes: 360
-  rocm-test:
-    name: pr14-rocm-test
-    needs: rocm-leg
+  ab:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "pr18-vulkan2"
+            backend: "vulkan"
+            base: "ff941a8"
+            head: "d2f58e3"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "alloff:SD_H3_GRAPH_FAST=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_KEEP_RESIDENT=0"
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+            zimg_cap: ""
+          - name: "pr19-vulkan"
+            backend: "vulkan"
+            base: "d2f58e3"
+            head: "3c26b6a"
+            tbo: "ROPE_PE_PERMUTE,CONV_2D_DW,RMS_NORM"
+            tbo_env: ""
+            h3: "1"
+            h3_envs: "alloff:SD_H3_FAST_SAGE_QKV=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_H3_AUDIO_DIRECT_DW=0;dw0:SD_H3_AUDIO_DIRECT_DW=0"
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: ""
+            zimg_cap: ""
+          - name: "pr21-hip"
+            backend: "hip"
+            base: "6321a69"
+            head: "ee5829c"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: ""
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496 1008x1008:--offload-to-cpu"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: "1"
+            zimg_cap: "5:1008x1008:--offload-to-cpu"
+          - name: "pr21-vulkan"
+            backend: "vulkan"
+            base: "6321a69"
+            head: "ee5829c"
+            tbo: ""
+            tbo_env: ""
+            h3: "1"
+            h3_envs: ""
+            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling 496x496 1008x1008:--offload-to-cpu"
+            head_cmake: ""
+            src_repo: ""
+            script: "run.sh"
+            variants: ""
+            steps: ""
+            reps: ""
+            h3_steps: ""
+            h3_ab_reps: "1"
+            zimg_cap: ""
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 240
+    timeout-minutes: 360
     steps:
       - name: Fetch harness
         run: git clone -q --depth 1 --branch sdrev-amd https://github.com/oobabooga/unsloth "$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" && echo "H=$RUNNER_TEMP/h-$GITHUB_RUN_ID-$$" >> "$GITHUB_ENV"
-      - name: Download bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: sd-sdrev14-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
-          path: ${{ runner.temp }}/bundle-${{ github.run_id }}
       - name: Run
-        run: BUNDLE_ZIP="$(ls ${{ runner.temp }}/bundle-${{ github.run_id }}/*.zip)" bash "$H/ci/rocm_bundle_test.sh"
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BASE: ${{ matrix.base }}
+          HEAD: ${{ matrix.head }}
+          TBO_OPS: ${{ matrix.tbo }}
+          TBO_ENV_VARIANTS: ${{ matrix.tbo_env }}
+          H3: ${{ matrix.h3 }}
+          H3_HEAD_ENVS: ${{ matrix.h3_envs }}
+          ZIMG: ${{ matrix.zimg }}
+          HEAD_CMAKE: ${{ matrix.head_cmake }}
+          SRC_REPO: ${{ matrix.src_repo }}
+          VARIANTS: ${{ matrix.variants }}
+          STEPS: ${{ matrix.steps }}
+          REPS: ${{ matrix.reps }}
+          H3_STEPS: ${{ matrix.h3_steps }}
+          H3_AB_REPS: ${{ matrix.h3_ab_reps }}
+          ZIMG_CAP: ${{ matrix.zimg_cap }}
+        run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr14-rocm-test
+          name: ${{ matrix.name }}
           path: ${{ env.ART }}
           if-no-files-found: ignore

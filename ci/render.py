@@ -3,7 +3,7 @@ import json
 jobs = json.load(open("ci/jobs.json"))
 [j.setdefault('script','run.sh') for j in jobs]
 lin = [j for j in jobs if j.get("os") != "windows" and not j.get("special")]; win = [j for j in jobs if j.get("os") == "windows"]
-keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps"]
+keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps","h3_steps","h3_ab_reps","zimg_cap"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
 out = """name: sd.cpp PR A/B on AMD
@@ -46,6 +46,7 @@ if lin:
           REPS: ${{ matrix.reps }}
           H3_STEPS: ${{ matrix.h3_steps }}
           H3_AB_REPS: ${{ matrix.h3_ab_reps }}
+          ZIMG_CAP: ${{ matrix.zimg_cap }}
         run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
