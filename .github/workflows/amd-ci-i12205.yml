@@ -14,8 +14,6 @@ name: "AMD CI: issue 12205 ROCr CWSR wave count"
 #            B: unpatched rebuild         vs patched rebuild  (the 2-line change alone)
 
 on:
-  push:
-    branches: [amd-ci-i12205]
   workflow_dispatch:
 
 permissions:

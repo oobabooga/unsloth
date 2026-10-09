@@ -1,0 +1,85 @@
+name: "AMD CI: issue 12205 rebuilt ROCr regression on a working GPU"
+
+# Does swapping TheRock's libhsa-runtime64 for the rebuilt one (same rocm-systems pin
+# d134b78 + the KFD wave count, built by run 37787382574) change anything on a GPU that
+# already works? gfx1151 bundle from b11160-mix-a6922cc, real topology, no shim:
+# greedy text identity, parallel serving, and llama-bench speed interleaved ABBA.
+
+on:
+  push:
+    branches: [amd-ci-i12205]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  BUNDLE_URL: "https://github.com/unslothai/llama.cpp/releases/download/b11160-mix-a6922cc/app-b11160-mix-a6922cc-linux-x64-rocm-gfx1151.tar.gz"
+  MODEL_URL: "https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  MODEL_SHA256: "3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1"
+
+jobs:
+
+  gpu:
+    name: "gfx1151 stock vs rebuilt libhsa-runtime64 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "i12205-regress"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: torch-free gate; GPU execution is proven per run by layer placement"
+          grep -h PRETTY_NAME /etc/os-release || true
+          uname -r
+          nproc
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: i12205-rocr
+          path: ${{ env.AMD_CI_WORK }}/art
+          run-id: 37787382574
+          github-token: ${{ github.token }}
+
+      - name: Assemble arms
+        run: |
+          set -euo pipefail
+          A="$AMD_CI_WORK"
+          mkdir -p "$A/base"
+          curl -fsSL --retry 5 "$BUNDLE_URL" | tar -xz -C "$A/base"
+          curl -fsSL --retry 5 -o "$A/model.gguf" "$MODEL_URL"
+          echo "$MODEL_SHA256  $A/model.gguf" | sha256sum -c -
+          rm -rf "${A:?}/head"
+          cp -a "$A/base" "$A/head"
+          for f in "$A"/head/libhsa-runtime64.so*; do cp "$A/art/libhsa-runtime64.patched.so.1" "$f"; done
+          sha256sum "$A"/base/libhsa-runtime64.so* "$A"/head/libhsa-runtime64.so*
+
+      - name: Regression check
+        timeout-minutes: 70
+        run: |
+          set +e
+          python3 amd_ci/i12205/regress_rocr.py --base "$AMD_CI_WORK/base" --head "$AMD_CI_WORK/head" \
+            --model "$AMD_CI_WORK/model.gguf" --out "$AMD_CI_WORK/out/regress" --abba 3
+          cat "$AMD_CI_WORK/out/regress/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/regress"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i12205-regress
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
