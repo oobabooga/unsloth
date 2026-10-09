@@ -3,7 +3,8 @@
 #      H3 (1 = H3 renders) H3_HEAD_ENVS (';'-separated extra head arms, each "name:VAR=1 VAR2=0") ZIMG (space list WxH[:flags])
 #      HEAD_CMAKE (extra cmake args for head) SRC_REPO (default unslothai)
 set -uo pipefail
-W="$RUNNER_TEMP/w"; rm -rf "$W"; mkdir -p "$W"/{tmp,hf,models,runs}
+W="$RUNNER_TEMP/sdrev-${GITHUB_RUN_ID:-local}-${BACKEND}-$$"; mkdir -p "$W"/{tmp,hf,models,runs,art}
+echo "ART=$W/art" >> "$GITHUB_ENV"
 S="$W/summary.md"; : > "$S"
 CI="$(cd "$(dirname "$0")" && pwd)"
 log() { echo "$*" | tee -a "$S"; }
@@ -142,7 +143,6 @@ if [ -n "${ZIMG:-}" ]; then
 fi
 
 # artifacts: logs, summary, a few frames
-mkdir -p "$W/art"; cp "$S" "$W"/*.log "$W/art/" 2>/dev/null
+cp "$S" "$W"/*.log "$W/art/" 2>/dev/null
 for d in "$W"/runs/*/; do n=$(basename "$d"); mkdir -p "$W/art/$n"; cp "$W/runs/$n.log" "$W/art/" 2>/dev/null; ls "$d"*.png 2>/dev/null | awk 'NR==1||NR%20==0' | xargs -r cp -t "$W/art/$n"; cp "$d"*.wav "$W/art/$n/" 2>/dev/null; done
-echo "ART=$W/art" >> "$GITHUB_ENV"
 cat "$S"
