@@ -131,7 +131,7 @@ jobs:
 
         (root/'generation_final.py').write_text('"""Studio\'s own DiffusionBackend: Qwen-Image-2.1 GGUF Q4_K_M, Auto, optionally under a simulated 20 GB discrete card."""\nimport argparse\nimport json\nimport os\nimport sys\nimport threading\nimport time\nimport traceback\nfrom pathlib import Path\n\np = argparse.ArgumentParser()\np.add_argument("--placement", choices=["auto","auto-tiled","resident","resident-tiled","model"], default="auto")\np.add_argument("--query-chunking", default="auto")\np.add_argument("--case", required=True)\np.add_argument("--output", required=True)\np.add_argument("--free-gib", type=float, default=0)\np.add_argument("--te", default="auto")\np.add_argument("--steps", type=int, default=4)\np.add_argument("--repeats", type=int, default=2)\np.add_argument("--size", type=int, default=1024)\np.add_argument("--serialize", action="store_true")\np.add_argument("--disable-fused-sdpa", action="store_true")\np.add_argument("--memory-mode", default="auto")\np.add_argument("--env", action="append", default=[])\np.add_argument("--expect-bounded", action="store_true")\np.add_argument("--expect-tiles", action="store_true")\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\nlock = threading.Lock()\n\n\ndef emit(event, **fields):\n    line = json.dumps(dict(event=event, case=args.case, t=time.time(), **fields), default=str)\n    with lock:\n        print("PROBE " + line, flush=True)\n        with (out / (args.case + ".jsonl")).open("a", encoding="utf-8") as f:\n            f.write(line + "\\n")\n\n\nfor kv in args.env:\n    k, _, v = kv.partition("=")\n    os.environ[k] = v\nif args.serialize:\n    os.environ["AMD_SERIALIZE_KERNEL"] = "1"\n    os.environ["HIP_LAUNCH_BLOCKING"] = "1"\n    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"\nos.environ["UNSLOTH_QWEN_IMAGE_ROCM_QUERY_CHUNKING"] = args.query_chunking\nos.environ["UNSLOTH_DIFFUSION_COND_CACHE_DIR"] = str(out / (args.case + "-conditioning"))\nimport main as studio_main  # Studio\'s own startup env (AOTriton opt-in, etc.)\n\nimport torch\nimport psutil\n\nemit("env", main=studio_main.__file__, torch=torch.__version__, hip=torch.version.hip,\n     props=str(torch.cuda.get_device_properties(0)),\n     env={k: os.environ.get(k) for k in ("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "MIOPEN_SEARCH_CUTOFF",\n                                         "AMD_SERIALIZE_KERNEL", "PYTORCH_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")},\n     sdp=dict(flash=torch.backends.cuda.flash_sdp_enabled(), mem=torch.backends.cuda.mem_efficient_sdp_enabled(),\n              math=torch.backends.cuda.math_sdp_enabled()),\n     blas=str(torch.backends.cuda.preferred_blas_library()))\nif args.disable_fused_sdpa:\n    torch.backends.cuda.enable_flash_sdp(False)\n    torch.backends.cuda.enable_mem_efficient_sdp(False)\nfrom utils.hardware import ensure_hardware_detected\n\nensure_hardware_detected()\nemit("after_hw_detect", env={k: os.environ.get(k) for k in ("MIOPEN_SEARCH_CUTOFF", "MIOPEN_FIND_MODE")})\nfrom core.inference import diffusion as d\nfrom core.inference import diffusion_memory as dm\nfrom core.inference.diffusion_attention import available_sdpa_kernels\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\ntarget = resolve_diffusion_device_target()\nemit("target", target=target.as_public_dict())\nprops = torch.cuda.get_device_properties(0)\nif args.free_gib:\n    cap = int(args.free_gib * 2**30)\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n\n    real_memory_info = torch.cuda.mem_get_info\n    def capped_memory_info(device=None):\n        physical_free, _ = real_memory_info(device)\n        return min(physical_free, max(0, cap - torch.cuda.memory_reserved(device))), 20 * 2**30\n    torch.cuda.mem_get_info = capped_memory_info\n    def virtual_memory(backend):\n        free, total = capped_memory_info()\n        return free // 2**20, total // 2**20, "discrete_vram"\n\n    dm._cuda_memory = virtual_memory\n    emit("synthetic_capacity", total_gib=20, free_gib=args.free_gib)\nfrom dataclasses import replace\norig_plan = d.plan_diffusion_memory\n\n\ndef record_plan(**kw):\n    plan = orig_plan(**kw)\n    if args.placement == "auto-tiled":\n        plan = replace(plan, vae_tiling=True)\n    elif args.placement in ("resident", "resident-tiled"):\n        plan = replace(plan, offload_policy="none", stream_text_encoders=False, stream_transformer=False,\n                       vae_tiling=args.placement.endswith("tiled"), resident_transformer_mib=None,\n                       resident_text_encoder_mib=None, reasons=("experimental forced resident placement",))\n    elif args.placement == "model":\n        plan = replace(plan, offload_policy="model", vae_tiling=True, stream_text_encoders=False,\n                       stream_transformer=False, resident_transformer_mib=None, resident_text_encoder_mib=None,\n                       reasons=("experimental whole-component placement",))\n    emit("plan", plan=plan.as_public_dict())\n    return plan\n\n\nd.plan_diffusion_memory = record_plan\nproc = psutil.Process()\n\n\ndef mem():\n    return dict(alloc=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved(),\n                peak=torch.cuda.max_memory_allocated(), rss=proc.memory_info().rss)\n\n\nbackend = d.DiffusionBackend()\ntry:\n    t0 = time.perf_counter()\n    backend.begin_load("unsloth/Qwen-Image-2.1-GGUF", gguf_filename="qwen-image-2.1-Q4_K_M.gguf",\n                       family_override="qwen-image-2.1", memory_mode=args.memory_mode,\n                       **({} if args.te == "auto" else {"text_encoder_quant": args.te}))\n    deadline = time.monotonic() + 3000\n    while True:\n        pr = backend.load_progress()\n        if pr.get("error"):\n            raise RuntimeError(pr["error"])\n        if pr.get("phase") == "ready":\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError("load > 50 min")\n        time.sleep(10)\n    emit("loaded", seconds=time.perf_counter() - t0, status=backend.status(), mem=mem())\n    import functools\n    pipe = backend._state.pipe\n    from core.inference import diffusion_attention as attention\n    processors = [type(m.processor).__name__ for m in pipe.transformer.modules() if hasattr(m,"processor")]\n    emit("attention_state", processors=sorted(set(processors)), flash=torch.backends.cuda.flash_sdp_enabled(), mem=torch.backends.cuda.mem_efficient_sdp_enabled(), math=torch.backends.cuda.math_sdp_enabled())\n    if args.expect_bounded:\n        from core.inference.diffusion_qwenimage21_math import bounded_math_attention\n        assert bounded_math_attention(pipe), processors\n        assert not torch.backends.cuda.flash_sdp_enabled()\n        assert not torch.backends.cuda.mem_efficient_sdp_enabled()\n    assert not os.environ.get("UNSLOTH_DIFFUSION_VAE_MAX_TILE"), "tile override must be absent"\n    phase_rows = []\n    tile_rows = []\n    from core.inference import diffusion_vae_tiling as vt\n    original_decode_tile = vt._decode_tile\n    def measured_decode_tile(vae, z):\n        row = dict(shape=list(z.shape), ok=False)\n        tile_rows.append(row)\n        try:\n            result = original_decode_tile(vae, z)\n            row["ok"] = True\n            return result\n        except Exception as exc:\n            row["error"] = type(exc).__name__\n            raise\n    vt._decode_tile = measured_decode_tile\n    def instrument(obj, method, phase):\n        if method == "forward":\n            pending = []\n            def before_forward(module, call_args):\n                torch.cuda.synchronize()\n                torch.cuda.reset_peak_memory_stats()\n                pending.append((time.perf_counter(), mem()))\n            def after_forward(module, call_args, output):\n                if not pending:\n                    return\n                began, before = pending.pop()\n                torch.cuda.synchronize()\n                row = dict(phase=phase, seconds=time.perf_counter()-began, before=before, after=mem())\n                phase_rows.append(row)\n                emit("phase", **row)\n            obj.register_forward_pre_hook(before_forward)\n            obj.register_forward_hook(after_forward, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            torch.cuda.reset_peak_memory_stats()\n            before = mem()\n            began = time.perf_counter()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                row = dict(phase=phase, seconds=time.perf_counter()-began,\n                           before=before, after=mem())\n                phase_rows.append(row)\n                emit("phase", **row)\n        setattr(obj, method, measured)\n    instrument(pipe, "encode_prompt", "encode")\n    instrument(pipe.transformer, "forward", "denoise")\n    instrument(pipe.vae, "decode", "decode")\n    emit("placement", policy=backend._state.offload_policy, tiling=getattr(pipe.vae,"use_tiling",None),\n         components={name:dict(device=str(next(module.parameters()).device),\n                              bytes=sum(p.numel()*p.element_size() for p in module.parameters()))\n                     for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\n    prompts = ["A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.",\n               "A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.",\n               "A chalkboard menu that reads FRESH COFFEE 2.50 in a small cafe."]\n    for i in range(args.repeats):\n        phase_rows.clear()\n        tile_rows.clear()\n        t1 = time.perf_counter()\n        res = backend.generate(prompt=prompts[i % len(prompts)], width=args.size, height=args.size,\n                               steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        for j, im in enumerate(res["images"]):\n            im.save(out / f"{args.case}-{i}-{j}.png")\n        emit("render", tiles=tile_rows, last_decode_tile=getattr(pipe.vae,"_unsloth_last_decode_tile",None), index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\n             phase_seconds={ph:sum(r["seconds"] for r in phase_rows if r["phase"]==ph) for ph in ("encode","denoise","decode")},\n             peak_allocated=max([r["after"]["peak"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\n        if args.expect_tiles:\n            assert tile_rows, "tiled decoder was not exercised"\n            assert all(row["ok"] for row in tile_rows), tile_rows\n            assert all(max(row["shape"][-2:]) <= 32 for row in tile_rows), tile_rows\n            assert tuple(pipe.vae._unsloth_last_decode_tile[:2]) == (32,32)\n        import numpy as np\n        for im in res["images"]:\n            pixels=np.asarray(im)\n            assert pixels.shape[:2] == (args.size,args.size)\n            assert pixels.std() > 1, "blank image"\n    emit("complete", success=True)\nexcept Exception as exc:  # noqa: BLE001\n    emit("failure", error=repr(exc)[:2000], traceback=traceback.format_exc()[-8000:], mem=None)\n    raise\nfinally:\n    try:\n        backend.unload()\n    except Exception:  # noqa: BLE001\n        pass\n',encoding='utf-8')
         (root/'probe_final.py').write_text("import json, sys, time\nfrom pathlib import Path\nstarted=time.perf_counter()\nimport main\nimport torch\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\nfrom core.inference import diffusion_attention as att\nfrom importlib import metadata\n\ntarget=resolve_diffusion_device_target()\nwant=sys.argv[1]\noutput=Path(sys.argv[2])\nt0=time.perf_counter()\navailable=att.available_sdpa_kernels(target)\ncold=time.perf_counter()-t0\nt0=time.perf_counter()\ncached=att.available_sdpa_kernels(target)\nwarm=time.perf_counter()-t0\ndisabled=att.guard_rocm_fused_sdpa(target)\nrecord=dict(want=want,available=available,cached=cached,disabled=disabled,cold_probe_seconds=cold,cached_probe_seconds=warm,process_seconds=time.perf_counter()-started,torch=torch.__version__,diffusers=metadata.version('diffusers'),device=str(torch.cuda.get_device_properties(0)),target=target.as_public_dict())\noutput.write_text(json.dumps(record,indent=2,default=str))\nprint('FINAL_PROBE',json.dumps(record,default=str),flush=True)\nassert available==cached\nif want=='healthy':\n    assert set(available)=={'math','flash','mem_efficient'}, available\n    assert not disabled\nelse:\n    assert available==('math',), available\n    assert set(disabled)=={'flash','mem_efficient'}, disabled\n    assert att.sdpa_math_only(target)\n\n# Check the final processor's prefill, masks and cache on the actual AMD device.\nfrom diffusers.models.transformers import transformer_qwenimage21 as qmod\nfrom core.inference.diffusion_qwenimage21_math import _processor_class\nfrom torch.nn.attention import sdpa_kernel, SDPBackend\nfrom diffusers.models.attention_dispatch import attention_backend\nwith torch.inference_mode(),sdpa_kernel([SDPBackend.MATH]),attention_backend('native'):\n    torch.manual_seed(7)\n    layer=qmod.QwenImage21Attention(dim=64,heads=2,dim_head=32).to(device='cuda',dtype=torch.bfloat16)\n    states=torch.randn(2,1800,64,device='cuda',dtype=torch.bfloat16)\n    stock=qmod.QwenImage21AttnProcessor()\n    bounded=_processor_class()()\n    mask=torch.ones(2,1800,device='cuda',dtype=torch.bool)\n    mask[1,580:600]=False\n    caches=[qmod.QwenImage21KVLayerCache(),qmod.QwenImage21KVLayerCache()]\n    kwargs=dict(segments=[(0,600,True),(600,1130,False)],key_valid=mask,kv_cache_mode='extract',cache_write_slice=slice(0,1130))\n    reference=stock(layer,states,layer_cache=caches[0],**kwargs)\n    actual=bounded(layer,states,layer_cache=caches[1],**kwargs)\n    torch.testing.assert_close(actual,reference,atol=.02,rtol=.02)\n    torch.testing.assert_close(caches[0].k,caches[1].k,atol=0,rtol=0)\n    torch.testing.assert_close(caches[0].v,caches[1].v,atol=0,rtol=0)\n    prefill_error=(actual.float()-reference.float()).abs().max().item()\n    decode=states[:,1130:]\n    kwargs=dict(kv_cache_mode='cached',attention_mask=mask[:,None,None,:])\n    reference=stock(layer,decode,layer_cache=caches[0],**kwargs)\n    actual=bounded(layer,decode,layer_cache=caches[1],**kwargs)\n    torch.testing.assert_close(actual,reference,atol=.02,rtol=.02)\n    record['processor_checks']=dict(prefill_max_abs=prefill_error,decode_max_abs=(actual.float()-reference.float()).abs().max().item(),kv_cache_exact=True)\noutput.write_text(json.dumps(record,indent=2,default=str))\nprint('PROCESSOR_CHECKS',json.dumps(record['processor_checks']),flush=True)\n",encoding='utf-8')
-        (root/'execute.py').write_text('import json, os, subprocess, sys, time\nfrom collections import deque\nfrom pathlib import Path\n\nroot=Path(os.environ[\'WORK_ROOT\'])\nout=root/\'out\'\nvariant,case,mode,*args=sys.argv[1:]\npy=str(root/(\'venv/Scripts/python.exe\' if sys.platform==\'win32\' else \'venv/bin/python\'))\ncode=root/(\'code\' if variant==\'base\' else variant)\nenv=dict(os.environ,PYTHONPATH=str(code/\'studio/backend\'))\nenv.pop(\'UNSLOTH_DIFFUSION_VAE_MAX_TILE\',None)\nenv.pop(\'UNSLOTH_ALLOW_ROCM_FUSED_SDPA\',None)\nif mode==\'generate\':\n    cmd=[py,\'-u\',str(root/\'generation_final.py\'),\'--case\',case,\'--output\',str(out),*args]\nelif mode==\'probe\':\n    cmd=[py,\'-u\',str(root/\'probe_final.py\'),args[0],str(out/(case+\'.json\'))]\nelif mode==\'damage\':\n    cmd=[py,\'-m\',\'pip\',\'uninstall\',\'-y\',\'amd-torch-device-gfx115x\']\nelif mode==\'repair\':\n    env[\'UNSLOTH_ROCM_GFX_ARCH\']=\'gfx1151\'\n    env[\'UNSLOTH_ROCM_TORCH_INSTALLED\']=\'1\'\n    snippet="import os,sys,time,json;from pathlib import Path;sys.path.insert(0,os.environ[\'WORK_ROOT\']+\'/pr1/studio\');import install_python_stack as s;s.VERBOSE=True;t=time.perf_counter();before=s._multiarch_device_pack_installed(\'gfx1151\');assert not before;"\n    if sys.platform==\'win32\':\n        snippet+="s._ensure_rocm_torch();"\n    else:\n        snippet+="import subprocess;subprocess.run([sys.executable,\'-m\',\'pip\',\'install\',\'--index-url\',\'https://repo.amd.com/rocm/whl-multi-arch/\',\'--extra-index-url\',\'https://pypi.org/simple\',\'torch[device-gfx1151]==2.11.0+rocm7.14.0\'],check=True);"\n    snippet+="assert s._multiarch_device_pack_installed(\'gfx1151\');record=dict(before=before,after=True,seconds=time.perf_counter()-t,automatic_windows=sys.platform==\'win32\');print(record);Path(os.environ[\'WORK_ROOT\']+\'/out/repair.json\').write_text(json.dumps(record))"\n    cmd=[py,\'-u\',\'-c\',snippet]\nelif mode==\'test\':\n    cmd=[py,\'-m\',\'pytest\',\'-q\',*args]\nelse: raise ValueError(mode)\nprint(\'RUN_CASE\',case,\'VARIANT\',variant,\'COMMAND\',cmd,flush=True)\nstart=time.time()\nwith (out/(case+\'.log\')).open(\'w\',encoding=\'utf-8\') as f:\n    child=subprocess.Popen(cmd,cwd=code,env=env,stdout=f,stderr=subprocess.STDOUT)\n    try: rc=child.wait(timeout=3600)\n    except subprocess.TimeoutExpired:\n        if sys.platform==\'win32\': subprocess.run([\'taskkill\',\'/PID\',str(child.pid),\'/T\',\'/F\'])\n        else: child.kill()\n        child.wait()\n        rc=124\nrecord=dict(case=case,variant=variant,returncode=rc,seconds=time.time()-start)\n(out/(case+\'-exit.json\')).write_text(json.dumps(record))\nprint(\'CASE_RESULT\',json.dumps(record),flush=True)\nwith (out/(case+\'.log\')).open(encoding=\'utf-8\',errors=\'replace\') as f: print(\'\'.join(deque(f,maxlen=45)),flush=True)\nsys.exit(rc)\n',encoding='utf-8')
+        (root/'execute.py').write_text('import json, os, subprocess, sys, time\nfrom collections import deque\nfrom pathlib import Path\n\nroot=Path(os.environ[\'WORK_ROOT\'])\nout=root/\'out\'\nvariant,case,mode,*args=sys.argv[1:]\npy=str(root/(\'venv/Scripts/python.exe\' if sys.platform==\'win32\' else \'venv/bin/python\'))\ncode=root/(\'code\' if variant==\'base\' else variant)\nenv=dict(os.environ,PYTHONPATH=str(code/\'studio/backend\'))\nenv.pop(\'UNSLOTH_DIFFUSION_VAE_MAX_TILE\',None)\nenv.pop(\'UNSLOTH_ALLOW_ROCM_FUSED_SDPA\',None)\nif mode==\'generate\':\n    cmd=[py,\'-u\',str(root/\'generation_final.py\'),\'--case\',case,\'--output\',str(out),*args]\nelif mode==\'probe\':\n    cmd=[py,\'-u\',str(root/\'probe_final.py\'),args[0],str(out/(case+\'.json\'))]\nelif mode==\'damage\':\n    cmd=[py,\'-m\',\'pip\',\'uninstall\',\'-y\',\'amd-torch-device-gfx115x\']\nelif mode==\'repair\':\n    env[\'UNSLOTH_ROCM_GFX_ARCH\']=\'gfx1151\'\n    env[\'UNSLOTH_ROCM_TORCH_INSTALLED\']=\'1\'\n    snippet="import os,sys,time,json;from pathlib import Path;sys.path.insert(0,os.environ[\'WORK_ROOT\']+\'/pr1/studio\');import install_python_stack as s;s.VERBOSE=True;t=time.perf_counter();before=s._multiarch_device_pack_installed(\'gfx1151\');assert not before;"\n    if sys.platform==\'win32\':\n        snippet+="s._ensure_rocm_torch();"\n        # Mirror the later Studio dependency phase of the real update. A Torch\n        # reinstall from AMD\'s index can replace shared Python dependencies.\n        snippet+="req=s.REQ_ROOT/\'studio.txt\';needs_deps=not s._skip_step(req,\'Unsloth Studio deps\',no_deps=False);print(\'STUDIO_DEPS_NEEDED\',needs_deps);s.pip_install(\'Installing Unsloth Studio dependencies\',\'--no-cache-dir\',req=req) if needs_deps else None;s._repair_bad_anyio();s._repair_bad_accelerate();"\n    else:\n        snippet+="import subprocess;subprocess.run([sys.executable,\'-m\',\'pip\',\'install\',\'--index-url\',\'https://repo.amd.com/rocm/whl-multi-arch/\',\'--extra-index-url\',\'https://pypi.org/simple\',\'torch[device-gfx1151]==2.11.0+rocm7.14.0\'],check=True);"\n    snippet+="assert s._multiarch_device_pack_installed(\'gfx1151\');record=dict(before=before,after=True,seconds=time.perf_counter()-t,automatic_windows=sys.platform==\'win32\');print(record);Path(os.environ[\'WORK_ROOT\']+\'/out/repair.json\').write_text(json.dumps(record))"\n    cmd=[py,\'-u\',\'-c\',snippet]\nelif mode==\'test\':\n    cmd=[py,\'-m\',\'pytest\',\'-q\',*args]\nelse: raise ValueError(mode)\nprint(\'RUN_CASE\',case,\'VARIANT\',variant,\'COMMAND\',cmd,flush=True)\nstart=time.time()\nwith (out/(case+\'.log\')).open(\'w\',encoding=\'utf-8\') as f:\n    child=subprocess.Popen(cmd,cwd=code,env=env,stdout=f,stderr=subprocess.STDOUT)\n    try: rc=child.wait(timeout=3600)\n    except subprocess.TimeoutExpired:\n        if sys.platform==\'win32\': subprocess.run([\'taskkill\',\'/PID\',str(child.pid),\'/T\',\'/F\'])\n        else: child.kill()\n        child.wait()\n        rc=124\nrecord=dict(case=case,variant=variant,returncode=rc,seconds=time.time()-start)\n(out/(case+\'-exit.json\')).write_text(json.dumps(record))\nprint(\'CASE_RESULT\',json.dumps(record),flush=True)\nwith (out/(case+\'.log\')).open(encoding=\'utf-8\',errors=\'replace\') as f: print(\'\'.join(deque(f,maxlen=45)),flush=True)\nsys.exit(rc)\n',encoding='utf-8')
       timeout-minutes: 30
       shell: python -X utf8 {0}
     - name: healthy-probe
@@ -159,111 +159,6 @@ jobs:
       continue-on-error: true
       timeout-minutes: 62
       shell: python -X utf8 {0}
-    - name: pr2-unit
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-unit','test','studio/backend/tests/test_qwen21_rocm_vae_budget.py'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: pr1-healthy1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-healthy1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr1-healthy1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-healthy1024-default25-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr1-healthy1024-default25*
-        retention-days: 14
-    - name: pr1-healthy1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-healthy1536','generate','--free-gib','19','--size','1536','--steps','4','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr1-healthy1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-healthy1536-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr1-healthy1536*
-        retention-days: 14
-    - name: base-resident1024
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'base','base-resident1024','generate','--placement','resident-tiled','--free-gib','19','--size','1024','--steps','4','--repeats','2'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence base-resident1024
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: base-resident1024-Windows
-        path: ${{ env.WORK_ROOT }}/out/base-resident1024*
-        retention-days: 14
-    - name: pr2-resident1024
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-resident1024','generate','--placement','resident-tiled','--free-gib','19','--size','1024','--steps','4','--repeats','2','--expect-tiles'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr2-resident1024
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-resident1024-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr2-resident1024*
-        retention-days: 14
-    - name: pr2-resident1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-resident1536','generate','--placement','resident-tiled','--free-gib','19','--size','1536','--steps','4','--repeats','2','--expect-tiles'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr2-resident1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-resident1536-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr2-resident1536*
-        retention-days: 14
-    - name: pr2-auto1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-auto1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr2-auto1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-auto1024-default25-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr2-auto1024-default25*
-        retention-days: 14
     - name: remove-family
       run: |
         import os,sys,subprocess
@@ -288,38 +183,6 @@ jobs:
       with:
         name: damaged-probe-Windows
         path: ${{ env.WORK_ROOT }}/out/damaged-probe*
-        retention-days: 14
-    - name: pr1-damaged1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-damaged1536','generate','--free-gib','19','--size','1536','--steps','4','--repeats','1','--expect-bounded'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr1-damaged1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-damaged1536-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr1-damaged1536*
-        retention-days: 14
-    - name: pr1-damaged1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-damaged1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1','--expect-bounded'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python -X utf8 {0}
-    - name: Evidence pr1-damaged1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-damaged1024-default25-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr1-damaged1024-default25*
         retention-days: 14
     - name: repair-family
       run: |
@@ -353,21 +216,37 @@ jobs:
         name: repaired-probe-Windows
         path: ${{ env.WORK_ROOT }}/out/repaired-probe*
         retention-days: 14
-    - name: pr1-repaired1024
+    - name: pr1-repaired1024-default25
       run: |
         import os,sys,subprocess
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-repaired1024','generate','--free-gib','19','--size','1024','--steps','4','--repeats','1'],check=True)
+        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-repaired1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1'],check=True)
       continue-on-error: true
       timeout-minutes: 62
       shell: python -X utf8 {0}
-    - name: Evidence pr1-repaired1024
+    - name: Evidence pr1-repaired1024-default25
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: pr1-repaired1024-Windows
-        path: ${{ env.WORK_ROOT }}/out/pr1-repaired1024*
+        name: pr1-repaired1024-default25-Windows
+        path: ${{ env.WORK_ROOT }}/out/pr1-repaired1024-default25*
+        retention-days: 14
+    - name: pr2-resident1536-default25
+      run: |
+        import os,sys,subprocess
+        from pathlib import Path
+        root=Path(os.environ['WORK_ROOT'])
+        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-resident1536-default25','generate','--placement','resident-tiled','--free-gib','19','--size','1536','--steps','25','--repeats','1','--expect-tiles'],check=True)
+      continue-on-error: true
+      timeout-minutes: 62
+      shell: python -X utf8 {0}
+    - name: Evidence pr2-resident1536-default25
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pr2-resident1536-default25-Windows
+        path: ${{ env.WORK_ROOT }}/out/pr2-resident1536-default25*
         retention-days: 14
     - name: All evidence
       uses: actions/upload-artifact@v4
@@ -381,7 +260,7 @@ jobs:
         import json,os
         from pathlib import Path
         root=Path(os.environ['WORK_ROOT'])/'out'
-        expected=['healthy-probe', 'pr1-unit', 'pr2-unit', 'pr1-healthy1024-default25', 'pr1-healthy1536', 'base-resident1024', 'pr2-resident1024', 'pr2-resident1536', 'pr2-auto1024-default25', 'remove-family', 'damaged-probe', 'pr1-damaged1536', 'pr1-damaged1024-default25', 'repair-family', 'repaired-probe', 'pr1-repaired1024']
+        expected=['healthy-probe', 'pr1-unit', 'remove-family', 'damaged-probe', 'repair-family', 'repaired-probe', 'pr1-repaired1024-default25', 'pr2-resident1536-default25']
         bad=[]
         for name in expected:
             p=root/(name+'-exit.json')
@@ -390,388 +269,3 @@ jobs:
         assert not bad,bad
       if: always()
       shell: python -X utf8 {0}
-  linux:
-    runs-on:
-    - self-hosted
-    - Linux
-    - strix-halo
-    - devlab-dispatch
-    timeout-minutes: 240
-    env:
-      STACK: multiarch-7.14.0
-      UNSLOTH_IS_PRESENT: '1'
-      PYTHONUNBUFFERED: '1'
-      PYTHONUTF8: '1'
-      HF_ENDPOINT: https://huggingface.co
-      HF_HUB_DISABLE_XET: '1'
-      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
-      HF_HUB_DISABLE_TELEMETRY: '1'
-      HF_HUB_DOWNLOAD_TIMEOUT: '120'
-      OMP_NUM_THREADS: '8'
-    steps:
-    - name: Prepare and verify exact PR source trees
-      run: |2+
-
-        import os,sys,subprocess,platform
-        from pathlib import Path
-        root=Path(os.environ['RUNNER_TEMP'])/'rocm-final-validation'
-        for name in ['out','tmp','cache/huggingface','cache/torch','cache/pip','studio','miopen/db','miopen/kernels']:
-          (root/name).mkdir(parents=True,exist_ok=True)
-        env={'WORK_ROOT':str(root),'TMPDIR':str(root/'tmp'),'TEMP':str(root/'tmp'),'TMP':str(root/'tmp'),'HF_HOME':str(root/'cache/huggingface'),'HUGGINGFACE_HUB_CACHE':str(root/'cache/huggingface/hub'),'TORCH_HOME':str(root/'cache/torch'),'PIP_CACHE_DIR':str(root/'cache/pip'),'UNSLOTH_HOME':str(root/'unsloth'),'UNSLOTH_STUDIO_HOME':str(root/'unsloth/studio'),'PYTHONPATH':str(root/'pr1/studio/backend'),'MIOPEN_USER_DB_PATH':str(root/'miopen/db'),'MIOPEN_CUSTOM_CACHE_DIR':str(root/'miopen/kernels')}
-        os.environ.update(env)
-        with open(os.environ['GITHUB_ENV'],'a') as f:
-          for k,v in env.items(): f.write(k+'='+v+'\n')
-        def run(cmd,**kw):
-            print('RUN',cmd,flush=True)
-            attempts=3 if cmd[0]=='git' and ('fetch' in cmd or 'checkout' in cmd) else 1
-            for attempt in range(attempts):
-                try:
-                    return subprocess.run(cmd,check=True,timeout=180 if attempts>1 else None,**kw)
-                except (subprocess.CalledProcessError,subprocess.TimeoutExpired):
-                    if attempt+1==attempts: raise
-                    import time
-                    print('Retrying source download',attempt+1,flush=True)
-                    time.sleep(5)
-        with (root/'out/host.txt').open('w') as f:
-          f.write(platform.platform()+'\n')
-          if sys.platform=='win32': subprocess.run(['powershell','-NoProfile','-Command','Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion; Get-CimInstance Win32_OperatingSystem | Format-List Caption,TotalVisibleMemorySize'],stdout=f,stderr=subprocess.STDOUT)
-          else: subprocess.run(['bash','-c','uname -a; lscpu; free -h; df -h'],stdout=f,stderr=subprocess.STDOUT)
-        run(['git','init',str(root/'code')]); run(['git','-C',str(root/'code'),'config','core.autocrlf','false'])
-        run(['git','-C',str(root/'code'),'remote','add','origin','https://github.com/unslothai/unsloth.git'])
-        run(['git','-C',str(root/'code'),'fetch','--depth=1','--filter=blob:none','origin','264eec55213d97ec84df6117c66774971af27442'])
-        run(['git','-C',str(root/'code'),'sparse-checkout','set','--no-cone',*['/*', '!/*/', '/studio/', '!/studio/*/', '/studio/backend/', '/unsloth/', '/tests/']])
-        run(['git','-C',str(root/'code'),'checkout','--detach','FETCH_HEAD'])
-
-        import base64, zlib, json
-        payload = {'pr1': {'commit': '2fb0d5775517ad6f146a0197646582d2492c0d6a', 'tree': '23f0250439459176d01cc85d47a319dee9f6756e', 'patch': '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'}, 'pr2': {'commit': 'ec5080a056134e4fc96a603ca22180abbedfab04', 'tree': '547f40ec90d25336dbbbf9098e52f3dc408d3e5a', 'patch': 'eJylVlFv2zYQfvevOHgvUizJtuI4aYYUzdKsCJYm3ZIOBYqCoCXKJiKJGknbcYb9991Rku20Tpp1AmwJ5N3x7r6775jKLIMwnEoLvG/sPJWqP+HJnSjTfqK06MsyE1qUieinKDo3UpVswQWzMpflNKpWMPkxvY4sU3EPg3RyMEoGo+woikQyyQZHw1cHAxgOBuPRqBOG4Y/61en1ej/s25s3EMaHh8EYevQavgJcSUWGv0SlTlKwyTydCuuh5jGclqsAHtzbh/A1XFcWrfL8syztl+MO0KP5Ek7AUyYS5UJqVUak/v70E7u9uDxn51d/+qA0dLt+ZKyWlefXejIj1UiaVCJOng+8TAHterjqw2sYNPbdGcLOdbnZ3duDuNOjnZ/gdiYg53oqdEj+Q6JElslEitIamIhcLWGJeYFCcDPXIgVVwtnHt6fuvDmipcMKl2ViW4u/L0UZXhR8KsI4GjbJQf1C6RVp/3F9VhwDtzA87GMO38lfIJeFtCaA0eB+NAhgPLrfj+mA1uSr8f3BGFWsKCp06/r6PbqWIWoYWqIWQiNCsJR2BvsxqVIkJmq1byzXlg60M/oTxmIYWa4wrY07mEo7E5oESsqWXpFBXALDCwF0gpEPqEWGW7OoK3BjBZJijRBlEPdVjrmzsI0f8AkaAIO6uTOlZSoMWpcGKoXyq8ZTWVQKHbVKJ7NOr1nLwKu/6HmIUrGQiYjsqhJwcgLdZJ7y7kaAQMH6wUxpz9mJnOuqDKA7k1U3gCtVCv+xAhmjgvUjxkqMlzFn+nRuFfYDgqd/uyRQHabxsDnOP95YaQrMRXx5ent+dXuztxfXBYjJ3CpFFrgcBoBnAJsKVVC23ekbIYJMJXdOklxxWB3DVGMxqjJfUSUrqFMRZlq01fVzXWyEnZpbUJmDkOe5SjhmAxKeEKQWV1whd9JniI7qxLh/9hcGHw+ZVknhKKHu8Z009xKtTimWkFFsBXVGw2oN862fKBqORTJOjkajQ0d5fQy4X87zfDeJvehkorBBMIDeMDg4RPrq9DDXH95+Ci8xlaUR4UWKjS8zKTDfp+8+XIb70SCknJPkmapWWk5nFuJBPKa+NyjtkvyxNLnC/ju9gIsyibDLeIEtgRXvFAyQrF6INIIbxKt1/vLi7Pzq5jxqj6Kyz7QqXE2atiNu8J2LKyxNU/FEkFCzU60o4LUWEXm0JvJWfRefAzewcIquTbAYa1NRraO0uUOu7brNrk9ynd6bRiST91ju6MaG+7VXqPJOrCpuk1nbGVtL2Lc58ru3sNE2NQRIPNKQOyfwK89N25nbmubZdu4eRsNRt1HD8NCQa+enuzcAzw/g7398b6MVsXmNH1siN63bkgbTcBwgqQYwHD8pbqhZWd2sKFeLPeD3V7h5dcfu2KjprGEz9M7MuFvwhjQM8PAARwD9/GcStLCYDkZ0wAo5wThzXkxSDns8wIl3tzxGczE2FpprzTS8hSHhnH4McsH1XVRxzSkTyP1e12CsaPUzOUTeDOOjL35dBK7rXLvdCVEZ14AuIYZxy7A/WDs+meMyr6kajBSNtvVSu4FhN7v1Ko45JEuJc4mXU+HF27xbNzZqYF3tvoSgwW22N9iElqSTmVKmljYeOVG7EjQmfaJdj3Dfj/3vJUbR7GQIxozSU4OIUCTVnF71LrrSfZStermJ1DBEgsuSUiU14ynHm9JiHccW2gGsU7c59vkE4gjdiG6G5lYaX95uW9NT5DsMY8jHT47rer/VNmJL0tn5Tu9+27lrTRzcdANjLJpXKbdumq/XtoRrgnAq9eKmIJ4uH7xM7sc0zl0ZrAFs7zq1SnuvYe6ag7xQmp2wPQ/VV0DsZMzueM13L/IecRmPvnXf9SGr7w1YfTggeM6kYVU7qP6/+y9lpYNhvMVJm6BqF80M51GGV5Z1RHhvLJV1tfjf8lDD+C9UgW0h'}}
-        manifest = {}
-        for variant, item in payload.items():
-            folder = root/variant
-            run(['git','-C',str(root/'code'),'worktree','add','--detach','--no-checkout',str(folder),'264eec55213d97ec84df6117c66774971af27442'])
-            run(['git','-C',str(folder),'sparse-checkout','set','--no-cone',*['/*', '!/*/', '/studio/', '!/studio/*/', '/studio/backend/', '/unsloth/', '/tests/']])
-            run(['git','-C',str(folder),'checkout','--detach','264eec55213d97ec84df6117c66774971af27442'])
-            patch = root/(variant+'.patch')
-            patch.write_bytes(zlib.decompress(base64.b64decode(item['patch'])))
-            run(['git','-C',str(folder),'apply','--index',str(patch)])
-            tree = subprocess.check_output(['git','-C',str(folder),'write-tree'],text=True).strip()
-            assert tree == item['tree'], (variant,tree,item['tree'])
-            manifest[variant] = dict(commit=item['commit'],tree=tree)
-        (root/'out/source-manifest.json').write_text(json.dumps(manifest,indent=2))
-
-      timeout-minutes: 20
-      shell: python3 -X utf8 {0}
-    - name: Source evidence
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: source-Linux
-        path: ${{ env.WORK_ROOT }}/out
-        retention-days: 14
-    - name: Install AMD Torch device extras
-      run: |
-        import os,sys,subprocess,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))
-        c=root/'torch-constraints.txt'
-        def run(cmd,**kw):
-            print('RUN',cmd,flush=True)
-            return subprocess.run(cmd,check=True,**kw)
-        run([sys.executable,'-m','venv',str(root/'venv')])
-        py=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))
-        run([py,'-m','pip','install','--upgrade','pip'])
-        stack=os.environ['STACK']
-        if stack=='multiarch-7.14.0':
-          specs=['torch[device-gfx1151]==2.11.0+rocm7.14.0','torchvision[device-gfx1151]==0.26.0+rocm7.14.0','torchaudio==2.11.0+rocm7.14.0']
-          idx='https://repo.amd.com/rocm/whl-multi-arch/'
-          cons=['torch==2.11.0+rocm7.14.0','torchvision==0.26.0+rocm7.14.0','torchaudio==2.11.0+rocm7.14.0']
-        else:
-          specs=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']
-          idx='https://repo.amd.com/rocm/whl/gfx1151/'
-          cons=['torch==2.11.0+rocm7.13.0','torchvision==0.26.0+rocm7.13.0']
-        run([py,'-m','pip','install','--index-url',idx,'--extra-index-url','https://pypi.org/simple',*specs])
-        c=root/'torch-constraints.txt'; c.write_text('\n'.join(cons)+'\n')
-      timeout-minutes: 30
-      shell: python3 -X utf8 {0}
-    - name: Install Studio dependencies and validation harness
-      run: |
-        import os,sys,subprocess,time
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        py=str(root/('venv/Scripts/python.exe' if sys.platform=='win32' else 'venv/bin/python'))
-        c=root/'torch-constraints.txt'
-        def run(cmd,**kw):
-            print('RUN',cmd,flush=True)
-            return subprocess.run(cmd,check=True,**kw)
-        rq=root/'code/studio/backend/requirements'
-        run([py,'-m','pip','install','-c',str(c),'-r',str(rq/'studio.txt'),'-r',str(rq/'diffusers-pin.txt')])
-        run([py,'-m','pip','install','-c',str(c),'-r',str(rq/'diffusers-main.txt')])
-        run([py,'-m','pip','install','-c',str(c),'transformers==5.5.0','accelerate>=1.0','peft>=0.18','sentencepiece','psutil','protobuf','scipy','einops','Pillow','pyyaml','safetensors','tyro','msgspec','wheel','pytest','httpx'])
-        run([py,'-m','pip','install','--no-deps','unsloth-zoo>=2026.9.9'])
-        run([py,'-m','pip','install','--no-deps',str(root/'code')])
-        run([py,'-m','pip','install','--no-deps','torchao==0.17.0'])
-        with (root/'out/pip-freeze.txt').open('w') as f: run([py,'-m','pip','freeze'],stdout=f)
-        run([py,'-c',"import main, torch; print(torch.__version__, torch.version.hip, torch.cuda.get_device_properties(0)); x=torch.randn((256,256),device='cuda',dtype=torch.bfloat16); print((x@x).sum().item()); from core.inference.diffusion import DiffusionBackend; from diffusers import QwenImage21Pipeline; print('IMPORTS PASSED')"])
-
-
-        (root/'generation_final.py').write_text('"""Studio\'s own DiffusionBackend: Qwen-Image-2.1 GGUF Q4_K_M, Auto, optionally under a simulated 20 GB discrete card."""\nimport argparse\nimport json\nimport os\nimport sys\nimport threading\nimport time\nimport traceback\nfrom pathlib import Path\n\np = argparse.ArgumentParser()\np.add_argument("--placement", choices=["auto","auto-tiled","resident","resident-tiled","model"], default="auto")\np.add_argument("--query-chunking", default="auto")\np.add_argument("--case", required=True)\np.add_argument("--output", required=True)\np.add_argument("--free-gib", type=float, default=0)\np.add_argument("--te", default="auto")\np.add_argument("--steps", type=int, default=4)\np.add_argument("--repeats", type=int, default=2)\np.add_argument("--size", type=int, default=1024)\np.add_argument("--serialize", action="store_true")\np.add_argument("--disable-fused-sdpa", action="store_true")\np.add_argument("--memory-mode", default="auto")\np.add_argument("--env", action="append", default=[])\np.add_argument("--expect-bounded", action="store_true")\np.add_argument("--expect-tiles", action="store_true")\nargs = p.parse_args()\nout = Path(args.output)\nout.mkdir(parents=True, exist_ok=True)\nlock = threading.Lock()\n\n\ndef emit(event, **fields):\n    line = json.dumps(dict(event=event, case=args.case, t=time.time(), **fields), default=str)\n    with lock:\n        print("PROBE " + line, flush=True)\n        with (out / (args.case + ".jsonl")).open("a", encoding="utf-8") as f:\n            f.write(line + "\\n")\n\n\nfor kv in args.env:\n    k, _, v = kv.partition("=")\n    os.environ[k] = v\nif args.serialize:\n    os.environ["AMD_SERIALIZE_KERNEL"] = "1"\n    os.environ["HIP_LAUNCH_BLOCKING"] = "1"\n    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"\nos.environ["UNSLOTH_QWEN_IMAGE_ROCM_QUERY_CHUNKING"] = args.query_chunking\nos.environ["UNSLOTH_DIFFUSION_COND_CACHE_DIR"] = str(out / (args.case + "-conditioning"))\nimport main as studio_main  # Studio\'s own startup env (AOTriton opt-in, etc.)\n\nimport torch\nimport psutil\n\nemit("env", main=studio_main.__file__, torch=torch.__version__, hip=torch.version.hip,\n     props=str(torch.cuda.get_device_properties(0)),\n     env={k: os.environ.get(k) for k in ("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "MIOPEN_SEARCH_CUTOFF",\n                                         "AMD_SERIALIZE_KERNEL", "PYTORCH_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")},\n     sdp=dict(flash=torch.backends.cuda.flash_sdp_enabled(), mem=torch.backends.cuda.mem_efficient_sdp_enabled(),\n              math=torch.backends.cuda.math_sdp_enabled()),\n     blas=str(torch.backends.cuda.preferred_blas_library()))\nif args.disable_fused_sdpa:\n    torch.backends.cuda.enable_flash_sdp(False)\n    torch.backends.cuda.enable_mem_efficient_sdp(False)\nfrom utils.hardware import ensure_hardware_detected\n\nensure_hardware_detected()\nemit("after_hw_detect", env={k: os.environ.get(k) for k in ("MIOPEN_SEARCH_CUTOFF", "MIOPEN_FIND_MODE")})\nfrom core.inference import diffusion as d\nfrom core.inference import diffusion_memory as dm\nfrom core.inference.diffusion_attention import available_sdpa_kernels\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\n\ntarget = resolve_diffusion_device_target()\nemit("target", target=target.as_public_dict())\nprops = torch.cuda.get_device_properties(0)\nif args.free_gib:\n    cap = int(args.free_gib * 2**30)\n    torch.cuda.set_per_process_memory_fraction(cap / props.total_memory, 0)\n\n    real_memory_info = torch.cuda.mem_get_info\n    def capped_memory_info(device=None):\n        physical_free, _ = real_memory_info(device)\n        return min(physical_free, max(0, cap - torch.cuda.memory_reserved(device))), 20 * 2**30\n    torch.cuda.mem_get_info = capped_memory_info\n    def virtual_memory(backend):\n        free, total = capped_memory_info()\n        return free // 2**20, total // 2**20, "discrete_vram"\n\n    dm._cuda_memory = virtual_memory\n    emit("synthetic_capacity", total_gib=20, free_gib=args.free_gib)\nfrom dataclasses import replace\norig_plan = d.plan_diffusion_memory\n\n\ndef record_plan(**kw):\n    plan = orig_plan(**kw)\n    if args.placement == "auto-tiled":\n        plan = replace(plan, vae_tiling=True)\n    elif args.placement in ("resident", "resident-tiled"):\n        plan = replace(plan, offload_policy="none", stream_text_encoders=False, stream_transformer=False,\n                       vae_tiling=args.placement.endswith("tiled"), resident_transformer_mib=None,\n                       resident_text_encoder_mib=None, reasons=("experimental forced resident placement",))\n    elif args.placement == "model":\n        plan = replace(plan, offload_policy="model", vae_tiling=True, stream_text_encoders=False,\n                       stream_transformer=False, resident_transformer_mib=None, resident_text_encoder_mib=None,\n                       reasons=("experimental whole-component placement",))\n    emit("plan", plan=plan.as_public_dict())\n    return plan\n\n\nd.plan_diffusion_memory = record_plan\nproc = psutil.Process()\n\n\ndef mem():\n    return dict(alloc=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved(),\n                peak=torch.cuda.max_memory_allocated(), rss=proc.memory_info().rss)\n\n\nbackend = d.DiffusionBackend()\ntry:\n    t0 = time.perf_counter()\n    backend.begin_load("unsloth/Qwen-Image-2.1-GGUF", gguf_filename="qwen-image-2.1-Q4_K_M.gguf",\n                       family_override="qwen-image-2.1", memory_mode=args.memory_mode,\n                       **({} if args.te == "auto" else {"text_encoder_quant": args.te}))\n    deadline = time.monotonic() + 3000\n    while True:\n        pr = backend.load_progress()\n        if pr.get("error"):\n            raise RuntimeError(pr["error"])\n        if pr.get("phase") == "ready":\n            break\n        if time.monotonic() > deadline:\n            raise TimeoutError("load > 50 min")\n        time.sleep(10)\n    emit("loaded", seconds=time.perf_counter() - t0, status=backend.status(), mem=mem())\n    import functools\n    pipe = backend._state.pipe\n    from core.inference import diffusion_attention as attention\n    processors = [type(m.processor).__name__ for m in pipe.transformer.modules() if hasattr(m,"processor")]\n    emit("attention_state", processors=sorted(set(processors)), flash=torch.backends.cuda.flash_sdp_enabled(), mem=torch.backends.cuda.mem_efficient_sdp_enabled(), math=torch.backends.cuda.math_sdp_enabled())\n    if args.expect_bounded:\n        from core.inference.diffusion_qwenimage21_math import bounded_math_attention\n        assert bounded_math_attention(pipe), processors\n        assert not torch.backends.cuda.flash_sdp_enabled()\n        assert not torch.backends.cuda.mem_efficient_sdp_enabled()\n    assert not os.environ.get("UNSLOTH_DIFFUSION_VAE_MAX_TILE"), "tile override must be absent"\n    phase_rows = []\n    tile_rows = []\n    from core.inference import diffusion_vae_tiling as vt\n    original_decode_tile = vt._decode_tile\n    def measured_decode_tile(vae, z):\n        row = dict(shape=list(z.shape), ok=False)\n        tile_rows.append(row)\n        try:\n            result = original_decode_tile(vae, z)\n            row["ok"] = True\n            return result\n        except Exception as exc:\n            row["error"] = type(exc).__name__\n            raise\n    vt._decode_tile = measured_decode_tile\n    def instrument(obj, method, phase):\n        if method == "forward":\n            pending = []\n            def before_forward(module, call_args):\n                torch.cuda.synchronize()\n                torch.cuda.reset_peak_memory_stats()\n                pending.append((time.perf_counter(), mem()))\n            def after_forward(module, call_args, output):\n                if not pending:\n                    return\n                began, before = pending.pop()\n                torch.cuda.synchronize()\n                row = dict(phase=phase, seconds=time.perf_counter()-began, before=before, after=mem())\n                phase_rows.append(row)\n                emit("phase", **row)\n            obj.register_forward_pre_hook(before_forward)\n            obj.register_forward_hook(after_forward, always_call=True)\n            return\n        original = getattr(obj, method)\n        @functools.wraps(original)\n        def measured(*a, **kw):\n            torch.cuda.synchronize()\n            torch.cuda.reset_peak_memory_stats()\n            before = mem()\n            began = time.perf_counter()\n            try:\n                return original(*a, **kw)\n            finally:\n                torch.cuda.synchronize()\n                row = dict(phase=phase, seconds=time.perf_counter()-began,\n                           before=before, after=mem())\n                phase_rows.append(row)\n                emit("phase", **row)\n        setattr(obj, method, measured)\n    instrument(pipe, "encode_prompt", "encode")\n    instrument(pipe.transformer, "forward", "denoise")\n    instrument(pipe.vae, "decode", "decode")\n    emit("placement", policy=backend._state.offload_policy, tiling=getattr(pipe.vae,"use_tiling",None),\n         components={name:dict(device=str(next(module.parameters()).device),\n                              bytes=sum(p.numel()*p.element_size() for p in module.parameters()))\n                     for name,module in pipe.components.items() if isinstance(module,torch.nn.Module)})\n    prompts = ["A red ceramic teapot on a wooden table beside a window, soft daylight, photograph.",\n               "A blue ceramic teapot on a wooden table beside a window, soft daylight, photograph.",\n               "A chalkboard menu that reads FRESH COFFEE 2.50 in a small cafe."]\n    for i in range(args.repeats):\n        phase_rows.clear()\n        tile_rows.clear()\n        t1 = time.perf_counter()\n        res = backend.generate(prompt=prompts[i % len(prompts)], width=args.size, height=args.size,\n                               steps=args.steps, guidance=1.0, seed=42)\n        torch.cuda.synchronize()\n        for j, im in enumerate(res["images"]):\n            im.save(out / f"{args.case}-{i}-{j}.png")\n        emit("render", tiles=tile_rows, last_decode_tile=getattr(pipe.vae,"_unsloth_last_decode_tile",None), index=i, seconds=time.perf_counter() - t1, mem=mem(), status=backend.status(),\n             phase_seconds={ph:sum(r["seconds"] for r in phase_rows if r["phase"]==ph) for ph in ("encode","denoise","decode")},\n             peak_allocated=max([r["after"]["peak"] for r in phase_rows] or [torch.cuda.max_memory_allocated()]))\n        if args.expect_tiles:\n            assert tile_rows, "tiled decoder was not exercised"\n            assert all(row["ok"] for row in tile_rows), tile_rows\n            assert all(max(row["shape"][-2:]) <= 32 for row in tile_rows), tile_rows\n            assert tuple(pipe.vae._unsloth_last_decode_tile[:2]) == (32,32)\n        import numpy as np\n        for im in res["images"]:\n            pixels=np.asarray(im)\n            assert pixels.shape[:2] == (args.size,args.size)\n            assert pixels.std() > 1, "blank image"\n    emit("complete", success=True)\nexcept Exception as exc:  # noqa: BLE001\n    emit("failure", error=repr(exc)[:2000], traceback=traceback.format_exc()[-8000:], mem=None)\n    raise\nfinally:\n    try:\n        backend.unload()\n    except Exception:  # noqa: BLE001\n        pass\n',encoding='utf-8')
-        (root/'probe_final.py').write_text("import json, sys, time\nfrom pathlib import Path\nstarted=time.perf_counter()\nimport main\nimport torch\nfrom utils.hardware import ensure_hardware_detected\nensure_hardware_detected()\nfrom core.inference.diffusion_device import resolve_diffusion_device_target\nfrom core.inference import diffusion_attention as att\nfrom importlib import metadata\n\ntarget=resolve_diffusion_device_target()\nwant=sys.argv[1]\noutput=Path(sys.argv[2])\nt0=time.perf_counter()\navailable=att.available_sdpa_kernels(target)\ncold=time.perf_counter()-t0\nt0=time.perf_counter()\ncached=att.available_sdpa_kernels(target)\nwarm=time.perf_counter()-t0\ndisabled=att.guard_rocm_fused_sdpa(target)\nrecord=dict(want=want,available=available,cached=cached,disabled=disabled,cold_probe_seconds=cold,cached_probe_seconds=warm,process_seconds=time.perf_counter()-started,torch=torch.__version__,diffusers=metadata.version('diffusers'),device=str(torch.cuda.get_device_properties(0)),target=target.as_public_dict())\noutput.write_text(json.dumps(record,indent=2,default=str))\nprint('FINAL_PROBE',json.dumps(record,default=str),flush=True)\nassert available==cached\nif want=='healthy':\n    assert set(available)=={'math','flash','mem_efficient'}, available\n    assert not disabled\nelse:\n    assert available==('math',), available\n    assert set(disabled)=={'flash','mem_efficient'}, disabled\n    assert att.sdpa_math_only(target)\n\n# Check the final processor's prefill, masks and cache on the actual AMD device.\nfrom diffusers.models.transformers import transformer_qwenimage21 as qmod\nfrom core.inference.diffusion_qwenimage21_math import _processor_class\nfrom torch.nn.attention import sdpa_kernel, SDPBackend\nfrom diffusers.models.attention_dispatch import attention_backend\nwith torch.inference_mode(),sdpa_kernel([SDPBackend.MATH]),attention_backend('native'):\n    torch.manual_seed(7)\n    layer=qmod.QwenImage21Attention(dim=64,heads=2,dim_head=32).to(device='cuda',dtype=torch.bfloat16)\n    states=torch.randn(2,1800,64,device='cuda',dtype=torch.bfloat16)\n    stock=qmod.QwenImage21AttnProcessor()\n    bounded=_processor_class()()\n    mask=torch.ones(2,1800,device='cuda',dtype=torch.bool)\n    mask[1,580:600]=False\n    caches=[qmod.QwenImage21KVLayerCache(),qmod.QwenImage21KVLayerCache()]\n    kwargs=dict(segments=[(0,600,True),(600,1130,False)],key_valid=mask,kv_cache_mode='extract',cache_write_slice=slice(0,1130))\n    reference=stock(layer,states,layer_cache=caches[0],**kwargs)\n    actual=bounded(layer,states,layer_cache=caches[1],**kwargs)\n    torch.testing.assert_close(actual,reference,atol=.02,rtol=.02)\n    torch.testing.assert_close(caches[0].k,caches[1].k,atol=0,rtol=0)\n    torch.testing.assert_close(caches[0].v,caches[1].v,atol=0,rtol=0)\n    prefill_error=(actual.float()-reference.float()).abs().max().item()\n    decode=states[:,1130:]\n    kwargs=dict(kv_cache_mode='cached',attention_mask=mask[:,None,None,:])\n    reference=stock(layer,decode,layer_cache=caches[0],**kwargs)\n    actual=bounded(layer,decode,layer_cache=caches[1],**kwargs)\n    torch.testing.assert_close(actual,reference,atol=.02,rtol=.02)\n    record['processor_checks']=dict(prefill_max_abs=prefill_error,decode_max_abs=(actual.float()-reference.float()).abs().max().item(),kv_cache_exact=True)\noutput.write_text(json.dumps(record,indent=2,default=str))\nprint('PROCESSOR_CHECKS',json.dumps(record['processor_checks']),flush=True)\n",encoding='utf-8')
-        (root/'execute.py').write_text('import json, os, subprocess, sys, time\nfrom collections import deque\nfrom pathlib import Path\n\nroot=Path(os.environ[\'WORK_ROOT\'])\nout=root/\'out\'\nvariant,case,mode,*args=sys.argv[1:]\npy=str(root/(\'venv/Scripts/python.exe\' if sys.platform==\'win32\' else \'venv/bin/python\'))\ncode=root/(\'code\' if variant==\'base\' else variant)\nenv=dict(os.environ,PYTHONPATH=str(code/\'studio/backend\'))\nenv.pop(\'UNSLOTH_DIFFUSION_VAE_MAX_TILE\',None)\nenv.pop(\'UNSLOTH_ALLOW_ROCM_FUSED_SDPA\',None)\nif mode==\'generate\':\n    cmd=[py,\'-u\',str(root/\'generation_final.py\'),\'--case\',case,\'--output\',str(out),*args]\nelif mode==\'probe\':\n    cmd=[py,\'-u\',str(root/\'probe_final.py\'),args[0],str(out/(case+\'.json\'))]\nelif mode==\'damage\':\n    cmd=[py,\'-m\',\'pip\',\'uninstall\',\'-y\',\'amd-torch-device-gfx115x\']\nelif mode==\'repair\':\n    env[\'UNSLOTH_ROCM_GFX_ARCH\']=\'gfx1151\'\n    env[\'UNSLOTH_ROCM_TORCH_INSTALLED\']=\'1\'\n    snippet="import os,sys,time,json;from pathlib import Path;sys.path.insert(0,os.environ[\'WORK_ROOT\']+\'/pr1/studio\');import install_python_stack as s;s.VERBOSE=True;t=time.perf_counter();before=s._multiarch_device_pack_installed(\'gfx1151\');assert not before;"\n    if sys.platform==\'win32\':\n        snippet+="s._ensure_rocm_torch();"\n    else:\n        snippet+="import subprocess;subprocess.run([sys.executable,\'-m\',\'pip\',\'install\',\'--index-url\',\'https://repo.amd.com/rocm/whl-multi-arch/\',\'--extra-index-url\',\'https://pypi.org/simple\',\'torch[device-gfx1151]==2.11.0+rocm7.14.0\'],check=True);"\n    snippet+="assert s._multiarch_device_pack_installed(\'gfx1151\');record=dict(before=before,after=True,seconds=time.perf_counter()-t,automatic_windows=sys.platform==\'win32\');print(record);Path(os.environ[\'WORK_ROOT\']+\'/out/repair.json\').write_text(json.dumps(record))"\n    cmd=[py,\'-u\',\'-c\',snippet]\nelif mode==\'test\':\n    cmd=[py,\'-m\',\'pytest\',\'-q\',*args]\nelse: raise ValueError(mode)\nprint(\'RUN_CASE\',case,\'VARIANT\',variant,\'COMMAND\',cmd,flush=True)\nstart=time.time()\nwith (out/(case+\'.log\')).open(\'w\',encoding=\'utf-8\') as f:\n    child=subprocess.Popen(cmd,cwd=code,env=env,stdout=f,stderr=subprocess.STDOUT)\n    try: rc=child.wait(timeout=3600)\n    except subprocess.TimeoutExpired:\n        if sys.platform==\'win32\': subprocess.run([\'taskkill\',\'/PID\',str(child.pid),\'/T\',\'/F\'])\n        else: child.kill()\n        child.wait()\n        rc=124\nrecord=dict(case=case,variant=variant,returncode=rc,seconds=time.time()-start)\n(out/(case+\'-exit.json\')).write_text(json.dumps(record))\nprint(\'CASE_RESULT\',json.dumps(record),flush=True)\nwith (out/(case+\'.log\')).open(encoding=\'utf-8\',errors=\'replace\') as f: print(\'\'.join(deque(f,maxlen=45)),flush=True)\nsys.exit(rc)\n',encoding='utf-8')
-      timeout-minutes: 30
-      shell: python3 -X utf8 {0}
-    - name: healthy-probe
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','healthy-probe','probe','healthy'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence healthy-probe
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: healthy-probe-Linux
-        path: ${{ env.WORK_ROOT }}/out/healthy-probe*
-        retention-days: 14
-    - name: pr1-unit
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-unit','test','studio/backend/tests/test_rocm_attention_recovery.py','studio/backend/tests/test_diffusion_qwenimage21_math.py','tests/studio/install/test_rocm_device_extra_integrity.py'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: pr2-unit
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-unit','test','studio/backend/tests/test_qwen21_rocm_vae_budget.py'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: pr1-healthy1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-healthy1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr1-healthy1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-healthy1024-default25-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr1-healthy1024-default25*
-        retention-days: 14
-    - name: pr1-healthy1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-healthy1536','generate','--free-gib','19','--size','1536','--steps','4','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr1-healthy1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-healthy1536-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr1-healthy1536*
-        retention-days: 14
-    - name: base-resident1024
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'base','base-resident1024','generate','--placement','resident-tiled','--free-gib','19','--size','1024','--steps','4','--repeats','2'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence base-resident1024
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: base-resident1024-Linux
-        path: ${{ env.WORK_ROOT }}/out/base-resident1024*
-        retention-days: 14
-    - name: pr2-resident1024
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-resident1024','generate','--placement','resident-tiled','--free-gib','19','--size','1024','--steps','4','--repeats','2','--expect-tiles'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr2-resident1024
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-resident1024-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr2-resident1024*
-        retention-days: 14
-    - name: pr2-resident1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-resident1536','generate','--placement','resident-tiled','--free-gib','19','--size','1536','--steps','4','--repeats','2','--expect-tiles'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr2-resident1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-resident1536-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr2-resident1536*
-        retention-days: 14
-    - name: pr2-auto1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr2','pr2-auto1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr2-auto1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr2-auto1024-default25-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr2-auto1024-default25*
-        retention-days: 14
-    - name: remove-family
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','remove-family','damage'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: damaged-probe
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','damaged-probe','probe','damaged'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence damaged-probe
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: damaged-probe-Linux
-        path: ${{ env.WORK_ROOT }}/out/damaged-probe*
-        retention-days: 14
-    - name: pr1-damaged1536
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-damaged1536','generate','--free-gib','19','--size','1536','--steps','4','--repeats','1','--expect-bounded'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr1-damaged1536
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-damaged1536-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr1-damaged1536*
-        retention-days: 14
-    - name: pr1-damaged1024-default25
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-damaged1024-default25','generate','--free-gib','19','--size','1024','--steps','25','--repeats','1','--expect-bounded'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr1-damaged1024-default25
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-damaged1024-default25-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr1-damaged1024-default25*
-        retention-days: 14
-    - name: repair-family
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','repair-family','repair'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence repair-family
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: repair-family-Linux
-        path: ${{ env.WORK_ROOT }}/out/repair-family*
-        retention-days: 14
-    - name: repaired-probe
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','repaired-probe','probe','healthy'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence repaired-probe
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: repaired-probe-Linux
-        path: ${{ env.WORK_ROOT }}/out/repaired-probe*
-        retention-days: 14
-    - name: pr1-repaired1024
-      run: |
-        import os,sys,subprocess
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])
-        subprocess.run([sys.executable,str(root/'execute.py'),'pr1','pr1-repaired1024','generate','--free-gib','19','--size','1024','--steps','4','--repeats','1'],check=True)
-      continue-on-error: true
-      timeout-minutes: 62
-      shell: python3 -X utf8 {0}
-    - name: Evidence pr1-repaired1024
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: pr1-repaired1024-Linux
-        path: ${{ env.WORK_ROOT }}/out/pr1-repaired1024*
-        retention-days: 14
-    - name: All evidence
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: rocm-final-Linux
-        path: ${{ env.WORK_ROOT }}/out
-        retention-days: 14
-    - name: Require all validation cases to pass
-      run: |
-        import json,os
-        from pathlib import Path
-        root=Path(os.environ['WORK_ROOT'])/'out'
-        expected=['healthy-probe', 'pr1-unit', 'pr2-unit', 'pr1-healthy1024-default25', 'pr1-healthy1536', 'base-resident1024', 'pr2-resident1024', 'pr2-resident1536', 'pr2-auto1024-default25', 'remove-family', 'damaged-probe', 'pr1-damaged1536', 'pr1-damaged1024-default25', 'repair-family', 'repaired-probe', 'pr1-repaired1024']
-        bad=[]
-        for name in expected:
-            p=root/(name+'-exit.json')
-            if not p.exists() or json.loads(p.read_text())['returncode']!=0: bad.append(name)
-        print('FINAL_CASES',len(expected),'FAILED',bad,flush=True)
-        assert not bad,bad
-      if: always()
-      shell: python3 -X utf8 {0}
