@@ -13,17 +13,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "pr19-hip"
+          - name: "pr18-hip-bisect"
             backend: "hip"
-            base: "5f222b8"
-            head: "338079e"
-            tbo: "ROPE_PE_PERMUTE,RMS_NORM,CONV_2D_DW,FLASH_ATTN_EXT"
+            base: ""
+            head: ""
+            tbo: ""
             tbo_env: ""
-            h3: "1"
-            h3_envs: "alloff:SD_H3_FAST_SAGE_QKV=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_H3_AUDIO_DIRECT_DW=0;dw0:SD_H3_AUDIO_DIRECT_DW=0"
-            zimg: "1024x1024:--vae-tiling 1008x1008:--vae-tiling"
+            h3: ""
+            h3_envs: ""
+            zimg: ""
             head_cmake: ""
             src_repo: ""
+            script: "bisect.sh"
+            variants: "a:ca92d95:all b:ca92d95:2:5f222b8 c:ca92d95:3:5f222b8 d:ca92d95:4:5f222b8 e:5f222b8:1 f:5f222b8:all"
+            steps: "2"
+            reps: "2"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -41,7 +45,10 @@ jobs:
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
           SRC_REPO: ${{ matrix.src_repo }}
-        run: bash "$H/ci/run.sh"
+          VARIANTS: ${{ matrix.variants }}
+          STEPS: ${{ matrix.steps }}
+          REPS: ${{ matrix.reps }}
+        run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

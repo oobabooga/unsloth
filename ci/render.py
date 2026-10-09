@@ -1,8 +1,9 @@
 # Render .github/workflows/sdrev.yml from ci/jobs.json (static matrices, DevLab runners only).
 import json
 jobs = json.load(open("ci/jobs.json"))
+[j.setdefault('script','run.sh') for j in jobs]
 lin = [j for j in jobs if j.get("os") != "windows"]; win = [j for j in jobs if j.get("os") == "windows"]
-keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo"]
+keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo","script","variants","steps","reps"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
 out = """name: sd.cpp PR A/B on AMD
@@ -40,7 +41,10 @@ if lin:
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
           SRC_REPO: ${{ matrix.src_repo }}
-        run: bash "$H/ci/run.sh"
+          VARIANTS: ${{ matrix.variants }}
+          STEPS: ${{ matrix.steps }}
+          REPS: ${{ matrix.reps }}
+        run: bash "$H/ci/${{ matrix.script }}"
       - name: Upload
         if: always() && env.ART != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
