@@ -2,7 +2,7 @@
 import json
 jobs = json.load(open("ci/jobs.json"))
 lin = [j for j in jobs if j.get("os") != "windows"]; win = [j for j in jobs if j.get("os") == "windows"]
-keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake"]
+keys = ["name","backend","base","head","tbo","tbo_env","h3","h3_envs","zimg","head_cmake","src_repo"]
 def mat(js):
     return "\n".join("          - " + "\n            ".join(f"{k}: {json.dumps(str(j.get(k,'')))}" for k in keys) for j in js)
 out = """name: sd.cpp PR A/B on AMD
@@ -39,6 +39,7 @@ if lin:
           H3_HEAD_ENVS: ${{ matrix.h3_envs }}
           ZIMG: ${{ matrix.zimg }}
           HEAD_CMAKE: ${{ matrix.head_cmake }}
+          SRC_REPO: ${{ matrix.src_repo }}
         run: bash "$H/ci/run.sh"
       - name: Upload
         if: always() && env.ART != ''
