@@ -103,7 +103,9 @@ $M = "$W\models"
 function H3Args($name) { @("-M","vid_gen","--diffusion-model","$M\minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf","--vae","$M\vae\minimax_h3_video_vae_fp16.safetensors","--audio-vae","$M\vae\minimax_h3_audio_vae_fp32.safetensors","--llm","$M\qwen3vl_32b_minimax_h3-Q2_K_M.gguf","-p","A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong.","--cfg-scale","1.0","-W","640","-H","384","--video-frames","56","--steps","4","--seed","42","--rng","cpu","--fps","24","--diffusion-fa","--offload-to-cpu","--max-vram","-1","-v","-o","$W\runs\$name\f_%03d.png") }
 if ($env:H3 -eq "1") {
   WaitModels
-  foreach ($a in @(@("base1","base"),@("head1","head"),@("base2","base"),@("head2","head"))) { RunSd $a[0] $bin[$a[1]] @() (H3Args $a[0]) }
+  if ($env:H3_WARMUP -eq "1") { RunSd "warm" $bin.base @() (H3Args "warm") }
+  $reps = if ($env:H3_AB_REPS) { [int]$env:H3_AB_REPS } else { 2 }
+  for ($r = 1; $r -le $reps; $r++) { RunSd "base$r" $bin.base @() (H3Args "base$r"); RunSd "head$r" $bin.head @() (H3Args "head$r") }
   Log ("cmp base1 base2: " + (& $py "$CI\compare.py" "$W\runs\base1" "$W\runs\base2"))
   Log ("cmp head1 head2: " + (& $py "$CI\compare.py" "$W\runs\head1" "$W\runs\head2"))
   Log ("cmp base1 head1: " + (& $py "$CI\compare.py" "$W\runs\base1" "$W\runs\head1"))

@@ -1,6 +1,13 @@
 [
  {
-  "name": "pr20-cuda-leg2",
-  "leg_file": "ci/pr20_leg.yml"
+  "name": "stack-windows-speed",
+  "os": "windows",
+  "base": "6321a69",
+  "head": "1957123",
+  "h3": "1",
+  "h3_warmup": "1",
+  "h3_ab_reps": "3",
+  "h3_envs": "",
+  "zimg": ""
  }
 ]
