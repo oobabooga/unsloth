@@ -1,11 +1,22 @@
 [
  {
-  "name": "pr21-hip-cap",
+  "name": "integ-hip",
   "backend": "hip",
   "base": "6321a69",
-  "head": "ee5829c",
-  "h3": "",
-  "zimg": "1008x1008:--offload-to-cpu",
-  "zimg_cap": "6.5:1008x1008:--offload-to-cpu 7.5:1008x1008:--offload-to-cpu 9:1008x1008:--offload-to-cpu"
+  "head": "beb28d6",
+  "src_repo": "oobabooga",
+  "h3": "1",
+  "h3_envs": "",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
+ },
+ {
+  "name": "integ-vulkan",
+  "backend": "vulkan",
+  "base": "6321a69",
+  "head": "beb28d6",
+  "src_repo": "oobabooga",
+  "h3": "1",
+  "h3_envs": "",
+  "zimg": "1024x1024:--vae-tiling 1008x1008:--vae-tiling 496x496:--vae-tiling"
  }
 ]
