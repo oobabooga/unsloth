@@ -1,43 +1,63 @@
 diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
-index a8e8bc2bc8..b0a7b39d87 100644
+index a8e8bc2bc8..b73808a132 100644
 --- a/studio/backend/core/inference/npu_backend.py
 +++ b/studio/backend/core/inference/npu_backend.py
-@@ -238,6 +238,7 @@ class LemonadeNpuBackend:
+@@ -45,6 +45,7 @@ PROVIDER_TYPE = "lemonade"
+ DEFAULT_CONTEXT_LENGTH = 8192
+ # Names the lemond install whose NPU passed `flm validate`, so a restart needs no new Enable.
+ _VALIDATED_MARKER = "npu_validated.json"
++_ENABLING_STATES = frozenset({"installing", "starting", "installing_flm", "validating"})
+ 
+ # Model modes Unsloth's chat cannot serve: embeddings and transcription have no chat endpoint,
+ # and a single-turn ("flash") model answers only the first message of a conversation.
+@@ -238,6 +239,7 @@ class LemonadeNpuBackend:
          self._validation: Optional[dict[str, Any]] = None
          self._state = "idle"
          self._error: Optional[str] = None
-+        self._flm_version_cache: Optional[tuple[tuple[str, int, int], str]] = None
++        self._flm_version_cache: Optional[tuple[tuple[str, int, int], Optional[str]]] = None
  
      @property
      def root(self) -> Path:
-@@ -336,6 +337,39 @@ class LemonadeNpuBackend:
+@@ -312,8 +314,8 @@ class LemonadeNpuBackend:
+         validated = self._validated_install()
+         return binary is None and isinstance(validated, str) and bool(validated)
+ 
+-    def _flm_version(self) -> Optional[str]:
+-        binary = self._flm_binary()
++    def _flm_version(self, binary: Optional[Path] = None) -> Optional[str]:
++        binary = binary or self._flm_binary()
+         if binary is None:
+             return None
+         env = child_env_without_native_path_secret()
+@@ -336,16 +338,51 @@ class LemonadeNpuBackend:
              return None
          return str(version).lstrip("v") if version else None
  
 +    def _installed_flm_version(self) -> Optional[str]:
 +        """``flm version`` of the installed binary, rerun only when that binary changes."""
 +        binary = self._flm_binary()
++        if binary is None:
++            return None
 +        try:
-+            stat = binary.stat() if binary is not None else None
++            stat = binary.stat()
 +        except OSError:
-+            stat = None
-+        if stat is None:
 +            return None
 +        key = (str(binary), stat.st_mtime_ns, stat.st_size)
 +        cached = self._flm_version_cache
 +        if cached is not None and cached[0] == key:
 +            return cached[1]
-+        version = self._flm_version()
-+        if version:
-+            self._flm_version_cache = (key, version)
++        # A failure is kept too: a binary that cannot answer is not rerun on every status read.
++        version = self._flm_version(binary)
++        self._flm_version_cache = (key, version)
 +        return version
 +
-+    def _versions(self, binary: Optional[Path]) -> dict[str, Optional[str]]:
++    def _versions(
++        self, binary: Optional[Path], validated: Optional[str]
++    ) -> dict[str, Optional[str]]:
 +        """Installed runtime versions. A pending upgrade reports the ones it will replace."""
 +        # Running flm while Enable replaces it could block the update on Windows.
-+        if self._state not in ("idle", "ready", "failed"):
++        if self._state in _ENABLING_STATES:
 +            return {"lemonade": None, "fastflowlm": None}
-+        validated = self._validated_install()
 +        lemond = binary or (Path(validated) if isinstance(validated, str) and validated else None)
 +        lemonade = None
 +        if lemond is not None:
@@ -50,16 +70,28 @@ index a8e8bc2bc8..b0a7b39d87 100644
      def status(self) -> dict[str, Any]:
          hardware = self.hardware()
          binary = self._installed_lemond()
-@@ -363,6 +397,7 @@ class LemonadeNpuBackend:
++        validated = self._validated_install()
+         # An enabled NPU stays enabled across a pin change: its first use upgrades the runtime.
+         upgrade_pending = self._state == "idle" and self._upgrade_pending(binary)
+         installed = binary is not None or upgrade_pending
+         ready = (
+             self._state == "ready"
+             or upgrade_pending
+-            or (self._state == "idle" and installed and self._validated_install() == str(binary))
++            or (self._state == "idle" and installed and validated == str(binary))
+         )
+         running = self._server is not None and self._server.is_alive()
+         resident = self.resident()
+@@ -363,6 +400,7 @@ class LemonadeNpuBackend:
              "loaded_model": resident.model.model_path if resident else None,
              "context_length": resident.context_length if resident else None,
              "loading_model": self._loading,
-+            "versions": self._versions(binary),
++            "versions": self._versions(binary, validated),
          }
  
      def _server_for(self, binary: Path) -> LemonadeServer:
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
-index 6d0605791e..550d410b21 100644
+index 6d0605791e..cb24938ac9 100644
 --- a/studio/backend/tests/test_npu_backend.py
 +++ b/studio/backend/tests/test_npu_backend.py
 @@ -507,6 +507,33 @@ def test_an_enabled_npu_upgrades_on_first_use_after_the_pins_move(npu, monkeypat
@@ -70,7 +102,7 @@ index 6d0605791e..550d410b21 100644
 +    monkeypatch.setenv("FAKE_FLM_VERSION", "v1.0.7")
 +    npu.installer.installed_version = lambda lemond: "2026.41.1"
 +    real, runs = npu._flm_version, []
-+    monkeypatch.setattr(npu, "_flm_version", lambda: runs.append(1) or real())
++    monkeypatch.setattr(npu, "_flm_version", lambda *args: runs.append(1) or real(*args))
 +    npu.enable()
 +    assert npu.status()["versions"] == {"lemonade": "2026.41.1", "fastflowlm": "1.0.7"}
 +    npu.status()
@@ -97,7 +129,7 @@ index 6d0605791e..550d410b21 100644
      restarted = _move_the_pins(npu, monkeypatch)
      try:
 diff --git a/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
-index 30e9fd0264..ddb6a5de98 100644
+index 30e9fd0264..cb9cd225da 100644
 --- a/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
 +++ b/studio/frontend/src/features/hub/catalog/npu-catalog-list.tsx
 @@ -6,6 +6,7 @@ import { Spinner } from "@/components/ui/spinner";
@@ -108,14 +140,12 @@ index 30e9fd0264..ddb6a5de98 100644
    NpuSetupNotice,
    npuDownloadLabel,
    npuResumeLabel,
-@@ -71,6 +72,11 @@ export function NpuCatalogList({
+@@ -71,6 +72,9 @@ export function NpuCatalogList({
        className="mx-auto flex min-h-0 w-full max-w-[var(--hub-measure)] flex-1 flex-col gap-0.5 overflow-y-auto px-3 py-3"
      >
        {body()}
 +      {catalog.ready ? (
-+        <div className="px-3 pt-3">
-+          <NpuPoweredBy status={catalog.status} />
-+        </div>
++        <NpuPoweredBy status={catalog.status} className="px-3 pt-3" />
 +      ) : null}
      </div>
    );
@@ -147,18 +177,21 @@ index f298794e5a..0c7263e398 100644
    type NpuCatalog,
    type NpuPickerSource,
 diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
-index 64c9054116..ed00350162 100644
+index 64c9054116..c0ebfbff71 100644
 --- a/studio/frontend/src/features/npu/npu-setup-notice.tsx
 +++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
-@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
+@@ -3,8 +3,10 @@
+ 
+ import { Button } from "@/components/ui/button";
  import { Spinner } from "@/components/ui/spinner";
++import { cn } from "@/lib/utils";
  import { AlertCircleIcon } from "@hugeicons/core-free-icons";
  import { HugeiconsIcon } from "@hugeicons/react";
 +import type { NpuStatus } from "./api";
  import type { NpuCatalog } from "./use-npu-catalog";
  
  export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
-@@ -61,27 +62,40 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
+@@ -61,27 +63,46 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
            <Spinner className="size-3.5 text-muted-foreground" />
          </div>
        ) : null}
@@ -192,11 +225,17 @@ index 64c9054116..ed00350162 100644
 +  value ? ` v${value}` : "";
 +
 +/** Credits the runtimes and names their installed versions, so a pin bump is visible. */
-+export function NpuPoweredBy({ status }: { status: NpuStatus }) {
++export function NpuPoweredBy({
++  status,
++  className,
++}: {
++  status: NpuStatus;
++  className?: string;
++}) {
 +  return (
 +    <p
 +      data-testid="npu-powered-by"
-+      className="text-ui-11 text-muted-foreground"
++      className={cn("text-ui-11 text-muted-foreground", className)}
 +    >
 +      Powered by{" "}
 +      <a
@@ -244,20 +283,44 @@ index deda0609b0..5d0c33b625 100644
        (running) => {
          for (const { model, percent } of running) {
 diff --git a/studio/install_lemonade_prebuilt.py b/studio/install_lemonade_prebuilt.py
-index d7125fc070..a9c56894c6 100644
+index d7125fc070..f524b9d872 100644
 --- a/studio/install_lemonade_prebuilt.py
 +++ b/studio/install_lemonade_prebuilt.py
-@@ -92,6 +92,16 @@ def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
+@@ -71,6 +71,14 @@ def install_dir(root: Path, pins: Optional[dict] = None) -> Path:
+     return Path(root) / pins["lemonade"]["version"]
+ 
+ 
++def _read_marker(directory: Path) -> Optional[dict]:
++    try:
++        marker = json.loads((directory / MARKER_NAME).read_text(encoding = "utf-8"))
++    except (OSError, ValueError):
++        return None
++    return marker if isinstance(marker, dict) else None
++
++
+ def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
+     """The lemond binary of a complete install matching the pin, else None."""
+     pins = pins or load_pins()
+@@ -78,9 +86,8 @@ def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
+     if key is None:
+         return None
+     target = install_dir(root, pins)
+-    try:
+-        marker = json.loads((target / MARKER_NAME).read_text(encoding = "utf-8"))
+-    except (OSError, ValueError):
++    marker = _read_marker(target)
++    if marker is None:
+         return None
+     asset = pins["lemonade"]["assets"][key]
+     if marker.get("sha256") != asset["sha256"] or marker.get("asset") != asset["name"]:
+@@ -92,6 +99,13 @@ def installed_lemond(root: Path, pins: Optional[dict] = None) -> Optional[Path]:
      return binary if binary.is_file() else None
  
  
 +def installed_version(lemond: Path) -> Optional[str]:
 +    """The Lemonade version recorded beside an installed lemond, or None."""
-+    try:
-+        marker = json.loads((Path(lemond).parent / MARKER_NAME).read_text(encoding = "utf-8"))
-+    except (OSError, ValueError):
-+        return None
-+    version = marker.get("version") if isinstance(marker, dict) else None
++    marker = _read_marker(lemond.parent)
++    version = marker.get("version") if marker else None
 +    return str(version) if version else None
 +
 +
