@@ -1,26 +1,35 @@
 [
  {
-  "name": "ref-hip",
-  "backend": "hip",
-  "zimg": "1008x1008:--vae-tiling",
-  "zimg_cap": "6.6:1024x1024: 6.9:1024x1024: 3.2:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6 2.4:1008x1008:-i,@W@/runs/z_1008x1008_vaetiling_base/out.png,--strength,0.6",
-  "base": "4a98feb",
-  "head": "8a48526",
-  "src_repo": "oobabooga",
+  "name": "ref-vulkan-s7",
+  "backend": "vulkan",
   "h3": "1",
   "h3_refcpu": "1",
   "h3_steps": "2",
-  "h3_ab_reps": "1"
+  "h3_ab_reps": "1",
+  "h3_seed": "7",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga"
  },
  {
-  "name": "ref-vulkan",
+  "name": "ref-vulkan-s1234",
   "backend": "vulkan",
-  "base": "4a98feb",
-  "head": "8a48526",
-  "src_repo": "oobabooga",
   "h3": "1",
   "h3_refcpu": "1",
   "h3_steps": "2",
-  "h3_ab_reps": "1"
+  "h3_ab_reps": "1",
+  "h3_seed": "1234",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga"
+ },
+ {
+  "name": "cap-hip",
+  "backend": "hip",
+  "zimg_cap": "9:1536x1536: 10:1536x1536: 12:1536x1536:",
+  "zimg": "1536x1536:--vae-tiling",
+  "base": "4a98feb",
+  "head": "8a48526",
+  "src_repo": "oobabooga"
  }
 ]
