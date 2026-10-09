@@ -125,6 +125,8 @@ def stop(proc):
 
 
 def variant(label, checkout, port, *extra):
+    # The desktop app's login secret, which the driver signs in with.
+    run([str(py), "-m", "unsloth_cli", "studio", "provision-desktop-auth"], cwd = WORK)
     proc = boot(checkout, port)
     try:
         code = run(
