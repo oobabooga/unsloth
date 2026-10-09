@@ -105,7 +105,7 @@ h3() { # name tree [env...]
   /usr/bin/time -f "WALL %e s MAXRSS %M KB" env "$@" "$W/$tree/build/bin/sd-cli" -M vid_gen --diffusion-model "$M/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" \
     --vae "$M/vae/minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M/vae/minimax_h3_audio_vae_fp32.safetensors" \
     --llm "$M/qwen3vl_32b_minimax_h3-Q2_K_M.gguf" -p "A red fox trots through fresh snow in a pine forest at sunrise, breath steaming, soft crunching footsteps and distant birdsong." \
-    --cfg-scale 1.0 -W 640 -H 384 --video-frames 56 --steps 4 --seed 42 --rng cpu --fps 24 --diffusion-fa --offload-to-cpu -v \
+    --cfg-scale 1.0 -W 640 -H 384 --video-frames 56 --steps 4 --seed 42 --rng cpu --fps 24 --diffusion-fa --offload-to-cpu --max-vram -1 -v \
     -o "$W/runs/$name/f_%03d.png" > "$W/runs/$name.log" 2>&1
   local rc=$?
   log "h3 $name rc=$rc $(grep WALL "$W/runs/$name.log") | $(times "$W/runs/$name.log")"
