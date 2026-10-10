@@ -69,9 +69,7 @@ jobs:
     # GPUs, so serialising all of them costs throughput for nothing; the labels
     # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
     # raises W101 if a step here touches GPU memory without a group.
-    concurrency:
-      group: amd-ci-strix-halo-windows-gpu
-      cancel-in-progress: false
+    # No group: the four Windows boxes are separate machines, and this job checks function, not timing.
     defaults:
       run:
         shell: powershell
