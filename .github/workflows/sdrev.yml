@@ -21,7 +21,7 @@ jobs:
             tbo_env: ""
             h3: ""
             h3_envs: ""
-            zimg: ""
+            zimg: "496x496"
             head_cmake: ""
             src_repo: "oobabooga"
             script: "run.sh"
