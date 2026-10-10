@@ -18,13 +18,15 @@ permissions:
 env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   BASE_SHA: "e0a92903052b4d556fc82299c5fe182125e71bfa"
+  HF_HUB_ETAG_TIMEOUT: "60"
+  HF_HUB_DOWNLOAD_TIMEOUT: "120"
 
 jobs:
 
   linux:
     name: "9897 GGUF image gen on Linux gfx1151 (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 180
+    timeout-minutes: 300
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -71,7 +73,7 @@ jobs:
             --out "$AMD_CI_WORK/out/host.json"
 
       - name: Arms
-        timeout-minutes: 90
+        timeout-minutes: 150
         run: |
           set +e
           export HF_HOME="$AMD_CI_WORK/hf"
@@ -105,7 +107,7 @@ jobs:
   windows:
     name: "9897 GGUF image gen on Windows gfx1151"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 180
+    timeout-minutes: 300
     concurrency:
       group: amd-ci-strix-halo-windows-gpu
       cancel-in-progress: false
@@ -179,7 +181,7 @@ jobs:
           exit 0
 
       - name: Arms
-        timeout-minutes: 90
+        timeout-minutes: 150
         run: |
           $ErrorActionPreference = "Continue"
           $env:HF_HOME = "$env:AMD_CI_WORK\hf"

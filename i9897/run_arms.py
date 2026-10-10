@@ -23,8 +23,9 @@ def main() -> int:
     ap.add_argument("--broken-cc", required = True)
     ap.add_argument("--out", required = True)
     ap.add_argument("--scratch", required = True)
-    ap.add_argument("--arms", default = "base_healthy,head_healthy,base_broken_cc,head_broken_cc")
+    ap.add_argument("--arms", default = "base_healthy,head_healthy,base_injected,head_injected")
     ap.add_argument("--steps", default = "4")
+    ap.add_argument("--probe-arg", action = "append", default = [])
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok = True)
     probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gguf_gen_probe.py")
@@ -33,8 +34,11 @@ def main() -> int:
         tree = args.base_tree if arm.startswith("base") else args.head_tree
         env = dict(os.environ)
         env.pop("CC", None)
+        # torch defaults error_on_custom_op_aliasing to bool($CI): a CI runner turns a user-side warning into an error.
+        env.pop("CI", None)
         if arm.endswith("broken_cc"):
             env["CC"] = args.broken_cc
+        extra = ["--inject-inductor-driver-failure"] if arm.endswith("injected") else []
         for name in ("triton", "inductor", "ucc"):
             d = os.path.join(args.scratch, f"{name}_{arm}")
             shutil.rmtree(d, ignore_errors = True)
@@ -54,6 +58,8 @@ def main() -> int:
                     "--out", out_json,
                     "--image-out", os.path.join(args.out, f"{arm}.png"),
                     "--steps", args.steps,
+                    *args.probe_arg,
+                    *extra,
                 ],
                 env = env,
                 stdout = fh,
@@ -67,7 +73,7 @@ def main() -> int:
         keep = (
             "generate_ok", "generate_error_type", "compiled_dequant_installed",
             "torch_compile_runtime_available", "crt_headers_reachable", "toolchain",
-            "torch", "hip", "triton", "device", "load_s", "generate_s", "setup_error",
+            "injected", "torch", "hip", "triton", "device", "load_s", "generate_s", "setup_error",
         )
         summary[arm] = {"rc": rc, "wall_s": round(time.time() - t0, 1), **{k: res.get(k) for k in keep}}
         print(arm, json.dumps(summary[arm]), flush = True)

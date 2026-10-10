@@ -25,6 +25,9 @@ def main() -> int:
     ap.add_argument("--steps", type = int, default = 2)
     ap.add_argument("--size", type = int, default = 512)
     ap.add_argument("--image-out", default = None)
+    # Raise where #9897's traceback did (inductor codegen asking Triton for its backend hash) while leaving every
+    # directly launched Triton kernel working: isolates the compiled GGUF dequant on hosts whose torch uses Triton eagerly.
+    ap.add_argument("--inject-inductor-driver-failure", action = "store_true")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.abspath(args.backend_dir))
@@ -67,6 +70,15 @@ def main() -> int:
             res["crt_headers_reachable"] = _msvc_env.crt_headers_reachable()
             res["toolchain"] = _msvc_env._toolchain_summary()
 
+        if args.inject_inductor_driver_failure:
+            import subprocess
+            import torch.utils._triton as tu
+
+            def _fail(*a, **k):
+                raise subprocess.CalledProcessError(1, ["clang-cl.exe", "hip_utils.c"])
+
+            tu.triton_hash_with_backend = _fail
+            res["injected"] = "torch.utils._triton.triton_hash_with_backend"
         from core.inference.diffusion import get_diffusion_backend
         from core.inference import diffusion_gguf_compile
 
@@ -105,10 +117,10 @@ def main() -> int:
             res["generate_ok"] = False
             res["generate_error_type"] = type(exc).__name__
             res["generate_error"] = str(exc)[:1500]
-            res["generate_tb_tail"] = traceback.format_exc()[-3000:]
+            res["generate_tb_tail"] = traceback.format_exc()[-12000:]
     except Exception as exc:  # noqa: BLE001
         res["setup_error"] = f"{type(exc).__name__}: {exc}"[:1500]
-        res["setup_tb_tail"] = traceback.format_exc()[-3000:]
+        res["setup_tb_tail"] = traceback.format_exc()[-12000:]
     res["log_records"] = records[-40:]
     with open(args.out, "w", encoding = "utf-8") as fh:
         json.dump(res, fh, indent = 1, default = str)
