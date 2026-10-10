@@ -73,15 +73,17 @@ def host_facts() -> dict:
 class _Load:
     """The fields of a load request validate_load reads."""
 
-    def __init__(self, precision: str, gpu_ids = None):
+    def __init__(self, precision: str, model: str = MODEL, gpu_ids = None):
         self.gpu_ids = gpu_ids
+        self.model_path = model
+        self.gguf_variant = None
         self.engine_precision = precision
         self.engine_parallelism = "tensor"
 
 
-def gpus(managed_engine, precision: str = "auto"):
+def gpus(managed_engine, precision: str = "auto", model: str = MODEL):
     # The physical GPUs Studio itself would launch on: inside the parent's visible set.
-    return managed_engine.validate_load("vllm", _Load(precision))
+    return managed_engine.validate_load("vllm", _Load(precision, model))
 
 
 def generate(managed_engine, engine_install, precision: str, model: str = MODEL) -> dict:
@@ -89,7 +91,7 @@ def generate(managed_engine, engine_install, precision: str, model: str = MODEL)
     engine = managed_engine.ManagedEngine("vllm")
     t0 = time.monotonic()
     try:
-        gpu_ids = gpus(managed_engine, precision)
+        gpu_ids = gpus(managed_engine, precision, model)
         out["gpu_ids"] = gpu_ids
         engine.start(model, 2048, gpu_ids, dict(os.environ), None, {"precision": precision})
         out["load_s"] = round(time.monotonic() - t0, 1)
