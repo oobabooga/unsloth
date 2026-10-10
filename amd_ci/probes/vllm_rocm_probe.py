@@ -70,12 +70,28 @@ def host_facts() -> dict:
     return facts
 
 
+class _Load:
+    """The fields of a load request validate_load reads."""
+
+    def __init__(self, precision: str, gpu_ids = None):
+        self.gpu_ids = gpu_ids
+        self.engine_precision = precision
+        self.engine_parallelism = "tensor"
+
+
+def gpus(managed_engine, precision: str = "auto"):
+    # The physical GPUs Studio itself would launch on: inside the parent's visible set.
+    return managed_engine.validate_load("vllm", _Load(precision))
+
+
 def generate(managed_engine, engine_install, precision: str, model: str = MODEL) -> dict:
     out = {"precision": precision, "model": model}
     engine = managed_engine.ManagedEngine("vllm")
     t0 = time.monotonic()
     try:
-        engine.start(model, 2048, [0], dict(os.environ), None, {"precision": precision})
+        gpu_ids = gpus(managed_engine, precision)
+        out["gpu_ids"] = gpu_ids
+        engine.start(model, 2048, gpu_ids, dict(os.environ), None, {"precision": precision})
         out["load_s"] = round(time.monotonic() - t0, 1)
         t1 = time.monotonic()
         stats: dict = {}
@@ -168,12 +184,8 @@ def main() -> int:
                 generate(managed_engine, engine_install, "auto", model) for model in CHECKPOINTS
             ]
             # 4-bit load-time conversion is refused on AMD before anything is unloaded.
-            class _Req:
-                gpu_ids = [0]
-                engine_precision = "int4"
-                engine_parallelism = "tensor"
             try:
-                managed_engine.validate_load("vllm", _Req())
+                managed_engine.validate_load("vllm", _Load("int4"))
                 obs["int4_refusal"] = None
             except Exception as e:  # noqa: BLE001
                 obs["int4_refusal"] = f"{type(e).__name__}: {e}"
