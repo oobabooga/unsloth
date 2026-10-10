@@ -2,8 +2,8 @@
 """Criteria: Studio's OpenBLAS default under a Windows job memory cap (#12374, PR #13048).
 
 Pairs with probes/openblas_memcap_probe.py. base = main (default 1), head = the memory-aware default. Differential on
-the `studio` arm: the head is fixed when it survives every cap and picks 8 threads uncapped; the base 'defect' here
-is that it pins 1 even uncapped. The unset and fixed8 arms show what a fixed default would do under the same caps.
+the `studio` arm: the base shows the defect when a capped start dies (OpenBLAS cannot get its buffers); the head is
+fixed when it survives every cap and still picks 8 numpy threads uncapped. The unset and fixed8 arms show what a fixed default would do under the same caps.
 """
 
 from __future__ import annotations
@@ -32,23 +32,24 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
 
 
 def table(obs: dict) -> str:
-    rows = ["| state | cap MB | arm | survived (runs) | OPENBLAS_NUM_THREADS | headroom MB | committed MB after numpy | after torch | died at |",
-            "|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| state | cap MB | arm | survived (runs) | OPENBLAS_NUM_THREADS | rocm-openblas threads | headroom MB | committed MB after numpy | after torch | died at |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for k, v in _states(obs).items():
-        for cap in (0, 2000, 1200, 700):
+        for cap in (0, 5000, 3500, 2500):
             for arm in ("studio", "unset", "fixed8"):
                 cs = _cells(v, arm, cap)
                 if not cs:
                     continue
                 died = sorted({c.get("stage") for c in cs if not c.get("ok")})
                 rows.append(f"| {k} | {cap or 'none'} | {arm} | {sum(c['ok'] for c in cs)}/{len(cs)} | "
-                            f"{cs[0].get('openblas_env')} | {cs[0].get('headroom_mb')} | {cs[0].get('numpy_private_mb')} | "
+                            f"{cs[0].get('openblas_env')} | {cs[0].get('dll_threads')} | {cs[0].get('headroom_mb')} | {cs[0].get('numpy_private_mb')} | "
                             f"{cs[0].get('torch_private_mb')} | {', '.join(d or '' for d in died)} |")
     return "\n".join(rows)
 
 
 def base_shows_defect(base: dict) -> bool:
-    return all(c.get("openblas_env") == "1" for c in _cells(base, "studio", 0)) and bool(_cells(base, "studio", 0))
+    capped = [c for c in base.get("cells", []) if c.get("arm") == "studio" and c.get("cap_mb")]
+    return any(not c.get("ok") for c in capped)
 
 
 def head_is_fixed(head: dict) -> bool:

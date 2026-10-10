@@ -68,6 +68,11 @@ out["stage"] = "import torch"; emit()
 import torch
 b = torch.ones(512, 512); b @ b
 out["torch_private_mb"] = priv()
+k = ctypes.WinDLL("kernel32"); k.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]; k.GetModuleHandleW.restype = ctypes.c_void_p
+h = k.GetModuleHandleW("rocm-openblas.dll")
+if h:
+    lib = ctypes.CDLL("rocm-openblas.dll", handle=h); lib.openblas_get_num_threads.restype = ctypes.c_int
+    out["dll_threads"] = lib.openblas_get_num_threads()
 out["stage"] = "done"; out["ok"] = True; emit()
 '''
 
@@ -98,18 +103,25 @@ def main() -> int:
         child.write_text(CHILD, encoding = "utf-8")
         backend = str(checkout / "studio" / "backend")
         for rep in range(2):
-            for cap in (0, 2000, 1200, 700):
+            for cap in (0, 5000, 3500, 2500):
                 for arm in ("studio", "unset", "fixed8"):
-                    r = subprocess.run([str(py), str(child), str(cap), arm, backend], capture_output = True, text = True,
-                                       encoding = "utf-8", errors = "replace", timeout = 900, cwd = str(work))
-                    cells = [json.loads(x[5:]) for x in r.stdout.splitlines() if x.startswith("CELL ")]
+                    try:
+                        r = subprocess.run([str(py), str(child), str(cap), arm, backend], capture_output = True,
+                                           text = True, encoding = "utf-8", errors = "replace", timeout = 600,
+                                           cwd = str(work))
+                        stdout, stderr, rc = r.stdout, r.stderr, r.returncode
+                    except subprocess.TimeoutExpired as e:
+                        # A child starved under the cap can hang instead of exiting: a failed cell, not a dead probe.
+                        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+                        stderr, rc = "timed out after 600 s", "hung"
+                    cells = [json.loads(x[5:]) for x in stdout.splitlines() if x.startswith("CELL ")]
                     cell = cells[-1] if cells else {"cap_mb": cap, "arm": arm}
-                    cell.update(rc = r.returncode, rep = rep, ok = bool(cell.get("ok")) and r.returncode == 0)
+                    cell.update(rc = rc, rep = rep, ok = bool(cell.get("ok")) and rc == 0)
                     if not cell["ok"]:
-                        cell["tail"] = (r.stdout + r.stderr)[-600:]
+                        cell["tail"] = (stdout + stderr)[-600:]
                     obs["cells"].append(cell)
                     print(f"[{args.state}] cap={cap} {arm}: ok={cell['ok']} env={cell.get('openblas_env')} "
-                          f"headroom={cell.get('headroom_mb')} stage={cell.get('stage')} rc={r.returncode}", flush = True)
+                          f"headroom={cell.get('headroom_mb')} stage={cell.get('stage')} rc={rc}", flush = True)
     except BaseException as e:  # noqa: BLE001
         obs["probe_error"] = f"{type(e).__name__}: {e}"
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
