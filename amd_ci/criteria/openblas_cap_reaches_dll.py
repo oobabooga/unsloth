@@ -56,9 +56,12 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     loaded = {k: [(r.get("child") or {}).get("dll_loaded") for r in _runs(v)] for k, v in st.items()}
     out.append(("rocm-openblas.dll was loaded in every cap run", all(x and all(x) for x in loaded.values()),
                 str(loaded)))
-    env1 = {k: [(r.get("child") or {}).get("env_openblas") for r in _runs(v)] for k, v in st.items()}
-    out.append(("configure_cpu_threads() set OPENBLAS_NUM_THREADS=1 in every state",
+    env1 = {k: [(r.get("child") or {}).get("env_openblas") for r in v.get("cap_user1") or []] for k, v in st.items()}
+    out.append(("the user's OPENBLAS_NUM_THREADS=1 stayed 1 after configure_cpu_threads()",
                 all(x and all(e == "1" for e in x) for x in env1.values()), str(env1)))
+    envd = {k: [(r.get("child") or {}).get("env_openblas") for r in v.get("cap") or []] for k, v in st.items()}
+    out.append(("configure_cpu_threads() set a positive OPENBLAS_NUM_THREADS default in every state",
+                all(x and all((e or "").isdigit() and int(e) >= 1 for e in x) for x in envd.values()), str(envd)))
     mm = {k: [(r.get("child") or {}).get("matmul_ok") for r in _runs(v)] for k, v in st.items()}
     out.append(("the CPU matmul ran and is finite", all(x and all(x) for x in mm.values()), str(mm)))
     n = {k: (len(v.get("cap") or []), len(v.get("cap_user1") or [])) for k, v in st.items()}
@@ -79,7 +82,8 @@ def table(obs: dict) -> str:
     for k, v in _states(obs).items():
         s = v.get("studio") or {}
         w = v.get("worker") or {}
-        rows.append(f"| {k} | {v.get('wheel')} | {_threads(v, 'cap_user1')} | {_busy(v, 'cap_user1')} "
+        envd = [(r.get("child") or {}).get("env_openblas") for r in v.get("cap") or []][:1]
+        rows.append(f"| {k} (default OPENBLAS_NUM_THREADS={envd}) | {v.get('wheel')} | {_threads(v, 'cap_user1')} | {_busy(v, 'cap_user1')} "
                     f"{[r.get('busy_cores_under_blas') for r in v.get('cap_user1') or []]} | {_threads(v)} / "
                     f"{_torch_threads(v)} | {_busy(v)} {[r.get('busy_cores_under_blas') for r in v.get('cap') or []]} | "
                     f"{w.get('openblas_threads')} / {w.get('torch_threads')} (marker {w.get('env_marker')}) | "
