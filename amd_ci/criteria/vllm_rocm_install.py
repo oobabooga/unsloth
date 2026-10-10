@@ -45,6 +45,12 @@ def table(obs: dict) -> str:
             f"{cell(_gen(v, 'auto'))} | {cell(_gen(v, 'fp8'))} | {str(v.get('int4_refusal'))[:100]} |"
         )
     head = _states(obs).get("head") or {}
+    if head.get("checkpoints"):
+        rows += ["", "Quantized checkpoints on head (informational, not part of the verdict):", "",
+                 "| checkpoint | load | answer or error |", "|---|---|---|"]
+        for g in head["checkpoints"]:
+            ans = repr((g.get("text") or "")[:40]) if g.get("text") is not None else (g.get("error") or "")[:200]
+            rows.append(f"| {g.get('model')} | {g.get('load_s', '-')}s | {ans} |")
     if head.get("install_error"):
         rows += ["", "head install error:", "```", head["install_error"][-2000:], "```"]
     for g in head.get("generations") or []:

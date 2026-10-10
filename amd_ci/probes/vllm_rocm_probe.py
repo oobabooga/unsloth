@@ -22,6 +22,15 @@ from pathlib import Path
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPT = "What is the capital of France? Answer with one word."
+# Which quantized formats vLLM's ROCm build serves here decides what Studio may offer on AMD.
+CHECKPOINTS = (
+    "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
+    "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
+    "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic",
+    "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8",
+    "RedHatAI/Qwen3-0.6B-quantized.w4a16",
+    "mgoin/Qwen3-0.6B-NVFP4",
+)
 
 
 def tree_bytes(root: Path) -> int:
@@ -61,12 +70,12 @@ def host_facts() -> dict:
     return facts
 
 
-def generate(managed_engine, engine_install, precision: str) -> dict:
-    out = {"precision": precision}
+def generate(managed_engine, engine_install, precision: str, model: str = MODEL) -> dict:
+    out = {"precision": precision, "model": model}
     engine = managed_engine.ManagedEngine("vllm")
     t0 = time.monotonic()
     try:
-        engine.start(MODEL, 2048, [0], dict(os.environ), None, {"precision": precision})
+        engine.start(model, 2048, [0], dict(os.environ), None, {"precision": precision})
         out["load_s"] = round(time.monotonic() - t0, 1)
         t1 = time.monotonic()
         stats: dict = {}
@@ -155,6 +164,9 @@ def main() -> int:
             uv_cache = Path(engine_install.install_environment()["UV_CACHE_DIR"])
             obs["uv_cache_bytes"] = tree_bytes(uv_cache) if uv_cache.is_dir() else None
             obs["generations"] = [generate(managed_engine, engine_install, p) for p in ("auto", "fp8")]
+            obs["checkpoints"] = [
+                generate(managed_engine, engine_install, "auto", model) for model in CHECKPOINTS
+            ]
             # 4-bit load-time conversion is refused on AMD before anything is unloaded.
             class _Req:
                 gpu_ids = [0]
