@@ -1,35 +1,10 @@
 [
  {
-  "name": "ref-vulkan-s7",
-  "backend": "vulkan",
-  "h3": "1",
-  "h3_refcpu": "1",
-  "h3_steps": "2",
-  "h3_ab_reps": "1",
-  "h3_seed": "7",
-  "base": "4a98feb",
-  "head": "8a48526",
-  "src_repo": "oobabooga"
- },
- {
-  "name": "ref-vulkan-s1234",
-  "backend": "vulkan",
-  "h3": "1",
-  "h3_refcpu": "1",
-  "h3_steps": "2",
-  "h3_ab_reps": "1",
-  "h3_seed": "1234",
-  "base": "4a98feb",
-  "head": "8a48526",
-  "src_repo": "oobabooga"
- },
- {
-  "name": "cap-hip",
+  "name": "cap-hip-up",
   "backend": "hip",
-  "zimg_cap": "9:1536x1536: 10:1536x1536: 12:1536x1536:",
-  "zimg": "1536x1536:--vae-tiling",
-  "base": "4a98feb",
+  "base": "f89d9b1",
   "head": "8a48526",
-  "src_repo": "oobabooga"
+  "src_repo": "oobabooga",
+  "zimg_cap": "9:1536x1536: 8:1536x1536: 9:1024x1024:"
  }
 ]
