@@ -121,14 +121,16 @@ def main() -> int:
         t0 = time.monotonic()
         try:
             engine_install._install("vllm", threading.Event())
-            obs["install_ok"] = True
         except Exception as e:  # noqa: BLE001
-            obs["install_ok"] = False
             obs["install_error"] = f"{type(e).__name__}: {e}"[-4000:]
         obs["install_s"] = round(time.monotonic() - t0, 1)
         job = dict(engine_install._jobs.get("vllm") or {})
         obs["install_job"] = {k: job.get(k) for k in ("state", "phase", "message")}
         obs["install_log_tail"] = (job.get("log") or [])[-30:]
+        # _install reports failure through its job record, not by raising.
+        obs["install_ok"] = job.get("state") == "success" and "install_error" not in obs
+        if job.get("state") == "error":
+            obs.setdefault("install_error", job.get("message"))
         info = engine_install.installed("vllm")
         obs["installed_info"] = (
             {k: info.get(k) for k in ("version", "platform", "host", "python", "directory")} if info else None
