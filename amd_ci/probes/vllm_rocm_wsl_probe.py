@@ -40,6 +40,13 @@ def host_facts() -> dict:
         facts["admin"] = bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception as e:  # noqa: BLE001
         facts["admin"] = f"{type(e).__name__}: {e}"
+    try:
+        import torch
+        facts["torch"] = torch.__version__
+        facts["torch_hip"] = getattr(torch.version, "hip", None)
+        facts["torch_gpu"] = torch.cuda.is_available() and torch.cuda.get_device_name(0)
+    except Exception as e:  # noqa: BLE001
+        facts["torch_error"] = f"{type(e).__name__}: {e}"
     facts["wsl_status"] = run(["wsl.exe", "--status"])
     facts["wsl_version"] = run(["wsl.exe", "--version"])
     facts["wsl_list"] = run(["wsl.exe", "-l", "-v"])
@@ -131,7 +138,16 @@ def main() -> int:
             gen = {"precision": "auto"}
             t1 = time.monotonic()
             try:
-                engine.start(MODEL, 2048, [0], dict(os.environ), None, {"precision": "auto"})
+                class _Load:
+                    gpu_ids = None
+                    model_path = MODEL
+                    gguf_variant = None
+                    engine_precision = "auto"
+                    engine_parallelism = "tensor"
+
+                gpu_ids = managed_engine.validate_load("vllm", _Load())
+                gen["gpu_ids"] = gpu_ids
+                engine.start(MODEL, 2048, gpu_ids, dict(os.environ), None, {"precision": "auto"})
                 gen["load_s"] = round(time.monotonic() - t1, 1)
                 gen.update(chat(engine))
             except Exception as e:  # noqa: BLE001
