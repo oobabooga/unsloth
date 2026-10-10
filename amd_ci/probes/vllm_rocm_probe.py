@@ -117,6 +117,8 @@ def generate(managed_engine, engine_install, precision: str, model: str = MODEL)
             engine.stop()
         except Exception as e:  # noqa: BLE001
             out["stop_error"] = f"{type(e).__name__}: {e}"
+        # The next load budgets from the driver's free memory, which trails a just-stopped engine.
+        time.sleep(30)
     return out
 
 
@@ -130,9 +132,11 @@ def main() -> int:
     obs: dict = {"state": args.state, "host": host_facts()}
     # Studio's own uv sits beside its interpreter or in the Studio home.
     home = os.environ.get("UNSLOTH_STUDIO_HOME", "")
-    os.environ["PATH"] = os.pathsep.join(
-        [str(Path(sys.executable).parent), *( [str(Path(home) / "bin")] if home else []), os.environ.get("PATH", "")]
-    )
+    # install.sh puts uv in ~/.local/bin (or UV_INSTALL_DIR), which a login shell has on PATH.
+    extra = [str(Path(sys.executable).parent), str(Path.home() / ".local" / "bin")]
+    extra += [os.environ[k] for k in ("UV_INSTALL_DIR", "XDG_BIN_HOME") if os.environ.get(k)]
+    extra += [str(Path(home) / "bin")] if home else []
+    os.environ["PATH"] = os.pathsep.join([*extra, os.environ.get("PATH", "")])
     obs["host"]["uv_after_path"] = shutil.which("uv")
     backend = args.checkout / "studio" / "backend"
     sys.path.insert(0, str(backend))
@@ -165,14 +169,16 @@ def main() -> int:
         t0 = time.monotonic()
         try:
             engine_install._install("vllm", threading.Event())
-            obs["install_ok"] = True
         except Exception as e:  # noqa: BLE001
-            obs["install_ok"] = False
             obs["install_error"] = f"{type(e).__name__}: {e}"[-4000:]
         obs["install_s"] = round(time.monotonic() - t0, 1)
         job = dict(engine_install._jobs.get("vllm") or {})
         obs["install_job"] = {k: job.get(k) for k in ("state", "phase", "message")}
         obs["install_log_tail"] = (job.get("log") or [])[-25:]
+        # _install reports failure through its job record, not by raising.
+        obs["install_ok"] = job.get("state") == "success" and "install_error" not in obs
+        if job.get("state") == "error":
+            obs.setdefault("install_error", job.get("message"))
         info = engine_install.installed("vllm")
         obs["installed_info"] = (
             {k: info.get(k) for k in ("version", "platform", "shared", "python", "directory")} if info else None
