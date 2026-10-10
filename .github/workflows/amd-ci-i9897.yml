@@ -1,0 +1,200 @@
+name: "AMD CI: issue 9897 GGUF image generation (Linux + Windows gfx1151)"
+
+# Issue 9897: GGUF image generation in Studio dies with "An internal error occurred" on AMD.
+# The reporter's log is Triton failing to build its hip_utils.c driver helper inside the compiled GGUF dequant.
+# Arms per OS, one Studio install from upstream main (BASE_SHA):
+#   base_healthy / head_healthy       main vs main + the eager fallback for the compiled GGUF dequant
+#   base_broken_cc / head_broken_cc   same, CC pointed at a compiler that always fails (Triton cannot build its driver)
+# No tokens are sent to this hardware; models are public.
+
+on:
+  push:
+    branches: [amd-ci-i9897]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "e0a92903052b4d556fc82299c5fe182125e71bfa"
+
+jobs:
+
+  linux:
+    name: "9897 GGUF image gen on Linux gfx1151 (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "i9897-linux"
+
+      - name: Trees (base = main, head = main + fix)
+        run: |
+          set -euo pipefail
+          git clone -q "$UPSTREAM" "$AMD_CI_WORK/base"
+          git -C "$AMD_CI_WORK/base" checkout -q "$BASE_SHA"
+          git -C "$AMD_CI_WORK/base" log -1 --oneline
+          cp -a "$AMD_CI_WORK/base" "$AMD_CI_WORK/head"
+          cp i9897/diffusion_gguf_compile.py "$AMD_CI_WORK/head/studio/backend/core/inference/diffusion_gguf_compile.py"
+          git -C "$AMD_CI_WORK/head" diff --stat
+
+      - name: Install Studio (base tree)
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/base"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UNSLOTH_SKIP_AUTOSTART=1
+          set +e
+          bash install.sh --local 2>&1 | tail -25
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || { echo "FATAL: install.sh exited $rc"; exit "$rc"; }
+          V="$UNSLOTH_STUDIO_HOME/unsloth_studio"
+          [ -x "$V/bin/python" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+
+      - name: ROCm gate
+        run: |
+          set +e
+          "$AMD_CI_PY" -c "import json,torch;print(json.dumps({'torch':torch.__version__,'hip':torch.version.hip,'avail':torch.cuda.is_available()}))"
+          "$AMD_CI_PY" amd_ci/lib/gate.py --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Arms
+        timeout-minutes: 90
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf"
+          "$AMD_CI_PY" -u i9897/run_arms.py --py "$AMD_CI_PY" \
+            --base-tree "$AMD_CI_WORK/base" --head-tree "$AMD_CI_WORK/head" \
+            --broken-cc /bin/false --out "$AMD_CI_WORK/out/arms" --scratch "$AMD_CI_WORK/scratch"
+          echo "run_arms rc=$?"
+          cat "$AMD_CI_WORK/out/arms/summary.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i9897-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  linux-control:
+    name: "9897 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  windows:
+    name: "9897 GGUF image gen on Windows gfx1151"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "i9897-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS=[$env:RUNNER_OS]"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Toolchain survey (is Visual Studio here?)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) { & $vswhere -all -products * -format text | Select-String "installationPath|displayName" } else { Write-Host "no vswhere" }
+          Write-Host "INCLUDE=[$env:INCLUDE]"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          exit 0
+
+      - name: Trees (base = main, head = main + fix)
+        run: |
+          $ErrorActionPreference = "Continue"
+          git clone -q "$env:UPSTREAM" "$env:AMD_CI_WORK\base"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C "$env:AMD_CI_WORK\base" checkout -q "$env:BASE_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C "$env:AMD_CI_WORK\base" log -1 --oneline
+          Copy-Item -Recurse -LiteralPath "$env:AMD_CI_WORK\base" -Destination "$env:AMD_CI_WORK\head"
+          Copy-Item -LiteralPath "i9897\diffusion_gguf_compile.py" -Destination "$env:AMD_CI_WORK\head\studio\backend\core\inference\diffusion_gguf_compile.py" -Force
+          git -C "$env:AMD_CI_WORK\head" diff --stat
+
+      - name: Install Studio (base tree)
+        timeout-minutes: 75
+        run: |
+          $ErrorActionPreference = "Continue"
+          Set-Location "$env:AMD_CI_WORK\base"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          $env:UNSLOTH_SKIP_AUTOSTART = "1"
+          if ($env:AMD_CI_PY -match 'Python(\d)(\d+)\\') { $env:UNSLOTH_PYTHON = "$($Matches[1]).$($Matches[2])" }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File ".\install.ps1" --local 2>&1 | Select-Object -Last 40
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: install.ps1 exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $py)) { Write-Host "FATAL: no Studio venv at $py"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+
+      - name: ROCm gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -c "import json,torch;print(json.dumps({'torch':torch.__version__,'hip':torch.version.hip,'avail':torch.cuda.is_available()}))"
+          & $env:AMD_CI_PY -c "import importlib.metadata as m;print(m.packages_distributions().get('triton'))" 2>&1
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu `
+            --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host.json"
+          exit 0
+
+      - name: Arms
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HF_HOME = "$env:AMD_CI_WORK\hf"
+          & $env:AMD_CI_PY -u "i9897\run_arms.py" --py "$env:AMD_CI_PY" `
+            --base-tree "$env:AMD_CI_WORK\base" --head-tree "$env:AMD_CI_WORK\head" `
+            --broken-cc "$env:GITHUB_WORKSPACE\i9897\false.cmd" `
+            --out "$env:AMD_CI_WORK\out\arms" --scratch "$env:AMD_CI_WORK\scratch"
+          Write-Host "run_arms rc=$LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\arms\summary.json" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i9897-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
