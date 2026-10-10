@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -26,10 +28,21 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> str:
     return p.stdout.strip()
 
 
-def clone(repo: str, dest: Path) -> Path:
-    if not dest.exists():
-        # blob:none keeps the clone small; the worktrees below fill in what they need.
-        run(["git", "clone", "-q", "--filter=blob:none", repo, str(dest)])
+def clone(repo: str, dest: Path, attempts: int = 3) -> Path:
+    if dest.exists():
+        return dest
+    # blob:none keeps the clone small; the worktrees below fill in what they need. Runner networks drop
+    # long transfers (curl 18 / 56, early EOF), so a failed clone is wiped and retried.
+    for attempt in range(1, attempts + 1):
+        p = subprocess.run(["git", "clone", "-q", "--filter=blob:none", repo, str(dest)], capture_output = True,
+                           text = True)
+        if p.returncode == 0:
+            return dest
+        shutil.rmtree(dest, ignore_errors = True)
+        if attempt == attempts:
+            raise SystemExit(f"command failed after {attempts} attempts: git clone {repo}\n{p.stderr.strip()}")
+        print(f"git clone attempt {attempt} failed, retrying: {p.stderr.strip()[-300:]}", flush = True)
+        time.sleep(15 * attempt)
     return dest
 
 
