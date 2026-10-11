@@ -141,7 +141,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/audio_cpp_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/audio_cpp_vulkan.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --repeats 2
+            --python "$env:AMD_CI_PY" -- --repeats 2 --audio speech16k.wav
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

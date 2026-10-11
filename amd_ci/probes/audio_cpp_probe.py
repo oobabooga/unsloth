@@ -124,6 +124,7 @@ def main() -> int:
     ap.add_argument("--work", default = None)
     ap.add_argument("--repeats", type = int, default = 2)
     ap.add_argument("--bench-states", default = "base,head")
+    ap.add_argument("--audio", default = "speech.wav", help = "clip under probes/i13042/")
     a = ap.parse_args()
     a.out = a.out.resolve()
 
@@ -133,7 +134,7 @@ def main() -> int:
     inst = work / f"{a.state}_audio"
     py = sys.executable
     script = "studio/install_audio_cpp_prebuilt.py"
-    obs: dict = {"state": a.state, "host": host_facts(), "install_dir": str(inst)}
+    obs: dict = {"state": a.state, "host": host_facts(), "install_dir": str(inst), "audio": a.audio}
 
     def save():
         a.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
@@ -189,7 +190,7 @@ def main() -> int:
                 busy_before = gpu_busy()
                 r = run([py, ASSETS / "audio_bench.py", "--server", server, "--backend", backend,
                          "--family", "moss_transcribe_diarize", "--model", mdl["path"], "--task", "asr",
-                         "--audio", ASSETS / "speech.wav", "--port", "18790", "--timeout", "900",
+                         "--audio", ASSETS / a.audio, "--port", "18790", "--timeout", "900",
                          "--json", jo], ASSETS, 1500)
                 res = {}
                 if jo.is_file():
