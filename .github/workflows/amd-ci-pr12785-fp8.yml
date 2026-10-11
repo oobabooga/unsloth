@@ -1,4 +1,4 @@
-name: "AMD CI: validate PR 12785"
+name: "AMD CI: PR 12785 FP8 investigation"
 
 # Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
 # values, and the tests/args, rather than the plumbing.
@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 12785"
 
 on:
   push:
-    branches: [amd-ci-pr12785]
+    branches: [amd-ci-pr12785-fp8]
   workflow_dispatch:
 
 permissions:
@@ -37,79 +37,8 @@ env:
 
 jobs:
 
-  suites:
-    name: "PR 12785 suites, base vs head"
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 120
-    env:
-      HIP_VISIBLE_DEVICES: ""
-      ROCR_VISIBLE_DEVICES: ""
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "pr12785-suites"
-
-      - name: Resolve states
-        run: |
-          set -euo pipefail
-          ARGS=""
-          [ "$MERGED" = "1" ] && ARGS="--merged"
-          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
-            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
-
-      - name: Environment
-        timeout-minutes: 60
-        run: |
-          set -euo pipefail
-          # Heavy, and only needed if the suites import torch. Delete otherwise.
-          cd "$AMD_CI_WORK/states/head"
-          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
-          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
-          # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
-          # tree pinning the newest unsloth fails to resolve. pip.conf already adds pypi.org as an
-          # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
-          # the ROCm torch index, whose wheels carry no upload time.
-          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
-          set +e
-          bash install.sh --local 2>&1 | tail -15
-          rc=${PIPESTATUS[0]}
-          set -e
-          [ "$rc" -eq 0 ] || exit "$rc"
-          V=""
-          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
-            [ -x "$c/bin/python" ] && { V="$c"; break; }
-          done
-          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
-          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
-          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
-
-      - name: Differential
-        run: |
-          set +e
-          python3 amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/pytest_probe.py \
-            --criteria amd_ci/criteria/pytest_no_regression.py \
-            --out-dir "$AMD_CI_WORK/out/suites" \
-            --python "${AMD_CI_PY:-python3}" \
-            -- --tests tests/test_managed_engines_rocm.py tests/test_managed_engines.py tests/test_wsl_host.py tests/test_engine_atomic_json.py
-          cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pr12785-suites
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
-
   gpu:
-    name: "PR 12785 GPU measurement (exclusive)"
+    name: "PR 12785 FP8 on gfx1151"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     # A shared constant, deliberately: it serialises every GPU measurement across
@@ -175,23 +104,19 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
-      - name: Differential
+      - name: FP8 investigation
+        timeout-minutes: 200
         run: |
           set +e
-          "$AMD_CI_PY" amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/vllm_rocm_probe.py \
-            --criteria amd_ci/criteria/vllm_rocm_install.py \
-            --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" 
-          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+          "$AMD_CI_PY" -u amd_ci/probes/fp8_probe.py \
+            --checkout "$AMD_CI_WORK/states/head" --out "$AMD_CI_WORK/out/fp8.json"
+          echo "probe exit $?"
+          head -c 20000 "$AMD_CI_WORK/out/fp8.json"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr12785-gpu
+          name: pr12785-fp8
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
