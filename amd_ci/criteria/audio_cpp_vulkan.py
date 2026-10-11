@@ -49,7 +49,8 @@ def head_is_fixed(o: dict) -> tuple[bool, str]:
         "backend vulkan": (r.get("backend") or "").lower() == "vulkan",
         "vulkan asset": "vulkan" in (r.get("asset") or "").lower(),
         "detected vulkan": o.get("detected_direct") == "vulkan",
-        "lists a Vulkan GPU": any("[GPU]" in row for row in o.get("vulkan_rows") or []),
+        # ggml-vulkan tags an integrated GPU `[IGPU]`, a discrete one `[GPU]`; the PR accepts any `Vulkan:<n>` row.
+        "lists a Vulkan GPU": any(("[GPU]" in row or "[IGPU]" in row) for row in o.get("vulkan_rows") or []),
         "idempotent re-run": bool(o.get("rerun_already_matches")),
     }
     if o.get("state") == "head":

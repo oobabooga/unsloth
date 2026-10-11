@@ -81,6 +81,12 @@ def main():
         result["ok"] = status == 200
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["fail_after_s"] = round(time.monotonic() - t0, 2)
+        if hasattr(exc, "read"):
+            try:
+                result["error_body"] = exc.read().decode("utf-8", "replace")[:2000]
+            except Exception:
+                pass
     finally:
         proc.terminate()
         try:
@@ -88,6 +94,11 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
+        if a.json:
+            try:
+                Path(a.json).with_suffix(".server.log").write_bytes((work / "server.log").read_bytes())
+            except OSError:
+                pass
         tail = (work / "server.log").read_bytes()[-1500:].decode("utf-8", "replace")
         result["log_tail"] = "\n".join(l for l in tail.splitlines() if "ggml_vulkan" in l or "fail" in l.lower() or "error" in l.lower())[-800:]
     print(json.dumps(result, indent = 1))
