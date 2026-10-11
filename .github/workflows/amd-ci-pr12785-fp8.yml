@@ -105,7 +105,7 @@ jobs:
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
       - name: FP8 investigation
-        timeout-minutes: 200
+        timeout-minutes: 220
         run: |
           set +e
           "$AMD_CI_PY" -u amd_ci/probes/fp8_probe.py \

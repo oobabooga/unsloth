@@ -72,16 +72,20 @@ print("RESULT " + json.dumps({"load_s": round(load, 1), "answer": o[0].outputs[0
 
 AITER = {"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_LINEAR": "1"}
 CASES = [
-    ("block FP8 0.6B (Qwen/Qwen3-0.6B-FP8)", "Qwen/Qwen3-0.6B-FP8", {}, 0.3, 1800),
-    ("per-token FP8 0.5B, default", "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic", {}, 0.3, 1800),
-    ("per-token FP8 0.5B, AITER on", "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic", AITER, 0.3, 1800),
-    ("block FP8 0.6B, AITER on", "Qwen/Qwen3-0.6B-FP8", AITER, 0.3, 1800),
-    ("unsloth/Qwen3.8-27B-FP8, default", "unsloth/Qwen3.8-27B-FP8", {}, 0.6, 3600),
+    ("unsloth/Qwen3.8-27B-FP8, default", "unsloth/Qwen3.8-27B-FP8", {}, 0.6, 2400),
+    ("per-token FP8 0.5B, default", "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic", {}, 0.3, 900),
+    ("per-token FP8 0.5B, AITER on", "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic", AITER, 0.3, 900),
+    ("unquantized 0.5B, AITER on", "Qwen/Qwen2.5-0.5B-Instruct", AITER, 0.3, 1800),
+    ("AWQ 0.5B, AITER on", "Qwen/Qwen2.5-0.5B-Instruct-AWQ", AITER, 0.3, 1800),
     ("unsloth/Qwen3.8-27B-FP8, AITER on", "unsloth/Qwen3.8-27B-FP8", AITER, 0.6, 3600),
+    ("unsloth/Qwen3.8-27B-FP8, AITER on, warm", "unsloth/Qwen3.8-27B-FP8", AITER, 0.6, 3600),
 ]
 
 
-def run(python: str, code: str, args: list[str], env: dict, timeout: int) -> dict:
+LOG_DIR = None
+
+
+def run(python: str, code: str, args: list[str], env: dict, timeout: int, label: str = "") -> dict:
     t = time.monotonic()
     try:
         p = subprocess.run([python, "-c", code, *args], env=env, capture_output=True, text=True,
@@ -92,6 +96,12 @@ def run(python: str, code: str, args: list[str], env: dict, timeout: int) -> dic
         text = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         rc = "timeout"
     res = {"rc": rc, "wall_s": round(time.monotonic() - t, 1)}
+    if LOG_DIR is not None:
+        name = "".join(ch if ch.isalnum() else "_" for ch in (label or "torch_facts"))
+        (LOG_DIR / f"{name}.log").write_text(text, encoding="utf-8")
+    import re as _re
+    res["errors"] = sorted({_re.sub(r"^.*\[core.py:\d+\]\s*", "", l)[:400] for l in text.splitlines()
+                            if _re.search(r"\b\w*(Error|Exception)\b: |requires|Selected \w+ for", l)})[:30]
     for line in text.splitlines():
         if line.startswith("RESULT "):
             res.update(json.loads(line[7:]))
@@ -108,6 +118,9 @@ def main() -> int:
     ap.add_argument("--checkout", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     a = ap.parse_args()
+    global LOG_DIR
+    LOG_DIR = a.out.parent / "fp8_logs"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     obs: dict = {}
     home = os.environ.get("UNSLOTH_STUDIO_HOME", "")
     extra = [str(Path(sys.executable).parent), str(Path.home() / ".local" / "bin")]
@@ -136,7 +149,7 @@ def main() -> int:
     a.out.write_text(json.dumps(obs, indent=2), encoding="utf-8")
     obs["cases"] = []
     for label, model, extra_env, mem, timeout in CASES:
-        r = run(python, LOAD, [model, str(mem), PROMPT], {**env, **extra_env}, timeout)
+        r = run(python, LOAD, [model, str(mem), PROMPT], {**env, **extra_env}, timeout, label)
         r.update({"label": label, "model": model, "env": extra_env})
         obs["cases"].append(r)
         print(json.dumps({k: v for k, v in r.items() if k != "tail"}), flush=True)
