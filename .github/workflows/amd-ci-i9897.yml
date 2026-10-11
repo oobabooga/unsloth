@@ -1,4 +1,4 @@
-name: "AMD CI: issue 9897 GGUF image generation (Linux + Windows gfx1151)"
+name: "AMD CI: issue 9897 torch.compile diagnosis (Linux + Windows gfx1151)"
 
 # Issue 9897: GGUF image generation in Studio dies with "An internal error occurred" on AMD.
 # The reporter's log is Triton failing to build its hip_utils.c driver helper inside the compiled GGUF dequant.
@@ -26,7 +26,7 @@ jobs:
   linux:
     name: "9897 GGUF image gen on Linux gfx1151 (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 300
+    timeout-minutes: 330
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -72,16 +72,15 @@ jobs:
           "$AMD_CI_PY" amd_ci/lib/gate.py --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
             --out "$AMD_CI_WORK/out/host.json"
 
-      - name: Arms
-        timeout-minutes: 150
+      - name: Diagnosis arms
+        timeout-minutes: 200
         run: |
           set +e
           export HF_HOME="$AMD_CI_WORK/hf"
-          "$AMD_CI_PY" -u i9897/run_arms.py --py "$AMD_CI_PY" \
-            --base-tree "$AMD_CI_WORK/base" --head-tree "$AMD_CI_WORK/head" \
-            --broken-cc /bin/false --out "$AMD_CI_WORK/out/arms" --scratch "$AMD_CI_WORK/scratch"
-          echo "run_arms rc=$?"
-          cat "$AMD_CI_WORK/out/arms/summary.json" >> "$GITHUB_STEP_SUMMARY"
+          "$AMD_CI_PY" -u i9897/diag_arms.py --py "$AMD_CI_PY" --tree "$AMD_CI_WORK/base" \
+            --out "$AMD_CI_WORK/out/diag" --scratch "$AMD_CI_WORK/scratch"
+          echo "diag rc=$?"
+          cat "$AMD_CI_WORK/out/diag/summary.json" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -107,7 +106,7 @@ jobs:
   windows:
     name: "9897 GGUF image gen on Windows gfx1151"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 300
+    timeout-minutes: 330
     concurrency:
       group: amd-ci-strix-halo-windows-gpu
       cancel-in-progress: false
@@ -180,17 +179,15 @@ jobs:
             --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host.json"
           exit 0
 
-      - name: Arms
-        timeout-minutes: 150
+      - name: Diagnosis arms
+        timeout-minutes: 200
         run: |
           $ErrorActionPreference = "Continue"
           $env:HF_HOME = "$env:AMD_CI_WORK\hf"
-          & $env:AMD_CI_PY -u "i9897\run_arms.py" --py "$env:AMD_CI_PY" `
-            --base-tree "$env:AMD_CI_WORK\base" --head-tree "$env:AMD_CI_WORK\head" `
-            --broken-cc "$env:GITHUB_WORKSPACE\i9897\false.cmd" `
-            --out "$env:AMD_CI_WORK\out\arms" --scratch "$env:AMD_CI_WORK\scratch"
-          Write-Host "run_arms rc=$LASTEXITCODE"
-          Get-Content "$env:AMD_CI_WORK\out\arms\summary.json" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY -u "i9897\diag_arms.py" --py "$env:AMD_CI_PY" --tree "$env:AMD_CI_WORK\base" `
+            --out "$env:AMD_CI_WORK\out\diag" --scratch "$env:AMD_CI_WORK\scratch"
+          Write-Host "diag rc=$LASTEXITCODE"
+          Get-Content "$env:AMD_CI_WORK\out\diag\summary.json" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           exit 0
 
       - uses: actions/upload-artifact@v4
