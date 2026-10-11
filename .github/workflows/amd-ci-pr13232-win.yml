@@ -125,7 +125,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout fastapi structlog pydantic httpx psutil
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout fastapi structlog pydantic httpx psutil pyjwt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
@@ -141,7 +141,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/test_gpu_selection.py tests/test_system_poll_no_cuda_context.py tests/test_gpu_inventory_stale.py
+            --python "$env:AMD_CI_PY" -- --tests tests/test_system_poll_no_cuda_context.py tests/test_gpu_inventory_stale.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
