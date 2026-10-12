@@ -21,7 +21,7 @@ def _first(o: dict) -> dict:
 
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
     out = []
-    for name in ("base", "head"):
+    for name in [n for n in ("base", "head", "main") if n in obs]:
         o = obs.get(name) or {}
         out.append((f"{name} installed and loaded the model", o.get("load_status") == 200,
                     o.get("error") or f"install_rc={o.get('install_rc')} load={o.get('load_status')} "
@@ -47,7 +47,7 @@ def _fmt(o: dict) -> str:
 def table(obs: dict) -> str:
     rows = ["| state | load s | first step s | first render s | finished | warm render s | error |",
             "|---|---|---|---|---|---|---|"]
-    for n in ("base", "head"):
+    for n in ("base", "head", "main"):
         if obs.get(n):
             rows.append(_fmt(obs[n]))
     return "\n".join(rows)

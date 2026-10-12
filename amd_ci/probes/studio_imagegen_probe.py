@@ -88,12 +88,32 @@ def gpu_busy():
     return max(vals) if vals else None
 
 
+_PROCS: dict = {}
+
+
 def tree(psutil, pid):
+    """The server's process tree, reusing one Process per pid so cpu_percent() has a baseline."""
     try:
-        root = psutil.Process(pid)
-        return [root] + root.children(recursive=True)
+        root = _PROCS.setdefault(pid, psutil.Process(pid))
+        kids = root.children(recursive=True)
     except psutil.Error:
         return []
+    return [root] + [_PROCS.setdefault(k.pid, k) for k in kids]
+
+
+def ui_poller(base_url, token, stop, lat):
+    """The Desktop UI's background polls while a render runs (cadence from the reporter's log)."""
+    nxt = {"/api/inference/monitor": 0.0, "/api/liveness": 0.0}
+    every = {"/api/inference/monitor": 12.0, "/api/liveness": 15.0}
+    while not stop.is_set():
+        now = time.time()
+        for path, due in nxt.items():
+            if now >= due:
+                t = time.time()
+                st, _ = api(base_url, path, token, timeout=60)
+                lat.setdefault(path, []).append((round(t, 1), st, round((time.time() - t) * 1000)))
+                nxt[path] = now + every[path]
+        stop.wait(1)
 
 
 def main() -> int:
@@ -289,6 +309,9 @@ def render(base_url, token, proc, psutil, stack_dir, cap, idx) -> dict:
     t0 = time.time()
     th = threading.Thread(target=call, daemon=True)
     th.start()
+    stop_ui = threading.Event()
+    ui_lat: dict = {}
+    threading.Thread(target=ui_poller, args=(base_url, token, stop_ui, ui_lat), daemon=True).start()
     last_step = -1
     dump_at = [60, 180, 420, 900, 1500]
     for p in tree(psutil, proc.pid):
@@ -299,7 +322,9 @@ def render(base_url, token, proc, psutil, stack_dir, cap, idx) -> dict:
     while th.is_alive() and time.time() - t0 < cap:
         th.join(5)
         el = round(time.time() - t0, 1)
-        st, prog = api(base_url, "/api/inference/images/generate-progress", token, timeout=10)
+        tq = time.time()
+        st, prog = api(base_url, "/api/inference/images/generate-progress", token, timeout=60)
+        progress_ms = round((time.time() - tq) * 1000)
         step = prog.get("step") if isinstance(prog, dict) else None
         if step is not None and step != last_step:
             out["timeline"].append({"t": el, "step": step, "total": prog.get("total_steps")})
@@ -312,7 +337,8 @@ def render(base_url, token, proc, psutil, stack_dir, cap, idx) -> dict:
                 cpu += p.cpu_percent(None)
             except psutil.Error:
                 pass
-        out["samples"].append({"t": el, "step": step, "gpu_busy": gpu_busy(), "cpu_pct": round(cpu)})
+        out["samples"].append({"t": el, "step": step, "gpu_busy": gpu_busy(), "cpu_pct": round(cpu),
+                               "progress_ms": progress_ms})
         if dump_at and el >= dump_at[0]:
             dump_at.pop(0)
             if (last_step or 0) < 1:
@@ -323,6 +349,8 @@ def render(base_url, token, proc, psutil, stack_dir, cap, idx) -> dict:
                         pass
                 out["dumps"].append(el)
     out["elapsed_s"] = round(time.time() - t0, 1)
+    stop_ui.set()
+    out["ui_poll_ms"] = {k: [(round(t - t0, 1), st, ms) for t, st, ms in v] for k, v in ui_lat.items()}
     if th.is_alive():
         out["finished"] = False
         out["error"] = f"no result after {cap}s (last step {last_step})"

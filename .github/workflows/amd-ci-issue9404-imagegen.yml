@@ -77,9 +77,11 @@ jobs:
           BASE=$(git rev-parse "v0.1.800-beta^{commit}")
           HEAD_SHA=$(git rev-parse "v0.1.905-beta^{commit}")
           git worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE"
+          MAIN_SHA=3075b73d17e234e7cbb8d77e66734c1d4e362eff
           git worktree add -q --detach "$AMD_CI_WORK/states/head" "$HEAD_SHA"
-          printf '{"pr": 9404, "merged": false, "commits": {"base": "%s", "head": "%s"}, "paths": {"base": "%s", "head": "%s"}}' \
-            "$BASE" "$HEAD_SHA" "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head" > "$AMD_CI_WORK/out/states.json"
+          git worktree add -q --detach "$AMD_CI_WORK/states/main" "$MAIN_SHA"
+          printf '{"pr": 9404, "merged": false, "commits": {"base": "%s", "head": "%s", "main": "%s"}, "paths": {"base": "%s", "head": "%s", "main": "%s"}}' \
+            "$BASE" "$HEAD_SHA" "$MAIN_SHA" "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head" "$AMD_CI_WORK/states/main" > "$AMD_CI_WORK/out/states.json"
           cat "$AMD_CI_WORK/out/states.json"
 
       - name: Probe environment
