@@ -90,6 +90,7 @@ jobs:
           "$AMD_CI_WORK/pvenv/bin/python" -m pip install -q psutil
           echo "AMD_CI_PY=$AMD_CI_WORK/pvenv/bin/python" >> "$GITHUB_ENV"
           echo "AMDCI_HF_HOME=$AMD_CI_WORK/hf" >> "$GITHUB_ENV"
+          echo "AMDCI_BASE_PINS=tokenizers>=0.22.0,<=0.23.0" >> "$GITHUB_ENV"
           df -h "$AMD_CI_WORK" | tail -1
           nproc; free -g | head -2
 

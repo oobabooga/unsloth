@@ -118,7 +118,10 @@ def main() -> int:
     home = work / "studio_home"
     env = dict(os.environ, UNSLOTH_STUDIO_HOME=str(home), UNSLOTH_SKIP_AUTOSTART="1",
                UV_EXTRA_INDEX_URL="https://pypi.org/simple")
-    rc, out = sh(["bash", "install.sh", "--local"], rec["steps_log"], "install.sh --local", cwd=str(src), env=env)
+    if os.environ.get("AMDCI_SKIP_INSTALL") == "1" and (home / "unsloth_studio" / "bin" / "python").exists():
+        rc = 0
+    else:
+        rc, out = sh(["bash", "install.sh", "--local"], rec["steps_log"], "install.sh --local", cwd=str(src), env=env)
     rec["install_rc"] = rc
     py = None
     for c in [home / "unsloth_studio", *sorted(home.glob(".venv_t5_*"))]:
@@ -130,6 +133,12 @@ def main() -> int:
         flush()
         return 0
     rec["python"] = str(py)
+    pins = os.environ.get("AMDCI_BASE_PINS", "").split()
+    if args.state == "base" and pins:
+        # The old tag's resolver now picks releases newer than its transformers accepts.
+        rc, _ = sh([str(py), "-m", "pip", "install", "-q", *pins], rec["steps_log"], "base pins " + " ".join(pins))
+        rec["base_pins"] = pins
+    sh([str(py), "-m", "pip", "list", "--format=freeze"], rec["steps_log"], "pip freeze")
     sh([str(py), "-m", "pip", "install", "-q", "psutil"], rec["steps_log"], "psutil")
     rc, out = sh([str(py), "-c", "import torch,json;print(json.dumps({'torch':torch.__version__,'hip':torch.version.hip,"
                   "'dev':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,"
