@@ -24,12 +24,19 @@ def main() -> int:
     args = ap.parse_args()
     script = args.checkout / "studio" / "install_llama_prebuilt.py"
     obs: dict = {"state": args.state, "runs": {}}
-    for label, extra in (("detected", []), ("forwarded_gfx1151", ["--rocm-gfx", "gfx1151"])):
+    import os
+    variants = (
+        ("detected", [], {}),
+        ("forwarded_gfx1151", ["--rocm-gfx", "gfx1151"], {}),
+        # What the update banner's migration check passes (llama_cpp_update._resolve_backends_for_host).
+        ("remembered_gfx1151", [], {"UNSLOTH_ROCM_GFX_REMEMBERED": "gfx1151"}),
+    )
+    for label, extra, env_extra in variants:
         with tempfile.TemporaryDirectory() as tmp:
             cmd = [sys.executable, str(script), "--resolve-backends", "--output-format", "json",
                    "--install-dir", tmp, *extra]
             p = subprocess.run(cmd, capture_output = True, text = True, encoding = "utf-8",
-                               errors = "replace", timeout = 600)
+                               errors = "replace", timeout = 600, env = {**os.environ, **env_extra})
         run = {"rc": p.returncode, "stderr_tail": p.stderr[-1500:]}
         try:
             data = json.loads(p.stdout[p.stdout.index("{"):])

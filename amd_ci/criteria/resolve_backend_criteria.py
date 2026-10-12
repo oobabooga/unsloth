@@ -6,7 +6,12 @@ from __future__ import annotations
 TITLE = "Automatic llama.cpp backend on a Windows Strix Halo host, base versus head"
 MODE = "differential"
 NEEDS: list[str] = ["windows", "gpu"]
-RUNS = ("detected", "forwarded_gfx1151")
+RUNS = ("detected", "forwarded_gfx1151", "remembered_gfx1151")
+# The judged run: setup.ps1 and the updater forward the arch (--rocm-gfx), so this is the
+# path a Desktop install takes. Without it this runner has no HIP SDK, detection reports no
+# ROCm and both states take the #7357 Vulkan route; that run must merely agree across states.
+JUDGED = "forwarded_gfx1151"
+ALSO_JUDGED = ("remembered_gfx1151",)
 
 
 def _auto(o: dict, run: str):
@@ -25,9 +30,13 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
             r = (o.get("runs") or {}).get(run) or {}
             out.append((f"{name} {run} resolved an auto backend", _auto(o, run) is not None,
                         r.get("error") or f"rc={r.get('rc')} auto={r.get('auto')}"))
-            rocm = r.get("rocm") or {}
-            out.append((f"{name} {run} has a ROCm bundle for this host",
-                        rocm.get("available") is True, str(rocm)))
+        rocm = ((o.get("runs") or {}).get(JUDGED) or {}).get("rocm") or {}
+        out.append((f"{name} {JUDGED} has a ROCm bundle for this host",
+                    rocm.get("available") is True, str(rocm)))
+    base, head = obs.get("base") or {}, obs.get("head") or {}
+    out.append(("unforwarded run identical across states (untouched path)",
+                _auto(base, "detected") == _auto(head, "detected"),
+                f"base={_auto(base, 'detected')} head={_auto(head, 'detected')}"))
     return out
 
 
@@ -43,10 +52,10 @@ def table(obs: dict) -> str:
 
 
 def base_shows_defect(base: dict) -> tuple[bool, str]:
-    got = {run: _auto(base, run) for run in RUNS}
+    got = {r: _auto(base, r) for r in (JUDGED, *ALSO_JUDGED)}
     return all(v == "vulkan" for v in got.values()), f"base auto: {got}"
 
 
 def head_is_fixed(head: dict) -> tuple[bool, str]:
-    got = {run: _auto(head, run) for run in RUNS}
+    got = {r: _auto(head, r) for r in (JUDGED, *ALSO_JUDGED)}
     return all(v == "rocm" for v in got.values()), f"head auto: {got}"
