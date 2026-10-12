@@ -1,0 +1,151 @@
+name: "AMD CI (Windows): issue 10656 Vulkan vs ROCm prefill on gfx1151"
+
+on:
+  push:
+    branches: [amd-ci-issue10656]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NEW_TAG: "b11541-mix-2500203"
+  OLD_TAG: "b10840-mix-d5c17a0"
+  MODEL_URL: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/main/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  windows:
+    name: "gfx1151 Windows: llama.cpp Vulkan vs ROCm prefill"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu-10656
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "issue10656-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host facts
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate, AdapterRAM | Format-List | Out-String | Tee-Object -FilePath "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-String | Tee-Object -FilePath "$env:AMD_CI_WORK\out\ram.txt"
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber | Format-List | Out-String | Tee-Object -FilePath "$env:AMD_CI_WORK\out\os.txt"
+
+      - name: Fetch prebuilts and model
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "$env:AMD_CI_WORK\src"
+          foreach ($tag in @($env:NEW_TAG, $env:OLD_TAG)) {
+            foreach ($kind in @("vulkan", "rocm-gfx1151")) {
+              $name = "app-$tag-windows-x64-$kind.zip"
+              $url = "https://github.com/unslothai/llama.cpp/releases/download/$tag/$name"
+              $zip = Join-Path $src $name
+              curl.exe -sSfL --retry 5 -o $zip $url
+              if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: download $url"; exit 1 }
+              $dest = Join-Path $src "$tag-$kind"
+              Expand-Archive -Path $zip -DestinationPath $dest -Force
+              $bench = Get-ChildItem -Path $dest -Recurse -Filter llama-bench.exe | Select-Object -First 1
+              Write-Host "$tag $kind -> $($bench.DirectoryName)"
+              Add-Content -Path $env:GITHUB_ENV -Value ("BIN_" + ($tag -replace '[^A-Za-z0-9]', '_') + "_" + ($kind -replace '[^A-Za-z0-9]', '_') + "=" + $bench.DirectoryName)
+            }
+          }
+          $model = "$env:AMD_CI_WORK\src\model.gguf"
+          curl.exe -sSfL --retry 5 -o $model $env:MODEL_URL
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: model download"; exit 1 }
+          (Get-Item $model).Length
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL=$model"
+
+      - name: List devices per backend
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = "$env:AMD_CI_WORK\out"
+          foreach ($pair in @(@("new_vulkan", $env:BIN_b11541_mix_2500203_vulkan), @("new_rocm", $env:BIN_b11541_mix_2500203_rocm_gfx1151))) {
+            Write-Host "=== $($pair[0]) ==="
+            & "$($pair[1])\llama-bench.exe" --list-devices 2>&1 | Tee-Object -FilePath "$out\devices_$($pair[0]).txt"
+          }
+
+      - name: llama-bench ABAB (latest pin) and reporter build
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = "$env:AMD_CI_WORK\out"
+          $arms = @(
+            @("new_rocm",   $env:BIN_b11541_mix_2500203_rocm_gfx1151, "1"),
+            @("new_vulkan", $env:BIN_b11541_mix_2500203_vulkan,       "1"),
+            @("new_rocm",   $env:BIN_b11541_mix_2500203_rocm_gfx1151, "2"),
+            @("new_vulkan", $env:BIN_b11541_mix_2500203_vulkan,       "2"),
+            @("old_rocm",   $env:BIN_b10840_mix_d5c17a0_rocm_gfx1151, "1"),
+            @("old_vulkan", $env:BIN_b10840_mix_d5c17a0_vulkan,       "1")
+          )
+          foreach ($a in $arms) {
+            $tag = "$($a[0])_r$($a[2])"
+            Write-Host "=== $tag ==="
+            & "$($a[1])\llama-bench.exe" -m $env:MODEL -ngl 99 -fa 1 -p 512,4096 -n 128 -d 0,16384 -r 2 -o json 2> "$out\bench_$tag.err" > "$out\bench_$tag.json"
+            Write-Host "exit $LASTEXITCODE"
+            Get-Content "$out\bench_$tag.err" | Select-String -Pattern "ggml_vulkan|matrix cores|ROCm|error" | Select-Object -First 10
+          }
+
+      - name: llama-server multi-turn prefill (262144 ctx)
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = "$env:AMD_CI_WORK\out"
+          $arms = @(
+            @("srv_new_rocm",   $env:BIN_b11541_mix_2500203_rocm_gfx1151),
+            @("srv_new_vulkan", $env:BIN_b11541_mix_2500203_vulkan),
+            @("srv_old_rocm",   $env:BIN_b10840_mix_d5c17a0_rocm_gfx1151),
+            @("srv_old_vulkan", $env:BIN_b10840_mix_d5c17a0_vulkan)
+          )
+          foreach ($a in $arms) {
+            & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\bench\server_prefill.py" `
+              --server "$($a[1])\llama-server.exe" --model $env:MODEL --label $a[0] `
+              --log "$out\$($a[0]).log" --out "$out\$($a[0]).json" `
+              -- -c 262144 -ngl 999 -fa on --jinja -np 1
+            Write-Host "exit $LASTEXITCODE"
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue10656-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
