@@ -1,0 +1,52 @@
+name: "AMD CI: repro issue 8442"
+
+on:
+  push:
+    branches: [amd-ci-i8442]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    name: "Issue 8442 GPU repro (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "i8442-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Repro
+        timeout-minutes: 140
+        run: |
+          set +e
+          bash i8442/amd_repro.sh
+          cat "$AMD_CI_WORK/out/i8442/SUMMARY.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop strays
+        if: always()
+        run: |
+          for p in $(pgrep -u "$(id -u)" -x llama-server); do kill "$p" 2>/dev/null; done; true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i8442-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
