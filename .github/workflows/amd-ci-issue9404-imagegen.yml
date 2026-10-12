@@ -1,0 +1,115 @@
+name: "AMD CI: validate PR 9404"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-issue9404-imagegen]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "9404"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  gpu:
+    name: "PR 9404 GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr9404-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          # Issue 9404 has no PR: base = the reporter's release tag, head = main pinned.
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          cd "$AMD_CI_WORK/repo"
+          BASE=$(git rev-parse "v0.1.800-beta^{commit}")
+          HEAD_SHA=3075b73d17e234e7cbb8d77e66734c1d4e362eff
+          git worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE"
+          git worktree add -q --detach "$AMD_CI_WORK/states/head" "$HEAD_SHA"
+          printf '{"pr": 9404, "merged": false, "commits": {"base": "%s", "head": "%s"}, "paths": {"base": "%s", "head": "%s"}}' \
+            "$BASE" "$HEAD_SHA" "$AMD_CI_WORK/states/base" "$AMD_CI_WORK/states/head" > "$AMD_CI_WORK/out/states.json"
+          cat "$AMD_CI_WORK/out/states.json"
+
+      - name: Probe environment
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python3 -m venv "$AMD_CI_WORK/pvenv"
+          "$AMD_CI_WORK/pvenv/bin/python" -m pip install -q psutil
+          echo "AMD_CI_PY=$AMD_CI_WORK/pvenv/bin/python" >> "$GITHUB_ENV"
+          echo "AMDCI_HF_HOME=$AMD_CI_WORK/hf" >> "$GITHUB_ENV"
+          df -h "$AMD_CI_WORK" | tail -1
+          nproc; free -g | head -2
+
+      - name: Differential
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/studio_imagegen_probe.py \
+            --criteria amd_ci/criteria/imagegen_hang_criteria.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" 
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr9404-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
