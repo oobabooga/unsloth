@@ -25,6 +25,8 @@ CONFIGS = {
     "studio_default": ["-np", "4", "--kv-unified", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"],
     "mtp_np1": ["-np", "1", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"],
     "no_mtp_np4": ["-np", "4", "--kv-unified", "--spec-type", "none"],
+    "no_mtp_np4_split": ["-np", "4", "--no-kv-unified", "--spec-type", "none"],
+    "no_mtp_np1": ["-np", "1", "--spec-type", "none"],
 }
 
 
@@ -41,6 +43,11 @@ def post(port, body, timeout=900):
 def title_like(r):
     c = (r["content"] or "").strip()
     return (bool(c) and len(c) <= 60 and "\n" not in c and not r["tool_calls"]) or "title" in (r["reasoning"] or "").lower()
+
+
+def garbage(r):
+    t = (r["content"] or "") + (r["reasoning"] or "")
+    return len(t) >= 20 and t.count("!") > len(t) // 2
 
 
 def body(messages, tools=None, max_tokens=400):
@@ -115,6 +122,33 @@ def identity_rounds(port, n):
     return hits
 
 
+def run_config(a, name, results):
+    args = CONFIGS[name]
+    s = Server(a.binary, a.model, args, a.port, f"{a.logdir}/{name}_cold.log")
+    try:
+        cold = post(a.port, PI)
+        cold2 = post(a.port, PI)
+    finally:
+        s.stop()
+    s = Server(a.binary, a.model, args, a.port, f"{a.logdir}/{name}_warm.log")
+    warm = []
+    try:
+        for rep in range(a.repeats):
+            ocs = [oc(a.port, u) for u in OC_USERS]
+            w = post(a.port, PI)
+            warm.append({"oc": ocs, "pi": w})
+            oc_bad = [x[1]["content"][:60] for x in ocs[1:] if title_like(x[1])]
+            print(f"[{name}] rep{rep} oc_main_title_like={oc_bad} pi_title_like={title_like(w)} oc_main={[x[1]['content'][:60] for x in ocs]} "
+                  f"pi_same_as_cold={w['content'] == cold['content']} pi={w['content'][:120]!r}", flush=True)
+        idr = identity_rounds(a.port, a.identity_rounds)
+        print(f"[{name}] identity leaks={sum(h['leak'] for h in idr)}/{len(idr)} sample={idr[0]['content'][:100]!r}", flush=True)
+    finally:
+        s.stop()
+    results[name] = {"identity": idr, "cold": cold, "cold_repeat_same": cold2["content"] == cold["content"], "warm": warm}
+    print(f"[{name}] cold={cold['content'][:120]!r} cold_repeat_same={results[name]['cold_repeat_same']}", flush=True)
+    Path(a.out).write_text(json.dumps(results, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
@@ -128,35 +162,21 @@ def main():
     a = ap.parse_args()
     results = {}
     for name in a.configs.split(","):
-        args = CONFIGS[name]
-        s = Server(a.binary, a.model, args, a.port, f"{a.logdir}/{name}_cold.log")
         try:
-            cold = post(a.port, PI)
-            cold2 = post(a.port, PI)
-        finally:
-            s.stop()
-        s = Server(a.binary, a.model, args, a.port, f"{a.logdir}/{name}_warm.log")
-        warm = []
-        try:
-            for rep in range(a.repeats):
-                ocs = [oc(a.port, u) for u in OC_USERS]
-                w = post(a.port, PI)
-                warm.append({"oc": ocs, "pi": w})
-                oc_bad = [x[1]["content"][:60] for x in ocs[1:] if title_like(x[1])]
-                print(f"[{name}] rep{rep} oc_main_title_like={oc_bad} pi_title_like={title_like(w)} oc_main={[x[1]['content'][:60] for x in ocs]} "
-                      f"pi_same_as_cold={w['content'] == cold['content']} pi={w['content'][:120]!r}", flush=True)
-            idr = identity_rounds(a.port, a.identity_rounds)
-            print(f"[{name}] identity leaks={sum(h['leak'] for h in idr)}/{len(idr)} sample={idr[0]['content'][:100]!r}", flush=True)
-        finally:
-            s.stop()
-        results[name] = {"identity": idr, "cold": cold, "cold_repeat_same": cold2["content"] == cold["content"], "warm": warm}
-        print(f"[{name}] cold={cold['content'][:120]!r} cold_repeat_same={results[name]['cold_repeat_same']}", flush=True)
-        Path(a.out).write_text(json.dumps(results, indent=1))
-    print("SUMMARY", json.dumps({k: {"cold_repeat_same": v["cold_repeat_same"],
+            run_config(a, name, results)
+        except Exception as exc:
+            results[name] = {"error": repr(exc)[:500]}
+            print(f"[{name}] ERROR {exc!r}"[:600], flush=True)
+            Path(a.out).write_text(json.dumps(results, indent=1))
+    print("SUMMARY", json.dumps({k: v if "error" in v else {"cold_repeat_same": v["cold_repeat_same"],
                                      "warm_same": [w["pi"]["content"] == v["cold"]["content"] for w in v["warm"]],
                                      "pi_title_like": [title_like(w["pi"]) for w in v["warm"]],
                                      "oc_main_title_like": sum(title_like(x[1]) for w in v["warm"] for x in w["oc"][1:]),
-                                     "identity_leaks": sum(h["leak"] for h in v["identity"])}
+                                     "identity_leaks": sum(h["leak"] for h in v["identity"]),
+                                     "cold_garbage": garbage(v["cold"]),
+                                     "warm_garbage": sum(garbage(x) for w in v["warm"] for pair in w["oc"] for x in pair)
+                                     + sum(garbage(w["pi"]) for w in v["warm"]),
+                                     "warm_total": sum(2 * len(w["oc"]) + 1 for w in v["warm"])}
                                  for k, v in results.items()}))
 
 
