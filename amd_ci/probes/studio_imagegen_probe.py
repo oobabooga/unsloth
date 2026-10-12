@@ -164,7 +164,11 @@ def main() -> int:
                 HF_HOME=os.environ.get("AMDCI_HF_HOME", str(work / "hf")),
                 TRITON_CACHE_DIR=str(work / "triton_cache"),
                 MIOPEN_USER_DB_PATH=str(work / "miopen_db"),
-                MIOPEN_CUSTOM_CACHE_DIR=str(work / "miopen_cache"))
+                MIOPEN_CUSTOM_CACHE_DIR=str(work / "miopen_cache"),
+                TORCHINDUCTOR_CACHE_DIR=str(work / "inductor_cache"))
+    # The runner exports CI=true; the reporter's Desktop does not, and torch reads it.
+    for k in ("CI", "GITHUB_ACTIONS"):
+        senv.pop(k, None)
     backend = src / "studio" / "backend"
     server_log = out_dir / f"server_{args.state}.log"
     logf = open(server_log, "w", encoding="utf-8")
