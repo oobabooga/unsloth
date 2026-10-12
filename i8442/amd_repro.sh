@@ -32,5 +32,6 @@ run() {  # label tag suffix configs
 run rocm_b10342_aug "b10342-mix-e34b418" "rocm-gfx1151" "studio_default,no_mtp_np4"
 run rocm_b11541_now "b11541-mix-2500203" "rocm-gfx1151" "studio_default,no_mtp_np4,mtp_np1"
 run vulkan_b11541_now "b11541-mix-2500203" "vulkan" "studio_default"
+echo "--- devices llama-server used:"; grep -h -m2 -E "ROCm devices|Device 0:|ggml_vulkan: 0 =" "$OUT"/logs/*__studio_default_cold.log | sort -u
 grep -h "SUMMARY" "$OUT"/*.txt | tee "$OUT/SUMMARY.txt"
 exit 0

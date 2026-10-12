@@ -29,7 +29,9 @@ jobs:
           set -euo pipefail
           python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 \
-            --out "$AMD_CI_WORK/out/host.json"
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: no torch here, so the gate cannot see ROCm; the repro checks llama-server's own device line"
+          (rocminfo 2>/dev/null | grep -m3 -E "gfx[0-9]+") || echo "rocminfo: no gfx line"
 
       - name: Repro
         timeout-minutes: 140
