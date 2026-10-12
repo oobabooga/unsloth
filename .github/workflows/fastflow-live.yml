@@ -11,7 +11,7 @@ jobs:
     - Linux
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -38,42 +38,91 @@ jobs:
         git -C source checkout c6db48dd3859e8eaa73fdee3b599b321f29d0bea
 
         '
-    - name: Download Qwen3.8 and exercise live NPU runtime
-      run: "cat > \"$RUNNER_TEMP/probe.py\" <<'PYPROBE'\nimport os,sys,json,time,traceback,subprocess,pathlib,platform\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-live'\n\
-        root.mkdir(exist_ok=True)\nos.environ['UNSLOTH_HOME']=str(root/'state')\nos.environ['UNSLOTH_STUDIO_HOME']=str(root/'state'/'studio')\n\
-        os.environ['HF_HOME']=str(root/'hf')\nos.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nrepo=pathlib.Path.cwd()/'source'\n\
-        sys.path[:0]=[str(repo/'studio/backend'),str(repo/'studio')]\nfrom core.inference.npu_backend import LemonadeNpuBackend\n\
-        out=root/'evidence';out.mkdir(exist_ok=True)\nresults=[]\ndef record(name,fn):\n t=time.monotonic()\n try:\n  value=fn();entry=dict(test=name,ok=True,seconds=round(time.monotonic()-t,2),value=value)\n\
-        \ except Exception as e:\n  entry=dict(test=name,ok=False,seconds=round(time.monotonic()-t,2),error=str(e),trace=traceback.format_exc())\n\
-        \ results.append(entry);print(json.dumps(entry,default=str),flush=True)\n (out/'probe-results.json').write_text(json.dumps(results,indent=2,default=str))\n\
-        \ return entry.get('value')\nb=LemonadeNpuBackend()\nrecord('hardware',b.hardware)\nrecord('enable',b.enable)\nrecord('status',b.status)\n\
-        models=record('catalog',lambda:[m.to_json() for m in b.catalog()]) or []\ntarget=next((m for m in models if 'qwen3.8'\
-        \ in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\nprint('TARGET',target,flush=True)\nif target:\n\
-        \ (out/'target.json').write_text(json.dumps(target))\n def download():\n  last=-1\n  for e in b.download(target['id']):\n\
-        \   pc=int(e.get('percent') or 0)\n   if pc>=last+5 or e.get('event') in ('complete','error'):\n    print('DOWNLOAD',json.dumps(e),flush=True);last=pc\n\
-        \  return [m.to_json() for m in b.catalog() if m.id==target['id']]\n record('download',download)\n record('load_8192',lambda:b.load(target['id'],context_length=8192).to_json())\n\
-        \ record('resident',b.status)\n def request(body):\n  r=b._server.request('POST','/v1/chat/completions',json_body=dict(model=target['id'],max_tokens=128,temperature=0,**body),timeout=300)\n\
-        \  r.raise_for_status();return r.json()\n record('plain_chat',lambda:request({'messages':[{'role':'user','content':'What\
-        \ is 17 plus 25? Answer only the number.'}],'think':False}))\n record('multi_turn',lambda:request({'messages':[{'role':'user','content':'My\
-        \ secret word is apricot.'},{'role':'assistant','content':'Understood.'},{'role':'user','content':'What was my secret\
-        \ word? Answer one word.'}],'think':False}))\n record('reasoning',lambda:request({'messages':[{'role':'user','content':'What\
-        \ is 17 plus 25?'}],'think':True}))\n record('tool_call',lambda:request({'messages':[{'role':'user','content':'Use\
-        \ get_weather to check weather in Paris.'}],'tools':[{'type':'function','function':{'name':'get_weather','description':'Get\
-        \ weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}],'think':False}))\n\
-        \ record('json_output',lambda:request({'messages':[{'role':'user','content':'Return exactly a JSON object with the\
-        \ key answer and integer value 42.'}],'response_format':{'type':'json_object'},'think':False}))\n record('unload',b.unload)\n\
-        \ record('reload_4096',lambda:b.load(target['id'],context_length=4096).to_json())\n record('status_4096',b.status)\n\
-        \ record('unload_again',b.unload)\nelse:\n record('target_present',lambda:(_ for _ in ()).throw(RuntimeError('Qwen3.8\
-        \ 27B absent from live catalog')))\nflm=record('flm_binary',lambda:str(b._flm_binary()))\nif flm and flm!='None':\n\
-        \ for args in [['version'],['validate','--json'],['list']]:\n  record('flm_'+args[0],lambda args=args:subprocess.run([flm,*args],capture_output=True,text=True,timeout=120).__dict__)\n\
-        if b._server:(out/'lemonade-tail.txt').write_text(b._server.log_tail(200))\nb.shutdown()\n\nPYPROBE\n\"$RUNNER_TEMP/fastflow-venv/bin/python\"\
-        \ -u \"$RUNNER_TEMP/probe.py\""
-    - name: Upload evidence
+    - name: Build Studio and install Playwright
+      run: "cat > \"$RUNNER_TEMP/build_ui.py\" <<'PYSCRIPT'\nimport os,sys,pathlib,subprocess\nrepo=pathlib.Path.cwd()/'source';root=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-ui';root.mkdir(exist_ok=True)\n\
+        os.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nos.environ['PIP_CACHE_DIR']=str(root/'pip-cache');os.environ['npm_config_cache']=str(root/'npm-cache')\n\
+        def run(args,**kw):\n print('RUN',args,flush=True);subprocess.run(args,check=True,**kw)\nrun([sys.executable,'-m','pip','install','-r',str(repo/'studio/backend/requirements/studio.txt'),'requests','playwright','transformers==5.5.0','sentencepiece','safetensors'])\n\
+        run([sys.executable,'-m','pip','install','--no-deps','-e',str(repo)])\nrun([sys.executable,str(repo/'studio/install_node_prebuilt.py'),'--install-dir',str(root/'node')])\n\
+        node=root/'node'/('node.exe' if os.name=='nt' else 'bin/node')\nnpm=root/'node'/('node_modules/npm/bin/npm-cli.js'\
+        \ if os.name=='nt' else 'lib/node_modules/npm/bin/npm-cli.js')\nos.environ['PATH']=str(node.parent)+os.pathsep+os.environ['PATH']\n\
+        run([str(node),str(npm),'ci','--no-audit','--no-fund'],cwd=repo/'studio/frontend')\nrun([str(node),str(npm),'run','build'],cwd=repo/'studio/frontend')\n\
+        run([sys.executable,'-m','playwright','install','chromium'])\n\nPYSCRIPT\n\"$RUNNER_TEMP/fastflow-venv/bin/python\"\
+        \ -u \"$RUNNER_TEMP/build_ui.py\""
+    - name: Exercise Studio NPU through Chromium and live APIs
+      run: "cat > \"$RUNNER_TEMP/ui.py\" <<'PYSCRIPT'\nimport os,sys,pathlib,json,time,subprocess,traceback,secrets,re\nimport\
+        \ requests\nfrom playwright.sync_api import sync_playwright\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-ui';root.mkdir(exist_ok=True)\n\
+        out=root/'evidence';out.mkdir(exist_ok=True)\nrepo=pathlib.Path.cwd()/'source'\nenv=dict(os.environ,UNSLOTH_HOME=str(root/'state'),UNSLOTH_STUDIO_HOME=str(root/'state/studio'),HF_HOME=str(root/'hf'),UNSLOTH_STUDIO_DISABLE_TORCH_WARM='1',UNSLOTH_STUDIO_PASSWORD=secrets.token_urlsafe(24),UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT='0',UNSLOTH_DISABLE_UPDATE_CHECK='1',PYTHONUTF8='1')\n\
+        base='http://127.0.0.1:8871'\nlog=open(out/'studio.log','w',encoding='utf-8')\nproc=subprocess.Popen([sys.executable,str(repo/'studio/backend/run.py'),'--host','127.0.0.1','--port','8871','--frontend',str(repo/'studio/frontend/dist'),'--no-cloudflare'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        results=[];page=None;session=requests.Session()\ndef result(name,fn):\n t=time.monotonic()\n try:\n  value=fn();row={'test':name,'ok':True,'seconds':round(time.monotonic()-t,2),'value':value}\n\
+        \ except Exception as e:\n  row={'test':name,'ok':False,'seconds':round(time.monotonic()-t,2),'error':str(e),'trace':traceback.format_exc()}\n\
+        \ print(json.dumps(row,default=str),flush=True);results.append(row)\n (out/'results.json').write_text(json.dumps(results,indent=2,default=str),encoding='utf-8')\n\
+        \ if page:\n  try:\n   page.screenshot(path=str(out/(name+'.png')),full_page=True,timeout=15000)\n   (out/(name+'.txt')).write_text(page.locator('body').inner_text(timeout=10000),encoding='utf-8')\n\
+        \  except Exception:pass\n return row.get('value')\ndef api(method,path,**kw):\n r=session.request(method,base+path,timeout=kw.pop('timeout',300),**kw);r.raise_for_status();return\
+        \ r.json()\ndef poll(fn,timeout=180):\n until=time.monotonic()+timeout\n while time.monotonic()<until:\n  try:\n \
+        \  value=fn()\n   if value:return value\n  except (requests.RequestException,ValueError):pass\n  time.sleep(2)\n raise\
+        \ TimeoutError('Timed out waiting for live state')\ntry:\n result('startup',lambda:poll(lambda:requests.get(base+'/api/health',timeout=5).status_code==200,180))\n\
+        \ if proc.poll() is not None:raise RuntimeError('Studio exited: '+(out/'studio.log').read_text()[-5000:])\n with sync_playwright()\
+        \ as pw:\n  browser=pw.chromium.launch(headless=True,args=['--no-sandbox'])\n  context=browser.new_context(viewport={'width':1440,'height':1000})\n\
+        \  context.tracing.start(screenshots=True,snapshots=True,sources=False)\n  page=context.new_page();page.set_default_timeout(20000)\n\
+        \  errors=[];page.on('pageerror',lambda e:errors.append(str(e)))\n  network=[]\n  page.on('response',lambda r:network.append({'url':r.url,'status':r.status})\
+        \ if '/api/npu' in r.url or '/api/inference/' in r.url else None)\n  def login():\n   page.goto(base+'/chat');page.get_by_label('Password',exact=True).fill(env['UNSLOTH_STUDIO_PASSWORD']);page.get_by_role('button',name='Login',exact=True).click();page.get_by_role('button',name='Select\
+        \ model',exact=True).wait_for(timeout=60000)\n   token=page.evaluate('localStorage.getItem(\"unsloth_auth_token\"\
+        )');assert token\n   session.headers['Authorization']='Bearer '+token\n   return {'url':page.url}\n  result('ui_login',login)\n\
+        \  result('npu_initial_status',lambda:api('GET','/api/npu/status'))\n  def hub():\n   page.get_by_role('button',name='More',exact=True).click();page.get_by_role('menuitem',name='Model\
+        \ hub',exact=True).click();page.get_by_label('Format filter',exact=True).click();page.get_by_role('option',name='NPU',exact=True).click()\n\
+        \   return page.locator('body').inner_text()\n  result('ui_hub_npu',hub)\n  def enable():\n   page.get_by_role('button',name='Enable\
+        \ NPU',exact=True).click()\n   status=poll(lambda:(lambda s:s if s['state'] in ('ready','failed') else None)(api('GET','/api/npu/status')),1200)\n\
+        \   assert status['ready'],status\n   page.get_by_test_id('hub-npu-row').first.wait_for(timeout=60000)\n   return\
+        \ status\n  result('ui_enable',enable)\n  catalog=result('live_catalog',lambda:api('GET','/api/npu/models')) or {}\n\
+        \  model=next((m for m in catalog.get('models',[]) if 'qwen3.8' in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\n\
+        \  if not model:raise RuntimeError('Qwen3.8 27B missing from NPU catalog')\n  mid=model['id'];modelpath=model['model_path'];row=page.get_by_test_id('hub-npu-row').filter(has=page.get_by_text(mid,exact=True))\n\
+        \  def download():\n   row.get_by_role('button',name='Download',exact=True).click();time.sleep(5)\n   active=api('GET','/api/npu/downloads');print('DOWNLOAD_ACTIVE',json.dumps(active),flush=True)\n\
+        \   page.screenshot(path=str(out/'download-start.png'),full_page=True)\n   page.reload();page.get_by_test_id('hub-npu-catalog').wait_for(timeout=60000)\n\
+        \   last=-1;deadline=time.monotonic()+2400\n   while time.monotonic()<deadline:\n    rows=api('GET','/api/npu/models')['models'];current=next(x\
+        \ for x in rows if x['id']==mid)\n    if current['downloaded']:break\n    downloads=api('GET','/api/npu/downloads');print('DOWNLOAD_PROGRESS',json.dumps(downloads),flush=True);time.sleep(15)\n\
+        \   else:raise TimeoutError('Model download did not complete')\n   row.get_by_role('button',name='Run',exact=True).wait_for(timeout=60000)\n\
+        \   return current\n  result('ui_download_reload_reconnect',download)\n  def run():\n   row.get_by_role('button',name='Run',exact=True).click();time.sleep(2)\n\
+        \   print('RUN_SCREEN',page.locator('body').inner_text()[-9000:],flush=True)\n   for label in ['Load','Load model','Run']:\n\
+        \    button=page.get_by_role('button',name=label,exact=True)\n    if button.count() and button.first.is_visible():button.first.click();break\n\
+        \   status=poll(lambda:(lambda s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n\
+        \   return status\n  result('ui_load',run)\n  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message\
+        \ input',exact=True).fill(prompt)\n   page.get_by_role('button',name='Send message (Enter)',exact=True).click()\n\
+        \   page.get_by_role('button',name='Stop generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop\
+        \ generating',exact=True).wait_for(state='hidden',timeout=300000)\n   text=page.locator('body').inner_text()\n   if\
+        \ expected:assert expected.lower() in text.lower(),text\n   return text[-10000:]\n  result('ui_chat',lambda:chat('What\
+        \ is 17 plus 25? Answer only the number. /no_think','42'))\n  result('ui_followup',lambda:chat('What arithmetic question\
+        \ did I just ask? /no_think','17'))\n  result('ui_reload_chat',lambda:(page.reload(),page.get_by_role('textbox',name='Message\
+        \ input').wait_for(timeout=60000),page.locator('body').inner_text()[-10000:])[-1])\n  def completion(extra):\n   body={'model':modelpath,'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25? Reply only with the number.'}],'max_tokens':128,'temperature':0,'enable_thinking':False};body.update(extra)\n\
+        \   data=api('POST','/v1/chat/completions',json=body)\n   assert data.get('choices'),data\n   return data\n  result('openai_models',lambda:api('GET','/v1/models'))\n\
+        \  result('openai_nonstream',lambda:completion({}))\n  result('openai_reasoning',lambda:completion({'enable_thinking':True,'max_tokens':256}))\n\
+        \  result('openai_json',lambda:completion({'messages':[{'role':'user','content':'Return exactly {\"answer\":42} as\
+        \ JSON.'}],'response_format':{'type':'json_object'}}))\n  tool={'type':'function','function':{'name':'get_weather','description':'Get\
+        \ current weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}\n\
+        \  tool_data=result('openai_tool_call',lambda:completion({'messages':[{'role':'user','content':'Use get_weather to\
+        \ check the weather in Paris.'}],'tools':[tool],'max_tokens':256}))\n  if tool_data and tool_data['choices'][0]['message'].get('tool_calls'):\n\
+        \   msg=tool_data['choices'][0]['message'];calls=msg['tool_calls']\n   result('openai_tool_roundtrip',lambda:completion({'messages':[{'role':'user','content':'Use\
+        \ get_weather to check the weather in Paris.'},msg,*[{'role':'tool','tool_call_id':c['id'],'content':'{\"temperature_c\"\
+        :21,\"condition\":\"sunny\"}'} for c in calls]],'tools':[tool]}))\n  def stream(cancel=False):\n   body={'model':modelpath,'messages':[{'role':'user','content':'Count\
+        \ from 1 to 100.' if cancel else 'What is 17 plus 25? Answer with just the number.'}],'max_tokens':256 if cancel else\
+        \ 64,'temperature':0,'enable_thinking':False,'stream':True,'stream_options':{'include_usage':True}}\n   lines=[]\n\
+        \   with session.post(base+'/v1/chat/completions',json=body,stream=True,timeout=300) as r:\n    r.raise_for_status()\n\
+        \    for line in r.iter_lines():\n     if line:lines.append(line.decode())\n     if cancel and len(lines)>=5:break\n\
+        \   assert lines,lines\n   if not cancel:assert any('[DONE]' in x for x in lines),lines\n   return lines\n  result('openai_stream',stream)\n\
+        \  result('openai_cancel',lambda:stream(True))\n  result('after_cancel',lambda:completion({}))\n  result('anthropic_messages',lambda:api('POST','/v1/messages',json={'model':modelpath,'max_tokens':64,'messages':[{'role':'user','content':'Say\
+        \ hello briefly.'}]}))\n  result('unload',lambda:api('POST','/api/inference/unload',json={'model_path':modelpath}))\n\
+        \  result('reload_context_4096',lambda:api('POST','/api/inference/load',timeout=1000,json={'model_path':modelpath,'max_seq_length':4096}))\n\
+        \  result('context_status_4096',lambda:api('GET','/api/npu/status'))\n  result('chat_after_reload',lambda:completion({}))\n\
+        \  result('unload_final',lambda:api('POST','/api/inference/unload',json={'model_path':modelpath}))\n  (out/'browser-errors.json').write_text(json.dumps(errors,indent=2));(out/'network.json').write_text(json.dumps(network,indent=2))\n\
+        \  context.tracing.stop(path=str(out/'trace.zip'));browser.close()\nexcept Exception as e:\n result('fatal',lambda:(_\
+        \ for _ in ()).throw(e))\nfinally:\n proc.terminate()\n try:proc.wait(timeout=30)\n except subprocess.TimeoutExpired:proc.kill()\n\
+        \ log.close()\n\nPYSCRIPT\n\"$RUNNER_TEMP/fastflow-venv/bin/python\" -u \"$RUNNER_TEMP/ui.py\""
+    - name: Upload browser and API evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fastflow-linux
-        path: ${{ runner.temp }}/fastflow-live/evidence
+        name: fastflow-ui-linux
+        path: ${{ runner.temp }}/fastflow-ui/evidence
         retention-days: 7
   windows:
     runs-on:
@@ -81,7 +130,7 @@ jobs:
     - Windows
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: powershell
@@ -106,40 +155,91 @@ jobs:
         git -C source checkout c6db48dd3859e8eaa73fdee3b599b321f29d0bea
 
         '
-    - name: Download Qwen3.8 and exercise live NPU runtime
-      run: "@'\nimport os,sys,json,time,traceback,subprocess,pathlib,platform\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-live'\n\
-        root.mkdir(exist_ok=True)\nos.environ['UNSLOTH_HOME']=str(root/'state')\nos.environ['UNSLOTH_STUDIO_HOME']=str(root/'state'/'studio')\n\
-        os.environ['HF_HOME']=str(root/'hf')\nos.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nrepo=pathlib.Path.cwd()/'source'\n\
-        sys.path[:0]=[str(repo/'studio/backend'),str(repo/'studio')]\nfrom core.inference.npu_backend import LemonadeNpuBackend\n\
-        out=root/'evidence';out.mkdir(exist_ok=True)\nresults=[]\ndef record(name,fn):\n t=time.monotonic()\n try:\n  value=fn();entry=dict(test=name,ok=True,seconds=round(time.monotonic()-t,2),value=value)\n\
-        \ except Exception as e:\n  entry=dict(test=name,ok=False,seconds=round(time.monotonic()-t,2),error=str(e),trace=traceback.format_exc())\n\
-        \ results.append(entry);print(json.dumps(entry,default=str),flush=True)\n (out/'probe-results.json').write_text(json.dumps(results,indent=2,default=str))\n\
-        \ return entry.get('value')\nb=LemonadeNpuBackend()\nrecord('hardware',b.hardware)\nrecord('enable',b.enable)\nrecord('status',b.status)\n\
-        models=record('catalog',lambda:[m.to_json() for m in b.catalog()]) or []\ntarget=next((m for m in models if 'qwen3.8'\
-        \ in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\nprint('TARGET',target,flush=True)\nif target:\n\
-        \ (out/'target.json').write_text(json.dumps(target))\n def download():\n  last=-1\n  for e in b.download(target['id']):\n\
-        \   pc=int(e.get('percent') or 0)\n   if pc>=last+5 or e.get('event') in ('complete','error'):\n    print('DOWNLOAD',json.dumps(e),flush=True);last=pc\n\
-        \  return [m.to_json() for m in b.catalog() if m.id==target['id']]\n record('download',download)\n record('load_8192',lambda:b.load(target['id'],context_length=8192).to_json())\n\
-        \ record('resident',b.status)\n def request(body):\n  r=b._server.request('POST','/v1/chat/completions',json_body=dict(model=target['id'],max_tokens=128,temperature=0,**body),timeout=300)\n\
-        \  r.raise_for_status();return r.json()\n record('plain_chat',lambda:request({'messages':[{'role':'user','content':'What\
-        \ is 17 plus 25? Answer only the number.'}],'think':False}))\n record('multi_turn',lambda:request({'messages':[{'role':'user','content':'My\
-        \ secret word is apricot.'},{'role':'assistant','content':'Understood.'},{'role':'user','content':'What was my secret\
-        \ word? Answer one word.'}],'think':False}))\n record('reasoning',lambda:request({'messages':[{'role':'user','content':'What\
-        \ is 17 plus 25?'}],'think':True}))\n record('tool_call',lambda:request({'messages':[{'role':'user','content':'Use\
-        \ get_weather to check weather in Paris.'}],'tools':[{'type':'function','function':{'name':'get_weather','description':'Get\
-        \ weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}],'think':False}))\n\
-        \ record('json_output',lambda:request({'messages':[{'role':'user','content':'Return exactly a JSON object with the\
-        \ key answer and integer value 42.'}],'response_format':{'type':'json_object'},'think':False}))\n record('unload',b.unload)\n\
-        \ record('reload_4096',lambda:b.load(target['id'],context_length=4096).to_json())\n record('status_4096',b.status)\n\
-        \ record('unload_again',b.unload)\nelse:\n record('target_present',lambda:(_ for _ in ()).throw(RuntimeError('Qwen3.8\
-        \ 27B absent from live catalog')))\nflm=record('flm_binary',lambda:str(b._flm_binary()))\nif flm and flm!='None':\n\
-        \ for args in [['version'],['validate','--json'],['list']]:\n  record('flm_'+args[0],lambda args=args:subprocess.run([flm,*args],capture_output=True,text=True,timeout=120).__dict__)\n\
-        if b._server:(out/'lemonade-tail.txt').write_text(b._server.log_tail(200))\nb.shutdown()\n\n'@ | Set-Content -Encoding\
-        \ UTF8 \"$env:RUNNER_TEMP/probe.py\"\n& \"$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe\" -u \"$env:RUNNER_TEMP/probe.py\""
-    - name: Upload evidence
+    - name: Build Studio and install Playwright
+      run: "@'\nimport os,sys,pathlib,subprocess\nrepo=pathlib.Path.cwd()/'source';root=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-ui';root.mkdir(exist_ok=True)\n\
+        os.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nos.environ['PIP_CACHE_DIR']=str(root/'pip-cache');os.environ['npm_config_cache']=str(root/'npm-cache')\n\
+        def run(args,**kw):\n print('RUN',args,flush=True);subprocess.run(args,check=True,**kw)\nrun([sys.executable,'-m','pip','install','-r',str(repo/'studio/backend/requirements/studio.txt'),'requests','playwright','transformers==5.5.0','sentencepiece','safetensors'])\n\
+        run([sys.executable,'-m','pip','install','--no-deps','-e',str(repo)])\nrun([sys.executable,str(repo/'studio/install_node_prebuilt.py'),'--install-dir',str(root/'node')])\n\
+        node=root/'node'/('node.exe' if os.name=='nt' else 'bin/node')\nnpm=root/'node'/('node_modules/npm/bin/npm-cli.js'\
+        \ if os.name=='nt' else 'lib/node_modules/npm/bin/npm-cli.js')\nos.environ['PATH']=str(node.parent)+os.pathsep+os.environ['PATH']\n\
+        run([str(node),str(npm),'ci','--no-audit','--no-fund'],cwd=repo/'studio/frontend')\nrun([str(node),str(npm),'run','build'],cwd=repo/'studio/frontend')\n\
+        run([sys.executable,'-m','playwright','install','chromium'])\n\n'@ | Set-Content -Encoding UTF8 \"$env:RUNNER_TEMP/build_ui.py\"\
+        \n& \"$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe\" -u \"$env:RUNNER_TEMP/build_ui.py\"\nif ($LASTEXITCODE -ne\
+        \ 0) { exit $LASTEXITCODE }"
+    - name: Exercise Studio NPU through Chromium and live APIs
+      run: "@'\nimport os,sys,pathlib,json,time,subprocess,traceback,secrets,re\nimport requests\nfrom playwright.sync_api\
+        \ import sync_playwright\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-ui';root.mkdir(exist_ok=True)\nout=root/'evidence';out.mkdir(exist_ok=True)\n\
+        repo=pathlib.Path.cwd()/'source'\nenv=dict(os.environ,UNSLOTH_HOME=str(root/'state'),UNSLOTH_STUDIO_HOME=str(root/'state/studio'),HF_HOME=str(root/'hf'),UNSLOTH_STUDIO_DISABLE_TORCH_WARM='1',UNSLOTH_STUDIO_PASSWORD=secrets.token_urlsafe(24),UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT='0',UNSLOTH_DISABLE_UPDATE_CHECK='1',PYTHONUTF8='1')\n\
+        base='http://127.0.0.1:8871'\nlog=open(out/'studio.log','w',encoding='utf-8')\nproc=subprocess.Popen([sys.executable,str(repo/'studio/backend/run.py'),'--host','127.0.0.1','--port','8871','--frontend',str(repo/'studio/frontend/dist'),'--no-cloudflare'],env=env,stdout=log,stderr=subprocess.STDOUT)\n\
+        results=[];page=None;session=requests.Session()\ndef result(name,fn):\n t=time.monotonic()\n try:\n  value=fn();row={'test':name,'ok':True,'seconds':round(time.monotonic()-t,2),'value':value}\n\
+        \ except Exception as e:\n  row={'test':name,'ok':False,'seconds':round(time.monotonic()-t,2),'error':str(e),'trace':traceback.format_exc()}\n\
+        \ print(json.dumps(row,default=str),flush=True);results.append(row)\n (out/'results.json').write_text(json.dumps(results,indent=2,default=str),encoding='utf-8')\n\
+        \ if page:\n  try:\n   page.screenshot(path=str(out/(name+'.png')),full_page=True,timeout=15000)\n   (out/(name+'.txt')).write_text(page.locator('body').inner_text(timeout=10000),encoding='utf-8')\n\
+        \  except Exception:pass\n return row.get('value')\ndef api(method,path,**kw):\n r=session.request(method,base+path,timeout=kw.pop('timeout',300),**kw);r.raise_for_status();return\
+        \ r.json()\ndef poll(fn,timeout=180):\n until=time.monotonic()+timeout\n while time.monotonic()<until:\n  try:\n \
+        \  value=fn()\n   if value:return value\n  except (requests.RequestException,ValueError):pass\n  time.sleep(2)\n raise\
+        \ TimeoutError('Timed out waiting for live state')\ntry:\n result('startup',lambda:poll(lambda:requests.get(base+'/api/health',timeout=5).status_code==200,180))\n\
+        \ if proc.poll() is not None:raise RuntimeError('Studio exited: '+(out/'studio.log').read_text()[-5000:])\n with sync_playwright()\
+        \ as pw:\n  browser=pw.chromium.launch(headless=True,args=['--no-sandbox'])\n  context=browser.new_context(viewport={'width':1440,'height':1000})\n\
+        \  context.tracing.start(screenshots=True,snapshots=True,sources=False)\n  page=context.new_page();page.set_default_timeout(20000)\n\
+        \  errors=[];page.on('pageerror',lambda e:errors.append(str(e)))\n  network=[]\n  page.on('response',lambda r:network.append({'url':r.url,'status':r.status})\
+        \ if '/api/npu' in r.url or '/api/inference/' in r.url else None)\n  def login():\n   page.goto(base+'/chat');page.get_by_label('Password',exact=True).fill(env['UNSLOTH_STUDIO_PASSWORD']);page.get_by_role('button',name='Login',exact=True).click();page.get_by_role('button',name='Select\
+        \ model',exact=True).wait_for(timeout=60000)\n   token=page.evaluate('localStorage.getItem(\"unsloth_auth_token\"\
+        )');assert token\n   session.headers['Authorization']='Bearer '+token\n   return {'url':page.url}\n  result('ui_login',login)\n\
+        \  result('npu_initial_status',lambda:api('GET','/api/npu/status'))\n  def hub():\n   page.get_by_role('button',name='More',exact=True).click();page.get_by_role('menuitem',name='Model\
+        \ hub',exact=True).click();page.get_by_label('Format filter',exact=True).click();page.get_by_role('option',name='NPU',exact=True).click()\n\
+        \   return page.locator('body').inner_text()\n  result('ui_hub_npu',hub)\n  def enable():\n   page.get_by_role('button',name='Enable\
+        \ NPU',exact=True).click()\n   status=poll(lambda:(lambda s:s if s['state'] in ('ready','failed') else None)(api('GET','/api/npu/status')),1200)\n\
+        \   assert status['ready'],status\n   page.get_by_test_id('hub-npu-row').first.wait_for(timeout=60000)\n   return\
+        \ status\n  result('ui_enable',enable)\n  catalog=result('live_catalog',lambda:api('GET','/api/npu/models')) or {}\n\
+        \  model=next((m for m in catalog.get('models',[]) if 'qwen3.8' in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\n\
+        \  if not model:raise RuntimeError('Qwen3.8 27B missing from NPU catalog')\n  mid=model['id'];modelpath=model['model_path'];row=page.get_by_test_id('hub-npu-row').filter(has=page.get_by_text(mid,exact=True))\n\
+        \  def download():\n   row.get_by_role('button',name='Download',exact=True).click();time.sleep(5)\n   active=api('GET','/api/npu/downloads');print('DOWNLOAD_ACTIVE',json.dumps(active),flush=True)\n\
+        \   page.screenshot(path=str(out/'download-start.png'),full_page=True)\n   page.reload();page.get_by_test_id('hub-npu-catalog').wait_for(timeout=60000)\n\
+        \   last=-1;deadline=time.monotonic()+2400\n   while time.monotonic()<deadline:\n    rows=api('GET','/api/npu/models')['models'];current=next(x\
+        \ for x in rows if x['id']==mid)\n    if current['downloaded']:break\n    downloads=api('GET','/api/npu/downloads');print('DOWNLOAD_PROGRESS',json.dumps(downloads),flush=True);time.sleep(15)\n\
+        \   else:raise TimeoutError('Model download did not complete')\n   row.get_by_role('button',name='Run',exact=True).wait_for(timeout=60000)\n\
+        \   return current\n  result('ui_download_reload_reconnect',download)\n  def run():\n   row.get_by_role('button',name='Run',exact=True).click();time.sleep(2)\n\
+        \   print('RUN_SCREEN',page.locator('body').inner_text()[-9000:],flush=True)\n   for label in ['Load','Load model','Run']:\n\
+        \    button=page.get_by_role('button',name=label,exact=True)\n    if button.count() and button.first.is_visible():button.first.click();break\n\
+        \   status=poll(lambda:(lambda s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n\
+        \   return status\n  result('ui_load',run)\n  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message\
+        \ input',exact=True).fill(prompt)\n   page.get_by_role('button',name='Send message (Enter)',exact=True).click()\n\
+        \   page.get_by_role('button',name='Stop generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop\
+        \ generating',exact=True).wait_for(state='hidden',timeout=300000)\n   text=page.locator('body').inner_text()\n   if\
+        \ expected:assert expected.lower() in text.lower(),text\n   return text[-10000:]\n  result('ui_chat',lambda:chat('What\
+        \ is 17 plus 25? Answer only the number. /no_think','42'))\n  result('ui_followup',lambda:chat('What arithmetic question\
+        \ did I just ask? /no_think','17'))\n  result('ui_reload_chat',lambda:(page.reload(),page.get_by_role('textbox',name='Message\
+        \ input').wait_for(timeout=60000),page.locator('body').inner_text()[-10000:])[-1])\n  def completion(extra):\n   body={'model':modelpath,'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25? Reply only with the number.'}],'max_tokens':128,'temperature':0,'enable_thinking':False};body.update(extra)\n\
+        \   data=api('POST','/v1/chat/completions',json=body)\n   assert data.get('choices'),data\n   return data\n  result('openai_models',lambda:api('GET','/v1/models'))\n\
+        \  result('openai_nonstream',lambda:completion({}))\n  result('openai_reasoning',lambda:completion({'enable_thinking':True,'max_tokens':256}))\n\
+        \  result('openai_json',lambda:completion({'messages':[{'role':'user','content':'Return exactly {\"answer\":42} as\
+        \ JSON.'}],'response_format':{'type':'json_object'}}))\n  tool={'type':'function','function':{'name':'get_weather','description':'Get\
+        \ current weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}\n\
+        \  tool_data=result('openai_tool_call',lambda:completion({'messages':[{'role':'user','content':'Use get_weather to\
+        \ check the weather in Paris.'}],'tools':[tool],'max_tokens':256}))\n  if tool_data and tool_data['choices'][0]['message'].get('tool_calls'):\n\
+        \   msg=tool_data['choices'][0]['message'];calls=msg['tool_calls']\n   result('openai_tool_roundtrip',lambda:completion({'messages':[{'role':'user','content':'Use\
+        \ get_weather to check the weather in Paris.'},msg,*[{'role':'tool','tool_call_id':c['id'],'content':'{\"temperature_c\"\
+        :21,\"condition\":\"sunny\"}'} for c in calls]],'tools':[tool]}))\n  def stream(cancel=False):\n   body={'model':modelpath,'messages':[{'role':'user','content':'Count\
+        \ from 1 to 100.' if cancel else 'What is 17 plus 25? Answer with just the number.'}],'max_tokens':256 if cancel else\
+        \ 64,'temperature':0,'enable_thinking':False,'stream':True,'stream_options':{'include_usage':True}}\n   lines=[]\n\
+        \   with session.post(base+'/v1/chat/completions',json=body,stream=True,timeout=300) as r:\n    r.raise_for_status()\n\
+        \    for line in r.iter_lines():\n     if line:lines.append(line.decode())\n     if cancel and len(lines)>=5:break\n\
+        \   assert lines,lines\n   if not cancel:assert any('[DONE]' in x for x in lines),lines\n   return lines\n  result('openai_stream',stream)\n\
+        \  result('openai_cancel',lambda:stream(True))\n  result('after_cancel',lambda:completion({}))\n  result('anthropic_messages',lambda:api('POST','/v1/messages',json={'model':modelpath,'max_tokens':64,'messages':[{'role':'user','content':'Say\
+        \ hello briefly.'}]}))\n  result('unload',lambda:api('POST','/api/inference/unload',json={'model_path':modelpath}))\n\
+        \  result('reload_context_4096',lambda:api('POST','/api/inference/load',timeout=1000,json={'model_path':modelpath,'max_seq_length':4096}))\n\
+        \  result('context_status_4096',lambda:api('GET','/api/npu/status'))\n  result('chat_after_reload',lambda:completion({}))\n\
+        \  result('unload_final',lambda:api('POST','/api/inference/unload',json={'model_path':modelpath}))\n  (out/'browser-errors.json').write_text(json.dumps(errors,indent=2));(out/'network.json').write_text(json.dumps(network,indent=2))\n\
+        \  context.tracing.stop(path=str(out/'trace.zip'));browser.close()\nexcept Exception as e:\n result('fatal',lambda:(_\
+        \ for _ in ()).throw(e))\nfinally:\n proc.terminate()\n try:proc.wait(timeout=30)\n except subprocess.TimeoutExpired:proc.kill()\n\
+        \ log.close()\n\n'@ | Set-Content -Encoding UTF8 \"$env:RUNNER_TEMP/ui.py\"\n& \"$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe\"\
+        \ -u \"$env:RUNNER_TEMP/ui.py\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    - name: Upload browser and API evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fastflow-windows
-        path: ${{ runner.temp }}/fastflow-live/evidence
+        name: fastflow-ui-windows
+        path: ${{ runner.temp }}/fastflow-ui/evidence
         retention-days: 7
