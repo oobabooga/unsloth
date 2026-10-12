@@ -103,22 +103,28 @@ IDB = body([{"role": "system", "content": "You are Bob, a helpful assistant from
             {"role": "user", "content": "Who are you? Answer in one sentence."}], None, 300)
 
 
-def identity_rounds(port, n):
+def identity_rounds(port, n, no_think=False):
     """Upstream ggml-org/llama.cpp#27422 shape: B must never call itself Machine 1."""
+    ida, idb = dict(IDA), dict(IDB)
+    if no_think:
+        for b in (ida, idb):
+            b["chat_template_kwargs"] = {"enable_thinking": False}
+            b["max_tokens"] = 80
     hits = []
     for i in range(n):
         if i % 2 == 0:
-            post(port, IDA)
-            b = post(port, IDB)
+            post(port, ida)
+            b = post(port, idb)
         else:
             with cf.ThreadPoolExecutor(2) as ex:
-                fa = ex.submit(post, port, IDA)
+                fa = ex.submit(post, port, ida)
                 time.sleep(0.05)
-                fb = ex.submit(post, port, IDB)
+                fb = ex.submit(post, port, idb)
                 fa.result()
                 b = fb.result()
         leak = "machine 1" in (b["content"] + b["reasoning"]).lower()
-        hits.append({"i": i, "concurrent": i % 2 == 1, "leak": leak, "content": b["content"][:200]})
+        bob = "bob" in b["content"].lower()
+        hits.append({"i": i, "concurrent": i % 2 == 1, "leak": leak, "bob": bob, "content": b["content"][:200]})
     return hits
 
 
@@ -140,8 +146,9 @@ def run_config(a, name, results):
             oc_bad = [x[1]["content"][:60] for x in ocs[1:] if title_like(x[1])]
             print(f"[{name}] rep{rep} oc_main_title_like={oc_bad} pi_title_like={title_like(w)} oc_main={[x[1]['content'][:60] for x in ocs]} "
                   f"pi_same_as_cold={w['content'] == cold['content']} pi={w['content'][:120]!r}", flush=True)
-        idr = identity_rounds(a.port, a.identity_rounds)
-        print(f"[{name}] identity leaks={sum(h['leak'] for h in idr)}/{len(idr)} sample={idr[0]['content'][:100]!r}", flush=True)
+        idr = identity_rounds(a.port, a.identity_rounds, a.no_think)
+        print(f"[{name}] identity leaks={sum(h['leak'] for h in idr)}/{len(idr)} answered_as_bob={sum(h['bob'] for h in idr)} "
+              f"sample={idr[0]['content'][:100]!r}", flush=True)
     finally:
         s.stop()
     results[name] = {"identity": idr, "cold": cold, "cold_repeat_same": cold2["content"] == cold["content"], "warm": warm}
@@ -157,6 +164,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--port", type=int, default=18542)
     ap.add_argument("--identity-rounds", type=int, default=10)
+    ap.add_argument("--no-think", action="store_true", help="identity rounds with enable_thinking=false")
     ap.add_argument("--out", required=True)
     ap.add_argument("--logdir", required=True)
     a = ap.parse_args()
@@ -173,6 +181,8 @@ def main():
                                      "pi_title_like": [title_like(w["pi"]) for w in v["warm"]],
                                      "oc_main_title_like": sum(title_like(x[1]) for w in v["warm"] for x in w["oc"][1:]),
                                      "identity_leaks": sum(h["leak"] for h in v["identity"]),
+                                     "identity_bob": sum(h.get("bob", False) for h in v["identity"]),
+                                     "identity_n": len(v["identity"]),
                                      "cold_garbage": garbage(v["cold"]),
                                      "warm_garbage": sum(garbage(x) for w in v["warm"] for pair in w["oc"] for x in pair)
                                      + sum(garbage(w["pi"]) for w in v["warm"]),

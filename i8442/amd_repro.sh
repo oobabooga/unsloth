@@ -34,11 +34,11 @@ run() {  # label tag suffix configs
   LD_LIBRARY_PATH="$libpath" "$bin" --version 2>&1 | tail -3
   mkdir -p "$OUT/logs/$label"
   LD_LIBRARY_PATH="$libpath" timeout 3000 python3 -u i8442/raw_server_diff.py \
-    --binary "$bin" --model "$MODEL" --configs "$4" --repeats 3 --identity-rounds 10 \
+    --binary "$bin" --model "$MODEL" --configs "$4" --repeats 2 --identity-rounds 20 --no-think \
     --out "$OUT/$label.json" --logdir "$OUT/logs/$label" 2>&1 | tee "$OUT/$label.txt"
 }
-run rocm_b11541_now "b11541-mix-2500203" "rocm-gfx1151" "studio_default,no_mtp_np4,no_mtp_np4_split,no_mtp_np1"
-run rocm_b10342_aug "b10342-mix-e34b418" "rocm-gfx1151" "studio_default,no_mtp_np4,no_mtp_np4_split,no_mtp_np1"
+run rocm_b11541_now "b11541-mix-2500203" "rocm-gfx1151" "studio_default,no_mtp_np4"
+run rocm_b10342_aug "b10342-mix-e34b418" "rocm-gfx1151" "studio_default,no_mtp_np4_split"
 run vulkan_b11541_now "b11541-mix-2500203" "vulkan" "studio_default"
 echo "--- devices llama-server used:"; for f in "$OUT"/logs/*/studio_default_cold.log; do echo "$f"; grep -m3 -E "ROCm devices|Device 0:|ggml_vulkan: 0 =|ROCm error|rocBLAS error" "$f"; done
 for f in "$OUT"/*.txt; do echo "$f"; grep -h "SUMMARY" "$f"; done | tee "$OUT/SUMMARY.txt"
