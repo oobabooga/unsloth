@@ -88,19 +88,19 @@ jobs:
         \   return current\n  result('ui_download_reload_reconnect',download)\n  def run():\n   row.get_by_role('button',name='Run',exact=True).click();time.sleep(3)\n\
         \   load_button=page.get_by_role('button',name='Load model',exact=True)\n   if not load_button.is_visible():\n   \
         \ page.screenshot(path=str(out/'hub-run-missing-picker.png'),full_page=True)\n    page.get_by_role('button',name='Select\
-        \ model',exact=True).click()\n    page.get_by_placeholder('Search Unsloth models',exact=True).fill(mid)\n    page.get_by_text(mid,exact=True).wait_for(timeout=60000)\n\
-        \    page.screenshot(path=str(out/'npu-picker-search.png'),full_page=True)\n    settings=page.get_by_role('button',name='Inference\
-        \ settings for '+mid,exact=True)\n    if settings.is_visible():\n     settings.click()\n     page.screenshot(path=str(out/'npu-run-settings.png'),full_page=True)\n\
-        \     load_button.click(timeout=60000)\n    else:\n     page.get_by_text(mid,exact=True).click()\n   else:load_button.click()\n\
-        \   status=poll(lambda:(lambda s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n\
-        \   return status\n  result('ui_load',run)\n  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message\
-        \ input',exact=True).fill(prompt)\n   page.get_by_role('textbox',name='Message input',exact=True).press('Enter')\n\
-        \   page.get_by_role('button',name='Stop generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop\
-        \ generating',exact=True).wait_for(state='hidden',timeout=300000)\n   text=page.locator('[data-role=assistant]').last.inner_text()\n\
-        \   if expected:assert expected.lower() in text.lower(),text\n   return text[-10000:]\n  result('ui_chat',lambda:chat('What\
-        \ is 17 plus 25? Answer only the number. /no_think','42'))\n  result('ui_followup',lambda:chat('What arithmetic question\
-        \ did I just ask? /no_think','17'))\n  def thinking_toggle():\n   toggle=page.locator('button[data-pill-label=\"Thinking\"\
-        ]')\n   before=toggle.get_attribute('data-active');toggle.click();after=toggle.get_attribute('data-active');assert\
+        \ model',exact=True).click()\n    page.get_by_role('tab',name='Recommended',exact=True).click()\n    page.locator('input[data-model-picker-search-input]').fill(mid)\n\
+        \    page.get_by_text(mid,exact=True).wait_for(timeout=60000)\n    page.screenshot(path=str(out/'npu-picker-search.png'),full_page=True)\n\
+        \    settings=page.get_by_role('button',name='Inference settings for '+mid,exact=True)\n    if settings.is_visible():\n\
+        \     settings.click()\n     page.screenshot(path=str(out/'npu-run-settings.png'),full_page=True)\n     load_button.click(timeout=60000)\n\
+        \    else:\n     page.get_by_text(mid,exact=True).click()\n   else:load_button.click()\n   status=poll(lambda:(lambda\
+        \ s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n   return status\n  result('ui_load',run)\n\
+        \  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message input',exact=True).fill(prompt)\n\
+        \   page.get_by_role('textbox',name='Message input',exact=True).press('Enter')\n   page.get_by_role('button',name='Stop\
+        \ generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop generating',exact=True).wait_for(state='hidden',timeout=300000)\n\
+        \   text=page.locator('[data-role=assistant]').last.inner_text()\n   if expected:assert expected.lower() in text.lower(),text\n\
+        \   return text[-10000:]\n  result('ui_chat',lambda:chat('What is 17 plus 25? Answer only the number. /no_think','42'))\n\
+        \  result('ui_followup',lambda:chat('What arithmetic question did I just ask? /no_think','17'))\n  def thinking_toggle():\n\
+        \   toggle=page.locator('button[data-pill-label=\"Thinking\"]')\n   before=toggle.get_attribute('data-active');toggle.click();after=toggle.get_attribute('data-active');assert\
         \ before!=after,(before,after)\n   answer=chat('What is 2 plus 3? Answer briefly.','5')\n   if toggle.get_attribute('data-active')=='true':toggle.click()\n\
         \   return {'before':before,'after':after,'answer':answer}\n  result('ui_thinking_toggle',thinking_toggle)\n  from\
         \ PIL import Image,ImageDraw\n  import base64,io\n  pic=Image.new('RGB',(640,480),'white');ImageDraw.Draw(pic).rectangle((160,80,480,400),fill='red');pic.save(out/'red-square.png')\n\
@@ -211,19 +211,19 @@ jobs:
         \   return current\n  result('ui_download_reload_reconnect',download)\n  def run():\n   row.get_by_role('button',name='Run',exact=True).click();time.sleep(3)\n\
         \   load_button=page.get_by_role('button',name='Load model',exact=True)\n   if not load_button.is_visible():\n   \
         \ page.screenshot(path=str(out/'hub-run-missing-picker.png'),full_page=True)\n    page.get_by_role('button',name='Select\
-        \ model',exact=True).click()\n    page.get_by_placeholder('Search Unsloth models',exact=True).fill(mid)\n    page.get_by_text(mid,exact=True).wait_for(timeout=60000)\n\
-        \    page.screenshot(path=str(out/'npu-picker-search.png'),full_page=True)\n    settings=page.get_by_role('button',name='Inference\
-        \ settings for '+mid,exact=True)\n    if settings.is_visible():\n     settings.click()\n     page.screenshot(path=str(out/'npu-run-settings.png'),full_page=True)\n\
-        \     load_button.click(timeout=60000)\n    else:\n     page.get_by_text(mid,exact=True).click()\n   else:load_button.click()\n\
-        \   status=poll(lambda:(lambda s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n\
-        \   return status\n  result('ui_load',run)\n  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message\
-        \ input',exact=True).fill(prompt)\n   page.get_by_role('textbox',name='Message input',exact=True).press('Enter')\n\
-        \   page.get_by_role('button',name='Stop generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop\
-        \ generating',exact=True).wait_for(state='hidden',timeout=300000)\n   text=page.locator('[data-role=assistant]').last.inner_text()\n\
-        \   if expected:assert expected.lower() in text.lower(),text\n   return text[-10000:]\n  result('ui_chat',lambda:chat('What\
-        \ is 17 plus 25? Answer only the number. /no_think','42'))\n  result('ui_followup',lambda:chat('What arithmetic question\
-        \ did I just ask? /no_think','17'))\n  def thinking_toggle():\n   toggle=page.locator('button[data-pill-label=\"Thinking\"\
-        ]')\n   before=toggle.get_attribute('data-active');toggle.click();after=toggle.get_attribute('data-active');assert\
+        \ model',exact=True).click()\n    page.get_by_role('tab',name='Recommended',exact=True).click()\n    page.locator('input[data-model-picker-search-input]').fill(mid)\n\
+        \    page.get_by_text(mid,exact=True).wait_for(timeout=60000)\n    page.screenshot(path=str(out/'npu-picker-search.png'),full_page=True)\n\
+        \    settings=page.get_by_role('button',name='Inference settings for '+mid,exact=True)\n    if settings.is_visible():\n\
+        \     settings.click()\n     page.screenshot(path=str(out/'npu-run-settings.png'),full_page=True)\n     load_button.click(timeout=60000)\n\
+        \    else:\n     page.get_by_text(mid,exact=True).click()\n   else:load_button.click()\n   status=poll(lambda:(lambda\
+        \ s:s if s.get('loaded_model')==modelpath else None)(api('GET','/api/npu/status')),1000)\n   return status\n  result('ui_load',run)\n\
+        \  def chat(prompt,expected=None):\n   page.get_by_role('textbox',name='Message input',exact=True).fill(prompt)\n\
+        \   page.get_by_role('textbox',name='Message input',exact=True).press('Enter')\n   page.get_by_role('button',name='Stop\
+        \ generating',exact=True).wait_for(timeout=30000)\n   page.get_by_role('button',name='Stop generating',exact=True).wait_for(state='hidden',timeout=300000)\n\
+        \   text=page.locator('[data-role=assistant]').last.inner_text()\n   if expected:assert expected.lower() in text.lower(),text\n\
+        \   return text[-10000:]\n  result('ui_chat',lambda:chat('What is 17 plus 25? Answer only the number. /no_think','42'))\n\
+        \  result('ui_followup',lambda:chat('What arithmetic question did I just ask? /no_think','17'))\n  def thinking_toggle():\n\
+        \   toggle=page.locator('button[data-pill-label=\"Thinking\"]')\n   before=toggle.get_attribute('data-active');toggle.click();after=toggle.get_attribute('data-active');assert\
         \ before!=after,(before,after)\n   answer=chat('What is 2 plus 3? Answer briefly.','5')\n   if toggle.get_attribute('data-active')=='true':toggle.click()\n\
         \   return {'before':before,'after':after,'answer':answer}\n  result('ui_thinking_toggle',thinking_toggle)\n  from\
         \ PIL import Image,ImageDraw\n  import base64,io\n  pic=Image.new('RGB',(640,480),'white');ImageDraw.Draw(pic).rectangle((160,80,480,400),fill='red');pic.save(out/'red-square.png')\n\
