@@ -8,7 +8,7 @@ render finishes within 300 s and returns a real PNG.
 
 from __future__ import annotations
 
-TITLE = "Issue 9404: Z-Image-Turbo GGUF Q4_K_M default render, v0.1.800-beta vs main"
+TITLE = "Issue 9404: Z-Image-Turbo GGUF Q4_K_M default render, v0.1.800-beta vs head"
 MODE = "differential"
 NEEDS = ["rocm", "gpu"]
 LIMIT_S = 300

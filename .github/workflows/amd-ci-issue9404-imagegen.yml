@@ -71,11 +71,11 @@ jobs:
       - name: Resolve states
         run: |
           set -euo pipefail
-          # Issue 9404 has no PR: base = the reporter's release tag, head = main pinned.
+          # Issue 9404 has no PR: base = the reporter's release tag, head = the latest Desktop release.
           git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
           cd "$AMD_CI_WORK/repo"
           BASE=$(git rev-parse "v0.1.800-beta^{commit}")
-          HEAD_SHA=3075b73d17e234e7cbb8d77e66734c1d4e362eff
+          HEAD_SHA=$(git rev-parse "v0.1.905-beta^{commit}")
           git worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE"
           git worktree add -q --detach "$AMD_CI_WORK/states/head" "$HEAD_SHA"
           printf '{"pr": 9404, "merged": false, "commits": {"base": "%s", "head": "%s"}, "paths": {"base": "%s", "head": "%s"}}' \
