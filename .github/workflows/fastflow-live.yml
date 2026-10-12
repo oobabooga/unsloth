@@ -1,0 +1,145 @@
+name: FastFlowLM live validation
+'on':
+  push:
+    branches:
+    - fastflow-ci-fe2e0255
+permissions: {}
+jobs:
+  linux:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Probe hardware and install isolated test environment
+      run: 'set -e
+
+        uname -a
+
+        free -h
+
+        ls -l /dev/accel* /dev/accel/* 2>/dev/null || true
+
+        ulimit -l
+
+        python3 -m venv "$RUNNER_TEMP/fastflow-venv"
+
+        "$RUNNER_TEMP/fastflow-venv/bin/python" -m pip install httpx psutil structlog requests pyyaml packaging
+
+        git clone --depth 1 https://github.com/unslothai/unsloth.git source
+
+        git -C source fetch --depth 1 origin c6db48dd3859e8eaa73fdee3b599b321f29d0bea
+
+        git -C source checkout c6db48dd3859e8eaa73fdee3b599b321f29d0bea
+
+        '
+    - name: Download Qwen3.8 and exercise live NPU runtime
+      run: "cat > \"$RUNNER_TEMP/probe.py\" <<'PYPROBE'\nimport os,sys,json,time,traceback,subprocess,pathlib,platform\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-live'\n\
+        root.mkdir(exist_ok=True)\nos.environ['UNSLOTH_HOME']=str(root/'state')\nos.environ['UNSLOTH_STUDIO_HOME']=str(root/'state'/'studio')\n\
+        os.environ['HF_HOME']=str(root/'hf')\nos.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nrepo=pathlib.Path.cwd()/'source'\n\
+        sys.path[:0]=[str(repo/'studio/backend'),str(repo/'studio')]\nfrom core.inference.npu_backend import LemonadeNpuBackend\n\
+        out=root/'evidence';out.mkdir(exist_ok=True)\nresults=[]\ndef record(name,fn):\n t=time.monotonic()\n try:\n  value=fn();entry=dict(test=name,ok=True,seconds=round(time.monotonic()-t,2),value=value)\n\
+        \ except Exception as e:\n  entry=dict(test=name,ok=False,seconds=round(time.monotonic()-t,2),error=str(e),trace=traceback.format_exc())\n\
+        \ results.append(entry);print(json.dumps(entry,default=str),flush=True)\n (out/'probe-results.json').write_text(json.dumps(results,indent=2,default=str))\n\
+        \ return entry.get('value')\nb=LemonadeNpuBackend()\nrecord('hardware',b.hardware)\nrecord('enable',b.enable)\nrecord('status',b.status)\n\
+        models=record('catalog',lambda:[m.to_json() for m in b.catalog()]) or []\ntarget=next((m for m in models if 'qwen3.8'\
+        \ in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\nprint('TARGET',target,flush=True)\nif target:\n\
+        \ (out/'target.json').write_text(json.dumps(target))\n def download():\n  last=-1\n  for e in b.download(target['id']):\n\
+        \   pc=int(e.get('percent') or 0)\n   if pc>=last+5 or e.get('event') in ('complete','error'):\n    print('DOWNLOAD',json.dumps(e),flush=True);last=pc\n\
+        \  return [m.to_json() for m in b.catalog() if m.id==target['id']]\n record('download',download)\n record('load_8192',lambda:b.load(target['id'],context_length=8192).to_json())\n\
+        \ record('resident',b.status)\n def request(body):\n  r=b._server.request('POST','/v1/chat/completions',json_body=dict(model=target['id'],max_tokens=128,temperature=0,**body),timeout=300)\n\
+        \  r.raise_for_status();return r.json()\n record('plain_chat',lambda:request({'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25? Answer only the number.'}],'think':False}))\n record('multi_turn',lambda:request({'messages':[{'role':'user','content':'My\
+        \ secret word is apricot.'},{'role':'assistant','content':'Understood.'},{'role':'user','content':'What was my secret\
+        \ word? Answer one word.'}],'think':False}))\n record('reasoning',lambda:request({'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25?'}],'think':True}))\n record('tool_call',lambda:request({'messages':[{'role':'user','content':'Use\
+        \ get_weather to check weather in Paris.'}],'tools':[{'type':'function','function':{'name':'get_weather','description':'Get\
+        \ weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}],'think':False}))\n\
+        \ record('json_output',lambda:request({'messages':[{'role':'user','content':'Return exactly a JSON object with the\
+        \ key answer and integer value 42.'}],'response_format':{'type':'json_object'},'think':False}))\n record('unload',b.unload)\n\
+        \ record('reload_4096',lambda:b.load(target['id'],context_length=4096).to_json())\n record('status_4096',b.status)\n\
+        \ record('unload_again',b.unload)\nelse:\n record('target_present',lambda:(_ for _ in ()).throw(RuntimeError('Qwen3.8\
+        \ 27B absent from live catalog')))\nflm=record('flm_binary',lambda:str(b._flm_binary()))\nif flm and flm!='None':\n\
+        \ for args in [['version'],['validate','--json'],['list']]:\n  record('flm_'+args[0],lambda args=args:subprocess.run([flm,*args],capture_output=True,text=True,timeout=120).__dict__)\n\
+        if b._server:(out/'lemonade-tail.txt').write_text(b._server.log_tail(200))\nb.shutdown()\n\nPYPROBE\n\"$RUNNER_TEMP/fastflow-venv/bin/python\"\
+        \ -u \"$RUNNER_TEMP/probe.py\""
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fastflow-linux
+        path: ${{ runner.temp }}/fastflow-live/evidence
+        retention-days: 7
+  windows:
+    runs-on:
+    - self-hosted
+    - Windows
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    steps:
+    - name: Probe hardware and install isolated test environment
+      run: '$ErrorActionPreference = ''Stop''
+
+        Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize
+
+        Get-PnpDevice | Where-Object {$_.FriendlyName -match ''NPU|Compute Accelerator''} | Format-List
+
+        python -m venv "$env:RUNNER_TEMP/fastflow-venv"
+
+        & "$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe" -m pip install httpx psutil structlog requests pyyaml packaging
+
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        git clone --depth 1 https://github.com/unslothai/unsloth.git source
+
+        git -C source fetch --depth 1 origin c6db48dd3859e8eaa73fdee3b599b321f29d0bea
+
+        git -C source checkout c6db48dd3859e8eaa73fdee3b599b321f29d0bea
+
+        '
+    - name: Download Qwen3.8 and exercise live NPU runtime
+      run: "@'\nimport os,sys,json,time,traceback,subprocess,pathlib,platform\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-live'\n\
+        root.mkdir(exist_ok=True)\nos.environ['UNSLOTH_HOME']=str(root/'state')\nos.environ['UNSLOTH_STUDIO_HOME']=str(root/'state'/'studio')\n\
+        os.environ['HF_HOME']=str(root/'hf')\nos.environ['TMPDIR']=str(root/'tmp');(root/'tmp').mkdir(exist_ok=True)\nrepo=pathlib.Path.cwd()/'source'\n\
+        sys.path[:0]=[str(repo/'studio/backend'),str(repo/'studio')]\nfrom core.inference.npu_backend import LemonadeNpuBackend\n\
+        out=root/'evidence';out.mkdir(exist_ok=True)\nresults=[]\ndef record(name,fn):\n t=time.monotonic()\n try:\n  value=fn();entry=dict(test=name,ok=True,seconds=round(time.monotonic()-t,2),value=value)\n\
+        \ except Exception as e:\n  entry=dict(test=name,ok=False,seconds=round(time.monotonic()-t,2),error=str(e),trace=traceback.format_exc())\n\
+        \ results.append(entry);print(json.dumps(entry,default=str),flush=True)\n (out/'probe-results.json').write_text(json.dumps(results,indent=2,default=str))\n\
+        \ return entry.get('value')\nb=LemonadeNpuBackend()\nrecord('hardware',b.hardware)\nrecord('enable',b.enable)\nrecord('status',b.status)\n\
+        models=record('catalog',lambda:[m.to_json() for m in b.catalog()]) or []\ntarget=next((m for m in models if 'qwen3.8'\
+        \ in m['checkpoint'].lower() and '27b' in m['checkpoint'].lower()),None)\nprint('TARGET',target,flush=True)\nif target:\n\
+        \ (out/'target.json').write_text(json.dumps(target))\n def download():\n  last=-1\n  for e in b.download(target['id']):\n\
+        \   pc=int(e.get('percent') or 0)\n   if pc>=last+5 or e.get('event') in ('complete','error'):\n    print('DOWNLOAD',json.dumps(e),flush=True);last=pc\n\
+        \  return [m.to_json() for m in b.catalog() if m.id==target['id']]\n record('download',download)\n record('load_8192',lambda:b.load(target['id'],context_length=8192).to_json())\n\
+        \ record('resident',b.status)\n def request(body):\n  r=b._server.request('POST','/v1/chat/completions',json_body=dict(model=target['id'],max_tokens=128,temperature=0,**body),timeout=300)\n\
+        \  r.raise_for_status();return r.json()\n record('plain_chat',lambda:request({'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25? Answer only the number.'}],'think':False}))\n record('multi_turn',lambda:request({'messages':[{'role':'user','content':'My\
+        \ secret word is apricot.'},{'role':'assistant','content':'Understood.'},{'role':'user','content':'What was my secret\
+        \ word? Answer one word.'}],'think':False}))\n record('reasoning',lambda:request({'messages':[{'role':'user','content':'What\
+        \ is 17 plus 25?'}],'think':True}))\n record('tool_call',lambda:request({'messages':[{'role':'user','content':'Use\
+        \ get_weather to check weather in Paris.'}],'tools':[{'type':'function','function':{'name':'get_weather','description':'Get\
+        \ weather in a city','parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}],'think':False}))\n\
+        \ record('json_output',lambda:request({'messages':[{'role':'user','content':'Return exactly a JSON object with the\
+        \ key answer and integer value 42.'}],'response_format':{'type':'json_object'},'think':False}))\n record('unload',b.unload)\n\
+        \ record('reload_4096',lambda:b.load(target['id'],context_length=4096).to_json())\n record('status_4096',b.status)\n\
+        \ record('unload_again',b.unload)\nelse:\n record('target_present',lambda:(_ for _ in ()).throw(RuntimeError('Qwen3.8\
+        \ 27B absent from live catalog')))\nflm=record('flm_binary',lambda:str(b._flm_binary()))\nif flm and flm!='None':\n\
+        \ for args in [['version'],['validate','--json'],['list']]:\n  record('flm_'+args[0],lambda args=args:subprocess.run([flm,*args],capture_output=True,text=True,timeout=120).__dict__)\n\
+        if b._server:(out/'lemonade-tail.txt').write_text(b._server.log_tail(200))\nb.shutdown()\n\n'@ | Set-Content -Encoding\
+        \ UTF8 \"$env:RUNNER_TEMP/probe.py\"\n& \"$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe\" -u \"$env:RUNNER_TEMP/probe.py\""
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fastflow-windows
+        path: ${{ runner.temp }}/fastflow-live/evidence
+        retention-days: 7
