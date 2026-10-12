@@ -5,30 +5,31 @@ name: FastFlowLM live validation
     - fastflow-ci-fe2e0255
 permissions: {}
 jobs:
-  windows:
+  linux:
     runs-on:
     - self-hosted
-    - Windows
+    - Linux
     - strix-halo
     - devlab-dispatch
     timeout-minutes: 60
     defaults:
       run:
-        shell: powershell
+        shell: bash
     steps:
     - name: Probe hardware and install isolated test environment
-      run: '$ErrorActionPreference = ''Stop''
+      run: 'set -e
 
-        Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize
+        uname -a
 
-        Get-PnpDevice | Where-Object {$_.FriendlyName -match ''NPU|Compute Accelerator''} | Format-List
+        free -h
 
-        python -m venv "$env:RUNNER_TEMP/fastflow-venv"
+        ls -l /dev/accel* /dev/accel/* 2>/dev/null || true
 
-        & "$env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe" -m pip install httpx psutil structlog requests pyyaml packaging
-        pillow tokenizers pywinpty
+        ulimit -l
 
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python3 -m venv "$RUNNER_TEMP/fastflow-venv"
+
+        "$RUNNER_TEMP/fastflow-venv/bin/python" -m pip install httpx psutil structlog requests pyyaml packaging pillow tokenizers
 
         git clone --depth 1 --filter=blob:none --sparse https://github.com/unslothai/unsloth.git source
 
@@ -39,8 +40,9 @@ jobs:
         git -C source checkout c6db48dd3859e8eaa73fdee3b599b321f29d0bea
 
         '
-    - name: Exercise interactive FastFlowLM in Windows ConPTY
-      run: "@'\nimport os,sys,pathlib,json,time,traceback\nfrom tokenizers import Tokenizer\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-terminal';root.mkdir(exist_ok=True)\n\
+    - name: Check sampling with valid top-k and penalty parameters
+      run: "cat > \"$RUNNER_TEMP/sampling_valid.py\" <<'PYSCRIPT'\nimport os,sys,pathlib,json,time,traceback\nfrom tokenizers\
+        \ import Tokenizer\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'fastflow-sampling-valid';root.mkdir(exist_ok=True)\n\
         os.environ['UNSLOTH_HOME']=str(root/'state');os.environ['UNSLOTH_STUDIO_HOME']=str(root/'state/studio')\nrepo=pathlib.Path.cwd()/'source';sys.path[:0]=[str(repo/'studio/backend'),str(repo/'studio')]\n\
         from core.inference.npu_backend import LemonadeNpuBackend\nout=root/'evidence';out.mkdir(exist_ok=True);rows=[]\n\
         def record(name,fn):\n t=time.monotonic()\n try:v=fn();r=dict(test=name,ok=True,seconds=round(time.monotonic()-t,2),value=v)\n\
@@ -48,24 +50,20 @@ jobs:
         \ rows.append(r);print(json.dumps(r,default=str),flush=True);(out/'results.json').write_text(json.dumps(rows,indent=2,default=str));return\
         \ r.get('value')\nb=LemonadeNpuBackend();record('enable',b.enable)\nm=next(m for m in b.catalog() if m.checkpoint=='qwen3.8-mtp:27b')\n\
         def download():\n last=-1\n for e in b.download(m.id):\n  if e.get('percent',0)>=last+10 or e.get('event') in ('complete','error'):print('DOWNLOAD',e,flush=True);last=e.get('percent',0)\n\
-        \ return True\nrecord('download',download);record('load',lambda:b.load(m.id,context_length=4096).to_json())\n\nrecord('unload_before_terminal',b.unload)\n\
-        flm=b._flm_binary();modeldir=b._flm_model_dir;b.shutdown()\ndef conpty():\n from winpty import PtyProcess\n import\
-        \ subprocess,threading,re\n env=dict(os.environ,FLM_MODEL_PATH=str(modeldir),FLM_DISABLE_UPDATE_CHECK='1')\n p=PtyProcess.spawn(subprocess.list2cmdline([str(flm),'run',m.checkpoint,'--ctx-len','4096']),env=env,dimensions=(40,140))\n\
-        \ chunks=[]\n def read():\n  try:\n   while p.isalive():\n    text=p.read(4096)\n    if text:chunks.append(text)\n\
-        \  except (EOFError,OSError):pass\n thread=threading.Thread(target=read,daemon=True);thread.start()\n def waitfor(predicate,timeout):\n\
-        \  deadline=time.monotonic()+timeout\n  while time.monotonic()<deadline:\n   text=re.sub(r'\\x1b\\[[0-?]*[ -/]*[@-~]','',\
-        \ ''.join(chunks))\n   if predicate(text):return text\n   time.sleep(.2)\n  raise TimeoutError('ConPTY output: '+''.join(chunks)[-6000:])\n\
-        \ try:\n  waitfor(lambda t:'>>>' in t,90)\n  p.write('What is 17 plus 25? Answer only the number.\\r\\n')\n  text=waitfor(lambda\
-        \ t:'42' in t,180)\n  # Wait for the second prompt before sending the exit command.\n  text=waitfor(lambda t:t.count('>>>')>=2,60)\n\
-        \  p.write('/bye\\r\\n')\n  waitfor(lambda t:not p.isalive(),30)\n  return {'output':text[-10000:],'exited':not p.isalive()}\n\
-        \ finally:\n  (out/'conpty-transcript.txt').write_text(''.join(chunks),encoding='utf-8')\n  if p.isalive():p.terminate(force=True)\n\
-        record('interactive_conpty_cli',conpty)\n\n'@ | Set-Content -Encoding UTF8 \"$env:RUNNER_TEMP/terminal.py\"\n& \"\
-        $env:RUNNER_TEMP/fastflow-venv/Scripts/python.exe\" -u \"$env:RUNNER_TEMP/terminal.py\"\nif ($LASTEXITCODE -ne 0)\
-        \ { exit $LASTEXITCODE }"
-    - name: Upload terminal evidence
+        \ return True\nrecord('download',download);record('load',lambda:b.load(m.id,context_length=4096).to_json())\ntokenizer=Tokenizer.from_file(str(b._model_files(m.checkpoint,b._flm_binary()).folder/'tokenizer.json'))\n\
+        def req(prompt,limit=24,temp=0,**params):\n body=dict(model=m.id,messages=[{'role':'user','content':prompt}],max_tokens=limit,temperature=temp,think=False,top_p=1.0,top_k=50,**params)\n\
+        \ r=b._server.request('POST','/v1/chat/completions',json_body=body,timeout=240);r.raise_for_status();v=r.json();message=v['choices'][0]['message'];content=message.get('content','')\n\
+        \ return {'request':body,'response':v,'encoded_content_tokens':len(tokenizer.encode(content,add_special_tokens=False).ids)}\n\
+        for limit in [1,2,4,8,16]:record('cap_'+str(limit),lambda limit=limit:req('Count from one to one hundred separated\
+        \ by commas.',limit))\nprompt=\"Invent a new imaginary planet. Begin your reply with exactly 'Planet:' followed by\
+        \ a unique invented name and a short description. Be imaginative.\"\nfor i in range(2):record('greedy_'+str(i),lambda:req(prompt,32,0))\n\
+        for i in range(5):record('temperature_2_'+str(i),lambda:req(prompt,32,2.0))\nrecord('presence_penalty_2',lambda:req(prompt,32,2.0,presence_penalty=2.0))\n\
+        record('repetition_penalty_2',lambda:req(prompt,32,2.0,repetition_penalty=2.0))\nif b._server:(out/'runtime-tail.txt').write_text(b._server.log_tail(200))\n\
+        b.shutdown()\n\nPYSCRIPT\n\"$RUNNER_TEMP/fastflow-venv/bin/python\" -u \"$RUNNER_TEMP/sampling_valid.py\""
+    - name: Upload sampling evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: fastflow-terminal-windows
-        path: ${{ runner.temp }}/fastflow-terminal/evidence
+        name: fastflow-sampling-valid-linux
+        path: ${{ runner.temp }}/fastflow-sampling-valid/evidence
         retention-days: 7
