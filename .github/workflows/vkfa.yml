@@ -1,0 +1,147 @@
+name: "AMD CI (Windows): Vulkan coopmat1 FA tile for 32 KiB shared memory"
+
+on:
+  push:
+    branches: [amd-ci-vkfa-cm1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_SHA: "4413a192410fad1f054e9216114087a3e01527a0"
+  VULKAN_VERSION: "1.4.357.0"
+  ROCM_TAG: "b11541-mix-2500203"
+  GEMMA_URL: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/main/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+
+jobs:
+
+  build:
+    name: "Build base and patched Vulkan llama.cpp (windows-latest)"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Install Vulkan SDK
+        run: |
+          $ErrorActionPreference = "Continue"
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: SDK download"; exit 1 }
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+      - name: Fetch llama.cpp
+        run: |
+          $ErrorActionPreference = "Continue"
+          git clone -q https://github.com/ggml-org/llama.cpp "$env:RUNNER_TEMP\base"
+          git -C "$env:RUNNER_TEMP\base" checkout -q $env:LLAMA_SHA
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git clone -q "$env:RUNNER_TEMP\base" "$env:RUNNER_TEMP\head"
+          git -C "$env:RUNNER_TEMP\head" checkout -q $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\head" apply "$env:GITHUB_WORKSPACE\patch\fa_cm1_small_shmem.patch"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: patch did not apply"; exit 1 }
+          git -C "$env:RUNNER_TEMP\head" diff --stat
+
+      - name: Build both arms
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($arm in @("base", "head")) {
+            $src = "$env:RUNNER_TEMP\$arm"
+            cmake -S $src -B "$src\build" -DGGML_VULKAN=ON -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON
+            if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: configure $arm"; exit 1 }
+            cmake --build "$src\build" --config Release -j 4 --target llama-bench test-backend-ops
+            if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: build $arm"; exit 1 }
+            New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\out\$arm" | Out-Null
+            Copy-Item "$src\build\bin\Release\*" "$env:RUNNER_TEMP\out\$arm\" -Recurse
+          }
+          Get-ChildItem "$env:RUNNER_TEMP\out\head" | Select-Object -First 20 Name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-binaries
+          path: ${{ runner.temp }}/out
+          retention-days: 3
+
+  windows:
+    name: "gfx1151 Windows: base vs patched Vulkan FA"
+    needs: build
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu-10656
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "vkfa-cm1"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vk-binaries
+          path: ${{ runner.temp }}/vkfa-cm1/src/bin
+
+      - name: Fetch model and ROCm reference
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "$env:AMD_CI_WORK\src"
+          curl.exe -sSfL --retry 5 -o "$src\gemma.gguf" $env:GEMMA_URL
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: model"; exit 1 }
+          $name = "app-$env:ROCM_TAG-windows-x64-rocm-gfx1151.zip"
+          curl.exe -sSfL --retry 5 -o "$src\$name" "https://github.com/unslothai/llama.cpp/releases/download/$env:ROCM_TAG/$name"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: rocm"; exit 1 }
+          Expand-Archive -Path "$src\$name" -DestinationPath "$src\rocm" -Force
+          $b = Get-ChildItem -Path "$src\rocm" -Recurse -Filter llama-bench.exe | Select-Object -First 1
+          Add-Content -Path $env:GITHUB_ENV -Value "BIN_ROCM=$($b.DirectoryName)"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List | Out-String | Tee-Object -FilePath "$env:AMD_CI_WORK\out\gpu.txt"
+
+      - name: Correctness, FLASH_ATTN_EXT vs CPU on the real 32 KiB device
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = "$env:AMD_CI_WORK\out"
+          foreach ($arm in @("base", "head")) {
+            & "$env:AMD_CI_WORK\src\bin\$arm\test-backend-ops.exe" -o FLASH_ATTN_EXT -b Vulkan0 2>&1 | Out-File -FilePath "$out\fa_ops_$arm.txt" -Encoding utf8
+            Write-Host "$arm exit $LASTEXITCODE"
+            Get-Content "$out\fa_ops_$arm.txt" | Select-String -Pattern "ggml_vulkan: 0|tests passed|backends passed|FAIL" | Select-Object -First 8
+          }
+
+      - name: llama-bench ABAB, Gemma 4 26B-A4B
+        timeout-minutes: 150
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = "$env:AMD_CI_WORK\out"
+          $arms = @(
+            @("vk_base_r1", "$env:AMD_CI_WORK\src\bin\base"),
+            @("vk_head_r1", "$env:AMD_CI_WORK\src\bin\head"),
+            @("rocm_r1",    $env:BIN_ROCM),
+            @("vk_base_r2", "$env:AMD_CI_WORK\src\bin\base"),
+            @("vk_head_r2", "$env:AMD_CI_WORK\src\bin\head"),
+            @("rocm_r2",    $env:BIN_ROCM)
+          )
+          foreach ($a in $arms) {
+            $t0 = Get-Date
+            & "$($a[1])\llama-bench.exe" -m "$env:AMD_CI_WORK\src\gemma.gguf" -ngl 99 -fa 1 -p 512,4096 -n 128 -d 0,16384 -r 2 -o json 2> "$out\bench_$($a[0]).err" | Out-File -FilePath "$out\bench_$($a[0]).json" -Encoding utf8
+            Write-Host "$($a[0]) exit $LASTEXITCODE in $([int]((Get-Date) - $t0).TotalSeconds)s"
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vkfa-cm1-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
