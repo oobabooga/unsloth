@@ -1,0 +1,65 @@
+name: Guard 13662
+
+on:
+  push:
+    branches: [ci-13662-guard]
+
+permissions: {}
+
+jobs:
+  guard:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:RUNNER_TEMP 'src'
+          git init -q $src
+          git -C $src remote add origin https://github.com/oobabooga/unsloth
+          git -C $src fetch -q --depth 1 origin 65f54b9c38c87db83926c62b593d5176402c4f84
+          git -C $src checkout -q FETCH_HEAD
+          git -C $src log -1 --format='%H %s'
+          Invoke-WebRequest -UseBasicParsing -OutFile (Join-Path $env:RUNNER_TEMP 'setup-main.ps1') `
+            https://raw.githubusercontent.com/unslothai/unsloth/cc7e8aaeb2ebe323daa0f051a4931f7d67580eba/studio/setup.ps1
+
+      - name: Branch, pwsh
+        shell: pwsh
+        run: |
+          Set-Location (Join-Path $env:RUNNER_TEMP 'src')
+          pwsh -NoProfile -File tests/studio/test_nvidia_library_inventory.ps1
+          exit $LASTEXITCODE
+
+      - name: Branch, Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          Set-Location (Join-Path $env:RUNNER_TEMP 'src')
+          powershell -NoProfile -File tests\studio\test_nvidia_library_inventory.ps1
+          exit $LASTEXITCODE
+
+      - name: Branch, Pester BuildToolsConsent
+        shell: pwsh
+        run: |
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = Join-Path $env:RUNNER_TEMP 'src\tests\studio_setup_ps1\Studio.Setup.BuildToolsConsent.Tests.ps1'
+          $cfg.Run.Exit = $true
+          $cfg.Run.Throw = $true
+          Invoke-Pester -Configuration $cfg
+
+      - name: Main's setup.ps1 under the new test
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'src'
+          Copy-Item -Force (Join-Path $env:RUNNER_TEMP 'setup-main.ps1') (Join-Path $src 'studio\setup.ps1')
+          Set-Location $src
+          $out = pwsh -NoProfile -File tests/studio/test_nvidia_library_inventory.ps1 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $out | Select-String -Pattern 'kind guard|check\(s\) failed|All checks passed' | ForEach-Object { $_.Line }
+          "EXIT_CODE=$code"
+          $fails = @($out | Select-String -Pattern 'FAIL  ')
+          $fails | ForEach-Object { $_.Line }
+          if ($code -eq 0) { throw 'main: expected the new kind-guard cases to fail' }
+          if (@($fails | Where-Object { $_.Line -notmatch 'keeps a CPU bundle on an NVIDIA host' }).Count) { throw 'main: an unexpected check failed' }
+          'main: only the new keep-the-CPU-bundle cases fail'
+          exit 0
