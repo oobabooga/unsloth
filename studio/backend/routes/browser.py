@@ -34,8 +34,10 @@ from core.inference.tools import (
     _fetch_url_raw,
     _normalize_url_scheme,
     _sniff_meta_charset,
+    _web_origin,
 )
 from loggers import get_logger
+from routes.browser_network import BROWSER_NETWORK_JS
 
 # same embedders as the canvas shell.
 from routes.inference import _ARTIFACT_PREVIEW_FRAME_ANCESTORS as _FRAME_ANCESTORS
@@ -61,6 +63,9 @@ _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 # Own pool, so slow sites can't starve chat inference's default executor.
 _FETCH_POOL = ThreadPoolExecutor(max_workers = 8, thread_name_prefix = "browser-fetch")
 _DISCONNECT_POLL_S = 0.25
+# A page's own API reads (/resource): its own pool, so a busy page can't hold up page loads.
+_RESOURCE_POOL = ThreadPoolExecutor(max_workers = 6, thread_name_prefix = "browser-resource")
+_MAX_RESOURCE_BYTES = 4 * 1024 * 1024
 
 # Quoted values are bounded and a bare "<" ends a tag, so stripping stays linear on hostile pages.
 _TAG_BODY = r"""(?:[^<>"']|"[^"]{0,4096}"|'[^']{0,4096}')*>"""
@@ -170,6 +175,9 @@ _FRAME_HTML = r"""<!doctype html>
         // about:srcdoc has an opaque origin, and data: and blob: URLs share it.
         const shellOrigin = location.origin === "null" ? null : location.origin;
         let pageUrl = cfg.url || location.href;
+        // Without a <base> of its own a document's base is its URL, so the shell's follows the router:
+        // relative links and requests after a pushState resolve as in a browser.
+        const routedBase = cfg.url && cfg.base === cfg.url ? document.querySelector("base") : null;
         const post = (message) => parent.postMessage({ source: "unsloth-browser", ...message }, "*");
         // URLs built from location point at this shell; map them to the page's site.
         const toPage = (url) => {
@@ -241,6 +249,7 @@ _FRAME_HTML = r"""<!doctype html>
           let jar = "";
           Object.defineProperty(document, "cookie", { get: () => jar, set: () => {}, configurable: true });
         } catch {}
+        /* BROWSER_NETWORK_JS */
         const shellPathname = location.pathname;
         // Throttle to 200 ms: some sites replaceState per scroll.
         let reportedUrl = pageUrl;
@@ -256,13 +265,21 @@ _FRAME_HTML = r"""<!doctype html>
         };
         for (const [method, original] of [["pushState", originalPush], ["replaceState", originalReplace]]) {
           history[method] = function (state, title, url) {
-            let next = url != null ? resolve(String(url)) : null;
+            const raw = url != null ? String(url) : null;
+            let next = raw !== null ? resolve(raw) : null;
+            // A router that builds its URL from location.pathname gets "srcdoc": put the page's path back.
+            const fromShell = raw !== null && /^(?:about:)?srcdoc(?=[?#]|$)/.exec(raw);
+            if (fromShell && cfg.url) {
+              const page = new URL(pageUrl);
+              next = new URL(page.pathname + raw.slice(fromShell[0].length), page.origin).href;
+            }
             // A router re-asserting the shell's own path is not a navigation.
             if (next && new URL(next).pathname === shellPathname) next = null;
             try { original.call(this, state, title, next ? shellPath(next) : undefined); }
             catch { original.call(this, state, title); }
             if (next) {
               pageUrl = next;
+              routedBase?.setAttribute("href", pageUrl);
               reportUrl();
             }
           };
@@ -700,7 +717,7 @@ _FRAME_HTML = r"""<!doctype html>
         }
         // Only the parent may drive the shell, once.
         if (!data || data.type !== "unsloth:browser-html" || typeof data.html !== "string") return;
-        const cfg = { url: data.url || null, refresh: data.refresh || null, zoom: Number(data.zoom) || 1, muted: data.muted === true };
+        const cfg = { url: data.url || null, base: data.base || null, refresh: data.refresh || null, zoom: Number(data.zoom) || 1, muted: data.muted === true };
         const base = data.base ? `<base href="${escapeAttr(data.base)}">` : "";
         const script = `<script>(${boot.toString()})(${JSON.stringify(cfg).replace(/</g, "\\u003c")});<\/script>`;
         page = document.createElement("iframe");
@@ -723,6 +740,8 @@ _FRAME_HTML = r"""<!doctype html>
     </script>
   </body>
 </html>"""
+
+_FRAME_HTML = _FRAME_HTML.replace("/* BROWSER_NETWORK_JS */", BROWSER_NETWORK_JS.strip(), 1)
 
 # Annotate, the body of a function of `post` that the page shell's `install` runs on the panel's
 # request: while it is on, pointer input is the panel's, and the page only reports the block under
@@ -1562,9 +1581,14 @@ async def browser_fetch(
 ):
     """Fetch a page: HTML as JSON for the shell, anything else raw with its content type."""
     request.url = _normalize_url_scheme(request.url.strip())
+    return await _run_until_disconnect(_FETCH_POOL, _fetch_and_build, request, http_request)
+
+
+async def _run_until_disconnect(pool, work, request, http_request: Request):
+    """``work(request, cancel_event)`` in ``pool``, cancelled when the client goes away."""
     cancel_event = threading.Event()
     loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(_FETCH_POOL, _fetch_and_build, request, cancel_event)
+    task = loop.run_in_executor(pool, work, request, cancel_event)
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout = _DISCONNECT_POLL_S)
@@ -1619,3 +1643,98 @@ async def browser_annotate_script():
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+class BrowserResourceRequest(BaseModel):
+    # The panel's address for the page, never one the page claims.
+    page_url: str = Field(..., min_length = 1, max_length = 8192)
+    url: str = Field(..., min_length = 1, max_length = 8192)
+    headers: dict[str, str] = Field(default_factory = dict, max_length = 32)
+
+
+_HEADER_NAME_RE = re.compile(r"[a-z0-9!#$%&'*+.^_`|~-]{1,100}")
+# The relay returns only status, type and body, so these stay native in the page (a Range needs
+# Content-Range, a conditional its 304's headers) along with credentials: one here is refused.
+# Kept in step with `plain` in routes/browser_network.py.
+_UNRELAYED_HEADER_RE = re.compile(r"authorization|cookie|range|if-.*")
+# The connection's and Studio's, not the page's to set, nor a claim about who the client is.
+_DROPPED_HEADERS = frozenset(
+    {
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "expect",
+        "forwarded",
+        "host",
+        "keep-alive",
+        "max-forwards",
+        "origin",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+        "via",
+        "x-real-ip",
+    }
+)
+
+
+def _resource_headers(headers: dict[str, str]) -> dict[str, str]:
+    forwarded = {"Accept": "*/*"}
+    for name, value in headers.items():
+        name = name.lower()
+        if (
+            not _HEADER_NAME_RE.fullmatch(name)
+            or len(value) > 4096
+            or any(c in value for c in "\r\n\0")
+        ):
+            raise HTTPException(status_code = 400, detail = "Not a valid request header.")
+        if _UNRELAYED_HEADER_RE.fullmatch(name):
+            raise HTTPException(status_code = 400, detail = f"The {name} header is not relayed.")
+        if name in _DROPPED_HEADERS or name.startswith(("sec-", "proxy-", "x-forwarded-")):
+            continue
+        # urllib capitalizes names the same way, so a page's "accept" replaces the default.
+        forwarded[name.capitalize()] = value
+    forwarded["User-Agent"] = _BROWSER_UA
+    return forwarded
+
+
+def _fetch_resource(request: BrowserResourceRequest, cancel_event: threading.Event) -> dict:
+    origin = _web_origin(request.url)
+    if origin is None or origin != _web_origin(request.page_url):
+        raise HTTPException(status_code = 400, detail = "Only the page's own site can be read.")
+    headers = _resource_headers(request.headers)
+    meta: dict = {}
+    # No Studio credentials and no cookies: what the site serves anyone.
+    error, body, _content_type = _fetch_url_raw(
+        request.url,
+        timeout = _FETCH_TIMEOUT_S,
+        extra_headers = headers,
+        deadline = time.monotonic() + _FETCH_TIMEOUT_S,
+        raw_bytes_max = _MAX_RESOURCE_BYTES,
+        meta_out = meta,
+        cancel_event = cancel_event,
+        same_origin_only = True,
+        raw_http_errors = True,
+    )
+    # An HTTP error still has a status and a body for the page; anything else is a network error to it.
+    if meta.get("status") is None:
+        raise HTTPException(status_code = 502, detail = error or "The page's request failed.")
+    return {
+        "url": meta.get("url") or request.url,
+        "status": meta["status"],
+        "headers": {"content-type": meta.get("content_type") or ""},
+        "body": base64.b64encode(body if isinstance(body, bytes) else b"").decode("ascii"),
+    }
+
+
+@router.post("/resource")
+async def browser_resource(
+    request: BrowserResourceRequest,
+    http_request: Request,
+    current_subject: str = Depends(get_current_subject),
+):
+    """A public same-origin GET for a page in the sandbox, whose opaque origin CORS refuses."""
+    return await _run_until_disconnect(_RESOURCE_POOL, _fetch_resource, request, http_request)
