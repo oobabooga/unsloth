@@ -54,7 +54,7 @@ jobs:
           $ErrorActionPreference = "Continue"
           foreach ($arm in @("base", "head")) {
             $src = "$env:RUNNER_TEMP\$arm"
-            cmake -S $src -B "$src\build" -DGGML_VULKAN=ON -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON
+            cmake -S $src -B "$src\build" -DGGML_VULKAN=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON
             if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: configure $arm"; exit 1 }
             cmake --build "$src\build" --config Release -j 4 --target llama-bench test-backend-ops
             if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: build $arm"; exit 1 }
@@ -135,7 +135,9 @@ jobs:
           foreach ($a in $arms) {
             $t0 = Get-Date
             & "$($a[1])\llama-bench.exe" -m "$env:AMD_CI_WORK\src\gemma.gguf" -ngl 99 -fa 1 -p 512,4096 -n 128 -d 0,16384 -r 2 -o json 2> "$out\bench_$($a[0]).err" | Out-File -FilePath "$out\bench_$($a[0]).json" -Encoding utf8
-            Write-Host "$($a[0]) exit $LASTEXITCODE in $([int]((Get-Date) - $t0).TotalSeconds)s"
+            $rc = $LASTEXITCODE
+            Write-Host "$($a[0]) exit $rc in $([int]((Get-Date) - $t0).TotalSeconds)s"
+            if ($rc -ne 0) { Write-Host "FATAL: $($a[0]) did not run"; exit 1 }
           }
 
       - uses: actions/upload-artifact@v4
