@@ -1,0 +1,208 @@
+name: AB 13662
+
+on:
+  push:
+    branches: [ci-13662-ab]
+
+permissions: {}
+
+env:
+  SHA_A: cc7e8aaeb2ebe323daa0f051a4931f7d67580eba
+  REPO_A: https://github.com/unslothai/unsloth
+  SHA_B: f5130228c71aa60170c9580cff345bdf72e74fdb
+  REPO_B: https://github.com/oobabooga/unsloth
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+jobs:
+  # The real install_llama_prebuilt.py against the live published release. Only the
+  # NVIDIA facts of detect_host() are replaced, with the #13662 reporter's values.
+  planner:
+    name: planner ${{ matrix.variant }} on ${{ matrix.box }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [A, B]
+        box: [github, devlab]
+        include:
+          - box: github
+            runs_on: '["windows-latest"]'
+          - box: devlab
+            runs_on: '["self-hosted", "Windows", "strix-halo", "devlab-dispatch"]'
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Fetch source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha  = if ('${{ matrix.variant }}' -eq 'A') { $env:SHA_A } else { $env:SHA_B }
+          $repo = if ('${{ matrix.variant }}' -eq 'A') { $env:REPO_A } else { $env:REPO_B }
+          $src = Join-Path $env:RUNNER_TEMP 'src'
+          git init -q $src
+          git -C $src remote add origin $repo
+          git -C $src fetch -q --depth 1 origin $sha
+          git -C $src checkout -q FETCH_HEAD
+          git -C $src log -1 --format='%H %s'
+          python --version
+
+      - name: Run the installer as the reporter's host
+        env:
+          # Manifest bundles skip the llama-server smoke test by default; run it here.
+          UNSLOTH_LLAMA_STAGED_VALIDATION: '1'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $scr = Join-Path $env:RUNNER_TEMP 'scr'
+          New-Item -ItemType Directory -Force -Path $scr | Out-Null
+          $wrapper = @'
+          import dataclasses, importlib.util, sys
+          path = sys.argv[1]
+          spec = importlib.util.spec_from_file_location("install_llama_prebuilt", path)
+          m = importlib.util.module_from_spec(spec)
+          sys.modules["install_llama_prebuilt"] = m
+          spec.loader.exec_module(m)
+          real = m.detect_host
+          def reporter_host(*args, **kwargs):
+              h = real(*args, **kwargs)
+              # #13662: GeForce GT 650M, compute 3.0, driver CUDA 10.1.
+              return dataclasses.replace(
+                  h,
+                  nvidia_smi = None,
+                  driver_cuda_version = (10, 1),
+                  compute_caps = ["30"],
+                  physical_compute_caps = ["30"],
+                  visible_cuda_devices = None,
+                  has_physical_nvidia = True,
+                  has_usable_nvidia = True,
+              )
+          m.detect_host = reporter_host
+          sys.argv = [path] + sys.argv[2:]
+          sys.exit(m.main())
+          '@
+          $wrapper = ($wrapper -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`n"
+          Set-Content -Path (Join-Path $scr 'reporter_host.py') -Value $wrapper -Encoding UTF8
+          $inst = Join-Path $env:RUNNER_TEMP 'llama.cpp'
+          $log = Join-Path $env:RUNNER_TEMP 'prebuilt.log'
+          python -I (Join-Path $scr 'reporter_host.py') (Join-Path $env:RUNNER_TEMP 'src\studio\install_llama_prebuilt.py') `
+            --install-dir $inst --llama-tag latest --published-repo unslothai/llama.cpp 2>&1 |
+            ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          "EXIT_CODE=$code"
+          $info = Join-Path $inst 'UNSLOTH_PREBUILT_INFO.json'
+          $kind = $null
+          if (Test-Path $info) {
+            $meta = Get-Content $info -Raw | ConvertFrom-Json
+            $kind = $meta.backend
+            "backend=$kind asset=$($meta.asset) release=$($meta.release_tag)"
+            $server = Join-Path $inst 'build\bin\Release\llama-server.exe'
+            & $server --version 2>&1 | ForEach-Object { "$_" }
+            & $server --list-devices 2>&1 | ForEach-Object { "$_" }
+          } else {
+            'no llama.cpp install on disk'
+          }
+          if ('${{ matrix.variant }}' -eq 'A') {
+            if ($code -ne 2) { throw "A: expected exit 2 (fall back to a source build), got $code" }
+            if (-not (Select-String -Path $log -Pattern 'falling back to source build' -Quiet)) { throw 'A: expected the source-build fallback' }
+            'A: as on main, no prebuilt; setup.ps1 falls back to a source build'
+          } else {
+            if ($code -ne 0) { throw "B: expected exit 0, got $code" }
+            if ($kind -ne 'vulkan') { throw "B: expected the vulkan backend, got $kind" }
+            if (-not (Select-String -Path $log -Pattern 'staged prebuilt validation succeeded' -Quiet)) { throw 'B: the smoke test did not pass' }
+            'B: Vulkan bundle installed and validated'
+          }
+          exit 0
+
+  # The real install.ps1 -> setup.ps1 with a winget.exe that cannot launch, as on the
+  # reporter's box, forced to the source build so Phase 3.5 installs OpenSSL.
+  setup:
+    name: setup.ps1 OpenSSL ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [A, B]
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Fetch source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha  = if ('${{ matrix.variant }}' -eq 'A') { $env:SHA_A } else { $env:SHA_B }
+          $repo = if ('${{ matrix.variant }}' -eq 'A') { $env:REPO_A } else { $env:REPO_B }
+          $src = Join-Path $env:RUNNER_TEMP 'src'
+          git init -q $src
+          git -C $src remote add origin $repo
+          git -C $src fetch -q --depth 1 origin $sha
+          git -C $src checkout -q FETCH_HEAD
+          git -C $src log -1 --format='%H %s'
+
+      - name: Pester (B only)
+        if: matrix.variant == 'B'
+        shell: pwsh
+        run: |
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = Join-Path $env:RUNNER_TEMP 'src\tests\studio_setup_ps1\Studio.Setup.BuildToolsConsent.Tests.ps1'
+          $cfg.Run.Exit = $true
+          $cfg.Run.Throw = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+      - name: Hide OpenSSL and install a winget that cannot launch
+        shell: pwsh
+        run: |
+          foreach ($root in 'C:\Program Files\OpenSSL-Win64', 'C:\Program Files\OpenSSL', 'C:\OpenSSL-Win64') {
+            if (Test-Path $root) { Rename-Item -LiteralPath $root -NewName ((Split-Path $root -Leaf) + '.hidden'); "hid $root" }
+          }
+          $fake = Join-Path $env:RUNNER_TEMP 'fakewinget'
+          New-Item -ItemType Directory -Force -Path $fake | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $fake 'winget.exe'), [byte[]](0x4E, 0x4F, 0x54, 0x50, 0x45))
+          # setup.ps1's Refresh-Environment rebuilds PATH as Machine > User > process, so the
+          # fake has to lead the Machine PATH to shadow the real winget alias on User PATH.
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          [Environment]::SetEnvironmentVariable('Path', "$fake;$machine", 'Machine')
+          $env:PATH = "$fake;$env:PATH"
+          (Get-Command winget -All).Source
+          try { winget --version } catch { "launch error: $($_.FullyQualifiedErrorId): $($_.Exception.Message)" }
+
+      - name: install.ps1 --local --no-torch, forced source build
+        shell: pwsh
+        env:
+          UNSLOTH_LLAMA_FORCE_COMPILE: '1'
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'src'
+          Set-Location $src
+          $fake = Join-Path $env:RUNNER_TEMP 'fakewinget'
+          $env:PATH = "$fake;$env:PATH"
+          $log = Join-Path $env:RUNNER_TEMP 'install.log'
+          $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --local --no-torch; exit $LASTEXITCODE'
+          pwsh -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          "EXIT_CODE=$code"
+          "--- OpenSSL and llama.cpp lines ---"
+          Select-String -Path $log -Pattern 'OpenSSL|winget|NativeCommandFailed|failed to run|llama.cpp|llama-server' | ForEach-Object { $_.Line } | Select-Object -Last 40
+          $reachedOpenSsl = Select-String -Path $log -Pattern 'installing OpenSSL dev' -Quiet
+          $continued = Select-String -Path $log -Pattern 'OpenSSL dev not available -- llama-server will be built without HTTPS' -Quiet
+          if (-not $reachedOpenSsl) { throw 'Phase 3.5 OpenSSL install was not reached; the A/B did not exercise the call' }
+          if ('${{ matrix.variant }}' -eq 'A') {
+            if ($code -eq 0) { throw 'A: expected setup to abort at the OpenSSL winget call' }
+            if ($continued) { throw 'A: setup unexpectedly continued past OpenSSL' }
+            if (-not (Select-String -Path $log -Pattern "Program 'winget.exe' failed to run" -Quiet)) { throw 'A: aborted, but not at the winget launch failure' }
+            'A: as on main, setup aborted at the OpenSSL winget call'
+          } else {
+            if (-not $continued) { throw 'B: setup did not continue past the OpenSSL step' }
+            if (Select-String -Path $log -Pattern 'Found OpenSSL \[ShiningLight' -Quiet) { throw 'B: the real winget ran, so the fake did not shadow it' }
+            if ($code -ne 0) { throw "B: continued past OpenSSL but install.ps1 exited $code" }
+            $server = Join-Path $env:USERPROFILE '.unsloth\llama.cpp\build\bin\Release\llama-server.exe'
+            if (-not (Test-Path $server)) { throw "B: no llama-server at $server" }
+            & $server --version 2>&1 | ForEach-Object { "$_" }
+            'B: setup continued without HTTPS and built llama-server'
+          }
