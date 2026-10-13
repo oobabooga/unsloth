@@ -1,0 +1,86 @@
+name: "AMD CI (Windows): issue 10656 Vulkan prefill sweep on gfx1151"
+
+on:
+  push:
+    branches: [amd-ci-issue10656-sweep]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TAG: "b11541-mix-2500203"
+  GEMMA_URL: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/main/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+  QWEN_URL: "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-UD-Q4_K_XL.gguf"
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  windows:
+    name: "gfx1151 Windows: Vulkan prefill sweep"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu-10656
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "issue10656-sweep"
+
+      - name: Host facts
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate | Format-List | Out-String | Tee-Object -FilePath "$env:AMD_CI_WORK\out\gpu.txt"
+
+      - name: Fetch prebuilts and models
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "$env:AMD_CI_WORK\src"
+          foreach ($kind in @("vulkan", "rocm-gfx1151")) {
+            $name = "app-$env:TAG-windows-x64-$kind.zip"
+            curl.exe -sSfL --retry 5 -o "$src\$name" "https://github.com/unslothai/llama.cpp/releases/download/$env:TAG/$name"
+            if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: download $name"; exit 1 }
+            Expand-Archive -Path "$src\$name" -DestinationPath "$src\$kind" -Force
+            $bench = Get-ChildItem -Path "$src\$kind" -Recurse -Filter llama-bench.exe | Select-Object -First 1
+            Add-Content -Path $env:GITHUB_ENV -Value ("BIN_" + ($kind -replace '[^A-Za-z0-9]', '_') + "=" + $bench.DirectoryName)
+          }
+          curl.exe -sSfL --retry 5 -o "$src\gemma.gguf" $env:GEMMA_URL
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: gemma"; exit 1 }
+          curl.exe -sSfL --retry 5 -o "$src\qwen.gguf" $env:QWEN_URL
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: qwen"; exit 1 }
+          & "$src\vulkan\llama-bench.exe" --list-devices 2>&1 | Out-File -FilePath "$env:AMD_CI_WORK\out\devices_vulkan.txt" -Encoding utf8
+
+      - name: Sweep
+        timeout-minutes: 170
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\bench\sweep.ps1" -Out "$env:AMD_CI_WORK\out" -Vk $env:BIN_vulkan -Ro $env:BIN_rocm_gfx1151 `
+            -Gemma "$env:AMD_CI_WORK\src\gemma.gguf" -Qwen "$env:AMD_CI_WORK\src\qwen.gguf"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue10656-sweep
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
