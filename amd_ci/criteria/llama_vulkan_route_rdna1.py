@@ -17,6 +17,8 @@ Pairs with probes/llama_vulkan_route_probe.py.
 
 from __future__ import annotations
 
+import re
+
 TITLE = "RDNA 1 (faked rocminfo gfx1010) llama.cpp prebuilt choice on real gfx1151, base versus head"
 MODE = "differential"
 NEEDS = ["linux", "rocm", "gpu", "discrete_gpu"]
@@ -38,9 +40,20 @@ def _vulkan_rows(o: dict) -> list[str]:
     return [l.strip() for l in text.splitlines() if l.strip().lower().startswith("vulkan")]
 
 
+def _offload_evidence(o: dict) -> list[str]:
+    run = (o or {}).get("chosen_run") or {}
+    rows = list(run.get("load_tensors") or []) + list(run.get("device_lines") or [])
+    out = []
+    for r in rows:
+        low = r.lower()
+        m = re.search(r"offloaded (\d+)/(\d+) layers to gpu", low)
+        if (m and int(m.group(1)) > 0) or ("vulkan" in low and "buffer size" in low):
+            out.append(r)
+    return out
+
+
 def _offloaded(o: dict) -> bool:
-    rows = ((o or {}).get("chosen_run") or {}).get("load_tensors") or []
-    return any("vulkan" in r.lower() for r in rows)
+    return bool(_offload_evidence(o)) and ((o or {}).get("chosen_run") or {}).get("completion_rc") == 0
 
 
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
@@ -75,9 +88,10 @@ def table(obs: dict) -> str:
     rows.append(f"| control arm install kind | `{_kind(b, 'control')}` | `{_kind(h, 'control')}` |")
     rows.append(f"| chosen bundle Vulkan devices | `{_vulkan_rows(b)}` | `{_vulkan_rows(h)}` |")
     hr = h.get("chosen_run") or {}
-    rows.append(f"| tiny GGUF -ngl 99 load_tensors | - | `{hr.get('load_tensors')}` |")
-    rows.append(f"| tiny GGUF completion rc / s | - | `{hr.get('completion_rc')}` / "
-                f"`{hr.get('completion_s')}` |")
+    rows.append(f"| tiny GGUF -ngl 99 offload evidence | - | `{_offload_evidence(h)[:4]}` |")
+    rows.append(f"| tiny GGUF completion (--device Vulkan0 -ngl 99) rc / s / text | - | "
+                f"`{hr.get('completion_rc')}` / `{hr.get('completion_s')}` / "
+                f"`{(hr.get('completion_text') or '').strip()[-80:]}` |")
     return "\n".join(rows)
 
 

@@ -157,7 +157,7 @@ def run_chosen(payload: dict, work: Path) -> dict:
         out["model_error"] = repr(exc)
         return out
     args = [str(completion), "-m", str(model), "-p", "The capital of France is", "-n", "16",
-            "-ngl", "99", "--temp", "0"]
+            "-ngl", "99", "--temp", "0", "--device", "Vulkan0"]
     if completion.name == "llama-cli":
         args += ["-st"]
     t = time.time()
@@ -168,7 +168,11 @@ def run_chosen(payload: dict, work: Path) -> dict:
     text = r.stdout + "\n" + r.stderr
     out["load_tensors"] = [l.strip() for l in text.splitlines()
                            if re.search(r"load_tensors:.*buffer size", l)][:8]
+    out["device_lines"] = [l.strip() for l in text.splitlines()
+                           if re.search(r"(?i)vulkan|offload|buffer size|using device", l)][:40]
     out["completion_text"] = r.stdout[-400:]
+    out["completion_args"] = args[1:]
+    out["completion_log_head"] = text[:6000]
     out["completion_log_tail"] = text[-2000:]
     return out
 
