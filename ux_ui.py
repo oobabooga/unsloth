@@ -122,8 +122,11 @@ def picker_row(model_id):
     return menu.get_by_text(model_id, exact=True).first
 
 
-def send_chat(text, timeout=600):
+def send_chat(text, timeout=600, new_chat=False):
     page = U.page
+    if new_chat:
+        page.get_by_role("button", name="New chat").first.click()
+        time.sleep(2)
     box = page.locator("textarea[aria-label='Message input']").first
     box.click()
     box.fill(text)
@@ -131,20 +134,31 @@ def send_chat(text, timeout=600):
     before = msgs.count()
     t = time.monotonic()
     page.keyboard.press("Enter")
-    # A new assistant turn appears, then the stop button goes away when it is done.
-    poll(lambda: msgs.count() > before or page.locator(".aui-composer-cancel").count() > 0, 120, 0.5)
+    try:
+        poll(lambda: msgs.count() > before or page.locator(".aui-composer-cancel").count() > 0, 120, 0.5)
+    except TimeoutError:
+        state = {"composer_value": box.input_value(), "composer_disabled": box.is_disabled(),
+                 "send_disabled": page.locator(".aui-composer-send").first.is_disabled() if page.locator(".aui-composer-send").count() else None,
+                 "trigger": picker_trigger().inner_text(), "status_loaded": inference_status().get("loaded")}
+        shot("send-did-not-start")
+        raise RuntimeError(f"message never started: {json.dumps(state)}")
     poll(lambda: page.locator(".aui-composer-cancel").count() == 0 and msgs.count() > before, timeout, 1)
     time.sleep(1.5)
     secs = round(time.monotonic() - t, 1)
     reply = msgs.last.inner_text() if msgs.count() else body_text()[-1500:]
-    return {"prompt": text, "seconds": secs, "reply": reply[-2000:]}
-
-
-def open_run_settings():
-    btn = U.page.get_by_role("button", name="Open run settings", exact=True)
-    if btn.count() and btn.first.is_visible():
-        btn.first.click()
-        time.sleep(1.5)
+    out = {"prompt": text, "seconds": secs, "reply": reply[-2000:]}
+    lines = [l for l in reply.splitlines() if l.strip()]
+    if lines and lines[0].startswith("Worked for") and (len(lines) < 2 or lines[1] in ("Copy", "Response hit the Max Tokens limit.")):
+        # No visible answer: open the thinking block to see where the text went.
+        try:
+            msgs.last.get_by_text(re.compile(r"^Worked for")).first.click()
+            time.sleep(1)
+            out["expanded_thinking"] = msgs.last.inner_text()[-1500:]
+            shot("empty-answer-expanded")
+        except Exception as exc:  # noqa: BLE001
+            out["expand_error"] = str(exc)[:300]
+        note(f"Empty visible answer for {text!r}: {reply[:120]!r}")
+    return out
 
 
 def set_number(box, value):
@@ -210,6 +224,19 @@ def main():
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append("console." + m.type + ": " + m.text) if m.type == "error" else None)
         net = []
+        traffic = open(U.OUT / "chat-traffic.jsonl", "a", encoding="utf-8")
+        def on_finished(req):
+            if "/api/inference/chat-runs" not in req.url and "/v1/chat/completions" not in req.url:
+                return
+            try:
+                resp = req.response()
+                body = resp.text() if resp and ("events" in req.url or req.method == "POST") else None
+            except Exception as exc:  # noqa: BLE001
+                body = f"<{exc}>"
+            traffic.write(json.dumps({"t": round(time.time(), 1), "method": req.method, "url": req.url.replace(U.BASE, ""),
+                                      "post": (req.post_data or "")[:6000], "body": (body or "")[-12000:]}) + "\n")
+            traffic.flush()
+        page.on("requestfinished", on_finished)
         page.on("response", lambda r: net.append({"t": round(time.time(), 1), "url": r.url.replace(U.BASE, ""), "status": r.status})
                 if ("/api/npu" in r.url or "/api/inference" in r.url or "/v1/" in r.url) else None)
         try:
@@ -406,7 +433,7 @@ def run_ui(page):
         before = ctx_box.first.input_value() if ctx_box.count() else None
         if ctx_box.count():
             set_number(ctx_box.first, "4096")
-        btn = panel.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$"))
+        btn = U.page.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$")).filter(visible=True)
         label = btn.first.inner_text()
         t = time.monotonic()
         btn.first.click()
@@ -512,18 +539,35 @@ def run_ui(page):
 
         def tool_chat():
             page = U.page
-            comp = page.locator(".aui-composer-root").first
-            tools = comp.get_by_role("button", name=re.compile(r"Tools"))
-            info = {"tools_buttons": [t.get_attribute("aria-label") or t.inner_text() for t in tools.all()]}
-            if tools.count():
-                info["before"] = tools.first.get_attribute("aria-pressed") or tools.first.get_attribute("data-state")
-                tools.first.click(); time.sleep(1); shot("tools-toggled")
-                info["after"] = tools.first.get_attribute("aria-pressed") or tools.first.get_attribute("data-state")
-                page.keyboard.press("Escape")
+            page.get_by_role("button", name="Tools and attachments").first.click()
+            time.sleep(1)
+            page.get_by_role("menuitem", name=re.compile(r"^Tools")).first.click()
+            time.sleep(1)
+            shot("tools-enabled")
             r = send_chat("Use Python to compute the sum of the integers from 1 to 100, and tell me the result.", timeout=900)
-            info["reply"] = r
-            return info
+            r["used_tool_text"] = "Python" in r["reply"] or "5050" in r["reply"]
+            return r
         step("tool_use_chat", tool_chat)
+
+    # --- R1: what does the chat show when reasoning fills the context? ---
+    def context_full():
+        open_picker("On Device")
+        picker_row(small["id"]).click()
+        poll(lambda: is_loaded(small), 600, 1)
+        open_picker("On Device")
+        U.page.get_by_role("button", name=f"Inference settings for {small['id']}").first.click()
+        time.sleep(1.5)
+        set_number(U.page.get_by_label("Context Length", exact=True).first, "2048")
+        U.page.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$")).filter(visible=True).first.click()
+        poll(lambda: (s := npu_status()) and s.get("context_length") == 2048, 300, 1)
+        close_picker()
+        r = send_chat("Think very carefully, step by step, and list every prime number below 3000 with a one-line justification for each.", timeout=600, new_chat=True)
+        r["banners"] = [b for b in ("hit the Max Tokens limit", "filled the model's context window", "empty response", "Continue", "Resume") if b in r["reply"]]
+        if not r["banners"]:
+            note("Reasoning filled the NPU context (2048) and the chat showed no explanation (no 'context window' / 'Max Tokens' banner).")
+        return r
+    step("context_full_ui_message", context_full)
+    step("chat_3x4_before_restart", lambda: send_chat("What is 3 times 4? Reply with just the number.", new_chat=True))
 
     # --- Restart Studio: does the NPU come back without clicking Enable again? ---
     close_picker()
@@ -567,6 +611,7 @@ def run_ui(page):
             t = time.monotonic()
             poll(lambda m=m: is_loaded(m), 600, 1)
             close_picker()
+            time.sleep(3)
             out[m["id"]] = {"switch_seconds": round(time.monotonic() - t, 1),
                             "chat": send_chat("Reply with the single word: ok", timeout=300)}
         return out
