@@ -63,12 +63,12 @@ def spawn_until(args, name, *, ready=None, timeout=900, then=None):
 
 def chat_via(text):
     """When `unsloth run` serves, find its base URL + key in its output and chat once."""
-    url = re.search(r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d+", text)
-    key = re.search(r"\b(sk-[A-Za-z0-9_\-]{10,}|unsloth_[A-Za-z0-9_\-]{10,})", text)
+    url = re.search(r"Unsloth Studio running at (https?://\S+)", text)
+    key = re.search(r"API Key:\s+(\S+)", text)
     if not url:
         return {"error": "no URL printed"}
-    base = url.group(0).replace("0.0.0.0", "127.0.0.1")
-    h = {"Authorization": "Bearer " + key.group(0)} if key else {}
+    base = url.group(1).rstrip("/").replace("0.0.0.0", "127.0.0.1")
+    h = {"Authorization": "Bearer " + key.group(1)} if key else {}
     models = U.requests.get(base + "/v1/models", headers=h, timeout=30)
     mid = None
     try:
@@ -78,7 +78,9 @@ def chat_via(text):
         pass
     r = U.requests.post(base + "/v1/chat/completions", headers=h, timeout=300,
                         json={"model": mid or "default", "messages": [{"role": "user", "content": "What is 17 + 25? Reply with just the number."}], "max_tokens": 200})
-    return {"base": base, "key_found": bool(key), "models_status": models.status_code, "model_ids": mid,
+    loaded = re.search(r"Model loaded:\s*(.+)", text)
+    return {"base": base, "key_found": bool(key), "model_loaded_line": loaded.group(1) if loaded else None,
+            "models_status": models.status_code, "model_ids": mid,
             "chat_status": r.status_code, "chat": r.text[:1500]}
 
 
@@ -96,7 +98,7 @@ def main():
     cat = json.loads((U.ROOT / "catalog.json").read_text()) if (U.ROOT / "catalog.json").exists() else []
     small = next((m for m in cat if m["checkpoint"] == "qwen3:0.6b"), None)
     npu_id = small["id"] if small else "qwen3-0.6b-FLM"
-    ready = r"(Ready|Serving|listening|OpenAI[- ]compatible|API key|base[_ ]url|http://127\.0\.0\.1:\d+/v1)"
+    ready = r"OpenAI / Anthropic SDK base URL:\s*\n\s*\S+"
 
     # What an NPU user would try first: the id Studio shows, its model_path, and FastFlowLM's own name.
     for label, model in (("model_path", "lemonade:" + npu_id), ("studio_id", npu_id), ("flm_name", "qwen3:0.6b")):

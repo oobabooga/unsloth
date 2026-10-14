@@ -52,6 +52,8 @@ jobs:
 
         start=$(date +%s)
 
+        unset HF_HOME HF_ENDPOINT HF_HUB_DISABLE_XET XDG_CACHE_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE
+
         curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$UX_ROOT/evidence/install.log"
 
         rc=${PIPESTATUS[1]}
@@ -147,6 +149,8 @@ jobs:
     - name: Install Unsloth Studio with the README one-liner
       timeout-minutes: 40
       run: '$ErrorActionPreference = ''Continue''
+
+        foreach ($v in ''HF_HOME'',''HF_ENDPOINT'',''HF_HUB_DISABLE_XET'',''XDG_CACHE_HOME'',''HUGGINGFACE_HUB_CACHE'',''TRANSFORMERS_CACHE'') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
 

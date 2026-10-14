@@ -43,6 +43,7 @@ def stop_studio():
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
     else:
         # Ctrl+C in the user's terminal signals the whole foreground group.
+        print(f"sending SIGINT to studio group {p.pid} at {time.strftime('%H:%M:%S')}", flush=True)
         os.killpg(p.pid, 2)
         try:
             p.wait(60)
@@ -52,7 +53,9 @@ def stop_studio():
     # Lemonade/FastFlowLM children must not outlive Studio.
     time.sleep(5)
     left = U.run("tasklist" if U.WIN else "ps -eo pid,ppid,etime,cmd", name=f"procs-after-stop-{studio['n']}")[1]
-    stray = [l for l in left.splitlines() if re.search(r"lemond|lemonade|flm(\.exe)?\b|llama-server", l, re.I)]
+    # /usr/bin/lemond is the runner image's own system service, not Studio's.
+    stray = [l for l in left.splitlines() if re.search(r"lemond|lemonade|flm(\.exe)?\b|llama-server", l, re.I)
+             and "/usr/bin/lemond" not in l]
     if stray:
         note(f"After stopping Studio #{studio['n']} these runtime processes were still alive: {stray[:6]}")
     studio["proc"] = None
@@ -241,6 +244,13 @@ def run_ui(page):
     def enable():
         menu = U.page.locator(".unsloth-model-selector-menu").first
         btn = menu.get_by_role("button", name=re.compile(r"^(Enable NPU|Start NPU runtime|Try again)$"))
+        if not btn.count():
+            # The NPU group starts folded: only an "NPU >" heading. A user has to think to open it.
+            note("Chat picker on a fresh Ryzen AI install: the NPU group is folded to a bare 'NPU' heading; Enable NPU is hidden until the user expands it.")
+            heading = menu.get_by_role("button", name=re.compile(r"^NPU$", re.I))
+            (heading.first if heading.count() else menu.get_by_text("NPU", exact=True).first).click()
+            time.sleep(1.5)
+            shot("npu-group-expanded")
         btn.first.scroll_into_view_if_needed()
         label = btn.first.inner_text()
         t = time.monotonic()

@@ -3,6 +3,10 @@ import json, os, pathlib, subprocess, sys, time, traceback
 
 import requests
 
+# A new user has none of the runner's shared caches or mirrors.
+RUNNER_ENV = {k: os.environ.pop(k) for k in ("HF_HOME", "HF_ENDPOINT", "HF_HUB_DISABLE_XET", "XDG_CACHE_HOME",
+                                            "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE") if k in os.environ}
+
 ROOT = pathlib.Path(os.environ["UX_ROOT"])
 OUT = ROOT / "evidence"
 OUT.mkdir(parents=True, exist_ok=True)
