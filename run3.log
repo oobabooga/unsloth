@@ -1,0 +1,342 @@
+linux	Set up job	﻿2026-10-14T19:34:46.5752502Z Current runner version: '2.337.0'
+linux	Set up job	2026-10-14T19:34:46.5757745Z Runner name: 'ephemeral-devlab-x2-la03-s03-d08-116052457087'
+linux	Set up job	2026-10-14T19:34:46.5758413Z Runner group name: 'Default'
+linux	Set up job	2026-10-14T19:34:46.5759078Z Machine name: 'X2-LA03-S03-D08'
+linux	Set up job	2026-10-14T19:34:46.5825156Z ##[group]GITHUB_TOKEN Permissions
+linux	Set up job	2026-10-14T19:34:46.5827505Z Metadata: read
+linux	Set up job	2026-10-14T19:34:46.5827869Z ##[endgroup]
+linux	Set up job	2026-10-14T19:34:46.5830004Z Secret source: Actions
+linux	Set up job	2026-10-14T19:34:46.5830565Z Cache mode: write
+linux	Set up job	2026-10-14T19:34:46.5831027Z Prepare workflow directory
+linux	Set up job	2026-10-14T19:34:46.6105761Z Prepare all required actions
+linux	Set up job	2026-10-14T19:34:46.6156948Z Complete job name: linux
+linux	Hardware	﻿2026-10-14T19:34:46.6850449Z ##[group]Run uname -a; free -h; lscpu | grep 'Model name'
+linux	Hardware	2026-10-14T19:34:46.6851132Z ^[[36;1muname -a; free -h; lscpu | grep 'Model name'^[[0m
+linux	Hardware	2026-10-14T19:34:46.6852202Z ^[[36;1mfor d in /sys/class/drm/card*/device; do [ -f $d/mem_info_gtt_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total) gtt_used=$(cat $d/mem_info_gtt_used)"; done^[[0m
+linux	Hardware	2026-10-14T19:34:46.6853368Z ^[[36;1mcat /sys/module/ttm/parameters/pages_limit 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:34:46.6854006Z ^[[36;1mls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:34:46.6854687Z ^[[36;1mldconfig -p | grep -E 'libvulkan|libamdhip64|libhipblas|librocblas' || true^[[0m
+linux	Hardware	2026-10-14T19:34:46.6855398Z ^[[36;1mls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:34:46.6878006Z shell: /usr/bin/bash -e {0}
+linux	Hardware	2026-10-14T19:34:46.6878517Z env:
+linux	Hardware	2026-10-14T19:34:46.6878830Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Hardware	2026-10-14T19:34:46.6879207Z ##[endgroup]
+linux	Hardware	2026-10-14T19:34:46.7017587Z Linux X2-LA03-S03-D08 6.17.0-1032-oem #32-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 24 05:46:26 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+linux	Hardware	2026-10-14T19:34:46.7076680Z                total        used        free      shared  buff/cache   available
+linux	Hardware	2026-10-14T19:34:46.7077874Z Mem:           124Gi       4.9Gi        46Gi       1.6Gi        76Gi       120Gi
+linux	Hardware	2026-10-14T19:34:46.7078916Z Swap:             0B          0B          0B
+linux	Hardware	2026-10-14T19:34:46.7079893Z Model name:                              AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	Hardware	2026-10-14T19:34:46.7113560Z /sys/class/drm/card0/device vram_total=536870912 gtt_total=67079913472 gtt_used=39673856
+linux	Hardware	2026-10-14T19:34:46.7123959Z 16376932
+linux	Hardware	2026-10-14T19:34:46.7138443Z /etc/vulkan/icd.d:
+linux	Hardware	2026-10-14T19:34:46.7139017Z 
+linux	Hardware	2026-10-14T19:34:46.7139308Z /usr/share/vulkan/icd.d:
+linux	Hardware	2026-10-14T19:34:46.7140010Z asahi_icd.json
+linux	Hardware	2026-10-14T19:34:46.7140807Z gfxstream_vk_icd.json
+linux	Hardware	2026-10-14T19:34:46.7141461Z intel_hasvk_icd.json
+linux	Hardware	2026-10-14T19:34:46.7142119Z intel_icd.json
+linux	Hardware	2026-10-14T19:34:46.7142713Z lvp_icd.json
+linux	Hardware	2026-10-14T19:34:46.7143292Z nouveau_icd.json
+linux	Hardware	2026-10-14T19:34:46.7143887Z radeon_icd.json
+linux	Hardware	2026-10-14T19:34:46.7144477Z virtio_icd.json
+linux	Hardware	2026-10-14T19:34:46.7156521Z 	libvulkan_virtio.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_virtio.so
+linux	Hardware	2026-10-14T19:34:46.7158044Z 	libvulkan_radeon.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_radeon.so
+linux	Hardware	2026-10-14T19:34:46.7160088Z 	libvulkan_nouveau.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_nouveau.so
+linux	Hardware	2026-10-14T19:34:46.7161011Z 	libvulkan_lvp.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_lvp.so
+linux	Hardware	2026-10-14T19:34:46.7161730Z 	libvulkan_intel_hasvk.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel_hasvk.so
+linux	Hardware	2026-10-14T19:34:46.7162448Z 	libvulkan_intel.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel.so
+linux	Hardware	2026-10-14T19:34:46.7163139Z 	libvulkan_gfxstream.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_gfxstream.so
+linux	Hardware	2026-10-14T19:34:46.7163841Z 	libvulkan_asahi.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_asahi.so
+linux	Hardware	2026-10-14T19:34:46.7164496Z 	libvulkan.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan.so.1
+linux	Hardware	2026-10-14T19:34:46.7165119Z 	librocblas.so.5 (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so.5
+linux	Hardware	2026-10-14T19:34:46.7165727Z 	librocblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so
+linux	Hardware	2026-10-14T19:34:46.7166525Z 	libhipblaslt.so.1 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so.1
+linux	Hardware	2026-10-14T19:34:46.7167204Z 	libhipblaslt.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so
+linux	Hardware	2026-10-14T19:34:46.7167817Z 	libhipblas.so.3 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so.3
+linux	Hardware	2026-10-14T19:34:46.7168412Z 	libhipblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so
+linux	Hardware	2026-10-14T19:34:46.7169015Z 	libamdhip64.so.7 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so.7
+linux	Hardware	2026-10-14T19:34:46.7169641Z 	libamdhip64.so.5 (libc6,x86-64) => /lib/x86_64-linux-gnu/libamdhip64.so.5
+linux	Hardware	2026-10-14T19:34:46.7170258Z 	libamdhip64.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so
+linux	Hardware	2026-10-14T19:34:46.7170841Z /opt/rocm
+linux	Hardware	2026-10-14T19:34:46.7171136Z /opt/rocm-7.2.1
+linux	Hardware	2026-10-14T19:34:46.7172730Z 7.2.1
+linux	Setup	﻿2026-10-14T19:34:46.7308902Z ##[group]Run export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+linux	Setup	2026-10-14T19:34:46.7309727Z ^[[36;1mexport W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}^[[0m
+linux	Setup	2026-10-14T19:34:46.7310327Z ^[[36;1mexport MODELS="$W/models" OUT="$W/out"^[[0m
+linux	Setup	2026-10-14T19:34:46.7310986Z ^[[36;1mecho "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV^[[0m
+linux	Setup	2026-10-14T19:34:46.7312158Z ^[[36;1mfor f in h3probe.py gttfill.py; do curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/51472c0333e9955d7d508ad05e7759e709031388/$f" -o "$W/$f"; done^[[0m
+linux	Setup	2026-10-14T19:34:46.7313702Z ^[[36;1mcd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T19:34:46.7315456Z ^[[36;1mcd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T19:34:46.7316685Z ^[[36;1mfind "$W/vk" "$W/rocm" -name sd-cli^[[0m
+linux	Setup	2026-10-14T19:34:46.7317366Z ^[[36;1mpython3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]" vulkan^[[0m
+linux	Setup	2026-10-14T19:34:46.7318055Z ^[[36;1mexport HF_HOME="$W/hf" TMPDIR="$W/tmp"^[[0m
+linux	Setup	2026-10-14T19:34:46.7318482Z ^[[36;1mpython - <<'PY'^[[0m
+linux	Setup	2026-10-14T19:34:46.7318850Z ^[[36;1mimport os^[[0m
+linux	Setup	2026-10-14T19:34:46.7319231Z ^[[36;1mfrom huggingface_hub import hf_hub_download^[[0m
+linux	Setup	2026-10-14T19:34:46.7320220Z ^[[36;1mfor f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:^[[0m
+linux	Setup	2026-10-14T19:34:46.7321368Z ^[[36;1m    print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))^[[0m
+linux	Setup	2026-10-14T19:34:46.7321965Z ^[[36;1mPY^[[0m
+linux	Setup	2026-10-14T19:34:46.7322273Z ^[[36;1mdu -sh "$W/models"^[[0m
+linux	Setup	2026-10-14T19:34:46.7335027Z shell: /usr/bin/bash -e {0}
+linux	Setup	2026-10-14T19:34:46.7335378Z env:
+linux	Setup	2026-10-14T19:34:46.7335681Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Setup	2026-10-14T19:34:46.7336059Z ##[endgroup]
+linux	Setup	2026-10-14T19:35:02.0353365Z /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	Setup	2026-10-14T19:35:02.0354679Z /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	Setup	2026-10-14T19:47:57.8906520Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf
+linux	Setup	2026-10-14T19:47:57.8909316Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+linux	Setup	2026-10-14T19:47:57.8910179Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors
+linux	Setup	2026-10-14T19:47:57.8911051Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors
+linux	Setup	2026-10-14T19:47:58.3330110Z 34G	/mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	List devices	﻿2026-10-14T19:47:58.3374496Z ##[group]Run VK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)
+linux	List devices	2026-10-14T19:47:58.3374951Z ^[[36;1mVK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)^[[0m
+linux	List devices	2026-10-14T19:47:58.3375434Z ^[[36;1mecho "VK=$VK" >> $GITHUB_ENV; echo "RC=$RC" >> $GITHUB_ENV^[[0m
+linux	List devices	2026-10-14T19:47:58.3375687Z ^[[36;1m$VK --list-devices || true^[[0m
+linux	List devices	2026-10-14T19:47:58.3375880Z ^[[36;1m$RC --list-devices || true^[[0m
+linux	List devices	2026-10-14T19:47:58.3376155Z ^[[36;1mldd $(dirname $RC)/libggml-hip.so | grep -E 'hip|rocblas|not found' || true^[[0m
+linux	List devices	2026-10-14T19:47:58.3389990Z shell: /usr/bin/bash -e {0}
+linux	List devices	2026-10-14T19:47:58.3390174Z env:
+linux	List devices	2026-10-14T19:47:58.3390342Z   TAG: master-951-f89d9b1-uafac7a7
+linux	List devices	2026-10-14T19:47:58.3390549Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	List devices	2026-10-14T19:47:58.3390809Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	List devices	2026-10-14T19:47:58.3391077Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	List devices	2026-10-14T19:47:58.3391297Z ##[endgroup]
+linux	List devices	2026-10-14T19:47:58.4801960Z ggml_vulkan: Found 1 Vulkan devices:
+linux	List devices	2026-10-14T19:47:58.4803076Z ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	List devices	2026-10-14T19:47:58.4864752Z Vulkan0	AMD Radeon Graphics (RADV GFX1151)
+linux	List devices	2026-10-14T19:47:58.4865136Z CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	List devices	2026-10-14T19:47:58.7012481Z ggml_cuda_init: found 1 ROCm devices (Total VRAM: 63972 MiB):
+linux	List devices	2026-10-14T19:47:58.7013394Z   Device 0: AMD Radeon Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 63972 MiB
+linux	List devices	2026-10-14T19:47:58.7014450Z load_backend: loaded ROCm backend from /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/libggml-hip.so
+linux	List devices	2026-10-14T19:47:58.7099692Z load_backend: loaded CPU backend from /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/libggml-cpu-zen4.so
+linux	List devices	2026-10-14T19:47:58.7215366Z ROCm0	AMD Radeon Graphics
+linux	List devices	2026-10-14T19:47:58.7215842Z CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	List devices	2026-10-14T19:47:58.7421668Z 	libhipblas.so.3 => /opt/rocm-7.2.1/lib/libhipblas.so.3 (0x0000721769b24000)
+linux	List devices	2026-10-14T19:47:58.7422514Z 	librocblas.so.5 => /opt/rocm-7.2.1/lib/librocblas.so.5 (0x0000721766b81000)
+linux	List devices	2026-10-14T19:47:58.7423177Z 	libamdhip64.so.7 => /opt/rocm-7.2.1/lib/libamdhip64.so.7 (0x0000721765197000)
+linux	List devices	2026-10-14T19:47:58.7423848Z 	libhipblaslt.so.1 => /opt/rocm-7.2.1/lib/libhipblaslt.so.1 (0x0000721730a64000)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	﻿2026-10-14T19:47:58.7457247Z ##[group]Run python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7457983Z ^[[36;1mpython3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true^[[0m
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7471851Z shell: /usr/bin/bash -e {0}
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7472023Z env:
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7472191Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7472436Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7472702Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7472981Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7473410Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7473867Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7474156Z ##[endgroup]
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7698598Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7974489Z [    0.0s] ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7988466Z [    0.0s]   max_vram: "-1",
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7988935Z [    0.0s]   disable_segmented_compute: false,
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:58.7989365Z [    0.0s]   auto_fit: true,
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:59.0312554Z [    0.3s] [W] --max-vram < 0 requested, but the main backend is CPU; disabling graph splitting --- ggml_graph_cut.cpp:245
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:59.0364282Z [    0.3s] [I] --max-vram < 0 auto-detected 62.75 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 61.75 GiB --- ggml_graph_cut.cpp:261
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:59.0366140Z [    0.3s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1343
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:47:59.9319595Z [    1.2s] [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:490
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:00.2774450Z [    1.5s] [V] qwen3vl compute buffer size: 1.88 MB(RAM) on CPU (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:02.7461971Z [    4.0s] [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:16.4082351Z [   17.6s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:28.4153570Z [   29.6s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:28.7151418Z [   29.9s] [V] model manager prepared params backend buffers (249.99 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:29.2323664Z [   30.5s] [V] minimax_h3_audio_vae compute buffer size: 16.31 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:29.8602326Z [   31.1s] [V] model manager prepared params backend buffers (4636.95 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:48:33.1968200Z [   34.4s] [V] minimax_h3_video_vae compute buffer size: 507.50 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:49:02.6423036Z RESULT {"label": "V_auto", "rc": 0, "secs": 63.9, "base_gtt_gib": 0.04, "peak_gtt_gib": 22.09, "base_vram_gib": 0.18, "peak_vram_gib": 0.41, "base_avail_gib": 119.88, "min_avail_gib": 81.77, "output": 711980}
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	﻿2026-10-14T19:49:02.6510151Z ##[group]Run "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6510466Z ^[[36;1m"$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6510740Z ^[[36;1mfor i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6511140Z ^[[36;1mpython3 "$W/h3probe.py" V_auto_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6511470Z ^[[36;1mkill $FP; wait $FP 2>/dev/null || true^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6522452Z shell: /usr/bin/bash -e {0}
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6522573Z env:
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6522682Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6522832Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6523012Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6523200Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6523526Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6523944Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:02.6524126Z ##[endgroup]
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9889955Z type 0 flags=0x1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9891052Z type 1 flags=0x1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9891598Z type 2 flags=0x6 heap 0 size=20.99 GiB heapflags=0x0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9892130Z type 3 flags=0x7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9892604Z type 4 flags=0x7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9893078Z type 5 flags=0xe heap 0 size=20.99 GiB heapflags=0x0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9893548Z type 6 flags=0xe heap 0 size=20.99 GiB heapflags=0x0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9894031Z type 7 flags=0xc1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9894527Z type 8 flags=0xc6 heap 0 size=20.99 GiB heapflags=0x0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9895061Z type 9 flags=0xc7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9895576Z type 10 flags=0xce heap 0 size=20.99 GiB heapflags=0x0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9895998Z using memory type 10
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9896380Z gtt total=62.47 used=0.04 GiB; allocating 39.94 GiB
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:07.9896925Z FILLED gtt used=39.97 free=22.50 GiB
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.0154429Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto_t.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.0508479Z [    0.0s] ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.0522960Z [    0.0s]   max_vram: "-1",
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.0523440Z [    0.0s]   disable_segmented_compute: false,
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.0523857Z [    0.0s]   auto_fit: true,
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.2924335Z [    0.3s] [W] --max-vram < 0 requested, but the main backend is CPU; disabling graph splitting --- ggml_graph_cut.cpp:245
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.2925642Z [    0.3s] [I] --max-vram < 0 auto-detected 22.81 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 21.81 GiB --- ggml_graph_cut.cpp:261
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:08.2959584Z [    0.3s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1343
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:10.7826943Z [    2.8s] [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:490
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:11.1200426Z [    3.1s] [V] qwen3vl compute buffer size: 1.88 MB(RAM) on CPU (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:13.8664828Z [    5.9s] [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:27.1571705Z [   19.1s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:27.1707631Z [   19.2s] [V] minimax_h3 using 54 segments --- ggml_runner.cpp:878
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:39.7171626Z [   31.7s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 54 segments) --- ggml_runner.cpp:1019
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:40.0114443Z [   32.0s] [V] model manager prepared params backend buffers (249.99 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:40.2445626Z [   32.2s] [V] minimax_h3_audio_vae compute buffer size: 16.31 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:41.2871386Z [   33.3s] [V] model manager prepared params backend buffers (4636.95 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:49:44.4582276Z [   36.4s] [V] minimax_h3_video_vae compute buffer size: 507.50 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:50:14.4035041Z RESULT {"label": "V_auto_t", "rc": 0, "secs": 66.4, "base_gtt_gib": 39.97, "peak_gtt_gib": 62.03, "base_vram_gib": 0.19, "peak_vram_gib": 0.44, "base_avail_gib": 79.05, "min_avail_gib": 40.85, "output": 711980}
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	﻿2026-10-14T19:50:14.5155979Z ##[group]Run "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5156442Z ^[[36;1m"$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5156896Z ^[[36;1mfor i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5157453Z ^[[36;1mpython3 "$W/h3probe.py" V_te_gpu_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5157909Z ^[[36;1mkill $FP; wait $FP 2>/dev/null || true^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5177577Z shell: /usr/bin/bash -e {0}
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5177773Z env:
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5177927Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5178153Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5178594Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5179128Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5180041Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5180970Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:14.5181469Z ##[endgroup]
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5522727Z type 0 flags=0x1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5523355Z type 1 flags=0x1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5523769Z type 2 flags=0x6 heap 0 size=20.99 GiB heapflags=0x0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5524269Z type 3 flags=0x7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5524661Z type 4 flags=0x7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5525079Z type 5 flags=0xe heap 0 size=20.99 GiB heapflags=0x0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5525472Z type 6 flags=0xe heap 0 size=20.99 GiB heapflags=0x0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5525874Z type 7 flags=0xc1 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5526282Z type 8 flags=0xc6 heap 0 size=20.99 GiB heapflags=0x0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5526867Z type 9 flags=0xc7 heap 1 size=41.98 GiB heapflags=0x1
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5527292Z type 10 flags=0xce heap 0 size=20.99 GiB heapflags=0x0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5527655Z using memory type 10
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5527969Z gtt total=62.47 used=0.04 GiB; allocating 39.94 GiB
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5528346Z FILLED gtt used=39.97 free=22.50 GiB
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.5757284Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_te_gpu_t.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.6059362Z [    0.0s] ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.6076947Z [    0.0s]   max_vram: "-1",
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.6077543Z [    0.0s]   disable_segmented_compute: false,
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.6077917Z [    0.0s]   auto_fit: true,
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.8135088Z [    0.2s] [I] --max-vram < 0 auto-detected 22.82 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 21.82 GiB --- ggml_graph_cut.cpp:261
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:19.8168171Z [    0.2s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1343
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:23.5381059Z [    4.0s] [V] model manager prepared params backend buffers (16240.00 MB, 551 tensors, 16 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:28.2914631Z [    8.7s] [V] qwen3vl compute buffer size: 1.88 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:30.2523029Z [   10.7s] [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:32.8221917Z [   13.2s] [W] model manager cannot make enough memory available on Vulkan0: need 1259.13 MB device / 747.13 MB budget, available 0.00 MB device / 11362.74 MB budget --- model_manager.cpp:1944
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:32.8223474Z [   13.2s] [E] minimax_h3 segment 1/1 (graph) failed during workspace capacity check --- ggml_runner.cpp:898
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3840844Z RESULT {"label": "V_te_gpu_t", "rc": 1, "secs": 13.8, "base_gtt_gib": 39.97, "peak_gtt_gib": 62.38, "base_vram_gib": 0.18, "peak_vram_gib": 0.19, "base_avail_gib": 79.94, "min_avail_gib": 42.36, "output": false}
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3890778Z [I] loading tensors completed, taking 2.93s (read: 2.83s, memcpy: 0.00s, convert: 0.00s, copy_to_backend: 0.00s) --- model_loader.cpp:1385
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3892042Z [V] model manager prepared params backend buffers (16240.00 MB, 551 tensors, 16 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3892999Z [V] model manager staged compute params (16239.66 MB, 551 tensors, 16 blocks) to Vulkan0, taking 4.44s --- model_manager.cpp:618
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3893855Z [V] qwen3vl compute buffer size: 1.88 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3894580Z [V] computing condition graph completed, taking 8464 ms --- conditioner.hpp:3210
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3895170Z [I] get_learned_condition completed, taking 8.46s --- video.cpp:1212
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3895636Z [I] generate_video 640x384x39 --- video.cpp:1612
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3895992Z [V] sample 40x24x12 --- video.cpp:1678
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3896276Z [I] minimax_h3 build cached graph cut plan done (taking 4 ms) --- ggml_graph_cut.cpp:1032
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3896953Z [V] loading 532/532 tensors from /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --- model_loader.cpp:1115
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3897300Z 
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3977665Z   |##                                                | 15/532 - 0.00MB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3977998Z   |##########                                        | 102/532 - 5.61GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3978278Z   |#################                                 | 175/532 - 6.46GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3978546Z   |########################                          | 248/532 - 6.82GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3978818Z   |##############################                    | 315/532 - 6.79GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3979082Z   |#####################################             | 390/532 - 6.94GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3979771Z   |############################################      | 461/532 - 7.01GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3980035Z   |##################################################| 532/532 - 7.41GB/s^[[K
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3980452Z [I] loading tensors completed, taking 1.43s (read: 1.40s, memcpy: 0.00s, convert: 0.00s, copy_to_backend: 0.00s) --- model_loader.cpp:1385
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3981028Z [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3981569Z [V] model manager staged compute params (10975.93 MB, 532 tensors, 12 blocks) to Vulkan0, taking 2.43s --- model_manager.cpp:618
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3982222Z [W] model manager memory on Vulkan0: reported free 17592186039058.38 MB / total 64484.39 MB, tracked weights 10975.93 MB / other runtime 0.00 MB / current runtime 0.00 MB --- model_manager.cpp:1766
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3982988Z [W] model manager cannot make enough memory available on Vulkan0: need 1259.13 MB device / 747.13 MB budget, available 0.00 MB device / 11362.74 MB budget --- model_manager.cpp:1944
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3983675Z [E] minimax_h3 segment 1/1 (graph) failed during workspace capacity check --- ggml_runner.cpp:898
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3984039Z [E] diffusion model compute failed --- diffusion_engine.cpp:2613
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3984337Z [E] Diffusion model sampling failed --- diffusion_engine.cpp:2752
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3984598Z [E] sampling failed after 4.53s --- video.cpp:1709
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3984815Z [E] generate failed --- main.cpp:939
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:50:33.3985195Z [V] model manager released params backend buffers (27216.71 MB, 1083 tensors, 28 blocks, RAM) from Vulkan_Host --- model_manager.cpp:1260
+linux	R_auto (upstream ROCm, Studio ROCm flags)	﻿2026-10-14T19:50:34.0391149Z ##[group]Run python3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0391845Z ^[[36;1mpython3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true^[[0m
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0405562Z shell: /usr/bin/bash -e {0}
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0405727Z env:
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0405884Z   TAG: master-951-f89d9b1-uafac7a7
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0406096Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0406356Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0406663Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0407096Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0407561Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0407846Z ##[endgroup]
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.0665812Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/R_auto.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.2531079Z [    0.2s] ggml_cuda_init: found 1 ROCm devices (Total VRAM: 63972 MiB):
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.2531899Z [    0.2s]   Device 0: AMD Radeon Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 63972 MiB
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.2622010Z [    0.2s]   max_vram: "-1",
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.2622563Z [    0.2s]   disable_segmented_compute: false,
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.2622935Z [    0.2s]   auto_fit: true,
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.4148979Z [    0.3s] [I] --max-vram < 0 auto-detected 62.47 GiB free VRAM (62.47 GiB total), reserving 1.00 GiB; using 61.47 GiB --- ggml_graph_cut.cpp:261
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:34.4182428Z [    0.4s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1329
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:35.6527468Z [    1.6s] [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:36.8244892Z [    2.8s] [V] qwen3vl compute buffer size: 1.88 MB(VRAM) on ROCm0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:37.6327341Z [    3.6s] [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:47.9739659Z [   13.9s] [V] minimax_h3 compute buffer size: 788.55 MB(VRAM) on ROCm0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:57.8232448Z [   23.8s] [V] minimax_h3 compute buffer size: 788.92 MB(VRAM) on ROCm0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:58.0975109Z [   24.0s] [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:58.8134027Z [   24.7s] [V] minimax_h3_audio_vae compute buffer size: 33.98 MB(VRAM) on ROCm0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:50:59.6750398Z [   25.6s] [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:51:01.6934823Z [   27.6s] [V] minimax_h3_video_vae compute buffer size: 507.28 MB(VRAM) on ROCm0 (peak across 1 segment) --- ggml_runner.cpp:1019
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:51:22.2426191Z RESULT {"label": "R_auto", "rc": 0, "secs": 48.2, "base_gtt_gib": 0.05, "peak_gtt_gib": 16.07, "base_vram_gib": 0.14, "peak_vram_gib": 0.14, "base_avail_gib": 119.99, "min_avail_gib": 80.97, "output": 427898}
+linux	Summary	﻿2026-10-14T19:51:22.2576016Z ##[group]Run cat "$OUT/results.jsonl" || true
+linux	Summary	2026-10-14T19:51:22.2576315Z ^[[36;1mcat "$OUT/results.jsonl" || true^[[0m
+linux	Summary	2026-10-14T19:51:22.2576757Z ^[[36;1mfor f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|error|abort|assert|budget|prepared params|max.vram' "$f" | head -40; done^[[0m
+linux	Summary	2026-10-14T19:51:22.2590418Z shell: /usr/bin/bash -e {0}
+linux	Summary	2026-10-14T19:51:22.2590584Z env:
+linux	Summary	2026-10-14T19:51:22.2590734Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Summary	2026-10-14T19:51:22.2590946Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	Summary	2026-10-14T19:51:22.2591205Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	Summary	2026-10-14T19:51:22.2591471Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	Summary	2026-10-14T19:51:22.2591901Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	Summary	2026-10-14T19:51:22.2592357Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	Summary	2026-10-14T19:51:22.2592620Z ##[endgroup]
+linux	Summary	2026-10-14T19:51:22.2638276Z {"label": "V_auto", "rc": 0, "secs": 63.9, "base_gtt_gib": 0.04, "peak_gtt_gib": 22.09, "base_vram_gib": 0.18, "peak_vram_gib": 0.41, "base_avail_gib": 119.88, "min_avail_gib": 81.77, "output": 711980}
+linux	Summary	2026-10-14T19:51:22.2640047Z {"label": "V_auto_t", "rc": 0, "secs": 66.4, "base_gtt_gib": 39.97, "peak_gtt_gib": 62.03, "base_vram_gib": 0.19, "peak_vram_gib": 0.44, "base_avail_gib": 79.05, "min_avail_gib": 40.85, "output": 711980}
+linux	Summary	2026-10-14T19:51:22.2641507Z {"label": "V_te_gpu_t", "rc": 1, "secs": 13.8, "base_gtt_gib": 39.97, "peak_gtt_gib": 62.38, "base_vram_gib": 0.18, "peak_vram_gib": 0.19, "base_avail_gib": 79.94, "min_avail_gib": 42.36, "output": false}
+linux	Summary	2026-10-14T19:51:22.2642935Z {"label": "R_auto", "rc": 0, "secs": 48.2, "base_gtt_gib": 0.05, "peak_gtt_gib": 16.07, "base_vram_gib": 0.14, "peak_vram_gib": 0.14, "base_avail_gib": 119.99, "min_avail_gib": 80.97, "output": 427898}
+linux	Summary	2026-10-14T19:51:22.2644353Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/R_auto.log
+linux	Summary	2026-10-14T19:51:22.2662902Z   max_vram: "-1",
+linux	Summary	2026-10-14T19:51:22.2664004Z [I] --max-vram < 0 auto-detected 62.47 GiB free VRAM (62.47 GiB total), reserving 1.00 GiB; using 61.47 GiB --- ggml_graph_cut.cpp:261
+linux	Summary	2026-10-14T19:51:22.2665092Z [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2666056Z [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2667063Z [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2667984Z [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 1 blocks, RAM) on ROCm_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2668705Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto.log
+linux	Summary	2026-10-14T19:51:22.2686329Z ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	Summary	2026-10-14T19:51:22.2687269Z   max_vram: "-1",
+linux	Summary	2026-10-14T19:51:22.2687897Z [W] --max-vram < 0 requested, but the main backend is CPU; disabling graph splitting --- ggml_graph_cut.cpp:245
+linux	Summary	2026-10-14T19:51:22.2688931Z [I] --max-vram < 0 auto-detected 62.75 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 61.75 GiB --- ggml_graph_cut.cpp:261
+linux	Summary	2026-10-14T19:51:22.2690009Z [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2691073Z [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2691668Z [V] model manager prepared params backend buffers (249.99 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2692201Z [V] model manager prepared params backend buffers (4636.95 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2692825Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto_t.log
+linux	Summary	2026-10-14T19:51:22.2705603Z ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	Summary	2026-10-14T19:51:22.2706473Z   max_vram: "-1",
+linux	Summary	2026-10-14T19:51:22.2707176Z [W] --max-vram < 0 requested, but the main backend is CPU; disabling graph splitting --- ggml_graph_cut.cpp:245
+linux	Summary	2026-10-14T19:51:22.2708199Z [I] --max-vram < 0 auto-detected 22.81 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 21.81 GiB --- ggml_graph_cut.cpp:261
+linux	Summary	2026-10-14T19:51:22.2709276Z [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2710328Z [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2711222Z [V] model manager prepared params backend buffers (249.99 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2711754Z [V] model manager prepared params backend buffers (4636.95 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2712190Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_te_gpu_t.log
+linux	Summary	2026-10-14T19:51:22.2724188Z ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	Summary	2026-10-14T19:51:22.2725051Z   max_vram: "-1",
+linux	Summary	2026-10-14T19:51:22.2725744Z [I] --max-vram < 0 auto-detected 22.82 GiB free VRAM (62.97 GiB total), reserving 1.00 GiB; using 21.82 GiB --- ggml_graph_cut.cpp:261
+linux	Summary	2026-10-14T19:51:22.2726960Z [V] model manager prepared params backend buffers (16240.00 MB, 551 tensors, 16 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2728201Z [V] model manager prepared params backend buffers (10976.71 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:490
+linux	Summary	2026-10-14T19:51:22.2729485Z [W] model manager cannot make enough memory available on Vulkan0: need 1259.13 MB device / 747.13 MB budget, available 0.00 MB device / 11362.74 MB budget --- model_manager.cpp:1944
+linux	Complete job	﻿2026-10-14T19:51:22.2798330Z Cleaning up orphan processes

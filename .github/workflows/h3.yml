@@ -10,26 +10,28 @@ jobs:
   linux:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
     env:
       TAG: master-951-f89d9b1-uafac7a7
     steps:
-      - name: Hardware
+      - name: Hardware and eligibility
         run: |
-          uname -a; free -h; lscpu | grep 'Model name'
-          for d in /sys/class/drm/card*/device; do [ -f $d/mem_info_gtt_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total) gtt_used=$(cat $d/mem_info_gtt_used)"; done
-          cat /sys/module/ttm/parameters/pages_limit 2>/dev/null || true
-          ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true
-          ldconfig -p | grep -E 'libvulkan|libamdhip64|libhipblas|librocblas' || true
-          ls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true
+          uname -r; free -g | head -2
+          for d in /sys/class/drm/card*/device; do [ -f $d/mem_info_vram_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total)"; done
+          V=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -n | tail -1)
+          if [ "${V:-0}" -ge $((32*1024*1024*1024)) ]; then echo "ELIGIBLE=1" >> $GITHUB_ENV; echo eligible; else echo "ELIGIBLE=0" >> $GITHUB_ENV; echo "small carve-out, skipping"; fi
       - name: Setup
+        if: env.ELIGIBLE == '1'
         run: |
-          export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+          export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,tmp,hf}
           export MODELS="$W/models" OUT="$W/out"
           echo "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV
           for f in h3probe.py gttfill.py; do curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/$f" -o "$W/$f"; done
           cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
-          cd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip
-          find "$W/vk" "$W/rocm" -name sd-cli
+          echo "VK=$(find "$W/vk" -name sd-cli | head -1)" >> $GITHUB_ENV
           python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]" vulkan
           export HF_HOME="$W/hf" TMPDIR="$W/tmp"
           python - <<'PY'
@@ -38,32 +40,33 @@ jobs:
           for f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:
               print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))
           PY
-          du -sh "$W/models"
-      - name: List devices
+          "$W/venv/bin/python" "$W/gttfill.py" 1000 1000 > "$W/types.log" 2>&1 & P=$!; sleep 8; kill $P; cat "$W/types.log"
+      - name: D_ctrl (Studio Auto flags, no filler, budget 14 GiB)
+        if: env.ELIGIBLE == '1'
+        run: python3 "$W/h3probe.py" D_ctrl "$VK" --offload-to-cpu --diffusion-fa --max-vram vulkan0=14 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+      - name: D_auto (Studio Auto flags; 15 GiB VRAM and 22.5 GiB GTT free, budget 14 GiB like a 16 GB card)
+        if: env.ELIGIBLE == '1'
         run: |
-          VK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)
-          echo "VK=$VK" >> $GITHUB_ENV; echo "RC=$RC" >> $GITHUB_ENV
-          $VK --list-devices || true
-          $RC --list-devices || true
-          ldd $(dirname $RC)/libggml-hip.so | grep -E 'hip|rocblas|not found' || true
-      - name: V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)
-        run: python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
-      - name: V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)
-        run: |
-          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
-          for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
-          python3 "$W/h3probe.py" V_auto_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 15 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          python3 "$W/h3probe.py" D_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram vulkan0=14 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
-      - name: V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)
+      - name: D_auto_raw (same, --max-vram -1 as Studio passes it)
+        if: env.ELIGIBLE == '1'
         run: |
-          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
-          for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
-          python3 "$W/h3probe.py" V_te_gpu_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 15 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          python3 "$W/h3probe.py" D_auto_raw "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
-      - name: R_auto (upstream ROCm, Studio ROCm flags)
-        run: python3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true
+      - name: D_te_gpu (TE on GPU, same constraint)
+        if: env.ELIGIBLE == '1'
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 15 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          python3 "$W/h3probe.py" D_te_gpu "$VK" --offload-to-cpu --diffusion-fa --max-vram vulkan0=14 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
       - name: Summary
-        if: always()
+        if: always() && env.ELIGIBLE == '1'
         run: |
           cat "$OUT/results.jsonl" || true
-          for f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|error|abort|assert|budget|prepared params|max.vram' "$f" | head -40; done
+          for f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|\[E\]|\[W\]|abort|assert|auto-detected|segments|prepared params' "$f" | head -40; done
