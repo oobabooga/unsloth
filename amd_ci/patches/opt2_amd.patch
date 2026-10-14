@@ -1,0 +1,476 @@
+diff --git a/studio/backend/core/inference/diffusion_autoopt/plan.py b/studio/backend/core/inference/diffusion_autoopt/plan.py
+index 012728a604..0c61782157 100644
+--- a/studio/backend/core/inference/diffusion_autoopt/plan.py
++++ b/studio/backend/core/inference/diffusion_autoopt/plan.py
+@@ -112,6 +112,8 @@ def compile_ineligible_reason(target: Any, family: Any) -> Optional[str]:
+         return "device does not support the default torch.compile profile"
+     if not bool(getattr(family, "supports_torch_compile", True)):
+         return "family opts out of torch.compile"
++    if not ds.rocm_compile_probe_passes(target):
++        return "ROCm regional compile probe failed on this install"
+     dtype = getattr(target, "dtype", None)
+     if ds._is_bfloat16(dtype):
+         return None
+diff --git a/studio/backend/core/inference/diffusion_device.py b/studio/backend/core/inference/diffusion_device.py
+index c1c0d2e7c1..4bfc5f57b3 100644
+--- a/studio/backend/core/inference/diffusion_device.py
++++ b/studio/backend/core/inference/diffusion_device.py
+@@ -538,7 +538,7 @@ def diffusion_device_target_from_torch_device(
+             backend = "rocm" if is_rocm else "cuda",
+             vendor = "amd" if is_rocm else "nvidia",
+             supports_model_cpu_offload = True,
+-            supports_default_torch_compile = not is_rocm,
++            supports_default_torch_compile = (not is_rocm) or _rocm_compile_allowed(),
+             supports_pinned_transfer = True,
+             # An overriding caller's "cuda:1" is a device choice to keep, not one to drop back to ordinal 0.
+             ordinal = int(index) if index.isdigit() else None,
+@@ -573,6 +573,16 @@ def float64_device(device: Any) -> Any:
+     return device if target.supports_float64 else "cpu"
+ 
+ 
++def _rocm_compile_allowed() -> bool:
++    """ROCm may take the regional compile unless ``UNSLOTH_DIFFUSION_ROCM_COMPILE=0``; whether this install can is probed
++    when a compiling tier first asks (``diffusion_rocm_compile``), not here."""
++    try:
++        from .diffusion_rocm_compile import rocm_compile_allowed
++        return rocm_compile_allowed()
++    except Exception:  # noqa: BLE001
++        return False
++
++
+ def _cuda_or_rocm_target(
+     torch: Any,
+     *,
+@@ -607,7 +617,7 @@ def _cuda_or_rocm_target(
+         backend = "rocm" if is_rocm else "cuda",
+         vendor = "amd" if is_rocm else "nvidia",
+         supports_model_cpu_offload = True,
+-        supports_default_torch_compile = not is_rocm,
++        supports_default_torch_compile = (not is_rocm) or _rocm_compile_allowed(),
+         supports_pinned_transfer = True,
+         ordinal = ordinal,
+     )
+diff --git a/studio/backend/core/inference/diffusion_rocm_compile.py b/studio/backend/core/inference/diffusion_rocm_compile.py
+new file mode 100644
+index 0000000000..12431fcd44
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_rocm_compile.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Whether the regional block compile may run on THIS ROCm install.
++
++ROCm used to be refused outright: inductor's pooled buffers (``memory_planning``) come back from
++``inductor::_alloc_from_pool`` as views AOTAutograd rejects at the first call. Studio now compiles with
++``memory_planning`` off and never captures graphs on ROCm, which is what the regional compile needs. Whether the
++toolchain (torch, Triton, the HIP compiler) can then build and run a transformer block is a property of the install,
++so it is probed once per process: one small block (LayerNorm, Linear, SDPA, GELU MLP) compiled exactly as the
++default tier compiles (``dynamic=True``, ``fullgraph=True``, no cudagraphs), run at two sequence lengths and checked
++against eager. Any failure keeps the denoiser eager, as before.
++
++``UNSLOTH_DIFFUSION_ROCM_COMPILE``: ``0`` never compiles on ROCm, ``1`` skips the probe, unset / ``auto`` probes.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import threading
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++ENV = "UNSLOTH_DIFFUSION_ROCM_COMPILE"
++
++_lock = threading.Lock()
++_result: dict[Any, tuple[bool, str]] = {}
++
++
++def rocm_compile_setting() -> str:
++    raw = (os.environ.get(ENV) or "auto").strip().lower()
++    if raw in ("0", "off", "false", "no"):
++        return "off"
++    if raw in ("1", "on", "true", "yes", "force"):
++        return "on"
++    return "auto"
++
++
++def rocm_compile_allowed() -> bool:
++    """The device-level answer: False only when the kill switch says so. The probe runs later, at compile time."""
++    return rocm_compile_setting() != "off"
++
++
++def rocm_block_compile_works(device: Any = None) -> bool:
++    """Whether a regional block compile builds and runs correctly here (cached per device for the process)."""
++    return rocm_block_compile_probe(device)[0]
++
++
++def rocm_block_compile_probe(device: Any = None) -> tuple[bool, str]:
++    setting = rocm_compile_setting()
++    if setting == "off":
++        return False, f"{ENV}=0"
++    if setting == "on":
++        return True, f"{ENV}=1 (probe skipped)"
++    try:
++        import torch
++    except Exception as exc:  # noqa: BLE001
++        return False, f"torch unavailable: {exc}"
++    if not getattr(getattr(torch, "version", None), "hip", None):
++        return True, "not ROCm"
++    try:
++        index = torch.cuda.current_device() if device is None else torch.device(device).index
++        if index is None:
++            index = torch.cuda.current_device()
++    except Exception:  # noqa: BLE001
++        index = 0
++    with _lock:
++        if index not in _result:
++            _result[index] = _probe(torch, index)
++            ok, why = _result[index]
++            (logger.info if ok else logger.warning)(
++                "diffusion.speed: ROCm regional compile probe on cuda:%s: %s (%s)",
++                index,
++                "ok" if ok else "failed, staying eager",
++                why,
++            )
++        return _result[index]
++
++
++def _probe(torch: Any, index: int) -> tuple[bool, str]:
++    start = time.perf_counter()
++    try:
++        import torch.nn.functional as F
++        from torch import nn
++
++        class _Block(nn.Module):
++            def __init__(self, dim: int = 128, heads: int = 4) -> None:
++                super().__init__()
++                self.heads = heads
++                self.norm1 = nn.LayerNorm(dim, elementwise_affine = False)
++                self.qkv = nn.Linear(dim, 3 * dim)
++                self.out = nn.Linear(dim, dim)
++                self.norm2 = nn.LayerNorm(dim)
++                self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(approximate = "tanh"), nn.Linear(4 * dim, dim))
++
++            def forward(self, x: Any, scale: Any) -> Any:
++                b, n, d = x.shape
++                h = self.norm1(x) * (1 + scale)
++                q, k, v = self.qkv(h).view(b, n, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
++                a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, n, d)
++                x = x + self.out(a)
++                return x + self.mlp(self.norm2(x))
++
++        dev = torch.device("cuda", index)
++        dtype = torch.bfloat16
++        gen = torch.Generator(device = "cpu").manual_seed(0)
++        block = _Block().to(device = dev, dtype = dtype).eval()
++        inductor_cfg = torch._inductor.config
++        patches = {"memory_planning": False} if hasattr(inductor_cfg, "memory_planning") else {}
++        compiled = torch.compile(block, dynamic = True, fullgraph = True)
++        worst = 0.0
++        with torch.no_grad(), inductor_cfg.patch(patches), torch._dynamo.config.patch(suppress_errors = False):
++            for n in (77, 160):
++                x = torch.randn(1, n, 128, generator = gen).to(device = dev, dtype = dtype)
++                s = torch.randn(1, 1, 128, generator = gen).to(device = dev, dtype = dtype) * 0.1
++                ref = block(x, s).float()
++                got = compiled(x, s).float()
++                if not bool(torch.isfinite(got).all()):
++                    return False, "non-finite compiled output"
++                worst = max(worst, float((got - ref).abs().max() / ref.abs().max().clamp_min(1e-6)))
++        torch.cuda.synchronize(dev)
++        if worst > 0.05:
++            return False, f"compiled block disagrees with eager (rel max err {worst:.3g})"
++        return True, f"rel max err {worst:.3g}, {time.perf_counter() - start:.1f}s"
++    except Exception as exc:  # noqa: BLE001 - any failure is the answer
++        return False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}"
++
++
++def _reset_for_tests() -> None:
++    with _lock:
++        _result.clear()
++
++
++def probe_result(index: int = 0) -> Optional[tuple[bool, str]]:
++    return _result.get(index)
+diff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py
+index 589ac66718..714d8bbe70 100644
+--- a/studio/backend/core/inference/diffusion_speed.py
++++ b/studio/backend/core/inference/diffusion_speed.py
+@@ -372,6 +372,8 @@ def compile_eligible(target: Any, *, is_gguf: bool, family: Any) -> bool:
+         return False
+     if not bool(getattr(family, "supports_torch_compile", True)):
+         return False
++    if not rocm_compile_probe_passes(target):
++        return False
+     dtype = getattr(target, "dtype", None)
+     if _is_bfloat16(dtype):
+         return True
+@@ -382,6 +384,17 @@ def compile_eligible(target: Any, *, is_gguf: bool, family: Any) -> bool:
+     return _is_float16(dtype) and _fp16_compile_capable(target)
+ 
+ 
++def rocm_compile_probe_passes(target: Any) -> bool:
++    """True off ROCm; on ROCm, whether one small block compiles and runs correctly here (probed once per process)."""
++    if getattr(target, "backend", None) != "rocm":
++        return True
++    try:
++        from .diffusion_rocm_compile import rocm_block_compile_works
++        return rocm_block_compile_works(getattr(target, "ordinal", None))
++    except Exception:  # noqa: BLE001 - optimisation only
++        return False
++
++
+ def fp16_compile_explicit_only(target: Any) -> bool:
+     """fp16 compiles only on an explicit tier, never the deferred profile (T4 SDXL-Turbo: ~245 s for ~0.1 s/image)."""
+     return _is_float16(getattr(target, "dtype", None))
+diff --git a/studio/backend/core/inference/sd_cpp_args.py b/studio/backend/core/inference/sd_cpp_args.py
+index 3548fda668..c56a6962a5 100644
+--- a/studio/backend/core/inference/sd_cpp_args.py
++++ b/studio/backend/core/inference/sd_cpp_args.py
+@@ -137,7 +137,8 @@ class SdCppUpscaleParams:
+ 
+ 
+ # Native (sd.cpp) speed profiles, the engine-side analogue of diffusion_speed. off: nothing. default: --diffusion-fa +
+-# --diffusion-conv-direct (numerically exact), except Apple Metal keeps only --diffusion-fa. max keeps it (profiles chain).
++# --diffusion-conv-direct (numerically exact), except Apple Metal, Vulkan and ROCm keep only --diffusion-fa. max keeps it
++# (profiles chain).
+ NATIVE_SPEED_OFF = "off"
+ NATIVE_SPEED_DEFAULT = "default"
+ NATIVE_SPEED_MAX = "max"
+@@ -145,21 +146,49 @@ NATIVE_SPEED_MODES = (NATIVE_SPEED_OFF, NATIVE_SPEED_DEFAULT, NATIVE_SPEED_MAX)
+ 
+ 
+ def native_speed_flags(
+-    speed_mode: Optional[str], backend_args: Optional[Sequence[str]] = None
++    speed_mode: Optional[str],
++    backend_args: Optional[Sequence[str]] = None,
++    accelerator: Optional[str] = None,
+ ) -> list[str]:
+     """sd-cli speed flags for a native speed mode (empty for off / None). Separate from offload:
+     ``--diffusion-fa`` is a win in its own right. De-duplicated against offload at the call site.
+-    ``backend_args``: the other argv flags, whose ``--backend`` decides whether the graph runs on Metal."""
++    ``backend_args``: the other argv flags, whose ``--backend`` decides whether the graph runs on Metal.
++    ``accelerator``: the build's accelerator class (``vulkan`` / ``rocm`` / ``cuda`` / ``cpu``), None if unknown."""
+     mode = (speed_mode or NATIVE_SPEED_OFF).strip().lower()
+     if mode in ("", NATIVE_SPEED_OFF):
+         return []
+     if mode in (NATIVE_SPEED_DEFAULT, NATIVE_SPEED_MAX):
+         if _runs_on_apple_metal(backend_args or ()):
+             return ["--diffusion-fa"]
++        if not conv_direct_wanted(backend_args or (), accelerator):
++            return ["--diffusion-fa"]
+         return ["--diffusion-fa", "--diffusion-conv-direct"]
+     raise ValueError(f"native speed_mode must be one of {NATIVE_SPEED_MODES}, got '{speed_mode}'")
+ 
+ 
++# ggml backends whose direct conv (implicit GEMM) is slower than im2col: Vulkan (sd.cpp #2137, RDNA2 10.9 -> 73.4 s)
++# and HIP (#2085, RDNA3), and on gfx1151 for both (Studio AMD CI). CUDA, CPU and an unknown build keep it.
++_CONV_DIRECT_SLOW_BACKENDS = ("vulkan", "rocm", "hip")
++
++
++def conv_direct_wanted(backend_args: Sequence[str] = (), accelerator: Optional[str] = None) -> bool:
++    """Whether ``--diffusion-conv-direct`` should ride the default / max speed profile.
++
++    The diffusion graph's device decides: an explicit ``--backend`` pin (``diffusion=Vulkan0``) wins, else the
++    build's ``accelerator`` class. ``UNSLOTH_SD_CPP_CONV_DIRECT`` = ``1`` / ``0`` forces it either way."""
++    import os
++
++    forced = (os.environ.get("UNSLOTH_SD_CPP_CONV_DIRECT") or "").strip().lower()
++    if forced in ("1", "on", "true", "yes"):
++        return True
++    if forced in ("0", "off", "false", "no"):
++        return False
++    args = list(backend_args)
++    target = _diffusion_backend([args[i + 1] for i, f in enumerate(args[:-1]) if f == "--backend"])
++    name = (target or accelerator or "").strip().lower().rstrip("0123456789")
++    return name not in _CONV_DIRECT_SLOW_BACKENDS
++
++
+ def _diffusion_backend(specs: Sequence[str]) -> Optional[str]:
+     """The backend the diffusion module gets from ``--backend`` specs: ``diffusion=`` beats a bare default; None = auto-fit."""
+     explicit = default = None
+@@ -636,6 +665,7 @@ def build_sd_cpp_server_command(
+     scratch_dir: Optional[str] = None,
+     verbose: bool = False,
+     extra_args: Optional[list[str]] = None,
++    accelerator: Optional[str] = None,
+ ) -> list[str]:
+     """Build the ``sd-server`` argv: model + hardware/server flags only.
+ 
+@@ -684,7 +714,7 @@ def build_sd_cpp_server_command(
+     # De-dup speed flags against offload (may already include --diffusion-fa).
+     placement = metal_placement_flags(offload)
+     backend_args = [*offload, *placement, *(extra_args or ())]
+-    cmd += [f for f in native_speed_flags(native_speed, backend_args) if f not in offload]
++    cmd += [f for f in native_speed_flags(native_speed, backend_args, accelerator) if f not in offload]
+     cmd += placement
+     if verbose:
+         cmd += ["-v"]
+diff --git a/studio/backend/core/inference/sd_cpp_engine.py b/studio/backend/core/inference/sd_cpp_engine.py
+index 17d83dedc4..b5216e6fd0 100644
+--- a/studio/backend/core/inference/sd_cpp_engine.py
++++ b/studio/backend/core/inference/sd_cpp_engine.py
+@@ -298,6 +298,21 @@ def _terminate(proc: "subprocess.Popen") -> None:
+         pass
+ 
+ 
++def binary_accelerator(binary: Optional[str]) -> Optional[str]:
++    """Accelerator class of ``binary`` (``vulkan`` / ``rocm`` / ``cuda`` / ``cpu``): its managed install record, else
++    the device listing an earlier probe already took of it (no subprocess here). None when neither says."""
++    if not binary:
++        return None
++    try:
++        from core.inference import sd_cpp_backend  # noqa: PLC0415 - the backend imports this module
++
++        return sd_cpp_backend._installed_accelerator_of(binary) or sd_cpp_backend.sd_cpp_listed_device(
++            binary, probe = False
++        )[0]
++    except Exception:  # noqa: BLE001 - unknown keeps the default speed flags
++        return None
++
++
+ def _binary_name(stem: str) -> str:
+     return f"{stem}.exe" if sys.platform == "win32" else stem
+ 
+@@ -808,14 +823,17 @@ class SdCppEngine:
+         process tree and raises ``SdCppCancelled``.
+         """
+         offload = list(offload or [])
++        binary = self._require_binary()
+         speed = [
+             f
+-            for f in native_speed_flags(native_speed, [*offload, *(extra_args or ())])
++            for f in native_speed_flags(
++                native_speed, [*offload, *(extra_args or ())], binary_accelerator(binary)
++            )
+             if f not in offload
+         ]
+         merged_extra = speed + list(extra_args or [])
+         cmd = build_sd_cpp_command(
+-            self._require_binary(),
++            binary,
+             files,
+             params,
+             output_path = str(self._prepare_out(output_path)),
+diff --git a/studio/backend/core/inference/sd_cpp_server.py b/studio/backend/core/inference/sd_cpp_server.py
+index bbc95a2633..959d5841ac 100644
+--- a/studio/backend/core/inference/sd_cpp_server.py
++++ b/studio/backend/core/inference/sd_cpp_server.py
+@@ -56,6 +56,7 @@ from core.inference.sd_cpp_engine import (
+     _sd_cpp_command_for_log,
+     _sd_cpp_command_summary,
+     _verbose_native_logs,
++    binary_accelerator,
+     runtime_env,
+ )
+ from utils.native_path_leases import child_env_without_native_path_secret
+@@ -225,6 +226,7 @@ class SdCppServer:
+                 scratch_dir = self._scratch_dir,
+                 verbose = True,  # sd-server prints the per-step sampling lines we parse
+                 extra_args = list(extra_args or []),
++                accelerator = binary_accelerator(self.binary),
+             )
+             run_env = runtime_env(self.binary, child_env_without_native_path_secret())
+             if env:
+diff --git a/studio/backend/tests/test_diffusion_device.py b/studio/backend/tests/test_diffusion_device.py
+index 4af4b1e574..abd969e6bd 100644
+--- a/studio/backend/tests/test_diffusion_device.py
++++ b/studio/backend/tests/test_diffusion_device.py
+@@ -196,7 +196,16 @@ def test_rocm_target(monkeypatch):
+     t = dd.resolve_diffusion_device_target()
+     assert (t.device, t.backend, t.vendor) == ("cuda", "rocm", "amd")
+     assert t.dtype == BF16
+-    assert t.supports_default_torch_compile is False  # ROCm disables default compile
++    # ROCm may compile; whether this install can is probed at compile time (diffusion_rocm_compile).
++    assert t.supports_default_torch_compile is True
++
++
++def test_rocm_target_compile_kill_switch(monkeypatch):
++    monkeypatch.setenv("UNSLOTH_DIFFUSION_ROCM_COMPILE", "0")
++    torch = _make_torch(cuda_available = True, bf16_supported = True)
++    _install(monkeypatch, torch, studio_device = "cuda", is_rocm = True)
++    t = dd.resolve_diffusion_device_target()
++    assert t.backend == "rocm" and t.supports_default_torch_compile is False
+ 
+ 
+ def test_rocm_without_bf16_uses_fp16(monkeypatch):
+diff --git a/studio/backend/tests/test_diffusion_speed.py b/studio/backend/tests/test_diffusion_speed.py
+index 6f6e75a5fe..6dde97fd29 100644
+--- a/studio/backend/tests/test_diffusion_speed.py
++++ b/studio/backend/tests/test_diffusion_speed.py
+@@ -2570,3 +2570,32 @@ def test_int8_gemm_install_follows_the_denoiser_placement(
+         denoiser_offloaded = denoiser_offloaded,
+     )
+     assert seen == [expected]
++
++
++def test_compile_eligible_on_rocm_follows_the_probe(monkeypatch):
++    from core.inference import diffusion_rocm_compile as rc
++
++    monkeypatch.delenv("TORCHDYNAMO_DISABLE", raising = False)
++    ds_mod.torch_compile_runtime_available.cache_clear()
++    rocm = types.SimpleNamespace(
++        device = "cuda", dtype = "bfloat16", backend = "rocm", ordinal = None, supports_default_torch_compile = True
++    )
++    monkeypatch.setattr(ds_mod, "_is_bfloat16", lambda d: d == "bfloat16")
++    monkeypatch.setattr(rc, "rocm_block_compile_works", lambda device = None: False)
++    assert ds_mod.compile_eligible(rocm, is_gguf = False, family = _family()) is False
++    monkeypatch.setattr(rc, "rocm_block_compile_works", lambda device = None: True)
++    assert ds_mod.compile_eligible(rocm, is_gguf = False, family = _family()) is True
++    # Off ROCm the probe is never consulted.
++    monkeypatch.setattr(rc, "rocm_block_compile_works", lambda device = None: 1 / 0)
++    cuda = types.SimpleNamespace(device = "cuda", dtype = "bfloat16", backend = "cuda", supports_default_torch_compile = True)
++    assert ds_mod.compile_eligible(cuda, is_gguf = False, family = _family()) is True
++
++
++def test_rocm_compile_probe_settings(monkeypatch):
++    from core.inference import diffusion_rocm_compile as rc
++
++    rc._reset_for_tests()
++    monkeypatch.setenv(rc.ENV, "0")
++    assert rc.rocm_block_compile_probe() == (False, f"{rc.ENV}=0") and not rc.rocm_compile_allowed()
++    monkeypatch.setenv(rc.ENV, "1")
++    assert rc.rocm_block_compile_probe()[0] is True and rc.rocm_compile_allowed()
+diff --git a/studio/backend/tests/test_sd_cpp_args.py b/studio/backend/tests/test_sd_cpp_args.py
+index 9efcabb01a..0e1d338fc6 100644
+--- a/studio/backend/tests/test_sd_cpp_args.py
++++ b/studio/backend/tests/test_sd_cpp_args.py
+@@ -389,6 +389,36 @@ def test_native_speed_flags():
+         native_speed_flags("ludicrous")
+ 
+ 
++def test_native_speed_flags_drop_conv_direct_on_vulkan_and_rocm(monkeypatch):
++    monkeypatch.delenv("UNSLOTH_SD_CPP_CONV_DIRECT", raising = False)
++    monkeypatch.setattr(_sd_cpp_args_module, "_runs_on_apple_metal", lambda *_a, **_k: False)
++    fa_only = ["--diffusion-fa"]
++    full = ["--diffusion-fa", "--diffusion-conv-direct"]
++    for accel in ("vulkan", "rocm", "ROCm"):
++        assert native_speed_flags("default", [], accel) == fa_only
++        assert native_speed_flags("max", [], accel) == fa_only
++    for accel in ("cuda", "cpu", None):
++        assert native_speed_flags("default", [], accel) == full
++    # The diffusion pin names the device the graph runs on, whatever the build's class says.
++    assert native_speed_flags("default", ["--backend", "diffusion=Vulkan0,te=cpu"], "cuda") == fa_only
++    assert native_speed_flags("default", ["--backend", "diffusion=ROCm1"], None) == fa_only
++    assert native_speed_flags("default", ["--backend", "diffusion=CUDA0"], "vulkan") == full
++    assert native_speed_flags("default", ["--backend", "diffusion=cpu"], "vulkan") == full
++    monkeypatch.setenv("UNSLOTH_SD_CPP_CONV_DIRECT", "1")
++    assert native_speed_flags("default", [], "vulkan") == full
++    monkeypatch.setenv("UNSLOTH_SD_CPP_CONV_DIRECT", "0")
++    assert native_speed_flags("default", [], "cuda") == fa_only
++
++
++def test_server_command_carries_accelerator(monkeypatch):
++    monkeypatch.delenv("UNSLOTH_SD_CPP_CONV_DIRECT", raising = False)
++    monkeypatch.setattr(_sd_cpp_args_module, "_runs_on_apple_metal", lambda *_a, **_k: False)
++    files = SdCppModelFiles(diffusion_model = "/m/dit.gguf")
++    kw = dict(host = "127.0.0.1", port = 1, native_speed = "default")
++    assert "--diffusion-conv-direct" not in build_sd_cpp_server_command("sd-server", files, accelerator = "vulkan", **kw)
++    assert "--diffusion-conv-direct" in build_sd_cpp_server_command("sd-server", files, accelerator = "cuda", **kw)
++
++
+ def test_offload_none_is_empty():
+     assert offload_flags(OFFLOAD_NONE) == []
+ 
