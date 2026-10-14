@@ -27,6 +27,8 @@ gtt_types, vram_types = [], []
 for i in range(props.memoryTypeCount):
     t = props.memoryTypes[i]; h = props.memoryHeaps[t.heapIndex]
     print(f"type {i} flags=0x{t.propertyFlags:x} heap {t.heapIndex} size={h.size/G:.2f} GiB", flush=True)
+    if t.propertyFlags & 0xC0:
+        continue  # AMD device-coherent / uncached types need VK_AMD_device_coherent_memory enabled
     if (t.propertyFlags & HV) == HV and not (t.propertyFlags & DL):
         gtt_types.append((h.size, i))
     if (t.propertyFlags & DL) and not (t.propertyFlags & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT):
