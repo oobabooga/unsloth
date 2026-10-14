@@ -1,0 +1,1125 @@
+diff --git a/README.md b/README.md
+index 8db45e3224..7278f4a7a2 100644
+--- a/README.md
++++ b/README.md
+@@ -423,6 +423,13 @@ Setup also installs [audio.cpp](https://github.com/0xShug0/audio.cpp) (prebuilt
+ - `UNSLOTH_AUDIO_CPP_ACCELERATOR=cpu` (or `cuda`, `vulkan`, `metal`) picks the bundle instead of auto-detecting.
+ - `AUDIOCPP_SERVER_PATH=/path/to/audiocpp_server` uses your own build.
+ 
++#### AMD Ryzen AI NPU:
++
++On a Ryzen AI PC with an XDNA2 NPU (Linux x86_64 or Windows, NPU driver installed), Studio runs chat models on the NPU through [FastFlowLM](https://github.com/ROCm/FastFlowLM) and [Lemonade](https://github.com/lemonade-sdk/lemonade), separately from the GPU:
++- In Chat, open **Select model**: the **NPU** group has an **Enable NPU** button that downloads Lemonade and FastFlowLM (about 47 MB) and checks the driver. Clicking an NPU model then downloads and loads it. The Model hub lists them under **Browse NPU models**.
++- From a terminal: `unsloth run --model qwen3-0.6b-FLM`, or `unsloth chat qwen3-0.6b-FLM` while Studio is running.
++- Over the API, NPU models serve `/v1/chat/completions` as `lemonade:<id>` (for example `lemonade:qwen3-0.6b-FLM`). With **Switch model by request** on (Settings > API), naming a downloaded NPU model loads it. They do not take `response_format`, `seed`, `frequency_penalty` or `logprobs`, and the coding agents in `unsloth start` need a GGUF model.
++
+ #### Uninstall
+ 
+ **MacOS, WSL, Linux:** `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.sh | sh`
+diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
+index 7eda56981e..4e1ecd7848 100644
+--- a/studio/backend/routes/inference.py
++++ b/studio/backend/routes/inference.py
+@@ -10913,7 +10913,10 @@ async def _reject_unservable_model(
+     if is_npu_model_path(requested_model) and not await asyncio.to_thread(
+         _loaded_satisfies, requested_model
+     ):
+-        message = f"The NPU model '{requested_model}' is not loaded. Load it in Unsloth Studio."
++        message = (
++            f"The NPU model '{requested_model}' is not loaded. Load it in Unsloth Studio, or turn "
++            "on 'Switch model by request' under Settings > API to load it from a request."
++        )
+         path = getattr(getattr(fastapi_request, "url", None), "path", None)
+         raise HTTPException(
+             status_code = 404,
+@@ -11155,6 +11158,41 @@ def _audio_cpp_switch_target(requested_model: Optional[str]) -> Optional[tuple]:
+     return (model.id, model.variant.key, model.id, False)
+ 
+ 
++async def _auto_switch_npu_model(
++    named_model: str, fastapi_request: Request, current_subject: str
++) -> None:
++    """Load a downloaded ``lemonade:<id>`` model a request names, when auto-switch is on.
++
++    Same lock and gates as a GGUF switch; ``_load_npu_model`` keeps the owner-only and
++    not-downloaded refusals. Off, the request still gets the not-loaded 404.
++    """
++    from core.inference.gpu_arbiter import require_no_foreign_generations
++    from core.inference.llama_keepwarm import inference_lifecycle_gate, model_load_gate
++    from utils.openai_auto_switch_settings import get_openai_auto_switch_enabled
++
++    if _auto_switch_opted_out(fastapi_request) or not get_openai_auto_switch_enabled():
++        return
++    if await asyncio.to_thread(_loaded_satisfies, named_model):
++        return
++    switch_path = getattr(getattr(fastapi_request, "url", None), "path", None)
++    async with _auto_switch_lock():
++        await _acquire_swap_gate()
++        try:
++            async with model_load_gate(), inference_lifecycle_gate():
++                # Re-read under the gate: another request may have loaded it while this one waited.
++                if await asyncio.to_thread(_loaded_satisfies, named_model):
++                    return
++                require_no_foreign_generations(path = switch_path)
++                await _load_model_impl(
++                    LoadRequest(model_path = named_model),
++                    fastapi_request,
++                    current_subject,
++                    current_request_counted = True,
++                )
++        finally:
++            _auto_switch_process_lock.release()
++
++
+ async def _maybe_auto_switch_model(
+     requested_model: Optional[str],
+     fastapi_request: Request,
+@@ -11345,6 +11383,15 @@ async def _maybe_auto_switch_model(
+             await _reject_unservable_model(requested_model, fastapi_request)
+             return
+ 
++    from core.inference.npu_backend import is_npu_model_path
++
++    if auto_switch_on and named_model and is_npu_model_path(named_model):
++        # The GGUF and checkpoint resolution below can never find an NPU model.
++        await _auto_switch_npu_model(named_model, fastapi_request, current_subject)
++        if claim_resident:
++            _claim_slot_for_non_preview(fastapi_request)
++        return
++
+     async def _resolve_and_switch() -> None:
+         from core.inference.openai_auto_download import looks_like_quant, split_model_ref
+ 
+@@ -29801,6 +29848,17 @@ _NPU_CUT_SHORT_ERROR = {
+ }
+ 
+ 
++def _npu_kv_cache_full(usage: Any) -> bool:
++    """Whether FastFlowLM's usage says the reply used the whole loaded context."""
++    if not isinstance(usage, dict):
++        return False
++    total = usage.get("total_tokens")
++    capacity = usage.get("max_kv_token_capacity")
++    return (
++        isinstance(total, int) and isinstance(capacity, int) and capacity > 0 and total >= capacity
++    )
++
++
+ class _NpuStreamRelay:
+     """Normalize model IDs, enforce stop sequences, and collect non-streaming replies.
+ 
+@@ -29842,16 +29900,22 @@ class _NpuStreamRelay:
+         self._pending = buffer[len(buffer) - keep :] if keep else ""
+         return buffer[: len(buffer) - keep] if keep else buffer
+ 
+-    def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
+-        return "data: " + json.dumps(
+-            {
+-                "id": self.completion_id or "chatcmpl-npu",
+-                "object": "chat.completion.chunk",
+-                "created": self.created or int(time.time()),
+-                "model": self.public_model,
+-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+-            }
+-        )
++    def _chunk(
++        self,
++        delta: dict,
++        finish_reason: Optional[str],
++        tool_event: Optional[dict] = None,
++    ) -> str:
++        chunk = {
++            "id": self.completion_id or "chatcmpl-npu",
++            "object": "chat.completion.chunk",
++            "created": self.created or int(time.time()),
++            "model": self.public_model,
++            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
++        }
++        if tool_event is not None:
++            chunk["_toolEvent"] = tool_event
++        return "data: " + json.dumps(chunk)
+ 
+     def feed(self, line: str) -> list[str]:
+         """The lines to send on for one line of the upstream stream."""
+@@ -29919,6 +29983,11 @@ class _NpuStreamRelay:
+             elif isinstance(content, str):
+                 self.content += content
+             if choice.get("finish_reason") is not None:
++                if choice["finish_reason"] == "stop" and _npu_kv_cache_full(chunk.get("usage")):
++                    # FastFlowLM says "stop" when the reply filled the context; without this the
++                    # chat saved a reasoning-only turn as complete and showed no answer and no reason.
++                    choice["finish_reason"] = "length"
++                    out.append(self._chunk({}, None, {"type": "context_window_exceeded"}))
+                 self.finish_reason = choice["finish_reason"]
+                 if self._pending:
+                     # The reply ended partway into a stop sequence, so what was held back is text.
+@@ -29930,7 +29999,9 @@ class _NpuStreamRelay:
+         return out
+ 
+     def completion(self) -> dict:
+-        message: dict[str, Any] = {"role": "assistant", "content": self.content or None}
++        # A tool-calling turn often streams only newlines as text; OpenAI sends null content there.
++        content = self.content if self.content.strip() or not self.tool_calls else ""
++        message: dict[str, Any] = {"role": "assistant", "content": content or None}
+         if self.reasoning:
+             message["reasoning_content"] = self.reasoning
+         if self.tool_calls:
+@@ -42092,6 +42163,17 @@ async def anthropic_messages(
+     # so validation runs before the reload hook gets a chance to restore the model.
+     # Plain detail, not _no_model_loaded_error: that helper leaves this case unchanged.
+     if not llama_backend.is_loaded and not _automatic_model_load_may_run():
++        _npu_model = _resident_npu_model()
++        if _npu_model is not None:
++            # "No GGUF model loaded" read as "nothing is loaded" while an NPU model was serving.
++            raise HTTPException(
++                status_code = 400,
++                detail = (
++                    f"The loaded NPU model ({_npu_model.model_path}) serves "
++                    "/v1/chat/completions only. Load a GGUF model to use the "
++                    "Anthropic Messages API."
++                ),
++            )
+         raise HTTPException(
+             status_code = 503,
+             detail = _no_model_loaded_detail("No GGUF model loaded. Load a GGUF model first."),
+diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
+index 922b9c8557..31445b12eb 100644
+--- a/studio/backend/tests/test_npu_chat_route.py
++++ b/studio/backend/tests/test_npu_chat_route.py
+@@ -69,7 +69,38 @@ _FLM_TIMINGS = {
+ }
+ 
+ 
++# The end of a reply whose reasoning filled the loaded context, captured on Strix Halo: FastFlowLM
++# says "stop" with the KV cache full.
++_FULL_USAGE = {
++    "prompt_tokens": 45,
++    "completion_tokens": 8147,
++    "total_tokens": 8192,
++    "active_kv_tokens": 8192,
++    "max_kv_token_capacity": 8192,
++    "kv_token_occupancy_rate_percentage": 100.0,
++}
++
++
+ def _script(prompt: str) -> str:
++    if "FULL" in prompt:
++        return (
++            _chunk({"reasoning_content": " Wait, no!"})
++            + _chunk({"content": None}, "stop", _FULL_USAGE)
++            + "data: [DONE]\n\n"
++        )
++    if "WSTOOL" in prompt:
++        call = {
++            "index": 0,
++            "id": "call_1",
++            "type": "function",
++            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
++        }
++        return (
++            _chunk({"content": "\n\n\n"})
++            + _chunk({"tool_calls": [call]})
++            + _chunk({}, "tool_calls", _USAGE)
++            + "data: [DONE]\n\n"
++        )
+     if "FAULT" in prompt:
+         return (
+             _chunk({"content": "par"})
+@@ -1278,3 +1309,40 @@ def test_a_tool_loop_turn_dropped_after_a_tool_call_is_cut_short():
+     plain = _TurnFinish()
+     plain.see(_chunk({}, "stop").strip())
+     assert plain.finished is True
++
++
++def test_a_reply_that_fills_the_context_says_so(flm):
++    flm(reasoning = True)
++    full = [{"role": "user", "content": "FULL"}]
++    status, lines = _call(stream = True, messages = full)
++    assert status == 200
++    chunks = _data(lines)
++    assert [c["_toolEvent"] for c in chunks if "_toolEvent" in c] == [
++        {"type": "context_window_exceeded"}
++    ]
++    finishes = [
++        c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]
++    ]
++    assert finishes == ["length"]
++    _, body = _call(stream = False, messages = full)
++    assert body["choices"][0]["finish_reason"] == "length"
++
++
++def test_a_reply_with_room_left_keeps_its_stop(flm):
++    flm()
++    status, lines = _call(stream = True, messages = [{"role": "user", "content": "TIMED"}])
++    assert status == 200
++    chunks = _data(lines)
++    assert not any("_toolEvent" in c for c in chunks)
++    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
++
++
++def test_whitespace_beside_a_tool_call_is_no_content(flm):
++    flm(tools = True)
++    tools = [
++        {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
++    ]
++    _, body = _call(stream = False, tools = tools, messages = [{"role": "user", "content": "WSTOOL"}])
++    message = body["choices"][0]["message"]
++    assert message["content"] is None
++    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+diff --git a/studio/backend/tests/test_openai_auto_switch.py b/studio/backend/tests/test_openai_auto_switch.py
+index 9e84e6cac6..bc9f2bcb14 100644
+--- a/studio/backend/tests/test_openai_auto_switch.py
++++ b/studio/backend/tests/test_openai_auto_switch.py
+@@ -12367,3 +12367,51 @@ def test_tensor_split_requires_matching_gpu_ids_at_the_settings_boundary(ids):
+         settings_route.ModelOverridePayload(
+             model_id = "org/split-GGUF", gpu_ids = ids, tensor_split = [3, 1]
+         )
++
++
++_NPU_MODEL = "lemonade:qwen3-0.6b-FLM"
++
++
++def test_an_npu_model_named_by_a_request_switches_when_on(monkeypatch):
++    # The GGUF resolver cannot find an NPU id, so this used to 404 even with the switch on.
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    _run_hook(_NPU_MODEL)
++    assert [call.model_path for call in rec.calls] == [_NPU_MODEL]
++
++
++def test_an_npu_model_named_with_the_switch_off_says_how_to_load_it(monkeypatch):
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None, enabled = False)
++    with pytest.raises(HTTPException) as excinfo:
++        _run_hook(_NPU_MODEL)
++    assert excinfo.value.status_code == 404
++    assert "Switch model by request" in str(excinfo.value.detail)
++    assert rec.calls == []
++
++
++def test_a_resident_npu_model_is_not_reloaded(monkeypatch):
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    monkeypatch.setattr(inference_route, "_loaded_satisfies", lambda model: model == _NPU_MODEL)
++    _run_hook(_NPU_MODEL)
++    assert rec.calls == []
++
++
++def test_messages_with_an_npu_model_loaded_names_it(monkeypatch):
++    # "No GGUF model loaded" read as "nothing is loaded" while the NPU model was serving.
++    from models.inference import AnthropicMessagesRequest
++
++    _wired(monkeypatch, _FakeBackend(None), None, enabled = False)
++    monkeypatch.setattr(inference_route, "_automatic_model_load_may_run", lambda: False)
++    monkeypatch.setattr(
++        inference_route,
++        "_resident_npu_model",
++        lambda: SimpleNamespace(model_path = _NPU_MODEL),
++    )
++    request = SimpleNamespace(
++        state = SimpleNamespace(), url = SimpleNamespace(path = "/v1/messages"), method = "POST"
++    )
++    payload = AnthropicMessagesRequest(max_tokens = 16, messages = [{"role": "user", "content": "hi"}])
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(inference_route.anthropic_messages(payload, request, "tester"))
++    assert excinfo.value.status_code == 400
++    assert _NPU_MODEL in excinfo.value.detail
++    assert "No GGUF model loaded" not in excinfo.value.detail
+diff --git a/studio/frontend/src/app/routes/hub.tsx b/studio/frontend/src/app/routes/hub.tsx
+index d353f1ee0a..40f45614b9 100644
+--- a/studio/frontend/src/app/routes/hub.tsx
++++ b/studio/frontend/src/app/routes/hub.tsx
+@@ -32,6 +32,8 @@ export interface ModelsSearch {
+   kind?: "models" | "datasets";
+   capability?: CapabilityKey;
+   audioTask?: PipelineType[];
++  /** The NPU list, kept in the URL so a refresh or a link lands back on it. */
++  format?: "npu";
+ }
+ 
+ export const Route = createRoute({
+@@ -75,6 +77,7 @@ export const Route = createRoute({
+     }
+     const audioTask = hubAudioTaskSearch(search.audioTask, next.capability);
+     if (audioTask) next.audioTask = audioTask;
++    if (search.format === "npu") next.format = "npu";
+     return next;
+   },
+ });
+diff --git a/studio/frontend/src/features/hub/hub-page.tsx b/studio/frontend/src/features/hub/hub-page.tsx
+index b8ee4cfd63..d71535ac73 100644
+--- a/studio/frontend/src/features/hub/hub-page.tsx
++++ b/studio/frontend/src/features/hub/hub-page.tsx
+@@ -26,7 +26,12 @@ import {
+   requestModelConfigHandoff,
+ } from "@/features/model-picker";
+ import { taskForMediaPick } from "@/features/model-picker/components/model-selector/audio-picker-policy";
+-import { type NpuModel, type NpuPickerSource, useNpuStatus } from "@/features/npu";
++import {
++  type NpuModel,
++  NpuHubPrompt,
++  type NpuPickerSource,
++  useNpuStatus,
++} from "@/features/npu";
+ import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
+ import { GuidedTour, useGuidedTourController } from "@/features/tour";
+ import { useDebouncedValue } from "@/hooks/use-debounced-value";
+@@ -596,7 +601,10 @@ export function ModelsPage() {
+     );
+   }, [urlResourceType]);
+   const [discoverFormat, setDiscoverFormat] = useState<ModelFormatFilter>(
+-    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended",
++    () =>
++      hubSearch.format === "npu"
++        ? "npu"
++        : (findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended"),
+   );
+   const [downloadedFormat, setDownloadedFormat] =
+     useState<ModelFormatFilter>("all");
+@@ -619,7 +627,24 @@ export function ModelsPage() {
+   const npuSource: NpuPickerSource | undefined = npuStatus?.supported
+     ? { status: npuStatus, onStatusChange: setNpuStatus }
+     : undefined;
+-  const formatFilter = isDiscoverTab ? discoverFormat : downloadedFormat;
++  // A link to the NPU list on a machine without one shows the feed, not an empty list.
++  const shownDiscoverFormat =
++    discoverFormat === "npu" && npuStatus && !npuStatus.supported
++      ? (findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended")
++      : discoverFormat;
++  const formatFilter = isDiscoverTab ? shownDiscoverFormat : downloadedFormat;
++  // The NPU list lives in the URL: a refresh during a long NPU download used to drop back to the
++  // feed, and the picker can link straight to it.
++  const urlFormat = hubSearch.format ?? null;
++  useEffect(() => {
++    const wanted = shownDiscoverFormat === "npu" && !isDatasetMode ? "npu" : null;
++    if (wanted === urlFormat) return;
++    void navigate({
++      to: "/hub",
++      search: (prev) => ({ ...prev, format: wanted ?? undefined }),
++      replace: true,
++    });
++  }, [shownDiscoverFormat, isDatasetMode, urlFormat, navigate]);
+   const npuCatalogSource =
+     formatFilter === "npu" && !isDatasetMode ? npuSource : undefined;
+   const showNpuCatalog = npuCatalogSource !== undefined;
+@@ -1827,6 +1852,12 @@ export function ModelsPage() {
+     if (isFeedMode) {
+       return (
+         <div className="flex flex-col gap-6 pt-6">
++          {npuStatus?.supported && !isDatasetMode ? (
++            <NpuHubPrompt
++              status={npuStatus}
++              onBrowse={() => setFormatFilter("npu")}
++            />
++          ) : null}
+           {allModelsView !== "split" && (
+             <HubFeed
+               trending={{
+@@ -1889,6 +1920,8 @@ export function ModelsPage() {
+   }, [
+     isDiscoverTab,
+     isFeedMode,
++    npuStatus,
++    setFormatFilter,
+     isChannelListMode,
+     isSortBrowseMode,
+     channelSection,
+diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+index d2bc85f2a0..e7b4f78b30 100644
+--- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
++++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
+@@ -495,10 +495,25 @@ function ListLabel({
+         divider ? "mt-3 border-t border-border pt-3" : "pt-3",
+       )}
+     >
+-      <span className="flex items-center gap-1.5 text-ui-10 font-semibold uppercase tracking-wider text-muted-foreground">
+-        {icon}
+-        {children}
+-      </span>
++      {onToggle ? (
++        // The label toggles as well: the chevron alone is a 12px target at the far edge. The
++        // chevron stays the keyboard control, so the label is not a second tab stop.
++        <button
++          type="button"
++          tabIndex={-1}
++          onClick={onToggle}
++          aria-expanded={!collapsed}
++          className="flex cursor-pointer select-none items-center gap-1.5 text-ui-10 font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground"
++        >
++          {icon}
++          {children}
++        </button>
++      ) : (
++        <span className="flex items-center gap-1.5 text-ui-10 font-semibold uppercase tracking-wider text-muted-foreground">
++          {icon}
++          {children}
++        </span>
++      )}
+       {(action || onToggle) && (
+         <div className="flex items-center gap-0.5">
+           {action}
+@@ -3869,7 +3884,25 @@ export function HubModelPicker({
+     offeredFormatFilters,
+   );
+   const [npuOnDeviceCollapsed, setNpuOnDeviceCollapsed] = useState(false);
+-  const [npuBrowseCollapsed, setNpuBrowseCollapsed] = useState(true);
++  // Null until the user folds or opens the NPU group themselves. Folded by default once the NPU
++  // is set up and holds a model; a fresh install showed only a bare "NPU" heading, hiding Enable NPU.
++  const [npuBrowseCollapsedChoice, setNpuBrowseCollapsedChoice] = useState<
++    boolean | null
++  >(null);
++  const npuNeedsAttention =
++    npuCatalog !== null &&
++    (!npuCatalog.ready ||
++      !npuCatalog.status.runtime_installed ||
++      (npuCatalog.models !== null &&
++        !npuCatalog.models.some((model) => model.downloaded)));
++  // Stays open for this picker once shown, so finishing Enable NPU does not fold it under the user.
++  // Adjusted during render rather than in an effect, so the group never paints folded in between.
++  const [npuAttentionShown, setNpuAttentionShown] = useState(false);
++  if (npuNeedsAttention && !npuAttentionShown) {
++    setNpuAttentionShown(true);
++  }
++  const npuBrowseCollapsed =
++    npuBrowseCollapsedChoice ?? (!npuNeedsAttention && !npuAttentionShown);
+   // What this picker's task filter has already established about every row it can show; chat
+   // passes none and keeps the full set.
+   const capabilityScope = useMemo<readonly (keyof ModelCapabilities)[] | null>(() => {
+@@ -8336,7 +8369,7 @@ export function HubModelPicker({
+                       onToggle={
+                         npuBrowseForcedOpen
+                           ? undefined
+-                          : () => setNpuBrowseCollapsed((v) => !v)
++                          : () => setNpuBrowseCollapsedChoice(!npuBrowseFolded)
+                       }
+                     >
+                       NPU
+diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
+index 0c7263e398..18bbd5a988 100644
+--- a/studio/frontend/src/features/npu/index.ts
++++ b/studio/frontend/src/features/npu/index.ts
+@@ -12,7 +12,7 @@ export {
+   npuRowsFor,
+   npuSizeLabel,
+ } from "./api";
+-export { NpuPoweredBy, NpuSetupNotice } from "./npu-setup-notice";
++export { NpuHubPrompt, NpuPoweredBy, NpuSetupNotice } from "./npu-setup-notice";
+ export {
+   type NpuCatalog,
+   type NpuPickerSource,
+diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
+index 688f32c964..aec4a56a15 100644
+--- a/studio/frontend/src/features/npu/npu-setup-notice.tsx
++++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
+@@ -15,8 +15,8 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
+   return (
+     <div className="flex flex-col gap-2 px-2.5 pb-2 text-xs">
+       <p className="text-muted-foreground">
+-        {status.hardware.name ?? "AMD NPU"}: FastFlowLM's own NPU builds, run
+-        through Lemonade. GGUF models run on the GPU.
++        {status.hardware.name ?? "AMD NPU"} found. These models run on the NPU,
++        separately from the GPU models listed below.
+       </p>
+       {status.error || problems.length > 0 ? (
+         <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-destructive">
+@@ -105,3 +105,33 @@ export function NpuPoweredBy({
+     </p>
+   );
+ }
++
++/** The Hub feed's pointer to the NPU list, which otherwise sits behind the format menu. */
++export function NpuHubPrompt({
++  status,
++  onBrowse,
++}: {
++  status: NpuStatus;
++  onBrowse: () => void;
++}) {
++  return (
++    <div
++      data-testid="hub-npu-prompt"
++      className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-muted/40 px-4 py-3 text-ui-13"
++    >
++      <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
++        <span
++          aria-hidden={true}
++          className="size-1.5 shrink-0 rounded-full bg-format-npu"
++        />
++        <span className="truncate">
++          {status.hardware.name ?? "AMD NPU"} found. Models built for it run on
++          the NPU, separately from the GPU.
++        </span>
++      </span>
++      <Button size="sm" variant="outline" onClick={onBrowse}>
++        Browse NPU models
++      </Button>
++    </div>
++  );
++}
+diff --git a/unsloth_cli/_inference.py b/unsloth_cli/_inference.py
+index 97ced9e1c8..c23d039c64 100644
+--- a/unsloth_cli/_inference.py
++++ b/unsloth_cli/_inference.py
+@@ -1119,6 +1119,20 @@ def connect_studio_server(
+     if not token:
+         return _refuse("couldn't self-issue an Unsloth token (is Unsloth set up here?).")
+     backend = HttpChatBackend(base_url, token)
++    from unsloth_cli._npu import npu_model_path, prepare_npu_model
++
++    if npu_model_path(model):
++        try:
++            prepare_npu_model(
++                lambda method, path, payload, timeout: backend._request(
++                    method, path, payload, timeout = timeout
++                ),
++                model,
++                lambda line: typer.echo(line, err = True),
++            )
++        except RuntimeError as exc:
++            typer.echo(f"Error: {exc}", err = True)
++            raise typer.Exit(code = 1)
+     backend.ensure_loaded(
+         model,
+         hf_token = hf_token,
+diff --git a/unsloth_cli/_npu.py b/unsloth_cli/_npu.py
+new file mode 100644
+index 0000000000..b17bf7cc72
+--- /dev/null
++++ b/unsloth_cli/_npu.py
+@@ -0,0 +1,132 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""AMD Ryzen AI NPU models from the CLI.
++
++They run inside Unsloth Studio through Lemonade and FastFlowLM, so the CLI drives a running Studio
++over HTTP: enable the runtime, download the model if needed, then load it like any other model.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from typing import Callable, Optional
++from urllib.parse import quote
++
++NPU_MODEL_PREFIX = "lemonade:"
++
++
++class NpuCliError(RuntimeError):
++    pass
++
++
++def npu_model_path(model: Optional[str]) -> Optional[str]:
++    """`lemonade:<id>` for an NPU model, or None.
++
++    Takes the `lemonade:<id>` model path and the bare id the Hub and the picker show
++    (`qwen3-0.6b-FLM`): Lemonade's NPU ids end in `-FLM` and never hold a slash.
++    """
++    if not model:
++        return None
++    text = model.strip()
++    if text.startswith(NPU_MODEL_PREFIX):
++        return text if len(text) > len(NPU_MODEL_PREFIX) else None
++    if "/" in text or "\\" in text or ":" in text or not text.lower().endswith("-flm"):
++        return None
++    if os.path.exists(text):
++        return None
++    return NPU_MODEL_PREFIX + text
++
++
++def _call(request: Callable[..., object], method: str, path: str, timeout: float):
++    """Open `path`, turning an HTTP error into the server's own message."""
++    import urllib.error
++    try:
++        return request(method, path, None, timeout)
++    except urllib.error.HTTPError as exc:
++        try:
++            detail = json.loads(exc.read() or b"{}").get("detail")
++        except Exception:
++            detail = None
++        raise NpuCliError(f"{method} {path} failed ({exc.code}): {detail or exc.reason}") from None
++
++
++def _read_json(response) -> dict:
++    with response:
++        body = json.loads(response.read() or b"{}")
++    return body if isinstance(body, dict) else {}
++
++
++def prepare_npu_model(
++    request: Callable[..., object], model_path: str, echo: Callable[[str], None]
++) -> None:
++    """Enable the NPU runtime and download `model_path` on the Studio behind `request`.
++
++    `request(method, path, payload, timeout)` returns an open HTTP response for that Studio.
++    """
++    model_id = model_path[len(NPU_MODEL_PREFIX) :]
++    status = _read_json(_call(request, "GET", "/api/npu/status", 60))
++    if not status.get("supported"):
++        hardware = status.get("hardware") or {}
++        reason = (
++            "no AMD Ryzen AI NPU was found on this machine"
++            if not hardware.get("present")
++            else f"{hardware.get('name') or 'this NPU'} is not supported (an XDNA2 NPU is needed)"
++        )
++        raise NpuCliError(f"{model_id} runs on the AMD NPU, but {reason}.")
++    if not status.get("ready"):
++        echo("Enabling the NPU runtime (Lemonade and FastFlowLM, about 47 MB)...")
++        status = _read_json(_call(request, "POST", "/api/npu/enable", 1800))
++        if not status.get("ready"):
++            problems = (status.get("validation") or {}).get("problems") or []
++            detail = status.get("error") or " ".join(problems) or "the NPU driver check failed"
++            raise NpuCliError(f"Could not enable the NPU runtime: {detail}")
++
++    models = _read_json(_call(request, "GET", "/api/npu/models", 120)).get("models") or []
++    entry = next((m for m in models if isinstance(m, dict) and m.get("id") == model_id), None)
++    if entry is None:
++        available = sorted(str(m.get("id")) for m in models if isinstance(m, dict))
++        listed = ", ".join(available[:12]) + (", ..." if len(available) > 12 else "")
++        raise NpuCliError(f"No NPU model named {model_id}. Available: {listed}")
++    if entry.get("downloaded"):
++        return
++
++    size = entry.get("size_gb")
++    echo(
++        f"Downloading {model_id}"
++        + (f" ({size:.1f} GB)" if isinstance(size, (int, float)) else "")
++        + "..."
++    )
++    last_tenth = -1
++    finished = False
++    response = _call(request, "POST", f"/api/npu/models/{quote(model_id, safe = '')}/download", 7200)
++    with response:
++        for raw in response:
++            line = (
++                raw.decode("utf-8", "replace").strip()
++                if isinstance(raw, bytes)
++                else str(raw).strip()
++            )
++            if not line.startswith("data:"):
++                continue
++            try:
++                event = json.loads(line[len("data:") :])
++            except ValueError:
++                continue
++            if not isinstance(event, dict):
++                continue
++            if event.get("event") == "error" or event.get("error"):
++                raise NpuCliError(
++                    f"Downloading {model_id} failed: {event.get('error') or 'unknown error'}"
++                )
++            percent = event.get("percent")
++            if isinstance(percent, (int, float)) and int(percent) // 10 > last_tenth:
++                last_tenth = int(percent) // 10
++                echo(f"  {int(percent)}%")
++            if event.get("event") == "complete":
++                finished = True
++    if not finished:
++        raise NpuCliError(
++            f"The download of {model_id} ended early. Run the command again to resume it."
++        )
+diff --git a/unsloth_cli/commands/chat.py b/unsloth_cli/commands/chat.py
+index f5fb38e5ab..d5cd354dfd 100644
+--- a/unsloth_cli/commands/chat.py
++++ b/unsloth_cli/commands/chat.py
+@@ -2,6 +2,7 @@
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+ import sys
++from types import SimpleNamespace
+ from typing import List, Optional
+ 
+ import typer
+@@ -128,11 +129,47 @@ def _drain_available_stdin() -> None:
+         return
+ 
+ 
++def _running_studio_npu_entries() -> list:
++    """Downloaded NPU models, when an Unsloth Studio is running: they live in Studio, not on disk here."""
++    from unsloth_cli._inference import (
++        HttpChatBackend,
++        _studio_token,
++        find_studio_server,
++        is_loopback_url,
++    )
++    from unsloth_cli._model_catalog import ModelEntry
++    from unsloth_cli._npu import NPU_MODEL_PREFIX
++
++    base_url = find_studio_server(timeout = 1.0)
++    token = _studio_token() if base_url and is_loopback_url(base_url) else None
++    if not token:
++        return []
++    try:
++        import json
++        with HttpChatBackend(base_url, token)._request(
++            "GET", "/api/npu/models", timeout = 10
++        ) as response:
++            models = json.loads(response.read()).get("models") or []
++    except Exception:
++        return []
++    return [
++        ModelEntry(
++            group = "AMD NPU (Unsloth Studio)",
++            name = str(m["id"]),
++            detail = "NPU"
++            + (f" · {m['size_gb']:.1f} GB" if isinstance(m.get("size_gb"), (int, float)) else ""),
++            model = NPU_MODEL_PREFIX + str(m["id"]),
++        )
++        for m in models
++        if isinstance(m, dict) and m.get("downloaded") and m.get("id")
++    ]
++
++
+ def _pick_model(console) -> str:
+     ensure_studio_backend_path()
+     from unsloth_cli._model_catalog import list_chat_models
+ 
+-    entries = list_chat_models()
++    entries = list_chat_models() + _running_studio_npu_entries()
+     if not entries:
+         typer.echo(
+             "No local models found. Pass a model id or path: `unsloth chat <model>`.",
+@@ -285,9 +322,32 @@ def chat(
+             raise typer.Exit(code = 1)
+         model = _pick_model(console)
+ 
+-    # Resolve first so --compare can be rejected before the slow load.
+-    with quiet_if_nonzero_mlx_rank():
+-        model_config = resolve_model_config(model, hf_token = hf_token)
++    from unsloth_cli._npu import npu_model_path
++
++    # An NPU model runs inside Unsloth Studio, never in this process: no HF config to resolve.
++    npu_path = npu_model_path(model)
++    if npu_path:
++        model = npu_path
++        model_config = SimpleNamespace(
++            display_name = npu_path.split(":", 1)[1],
++            is_gguf = False,
++            is_lora = False,
++            path = None,
++            base_model = None,
++            gguf_variant = None,
++        )
++        if no_server or is_mlx_distributed:
++            if should_print:
++                err.print(
++                    "NPU models run inside Unsloth Studio; drop --no-server.",
++                    style = "red",
++                    markup = False,
++                )
++            raise typer.Exit(code = 1)
++    else:
++        # Resolve first so --compare can be rejected before the slow load.
++        with quiet_if_nonzero_mlx_rank():
++            model_config = resolve_model_config(model, hf_token = hf_token)
+     compare_blocked = _compare_blocked_reason(model_config)
+     if is_mlx_distributed:
+         compare_blocked = (
+@@ -318,6 +378,16 @@ def chat(
+         else connect_studio_server(model, **server_load_opts(ctx, load_opts))
+     )
+     server_mode = chat_backend is not None
++    if npu_path and not server_mode:
++        if should_print:
++            err.print(
++                f"{model_config.display_name} runs on the AMD NPU inside Unsloth Studio. "
++                "Start it with `unsloth studio` (or `unsloth run --model "
++                f"{npu_path}`) and run this again.",
++                style = "red",
++                markup = False,
++            )
++        raise typer.Exit(code = 1)
+     if server_mode and should_print:
+         console.print(
+             "(Unsloth server connected — model stays warm after /exit)",
+diff --git a/unsloth_cli/commands/start.py b/unsloth_cli/commands/start.py
+index b80bda0458..711863672b 100644
+--- a/unsloth_cli/commands/start.py
++++ b/unsloth_cli/commands/start.py
+@@ -2774,6 +2774,18 @@ def _fail_gguf_variant_missing(model_id: str, variant: str, variants: list) -> N
+     _fail(message)
+ 
+ 
++def _refuse_npu_model(model: Optional[str]) -> None:
++    from unsloth_cli._npu import npu_model_path
++    npu_path = npu_model_path(model)
++    if npu_path:
++        model_id = npu_path.split(":", 1)[1]
++        # Unchecked, `lemonade:<id>` was split into a GGUF lookup for a repo named "lemonade".
++        _fail(
++            f"{model_id} is an AMD NPU model. `unsloth start` runs coding agents on GGUF models; "
++            f"chat with {model_id} in Unsloth Studio or with `unsloth chat {model_id}`."
++        )
++
++
+ def _fail_agent_needs_gguf(agent: _GgufAgent, model_id: str) -> NoReturn:
+     message = (
+         f"{agent.label} needs a GGUF model served by llama-server, " f"but {model_id} is not one."
+@@ -2796,6 +2808,7 @@ def _preflight_agent_gguf(
+     # Only a complete listing with no .gguf files rejects; unknown defers to the
+     # post-connect check. Mirrors _require_studio's auto-start condition, so with no start
+     # possible its "no running server" error comes first, without a hub probe.
++    _refuse_npu_model(model)
+     if not (serve and launch and model):
+         return
+     expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
+@@ -4623,6 +4636,7 @@ def _connect(
+     server_options: ServerOptions = ServerOptions(),
+     preload_check = None,
+ ) -> tuple:
++    _refuse_npu_model(model)
+     # `--model org/name:QUANT` is shorthand for `--model org/name --gguf-variant QUANT`. Split it before we match or serve so the attach path resolves against the already-loaded `org/name` (listed without the suffix) instead of reloading a `:`-suffixed repo id, which Unsloth rejects and which would evict a model another session is using.
+     if model:
+         repo, variant = _split_repo_variant(model)
+diff --git a/unsloth_cli/commands/studio.py b/unsloth_cli/commands/studio.py
+index a173bf6867..8a9e1e856a 100644
+--- a/unsloth_cli/commands/studio.py
++++ b/unsloth_cli/commands/studio.py
+@@ -2359,7 +2359,8 @@ def run(
+         help = (
+             "Model path or HF repo. Accepts llama.cpp-style "
+             "`org/repo:variant` syntax. `-hf` / `--hf-repo` match "
+-            "llama-server's spelling."
++            "llama-server's spelling. An AMD Ryzen AI NPU model is "
++            "`lemonade:<id>` or its bare id, e.g. `qwen3-0.6b-FLM`."
+         ),
+     ),
+     gguf_variant: Optional[str] = typer.Option(
+@@ -2696,8 +2697,21 @@ def run(
+         )
+         raise typer.Exit(2)
+ 
++    from unsloth_cli._npu import npu_model_path
++
++    # An NPU model's `lemonade:` prefix is not a llama.cpp `repo:variant` split.
++    npu_path = npu_model_path(model)
++    if npu_path:
++        if gguf_variant or extra_llama_args or engine != "auto":
++            typer.echo(
++                "Error: NPU models run on FastFlowLM; --gguf-variant, --engine and "
++                "llama-server flags do not apply to them.",
++                err = True,
++            )
++            raise typer.Exit(2)
++        model = npu_path
+     # Parse llama.cpp `repo:variant`; error if it disagrees with --gguf-variant.
+-    parsed_repo, embedded_variant = _split_repo_variant(model)
++    parsed_repo, embedded_variant = (model, None) if npu_path else _split_repo_variant(model)
+     if embedded_variant:
+         if gguf_variant and gguf_variant != embedded_variant:
+             typer.echo(
+@@ -2942,6 +2956,30 @@ def run(
+             except RuntimeError as exc:
+                 typer.echo(f"Error: {exc}", err = True)
+                 raise typer.Exit(1)
++        if npu_path:
++            from unsloth_cli._npu import prepare_npu_model
++            def _npu_request(method, path, payload, timeout):
++                import urllib.request
++                request = urllib.request.Request(
++                    f"http://{_url_host(request_host)}:{actual_port}{path}",
++                    data = None if payload is None else json.dumps(payload).encode(),
++                    headers = {
++                        "Content-Type": "application/json",
++                        "Authorization": f"Bearer {api_key}",
++                    },
++                    method = method,
++                )
++                return _direct_urlopen(request, timeout = timeout)
++
++            try:
++                prepare_npu_model(
++                    _npu_request,
++                    model,
++                    (lambda _line: None) if silent else typer.echo,
++                )
++            except RuntimeError as exc:
++                typer.echo(f"Error: {exc}", err = True)
++                raise typer.Exit(1)
+         if not silent:
+             typer.echo(f"Loading model: {model}...")
+         try:
+diff --git a/unsloth_cli/tests/test_npu_cli.py b/unsloth_cli/tests/test_npu_cli.py
+new file mode 100644
+index 0000000000..778d2476a8
+--- /dev/null
++++ b/unsloth_cli/tests/test_npu_cli.py
+@@ -0,0 +1,180 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""AMD NPU models from `unsloth run`, `unsloth chat` and `unsloth start`."""
++
++from __future__ import annotations
++
++import io
++import json
++import sys
++from pathlib import Path
++
++import pytest
++import typer
++from typer.testing import CliRunner
++
++_REPO_ROOT = Path(__file__).resolve().parents[2]
++if str(_REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(_REPO_ROOT))
++
++from unsloth_cli._npu import NpuCliError, npu_model_path, prepare_npu_model
++
++
++@pytest.mark.parametrize(
++    ("model", "expected"),
++    [
++        ("lemonade:qwen3-0.6b-FLM", "lemonade:qwen3-0.6b-FLM"),
++        ("qwen3-0.6b-FLM", "lemonade:qwen3-0.6b-FLM"),
++        ("qwen3.8-mtp-27b-flm", "lemonade:qwen3.8-mtp-27b-flm"),
++        ("unsloth/Qwen3-0.6B-GGUF", None),
++        ("unsloth/Qwen3-0.6B-GGUF:Q4_K_M", None),
++        ("org/name-FLM", None),
++        ("lemonade:", None),
++        ("", None),
++        (None, None),
++    ],
++)
++def test_npu_model_path(model, expected):
++    assert npu_model_path(model) == expected
++
++
++class _Studio:
++    """A Studio's /api/npu routes, answering `prepare_npu_model`'s requests."""
++
++    def __init__(
++        self,
++        *,
++        supported = True,
++        ready = False,
++        downloaded = False,
++        events = None,
++    ):
++        self.status = {"supported": supported, "ready": ready, "hardware": {"present": supported}}
++        self.downloaded = downloaded
++        self.events = (
++            events
++            if events is not None
++            else [
++                {"event": "progress", "percent": 0},
++                {"event": "progress", "percent": 55},
++                {"event": "complete", "percent": 100},
++            ]
++        )
++        self.calls = []
++
++    def __call__(self, method, path, payload, timeout):
++        self.calls.append((method, path))
++        if path == "/api/npu/status":
++            return io.BytesIO(json.dumps(self.status).encode())
++        if path == "/api/npu/enable":
++            self.status["ready"] = True
++            return io.BytesIO(json.dumps(self.status).encode())
++        if path == "/api/npu/models":
++            models = [
++                {"id": "qwen3-0.6b-FLM", "downloaded": self.downloaded, "size_gb": 0.66},
++                {"id": "gemma3-1b-FLM", "downloaded": False, "size_gb": 1.2},
++            ]
++            return io.BytesIO(json.dumps({"models": models}).encode())
++        if path.endswith("/download"):
++            return io.BytesIO("".join(f"data: {json.dumps(e)}\n\n" for e in self.events).encode())
++        raise AssertionError(path)
++
++
++def test_a_fresh_npu_is_enabled_and_the_model_downloaded():
++    studio, lines = _Studio(), []
++    prepare_npu_model(studio, "lemonade:qwen3-0.6b-FLM", lines.append)
++    assert studio.calls == [
++        ("GET", "/api/npu/status"),
++        ("POST", "/api/npu/enable"),
++        ("GET", "/api/npu/models"),
++        ("POST", "/api/npu/models/qwen3-0.6b-FLM/download"),
++    ]
++    assert lines[0].startswith("Enabling the NPU runtime")
++    assert "  100%" in lines
++
++
++def test_a_ready_downloaded_model_needs_nothing():
++    studio = _Studio(ready = True, downloaded = True)
++    prepare_npu_model(studio, "lemonade:qwen3-0.6b-FLM", lambda _line: None)
++    assert studio.calls == [("GET", "/api/npu/status"), ("GET", "/api/npu/models")]
++
++
++def test_no_npu_says_so():
++    with pytest.raises(NpuCliError, match = "no AMD Ryzen AI NPU"):
++        prepare_npu_model(_Studio(supported = False), "lemonade:qwen3-0.6b-FLM", print)
++
++
++def test_an_unknown_model_lists_the_real_ones():
++    with pytest.raises(NpuCliError, match = "gemma3-1b-FLM"):
++        prepare_npu_model(_Studio(ready = True), "lemonade:nope-FLM", print)
++
++
++@pytest.mark.parametrize(
++    "events",
++    [
++        [{"event": "error", "error": "disk full"}],
++        [{"event": "progress", "percent": 40}],
++    ],
++)
++def test_a_failed_or_cut_download_fails(events):
++    with pytest.raises(NpuCliError):
++        prepare_npu_model(_Studio(ready = True, events = events), "lemonade:qwen3-0.6b-FLM", print)
++
++
++def test_run_refuses_gguf_flags_for_an_npu_model():
++    from unsloth_cli import app
++
++    result = CliRunner().invoke(
++        app, ["run", "--model", "lemonade:qwen3-0.6b-FLM", "--gguf-variant", "Q4_K_M"]
++    )
++    assert result.exit_code == 2
++    assert "NPU models run on FastFlowLM" in result.output
++
++
++def test_run_does_not_split_the_lemonade_prefix():
++    import inspect
++
++    from unsloth_cli.commands import studio as studio_mod
++
++    src = inspect.getsource(studio_mod.run)
++    # `lemonade:<id>` was split llama.cpp-style into repo "lemonade", variant "<id>".
++    assert "(model, None) if npu_path else _split_repo_variant(model)" in src
++    assert "prepare_npu_model(" in src
++
++
++def test_start_names_an_npu_model_instead_of_looking_up_a_gguf(capsys, monkeypatch):
++    from unsloth_cli.commands import start as start_mod
++
++    # Never reach a real server: a Studio running on this machine would be asked to switch models.
++    def _no_server(*_args, **_kwargs):
++        raise AssertionError("unsloth start looked for a Studio before refusing the NPU model")
++
++    monkeypatch.setattr(start_mod, "_require_studio", _no_server)
++    with pytest.raises((typer.Exit, SystemExit)):
++        start_mod._connect(None, "lemonade:qwen3-0.6b-FLM")
++    assert "qwen3-0.6b-FLM is an AMD NPU model" in capsys.readouterr().err
++
++
++def test_chat_needs_a_running_studio_for_an_npu_model(monkeypatch):
++    from unsloth_cli import app
++    from unsloth_cli.commands import chat as chat_mod
++
++    monkeypatch.setattr(chat_mod, "connect_studio_server", lambda *_a, **_k: None)
++    monkeypatch.setattr(chat_mod, "_running_studio_npu_entries", lambda: [])
++    result = CliRunner().invoke(app, ["chat", "qwen3-0.6b-FLM"])
++    assert result.exit_code == 1
++    assert "runs on the AMD NPU inside Unsloth Studio" in result.output
++
++
++def test_a_gguf_agent_refuses_an_npu_model_before_any_hub_lookup(capsys, monkeypatch):
++    from unsloth_cli.commands import start as start_mod
++
++    def _no_lookup(*_args, **_kwargs):
++        raise AssertionError("looked the NPU id up as a Hugging Face GGUF repo")
++
++    monkeypatch.setattr(start_mod, "find_studio_server", _no_lookup)
++    monkeypatch.setattr(start_mod, "_hub_gguf_files", _no_lookup)
++    with pytest.raises((typer.Exit, SystemExit)):
++        start_mod._preflight_agent_gguf(start_mod._CLAUDE_GGUF_AGENT, "lemonade:qwen3-0.6b-FLM")
++    assert "is an AMD NPU model" in capsys.readouterr().err

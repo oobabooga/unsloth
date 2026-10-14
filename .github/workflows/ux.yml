@@ -1,17 +1,191 @@
-name: FastFlow UX probe
+name: FastFlow NPU fixes A/B
 'on':
   push:
     branches:
     - amd-fastflow-ux-c5984ef8
 permissions: {}
 jobs:
-  windows:
+  linux-A:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 220
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Prepare a fresh user and fetch the harness
+      run: 'set -euxo pipefail
+
+        root="$RUNNER_TEMP/ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-A"
+
+        mkdir -p "$root/h" "$root/evidence" "$root/home"
+
+        echo "UX_ROOT=$root" >> $GITHUB_ENV
+
+        echo "PLAYWRIGHT_BROWSERS_PATH=$root/pw-browsers" >> $GITHUB_ENV
+
+        echo "HOME=$root/home" >> $GITHUB_ENV
+
+        echo "$root/home/.local/bin" >> $GITHUB_PATH
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -o "$root/h/uxlib.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -o "$root/h/ux_ui.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab.py" -o "$root/h/ux_ab.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/fix.patch" -o "$root/h/fix.patch"
+
+        python3 "$root/h/probe_hw.py" "$root/evidence/hardware.json"'
+    - name: Install Studio from source (A)
+      timeout-minutes: 60
+      run: 'set -uxo pipefail
+
+        unset HF_HOME HF_ENDPOINT HF_HUB_DISABLE_XET XDG_CACHE_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE
+
+        git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$UX_ROOT/src"
+
+        git -C "$UX_ROOT/src" checkout -q 5e927b0fa337ad18e84261dd1ca691f98a8931c6
+
+        echo ''A: merge base only''
+
+        { git -C "$UX_ROOT/src" log -1 --format=%H; git -C "$UX_ROOT/src" status --short; } > "$UX_ROOT/evidence/source.txt"
+
+        start=$(date +%s)
+
+        (cd "$UX_ROOT/src" && ./install.sh --local) 2>&1 | tee "$UX_ROOT/evidence/install.log"
+
+        rc=${PIPESTATUS[0]}
+
+        echo "install rc=$rc seconds=$(( $(date +%s) - start ))" | tee "$UX_ROOT/evidence/install-summary.txt"
+
+        exit $rc'
+    - name: Browser for the harness
+      timeout-minutes: 15
+      run: 'set -euxo pipefail
+
+        python3 -m venv "$UX_ROOT/pw"
+
+        "$UX_ROOT/pw/bin/pip" install -q playwright==1.55.0 requests
+
+        env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -m playwright install chromium'
+    - name: A/B session (A)
+      timeout-minutes: 120
+      if: always()
+      env:
+        UX_SUITE: ab
+        UX_OS: Linux
+        UX_SIDE: A
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_ab.py"
+    - name: Collect Studio logs
+      if: always()
+      run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ab-A-linux
+        path: ${{ env.UX_ROOT }}/evidence
+        retention-days: 14
+  linux-B:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 220
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Prepare a fresh user and fetch the harness
+      run: 'set -euxo pipefail
+
+        root="$RUNNER_TEMP/ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-B"
+
+        mkdir -p "$root/h" "$root/evidence" "$root/home"
+
+        echo "UX_ROOT=$root" >> $GITHUB_ENV
+
+        echo "PLAYWRIGHT_BROWSERS_PATH=$root/pw-browsers" >> $GITHUB_ENV
+
+        echo "HOME=$root/home" >> $GITHUB_ENV
+
+        echo "$root/home/.local/bin" >> $GITHUB_PATH
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -o "$root/h/uxlib.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -o "$root/h/ux_ui.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab.py" -o "$root/h/ux_ab.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/fix.patch" -o "$root/h/fix.patch"
+
+        python3 "$root/h/probe_hw.py" "$root/evidence/hardware.json"'
+    - name: Install Studio from source (B)
+      timeout-minutes: 60
+      run: 'set -uxo pipefail
+
+        unset HF_HOME HF_ENDPOINT HF_HUB_DISABLE_XET XDG_CACHE_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE
+
+        git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$UX_ROOT/src"
+
+        git -C "$UX_ROOT/src" checkout -q 5e927b0fa337ad18e84261dd1ca691f98a8931c6
+
+        git -C "$UX_ROOT/src" apply --whitespace=nowarn "$UX_ROOT/h/fix.patch"
+
+        { git -C "$UX_ROOT/src" log -1 --format=%H; git -C "$UX_ROOT/src" status --short; } > "$UX_ROOT/evidence/source.txt"
+
+        start=$(date +%s)
+
+        (cd "$UX_ROOT/src" && ./install.sh --local) 2>&1 | tee "$UX_ROOT/evidence/install.log"
+
+        rc=${PIPESTATUS[0]}
+
+        echo "install rc=$rc seconds=$(( $(date +%s) - start ))" | tee "$UX_ROOT/evidence/install-summary.txt"
+
+        exit $rc'
+    - name: Browser for the harness
+      timeout-minutes: 15
+      run: 'set -euxo pipefail
+
+        python3 -m venv "$UX_ROOT/pw"
+
+        "$UX_ROOT/pw/bin/pip" install -q playwright==1.55.0 requests
+
+        env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -m playwright install chromium'
+    - name: A/B session (B)
+      timeout-minutes: 120
+      if: always()
+      env:
+        UX_SUITE: ab
+        UX_OS: Linux
+        UX_SIDE: B
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_ab.py"
+    - name: Collect Studio logs
+      if: always()
+      run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ab-B-linux
+        path: ${{ env.UX_ROOT }}/evidence
+        retention-days: 14
+  windows-A:
     runs-on:
     - self-hosted
     - Windows
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 200
+    timeout-minutes: 220
     defaults:
       run:
         shell: powershell
@@ -19,7 +193,7 @@ jobs:
     - name: Prepare a fresh user and fetch the harness
       run: '$ErrorActionPreference = ''Stop''
 
-        $root = Join-Path $env:RUNNER_TEMP (''ux-'' + $env:GITHUB_RUN_ID + ''-'' + $env:GITHUB_RUN_ATTEMPT)
+        $root = Join-Path $env:RUNNER_TEMP (''ab-'' + $env:GITHUB_RUN_ID + ''-'' + $env:GITHUB_RUN_ATTEMPT + ''-A'')
 
         New-Item -ItemType Directory -Force -Path $root, "$root\h", "$root\evidence" | Out-Null
 
@@ -37,50 +211,52 @@ jobs:
 
         Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -OutFile "$root\h\ux_ui.py"
 
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_api.py" -OutFile "$root\h\ux_api.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_cli.py" -OutFile "$root\h\ux_cli.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_probe.py" -OutFile "$root\h\ux_probe.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab.py" -OutFile "$root\h\ux_ab.py"
 
         Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -OutFile "$root\h\probe_hw.py"
 
-        Write-Host "Pre-existing default Studio home: $(Test-Path "$env:USERPROFILE\.unsloth\studio")"
-
-        Get-Command unsloth -ErrorAction SilentlyContinue | Format-List | Out-String | Write-Host
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/fix.patch" -OutFile "$root\h\fix.patch"
 
         python "$root\h\probe_hw.py" "$root\evidence\hardware.json"'
-    - name: Install Unsloth Studio with the README one-liner
-      timeout-minutes: 40
+    - name: Install Studio from source (A)
+      timeout-minutes: 60
       run: '$ErrorActionPreference = ''Continue''
 
-        foreach ($v in ''HF_HOME'',''HF_ENDPOINT'',''HF_HUB_DISABLE_XET'',''XDG_CACHE_HOME'',''HUGGINGFACE_HUB_CACHE'',''TRANSFORMERS_CACHE'') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+        Remove-Item Env:HF_HOME -ErrorAction SilentlyContinue
+
+        Remove-Item Env:HF_ENDPOINT -ErrorAction SilentlyContinue
+
+        Remove-Item Env:HF_HUB_DISABLE_XET -ErrorAction SilentlyContinue
+
+        Remove-Item Env:XDG_CACHE_HOME -ErrorAction SilentlyContinue
+
+        Remove-Item Env:HUGGINGFACE_HUB_CACHE -ErrorAction SilentlyContinue
+
+        Remove-Item Env:TRANSFORMERS_CACHE -ErrorAction SilentlyContinue
+
+        git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$env:UX_ROOT\src"
+
+        git -C "$env:UX_ROOT\src" checkout -q 5e927b0fa337ad18e84261dd1ca691f98a8931c6
+
+        Write-Host ''A: merge base only''
+
+        git -C "$env:UX_ROOT\src" log -1 --format=%H | Out-File "$env:UX_ROOT\evidence\source.txt"
+
+        git -C "$env:UX_ROOT\src" status --short | Out-File -Append "$env:UX_ROOT\evidence\source.txt"
+
+        Push-Location "$env:UX_ROOT\src"
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
 
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://unsloth.ai/install.ps1 | iex" *>&1 | Tee-Object -FilePath "$env:UX_ROOT\evidence\install.log"
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local *>&1 | Tee-Object -FilePath "$env:UX_ROOT\evidence\install.log"
 
         $rc = $LASTEXITCODE
 
-        Write-Host "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)"
+        Pop-Location
 
-        "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)" | Out-File "$env:UX_ROOT\evidence\install-summary.txt"
+        "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)" | Tee-Object -FilePath "$env:UX_ROOT\evidence\install-summary.txt"
 
-        $userPath = [Environment]::GetEnvironmentVariable(''Path'',''User'')
-
-        "User PATH: $userPath" | Out-File -Append "$env:UX_ROOT\evidence\install-summary.txt"
-
-        $env:Path = $userPath + '';'' + [Environment]::GetEnvironmentVariable(''Path'',''Machine'')
-
-        $cmd = Get-Command unsloth -ErrorAction SilentlyContinue
-
-        "unsloth on new-shell PATH: $($cmd.Source)" | Out-File -Append "$env:UX_ROOT\evidence\install-summary.txt"
-
-        Get-Content "$env:UX_ROOT\evidence\install-summary.txt"
-
-        if (-not $cmd) { $cmd = Get-Item "$env:UNSLOTH_STUDIO_HOME\bin\unsloth.exe" -ErrorAction SilentlyContinue; if ($cmd) { $cmd = @{ Source = $cmd.FullName } } }
-
-        if ($cmd) { (Split-Path $cmd.Source) | Out-File -Append -Encoding utf8 $env:GITHUB_PATH }
+        "$env:UNSLOTH_STUDIO_HOME\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
         if ($rc -ne 0) { exit $rc }'
     - name: Browser for the harness
@@ -89,16 +265,17 @@ jobs:
 
         python -m venv "$env:UX_ROOT\pw"
 
-        & "$env:UX_ROOT\pw\Scripts\python.exe" -m pip install -q playwright==1.55.0 requests pywinpty==3.0.5
+        & "$env:UX_ROOT\pw\Scripts\python.exe" -m pip install -q playwright==1.55.0 requests
 
         & "$env:UX_ROOT\pw\Scripts\python.exe" -m playwright install chromium'
-    - name: 'User session: probe'
-      timeout-minutes: 90
+    - name: A/B session (A)
+      timeout-minutes: 120
       if: always()
       env:
-        UX_SUITE: probe
+        UX_SUITE: ab
         UX_OS: Windows
-      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h/ux_probe.py"'
+        UX_SIDE: A
+      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h\ux_ab.py"'
     - name: Collect Studio logs
       if: always()
       run: Get-ChildItem -Recurse "$env:UNSLOTH_STUDIO_HOME" -Include *.log -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 50MB } | ForEach-Object { Copy-Item $_.FullName "$env:UX_ROOT\evidence\"
@@ -107,96 +284,114 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: ux-probe-windows
+        name: ab-A-windows
         path: ${{ env.UX_ROOT }}/evidence
         retention-days: 14
-  linux:
+  windows-B:
     runs-on:
     - self-hosted
-    - Linux
+    - Windows
     - strix-halo
     - devlab-dispatch
-    timeout-minutes: 200
+    timeout-minutes: 220
     defaults:
       run:
-        shell: bash
+        shell: powershell
     steps:
     - name: Prepare a fresh user and fetch the harness
-      run: 'set -euxo pipefail
+      run: '$ErrorActionPreference = ''Stop''
 
-        root="$RUNNER_TEMP/ux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        $root = Join-Path $env:RUNNER_TEMP (''ab-'' + $env:GITHUB_RUN_ID + ''-'' + $env:GITHUB_RUN_ATTEMPT + ''-B'')
 
-        mkdir -p "$root/h" "$root/evidence" "$root/home"
+        New-Item -ItemType Directory -Force -Path $root, "$root\h", "$root\evidence" | Out-Null
 
-        echo "UX_ROOT=$root" >> $GITHUB_ENV
+        "UX_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-        echo "PLAYWRIGHT_BROWSERS_PATH=$root/pw-browsers" >> $GITHUB_ENV
+        "PLAYWRIGHT_BROWSERS_PATH=$root\pw-browsers" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-        echo "HOME=$root/home" >> $GITHUB_ENV
+        "UNSLOTH_STUDIO_HOME=$root\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-        echo "$root/home/.local/bin" >> $GITHUB_PATH
+        "PYTHONUTF8=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -o "$root/h/uxlib.py"
+        "PYTHONIOENCODING=utf-8" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -o "$root/h/ux_ui.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -OutFile "$root\h\uxlib.py"
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_api.py" -o "$root/h/ux_api.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -OutFile "$root\h\ux_ui.py"
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_cli.py" -o "$root/h/ux_cli.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab.py" -OutFile "$root\h\ux_ab.py"
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_probe.py" -o "$root/h/ux_probe.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -OutFile "$root\h\probe_hw.py"
 
-        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/fix.patch" -OutFile "$root\h\fix.patch"
 
-        env | sort | grep -viE ''token|secret'' > "$root/evidence/env.txt"
+        python "$root\h\probe_hw.py" "$root\evidence\hardware.json"'
+    - name: Install Studio from source (B)
+      timeout-minutes: 60
+      run: '$ErrorActionPreference = ''Continue''
 
-        python3 "$root/h/probe_hw.py" "$root/evidence/hardware.json"
+        Remove-Item Env:HF_HOME -ErrorAction SilentlyContinue
 
-        ls -l /dev/accel* || true; systemctl --no-pager status lemonade-server 2>&1 | head -5 || true
+        Remove-Item Env:HF_ENDPOINT -ErrorAction SilentlyContinue
 
-        ss -ltnp 2>/dev/null | head -30 || true'
-    - name: Install Unsloth Studio with the README one-liner
-      timeout-minutes: 40
-      run: 'set -uxo pipefail
+        Remove-Item Env:HF_HUB_DISABLE_XET -ErrorAction SilentlyContinue
 
-        start=$(date +%s)
+        Remove-Item Env:XDG_CACHE_HOME -ErrorAction SilentlyContinue
 
-        unset HF_HOME HF_ENDPOINT HF_HUB_DISABLE_XET XDG_CACHE_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE
+        Remove-Item Env:HUGGINGFACE_HUB_CACHE -ErrorAction SilentlyContinue
 
-        curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$UX_ROOT/evidence/install.log"
+        Remove-Item Env:TRANSFORMERS_CACHE -ErrorAction SilentlyContinue
 
-        rc=${PIPESTATUS[1]}
+        git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$env:UX_ROOT\src"
 
-        echo "install rc=$rc seconds=$(( $(date +%s) - start ))" | tee "$UX_ROOT/evidence/install-summary.txt"
+        git -C "$env:UX_ROOT\src" checkout -q 5e927b0fa337ad18e84261dd1ca691f98a8931c6
 
-        bash -lc ''command -v unsloth; unsloth --version'' 2>&1 | tee -a "$UX_ROOT/evidence/install-summary.txt" || true
+        git -C "$env:UX_ROOT\src" apply --whitespace=nowarn "$env:UX_ROOT\h\fix.patch"; if ($LASTEXITCODE -ne 0) { exit 1 }
 
-        ls -la "$HOME" "$HOME/.local/bin" 2>&1 | tee -a "$UX_ROOT/evidence/install-summary.txt" || true
+        git -C "$env:UX_ROOT\src" log -1 --format=%H | Out-File "$env:UX_ROOT\evidence\source.txt"
 
-        exit $rc'
+        git -C "$env:UX_ROOT\src" status --short | Out-File -Append "$env:UX_ROOT\evidence\source.txt"
+
+        Push-Location "$env:UX_ROOT\src"
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --local *>&1 | Tee-Object -FilePath "$env:UX_ROOT\evidence\install.log"
+
+        $rc = $LASTEXITCODE
+
+        Pop-Location
+
+        "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)" | Tee-Object -FilePath "$env:UX_ROOT\evidence\install-summary.txt"
+
+        "$env:UNSLOTH_STUDIO_HOME\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+        if ($rc -ne 0) { exit $rc }'
     - name: Browser for the harness
       timeout-minutes: 15
-      run: 'set -euxo pipefail
+      run: '$ErrorActionPreference = ''Stop''
 
-        python3 -m venv "$UX_ROOT/pw"
+        python -m venv "$env:UX_ROOT\pw"
 
-        "$UX_ROOT/pw/bin/pip" install -q playwright==1.55.0 requests
+        & "$env:UX_ROOT\pw\Scripts\python.exe" -m pip install -q playwright==1.55.0 requests
 
-        env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -m playwright install chromium'
-    - name: 'User session: probe'
-      timeout-minutes: 90
+        & "$env:UX_ROOT\pw\Scripts\python.exe" -m playwright install chromium'
+    - name: A/B session (B)
+      timeout-minutes: 120
       if: always()
       env:
-        UX_SUITE: probe
-        UX_OS: Linux
-      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_probe.py"
+        UX_SUITE: ab
+        UX_OS: Windows
+        UX_SIDE: B
+      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h\ux_ab.py"'
     - name: Collect Studio logs
       if: always()
-      run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
+      run: Get-ChildItem -Recurse "$env:UNSLOTH_STUDIO_HOME" -Include *.log -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 50MB } | ForEach-Object { Copy-Item $_.FullName "$env:UX_ROOT\evidence\"
+        -ErrorAction SilentlyContinue }; exit 0
     - name: Upload evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: ux-probe-linux
+        name: ab-B-windows
         path: ${{ env.UX_ROOT }}/evidence
         retention-days: 14
