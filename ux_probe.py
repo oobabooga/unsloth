@@ -139,6 +139,47 @@ def body(page):
         return out
     step("s1_deep", s1_deep, shoot=False)
 
+    # S1 as it failed before: enter text the moment the switch finishes, no pause.
+    def s1_immediate():
+        out = {}
+        for m, label in ((big, "to-2b"), (small, "back-to-0.6b")):
+            X.open_picker("On Device")
+            X.picker_row(m["id"]).click()
+            poll(lambda m=m: X.is_loaded(m), 600, 0.3)
+            X.close_picker()
+            box = page.locator("textarea[aria-label='Message input']").filter(visible=True).first
+            box.click()
+            page.keyboard.type("Reply with the single word: ok", delay=20)
+            reads = [box.input_value()]
+            for _ in range(4):
+                time.sleep(0.5)
+                reads.append(box.input_value())
+            shot(f"immediate-{label}")
+            out[label] = {"readbacks": reads}
+            if reads[-1] != "Reply with the single word: ok":
+                note(f"Text typed immediately after switching ({label}) did not survive: {reads}")
+                box.press("Control+a"); box.press("Delete")
+                box.type("Reply with the single word: ok")
+            try:
+                out[label]["chat"] = X.send_chat_typed()
+            except Exception as exc:  # noqa: BLE001
+                out[label]["chat_error"] = str(exc)[:400]
+        return out
+    step("s1_immediate", s1_immediate, shoot=False)
+
+    def repeat_3x4():
+        rows = []
+        for i in range(6):
+            r = X.send_chat("What is 3 times 4? Reply with just the number.", new_chat=True, timeout=400)
+            visible = [l for l in r["reply"].splitlines() if l.strip() and not l.startswith("Worked for")][:1]
+            rows.append({"i": i, "visible_first_line": visible[0] if visible else None, "seconds": r["seconds"],
+                         "events": run_events(RUNS[-1]) if RUNS else None})
+        empty = [x for x in rows if x["visible_first_line"] in (None, "Copy")]
+        if empty:
+            note(f"{len(empty)}/6 fresh chats of 'What is 3 times 4?' showed no answer.")
+        return rows
+    step("e1_repeat_3x4", repeat_3x4, shoot=False)
+
 
 if __name__ == "__main__":
     main()

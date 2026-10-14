@@ -161,6 +161,19 @@ def send_chat(text, timeout=600, new_chat=False):
     return out
 
 
+def send_chat_typed(timeout=300):
+    """Send whatever is already in the composer."""
+    page = U.page
+    msgs = page.locator(".aui-assistant-message-root")
+    before = msgs.count()
+    t = time.monotonic()
+    page.keyboard.press("Enter")
+    poll(lambda: msgs.count() > before or page.locator(".aui-composer-cancel").count() > 0, 120, 0.5)
+    poll(lambda: page.locator(".aui-composer-cancel").count() == 0 and msgs.count() > before, timeout, 1)
+    time.sleep(1.5)
+    return {"seconds": round(time.monotonic() - t, 1), "reply": msgs.last.inner_text()[-500:]}
+
+
 def set_number(box, value):
     box.scroll_into_view_if_needed()
     box.click()
