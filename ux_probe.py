@@ -118,6 +118,16 @@ def body(page):
             X.close_picker()
             time.sleep(3)
             out[label] = composer_probe(label)
+            # Same as the failing run 11 sequence: fill, read back, then chat with this model.
+            box = page.locator("textarea[aria-label='Message input']").filter(visible=True).first
+            box.click()
+            box.fill("Reply with the single word: ok")
+            out[label]["fill_readback"] = box.input_value()
+            box.press("Control+a"); box.press("Delete")
+            try:
+                out[label]["chat"] = X.send_chat("Reply with the single word: ok", timeout=300)
+            except Exception as exc:  # noqa: BLE001
+                out[label]["chat_error"] = str(exc)[:500]
         if not out["after-switch-back-to-0.6b"]["typed_value"]:
             note("After switching qwen3.5-2b-FLM -> qwen3-0.6b-FLM in the picker, keystrokes in the composer are lost (value stays empty).")
         page.get_by_role("button", name="New chat").first.click()
