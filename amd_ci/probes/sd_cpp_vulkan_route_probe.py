@@ -30,6 +30,22 @@ SCRUB = (
 )
 
 
+MODEL_URL = ("https://huggingface.co/concedo/sdxs-512-tinySDdistilled-GGUF/resolve/main/"
+             "sdxs-512-tinySDdistilled_Q8_0.gguf")
+
+
+def _tiny_model() -> Path:
+    """Downloaded once per run into RUNNER_TEMP; base and head share it."""
+    import urllib.request
+
+    path = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "sdxs-512-q8_0.gguf"
+    if not path.exists() or path.stat().st_size < 600_000_000:
+        tmp = path.with_suffix(".part")
+        urllib.request.urlretrieve(MODEL_URL, tmp)
+        os.replace(tmp, path)
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required = True)
@@ -101,6 +117,23 @@ def main() -> int:
                                text = True, encoding = "utf-8", errors = "replace", timeout = 180)
             obs["list_devices_rc"] = r.returncode
             obs["list_devices"] = (r.stdout + "\n" + r.stderr)[-3000:]
+            # One 512x512 image from a 0.7 GB one-step model, timed, on whatever device the build picks.
+            model = _tiny_model()
+            png = work / "out.png"
+            t = time.time()
+            g = subprocess.run([str(cli), "-m", str(model), "-p", "a red apple on a wooden table",
+                                "--steps", "1", "--cfg-scale", "1", "-W", "512", "-H", "512",
+                                "--seed", "42", "-o", str(png)], env = env, capture_output = True,
+                               text = True, encoding = "utf-8", errors = "replace", timeout = 1200)
+            obs["generate_s"] = round(time.time() - t, 1)
+            obs["generate_rc"] = g.returncode
+            obs["generate_png_bytes"] = png.stat().st_size if png.exists() else 0
+            log = g.stdout + "\n" + g.stderr
+            obs["generate_vulkan_lines"] = [l.strip()[:200] for l in log.splitlines()
+                                            if "vulkan" in l.lower()][:6]
+            obs["generate_timing_lines"] = [l.strip()[:200] for l in log.splitlines()
+                                            if "completed" in l.lower() or "taking" in l.lower()][-6:]
+            obs["generate_tail"] = log[-1500:]
     except Exception:  # noqa: BLE001
         obs["error"] = traceback.format_exc()[-3000:]
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
