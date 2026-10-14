@@ -1,0 +1,60 @@
+name: AMD H3 memory probe
+
+on:
+  push:
+    branches: [amd-h3-mem-probe-20261014]
+
+permissions: {}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    env:
+      TAG: master-951-f89d9b1-uafac7a7
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; free -h; lscpu | grep 'Model name'
+          for d in /sys/class/drm/card*/device; do [ -f $d/mem_info_gtt_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total) gtt_used=$(cat $d/mem_info_gtt_used)"; done
+          cat /sys/module/ttm/parameters/pages_limit 2>/dev/null || true
+          ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true
+          ldconfig -p | grep -E 'libvulkan|libamdhip64|libhipblas|librocblas' || true
+          ls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true
+      - name: Setup
+        run: |
+          W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+          echo "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/h3probe.py" -o "$W/h3probe.py"
+          cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
+          cd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip
+          find "$W/vk" "$W/rocm" -name sd-cli
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]"
+          export HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          for f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:
+              print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))
+          PY
+          du -sh "$W/models"
+      - name: List devices
+        run: |
+          VK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)
+          echo "VK=$VK" >> $GITHUB_ENV; echo "RC=$RC" >> $GITHUB_ENV
+          $VK --list-devices || true
+          $RC --list-devices || true
+          ldd $(dirname $RC)/libggml-hip.so | grep -E 'hip|rocblas|not found' || true
+      - name: V_auto (Studio Auto, offloaded, TE on CPU)
+        run: python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+      - name: V_16g (same, 14 GiB VRAM budget)
+        run: python3 "$W/h3probe.py" V_16g "$VK" --offload-to-cpu --diffusion-fa --max-vram vulkan0=14 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+      - name: V_te_gpu (offload, TE on GPU)
+        run: python3 "$W/h3probe.py" V_te_gpu "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
+      - name: R_auto (upstream ROCm, Studio ROCm flags)
+        run: python3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true
+      - name: Summary
+        if: always()
+        run: |
+          cat "$OUT/results.jsonl" || true
+          for f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|error|abort|assert|budget|prepared params|max.vram' "$f" | head -40; done
