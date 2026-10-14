@@ -1,0 +1,41 @@
+name: MPS memory probe
+
+on:
+  push:
+    branches: [mps-mem-probe-ci]
+
+permissions: {}
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Hardware
+        run: |
+          sysctl hw.memsize hw.model machdep.cpu.brand_string hw.ncpu || true
+          sysctl iogpu.wired_limit_mb || true
+          sw_vers
+          vm_stat
+          memory_pressure | tail -5 || true
+          df -h / "$RUNNER_TEMP"
+          system_profiler SPDisplaysDataType | head -30
+      - name: Torch MPS
+        run: |
+          python3 -m venv "$RUNNER_TEMP/v"
+          . "$RUNNER_TEMP/v/bin/activate"
+          pip install -q torch psutil
+          python - <<'PY'
+          import psutil, torch
+          vm = psutil.virtual_memory()
+          g = 2**30
+          print("psutil total %.2f available %.2f free %.2f inactive %.2f wired %.2f" % (vm.total/g, vm.available/g, vm.free/g, vm.inactive/g, vm.wired/g))
+          print("mps available", torch.backends.mps.is_available())
+          print("recommended_max_memory GiB %.2f" % (torch.mps.recommended_max_memory()/g))
+          x = torch.ones(1024, 1024, 256, dtype=torch.bfloat16, device="mps")
+          print("after 512MiB alloc: current %.3f driver %.3f" % (torch.mps.current_allocated_memory()/g, torch.mps.driver_allocated_memory()/g))
+          PY
