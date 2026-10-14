@@ -1375,9 +1375,6 @@ def h3_native_render_flags(
 # --offload-to-cpu pins GPU-run weights in the device host buffer (GTT on Vulkan/radv, capped by TTM pages_limit,
 # overflow = "device lost"); --clip-on-cpu modules use plain RAM. Measured Q4_K, 864x480x124: 31.35 vs 15.49 GiB pinned.
 H3_NATIVE_PINNED_MARGIN_BYTES = 1 << 30
-# sd.cpp's device minimum for a segment: the denoiser's compute buffer plus 512 MiB ("need X MB device / Y MB budget").
-# On a UMA card the part VRAM cannot hold comes out of GTT beside the pinned weights; a discrete card refuses it.
-H3_NATIVE_SEGMENT_FLOOR_BYTES = 512 << 20
 # sd-cli's own host use beyond the weights (CPU compute buffers, decoded frames, audio), and Studio itself.
 H3_NATIVE_HOST_OVERHEAD_BYTES = 3 << 30
 H3_NATIVE_FIT_ENV = "UNSLOTH_H3_NATIVE_FIT_CHECK"
@@ -1772,10 +1769,12 @@ def h3_native_live_fit(
         gtt_free, gtt_known = amdgpu_gtt_reading(None)
     spill = 0
     if inputs.check_gtt and inputs.uma and compute_bytes:
-        # What the carve-out cannot hold of the compute buffer comes from GTT, beside the pinned weights.
+        # What the carve-out cannot hold of the compute buffer comes from GTT, beside the pinned weights. A segment's
+        # weights come on top (about 0.3 GiB at 864x480x124, 1.2 at 1344x768x124 on gfx1151); sd.cpp's own capacity
+        # check reports that remainder, so only the compute buffer is charged here.
         vram_free = amdgpu_vram_free_bytes(inputs.gtt_pci_slot)
         if vram_free is not None:
-            spill = max(int(compute_bytes) + H3_NATIVE_SEGMENT_FLOOR_BYTES - vram_free, 0)
+            spill = max(int(compute_bytes) - vram_free, 0)
     return h3_native_memory_fit(
         inputs.base_flags,
         accelerator = inputs.accelerator,
