@@ -59,10 +59,12 @@ def table(obs: dict) -> str:
     rows.append(f"| asset | `{_asset(b)}` | `{_asset(h)}` |")
     rows.append(f"| install record accelerator | `{_record_accel(b)}` | `{_record_accel(h)}` |")
     rows.append(f"| sd-cli Vulkan devices | `{_vulkan_rows(b)}` | `{_vulkan_rows(h)}` |")
-    rows.append(f"| 512x512 image, 1 step: rc / PNG bytes | `{b.get('generate_rc')}` / "
+    rows.append(f"| SD-Turbo 512x512, 8 steps: max rc / min PNG bytes | `{b.get('generate_rc')}` / "
                 f"`{b.get('generate_png_bytes')}` | `{h.get('generate_rc')}` / "
                 f"`{h.get('generate_png_bytes')}` |")
-    rows.append(f"| image wall time (s) | `{b.get('generate_s')}` | `{h.get('generate_s')}` |")
+    rows.append(f"| median wall time of 3 one-shot runs (s) | `{b.get('generate_s')}` | `{h.get('generate_s')}` |")
+    rows.append(f"| per-run wall (s) | `{[r.get('wall_s') for r in b.get('generate_runs') or []]}` | "
+                f"`{[r.get('wall_s') for r in h.get('generate_runs') or []]}` |")
     rows.append(f"| sd-cli Vulkan log lines | `{b.get('generate_vulkan_lines')}` | "
                 f"`{h.get('generate_vulkan_lines')}` |")
     return "\n".join(rows)

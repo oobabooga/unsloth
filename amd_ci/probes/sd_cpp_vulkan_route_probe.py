@@ -30,16 +30,16 @@ SCRUB = (
 )
 
 
-MODEL_URL = ("https://huggingface.co/concedo/sdxs-512-tinySDdistilled-GGUF/resolve/main/"
-             "sdxs-512-tinySDdistilled_Q8_0.gguf")
+MODEL_URL = "https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf"
+REPEATS = 3
 
 
 def _tiny_model() -> Path:
     """Downloaded once per run into RUNNER_TEMP; base and head share it."""
     import urllib.request
 
-    path = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "sdxs-512-q8_0.gguf"
-    if not path.exists() or path.stat().st_size < 600_000_000:
+    path = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "sd_turbo-f16-q8_0.gguf"
+    if not path.exists() or path.stat().st_size < 2_000_000_000:
         tmp = path.with_suffix(".part")
         urllib.request.urlretrieve(MODEL_URL, tmp)
         os.replace(tmp, path)
@@ -117,18 +117,26 @@ def main() -> int:
                                text = True, encoding = "utf-8", errors = "replace", timeout = 180)
             obs["list_devices_rc"] = r.returncode
             obs["list_devices"] = (r.stdout + "\n" + r.stderr)[-3000:]
-            # One 512x512 image from a 0.7 GB one-step model, timed, on whatever device the build picks.
+            # SD-Turbo (2.0 GB), 512x512, 8 steps, REPEATS one-shot runs (each pays its own load and
+            # Vulkan pipeline build, as a one-shot sd-cli load does).
             model = _tiny_model()
-            png = work / "out.png"
-            t = time.time()
-            g = subprocess.run([str(cli), "-m", str(model), "-p", "a red apple on a wooden table",
-                                "--steps", "1", "--cfg-scale", "1", "-W", "512", "-H", "512",
-                                "--seed", "42", "-o", str(png)], env = env, capture_output = True,
-                               text = True, encoding = "utf-8", errors = "replace", timeout = 1200)
-            obs["generate_s"] = round(time.time() - t, 1)
-            obs["generate_rc"] = g.returncode
-            obs["generate_png_bytes"] = png.stat().st_size if png.exists() else 0
-            log = g.stdout + "\n" + g.stderr
+            runs, log = [], ""
+            for i in range(REPEATS):
+                png = work / f"out{i}.png"
+                t = time.time()
+                g = subprocess.run([str(cli), "-m", str(model), "-p", "a red apple on a wooden table",
+                                    "--steps", "8", "--cfg-scale", "1", "-W", "512", "-H", "512",
+                                    "--seed", "42", "-o", str(png)], env = env, capture_output = True,
+                                   text = True, encoding = "utf-8", errors = "replace", timeout = 1800)
+                log = g.stdout + "\n" + g.stderr
+                sampling = [l for l in log.splitlines() if "sampling completed" in l.lower()]
+                runs.append({"rc": g.returncode, "wall_s": round(time.time() - t, 2),
+                             "png_bytes": png.stat().st_size if png.exists() else 0,
+                             "sampling": sampling[-1].strip()[:160] if sampling else None})
+            obs["generate_runs"] = runs
+            obs["generate_rc"] = max(r["rc"] for r in runs)
+            obs["generate_png_bytes"] = min(r["png_bytes"] for r in runs)
+            obs["generate_s"] = sorted(r["wall_s"] for r in runs)[len(runs) // 2]
             obs["generate_vulkan_lines"] = [l.strip()[:200] for l in log.splitlines()
                                             if "vulkan" in l.lower()][:6]
             obs["generate_timing_lines"] = [l.strip()[:200] for l in log.splitlines()
