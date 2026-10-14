@@ -104,7 +104,7 @@ jobs:
             --probe amd_ci/probes/sdcpp_conv_probe.py \
             --criteria amd_ci/criteria/sdcpp_conv_direct.py \
             --out-dir "$AMD_CI_WORK/out/sdcpp" \
-            --python "$AMD_CI_PY" -- --shared "$AMD_CI_WORK/sdcpp_shared" --reps 3 --state-reps 2
+            --python "$AMD_CI_PY" -- --shared "$AMD_CI_WORK/sdcpp_shared" --reps 4 --state-reps 2
           cat "$AMD_CI_WORK/out/sdcpp/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/sdcpp"
           exit 0
@@ -120,7 +120,7 @@ jobs:
             --probe diffusion_bench/amd/diffusion_probe.py \
             --criteria diffusion_bench/amd/criteria_differential.py \
             --out-dir "$AMD_CI_WORK/out/compile" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_rocm_compile.json --budget-min 240.0 --cell-timeout 3600.0 --only 'klein_*' --only 'zimg_*' --defect slow:klein_cmp:klein_nc:0.95
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_rocm_compile.json --budget-min 240.0 --cell-timeout 3600.0 --only 'klein_*' --only 'zimg_*' --defect slow:klein_cmp:klein_nc:0.97
           cat "$AMD_CI_WORK/out/compile/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/compile"
 

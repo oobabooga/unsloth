@@ -174,7 +174,8 @@ def run_cli(cmd: list, binary: Path, log: Path, timeout: float = 1800) -> dict:
             r[k] = float(m[-1])
     dev = [ln.strip() for ln in text.splitlines() if "model buffer size" in ln or "using " in ln.lower()][:12]
     r["device_lines"] = dev
-    out_png = Path(cmd[cmd.index("-o") + 1])
+    flag = "-o" if "-o" in cmd else ("--output" if "--output" in cmd else None)
+    out_png = Path(cmd[cmd.index(flag) + 1]) if flag else Path("/nonexistent")
     if out_png.is_file():
         r["png_sha"] = sha256(out_png)[:16]
         r["png_bytes"] = out_png.stat().st_size
@@ -323,8 +324,9 @@ def main() -> int:
         for i in range(args.state_reps):
             png = out_dir / f"{accel}_{i}.png"
             c = list(cmd)
-            if "-o" in c:
-                c[c.index("-o") + 1] = str(png)
+            for flag in ("-o", "--output"):
+                if flag in c:
+                    c[c.index(flag) + 1] = str(png)
             if "-v" not in c:
                 c.append("-v")
             runs.append(run_cli(c, cli, png.with_suffix(".log")))
