@@ -3,7 +3,7 @@
 
 Differential (#13666). The defect: the base resolves the plain CPU build ("auto"/"cpu"), whose
 sd-cli lists no Vulkan device. Fixed: the head resolves "vulkan", installs a -vulkan asset, and
-its sd-cli lists a Vulkan device on the real Radeon.
+its sd-cli lists a Vulkan device on the real Radeon and renders one image there.
 
 Gates: both probes ran; torch is CPU-only and the diffusion backend is "cpu" at both states
 (otherwise the route under test is not reached); the real inventory lists an AMD card; both
@@ -59,6 +59,12 @@ def table(obs: dict) -> str:
     rows.append(f"| asset | `{_asset(b)}` | `{_asset(h)}` |")
     rows.append(f"| install record accelerator | `{_record_accel(b)}` | `{_record_accel(h)}` |")
     rows.append(f"| sd-cli Vulkan devices | `{_vulkan_rows(b)}` | `{_vulkan_rows(h)}` |")
+    rows.append(f"| 512x512 image, 1 step: rc / PNG bytes | `{b.get('generate_rc')}` / "
+                f"`{b.get('generate_png_bytes')}` | `{h.get('generate_rc')}` / "
+                f"`{h.get('generate_png_bytes')}` |")
+    rows.append(f"| image wall time (s) | `{b.get('generate_s')}` | `{h.get('generate_s')}` |")
+    rows.append(f"| sd-cli Vulkan log lines | `{b.get('generate_vulkan_lines')}` | "
+                f"`{h.get('generate_vulkan_lines')}` |")
     return "\n".join(rows)
 
 
@@ -69,4 +75,5 @@ def base_shows_defect(base: dict) -> bool:
 def head_is_fixed(head: dict) -> bool:
     return (head.get("image_install_accelerator") == "vulkan"
             and "vulkan" in _asset(head).lower() and _record_accel(head) == "vulkan"
-            and bool(_vulkan_rows(head)))
+            and bool(_vulkan_rows(head))
+            and head.get("generate_rc") == 0 and (head.get("generate_png_bytes") or 0) > 0)
