@@ -12,7 +12,7 @@ HEAPS = {}
 def pool(kind):
     if os.name == "nt":
         # No sysfs: treat the memory heap as the pool and only this process as its user.
-        return HEAPS.get(kind, 0), sum(1 for _ in held_kind(kind)) * G
+        return HEAPS.get(kind, 0), sum(1 for _ in held_kind(kind)) * CHUNK
     d = [p.rsplit("/", 1)[0] for p in glob.glob(f"/sys/class/drm/card*/device/mem_info_{kind}_total")]
     tot = sum(int(open(x + f"/mem_info_{kind}_total").read()) for x in d)
     used = sum(int(open(x + f"/mem_info_{kind}_used").read()) for x in d)
@@ -45,17 +45,33 @@ held_kinds = []
 def held_kind(kind):
     return [k for k in held_kinds if k == kind]
 
+CHUNK = 256 << 20
+
+
 def fill(kind, mtype, target_free, touch):
     tot, used = pool(kind)
     need = int(tot - used - target_free * G)
-    print(f"{kind} total={tot/G:.2f} used={used/G:.2f} GiB; allocating {max(need,0)/G:.2f} GiB from type {mtype}", flush=True)
+    candidates = [mtype] + [i for _, i in sorted(gtt_types if kind == "gtt" else vram_types, reverse=True) if i != mtype]
+    print(f"{kind} total={tot/G:.2f} used={used/G:.2f} GiB; allocating {max(need,0)/G:.2f} GiB, types {candidates}", flush=True)
     while need > 0:
-        n = min(G, need)
-        mem = vk.vkAllocateMemory(dev, vk.VkMemoryAllocateInfo(allocationSize=n, memoryTypeIndex=mtype), None)
+        n = min(CHUNK, need)
+        mem = None
+        for t in list(candidates):
+            try:
+                mem = vk.vkAllocateMemory(dev, vk.VkMemoryAllocateInfo(allocationSize=n, memoryTypeIndex=t), None)
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f"type {t} refused {n} bytes: {type(exc).__name__}", flush=True)
+                candidates.remove(t)
+        if mem is None:
+            print("no memory type accepts the allocation; stopping", flush=True)
+            break
         if touch:
             ptr = vk.vkMapMemory(dev, mem, 0, n, 0)
             ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(ptr)), 1, n)
         held.append(mem); held_kinds.append(kind); need -= n
+        if len(held) % 16 == 0:
+            print(f"held {len(held) * CHUNK / G:.2f} GiB", flush=True)
 
 if len(sys.argv) > 2 and vram_types:
     fill("vram", max(vram_types)[1], float(sys.argv[2]), False)
