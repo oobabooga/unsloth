@@ -1,0 +1,48 @@
+name: MPS footprint measurement
+
+on:
+  push:
+    branches: [mps-mem-measure-ci]
+
+permissions: {}
+
+jobs:
+  measure:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      HF_HOME: ${{ github.workspace }}/hf
+    steps:
+      - name: Fetch script
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/oobabooga/unsloth/${GITHUB_SHA}/mps_measure.py" -o "$RUNNER_TEMP/mps_measure.py"
+      - name: Install
+        run: |
+          python3 -m venv "$RUNNER_TEMP/v"
+          . "$RUNNER_TEMP/v/bin/activate"
+          pip install -q torch psutil diffusers==0.41.0 transformers==5.5.0 accelerate gguf safetensors huggingface_hub sentencepiece
+      - name: Load Z-Image Q4_K_M
+        continue-on-error: true
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/mps_measure.py" load unsloth/Z-Image-Turbo-GGUF z-image-turbo-Q4_K_M.gguf ZImageTransformer2DModel unsloth/Z-Image-Turbo
+      - name: Load Z-Image Q8_0
+        continue-on-error: true
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/mps_measure.py" load unsloth/Z-Image-Turbo-GGUF z-image-turbo-Q8_0.gguf ZImageTransformer2DModel unsloth/Z-Image-Turbo
+      - name: Load Klein 4B Q4_K_M
+        continue-on-error: true
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/mps_measure.py" load unsloth/FLUX.2-klein-4B-GGUF flux-2-klein-4b-Q4_K_M.gguf Flux2Transformer2DModel unsloth/FLUX.2-klein-4B
+      - name: Load Klein 4B Q8_0
+        continue-on-error: true
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/mps_measure.py" load unsloth/FLUX.2-klein-4B-GGUF flux-2-klein-4b-Q8_0.gguf Flux2Transformer2DModel unsloth/FLUX.2-klein-4B
+      - name: Z-Image text encoder, 512-token encode
+        continue-on-error: true
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/mps_measure.py" te unsloth/Z-Image-Turbo 512
