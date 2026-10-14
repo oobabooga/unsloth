@@ -1,0 +1,59 @@
+name: AMD H3 memory probe Windows
+
+on:
+  push:
+    branches: [amd-h3-mem-probe-win-20261014]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    env:
+      TAG: master-951-f89d9b1-uafac7a7
+    steps:
+      - name: Setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = Join-Path $env:RUNNER_TEMP "h3"
+          New-Item -ItemType Directory -Force -Path "$W\models","$W\out","$W\vk","$W\hf","$W\tmp" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "MODELS=$W\models" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "OUT=$W\out" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | Format-List
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/h3probe.py" -OutFile "$W\h3probe.py"
+          $ProgressPreference = "SilentlyContinue"
+          Invoke-WebRequest -UseBasicParsing "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$env:TAG/sd-$env:TAG-bin-win-vulkan-x64.zip" -OutFile "$W\vk.zip"
+          Expand-Archive -Force "$W\vk.zip" "$W\vk"
+          Get-ChildItem -Recurse "$W\vk" -Filter sd-cli.exe | Select-Object -ExpandProperty FullName
+          python -m venv "$W\venv"
+          & "$W\venv\Scripts\python.exe" -m pip -q install -U "huggingface_hub[hf_xet]"
+          $env:HF_HOME = "$W\hf"; $env:TMP = "$W\tmp"; $env:TEMP = "$W\tmp"
+          & "$W\venv\Scripts\python.exe" -c "import os; from huggingface_hub import hf_hub_download as d; [print(d('unsloth/MiniMax-H3-GGUF', f, local_dir=os.environ['MODELS'])) for f in ['minimax_h3_fl2va_pruned-Q4_K.gguf','qwen3vl_32b_minimax_h3-Q4_K_M.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors']]"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: List devices
+        shell: powershell
+        run: |
+          $VK = (Get-ChildItem -Recurse "$env:W\vk" -Filter sd-cli.exe | Select-Object -First 1).FullName
+          "VK=$VK" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          & $VK --list-devices
+          exit 0
+      - name: W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)
+        shell: cmd
+        run: |
+          python "%W%\h3probe.py" W_auto_studio "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0
+          exit /b 0
+      - name: W_te_cpu (same, TE on CPU)
+        shell: cmd
+        run: |
+          python "%W%\h3probe.py" W_te_cpu "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+          exit /b 0
+      - name: Summary
+        if: always()
+        shell: cmd
+        run: |
+          type "%OUT%\results.jsonl"
+          for %%f in ("%OUT%\*.log") do (echo === %%f & findstr /i /c:"error" /c:"lost" /c:"abort" /c:"assert" /c:"prepared params" /c:"out of" "%%f")
+          exit /b 0
