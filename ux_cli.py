@@ -105,9 +105,8 @@ def main():
         step(f"unsloth_run_npu_{label}", lambda model=model, label=label:
              spawn_until(["run", "--model", model, "-p", "8899"], f"run-npu-{label}", ready=ready, timeout=900, then=chat_via), shoot=False)
 
-    # The same request a GPU user makes, for comparison.
-    step("unsloth_run_gguf_baseline", lambda: spawn_until(["run", "--model", "unsloth/Qwen3-0.6B-GGUF:Q4_K_M", "-p", "8899"],
-                                                         "run-gguf", ready=ready, timeout=1500, then=chat_via), shoot=False)
+    # The GGUF baseline (`unsloth run --model unsloth/Qwen3-0.6B-GGUF:Q4_K_M`) served and chatted in 21-25 s on
+    # both OSes in runs 3-8; not repeated.
 
     # `unsloth chat` is the terminal chat: does it offer the NPU model at all?
     def chat_cli():

@@ -116,6 +116,25 @@ def main():
         if r and r["status"] != 200:
             note(f"NPU chat rejects `{label}` with HTTP {r['status']}: {json.dumps(r['body'])[:240]}")
 
+    # R1: does the small reasoning model finish a trivial question when nothing caps it?
+    def r1(model_path, n):
+        rows = []
+        for _ in range(n):
+            r = chat({"model": model_path, "messages": base_msg}, key=raw_key)
+            b = r["body"] if isinstance(r["body"], dict) else {}
+            ch = (b.get("choices") or [{}])[0]
+            msg = ch.get("message") or {}
+            rows.append({"status": r["status"], "seconds": r["seconds"], "finish": ch.get("finish_reason"),
+                         "completion_tokens": (b.get("usage") or {}).get("completion_tokens"),
+                         "content": (msg.get("content") or "")[-200:], "reasoning_tail": (msg.get("reasoning_content") or "")[-300:]})
+        return rows
+    step("r1_small_uncapped_x3", lambda: r1(small["model_path"], 3), shoot=False)
+    def r1_stream_end():
+        r = U.session.post(U.BASE + "/v1/chat/completions", json={"model": small["model_path"], "messages": [{"role": "user", "content": "Think very carefully, step by step, and list every prime number below 3000 with a one-line justification for each."}], "stream": True}, timeout=900, stream=True)
+        lines = [l for l in r.iter_lines(decode_unicode=True) if l]
+        return {"status": r.status_code, "n": len(lines), "last_lines": lines[-6:]}
+    step("r1_stream_until_context_full", r1_stream_end, shoot=False)
+
     # Other API shapes a user's tools speak.
     anth = {"model": small["model_path"], "max_tokens": 200, "messages": [{"role": "user", "content": "Say ok."}]}
     for label, path, body in (("anthropic_messages", "/v1/messages", anth),

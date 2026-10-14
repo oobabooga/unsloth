@@ -69,6 +69,11 @@ def stop_studio():
     return {"stray_runtime_processes": stray}
 
 
+def is_loaded(model):
+    st = inference_status()
+    return st.get("loaded") and model["model_path"] in (st.get("loaded") or []) and st
+
+
 def npu_status():
     return api("GET", "/api/npu/status")["body"]
 
@@ -318,7 +323,7 @@ def run_ui(page):
 
     def ensure_loaded():
         st = inference_status()
-        if st.get("active_model") == small["model_path"] or (st.get("is_npu") and st.get("loaded")):
+        if small["model_path"] in (st.get("loaded") or []):
             return {"already_loaded": True, "status": st}
         note("Downloading an NPU model from the chat picker did not load it; the user must act again.")
         # Look for the obvious next action.
@@ -331,7 +336,7 @@ def run_ui(page):
             row = picker_row(small["id"])
             row.click()
         t = time.monotonic()
-        st = poll(lambda: (s := inference_status()) and (s.get("active_model") == small["model_path"] or s.get("is_npu")) and s.get("loaded") and s, 600, 1)
+        st = poll(lambda: is_loaded(small), 600, 1)
         return {"already_loaded": False, "load_seconds": round(time.monotonic() - t, 1), "status": st, "text_before": txt[:800]}
     step("small_model_loaded", ensure_loaded)
     step("npu_status_after_load", npu_status, shoot=False)
@@ -401,7 +406,7 @@ def run_ui(page):
         before = ctx_box.first.input_value() if ctx_box.count() else None
         if ctx_box.count():
             set_number(ctx_box.first, "4096")
-        btn = U.page.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$"))
+        btn = panel.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$"))
         label = btn.first.inner_text()
         t = time.monotonic()
         btn.first.click()
@@ -474,14 +479,14 @@ def run_ui(page):
             shot("after-hub-run")
             url = page.url
             settings_open = page.locator(".unsloth-model-selector-menu").count() > 0
-            btn = page.get_by_role("button", name=re.compile(r"^(Load model|Reload model)$"))
+            btn = page.locator(".unsloth-model-selector-menu").first.get_by_role("button", name=re.compile(r"^(Load model|Reload model)$"))
             info = {"url": url, "settings_open": settings_open, "load_button": btn.count()}
             if not btn.count():
                 note("Hub Run on an NPU model did not show a Load button.")
                 return info
             t = time.monotonic()
             btn.first.click()
-            poll(lambda: (s := inference_status()) and s.get("active_model") == vision["model_path"] and s.get("loaded"), 600, 1)
+            poll(lambda: is_loaded(vision), 600, 1)
             info["load_seconds"] = round(time.monotonic() - t, 1)
             return info
         step("hub_run_vision_model", hub_run)
@@ -491,19 +496,29 @@ def run_ui(page):
             page = U.page
             png = U.ROOT / "red.png"
             png.write_bytes(base64.b64decode(RED_PNG))
-            inp = page.locator("input[type=file]").first
-            inp.set_input_files(str(png))
-            time.sleep(2)
-            return send_chat("What color is this image? Answer with one word.")
+            page.get_by_role("button", name="Tools and attachments").first.click()
+            time.sleep(1)
+            shot("plus-menu")
+            items = [i.inner_text() for i in page.get_by_role("menuitem").all()]
+            with page.expect_file_chooser(timeout=15000) as fc:
+                page.get_by_role("menuitem").first.click()
+            fc.value.set_files(str(png))
+            time.sleep(3)
+            shot("image-attached")
+            r = send_chat("What color is this image? Answer with one word.")
+            r["plus_menu_items"] = items
+            return r
         step("vision_chat_with_image", image_chat)
 
         def tool_chat():
             page = U.page
-            tools = page.get_by_role("button", name="Tools", exact=True)
-            info = {}
+            comp = page.locator(".aui-composer-root").first
+            tools = comp.get_by_role("button", name=re.compile(r"Tools"))
+            info = {"tools_buttons": [t.get_attribute("aria-label") or t.inner_text() for t in tools.all()]}
             if tools.count():
-                tools.first.click(); time.sleep(1); shot("tools-menu")
-                info["menu"] = body_text()[-800:]
+                info["before"] = tools.first.get_attribute("aria-pressed") or tools.first.get_attribute("data-state")
+                tools.first.click(); time.sleep(1); shot("tools-toggled")
+                info["after"] = tools.first.get_attribute("aria-pressed") or tools.first.get_attribute("data-state")
                 page.keyboard.press("Escape")
             r = send_chat("Use Python to compute the sum of the integers from 1 to 100, and tell me the result.", timeout=900)
             info["reply"] = r
@@ -535,44 +550,27 @@ def run_ui(page):
         row = picker_row(small["id"])
         row.click()
         t = time.monotonic()
-        st = poll(lambda: (s := inference_status()) and s.get("active_model") == small["model_path"] and s.get("loaded") and s, 600, 1)
+        st = poll(lambda: is_loaded(small), 600, 1)
         close_picker()
         r = send_chat("What is 3 times 4? Reply with just the number.")
         return {"load_seconds": round(time.monotonic() - t, 1), "context_length": npu_status().get("context_length"), "chat": r}
     step("load_small_after_restart", reload_after_restart)
 
-    # --- Normal unsloth for comparison: a small GGUF on the same machine's GPU ---
-    def gguf_flow():
-        page = U.page
-        open_picker("Recommended")
-        search = page.locator("[data-model-picker-search-input]").first
-        search.fill("Qwen3-0.6B")
-        time.sleep(4)
-        shot("gguf-search")
-        opt = page.locator(".unsloth-model-selector-menu").first.get_by_text(re.compile(r"^Qwen3-0\.6B-GGUF$")).first
-        opt.click()
-        time.sleep(3)
-        shot("gguf-after-click")
-        # GGUF repos expand into quants; pick the recommended/first one if asked.
-        q = page.get_by_text(re.compile(r"^(Q4_K_M|UD-Q4_K_XL)$"))
-        if q.count():
-            q.first.click()
-        t = time.monotonic()
-        st = poll(lambda: (s := inference_status()) and s.get("loaded") and not s.get("is_npu") and s, 1200, 2)
-        close_picker()
-        r = send_chat("What is 17 + 25? Reply with just the number.")
-        return {"load_seconds": round(time.monotonic() - t, 1), "status": st, "chat": r, "npu_after": npu_status()}
-    step("gguf_comparison_flow", gguf_flow)
-
-    def switch_back():
-        open_picker("On Device")
-        picker_row(small["id"]).click()
-        t = time.monotonic()
-        st = poll(lambda: (s := inference_status()) and s.get("active_model") == small["model_path"] and s.get("loaded") and s, 600, 1)
-        close_picker()
-        return {"switch_seconds": round(time.monotonic() - t, 1), "chat": send_chat("Reply with the word ok.")}
-    step("switch_gguf_to_npu", switch_back)
-
+    # --- Switch between two NPU models from the picker ---
+    def switch_npu_models():
+        out = {}
+        for m in (vision, small):
+            if not m:
+                continue
+            open_picker("On Device")
+            picker_row(m["id"]).click()
+            t = time.monotonic()
+            poll(lambda m=m: is_loaded(m), 600, 1)
+            close_picker()
+            out[m["id"]] = {"switch_seconds": round(time.monotonic() - t, 1),
+                            "chat": send_chat("Reply with the single word: ok", timeout=300)}
+        return out
+    step("switch_between_npu_models", switch_npu_models)
 
 
 RED_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAACwElEQVR4nO3TMQEAIAzAMEDD/CtDDDI4mijo031nFlSd3wHwkwFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkGYA0gxAmgFIMwBpBiDNAKQZgDQDkPYAXr8DBG1eXNAAAAAASUVORK5CYII=")
