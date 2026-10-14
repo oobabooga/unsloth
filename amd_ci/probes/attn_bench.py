@@ -133,8 +133,20 @@ def main() -> int:
             if fn is None:
                 raise RuntimeError(f"no flash_attn_func in {dir(hub)[:30]}")
 
-            def aiter_hub(q, k, v, fn = fn):
-                r = fn(q, k, v)
+            def aiter_hub(q, k, v, fn = fn, hub = hub):
+                try:
+                    r = fn(q, k, v)
+                except FileNotFoundError as exc:
+                    # The hub build ships tuned configs for gfx942 / gfx950 / gfx1250 only. Borrow the RDNA (gfx1250)
+                    # one under this arch's name, recorded, so the kernel itself can be timed.
+                    missing = Path(str(exc.filename or ""))
+                    donor = missing.with_name("gfx1250-MHA-DEFAULT.json")
+                    if not missing.name.endswith("-MHA-DEFAULT.json") or not donor.exists():
+                        raise
+                    import shutil
+                    shutil.copyfile(donor, missing)
+                    out["aiter_hub_config_borrowed"] = f"{donor.name} -> {missing.name}"
+                    r = fn(q, k, v)
                 return r[0] if isinstance(r, (tuple, list)) else r
             arms["aiter_hub"] = aiter_hub
         except Exception as exc:  # noqa: BLE001

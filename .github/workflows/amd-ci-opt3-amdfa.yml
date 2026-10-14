@@ -15,6 +15,7 @@ env:
   BASE_SHA: "5e927b0fa337ad18e84261dd1ca691f98a8931c6"
   FA_REPO: "https://github.com/Dao-AILab/flash-attention"
   FA_SHA: "1fc0221183e799363001394a12dd9e78e15f5dda"
+  FA_TRITON_SHA: "bbe25bacff9f337568b66e69950e549df9839068"
 
 jobs:
 
@@ -69,28 +70,26 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
-      - name: "flash-attention CK build for gfx1151 (Triton build as fallback), aiter hub kernel deps"
-        timeout-minutes: 240
+      - name: "flash-attention: CK build for gfx1151 (ROCm SDK devel from pip), Triton build in its own dir"
+        timeout-minutes: 300
         run: |
           set +e
           O="$AMD_CI_WORK/out"
           "$AMD_CI_PY" -m pip install -q setuptools wheel packaging psutil ninja einops kernels > "$O/fa_deps.log" 2>&1
           echo "deps rc=$?"
           "$AMD_CI_PY" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|pytorch)" | tee "$O/rocm_pkgs.txt"
-          HIPCC=$(command -v hipcc || ls /opt/rocm/bin/hipcc 2>/dev/null)
-          if [ -n "$HIPCC" ]; then
-            ROOT=$(dirname "$(dirname "$HIPCC")")
-          else
-            RV=$("$AMD_CI_PY" -c "import importlib.metadata as m; print(m.version('rocm'))" 2>/dev/null)
-            echo "no hipcc on host; rocm pip version '$RV': installing rocm[devel]"
-            for IDX in https://repo.amd.com/rocm/whl/gfx1151/ https://rocm.nightlies.amd.com/v2/gfx1151/; do
-              "$AMD_CI_PY" -m pip install "rocm[devel]==$RV" --index-url "$IDX" >> "$O/rocm_devel.log" 2>&1 && { echo "rocm[devel] from $IDX"; break; }
-            done
-            ROOT=$("$AMD_CI_PY" -m rocm_sdk path --root 2>>"$O/rocm_devel.log")
-            [ -z "$ROOT" ] && ROOT=$(dirname "$AMD_CI_PY")/../lib/python3*/site-packages/_rocm_sdk_devel
-          fi
-          echo "ROCM root: $ROOT"; ls "$ROOT/bin" 2>/dev/null | grep -E "hipcc|clang|amdclang" | head
-          export ROCM_HOME="$ROOT" ROCM_PATH="$ROOT" HIP_PATH="$ROOT" PATH="$ROOT/bin:$PATH"
+          echo "host hipcc: $(command -v hipcc) (run 1: a wrapper whose /usr/lib/llvm/bin/clang++ is missing)"
+          RV=$("$AMD_CI_PY" -c "import importlib.metadata as m; print(m.version('rocm'))")
+          for IDX in https://repo.amd.com/rocm/whl/gfx1151/ https://rocm.nightlies.amd.com/v2/gfx1151/; do
+            "$AMD_CI_PY" -m pip install "rocm[devel]==$RV" --extra-index-url "$IDX" >> "$O/rocm_devel.log" 2>&1 && { echo "rocm[devel]==$RV from $IDX"; break; }
+          done
+          tail -3 "$O/rocm_devel.log"
+          VBIN=$(dirname "$AMD_CI_PY")
+          ROOT=$("$VBIN/rocm-sdk" path --root 2>>"$O/rocm_devel.log")
+          [ -n "$ROOT" ] || ROOT=$("$AMD_CI_PY" -m rocm_sdk path --root 2>>"$O/rocm_devel.log")
+          echo "ROCm SDK root: '$ROOT'"; ls "$ROOT/bin" 2>/dev/null | grep -E "^(hipcc|amdclang|clang)" | head -5
+          export ROCM_HOME="$ROOT" ROCM_PATH="$ROOT" HIP_PATH="$ROOT" PATH="$ROOT/bin:$ROOT/lib/llvm/bin:$PATH"
+          echo "hipcc now: $(command -v hipcc)"; hipcc --version 2>&1 | head -3
           git clone -q "$FA_REPO" "$AMD_CI_WORK/src/flash-attention"
           cd "$AMD_CI_WORK/src/flash-attention"
           git checkout -q "$FA_SHA"
@@ -100,13 +99,15 @@ jobs:
           GPU_ARCHS=gfx1151 OPT_DIM=128 MAX_JOBS=$(nproc) "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps . > "$O/fa_ck_build.log" 2>&1
           rc=$?
           T1=$(date +%s)
-          echo "{\"ck_build_rc\": $rc, \"ck_build_s\": $((T1-T0)), \"rocm_root\": \"$ROOT\"}" > "$O/fa_build.json"
-          echo "CK build rc=$rc in $((T1-T0)) s"; tail -25 "$O/fa_ck_build.log"
-          if [ "$rc" -ne 0 ]; then
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps . > "$O/fa_triton_build.log" 2>&1
-            echo "Triton build rc=$?"
-            echo "{\"ck_build_rc\": $rc, \"ck_build_s\": $((T1-T0)), \"triton_fallback\": true}" > "$O/fa_build.json"
-          fi
+          echo "CK build rc=$rc in $((T1-T0)) s"; grep -m5 -E "error:|FAILED" "$O/fa_ck_build.log" | cut -c1-300; tail -5 "$O/fa_ck_build.log"
+          # Triton AMD backend at the SHA the v6 run built (newer SHAs pull aiter at metadata time), in its own dir.
+          git clone -q "$FA_REPO" "$AMD_CI_WORK/src/fa-triton" && git -C "$AMD_CI_WORK/src/fa-triton" checkout -q "$FA_TRITON_SHA"
+          cd "$AMD_CI_WORK/src/fa-triton"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps --target "$AMD_CI_WORK/fa_triton" . > "$O/fa_triton_build.log" 2>&1
+          trc=$?
+          echo "Triton build rc=$trc"; tail -3 "$O/fa_triton_build.log"
+          echo "{\"ck_build_rc\": $rc, \"ck_build_s\": $((T1-T0)), \"triton_build_rc\": $trc, \"rocm_root\": \"$ROOT\"}" > "$O/fa_build.json"
+          sed "s#@FA_TRITON_DIR@#$AMD_CI_WORK/fa_triton#" "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_fa.json" > "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_fa_run.json"
           exit 0
 
       - name: "Attention alone + whole synthetic block at DiT shapes"
@@ -117,7 +118,7 @@ jobs:
           export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 HF_HOME="$AMD_CI_WORK/hf_home"
           "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_ck.json" > "$O/attn_ck.log" 2>&1
           echo "ck rc=$?"
-          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_triton.json" > "$O/attn_triton.log" 2>&1
+          PYTHONPATH="$AMD_CI_WORK/fa_triton" FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_triton.json" > "$O/attn_triton.log" 2>&1
           echo "triton rc=$?"
           "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_ck_rep.json" > "$O/attn_ck_rep.log" 2>&1
           echo "ck repeat rc=$?"
@@ -131,7 +132,7 @@ jobs:
           export TORCH_HOME="$AMD_CI_WORK/torch_home"
           export HF_HOME="$AMD_CI_WORK/hf_home"
           "$AMD_CI_PY" diffusion_bench/amd/diffusion_probe.py --state base --checkout "$AMD_CI_WORK/states/base" \
-            --out "$AMD_CI_WORK/out/e2e/obs_base.json" --spec diffusion_bench/specs/amd_fa.json \
+            --out "$AMD_CI_WORK/out/e2e/obs_base.json" --spec diffusion_bench/specs/amd_fa_run.json \
             --budget-min 200.0 --cell-timeout 3600.0 --only 'klein_*' --only 'zimg_*' > "$AMD_CI_WORK/out/e2e_probe.log" 2>&1
           echo "e2e rc=$?"
           tail -30 "$AMD_CI_WORK/out/e2e_probe.log"

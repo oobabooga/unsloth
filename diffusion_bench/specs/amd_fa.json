@@ -1,6 +1,6 @@
 {
  "name": "amd_fa",
- "description": "Fused attention on gfx1151, origin/main only: *_nat0/*_nat = attention_backend native (diffusers SDPA, AOTriton, Studio ROCm default; A/A pair), *_fack = flash with the DAO flash_attn CK build, *_fatr = flash with the same package forced to its Triton AMD backend, *_auto = auto (what Studio picks with flash_attn installed). LPIPS vs *_nat. n=5.",
+ "description": "Fused attention on gfx1151, origin/main only: *_nat0/*_nat = attention_backend native (diffusers SDPA, AOTriton, Studio ROCm default; A/A pair), *_fack = flash with the DAO flash_attn CK build, *_fatr = flash with the Triton AMD flash_attn build (separate --target dir on PYTHONPATH, FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE), *_auto = auto (what Studio picks with flash_attn installed). LPIPS vs *_nat. n=5.",
  "models": {
   "zimage_turbo": {
    "repo": "Tongyi-MAI/Z-Image-Turbo",
@@ -122,7 +122,8 @@
    "env": {
     "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
     "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0",
-    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+    "PYTHONPATH": "@FA_TRITON_DIR@"
    }
   },
   {
@@ -235,7 +236,8 @@
     "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
     "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
     "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0",
-    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+    "PYTHONPATH": "@FA_TRITON_DIR@"
    },
    "guidance": 0.0
   },
