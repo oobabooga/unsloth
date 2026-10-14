@@ -1,0 +1,103 @@
+linux	Set up job	﻿2026-10-14T18:46:55.3963714Z Current runner version: '2.337.0'
+linux	Set up job	2026-10-14T18:46:55.3969310Z Runner name: 'ephemeral-devlab-x2-la03-s03-d05-116026955661'
+linux	Set up job	2026-10-14T18:46:55.3969982Z Runner group name: 'Default'
+linux	Set up job	2026-10-14T18:46:55.3970634Z Machine name: 'X2-LA03-S03-D05'
+linux	Set up job	2026-10-14T18:46:55.4034112Z ##[group]GITHUB_TOKEN Permissions
+linux	Set up job	2026-10-14T18:46:55.4036770Z Metadata: read
+linux	Set up job	2026-10-14T18:46:55.4037146Z ##[endgroup]
+linux	Set up job	2026-10-14T18:46:55.4039031Z Secret source: Actions
+linux	Set up job	2026-10-14T18:46:55.4039577Z Cache mode: write
+linux	Set up job	2026-10-14T18:46:55.4040008Z Prepare workflow directory
+linux	Set up job	2026-10-14T18:46:55.4858430Z Prepare all required actions
+linux	Set up job	2026-10-14T18:46:55.5181746Z Complete job name: linux
+linux	Hardware	﻿2026-10-14T18:46:55.6136761Z ##[group]Run uname -a; free -h; lscpu | grep 'Model name'
+linux	Hardware	2026-10-14T18:46:55.6137431Z ^[[36;1muname -a; free -h; lscpu | grep 'Model name'^[[0m
+linux	Hardware	2026-10-14T18:46:55.6138491Z ^[[36;1mfor d in /sys/class/drm/card*/device; do [ -f $d/mem_info_gtt_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total) gtt_used=$(cat $d/mem_info_gtt_used)"; done^[[0m
+linux	Hardware	2026-10-14T18:46:55.6139643Z ^[[36;1mcat /sys/module/ttm/parameters/pages_limit 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T18:46:55.6140272Z ^[[36;1mls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T18:46:55.6140943Z ^[[36;1mldconfig -p | grep -E 'libvulkan|libamdhip64|libhipblas|librocblas' || true^[[0m
+linux	Hardware	2026-10-14T18:46:55.6141645Z ^[[36;1mls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T18:46:55.6186872Z shell: /usr/bin/bash -e {0}
+linux	Hardware	2026-10-14T18:46:55.6187386Z env:
+linux	Hardware	2026-10-14T18:46:55.6187688Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Hardware	2026-10-14T18:46:55.6188058Z ##[endgroup]
+linux	Hardware	2026-10-14T18:46:55.6338670Z Linux X2-LA03-S03-D05 6.17.0-1032-oem #32-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 24 05:46:26 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+linux	Hardware	2026-10-14T18:46:55.6339586Z                total        used        free      shared  buff/cache   available
+linux	Hardware	2026-10-14T18:46:55.6340153Z Mem:           124Gi       5.2Gi        37Gi       1.9Gi        85Gi       119Gi
+linux	Hardware	2026-10-14T18:46:55.6340665Z Swap:             0B          0B          0B
+linux	Hardware	2026-10-14T18:46:55.6401988Z Model name:                              AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	Hardware	2026-10-14T18:46:55.6449640Z /sys/class/drm/card0/device vram_total=536870912 gtt_total=67079913472 gtt_used=39673856
+linux	Hardware	2026-10-14T18:46:55.6461470Z 16376932
+linux	Hardware	2026-10-14T18:46:55.6478436Z /etc/vulkan/icd.d:
+linux	Hardware	2026-10-14T18:46:55.6478889Z 
+linux	Hardware	2026-10-14T18:46:55.6479170Z /usr/share/vulkan/icd.d:
+linux	Hardware	2026-10-14T18:46:55.6479838Z asahi_icd.json
+linux	Hardware	2026-10-14T18:46:55.6480438Z gfxstream_vk_icd.json
+linux	Hardware	2026-10-14T18:46:55.6481088Z intel_hasvk_icd.json
+linux	Hardware	2026-10-14T18:46:55.6481733Z intel_icd.json
+linux	Hardware	2026-10-14T18:46:55.6482306Z lvp_icd.json
+linux	Hardware	2026-10-14T18:46:55.6482875Z nouveau_icd.json
+linux	Hardware	2026-10-14T18:46:55.6483455Z radeon_icd.json
+linux	Hardware	2026-10-14T18:46:55.6484031Z virtio_icd.json
+linux	Hardware	2026-10-14T18:46:55.6498054Z 	libvulkan_virtio.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_virtio.so
+linux	Hardware	2026-10-14T18:46:55.6499473Z 	libvulkan_radeon.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_radeon.so
+linux	Hardware	2026-10-14T18:46:55.6500846Z 	libvulkan_nouveau.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_nouveau.so
+linux	Hardware	2026-10-14T18:46:55.6502155Z 	libvulkan_lvp.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_lvp.so
+linux	Hardware	2026-10-14T18:46:55.6503518Z 	libvulkan_intel_hasvk.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel_hasvk.so
+linux	Hardware	2026-10-14T18:46:55.6505120Z 	libvulkan_intel.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel.so
+linux	Hardware	2026-10-14T18:46:55.6506469Z 	libvulkan_gfxstream.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_gfxstream.so
+linux	Hardware	2026-10-14T18:46:55.6507830Z 	libvulkan_asahi.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_asahi.so
+linux	Hardware	2026-10-14T18:46:55.6509073Z 	libvulkan.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan.so.1
+linux	Hardware	2026-10-14T18:46:55.6510257Z 	librocblas.so.5 (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so.5
+linux	Hardware	2026-10-14T18:46:55.6511423Z 	librocblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so
+linux	Hardware	2026-10-14T18:46:55.6512647Z 	libhipblaslt.so.1 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so.1
+linux	Hardware	2026-10-14T18:46:55.6513265Z 	libhipblaslt.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so
+linux	Hardware	2026-10-14T18:46:55.6513867Z 	libhipblas.so.3 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so.3
+linux	Hardware	2026-10-14T18:46:55.6514451Z 	libhipblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so
+linux	Hardware	2026-10-14T18:46:55.6515060Z 	libamdhip64.so.7 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so.7
+linux	Hardware	2026-10-14T18:46:55.6515896Z 	libamdhip64.so.5 (libc6,x86-64) => /lib/x86_64-linux-gnu/libamdhip64.so.5
+linux	Hardware	2026-10-14T18:46:55.6516566Z 	libamdhip64.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so
+linux	Hardware	2026-10-14T18:46:55.6517173Z /opt/rocm
+linux	Hardware	2026-10-14T18:46:55.6517463Z /opt/rocm-7.2.1
+linux	Hardware	2026-10-14T18:46:55.6517763Z 7.2.1
+linux	Setup	﻿2026-10-14T18:46:55.6773092Z ##[group]Run W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+linux	Setup	2026-10-14T18:46:55.6773797Z ^[[36;1mW="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}^[[0m
+linux	Setup	2026-10-14T18:46:55.6774545Z ^[[36;1mecho "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV^[[0m
+linux	Setup	2026-10-14T18:46:55.6775736Z ^[[36;1mcurl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/a4b63788d39dcc19903b68fc1592502f99b835e8/h3probe.py" -o "$W/h3probe.py"^[[0m
+linux	Setup	2026-10-14T18:46:55.6777180Z ^[[36;1mcd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T18:46:55.6778897Z ^[[36;1mcd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T18:46:55.6780035Z ^[[36;1mfind "$W/vk" "$W/rocm" -name sd-cli^[[0m
+linux	Setup	2026-10-14T18:46:55.6780702Z ^[[36;1mpython3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]"^[[0m
+linux	Setup	2026-10-14T18:46:55.6781361Z ^[[36;1mexport HF_HOME="$W/hf" TMPDIR="$W/tmp"^[[0m
+linux	Setup	2026-10-14T18:46:55.6781785Z ^[[36;1mpython - <<'PY'^[[0m
+linux	Setup	2026-10-14T18:46:55.6782115Z ^[[36;1mimport os^[[0m
+linux	Setup	2026-10-14T18:46:55.6782480Z ^[[36;1mfrom huggingface_hub import hf_hub_download^[[0m
+linux	Setup	2026-10-14T18:46:55.6783441Z ^[[36;1mfor f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:^[[0m
+linux	Setup	2026-10-14T18:46:55.6784557Z ^[[36;1m    print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))^[[0m
+linux	Setup	2026-10-14T18:46:55.6785173Z ^[[36;1mPY^[[0m
+linux	Setup	2026-10-14T18:46:55.6785477Z ^[[36;1mdu -sh "$W/models"^[[0m
+linux	Setup	2026-10-14T18:46:55.6811567Z shell: /usr/bin/bash -e {0}
+linux	Setup	2026-10-14T18:46:55.6811910Z env:
+linux	Setup	2026-10-14T18:46:55.6812210Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Setup	2026-10-14T18:46:55.6812578Z ##[endgroup]
+linux	Setup	2026-10-14T18:47:05.6289321Z /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	Setup	2026-10-14T18:47:05.6290760Z /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	Setup	2026-10-14T18:47:08.9193615Z Traceback (most recent call last):
+linux	Setup	2026-10-14T18:47:08.9199308Z   File "<stdin>", line 4, in <module>
+linux	Setup	2026-10-14T18:47:08.9199927Z   File "<frozen os>", line 685, in __getitem__
+linux	Setup	2026-10-14T18:47:08.9200525Z KeyError: 'MODELS'
+linux	Setup	2026-10-14T18:47:08.9374544Z ##[error]Process completed with exit code 1.
+linux	Summary	﻿2026-10-14T18:47:08.9913054Z ##[group]Run cat "$OUT/results.jsonl" || true
+linux	Summary	2026-10-14T18:47:08.9913384Z ^[[36;1mcat "$OUT/results.jsonl" || true^[[0m
+linux	Summary	2026-10-14T18:47:08.9913722Z ^[[36;1mfor f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|error|abort|assert|budget|prepared params|max.vram' "$f" | head -40; done^[[0m
+linux	Summary	2026-10-14T18:47:08.9945170Z shell: /usr/bin/bash -e {0}
+linux	Summary	2026-10-14T18:47:08.9945331Z env:
+linux	Summary	2026-10-14T18:47:08.9945478Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Summary	2026-10-14T18:47:08.9945655Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	Summary	2026-10-14T18:47:08.9946007Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	Summary	2026-10-14T18:47:08.9946247Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	Summary	2026-10-14T18:47:08.9946429Z ##[endgroup]
+linux	Summary	2026-10-14T18:47:09.0012283Z cat: /mnt/scratch/actions-runner-01/_work/_temp/h3/out/results.jsonl: No such file or directory
+linux	Summary	2026-10-14T18:47:09.0020957Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/*.log
+linux	Summary	2026-10-14T18:47:09.0040044Z grep: /mnt/scratch/actions-runner-01/_work/_temp/h3/out/*.log: No such file or directory
+linux	Complete job	﻿2026-10-14T18:47:09.0123364Z Cleaning up orphan processes

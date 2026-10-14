@@ -2,6 +2,9 @@
 import glob, json, os, subprocess, sys, threading, time
 
 def sysfs(name):
+    if os.name == "nt":
+        shared, dedicated = win_sample()
+        return shared if "gtt" in name else dedicated
     tot = 0
     for p in glob.glob(f"/sys/class/drm/card*/device/{name}"):
         try:
@@ -10,7 +13,26 @@ def sysfs(name):
             pass
     return tot
 
+WIN = os.name == "nt"
+
+def win_sample():
+    """(shared, dedicated) GPU adapter memory in bytes, summed over adapters, via perf counters."""
+    ps = ("$s=(Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage','\\GPU Adapter Memory(*)\\Dedicated Usage')"
+          ".CounterSamples; $a=0;$b=0; foreach($x in $s){ if($x.Path -like '*shared usage'){$a+=$x.CookedValue}else{$b+=$x.CookedValue} }; [string]$a + ' ' + [string]$b")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=20).stdout.split()
+        return int(float(out[0])), int(float(out[1]))
+    except Exception:
+        return 0, 0
+
 def meminfo(key):
+    if WIN:
+        import ctypes
+        class M(ctypes.Structure):
+            _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("tot", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                        ("pf", ctypes.c_ulonglong), ("apf", ctypes.c_ulonglong), ("v", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("e", ctypes.c_ulonglong)]
+        m = M(); m.l = ctypes.sizeof(M); ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.avail
     for line in open("/proc/meminfo"):
         if line.startswith(key + ":"):
             return int(line.split()[1]) * 1024
@@ -37,7 +59,7 @@ def main():
             peak["gtt"] = max(peak["gtt"], sysfs("mem_info_gtt_used"))
             peak["vram"] = max(peak["vram"], sysfs("mem_info_vram_used"))
             peak["avail_min"] = min(peak["avail_min"], meminfo("MemAvailable"))
-            time.sleep(0.25)
+            time.sleep(0.25 if not WIN else 0.5)
     t = threading.Thread(target=sample, daemon=True); t.start()
     print("CMD:", " ".join(cmd), flush=True)
     t0 = time.time()

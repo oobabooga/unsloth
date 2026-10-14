@@ -23,9 +23,10 @@ jobs:
           ls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true
       - name: Setup
         run: |
-          W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+          export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+          export MODELS="$W/models" OUT="$W/out"
           echo "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV
-          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/h3probe.py" -o "$W/h3probe.py"
+          for f in h3probe.py gttfill.py; do curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/$f" -o "$W/$f"; done
           cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
           cd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip
           find "$W/vk" "$W/rocm" -name sd-cli
@@ -45,12 +46,20 @@ jobs:
           $VK --list-devices || true
           $RC --list-devices || true
           ldd $(dirname $RC)/libggml-hip.so | grep -E 'hip|rocblas|not found' || true
-      - name: V_auto (Studio Auto, offloaded, TE on CPU)
+      - name: V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)
         run: python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
-      - name: V_16g (same, 14 GiB VRAM budget)
-        run: python3 "$W/h3probe.py" V_16g "$VK" --offload-to-cpu --diffusion-fa --max-vram vulkan0=14 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
-      - name: V_te_gpu (offload, TE on GPU)
-        run: python3 "$W/h3probe.py" V_te_gpu "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
+      - name: V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)
+        run: |
+          python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          python3 "$W/h3probe.py" V_auto_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)
+        run: |
+          python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          python3 "$W/h3probe.py" V_te_gpu_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
       - name: R_auto (upstream ROCm, Studio ROCm flags)
         run: python3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true
       - name: Summary
