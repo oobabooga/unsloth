@@ -19,6 +19,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $W = Join-Path $env:RUNNER_TEMP "h3"
           New-Item -ItemType Directory -Force -Path "$W\models","$W\out","$W\vk","$W\hf","$W\tmp" | Out-Null
+          $env:W = $W; $env:MODELS = "$W\models"; $env:OUT = "$W\out"
           "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "MODELS=$W\models" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "OUT=$W\out" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
