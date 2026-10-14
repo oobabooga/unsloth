@@ -43,12 +43,19 @@ def stop_studio():
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
     else:
         # Ctrl+C in the user's terminal signals the whole foreground group.
-        print(f"sending SIGINT to studio group {p.pid} at {time.strftime('%H:%M:%S')}", flush=True)
+        try:
+            sig = {l.split(":")[0]: l.split(":")[1].strip() for l in open(f"/proc/{p.pid}/status") if l.startswith(("SigIgn", "SigCgt"))}
+        except OSError:
+            sig = {}
+        # Bit 2 of SigIgn set means the runner started us with SIGINT ignored: then Ctrl+C evidence is void.
+        sigint_ignored = bool(int(sig.get("SigIgn", "0"), 16) & 0x2)
+        print(f"sending SIGINT to studio group {p.pid} at {time.strftime('%H:%M:%S')} sig={sig} sigint_ignored={sigint_ignored}", flush=True)
         os.killpg(p.pid, 2)
         try:
             p.wait(60)
         except subprocess.TimeoutExpired:
-            note("`unsloth studio` did not exit within 60 s of Ctrl+C.")
+            if not sigint_ignored:
+                note("`unsloth studio` did not exit within 60 s of Ctrl+C (SIGINT to its process group).")
             os.killpg(p.pid, 9)
     # Lemonade/FastFlowLM children must not outlive Studio.
     time.sleep(5)
@@ -247,8 +254,11 @@ def run_ui(page):
         if not btn.count():
             # The NPU group starts folded: only an "NPU >" heading. A user has to think to open it.
             note("Chat picker on a fresh Ryzen AI install: the NPU group is folded to a bare 'NPU' heading; Enable NPU is hidden until the user expands it.")
-            heading = menu.get_by_role("button", name=re.compile(r"^NPU$", re.I))
-            (heading.first if heading.count() else menu.get_by_text("NPU", exact=True).first).click()
+            # Clicking the "NPU" label does nothing; only the small chevron at the far right expands it.
+            menu.get_by_text("NPU", exact=True).first.click()
+            time.sleep(1)
+            if not btn.count():
+                menu.get_by_role("button", name="Expand section").first.click()
             time.sleep(1.5)
             shot("npu-group-expanded")
         btn.first.scroll_into_view_if_needed()

@@ -5,6 +5,108 @@ name: FastFlow UX ui,api,cli
     - amd-fastflow-ux-c5984ef8
 permissions: {}
 jobs:
+  linux:
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 200
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Prepare a fresh user and fetch the harness
+      run: 'set -euxo pipefail
+
+        root="$RUNNER_TEMP/ux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+        mkdir -p "$root/h" "$root/evidence" "$root/home"
+
+        echo "UX_ROOT=$root" >> $GITHUB_ENV
+
+        echo "PLAYWRIGHT_BROWSERS_PATH=$root/pw-browsers" >> $GITHUB_ENV
+
+        echo "HOME=$root/home" >> $GITHUB_ENV
+
+        echo "$root/home/.local/bin" >> $GITHUB_PATH
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -o "$root/h/uxlib.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -o "$root/h/ux_ui.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_api.py" -o "$root/h/ux_api.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_cli.py" -o "$root/h/ux_cli.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
+
+        env | sort | grep -viE ''token|secret'' > "$root/evidence/env.txt"
+
+        python3 "$root/h/probe_hw.py" "$root/evidence/hardware.json"
+
+        ls -l /dev/accel* || true; systemctl --no-pager status lemonade-server 2>&1 | head -5 || true
+
+        ss -ltnp 2>/dev/null | head -30 || true'
+    - name: Install Unsloth Studio with the README one-liner
+      timeout-minutes: 40
+      run: 'set -uxo pipefail
+
+        start=$(date +%s)
+
+        unset HF_HOME HF_ENDPOINT HF_HUB_DISABLE_XET XDG_CACHE_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE
+
+        curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$UX_ROOT/evidence/install.log"
+
+        rc=${PIPESTATUS[1]}
+
+        echo "install rc=$rc seconds=$(( $(date +%s) - start ))" | tee "$UX_ROOT/evidence/install-summary.txt"
+
+        bash -lc ''command -v unsloth; unsloth --version'' 2>&1 | tee -a "$UX_ROOT/evidence/install-summary.txt" || true
+
+        ls -la "$HOME" "$HOME/.local/bin" 2>&1 | tee -a "$UX_ROOT/evidence/install-summary.txt" || true
+
+        exit $rc'
+    - name: Browser for the harness
+      timeout-minutes: 15
+      run: 'set -euxo pipefail
+
+        python3 -m venv "$UX_ROOT/pw"
+
+        "$UX_ROOT/pw/bin/pip" install -q playwright==1.55.0 requests
+
+        env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -m playwright install chromium'
+    - name: 'User session: ui'
+      timeout-minutes: 90
+      if: always()
+      env:
+        UX_SUITE: ui
+        UX_OS: Linux
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_ui.py"
+    - name: 'User session: api'
+      timeout-minutes: 90
+      if: always()
+      env:
+        UX_SUITE: api
+        UX_OS: Linux
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_api.py"
+    - name: 'User session: cli'
+      timeout-minutes: 90
+      if: always()
+      env:
+        UX_SUITE: cli
+        UX_OS: Linux
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_cli.py"
+    - name: Collect Studio logs
+      if: always()
+      run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ux-ui-api-cli-linux
+        path: ${{ env.UX_ROOT }}/evidence
+        retention-days: 14
   windows:
     runs-on:
     - self-hosted
