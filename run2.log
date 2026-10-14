@@ -1,0 +1,392 @@
+linux	Set up job	﻿2026-10-14T19:04:43.7715486Z Current runner version: '2.337.0'
+linux	Set up job	2026-10-14T19:04:43.7720623Z Runner name: 'ephemeral-devlab-x2-la03-s03-d05-116038967007'
+linux	Set up job	2026-10-14T19:04:43.7721253Z Runner group name: 'Default'
+linux	Set up job	2026-10-14T19:04:43.7721926Z Machine name: 'X2-LA03-S03-D05'
+linux	Set up job	2026-10-14T19:04:43.7780853Z ##[group]GITHUB_TOKEN Permissions
+linux	Set up job	2026-10-14T19:04:43.7783945Z Metadata: read
+linux	Set up job	2026-10-14T19:04:43.7784330Z ##[endgroup]
+linux	Set up job	2026-10-14T19:04:43.7786443Z Secret source: Actions
+linux	Set up job	2026-10-14T19:04:43.7786998Z Cache mode: write
+linux	Set up job	2026-10-14T19:04:43.7787532Z Prepare workflow directory
+linux	Set up job	2026-10-14T19:04:43.8062139Z Prepare all required actions
+linux	Set up job	2026-10-14T19:04:43.8114556Z Complete job name: linux
+linux	Hardware	﻿2026-10-14T19:04:43.8804449Z ##[group]Run uname -a; free -h; lscpu | grep 'Model name'
+linux	Hardware	2026-10-14T19:04:43.8805282Z ^[[36;1muname -a; free -h; lscpu | grep 'Model name'^[[0m
+linux	Hardware	2026-10-14T19:04:43.8806363Z ^[[36;1mfor d in /sys/class/drm/card*/device; do [ -f $d/mem_info_gtt_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total) gtt_used=$(cat $d/mem_info_gtt_used)"; done^[[0m
+linux	Hardware	2026-10-14T19:04:43.8807609Z ^[[36;1mcat /sys/module/ttm/parameters/pages_limit 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:04:43.8808246Z ^[[36;1mls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:04:43.8808931Z ^[[36;1mldconfig -p | grep -E 'libvulkan|libamdhip64|libhipblas|librocblas' || true^[[0m
+linux	Hardware	2026-10-14T19:04:43.8809642Z ^[[36;1mls -d /opt/rocm* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null || true^[[0m
+linux	Hardware	2026-10-14T19:04:43.8855901Z shell: /usr/bin/bash -e {0}
+linux	Hardware	2026-10-14T19:04:43.8856455Z env:
+linux	Hardware	2026-10-14T19:04:43.8856767Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Hardware	2026-10-14T19:04:43.8857147Z ##[endgroup]
+linux	Hardware	2026-10-14T19:04:43.9018150Z Linux X2-LA03-S03-D05 6.17.0-1032-oem #32-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 24 05:46:26 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+linux	Hardware	2026-10-14T19:04:43.9019050Z                total        used        free      shared  buff/cache   available
+linux	Hardware	2026-10-14T19:04:43.9019652Z Mem:           124Gi       5.2Gi        41Gi       1.8Gi        81Gi       119Gi
+linux	Hardware	2026-10-14T19:04:43.9020196Z Swap:             0B          0B          0B
+linux	Hardware	2026-10-14T19:04:43.9077238Z Model name:                              AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	Hardware	2026-10-14T19:04:43.9113147Z /sys/class/drm/card0/device vram_total=536870912 gtt_total=67079913472 gtt_used=39673856
+linux	Hardware	2026-10-14T19:04:43.9121516Z 16376932
+linux	Hardware	2026-10-14T19:04:43.9136533Z /etc/vulkan/icd.d:
+linux	Hardware	2026-10-14T19:04:43.9136783Z 
+linux	Hardware	2026-10-14T19:04:43.9136934Z /usr/share/vulkan/icd.d:
+linux	Hardware	2026-10-14T19:04:43.9137284Z asahi_icd.json
+linux	Hardware	2026-10-14T19:04:43.9137678Z gfxstream_vk_icd.json
+linux	Hardware	2026-10-14T19:04:43.9138012Z intel_hasvk_icd.json
+linux	Hardware	2026-10-14T19:04:43.9138353Z intel_icd.json
+linux	Hardware	2026-10-14T19:04:43.9138658Z lvp_icd.json
+linux	Hardware	2026-10-14T19:04:43.9138955Z nouveau_icd.json
+linux	Hardware	2026-10-14T19:04:43.9139260Z radeon_icd.json
+linux	Hardware	2026-10-14T19:04:43.9139565Z virtio_icd.json
+linux	Hardware	2026-10-14T19:04:43.9154062Z 	libvulkan_virtio.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_virtio.so
+linux	Hardware	2026-10-14T19:04:43.9154781Z 	libvulkan_radeon.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_radeon.so
+linux	Hardware	2026-10-14T19:04:43.9155511Z 	libvulkan_nouveau.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_nouveau.so
+linux	Hardware	2026-10-14T19:04:43.9156214Z 	libvulkan_lvp.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_lvp.so
+linux	Hardware	2026-10-14T19:04:43.9156918Z 	libvulkan_intel_hasvk.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel_hasvk.so
+linux	Hardware	2026-10-14T19:04:43.9157634Z 	libvulkan_intel.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_intel.so
+linux	Hardware	2026-10-14T19:04:43.9158329Z 	libvulkan_gfxstream.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_gfxstream.so
+linux	Hardware	2026-10-14T19:04:43.9159028Z 	libvulkan_asahi.so (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan_asahi.so
+linux	Hardware	2026-10-14T19:04:43.9159672Z 	libvulkan.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libvulkan.so.1
+linux	Hardware	2026-10-14T19:04:43.9160285Z 	librocblas.so.5 (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so.5
+linux	Hardware	2026-10-14T19:04:43.9160889Z 	librocblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/librocblas.so
+linux	Hardware	2026-10-14T19:04:43.9161713Z 	libhipblaslt.so.1 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so.1
+linux	Hardware	2026-10-14T19:04:43.9162345Z 	libhipblaslt.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblaslt.so
+linux	Hardware	2026-10-14T19:04:43.9162959Z 	libhipblas.so.3 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so.3
+linux	Hardware	2026-10-14T19:04:43.9163558Z 	libhipblas.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libhipblas.so
+linux	Hardware	2026-10-14T19:04:43.9164168Z 	libamdhip64.so.7 (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so.7
+linux	Hardware	2026-10-14T19:04:43.9164796Z 	libamdhip64.so.5 (libc6,x86-64) => /lib/x86_64-linux-gnu/libamdhip64.so.5
+linux	Hardware	2026-10-14T19:04:43.9165450Z 	libamdhip64.so (libc6,x86-64) => /opt/rocm-7.2.1/lib/libamdhip64.so
+linux	Hardware	2026-10-14T19:04:43.9166024Z /opt/rocm
+linux	Hardware	2026-10-14T19:04:43.9166320Z /opt/rocm-7.2.1
+linux	Hardware	2026-10-14T19:04:43.9177768Z 7.2.1
+linux	Setup	﻿2026-10-14T19:04:43.9304850Z ##[group]Run export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}
+linux	Setup	2026-10-14T19:04:43.9305677Z ^[[36;1mexport W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,rocm,tmp,hf}^[[0m
+linux	Setup	2026-10-14T19:04:43.9306265Z ^[[36;1mexport MODELS="$W/models" OUT="$W/out"^[[0m
+linux	Setup	2026-10-14T19:04:43.9306913Z ^[[36;1mecho "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV^[[0m
+linux	Setup	2026-10-14T19:04:43.9308064Z ^[[36;1mfor f in h3probe.py gttfill.py; do curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/e195d6f6014df0119b46cec7a1c1621c98d849d1/$f" -o "$W/$f"; done^[[0m
+linux	Setup	2026-10-14T19:04:43.9309597Z ^[[36;1mcd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T19:04:43.9311319Z ^[[36;1mcd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip^[[0m
+linux	Setup	2026-10-14T19:04:43.9312494Z ^[[36;1mfind "$W/vk" "$W/rocm" -name sd-cli^[[0m
+linux	Setup	2026-10-14T19:04:43.9313145Z ^[[36;1mpython3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]"^[[0m
+linux	Setup	2026-10-14T19:04:43.9313805Z ^[[36;1mexport HF_HOME="$W/hf" TMPDIR="$W/tmp"^[[0m
+linux	Setup	2026-10-14T19:04:43.9314230Z ^[[36;1mpython - <<'PY'^[[0m
+linux	Setup	2026-10-14T19:04:43.9314565Z ^[[36;1mimport os^[[0m
+linux	Setup	2026-10-14T19:04:43.9314958Z ^[[36;1mfrom huggingface_hub import hf_hub_download^[[0m
+linux	Setup	2026-10-14T19:04:43.9315923Z ^[[36;1mfor f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:^[[0m
+linux	Setup	2026-10-14T19:04:43.9317057Z ^[[36;1m    print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))^[[0m
+linux	Setup	2026-10-14T19:04:43.9317648Z ^[[36;1mPY^[[0m
+linux	Setup	2026-10-14T19:04:43.9317950Z ^[[36;1mdu -sh "$W/models"^[[0m
+linux	Setup	2026-10-14T19:04:43.9346986Z shell: /usr/bin/bash -e {0}
+linux	Setup	2026-10-14T19:04:43.9347331Z env:
+linux	Setup	2026-10-14T19:04:43.9347629Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Setup	2026-10-14T19:04:43.9348004Z ##[endgroup]
+linux	Setup	2026-10-14T19:05:25.3108731Z /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	Setup	2026-10-14T19:05:25.3109427Z /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	Setup	2026-10-14T19:15:03.6147297Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf
+linux	Setup	2026-10-14T19:15:03.6148653Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+linux	Setup	2026-10-14T19:15:03.6149386Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors
+linux	Setup	2026-10-14T19:15:03.6150183Z /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors
+linux	Setup	2026-10-14T19:15:03.6808516Z 34G	/mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	List devices	﻿2026-10-14T19:15:03.6849176Z ##[group]Run VK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)
+linux	List devices	2026-10-14T19:15:03.6849617Z ^[[36;1mVK=$(find "$W/vk" -name sd-cli | head -1); RC=$(find "$W/rocm" -name sd-cli | head -1)^[[0m
+linux	List devices	2026-10-14T19:15:03.6850091Z ^[[36;1mecho "VK=$VK" >> $GITHUB_ENV; echo "RC=$RC" >> $GITHUB_ENV^[[0m
+linux	List devices	2026-10-14T19:15:03.6850339Z ^[[36;1m$VK --list-devices || true^[[0m
+linux	List devices	2026-10-14T19:15:03.6850534Z ^[[36;1m$RC --list-devices || true^[[0m
+linux	List devices	2026-10-14T19:15:03.6850804Z ^[[36;1mldd $(dirname $RC)/libggml-hip.so | grep -E 'hip|rocblas|not found' || true^[[0m
+linux	List devices	2026-10-14T19:15:03.6888417Z shell: /usr/bin/bash -e {0}
+linux	List devices	2026-10-14T19:15:03.6888600Z env:
+linux	List devices	2026-10-14T19:15:03.6888772Z   TAG: master-951-f89d9b1-uafac7a7
+linux	List devices	2026-10-14T19:15:03.6888983Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	List devices	2026-10-14T19:15:03.6889237Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	List devices	2026-10-14T19:15:03.6889500Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	List devices	2026-10-14T19:15:03.6889723Z ##[endgroup]
+linux	List devices	2026-10-14T19:15:03.8358585Z ggml_vulkan: Found 1 Vulkan devices:
+linux	List devices	2026-10-14T19:15:03.8359796Z ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+linux	List devices	2026-10-14T19:15:03.8408758Z Vulkan0	AMD Radeon Graphics (RADV GFX1151)
+linux	List devices	2026-10-14T19:15:03.8409196Z CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	List devices	2026-10-14T19:15:04.1456254Z ggml_cuda_init: found 1 ROCm devices (Total VRAM: 63972 MiB):
+linux	List devices	2026-10-14T19:15:04.1459321Z   Device 0: AMD Radeon Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 63972 MiB
+linux	List devices	2026-10-14T19:15:04.1460429Z load_backend: loaded ROCm backend from /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/libggml-hip.so
+linux	List devices	2026-10-14T19:15:04.1538981Z load_backend: loaded CPU backend from /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/libggml-cpu-zen4.so
+linux	List devices	2026-10-14T19:15:04.1661773Z ROCm0	AMD Radeon Graphics
+linux	List devices	2026-10-14T19:15:04.1662239Z CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+linux	List devices	2026-10-14T19:15:04.1882046Z 	libhipblas.so.3 => /opt/rocm-7.2.1/lib/libhipblas.so.3 (0x00007889ff24e000)
+linux	List devices	2026-10-14T19:15:04.1882790Z 	librocblas.so.5 => /opt/rocm-7.2.1/lib/librocblas.so.5 (0x00007889fc2ab000)
+linux	List devices	2026-10-14T19:15:04.1883454Z 	libamdhip64.so.7 => /opt/rocm-7.2.1/lib/libamdhip64.so.7 (0x00007889fa8c1000)
+linux	List devices	2026-10-14T19:15:04.1884139Z 	libhipblaslt.so.1 => /opt/rocm-7.2.1/lib/libhipblaslt.so.1 (0x00007889c61e4000)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	﻿2026-10-14T19:15:04.1913997Z ##[group]Run python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1914753Z ^[[36;1mpython3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true^[[0m
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1952637Z shell: /usr/bin/bash -e {0}
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1952825Z env:
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1952980Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1953230Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1953499Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1953788Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1954226Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1954686Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.1955040Z ##[endgroup]
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2275972Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width /mnt/scratch/actions-runner-01/_work/_temp/h3 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2307635Z [    0.0s] [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2309760Z [    0.0s]   --metadata-all                 include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2310272Z [    0.0s]   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2311706Z [    0.0s]   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2312344Z [    0.0s]                                            by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2312819Z [    0.0s]                                            an explicit budget; a negative value reserves that much free VRAM
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2313291Z [    0.0s]   --disable-prefetch                       disable asynchronous next-segment weight prefetch (defaults to false)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2313828Z [    0.0s]   --disable-segmented-compute              force monolithic graph execution even when automatic graph cutting is needed
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2314326Z [    0.0s]   --offload-to-cpu                         place the weights in RAM to save VRAM, and automatically load them into VRAM
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2314781Z [    0.0s]   --auto-fit                               on|off (default: on). Preserve --backend (otherwise select one GPU) and place
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2315353Z [    0.0s]                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2315805Z [    0.0s]                                            explicit --params-backend; uses automatic graph segmentation when needed
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.2316240Z [    0.0s]                                            o|none|stretch|crop|crop-resize|fit-pad,filter=auto|nearest|nearest-exact|bil
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4792326Z RESULT {"label": "V_auto", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 119.65, "min_avail_gib": 119.65, "output": false}
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4793971Z   --sigmas                                 custom sigma values for the sampler, comma-separated (e.g.,
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4799149Z                                            "14.61,7.8,3.5,0.0").
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4800083Z   --hires-sigmas                           custom sigma values for the highres fix second pass, comma-separated (e.g.,
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4800785Z                                            "0.85,0.725,0.421875,0.0").
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4801398Z   --skip-layers                            layers to skip for SLG steps (default: [7,8,9])
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4802157Z   --high-noise-skip-layers                 (high noise) layers to skip for SLG steps (default: [7,8,9])
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4803075Z   -r, --ref-image                          reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4803733Z                                            times)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4804353Z   --ref-video                              MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4805068Z                                            multiple times)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4805759Z   --ref-video-audio                        WAV soundtrack paired by index with --ref-video (can be used multiple times)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4806642Z   --ref-audio                              standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4807713Z   --audio                                  driving audio track (Wan2.2 S2V; can be used once)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4808100Z   --cache-mode                             caching method: 'easycache' (DiT), 'ucache' (UNET),
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4808470Z                                            'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4808791Z                                            Chebyshev+Taylor forecasting)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4809135Z   --cache-option                           named cache params (key=value format, comma-separated). easycache/ucache:
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4809553Z                                            threshold=,start=,end=,decay=,relative=,reset=; dbcache/taylorseer/cache-dit:
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4809948Z                                            Fn=,Bn=,threshold=,warmup=; spectrum: w=,m=,lam=,window=,flex=,warmup=,stop=.
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4810292Z                                            Examples: "threshold=0.25" or "threshold=1.5,reset=0"
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4810624Z   --scm-mask                               SCM steps mask for cache-dit: comma-separated 0/1 (e.g.,
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4810935Z                                            "1,1,1,0,0,1,0,0,1,0") - 1=compute, 0=can cache
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4811224Z   --scm-policy                             SCM policy: 'dynamic' (default) or 'static'
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4811594Z   --vae-tile-size                          tile size for vae encode and decode in image pixels, format [W]x[H] or [S]
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4811942Z                                            (default: 256x256; requires --vae-tiling)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4812311Z   --vae-relative-tile-size                 relative tile size for vae encode and decode, format [W]x[H] or [S]: <=1 is a
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4812739Z                                            dimension fraction, >1 a target tile count (overrides --vae-tile-size;
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4813044Z                                            requires --vae-tiling)
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4813334Z   --prompt-file                            path to the file containing the prompt to render
+linux	V_auto (Studio Auto, offloaded, TE on CPU, full GTT pool)	2026-10-14T19:15:04.4813688Z   --negative-prompt-file                   path to the file containing the negative prompt
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	﻿2026-10-14T19:15:04.4875494Z ##[group]Run python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4875867Z ^[[36;1mpython3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4876233Z ^[[36;1mfor i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4876797Z ^[[36;1mpython3 "$W/h3probe.py" V_auto_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4877255Z ^[[36;1mkill $FP; wait $FP 2>/dev/null || true^[[0m
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4915875Z shell: /usr/bin/bash -e {0}
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4916044Z env:
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4916198Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4916423Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4916686Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4916959Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4917393Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4917878Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:04.4918134Z ##[endgroup]
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.5333460Z gtt total=62.47 used=0.04 GiB; pinning 39.94 GiB
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.5334091Z FILLED gtt used=0.04 free=62.43 GiB
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.5497189Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width /mnt/scratch/actions-runner-01/_work/_temp/h3 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto_t.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6216169Z [    0.1s] [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6217675Z [    0.1s]   --metadata-all                 include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6218590Z [    0.1s]   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6219509Z [    0.1s]   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6220351Z [    0.1s]                                            by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6221122Z [    0.1s]                                            an explicit budget; a negative value reserves that much free VRAM
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6221929Z [    0.1s]   --disable-prefetch                       disable asynchronous next-segment weight prefetch (defaults to false)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6222867Z [    0.1s]   --disable-segmented-compute              force monolithic graph execution even when automatic graph cutting is needed
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6223803Z [    0.1s]   --offload-to-cpu                         place the weights in RAM to save VRAM, and automatically load them into VRAM
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6224667Z [    0.1s]   --auto-fit                               on|off (default: on). Preserve --backend (otherwise select one GPU) and place
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6225495Z [    0.1s]                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6226442Z [    0.1s]                                            explicit --params-backend; uses automatic graph segmentation when needed
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.6226772Z [    0.1s]                                            o|none|stretch|crop|crop-resize|fit-pad,filter=auto|nearest|nearest-exact|bil
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8007507Z RESULT {"label": "V_auto_t", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.19, "peak_vram_gib": 0.19, "base_avail_gib": 79.63, "min_avail_gib": 79.62, "output": false}
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8008889Z   --sigmas                                 custom sigma values for the sampler, comma-separated (e.g.,
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8009532Z                                            "14.61,7.8,3.5,0.0").
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8010317Z   --hires-sigmas                           custom sigma values for the highres fix second pass, comma-separated (e.g.,
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8010997Z                                            "0.85,0.725,0.421875,0.0").
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8011653Z   --skip-layers                            layers to skip for SLG steps (default: [7,8,9])
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8012418Z   --high-noise-skip-layers                 (high noise) layers to skip for SLG steps (default: [7,8,9])
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8013288Z   -r, --ref-image                          reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8013926Z                                            times)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8014581Z   --ref-video                              MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8015284Z                                            multiple times)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8016524Z   --ref-video-audio                        WAV soundtrack paired by index with --ref-video (can be used multiple times)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8017410Z   --ref-audio                              standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8017857Z   --audio                                  driving audio track (Wan2.2 S2V; can be used once)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8018233Z   --cache-mode                             caching method: 'easycache' (DiT), 'ucache' (UNET),
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8018598Z                                            'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8018917Z                                            Chebyshev+Taylor forecasting)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8019264Z   --cache-option                           named cache params (key=value format, comma-separated). easycache/ucache:
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8019687Z                                            threshold=,start=,end=,decay=,relative=,reset=; dbcache/taylorseer/cache-dit:
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8020127Z                                            Fn=,Bn=,threshold=,warmup=; spectrum: w=,m=,lam=,window=,flex=,warmup=,stop=.
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8020475Z                                            Examples: "threshold=0.25" or "threshold=1.5,reset=0"
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8020809Z   --scm-mask                               SCM steps mask for cache-dit: comma-separated 0/1 (e.g.,
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8021146Z                                            "1,1,1,0,0,1,0,0,1,0") - 1=compute, 0=can cache
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8021440Z   --scm-policy                             SCM policy: 'dynamic' (default) or 'static'
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8021812Z   --vae-tile-size                          tile size for vae encode and decode in image pixels, format [W]x[H] or [S]
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8022182Z                                            (default: 256x256; requires --vae-tiling)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8022559Z   --vae-relative-tile-size                 relative tile size for vae encode and decode, format [W]x[H] or [S]: <=1 is a
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8022992Z                                            dimension fraction, >1 a target tile count (overrides --vae-tile-size;
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8023297Z                                            requires --vae-tiling)
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8023678Z   --prompt-file                            path to the file containing the prompt to render
+linux	V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)	2026-10-14T19:15:12.8024036Z   --negative-prompt-file                   path to the file containing the negative prompt
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	﻿2026-10-14T19:15:12.8102937Z ##[group]Run python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8103349Z ^[[36;1mpython3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8103711Z ^[[36;1mfor i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8104267Z ^[[36;1mpython3 "$W/h3probe.py" V_te_gpu_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8104715Z ^[[36;1mkill $FP; wait $FP 2>/dev/null || true^[[0m
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138001Z shell: /usr/bin/bash -e {0}
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138242Z env:
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138370Z   TAG: master-951-f89d9b1-uafac7a7
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138539Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138740Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8138935Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8139255Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8139653Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:12.8139852Z ##[endgroup]
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8363878Z gtt total=62.47 used=0.04 GiB; pinning 39.93 GiB
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8364436Z FILLED gtt used=0.04 free=62.43 GiB
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8526321Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width /mnt/scratch/actions-runner-01/_work/_temp/h3 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_te_gpu_t.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8545060Z [    0.0s] [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8546238Z [    0.0s]   --metadata-all                 include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8547244Z [    0.0s]   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8548196Z [    0.0s]   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8549115Z [    0.0s]                                            by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8549927Z [    0.0s]                                            an explicit budget; a negative value reserves that much free VRAM
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8550797Z [    0.0s]   --disable-prefetch                       disable asynchronous next-segment weight prefetch (defaults to false)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8551819Z [    0.0s]   --disable-segmented-compute              force monolithic graph execution even when automatic graph cutting is needed
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8552840Z [    0.0s]   --offload-to-cpu                         place the weights in RAM to save VRAM, and automatically load them into VRAM
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8553783Z [    0.0s]   --auto-fit                               on|off (default: on). Preserve --backend (otherwise select one GPU) and place
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8554666Z [    0.0s]                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8555770Z [    0.0s]                                            explicit --params-backend; uses automatic graph segmentation when needed
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:15.8556653Z [    0.0s]                                            o|none|stretch|crop|crop-resize|fit-pad,filter=auto|nearest|nearest-exact|bil
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1053340Z RESULT {"label": "V_te_gpu_t", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 79.62, "min_avail_gib": 79.62, "output": false}
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1054817Z   --sigmas                                 custom sigma values for the sampler, comma-separated (e.g.,
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1055619Z                                            "14.61,7.8,3.5,0.0").
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1056248Z   --hires-sigmas                           custom sigma values for the highres fix second pass, comma-separated (e.g.,
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1056906Z                                            "0.85,0.725,0.421875,0.0").
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1057648Z   --skip-layers                            layers to skip for SLG steps (default: [7,8,9])
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1058592Z   --high-noise-skip-layers                 (high noise) layers to skip for SLG steps (default: [7,8,9])
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1059677Z   -r, --ref-image                          reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1061908Z                                            times)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1062687Z   --ref-video                              MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1063476Z                                            multiple times)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1064327Z   --ref-video-audio                        WAV soundtrack paired by index with --ref-video (can be used multiple times)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1065505Z   --ref-audio                              standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1066439Z   --audio                                  driving audio track (Wan2.2 S2V; can be used once)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1067241Z   --cache-mode                             caching method: 'easycache' (DiT), 'ucache' (UNET),
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1068145Z                                            'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1068940Z                                            Chebyshev+Taylor forecasting)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1069279Z   --cache-option                           named cache params (key=value format, comma-separated). easycache/ucache:
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1069633Z                                            threshold=,start=,end=,decay=,relative=,reset=; dbcache/taylorseer/cache-dit:
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1069966Z                                            Fn=,Bn=,threshold=,warmup=; spectrum: w=,m=,lam=,window=,flex=,warmup=,stop=.
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1070257Z                                            Examples: "threshold=0.25" or "threshold=1.5,reset=0"
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1070534Z   --scm-mask                               SCM steps mask for cache-dit: comma-separated 0/1 (e.g.,
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1070796Z                                            "1,1,1,0,0,1,0,0,1,0") - 1=compute, 0=can cache
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1071041Z   --scm-policy                             SCM policy: 'dynamic' (default) or 'static'
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1071360Z   --vae-tile-size                          tile size for vae encode and decode in image pixels, format [W]x[H] or [S]
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1071652Z                                            (default: 256x256; requires --vae-tiling)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1071964Z   --vae-relative-tile-size                 relative tile size for vae encode and decode, format [W]x[H] or [S]: <=1 is a
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1072323Z                                            dimension fraction, >1 a target tile count (overrides --vae-tile-size;
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1072577Z                                            requires --vae-tiling)
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1072911Z   --prompt-file                            path to the file containing the prompt to render
+linux	V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)	2026-10-14T19:15:16.1073206Z   --negative-prompt-file                   path to the file containing the negative prompt
+linux	R_auto (upstream ROCm, Studio ROCm flags)	﻿2026-10-14T19:15:16.1825976Z ##[group]Run python3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1826687Z ^[[36;1mpython3 "$W/h3probe.py" R_auto "$RC" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0 || true^[[0m
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1863851Z shell: /usr/bin/bash -e {0}
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1864018Z env:
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1864180Z   TAG: master-951-f89d9b1-uafac7a7
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1864389Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1864646Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1864936Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1865366Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1865823Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.1866111Z ##[endgroup]
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2118046Z CMD: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli --mode vid_gen --diffusion-model /mnt/scratch/actions-runner-01/_work/_temp/h3/models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae /mnt/scratch/actions-runner-01/_work/_temp/h3/models/vae/minimax_h3_audio_vae_fp32.safetensors --llm /mnt/scratch/actions-runner-01/_work/_temp/h3/models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width /mnt/scratch/actions-runner-01/_work/_temp/h3 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output /mnt/scratch/actions-runner-01/_work/_temp/h3/out/R_auto.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=ROCm0,te=ROCm0,vae=ROCm0
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2192126Z [    0.0s] [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2193287Z [    0.0s]   --metadata-all                 include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2194269Z [    0.0s]   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2195251Z [    0.0s]   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2196179Z [    0.0s]                                            by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2196953Z [    0.0s]                                            an explicit budget; a negative value reserves that much free VRAM
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2197814Z [    0.0s]   --disable-prefetch                       disable asynchronous next-segment weight prefetch (defaults to false)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2198806Z [    0.0s]   --disable-segmented-compute              force monolithic graph execution even when automatic graph cutting is needed
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2199397Z [    0.0s]   --offload-to-cpu                         place the weights in RAM to save VRAM, and automatically load them into VRAM
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2199855Z [    0.0s]   --auto-fit                               on|off (default: on). Preserve --backend (otherwise select one GPU) and place
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2200289Z [    0.0s]                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2200704Z [    0.0s]                                            explicit --params-backend; uses automatic graph segmentation when needed
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.2201140Z [    0.0s]                                            o|none|stretch|crop|crop-resize|fit-pad,filter=auto|nearest|nearest-exact|bil
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4644191Z RESULT {"label": "R_auto", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 119.85, "min_avail_gib": 119.85, "output": false}
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4646744Z   --sigmas                                 custom sigma values for the sampler, comma-separated (e.g.,
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4647138Z                                            "14.61,7.8,3.5,0.0").
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4647507Z   --hires-sigmas                           custom sigma values for the highres fix second pass, comma-separated (e.g.,
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4647866Z                                            "0.85,0.725,0.421875,0.0").
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4648159Z   --skip-layers                            layers to skip for SLG steps (default: [7,8,9])
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4648551Z   --high-noise-skip-layers                 (high noise) layers to skip for SLG steps (default: [7,8,9])
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4649004Z   -r, --ref-image                          reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4649339Z                                            times)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4649693Z   --ref-video                              MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4650390Z                                            multiple times)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4650754Z   --ref-video-audio                        WAV soundtrack paired by index with --ref-video (can be used multiple times)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4651222Z   --ref-audio                              standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4651613Z   --audio                                  driving audio track (Wan2.2 S2V; can be used once)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4651956Z   --cache-mode                             caching method: 'easycache' (DiT), 'ucache' (UNET),
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4652336Z                                            'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4652682Z                                            Chebyshev+Taylor forecasting)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4653049Z   --cache-option                           named cache params (key=value format, comma-separated). easycache/ucache:
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4653504Z                                            threshold=,start=,end=,decay=,relative=,reset=; dbcache/taylorseer/cache-dit:
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4653919Z                                            Fn=,Bn=,threshold=,warmup=; spectrum: w=,m=,lam=,window=,flex=,warmup=,stop=.
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4654279Z                                            Examples: "threshold=0.25" or "threshold=1.5,reset=0"
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4654619Z   --scm-mask                               SCM steps mask for cache-dit: comma-separated 0/1 (e.g.,
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4655015Z                                            "1,1,1,0,0,1,0,0,1,0") - 1=compute, 0=can cache
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4655332Z   --scm-policy                             SCM policy: 'dynamic' (default) or 'static'
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4655717Z   --vae-tile-size                          tile size for vae encode and decode in image pixels, format [W]x[H] or [S]
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4656090Z                                            (default: 256x256; requires --vae-tiling)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4656471Z   --vae-relative-tile-size                 relative tile size for vae encode and decode, format [W]x[H] or [S]: <=1 is a
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4656909Z                                            dimension fraction, >1 a target tile count (overrides --vae-tile-size;
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4657224Z                                            requires --vae-tiling)
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4657523Z   --prompt-file                            path to the file containing the prompt to render
+linux	R_auto (upstream ROCm, Studio ROCm flags)	2026-10-14T19:15:16.4657885Z   --negative-prompt-file                   path to the file containing the negative prompt
+linux	Summary	﻿2026-10-14T19:15:16.4734675Z ##[group]Run cat "$OUT/results.jsonl" || true
+linux	Summary	2026-10-14T19:15:16.4735033Z ^[[36;1mcat "$OUT/results.jsonl" || true^[[0m
+linux	Summary	2026-10-14T19:15:16.4735429Z ^[[36;1mfor f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|error|abort|assert|budget|prepared params|max.vram' "$f" | head -40; done^[[0m
+linux	Summary	2026-10-14T19:15:16.4772805Z shell: /usr/bin/bash -e {0}
+linux	Summary	2026-10-14T19:15:16.4772971Z env:
+linux	Summary	2026-10-14T19:15:16.4773120Z   TAG: master-951-f89d9b1-uafac7a7
+linux	Summary	2026-10-14T19:15:16.4773331Z   W: /mnt/scratch/actions-runner-01/_work/_temp/h3
+linux	Summary	2026-10-14T19:15:16.4773590Z   MODELS: /mnt/scratch/actions-runner-01/_work/_temp/h3/models
+linux	Summary	2026-10-14T19:15:16.4773858Z   OUT: /mnt/scratch/actions-runner-01/_work/_temp/h3/out
+linux	Summary	2026-10-14T19:15:16.4774278Z   VK: /mnt/scratch/actions-runner-01/_work/_temp/h3/vk/sd-master-951-f89d9b1-uafac7a7-bin-Linux-Ubuntu-22.04-x86_64-vulkan/sd-cli
+linux	Summary	2026-10-14T19:15:16.4774732Z   RC: /mnt/scratch/actions-runner-01/_work/_temp/h3/rocm/build/bin/sd-cli
+linux	Summary	2026-10-14T19:15:16.4775008Z ##[endgroup]
+linux	Summary	2026-10-14T19:15:16.4832153Z {"label": "V_auto", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 119.65, "min_avail_gib": 119.65, "output": false}
+linux	Summary	2026-10-14T19:15:16.4833556Z {"label": "V_auto_t", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.19, "peak_vram_gib": 0.19, "base_avail_gib": 79.63, "min_avail_gib": 79.62, "output": false}
+linux	Summary	2026-10-14T19:15:16.4835425Z {"label": "V_te_gpu_t", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 79.62, "min_avail_gib": 79.62, "output": false}
+linux	Summary	2026-10-14T19:15:16.4836653Z {"label": "R_auto", "rc": 1, "secs": 0.3, "base_gtt_gib": 0.04, "peak_gtt_gib": 0.04, "base_vram_gib": 0.18, "peak_vram_gib": 0.18, "base_avail_gib": 119.85, "min_avail_gib": 119.85, "output": false}
+linux	Summary	2026-10-14T19:15:16.4837540Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/R_auto.log
+linux	Summary	2026-10-14T19:15:16.4848906Z [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	Summary	2026-10-14T19:15:16.4849614Z   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	Summary	2026-10-14T19:15:16.4850543Z   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	Summary	2026-10-14T19:15:16.4851259Z                                            an explicit budget; a negative value reserves that much free VRAM
+linux	Summary	2026-10-14T19:15:16.4851925Z                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	Summary	2026-10-14T19:15:16.4852538Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto.log
+linux	Summary	2026-10-14T19:15:16.4863359Z [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	Summary	2026-10-14T19:15:16.4863869Z   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	Summary	2026-10-14T19:15:16.4864320Z   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	Summary	2026-10-14T19:15:16.4864730Z                                            an explicit budget; a negative value reserves that much free VRAM
+linux	Summary	2026-10-14T19:15:16.4865142Z                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	Summary	2026-10-14T19:15:16.4865495Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_auto_t.log
+linux	Summary	2026-10-14T19:15:16.4882184Z [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	Summary	2026-10-14T19:15:16.4883188Z   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	Summary	2026-10-14T19:15:16.4884077Z   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	Summary	2026-10-14T19:15:16.4885138Z                                            an explicit budget; a negative value reserves that much free VRAM
+linux	Summary	2026-10-14T19:15:16.4885883Z                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	Summary	2026-10-14T19:15:16.4886657Z === /mnt/scratch/actions-runner-01/_work/_temp/h3/out/V_te_gpu_t.log
+linux	Summary	2026-10-14T19:15:16.4902332Z [E] error: invalid parameter for argument "--width": "/mnt/scratch/actions-runner-01/_work/_temp/h3" --- common.cpp:348
+linux	Summary	2026-10-14T19:15:16.4903346Z   --log-level                    minimum log level, one of [debug, verbose, info, warn, error] (default: info)
+linux	Summary	2026-10-14T19:15:16.4904232Z   --max-vram <string>                      optional per-device budget in GiB for managed weights and runner buffers
+linux	Summary	2026-10-14T19:15:16.4905074Z                                            an explicit budget; a negative value reserves that much free VRAM
+linux	Summary	2026-10-14T19:15:16.4906163Z                                            according to available memory (--max-vram limits GPU budgets). Disabled by
+linux	Complete job	﻿2026-10-14T19:15:16.4971847Z Cleaning up orphan processes

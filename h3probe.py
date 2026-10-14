@@ -40,7 +40,7 @@ def meminfo(key):
 
 def main():
     label, binary, extra = sys.argv[1], sys.argv[2], sys.argv[3:]
-    w = os.environ.get("W", "640"); h = os.environ.get("H", "384"); fr = os.environ.get("FRAMES", "25")
+    w = os.environ.get("VW", "640"); h = os.environ.get("VH", "384"); fr = os.environ.get("FRAMES", "25")
     M = os.environ["MODELS"]
     out = os.path.join(os.environ["OUT"], f"{label}.webm")
     cmd = [binary, "--mode", "vid_gen",

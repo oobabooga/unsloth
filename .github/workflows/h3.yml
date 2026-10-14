@@ -30,7 +30,7 @@ jobs:
           cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
           cd "$W/rocm" && curl -fsSL -o b.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-951-f89d9b1/sd-master-f89d9b1-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip" && unzip -q b.zip && rm b.zip
           find "$W/vk" "$W/rocm" -name sd-cli
-          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]"
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]" vulkan
           export HF_HOME="$W/hf" TMPDIR="$W/tmp"
           python - <<'PY'
           import os
@@ -50,13 +50,13 @@ jobs:
         run: python3 "$W/h3probe.py" V_auto "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
       - name: V_auto_t (same, GTT pool held to 22.5 GiB free like a 48 GB host)
         run: |
-          python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
           for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
           python3 "$W/h3probe.py" V_auto_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
       - name: V_te_gpu_t (TE on GPU, GTT pool held to 22.5 GiB free)
         run: |
-          python3 "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
           for i in $(seq 1 120); do grep -q FILLED "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
           python3 "$W/h3probe.py" V_te_gpu_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
