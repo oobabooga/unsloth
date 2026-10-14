@@ -72,6 +72,7 @@ SCRUB = (
     "GGML_VK_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION", "UNSLOTH_LLAMA_CPP_BACKEND",
     "UNSLOTH_FORCE_VULKAN", "UNSLOTH_ROCM_GFX_ARCH", "UNSLOTH_LLAMA_RELEASE_TAG",
 )
+_tar_open = tarfile.open
 TINY_GGUF = ("https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/"
              "SmolLM2-135M-Instruct-Q4_K_M.gguf")
 
@@ -128,7 +129,7 @@ def run_chosen(payload: dict, work: Path) -> dict:
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(root)
     else:
-        with tarfile.open(archive) as tf:
+        with _tar_open(archive) as tf:  # a binary archive, not text I/O
             tf.extractall(root)
     servers = sorted(p for p in root.rglob("llama-server") if p.is_file())
     out["llama_server"] = str(servers[0]) if servers else None

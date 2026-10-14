@@ -52,8 +52,19 @@ def _offload_evidence(o: dict) -> list[str]:
     return out
 
 
+def _pinned_to_vulkan(o: dict) -> bool:
+    """llama.cpp rejects an unknown --device name, so a completion that ran with
+    `-ngl 99 --device Vulkan0` ran on that device. This build logs no load_tensors lines."""
+    run = (o or {}).get("chosen_run") or {}
+    args = run.get("completion_args") or []
+    return ("--device" in args and args[args.index("--device") + 1:][:1] == ["Vulkan0"]
+            and "-ngl" in args and run.get("completion_rc") == 0
+            and bool((run.get("completion_text") or "").strip()))
+
+
 def _offloaded(o: dict) -> bool:
-    return bool(_offload_evidence(o)) and ((o or {}).get("chosen_run") or {}).get("completion_rc") == 0
+    run = (o or {}).get("chosen_run") or {}
+    return run.get("completion_rc") == 0 and (bool(_offload_evidence(o)) or _pinned_to_vulkan(o))
 
 
 def gates(obs: dict) -> list[tuple[str, bool, str]]:
