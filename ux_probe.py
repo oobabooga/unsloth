@@ -92,71 +92,42 @@ def body(page):
         return X.inference_status().get("loaded")
     step("load_small_from_picker", load_small_ui)
 
-    # E1: how often does a trivial question come back with no visible answer?
-    def repeat_3x4():
-        rows = []
-        for i in range(6):
-            r = X.send_chat("What is 3 times 4? Reply with just the number.", new_chat=True, timeout=400)
-            ev = run_events(RUNS[-1]) if RUNS else None
-            visible = [l for l in r["reply"].splitlines() if l.strip() and not l.startswith("Worked for")][:1]
-            rows.append({"i": i, "visible_first_line": visible[0] if visible else None, "seconds": r["seconds"], "events": ev,
-                         "expanded": r.get("expanded_thinking", "")[-300:]})
-            shot(f"3x4-{i}", full=False)
-        empty = [x for x in rows if x["visible_first_line"] in (None, "Copy")]
-        if empty:
-            note(f"{len(empty)}/6 fresh chats of 'What is 3 times 4?' on qwen3-0.6b-FLM showed no answer.")
-        return rows
-    step("e1_repeat_3x4", repeat_3x4, shoot=False)
+    def composer_probe(label):
+        info = page.evaluate("""() => [...document.querySelectorAll("textarea[aria-label='Message input']")].map(t => {
+            const r = t.getBoundingClientRect();
+            return {visible: !!(t.offsetParent), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), readOnly: t.readOnly, disabled: t.disabled, value: t.value};
+        })""")
+        box = page.locator("textarea[aria-label='Message input']").filter(visible=True).first
+        box.click()
+        page.keyboard.type("hello there", delay=40)
+        time.sleep(0.5)
+        typed = box.input_value()
+        active = page.evaluate("() => { const a = document.activeElement; return a ? (a.tagName + ' ' + (a.getAttribute('aria-label') || '')) : null }")
+        shot(f"typed-{label}")
+        box.press("Control+a"); box.press("Delete")
+        return {"textareas": info, "typed_value": typed, "active": active}
 
-    # S1: does a draft typed right after a model switch survive?
-    def switch_and_type():
+    def s1_deep():
         out = {}
-        for m in (big, small):
+        out["baseline_small"] = composer_probe("baseline-small")
+        out["baseline_chat"] = X.send_chat("Reply with the single word: ok", timeout=300)
+        for m, label in ((big, "after-switch-to-2b"), (small, "after-switch-back-to-0.6b")):
             X.open_picker("On Device")
             X.picker_row(m["id"]).click()
-            t = time.monotonic()
             poll(lambda m=m: X.is_loaded(m), 600, 1)
-            loaded_after = round(time.monotonic() - t, 1)
             X.close_picker()
-            box = page.locator("textarea[aria-label='Message input']").first
-            box.click()
-            box.fill("Reply with the single word: ok")
-            reads = [box.input_value()]
-            for _ in range(5):
-                time.sleep(1)
-                reads.append(box.input_value())
-            shot(f"draft-after-switch-{m['id']}")
-            out[m["id"]] = {"backend_loaded_s": loaded_after, "draft_readbacks": reads,
-                            "toasts": [t.inner_text() for t in page.locator("[data-sonner-toast]").all()][:3]}
-            if reads[-1] != reads[0]:
-                note(f"Text typed right after switching to {m['id']} was cleared from the composer ({reads}).")
-            try:
-                out[m["id"]]["chat"] = X.send_chat("Reply with the single word: ok", timeout=300)
-            except Exception as exc:  # noqa: BLE001
-                out[m["id"]]["chat_error"] = str(exc)[:600]
+            time.sleep(3)
+            out[label] = composer_probe(label)
+        if not out["after-switch-back-to-0.6b"]["typed_value"]:
+            note("After switching qwen3.5-2b-FLM -> qwen3-0.6b-FLM in the picker, keystrokes in the composer are lost (value stays empty).")
+        page.get_by_role("button", name="New chat").first.click()
+        time.sleep(2)
+        out["after_new_chat"] = composer_probe("after-new-chat")
+        page.reload(wait_until="networkidle")
+        time.sleep(4)
+        out["after_reload"] = composer_probe("after-reload")
         return out
-    step("s1_switch_then_type", switch_and_type, shoot=False)
-
-    # R1: reasoning fills a small context; what does the chat say?
-    def context_full():
-        X.open_picker("On Device")
-        page.get_by_role("button", name=f"Inference settings for {small['id']}").first.click()
-        time.sleep(1.5)
-        box = page.get_by_label("Context Length", exact=True).first
-        box.click(force=True)
-        box.press("Control+a")
-        box.type("2048", delay=60)
-        box.press("Tab")
-        page.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$")).filter(visible=True).first.click(force=True)
-        poll(lambda: (s := X.npu_status()) and s.get("context_length") == 2048, 300, 1)
-        X.close_picker()
-        r = X.send_chat("Think very carefully, step by step, and list every prime number below 3000 with a one-line justification for each.", timeout=600, new_chat=True)
-        r["events"] = run_events(RUNS[-1]) if RUNS else None
-        r["banners"] = [b for b in ("hit the Max Tokens limit", "filled the model's context window", "empty response", "Continue", "Resume") if b in r["reply"]]
-        if not r["banners"]:
-            note("When reasoning filled the 2048-token NPU context the chat showed no explanation.")
-        return r
-    step("r1_context_full_message", context_full)
+    step("s1_deep", s1_deep, shoot=False)
 
 
 if __name__ == "__main__":
