@@ -1,0 +1,60 @@
+name: AMD H3 reserve probe
+
+on:
+  push:
+    branches: [amd-h3-mem-probe-rsv-20261014]
+
+permissions: {}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    env:
+      TAG: master-951-f89d9b1-uafac7a7
+    steps:
+      - name: Hardware and eligibility
+        run: |
+          uname -r; free -g | head -2
+          for d in /sys/class/drm/card*/device; do [ -f $d/mem_info_vram_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total)"; done
+          V=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -n | tail -1)
+          if true; then echo "ELIGIBLE=1" >> $GITHUB_ENV; echo eligible; else echo "ELIGIBLE=0" >> $GITHUB_ENV; echo "small carve-out, skipping"; fi
+      - name: Setup
+        if: env.ELIGIBLE == '1'
+        run: |
+          export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,tmp,hf}
+          export MODELS="$W/models" OUT="$W/out"
+          echo "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV
+          for f in h3probe.py gttfill.py; do curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/$f" -o "$W/$f"; done
+          cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
+          echo "VK=$(find "$W/vk" -name sd-cli | head -1)" >> $GITHUB_ENV
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]" vulkan
+          export HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          for f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:
+              print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))
+          PY
+          "$W/venv/bin/python" "$W/gttfill.py" 1000 1000 > "$W/types.log" 2>&1 & P=$!; sleep 8; kill $P; cat "$W/types.log"
+      - name: R480 (864x480x124, GTT held to 22.5 GiB free, --max-vram -16.5)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 60
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" R480 "$VK" --offload-to-cpu --diffusion-fa --max-vram -16.5 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: R768 (1344x768x124, GTT held to 28.0 GiB free, --max-vram -16.5)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 120
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 28.0 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          VW=1344 VH=768 FRAMES=124 python3 "$W/h3probe.py" R768 "$VK" --offload-to-cpu --diffusion-fa --max-vram -16.5 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: Summary
+        if: always() && env.ELIGIBLE == '1'
+        run: |
+          cat "$OUT/results.jsonl" || true
+          for f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|\[E\]|\[W\]|abort|assert|auto-detected|segments|prepared params' "$f" | head -40; done
