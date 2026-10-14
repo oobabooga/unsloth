@@ -116,19 +116,47 @@ def picker_row(model_id):
 
 def send_chat(text, timeout=600):
     page = U.page
-    box = page.get_by_role("textbox").last
+    box = page.locator("textarea[aria-label='Message input']").first
     box.click()
     box.fill(text)
-    before = page.locator("[data-message-role='assistant'], .aui-assistant-message-root").count()
+    msgs = page.locator(".aui-assistant-message-root")
+    before = msgs.count()
     t = time.monotonic()
     page.keyboard.press("Enter")
-    # Done when the stop button is gone and the composer is idle again.
-    time.sleep(2)
-    poll(lambda: page.get_by_role("button", name=re.compile(r"^Stop", re.I)).count() == 0, timeout, 1)
+    # A new assistant turn appears, then the stop button goes away when it is done.
+    poll(lambda: msgs.count() > before or page.locator(".aui-composer-cancel").count() > 0, 120, 0.5)
+    poll(lambda: page.locator(".aui-composer-cancel").count() == 0 and msgs.count() > before, timeout, 1)
+    time.sleep(1.5)
     secs = round(time.monotonic() - t, 1)
-    msgs = page.locator("[data-message-role='assistant'], .aui-assistant-message-root")
     reply = msgs.last.inner_text() if msgs.count() else body_text()[-1500:]
-    return {"prompt": text, "seconds": secs, "assistant_count_before": before, "reply": reply[-2000:]}
+    return {"prompt": text, "seconds": secs, "reply": reply[-2000:]}
+
+
+def open_run_settings():
+    btn = U.page.get_by_role("button", name="Open run settings", exact=True)
+    if btn.count() and btn.first.is_visible():
+        btn.first.click()
+        time.sleep(1.5)
+
+
+def set_number(box, value):
+    box.scroll_into_view_if_needed()
+    box.click()
+    box.press("Control+a")
+    box.type(value, delay=60)
+    box.press("Tab")
+    time.sleep(0.8)
+
+
+def goto_hub():
+    page = U.page
+    nav = page.get_by_test_id("nav-row-hub")
+    if nav.count() and nav.first.is_visible():
+        nav.first.click()
+    else:
+        page.goto(U.BASE + "/hub", wait_until="networkidle")
+    page.wait_for_url(re.compile(r"/hub"), timeout=30000)
+    time.sleep(3)
 
 
 def catalog():
@@ -318,6 +346,7 @@ def run_ui(page):
     def sampling():
         page = U.page
         out = {}
+        open_run_settings()
         for label, value in (("Temperature", "0.2"), ("Max Tokens", "64")):
             box = page.get_by_label(label, exact=True)
             if not box.count():
@@ -325,15 +354,13 @@ def run_ui(page):
             if not box.count():
                 out[label] = "not found"
                 continue
-            box.first.scroll_into_view_if_needed()
-            box.first.fill(value)
-            box.first.press("Tab")
+            set_number(box.first, value)
             out[label] = box.first.input_value()
         r = send_chat("Write a long story about a lighthouse keeper. Make it at least 500 words.")
         out["reply_words"] = len(r["reply"].split())
-        out["reply_tail"] = r["reply"][-300:]
-        if out["reply_words"] > 120:
-            note(f"Max Tokens=64 set in Run settings, but the NPU reply had {out['reply_words']} words.")
+        out["reply_tail"] = r["reply"][-400:]
+        out["hit_limit_banner"] = "hit the Max Tokens limit" in r["reply"]
+        out["seconds"] = r["seconds"]
         return out
     step("sampling_settings_apply", sampling)
 
@@ -352,8 +379,7 @@ def run_ui(page):
         ctx_box = U.page.get_by_label("Context Length", exact=True)
         before = ctx_box.first.input_value() if ctx_box.count() else None
         if ctx_box.count():
-            ctx_box.first.fill("4096")
-            ctx_box.first.press("Tab")
+            set_number(ctx_box.first, "4096")
         btn = U.page.get_by_role("button", name=re.compile(r"^(Reload model|Load model)$"))
         label = btn.first.inner_text()
         t = time.monotonic()
@@ -375,9 +401,7 @@ def run_ui(page):
 
     # --- The Model hub, as a user browsing for more NPU models ---
     def hub_default():
-        U.page.get_by_test_id("nav-row-hub").click()
-        U.page.wait_for_url(re.compile(r"/hub"), timeout=30000)
-        time.sleep(4)
+        goto_hub()
         txt = body_text()
         visible = small["id"] in txt or "NPU" in txt
         if small["id"] not in txt:
