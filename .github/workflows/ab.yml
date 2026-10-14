@@ -1,0 +1,62 @@
+name: MPS unified-memory refusal A/B
+
+on:
+  push:
+    branches: [mps-mem-ab-ci]
+
+permissions: {}
+
+jobs:
+  ab:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      HF_HOME: ${{ github.workspace }}/hf
+      MAIN_SHA: 97ed9415f7
+    steps:
+      - name: Trees
+        run: |
+          RAW="https://raw.githubusercontent.com/oobabooga/unsloth/${GITHUB_SHA}"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git main
+          git -C main checkout -q "$MAIN_SHA"
+          git -C main log --oneline -1
+          cp -R main branch
+          curl -sSfL "$RAW/diffusion_memory.py" -o branch/studio/backend/core/inference/diffusion_memory.py
+          curl -sSfL "$RAW/decision_ab.py" -o "$RUNNER_TEMP/decision_ab.py"
+          diff -u main/studio/backend/core/inference/diffusion_memory.py branch/studio/backend/core/inference/diffusion_memory.py | head -400 || true
+      - name: Install
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/v" || python3 -m venv "$RUNNER_TEMP/v"
+          . "$RUNNER_TEMP/v/bin/activate"
+          python --version
+          R=main/studio/backend/requirements
+          pip install -q torch
+          pip install -q -r $R/no-torch-runtime.txt
+          pip install -q -r $R/studio.txt
+          pip install -q -r $R/diffusers-pin.txt
+          python -c "import torch, diffusers, transformers; print(torch.__version__, diffusers.__version__, transformers.__version__, torch.backends.mps.is_available())"
+      - name: Live readings on this runner
+        run: |
+          sysctl hw.memsize
+          . "$RUNNER_TEMP/v/bin/activate"
+          python - <<'PY'
+          import psutil, torch
+          vm = psutil.virtual_memory()
+          print("psutil available GiB %.2f, Metal working set GiB %.2f" % (vm.available / 2**30, torch.mps.recommended_max_memory() / 2**30))
+          PY
+      - name: A main, reporter machine
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/decision_ab.py" "$GITHUB_WORKSPACE/main/studio/backend" main reporter
+      - name: B branch, reporter machine
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          python "$RUNNER_TEMP/decision_ab.py" "$GITHUB_WORKSPACE/branch/studio/backend" branch reporter
+      - name: A main, this runner's live readings
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          AB_ONLY="Klein 4B Q4_K_M" python "$RUNNER_TEMP/decision_ab.py" "$GITHUB_WORKSPACE/main/studio/backend" main runner
+      - name: B branch, this runner's live readings
+        run: |
+          . "$RUNNER_TEMP/v/bin/activate"
+          AB_ONLY="Klein 4B Q4_K_M" python "$RUNNER_TEMP/decision_ab.py" "$GITHUB_WORKSPACE/branch/studio/backend" branch runner
