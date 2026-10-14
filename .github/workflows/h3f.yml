@@ -1,0 +1,100 @@
+name: AMD H3 Studio fit end-to-end
+
+on:
+  push:
+    branches: [amd-h3-studiofit-20261014]
+
+permissions: {}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    env:
+      TAG: master-951-f89d9b1-uafac7a7
+    steps:
+      - name: Hardware and eligibility
+        run: |
+          uname -r; free -g | head -2
+          for d in /sys/class/drm/card*/device; do [ -f $d/mem_info_vram_total ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total)"; done
+          V=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -n | tail -1)
+          if true; then echo "ELIGIBLE=1" >> $GITHUB_ENV; echo eligible; else echo "ELIGIBLE=0" >> $GITHUB_ENV; echo "small carve-out, skipping"; fi
+      - name: Setup
+        if: env.ELIGIBLE == '1'
+        run: |
+          export W="$RUNNER_TEMP/h3"; mkdir -p "$W"/{models,out,vk,tmp,hf}
+          export MODELS="$W/models" OUT="$W/out"
+          echo "W=$W" >> $GITHUB_ENV; echo "MODELS=$W/models" >> $GITHUB_ENV; echo "OUT=$W/out" >> $GITHUB_ENV
+          for f in h3probe.py gttfill.py studiofit.py pkg/core/__init__.py pkg/core/inference/__init__.py pkg/core/inference/video_minimax_h3.py pkg/utils/__init__.py pkg/utils/host_memory.py; do mkdir -p "$W/$(dirname $f)"; curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/$f" -o "$W/$f"; done
+          cd "$W/vk" && curl -fsSL -o b.zip "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip" && unzip -q b.zip && rm b.zip
+          echo "VK=$(find "$W/vk" -name sd-cli | head -1)" >> $GITHUB_ENV
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"; pip -q install -U "huggingface_hub[hf_xet]" vulkan
+          export HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          for f in ["minimax_h3_fl2va_pruned-Q4_K.gguf","qwen3vl_32b_minimax_h3-Q4_K_M.gguf","vae/minimax_h3_video_vae_fp16.safetensors","vae/minimax_h3_audio_vae_fp32.safetensors"]:
+              print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))
+          PY
+          "$W/venv/bin/python" "$W/gttfill.py" 1000 1000 > "$W/types.log" 2>&1 & P=$!; sleep 8; kill $P; cat "$W/types.log"
+      - name: F480_225 (864x480x124, GTT held to 22.5 GiB free, Studio's fitted flags)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 60
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; grep FILLED "$W/fill.log"
+          FIT=$(python3 "$W/studiofit.py" "$VK" 864 480); echo "FIT F480_225 $FIT"
+          if echo "$FIT" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["refusal"] is None else 1)'; then
+            FLAGS=$(echo "$FIT" | python3 -c 'import json,sys,shlex; print(shlex.join(json.load(sys.stdin)["flags"]))')
+            eval "VW=864 VH=480 FRAMES=124 python3 \"$W/h3probe.py\" F480_225 \"$VK\" $FLAGS" || true
+          else
+            echo "REFUSED F480_225"
+          fi
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: F768_225 (1344x768x124, GTT held to 22.5 GiB free, Studio's fitted flags)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 20
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; grep FILLED "$W/fill.log"
+          FIT=$(python3 "$W/studiofit.py" "$VK" 1344 768); echo "FIT F768_225 $FIT"
+          if echo "$FIT" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["refusal"] is None else 1)'; then
+            FLAGS=$(echo "$FIT" | python3 -c 'import json,sys,shlex; print(shlex.join(json.load(sys.stdin)["flags"]))')
+            eval "VW=1344 VH=768 FRAMES=124 python3 \"$W/h3probe.py\" F768_225 \"$VK\" $FLAGS" || true
+          else
+            echo "REFUSED F768_225"
+          fi
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: F480_200 (864x480x124, GTT held to 20.0 GiB free, Studio's fitted flags)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 20
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 20.0 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; grep FILLED "$W/fill.log"
+          FIT=$(python3 "$W/studiofit.py" "$VK" 864 480); echo "FIT F480_200 $FIT"
+          if echo "$FIT" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["refusal"] is None else 1)'; then
+            FLAGS=$(echo "$FIT" | python3 -c 'import json,sys,shlex; print(shlex.join(json.load(sys.stdin)["flags"]))')
+            eval "VW=864 VH=480 FRAMES=124 python3 \"$W/h3probe.py\" F480_200 \"$VK\" $FLAGS" || true
+          else
+            echo "REFUSED F480_200"
+          fi
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: F768_280 (1344x768x124, GTT held to 28.0 GiB free, Studio's fitted flags)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 150
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 28.0 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; grep FILLED "$W/fill.log"
+          FIT=$(python3 "$W/studiofit.py" "$VK" 1344 768); echo "FIT F768_280 $FIT"
+          if echo "$FIT" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["refusal"] is None else 1)'; then
+            FLAGS=$(echo "$FIT" | python3 -c 'import json,sys,shlex; print(shlex.join(json.load(sys.stdin)["flags"]))')
+            eval "VW=1344 VH=768 FRAMES=124 python3 \"$W/h3probe.py\" F768_280 \"$VK\" $FLAGS" || true
+          else
+            echo "REFUSED F768_280"
+          fi
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: Summary
+        if: always() && env.ELIGIBLE == '1'
+        run: |
+          cat "$OUT/results.jsonl" || true
+          for f in "$OUT"/*.log; do echo "=== $f"; grep -iE 'radv|lost|\[E\]|\[W\]|abort|assert|auto-detected|segments|prepared params' "$f" | head -40; done
