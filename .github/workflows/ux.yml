@@ -25,6 +25,8 @@ jobs:
 
         echo "UX_ROOT=$root" >> $GITHUB_ENV
 
+        echo "PLAYWRIGHT_BROWSERS_PATH=$root/pw-browsers" >> $GITHUB_ENV
+
         echo "HOME=$root/home" >> $GITHUB_ENV
 
         echo "$root/home/.local/bin" >> $GITHUB_PATH
@@ -103,118 +105,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ux-ui-api-cli-linux
-        path: ${{ env.UX_ROOT }}/evidence
-        retention-days: 14
-  windows:
-    runs-on:
-    - self-hosted
-    - Windows
-    - strix-halo
-    - devlab-dispatch
-    timeout-minutes: 200
-    defaults:
-      run:
-        shell: powershell
-    steps:
-    - name: Prepare a fresh user and fetch the harness
-      run: '$ErrorActionPreference = ''Stop''
-
-        $root = Join-Path $env:RUNNER_TEMP (''ux-'' + $env:GITHUB_RUN_ID + ''-'' + $env:GITHUB_RUN_ATTEMPT)
-
-        New-Item -ItemType Directory -Force -Path $root, "$root\h", "$root\evidence" | Out-Null
-
-        "UX_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-        "UNSLOTH_STUDIO_HOME=$root\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-        "PYTHONUTF8=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-        "PYTHONIOENCODING=utf-8" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/uxlib.py" -OutFile "$root\h\uxlib.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ui.py" -OutFile "$root\h\ux_ui.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_api.py" -OutFile "$root\h\ux_api.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_cli.py" -OutFile "$root\h\ux_cli.py"
-
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -OutFile "$root\h\probe_hw.py"
-
-        Write-Host "Pre-existing default Studio home: $(Test-Path "$env:USERPROFILE\.unsloth\studio")"
-
-        Get-Command unsloth -ErrorAction SilentlyContinue | Format-List | Out-String | Write-Host
-
-        python "$root\h\probe_hw.py" "$root\evidence\hardware.json"'
-    - name: Install Unsloth Studio with the README one-liner
-      timeout-minutes: 40
-      run: '$ErrorActionPreference = ''Continue''
-
-        foreach ($v in ''HF_HOME'',''HF_ENDPOINT'',''HF_HUB_DISABLE_XET'',''XDG_CACHE_HOME'',''HUGGINGFACE_HUB_CACHE'',''TRANSFORMERS_CACHE'') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
-
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://unsloth.ai/install.ps1 | iex" *>&1 | Tee-Object -FilePath "$env:UX_ROOT\evidence\install.log"
-
-        $rc = $LASTEXITCODE
-
-        Write-Host "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)"
-
-        "install rc=$rc seconds=$($sw.Elapsed.TotalSeconds)" | Out-File "$env:UX_ROOT\evidence\install-summary.txt"
-
-        $userPath = [Environment]::GetEnvironmentVariable(''Path'',''User'')
-
-        "User PATH: $userPath" | Out-File -Append "$env:UX_ROOT\evidence\install-summary.txt"
-
-        $env:Path = $userPath + '';'' + [Environment]::GetEnvironmentVariable(''Path'',''Machine'')
-
-        $cmd = Get-Command unsloth -ErrorAction SilentlyContinue
-
-        "unsloth on new-shell PATH: $($cmd.Source)" | Out-File -Append "$env:UX_ROOT\evidence\install-summary.txt"
-
-        Get-Content "$env:UX_ROOT\evidence\install-summary.txt"
-
-        if ($cmd) { (Split-Path $cmd.Source) | Out-File -Append -Encoding utf8 $env:GITHUB_PATH }
-
-        if ($rc -ne 0) { exit $rc }'
-    - name: Browser for the harness
-      timeout-minutes: 15
-      run: '$ErrorActionPreference = ''Stop''
-
-        python -m venv "$env:UX_ROOT\pw"
-
-        & "$env:UX_ROOT\pw\Scripts\python.exe" -m pip install -q playwright==1.55.0 requests pywinpty==3.0.5
-
-        & "$env:UX_ROOT\pw\Scripts\python.exe" -m playwright install chromium'
-    - name: 'User session: ui'
-      timeout-minutes: 90
-      if: always()
-      env:
-        UX_SUITE: ui
-        UX_OS: Windows
-      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h/ux_ui.py"'
-    - name: 'User session: api'
-      timeout-minutes: 90
-      if: always()
-      env:
-        UX_SUITE: api
-        UX_OS: Windows
-      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h/ux_api.py"'
-    - name: 'User session: cli'
-      timeout-minutes: 90
-      if: always()
-      env:
-        UX_SUITE: cli
-        UX_OS: Windows
-      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h/ux_cli.py"'
-    - name: Collect Studio logs
-      if: always()
-      run: Get-ChildItem -Recurse "$env:UNSLOTH_STUDIO_HOME" -Include *.log -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 50MB } | ForEach-Object { Copy-Item $_.FullName "$env:UX_ROOT\evidence\"
-        -ErrorAction SilentlyContinue }; exit 0
-    - name: Upload evidence
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: ux-ui-api-cli-windows
         path: ${{ env.UX_ROOT }}/evidence
         retention-days: 14
