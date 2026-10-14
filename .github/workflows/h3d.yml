@@ -37,31 +37,29 @@ jobs:
               print(hf_hub_download("unsloth/MiniMax-H3-GGUF", f, local_dir=os.environ["MODELS"]))
           PY
           "$W/venv/bin/python" "$W/gttfill.py" 1000 1000 > "$W/types.log" 2>&1 & P=$!; sleep 8; kill $P; cat "$W/types.log"
-      - name: S480 (864x480x124)
+      - name: T235 (864x480x124, GTT held to 23.5 GiB free)
         if: env.ELIGIBLE == '1'
-        timeout-minutes: 90
+        timeout-minutes: 60
         run: |
-          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" S480 "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
-      - name: S480_t (864x480x124, GTT held to 22.5 GiB free)
-        if: env.ELIGIBLE == '1'
-        timeout-minutes: 90
-        run: |
-          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          "$W/venv/bin/python" "$W/gttfill.py" 23.5 > "$W/fill.log" 2>&1 & FP=$!
           for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
-          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" S480_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" T235 "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
-      - name: S768 (1344x768x124)
+      - name: T250 (864x480x124, GTT held to 25.0 GiB free)
         if: env.ELIGIBLE == '1'
-        timeout-minutes: 90
+        timeout-minutes: 60
         run: |
-          VW=1344 VH=768 FRAMES=124 python3 "$W/h3probe.py" S768 "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
-      - name: S768_t (1344x768x124, GTT held to 22.5 GiB free)
-        if: env.ELIGIBLE == '1'
-        timeout-minutes: 90
-        run: |
-          "$W/venv/bin/python" "$W/gttfill.py" 22.5 > "$W/fill.log" 2>&1 & FP=$!
+          "$W/venv/bin/python" "$W/gttfill.py" 25.0 > "$W/fill.log" 2>&1 & FP=$!
           for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
-          VW=1344 VH=768 FRAMES=124 python3 "$W/h3probe.py" S768_t "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" T250 "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
+          kill $FP; wait $FP 2>/dev/null || true
+      - name: T220 (864x480x124, GTT held to 22.0 GiB free)
+        if: env.ELIGIBLE == '1'
+        timeout-minutes: 60
+        run: |
+          "$W/venv/bin/python" "$W/gttfill.py" 22.0 > "$W/fill.log" 2>&1 & FP=$!
+          for i in $(seq 1 300); do grep -q "FILLED gtt" "$W/fill.log" && break; sleep 1; done; cat "$W/fill.log"
+          VW=864 VH=480 FRAMES=124 python3 "$W/h3probe.py" T220 "$VK" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0 || true
           kill $FP; wait $FP 2>/dev/null || true
       - name: Summary
         if: always() && env.ELIGIBLE == '1'
