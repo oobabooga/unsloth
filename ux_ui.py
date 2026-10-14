@@ -282,6 +282,14 @@ def run_ui(page):
                 "picker_after": menu.inner_text()[:1500]}
     step("enable_npu_from_chat_picker", enable)
 
+    def enable_fallback():
+        s = npu_status()
+        if s.get("ready"):
+            return "already ready"
+        api("POST", "/api/npu/enable", timeout=900)
+        return poll(lambda: (x := npu_status()) and x["state"] in ("ready", "failed") and x, 900, 2)
+    step("enable_fallback_via_api_if_ui_failed", enable_fallback, shoot=False)
+
     small = step("catalog_small_model", lambda: model_for(SMALL), shoot=False)
     vision = step("catalog_vision_model", lambda: model_for(VISION), shoot=False)
     step("catalog_overview", lambda: [{k: m[k] for k in ("id", "checkpoint", "size_gb", "downloaded", "max_context_length")} for m in catalog()], shoot=False)
