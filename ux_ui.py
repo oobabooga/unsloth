@@ -87,14 +87,7 @@ def wait_text(pattern, timeout=60):
 
 
 def picker_trigger():
-    page = U.page
-    for name in ("Select model",):
-        loc = page.get_by_role("button", name=name, exact=True)
-        if loc.count():
-            return loc.first
-    # Once a model is chosen the trigger shows its name; it is the first popup button in the chat header.
-    loc = page.locator("main button[aria-haspopup]").first
-    return loc
+    return U.page.locator(".unsloth-model-selector-trigger, [data-tour='chat-model-selector']").first
 
 
 def open_picker(tab="Recommended"):

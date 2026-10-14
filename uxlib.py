@@ -63,6 +63,13 @@ def step(name, fn, *, shoot=True):
 
 def api(method, path, *, ok=(200,), timeout=600, **kw):
     r = session.request(method, BASE + path, timeout=timeout, **kw)
+    if r.status_code == 401 and page is not None:
+        # The browser refreshes its own token; reuse it.
+        try:
+            session.headers["Authorization"] = "Bearer " + page.evaluate("localStorage.getItem('unsloth_auth_token')")
+            r = session.request(method, BASE + path, timeout=timeout, **kw)
+        except Exception:
+            pass
     body = None
     try:
         body = r.json()
