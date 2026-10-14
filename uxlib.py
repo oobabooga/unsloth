@@ -6,7 +6,8 @@ import requests
 ROOT = pathlib.Path(os.environ["UX_ROOT"])
 OUT = ROOT / "evidence"
 OUT.mkdir(parents=True, exist_ok=True)
-SHOTS = OUT / "shots"
+SUITE = os.environ.get("UX_SUITE", "local")
+SHOTS = OUT / ("shots-" + SUITE)
 SHOTS.mkdir(exist_ok=True)
 WIN = sys.platform == "win32"
 PORT = int(os.environ.get("UX_PORT", "8888"))
@@ -23,7 +24,7 @@ def note(text):
     row = {"t": round(time.time()), "note": text}
     NOTES.append(row)
     print("NOTE " + text, flush=True)
-    (OUT / "notes.json").write_text(json.dumps(NOTES, indent=2), encoding="utf-8")
+    (OUT / f"notes-{SUITE}.json").write_text(json.dumps(NOTES, indent=2), encoding="utf-8")
 
 
 def shot(name, full=True):
@@ -50,7 +51,7 @@ def step(name, fn, *, shoot=True):
                "error": str(exc)[:4000], "trace": traceback.format_exc()[-4000:]}
     print("RESULT " + json.dumps(row, default=str)[:3000], flush=True)
     RESULTS.append(row)
-    (OUT / "results.json").write_text(json.dumps(RESULTS, indent=2, default=str), encoding="utf-8")
+    (OUT / f"results-{SUITE}.json").write_text(json.dumps(RESULTS, indent=2, default=str), encoding="utf-8")
     if shoot:
         shot(name + ("" if row["ok"] else "-FAIL"))
     return row.get("value") if row["ok"] else None
