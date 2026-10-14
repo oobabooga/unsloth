@@ -1,0 +1,147 @@
+windows	Set up job	﻿2026-10-14T19:34:25.7594321Z Current runner version: '2.337.0'
+windows	Set up job	2026-10-14T19:34:25.7599777Z Runner name: 'ephemeral-devlab-x2-la03-s05-d06-116052596046'
+windows	Set up job	2026-10-14T19:34:25.7600275Z Runner group name: 'Default'
+windows	Set up job	2026-10-14T19:34:25.7600701Z Machine name: 'X2-LA03-S05-D06'
+windows	Set up job	2026-10-14T19:34:25.7602190Z ##[group]GITHUB_TOKEN Permissions
+windows	Set up job	2026-10-14T19:34:25.7603461Z Metadata: read
+windows	Set up job	2026-10-14T19:34:25.7603754Z ##[endgroup]
+windows	Set up job	2026-10-14T19:34:25.7604886Z Secret source: Actions
+windows	Set up job	2026-10-14T19:34:25.7605394Z Cache mode: write
+windows	Set up job	2026-10-14T19:34:25.7605789Z Prepare workflow directory
+windows	Set up job	2026-10-14T19:34:25.7803234Z Prepare all required actions
+windows	Set up job	2026-10-14T19:34:25.7839503Z Complete job name: windows
+windows	Setup	﻿2026-10-14T19:34:25.8405964Z ##[group]Run $ErrorActionPreference = "Stop"
+windows	Setup	2026-10-14T19:34:25.8406545Z ^[[36;1m$ErrorActionPreference = "Stop"^[[0m
+windows	Setup	2026-10-14T19:34:25.8406933Z ^[[36;1m$W = Join-Path $env:RUNNER_TEMP "h3"^[[0m
+windows	Setup	2026-10-14T19:34:25.8407475Z ^[[36;1mNew-Item -ItemType Directory -Force -Path "$W\models","$W\out","$W\vk","$W\hf","$W\tmp" | Out-Null^[[0m
+windows	Setup	2026-10-14T19:34:25.8408116Z ^[[36;1m$env:W = $W; $env:MODELS = "$W\models"; $env:OUT = "$W\out"^[[0m
+windows	Setup	2026-10-14T19:34:25.8408575Z ^[[36;1m"W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV^[[0m
+windows	Setup	2026-10-14T19:34:25.8409033Z ^[[36;1m"MODELS=$W\models" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV^[[0m
+windows	Setup	2026-10-14T19:34:25.8409567Z ^[[36;1m"OUT=$W\out" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV^[[0m
+windows	Setup	2026-10-14T19:34:25.8410150Z ^[[36;1mGet-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | Format-List^[[0m
+windows	Setup	2026-10-14T19:34:25.8411114Z ^[[36;1mInvoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/oobabooga/unsloth/c2bbe2eabc0b84a4d90e9c23bf1333cc42ac120f/h3probe.py" -OutFile "$W\h3probe.py"^[[0m
+windows	Setup	2026-10-14T19:34:25.8411914Z ^[[36;1m$ProgressPreference = "SilentlyContinue"^[[0m
+windows	Setup	2026-10-14T19:34:25.8412682Z ^[[36;1mInvoke-WebRequest -UseBasicParsing "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$env:TAG/sd-$env:TAG-bin-win-vulkan-x64.zip" -OutFile "$W\vk.zip"^[[0m
+windows	Setup	2026-10-14T19:34:25.8413440Z ^[[36;1mExpand-Archive -Force "$W\vk.zip" "$W\vk"^[[0m
+windows	Setup	2026-10-14T19:34:25.8413982Z ^[[36;1mGet-ChildItem -Recurse "$W\vk" -Filter sd-cli.exe | Select-Object -ExpandProperty FullName^[[0m
+windows	Setup	2026-10-14T19:34:25.8414526Z ^[[36;1mpython -m venv "$W\venv"^[[0m
+windows	Setup	2026-10-14T19:34:25.8414943Z ^[[36;1m& "$W\venv\Scripts\python.exe" -m pip -q install -U "huggingface_hub[hf_xet]"^[[0m
+windows	Setup	2026-10-14T19:34:25.8415461Z ^[[36;1m$env:HF_HOME = "$W\hf"; $env:TMP = "$W\tmp"; $env:TEMP = "$W\tmp"^[[0m
+windows	Setup	2026-10-14T19:34:25.8416665Z ^[[36;1m& "$W\venv\Scripts\python.exe" -c "import os; from huggingface_hub import hf_hub_download as d; [print(d('unsloth/MiniMax-H3-GGUF', f, local_dir=os.environ['MODELS'])) for f in ['minimax_h3_fl2va_pruned-Q4_K.gguf','qwen3vl_32b_minimax_h3-Q4_K_M.gguf','vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors']]"^[[0m
+windows	Setup	2026-10-14T19:34:25.8417834Z ^[[36;1mif ($LASTEXITCODE -ne 0) { exit 1 }^[[0m
+windows	Setup	2026-10-14T19:34:25.8486554Z shell: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.EXE -command ". '{0}'"
+windows	Setup	2026-10-14T19:34:25.8487132Z env:
+windows	Setup	2026-10-14T19:34:25.8487471Z   TAG: master-951-f89d9b1-uafac7a7
+windows	Setup	2026-10-14T19:34:25.8487775Z ##[endgroup]
+windows	Setup	2026-10-14T19:34:26.9076902Z 
+windows	Setup	2026-10-14T19:34:26.9082244Z 
+windows	Setup	2026-10-14T19:34:26.9162183Z Name          : AMD Radeon(TM) 8060S Graphics
+windows	Setup	2026-10-14T19:34:26.9163142Z AdapterRAM    : 536870912
+windows	Setup	2026-10-14T19:34:26.9163732Z DriverVersion : 32.0.31041.3013
+windows	Setup	2026-10-14T19:34:26.9164121Z 
+windows	Setup	2026-10-14T19:34:26.9170901Z 
+windows	Setup	2026-10-14T19:34:26.9173431Z 
+windows	Setup	2026-10-14T19:34:29.8387026Z C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe
+windows	Setup	2026-10-14T19:34:34.4233992Z 
+windows	Setup	2026-10-14T19:34:34.4235680Z [notice] A new release of pip is available: 25.0.1 -> 26.2.1
+windows	Setup	2026-10-14T19:34:34.4237069Z [notice] To update, run: C:\actions-runner-01\_work\_temp\h3\venv\Scripts\python.exe -m pip install --upgrade pip
+windows	Setup	2026-10-14T19:46:31.1602976Z C:\actions-runner-01\_work\_temp\h3\models\minimax_h3_fl2va_pruned-Q4_K.gguf
+windows	Setup	2026-10-14T19:46:31.1604896Z C:\actions-runner-01\_work\_temp\h3\models\qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+windows	Setup	2026-10-14T19:46:31.1605158Z C:\actions-runner-01\_work\_temp\h3\models\vae\minimax_h3_video_vae_fp16.safetensors
+windows	Setup	2026-10-14T19:46:31.1605475Z C:\actions-runner-01\_work\_temp\h3\models\vae\minimax_h3_audio_vae_fp32.safetensors
+windows	List devices	﻿2026-10-14T19:46:31.2284932Z ##[group]Run $VK = (Get-ChildItem -Recurse "$env:W\vk" -Filter sd-cli.exe | Select-Object -First 1).FullName
+windows	List devices	2026-10-14T19:46:31.2285363Z ^[[36;1m$VK = (Get-ChildItem -Recurse "$env:W\vk" -Filter sd-cli.exe | Select-Object -First 1).FullName^[[0m
+windows	List devices	2026-10-14T19:46:31.2285625Z ^[[36;1m"VK=$VK" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV^[[0m
+windows	List devices	2026-10-14T19:46:31.2285792Z ^[[36;1m& $VK --list-devices^[[0m
+windows	List devices	2026-10-14T19:46:31.2285906Z ^[[36;1mexit 0^[[0m
+windows	List devices	2026-10-14T19:46:31.2347280Z shell: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.EXE -command ". '{0}'"
+windows	List devices	2026-10-14T19:46:31.2347507Z env:
+windows	List devices	2026-10-14T19:46:31.2347613Z   TAG: master-951-f89d9b1-uafac7a7
+windows	List devices	2026-10-14T19:46:31.2347751Z   W: C:\actions-runner-01\_work\_temp\h3
+windows	List devices	2026-10-14T19:46:31.2347906Z   MODELS: C:\actions-runner-01\_work\_temp\h3\models
+windows	List devices	2026-10-14T19:46:31.2348068Z   OUT: C:\actions-runner-01\_work\_temp\h3\out
+windows	List devices	2026-10-14T19:46:31.2348217Z ##[endgroup]
+windows	List devices	2026-10-14T19:46:32.1769399Z ggml_vulkan: Found 1 Vulkan devices:
+windows	List devices	2026-10-14T19:46:32.1783598Z ggml_vulkan: 0 = AMD Radeon(TM) 8060S Graphics (AMD proprietary driver) | uma: 1 | fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | matrix cores: KHR_coopmat
+windows	List devices	2026-10-14T19:46:32.1856191Z Vulkan0	AMD Radeon(TM) 8060S Graphics
+windows	List devices	2026-10-14T19:46:32.1856859Z CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S          
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	﻿2026-10-14T19:46:32.2477259Z ##[group]Run python "%W%\h3probe.py" W_auto_studio "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2477795Z ^[[36;1mpython "%W%\h3probe.py" W_auto_studio "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0^[[0m
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2478123Z ^[[36;1mexit /b 0^[[0m
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2485463Z shell: C:\WINDOWS\system32\cmd.EXE /D /E:ON /V:OFF /S /C "CALL "{0}""
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2485665Z env:
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2485768Z   TAG: master-951-f89d9b1-uafac7a7
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2485903Z   W: C:\actions-runner-01\_work\_temp\h3
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2486056Z   MODELS: C:\actions-runner-01\_work\_temp\h3\models
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2486213Z   OUT: C:\actions-runner-01\_work\_temp\h3\out
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2486460Z   VK: C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:32.2486688Z ##[endgroup]
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.1257973Z CMD: C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe --mode vid_gen --diffusion-model C:\actions-runner-01\_work\_temp\h3\models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae C:\actions-runner-01\_work\_temp\h3\models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae C:\actions-runner-01\_work\_temp\h3\models/vae/minimax_h3_audio_vae_fp32.safetensors --llm C:\actions-runner-01\_work\_temp\h3\models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output C:\actions-runner-01\_work\_temp\h3\out\W_auto_studio.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --backend diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.1779449Z [    0.1s]   max_vram: "-1",
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.1780257Z [    0.1s]   disable_segmented_compute: false,
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.1780694Z [    0.1s]   auto_fit: true,
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.4759365Z [    0.4s] [I] --max-vram < 0 auto-detected 97.11 GiB free VRAM (102.22 GiB total), reserving 1.00 GiB; using 96.11 GiB --- ggml_graph_cut.cpp:265
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:36.4819811Z [    0.4s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1358
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:40.6786788Z [    4.6s] [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 16 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:49.2675701Z [   13.1s] [V] qwen3vl compute buffer size: 1.88 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:46:53.7271826Z [   17.6s] [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:47:40.0140968Z [   63.9s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:48:19.0837144Z [  103.0s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:48:20.2764971Z [  104.2s] [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:48:21.7020258Z [  105.6s] [V] minimax_h3_audio_vae compute buffer size: 16.31 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:48:23.3606141Z [  107.2s] [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:48:32.4417830Z [  116.3s] [V] minimax_h3_video_vae compute buffer size: 507.50 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_auto_studio (Studio Auto on Windows, no GTT fit -> TE on GPU)	2026-10-14T19:49:51.8587208Z RESULT {"label": "W_auto_studio", "rc": 0, "secs": 195.7, "base_gtt_gib": 0.49, "peak_gtt_gib": 38.66, "base_vram_gib": 0.05, "peak_vram_gib": 0.33, "base_avail_gib": 117.25, "min_avail_gib": 79.24, "output": 708588}
+windows	W_te_cpu (same, TE on CPU)	﻿2026-10-14T19:49:51.8804874Z ##[group]Run python "%W%\h3probe.py" W_te_cpu "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8805441Z ^[[36;1mpython "%W%\h3probe.py" W_te_cpu "%VK%" --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0^[[0m
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8805727Z ^[[36;1mexit /b 0^[[0m
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8812481Z shell: C:\WINDOWS\system32\cmd.EXE /D /E:ON /V:OFF /S /C "CALL "{0}""
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8812655Z env:
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8812758Z   TAG: master-951-f89d9b1-uafac7a7
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8812890Z   W: C:\actions-runner-01\_work\_temp\h3
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8813040Z   MODELS: C:\actions-runner-01\_work\_temp\h3\models
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8813198Z   OUT: C:\actions-runner-01\_work\_temp\h3\out
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8813443Z   VK: C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:51.8813668Z ##[endgroup]
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:55.6848902Z CMD: C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe --mode vid_gen --diffusion-model C:\actions-runner-01\_work\_temp\h3\models/minimax_h3_fl2va_pruned-Q4_K.gguf --vae C:\actions-runner-01\_work\_temp\h3\models/vae/minimax_h3_video_vae_fp16.safetensors --audio-vae C:\actions-runner-01\_work\_temp\h3\models/vae/minimax_h3_audio_vae_fp32.safetensors --llm C:\actions-runner-01\_work\_temp\h3\models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf --prompt a red fox running through snow, cinematic --cfg-scale 1 --width 640 --height 384 --rng cpu --fps 24 --video-frames 25 --steps 2 --seed 1 --output C:\actions-runner-01\_work\_temp\h3\out\W_te_cpu.webm -v --offload-to-cpu --diffusion-fa --max-vram -1 --clip-on-cpu --backend diffusion=Vulkan0,te=cpu,vae=Vulkan0
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:55.7496921Z [    0.1s]   max_vram: "-1",
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:55.7497719Z [    0.1s]   disable_segmented_compute: false,
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:55.7498185Z [    0.1s]   auto_fit: true,
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:56.0224507Z [    0.3s] [W] --max-vram < 0 requested, but the main backend is CPU; disabling graph splitting --- ggml_graph_cut.cpp:245
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:56.0240702Z [    0.3s] [I] --max-vram < 0 auto-detected 97.11 GiB free VRAM (102.22 GiB total), reserving 1.00 GiB; using 96.11 GiB --- ggml_graph_cut.cpp:265
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:56.0299955Z [    0.3s] [I] total params memory size = 33909.96MB (VRAM 0.00MB, RAM 33909.96MB): text_encoders 17375.93MB(RAM), diffusion_model 10975.93MB(RAM), vae 5558.10MB(RAM), controlnet 0.00MB(N/A), extensions 0.00MB(N/A) --- diffusion_engine.cpp:1358
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:59.5493484Z [    3.9s] [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:494
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:49:59.9000554Z [    4.2s] [V] qwen3vl compute buffer size: 1.88 MB(RAM) on CPU (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:50:02.7280730Z [    7.0s] [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:50:32.6523964Z [   37.0s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:51:00.9983777Z [   65.3s] [V] minimax_h3 compute buffer size: 747.13 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:51:02.0836809Z [   66.4s] [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:51:02.2746152Z [   66.6s] [V] minimax_h3_audio_vae compute buffer size: 16.31 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:51:03.5783813Z [   67.9s] [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:51:09.4578581Z [   73.8s] [V] minimax_h3_video_vae compute buffer size: 507.50 MB(VRAM) on Vulkan0 (peak across 1 segment) --- ggml_runner.cpp:1022
+windows	W_te_cpu (same, TE on CPU)	2026-10-14T19:52:17.8425749Z RESULT {"label": "W_te_cpu", "rc": 0, "secs": 142.2, "base_gtt_gib": 0.49, "peak_gtt_gib": 22.72, "base_vram_gib": 0.05, "peak_vram_gib": 0.3, "base_avail_gib": 118.28, "min_avail_gib": 79.73, "output": 711564}
+windows	Summary	﻿2026-10-14T19:52:17.8625371Z ##[group]Run type "%OUT%\results.jsonl"
+windows	Summary	2026-10-14T19:52:17.8625569Z ^[[36;1mtype "%OUT%\results.jsonl"^[[0m
+windows	Summary	2026-10-14T19:52:17.8625837Z ^[[36;1mfor %%f in ("%OUT%\*.log") do (echo === %%f & findstr /i /c:"error" /c:"lost" /c:"abort" /c:"assert" /c:"prepared params" /c:"out of" "%%f")^[[0m
+windows	Summary	2026-10-14T19:52:17.8626092Z ^[[36;1mexit /b 0^[[0m
+windows	Summary	2026-10-14T19:52:17.8632463Z shell: C:\WINDOWS\system32\cmd.EXE /D /E:ON /V:OFF /S /C "CALL "{0}""
+windows	Summary	2026-10-14T19:52:17.8632635Z env:
+windows	Summary	2026-10-14T19:52:17.8632743Z   TAG: master-951-f89d9b1-uafac7a7
+windows	Summary	2026-10-14T19:52:17.8632879Z   W: C:\actions-runner-01\_work\_temp\h3
+windows	Summary	2026-10-14T19:52:17.8633028Z   MODELS: C:\actions-runner-01\_work\_temp\h3\models
+windows	Summary	2026-10-14T19:52:17.8633262Z   OUT: C:\actions-runner-01\_work\_temp\h3\out
+windows	Summary	2026-10-14T19:52:17.8633510Z   VK: C:\actions-runner-01\_work\_temp\h3\vk\sd-master-951-f89d9b1-uafac7a7-bin-win-vulkan-x64\sd-cli.exe
+windows	Summary	2026-10-14T19:52:17.8633756Z ##[endgroup]
+windows	Summary	2026-10-14T19:52:17.8708484Z {"label": "W_auto_studio", "rc": 0, "secs": 195.7, "base_gtt_gib": 0.49, "peak_gtt_gib": 38.66, "base_vram_gib": 0.05, "peak_vram_gib": 0.33, "base_avail_gib": 117.25, "min_avail_gib": 79.24, "output": 708588}
+windows	Summary	2026-10-14T19:52:17.8709070Z {"label": "W_te_cpu", "rc": 0, "secs": 142.2, "base_gtt_gib": 0.49, "peak_gtt_gib": 22.72, "base_vram_gib": 0.05, "peak_vram_gib": 0.3, "base_avail_gib": 118.28, "min_avail_gib": 79.73, "output": 711564}
+windows	Summary	2026-10-14T19:52:17.8710799Z === C:\actions-runner-01\_work\_temp\h3\out\W_auto_studio.log 
+windows	Summary	2026-10-14T19:52:17.8774699Z [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 16 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8775114Z [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8775802Z [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8776183Z [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8784199Z === C:\actions-runner-01\_work\_temp\h3\out\W_te_cpu.log 
+windows	Summary	2026-10-14T19:52:17.8826894Z [V] model manager prepared params backend buffers (16239.66 MB, 551 tensors, 1 blocks, RAM) on CPU --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8828110Z [V] model manager prepared params backend buffers (10975.93 MB, 532 tensors, 12 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8828514Z [V] model manager prepared params backend buffers (247.65 MB, 781 tensors, 1 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Summary	2026-10-14T19:52:17.8828907Z [V] model manager prepared params backend buffers (4636.94 MB, 441 tensors, 5 blocks, RAM) on Vulkan_Host --- model_manager.cpp:494
+windows	Complete job	﻿2026-10-14T19:52:17.8909547Z Cleaning up orphan processes
