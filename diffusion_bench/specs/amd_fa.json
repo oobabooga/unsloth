@@ -1,0 +1,268 @@
+{
+ "name": "amd_fa",
+ "description": "Fused attention on gfx1151, origin/main only: *_nat0/*_nat = attention_backend native (diffusers SDPA, AOTriton, Studio ROCm default; A/A pair), *_fack = flash with the DAO flash_attn CK build, *_fatr = flash with the Triton AMD flash_attn build (separate --target dir on PYTHONPATH, FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE), *_auto = auto (what Studio picks with flash_attn installed). LPIPS vs *_nat. n=5.",
+ "models": {
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "flux2_klein_4b": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 2,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "klein_nat0",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "klein_nat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "klein_fack",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "klein_fatr",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+    "PYTHONPATH": "@FA_TRITON_DIR@"
+   }
+  },
+  {
+   "tag": "klein_auto",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "zimg_nat0",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_nat",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_fack",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_fatr",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+    "PYTHONPATH": "@FA_TRITON_DIR@"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_auto",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  }
+ ]
+}

@@ -1,0 +1,186 @@
+name: "AMD CI: PR 13792 head 4d57da496 vs merge base, per-bucket ROCm flash admission, gfx1151 (Linux)"
+
+# Measurement only, origin/main. No secret is referenced; every model is a public download.
+
+on:
+  push:
+    branches: [amd-ci-pr13792-final]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "6c3bd1625625c7310d655db809a790d917c7880a"
+  HEAD_SHA: "4d57da496f60373a399a7cd4f397462ce0c09380"
+  FA_REPO: "https://github.com/Dao-AILab/flash-attention"
+  FA_SHA: "1fc0221183e799363001394a12dd9e78e15f5dda"
+  FA_TRITON_SHA: "bbe25bacff9f337568b66e69950e549df9839068"
+
+jobs:
+
+  gpu:
+    name: "fused attention on gfx1151 (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 720
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr13792-final"
+
+      - name: Disk, memory, cores, ROCm toolchain on the host
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"; free -g; nproc
+          command -v hipcc; ls -d /opt/rocm* 2>/dev/null
+          mkdir -p "$AMD_CI_WORK/out"
+          exit 0
+
+      - name: Resolve states (merge base 6c3bd1625, and merge base + PR 13792 head 4d57da496 diff)
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/pr13792_final.patch"
+          git -C "$AMD_CI_WORK/states/head" diff --cached --stat
+          # the patched tree must equal PR head 4d57da496 file for file
+          for pair in studio/backend/core/inference/diffusion.py=4db083cba0bee52aa4e486d793d1f920c74f32b6 \
+                      studio/backend/core/inference/diffusion_attention.py=80f53b9d187b3cd608fcdee513e45aa66133b2e4 \
+                      studio/backend/core/inference/video.py=5d36cb58685641b5db91d9e98bb18ab3127441c6 \
+                      studio/backend/tests/test_diffusion_attention_rocm_flash.py=542a4c74300433cca450e7b9058cdbb56cd8bdfb; do
+            got=$(git -C "$AMD_CI_WORK/states/head" rev-parse ":${pair%%=*}")
+            [ "$got" = "${pair#*=}" ] || { echo "FATAL: ${pair%%=*} is $got, head 4d57da496 has ${pair#*=}"; exit 1; }
+          done
+          echo "head tree matches 4d57da496 on all 4 PR files"
+          python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK" \
+            --base-sha "$BASE_SHA" --patch pr13792_final.patch --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Studio install and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/base"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: "flash-attention: CK build for gfx1151 (ROCm SDK devel from pip), Triton build in its own dir"
+        timeout-minutes: 300
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          "$AMD_CI_PY" -m pip install -q setuptools wheel packaging psutil ninja einops kernels > "$O/fa_deps.log" 2>&1
+          echo "deps rc=$?"
+          "$AMD_CI_PY" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|pytorch)" | tee "$O/rocm_pkgs.txt"
+          echo "host hipcc: $(command -v hipcc) (run 1: a wrapper whose /usr/lib/llvm/bin/clang++ is missing)"
+          RV=$("$AMD_CI_PY" -c "import importlib.metadata as m; print(m.version('rocm'))")
+          for IDX in https://repo.amd.com/rocm/whl/gfx1151/ https://rocm.nightlies.amd.com/v2/gfx1151/; do
+            "$AMD_CI_PY" -m pip install "rocm[devel]==$RV" --extra-index-url "$IDX" >> "$O/rocm_devel.log" 2>&1 && { echo "rocm[devel]==$RV from $IDX"; break; }
+          done
+          tail -3 "$O/rocm_devel.log"
+          VBIN=$(dirname "$AMD_CI_PY")
+          ROOT=$("$VBIN/rocm-sdk" path --root 2>>"$O/rocm_devel.log")
+          [ -n "$ROOT" ] || ROOT=$("$AMD_CI_PY" -m rocm_sdk path --root 2>>"$O/rocm_devel.log")
+          echo "ROCm SDK root: '$ROOT'"; ls "$ROOT/bin" 2>/dev/null | grep -E "^(hipcc|amdclang|clang)" | head -5
+          export ROCM_HOME="$ROOT" ROCM_PATH="$ROOT" HIP_PATH="$ROOT" PATH="$ROOT/bin:$ROOT/lib/llvm/bin:$PATH"
+          echo "hipcc now: $(command -v hipcc)"; hipcc --version 2>&1 | head -3
+          git clone -q "$FA_REPO" "$AMD_CI_WORK/src/flash-attention"
+          cd "$AMD_CI_WORK/src/flash-attention"
+          git checkout -q "$FA_SHA"
+          git submodule update --init --depth 1 csrc/composable_kernel > /dev/null 2>&1
+          git -C csrc/composable_kernel log -1 --format='CK %H %cd'
+          T0=$(date +%s)
+          GPU_ARCHS=gfx1151 OPT_DIM=128 MAX_JOBS=$(nproc) "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps . > "$O/fa_ck_build.log" 2>&1
+          rc=$?
+          T1=$(date +%s)
+          echo "CK build rc=$rc in $((T1-T0)) s"; grep -m5 -E "error:|FAILED" "$O/fa_ck_build.log" | cut -c1-300; tail -5 "$O/fa_ck_build.log"
+          trc=-1
+          echo "{\"ck_build_rc\": $rc, \"ck_build_s\": $((T1-T0)), \"triton_build_rc\": $trc, \"rocm_root\": \"$ROOT\"}" > "$O/fa_build.json"
+          exit 0
+
+      - name: "Persisted verdicts + per-bucket probe (1024..65536 tokens): two processes per state, then forced modes (head)"
+        timeout-minutes: 60
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/persist"; mkdir -p "$O"
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          "$AMD_CI_PY" -c "import flash_attn, sys; print('flash_attn', flash_attn.__version__, flash_attn.__file__)"
+          run() {  # state label [env...]
+            st=$1; lb=$2; shift 2
+            env "$@" UNSLOTH_DIFFUSION_ROCM_FLASH_CACHE_DIR="$AMD_CI_WORK/rocm_flash_cache_$st" \
+              "$AMD_CI_PY" amd_ci/probes/rocm_flash_persist_probe.py \
+              --backend-dir "$AMD_CI_WORK/states/$st/studio/backend" --label "${st}_$lb" \
+              --out "$O/persist_${st}_$lb.json" > "$O/persist_${st}_$lb.log" 2>&1
+            echo "== $st $lb rc=$?"; grep -E "ROCm flash|flash_attn|Error|error" "$O/persist_${st}_$lb.log" | cut -c1-400
+          }
+          run base 1; run base 2
+          run head 1; run head 2
+          run head off UNSLOTH_DIFFUSION_ROCM_FLASH=0
+          run head on UNSLOTH_DIFFUSION_ROCM_FLASH=1
+          python3 amd_ci/criteria/rocm_flash_persist_check.py --dir "$O" --out "$O/persist_verdict.json"
+          echo "persist check rc=$?"
+          exit 0
+
+      - name: "Differential: auto attention on ROCm with flash_attn CK installed (Z-Image, Wan2.2-5B 33f + 49f wan_49*)"
+        timeout-minutes: 380
+        run: |
+          set +e
+          export TORCH_HOME="$AMD_CI_WORK/torch_home"
+          export HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_differential.py \
+            --out-dir "$AMD_CI_WORK/out/ab" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_fa_final_ab.json --budget-min 330.0 --cell-timeout 3600.0 --defect slow:zimg_auto:zimg_nat:0.95
+          cat "$AMD_CI_WORK/out/ab/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/ab"
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            [ "$pid" = "$$" ] && continue
+            cwd=$(readlink "$d/cwd" 2>/dev/null)
+            case "$cwd" in
+              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
+            esac
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr13792-final
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/cell.log
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/record.json
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.png
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.log
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/logs
+          retention-days: 14
+          if-no-files-found: warn

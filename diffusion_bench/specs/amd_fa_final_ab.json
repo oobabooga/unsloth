@@ -1,0 +1,289 @@
+{
+ "name": "amd_fa_final_ab",
+ "description": "PR 13792 head 4d57da496 vs merge base 6c3bd1625 on gfx1151 with the DAO flash_attn CK build: *_nat0/*_nat native A/A, *_auto auto (head: 4096-token load probe, lazy per-bucket timing), zimg_auto2 second Studio process (head: cached verdicts), *_off auto with UNSLOTH_DIFFUSION_ROCM_FLASH=0. wan_* Wan2.2-TI2V-5B 1280x704x33 (7920 tokens, bucket 4096), 10 steps, n=3; wan_49* 1280x704x49 (11440 tokens, bucket 8192: timed lazily on the first eager call mid-generation), n=1.",
+ "models": {
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 2,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "zimg_nat0",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_nat",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_auto",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_auto2",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_off",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nat",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_FLASH": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "wan_nat0",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_nat",
+   "kind": "video",
+   "prompts": "video_3",
+   "width": 1280,
+   "height": 704,
+   "frames": 33,
+   "fps": null,
+   "steps": 10,
+   "short_steps": 2,
+   "guidance": null,
+   "n": 3,
+   "save_frames_every": 8,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_nat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_nat",
+   "kind": "video",
+   "prompts": "video_3",
+   "width": 1280,
+   "height": 704,
+   "frames": 33,
+   "fps": null,
+   "steps": 10,
+   "short_steps": 2,
+   "guidance": null,
+   "n": 3,
+   "save_frames_every": 8,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_auto",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_nat",
+   "kind": "video",
+   "prompts": "video_3",
+   "width": 1280,
+   "height": 704,
+   "frames": 33,
+   "fps": null,
+   "steps": 10,
+   "short_steps": 2,
+   "guidance": null,
+   "n": 3,
+   "save_frames_every": 8,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_49nat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_49nat",
+   "kind": "video",
+   "prompts": "video_3",
+   "width": 1280,
+   "height": 704,
+   "frames": 49,
+   "fps": null,
+   "steps": 10,
+   "short_steps": 2,
+   "guidance": null,
+   "n": 1,
+   "save_frames_every": 8,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "default",
+    "attention_backend": "native"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_49auto",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_49nat",
+   "kind": "video",
+   "prompts": "video_3",
+   "width": 1280,
+   "height": 704,
+   "frames": 49,
+   "fps": null,
+   "steps": 10,
+   "short_steps": 2,
+   "guidance": null,
+   "n": 1,
+   "save_frames_every": 8,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "default",
+    "attention_backend": "auto"
+   },
+   "env": {
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  }
+ ]
+}
