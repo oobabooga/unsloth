@@ -91,7 +91,7 @@ def main() -> int:
             env.update(arm["env"])
             cmd = [str(exe), "-m", args.model, "-ngl", "99", "-cmoe", "--moe-cache-mib", str(args.cache_mib),
                    "-fa", "on", "-c", "2048", "-p", PROMPT, "-n", str(args.n_predict), "--temp", "0",
-                   "--seed", "42", "-lv", "3", "-no-cnv", "--no-display-prompt", "--load-mode", arm["mode"]]
+                   "--seed", "42", "-lv", "4", "-no-cnv", "--no-display-prompt", "--load-mode", arm["mode"]]
             before = free_m()
             t0 = time.time()
             try:
