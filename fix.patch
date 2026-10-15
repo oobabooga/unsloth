@@ -17,7 +17,7 @@ index 8db45e3224..7278f4a7a2 100644
  
  **MacOS, WSL, Linux:** `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.sh | sh`
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index 7eda56981e..4e1ecd7848 100644
+index 7eda56981e..b8614fb1bd 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -10913,7 +10913,10 @@ async def _reject_unservable_model(
@@ -32,10 +32,52 @@ index 7eda56981e..4e1ecd7848 100644
          path = getattr(getattr(fastapi_request, "url", None), "path", None)
          raise HTTPException(
              status_code = 404,
-@@ -11155,6 +11158,41 @@ def _audio_cpp_switch_target(requested_model: Optional[str]) -> Optional[tuple]:
+@@ -11155,6 +11158,83 @@ def _audio_cpp_switch_target(requested_model: Optional[str]) -> Optional[tuple]:
      return (model.id, model.variant.key, model.id, False)
  
  
++async def _refuse_unservable_npu_switch(
++    named_model: str,
++    fastapi_request: Request,
++    *,
++    gguf_only: bool,
++    needs_vision: bool,
++    needs_audio: bool,
++    rejection_prefix: str,
++) -> None:
++    """400 for a request naming an NPU model that could not serve it once loaded."""
++    from core.inference.npu_backend import NpuError, get_npu_backend, model_id_from_path
++
++    message = None
++    if gguf_only:
++        message = (
++            f"The NPU model '{named_model}' serves /v1/chat/completions only. "
++            "Load a GGUF model to use this endpoint."
++        )
++    elif needs_audio:
++        message = f"{rejection_prefix}The NPU model '{named_model}' takes no audio or video input."
++    elif needs_vision and not await asyncio.to_thread(_loaded_satisfies, named_model):
++        try:
++            model = await asyncio.to_thread(
++                get_npu_backend().loadable_model, model_id_from_path(named_model)
++            )
++        except NpuError:
++            model = None  # Not downloaded or unknown: the load reports that itself.
++        if model is not None and not model.vision:
++            message = f"{rejection_prefix}The NPU model '{named_model}' cannot read images."
++    if message is None:
++        return
++    path = getattr(getattr(fastapi_request, "url", None), "path", None)
++    raise HTTPException(
++        status_code = 400,
++        detail = (
++            error_body_for_path(path, message, status = 400, code = "invalid_value", param = "model")
++            if isinstance(path, str)
++            else message
++        ),
++    )
++
++
 +async def _auto_switch_npu_model(
 +    named_model: str, fastapi_request: Request, current_subject: str
 +) -> None:
@@ -74,13 +116,28 @@ index 7eda56981e..4e1ecd7848 100644
  async def _maybe_auto_switch_model(
      requested_model: Optional[str],
      fastapi_request: Request,
-@@ -11345,6 +11383,15 @@ async def _maybe_auto_switch_model(
+@@ -11345,6 +11425,30 @@ async def _maybe_auto_switch_model(
              await _reject_unservable_model(requested_model, fastapi_request)
              return
  
 +    from core.inference.npu_backend import is_npu_model_path
 +
 +    if auto_switch_on and named_model and is_npu_model_path(named_model):
++        # Refused before the switch, so a request the NPU cannot serve never evicts the resident model.
++        await _refuse_unservable_npu_switch(
++            named_model,
++            fastapi_request,
++            gguf_only = gguf_only,
++            needs_vision = gguf_requires_vision,
++            needs_audio = bool(
++                require_audio_input
++                or require_video
++                or require_speech
++                or require_audio_workflow
++                or audio_preflight
++            ),
++            rejection_prefix = rejection_prefix,
++        )
 +        # The GGUF and checkpoint resolution below can never find an NPU model.
 +        await _auto_switch_npu_model(named_model, fastapi_request, current_subject)
 +        if claim_resident:
@@ -90,7 +147,7 @@ index 7eda56981e..4e1ecd7848 100644
      async def _resolve_and_switch() -> None:
          from core.inference.openai_auto_download import looks_like_quant, split_model_ref
  
-@@ -29801,6 +29848,17 @@ _NPU_CUT_SHORT_ERROR = {
+@@ -29801,6 +29905,17 @@ _NPU_CUT_SHORT_ERROR = {
  }
  
  
@@ -108,7 +165,7 @@ index 7eda56981e..4e1ecd7848 100644
  class _NpuStreamRelay:
      """Normalize model IDs, enforce stop sequences, and collect non-streaming replies.
  
-@@ -29842,16 +29900,22 @@ class _NpuStreamRelay:
+@@ -29842,16 +29957,22 @@ class _NpuStreamRelay:
          self._pending = buffer[len(buffer) - keep :] if keep else ""
          return buffer[: len(buffer) - keep] if keep else buffer
  
@@ -141,7 +198,7 @@ index 7eda56981e..4e1ecd7848 100644
  
      def feed(self, line: str) -> list[str]:
          """The lines to send on for one line of the upstream stream."""
-@@ -29919,6 +29983,11 @@ class _NpuStreamRelay:
+@@ -29919,6 +30040,11 @@ class _NpuStreamRelay:
              elif isinstance(content, str):
                  self.content += content
              if choice.get("finish_reason") is not None:
@@ -153,7 +210,7 @@ index 7eda56981e..4e1ecd7848 100644
                  self.finish_reason = choice["finish_reason"]
                  if self._pending:
                      # The reply ended partway into a stop sequence, so what was held back is text.
-@@ -29930,7 +29999,9 @@ class _NpuStreamRelay:
+@@ -29930,7 +30056,9 @@ class _NpuStreamRelay:
          return out
  
      def completion(self) -> dict:
@@ -164,7 +221,7 @@ index 7eda56981e..4e1ecd7848 100644
          if self.reasoning:
              message["reasoning_content"] = self.reasoning
          if self.tool_calls:
-@@ -42092,6 +42163,17 @@ async def anthropic_messages(
+@@ -42092,6 +42220,17 @@ async def anthropic_messages(
      # so validation runs before the reload hook gets a chance to restore the model.
      # Plain detail, not _no_model_loaded_error: that helper leaves this case unchanged.
      if not llama_backend.is_loaded and not _automatic_model_load_may_run():
@@ -267,10 +324,10 @@ index 922b9c8557..31445b12eb 100644
 +    assert message["content"] is None
 +    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
 diff --git a/studio/backend/tests/test_openai_auto_switch.py b/studio/backend/tests/test_openai_auto_switch.py
-index 9e84e6cac6..bc9f2bcb14 100644
+index 9e84e6cac6..dee02bf77e 100644
 --- a/studio/backend/tests/test_openai_auto_switch.py
 +++ b/studio/backend/tests/test_openai_auto_switch.py
-@@ -12367,3 +12367,51 @@ def test_tensor_split_requires_matching_gpu_ids_at_the_settings_boundary(ids):
+@@ -12367,3 +12367,117 @@ def test_tensor_split_requires_matching_gpu_ids_at_the_settings_boundary(ids):
          settings_route.ModelOverridePayload(
              model_id = "org/split-GGUF", gpu_ids = ids, tensor_split = [3, 1]
          )
@@ -322,6 +379,72 @@ index 9e84e6cac6..bc9f2bcb14 100644
 +    assert excinfo.value.status_code == 400
 +    assert _NPU_MODEL in excinfo.value.detail
 +    assert "No GGUF model loaded" not in excinfo.value.detail
++
++
++def test_messages_with_switching_on_and_an_npu_model_loaded_names_it(monkeypatch):
++    # The early check is skipped once automatic loads may run; the later one must say the same.
++    from models.inference import AnthropicMessagesRequest
++
++    _wired(monkeypatch, _FakeBackend(None), None, enabled = True)
++    monkeypatch.setattr(
++        inference_route,
++        "_resident_npu_model",
++        lambda: SimpleNamespace(model_path = _NPU_MODEL, id = "qwen3-0.6b-FLM"),
++    )
++    monkeypatch.setattr(inference_route, "_loaded_satisfies", lambda model: model == _NPU_MODEL)
++    request = SimpleNamespace(
++        state = SimpleNamespace(), url = SimpleNamespace(path = "/v1/messages"), method = "POST"
++    )
++    payload = AnthropicMessagesRequest(
++        model = _NPU_MODEL, max_tokens = 16, messages = [{"role": "user", "content": "hi"}]
++    )
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(inference_route.anthropic_messages(payload, request, "tester"))
++    assert excinfo.value.status_code == 400
++    assert _NPU_MODEL in str(excinfo.value.detail)
++
++
++def _npu_catalog_entry(monkeypatch, *, vision):
++    from core.inference import npu_backend as nb
++    class _Npu:
++        def loadable_model(self, model_id):
++            return SimpleNamespace(id = model_id, vision = vision)
++
++    monkeypatch.setattr(nb, "get_npu_backend", lambda: _Npu())
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "words"),
++    [
++        ({"gguf_only": True}, "serves /v1/chat/completions only"),
++        ({"require_audio_input": True}, "takes no audio or video input"),
++        ({"require_video": True}, "takes no audio or video input"),
++        ({"require_vision": True}, "cannot read images"),
++    ],
++)
++def test_a_request_the_npu_model_cannot_serve_never_switches(monkeypatch, kwargs, words):
++    # Loading first evicted the resident GGUF, then the endpoint failed on the NPU model anyway.
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    _npu_catalog_entry(monkeypatch, vision = False)
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(
++            inference_route._maybe_auto_switch_model(_NPU_MODEL, object(), "tester", **kwargs)
++        )
++    assert excinfo.value.status_code == 400
++    assert words in str(excinfo.value.detail)
++    assert rec.calls == []
++    assert backend.model_identifier == "unsloth/A-GGUF"
++
++
++def test_an_image_request_switches_to_a_vision_npu_model(monkeypatch):
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    _npu_catalog_entry(monkeypatch, vision = True)
++    asyncio.run(
++        inference_route._maybe_auto_switch_model(
++            _NPU_MODEL, object(), "tester", require_vision = True
++        )
++    )
++    assert [call.model_path for call in rec.calls] == [_NPU_MODEL]
 diff --git a/studio/frontend/src/app/routes/hub.tsx b/studio/frontend/src/app/routes/hub.tsx
 index d353f1ee0a..40f45614b9 100644
 --- a/studio/frontend/src/app/routes/hub.tsx
@@ -344,7 +467,7 @@ index d353f1ee0a..40f45614b9 100644
    },
  });
 diff --git a/studio/frontend/src/features/hub/hub-page.tsx b/studio/frontend/src/features/hub/hub-page.tsx
-index b8ee4cfd63..d71535ac73 100644
+index b8ee4cfd63..62f1eab4a9 100644
 --- a/studio/frontend/src/features/hub/hub-page.tsx
 +++ b/studio/frontend/src/features/hub/hub-page.tsx
 @@ -26,7 +26,12 @@ import {
@@ -361,45 +484,148 @@ index b8ee4cfd63..d71535ac73 100644
  import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
  import { GuidedTour, useGuidedTourController } from "@/features/tour";
  import { useDebouncedValue } from "@/hooks/use-debounced-value";
-@@ -596,7 +601,10 @@ export function ModelsPage() {
-     );
-   }, [urlResourceType]);
-   const [discoverFormat, setDiscoverFormat] = useState<ModelFormatFilter>(
--    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended",
-+    () =>
-+      hubSearch.format === "npu"
-+        ? "npu"
-+        : (findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended"),
-   );
-   const [downloadedFormat, setDownloadedFormat] =
-     useState<ModelFormatFilter>("all");
-@@ -619,7 +627,24 @@ export function ModelsPage() {
+@@ -619,26 +624,45 @@ export function ModelsPage() {
    const npuSource: NpuPickerSource | undefined = npuStatus?.supported
      ? { status: npuStatus, onStatusChange: setNpuStatus }
      : undefined;
 -  const formatFilter = isDiscoverTab ? discoverFormat : downloadedFormat;
-+  // A link to the NPU list on a machine without one shows the feed, not an empty list.
++  // The URL alone holds the Discover NPU list: a refresh during a long NPU download used to drop
++  // back to the feed, and a link or Back lands on it. Every other choice clears `format`. A link to
++  // it on a machine without an NPU shows the feed rather than an empty list.
++  const urlFormat = hubSearch.format ?? null;
 +  const shownDiscoverFormat =
-+    discoverFormat === "npu" && npuStatus && !npuStatus.supported
-+      ? (findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended")
++    urlFormat === "npu" && !(npuStatus && !npuStatus.supported)
++      ? "npu"
 +      : discoverFormat;
 +  const formatFilter = isDiscoverTab ? shownDiscoverFormat : downloadedFormat;
-+  // The NPU list lives in the URL: a refresh during a long NPU download used to drop back to the
-+  // feed, and the picker can link straight to it.
-+  const urlFormat = hubSearch.format ?? null;
-+  useEffect(() => {
-+    const wanted = shownDiscoverFormat === "npu" && !isDatasetMode ? "npu" : null;
-+    if (wanted === urlFormat) return;
-+    void navigate({
-+      to: "/hub",
-+      search: (prev) => ({ ...prev, format: wanted ?? undefined }),
-+      replace: true,
-+    });
-+  }, [shownDiscoverFormat, isDatasetMode, urlFormat, navigate]);
    const npuCatalogSource =
      formatFilter === "npu" && !isDatasetMode ? npuSource : undefined;
    const showNpuCatalog = npuCatalogSource !== undefined;
-@@ -1827,6 +1852,12 @@ export function ModelsPage() {
+   const setFormatFilter = useCallback(
+     (next: ModelFormatFilter) => {
+       if (isDiscoverTab) {
++        if (next === "npu") {
++          void navigate({
++            to: "/hub",
++            search: (prev) => ({ ...prev, section: undefined, format: "npu" }),
++          });
++          return;
++        }
+         setDiscoverFormat(next);
+-        if (urlSection) {
++        if (urlSection || urlFormat) {
+           // Exit the section so its preset does not re-impose its own format.
+           void navigate({
+             to: "/hub",
+-            search: (prev) => ({ ...prev, section: undefined }),
++            search: (prev) => ({
++              ...prev,
++              section: undefined,
++              format: undefined,
++            }),
+           });
+         }
+       } else {
+         setDownloadedFormat(next);
+       }
+     },
+-    [isDiscoverTab, urlSection, navigate],
++    [isDiscoverTab, urlSection, urlFormat, navigate],
+   );
+   const hubSource = useHubSource();
+   const [storedSearchFilters, setSearchFilters] = useState<ModelSearchFilters>(
+@@ -718,6 +742,7 @@ export function ModelsPage() {
+           kind: next === "datasets" ? "datasets" : undefined,
+           section: undefined,
+           model: undefined,
++          format: undefined,
+         }),
+         replace: true,
+       });
+@@ -741,7 +766,12 @@ export function ModelsPage() {
+       setQuery("");
+       void navigate({
+         to: "/hub",
+-        search: (prev) => ({ ...prev, section, model: undefined }),
++        search: (prev) => ({
++          ...prev,
++          section,
++          model: undefined,
++          format: undefined,
++        }),
+       });
+     },
+     [urlSection, navigate],
+@@ -756,7 +786,7 @@ export function ModelsPage() {
+     setSortBrowseActive(false);
+     void navigate({
+       to: "/hub",
+-      search: (prev) => ({ ...prev, section: undefined }),
++      search: (prev) => ({ ...prev, section: undefined, format: undefined }),
+     });
+   }, [navigate]);
+   const handleResetToDiscover = useCallback(() => {
+@@ -780,6 +810,7 @@ export function ModelsPage() {
+         section: undefined,
+         model: undefined,
+         kind: undefined,
++        format: undefined,
+       }),
+     });
+   }, [navigate, setModelsTab]);
+@@ -813,6 +844,7 @@ export function ModelsPage() {
+         audioTask: undefined,
+         section: undefined,
+         model: undefined,
++        format: undefined,
+       }),
+       replace: true,
+     });
+@@ -1274,10 +1306,10 @@ export function ModelsPage() {
+   const handleClearFilters = useCallback(() => {
+     if (isDiscoverTab) {
+       setDiscoverFormat("all");
+-      if (urlSection) {
++      if (urlSection || urlFormat) {
+         void navigate({
+           to: "/hub",
+-          search: (prev) => ({ ...prev, section: undefined }),
++          search: (prev) => ({ ...prev, section: undefined, format: undefined }),
+           replace: true,
+         });
+       }
+@@ -1287,7 +1319,7 @@ export function ModelsPage() {
+     }
+     setCapabilityFilter("all");
+     setSearchFilters({});
+-  }, [isDiscoverTab, urlSection, navigate]);
++  }, [isDiscoverTab, urlSection, urlFormat, navigate]);
+   const handleDiscoverFetchIntent = useCallback(() => {
+     setDiscoverFetchIntent((value) => value + 1);
+   }, []);
+@@ -1377,7 +1409,12 @@ export function ModelsPage() {
+       setQuery("");
+       void navigate({
+         to: "/hub",
+-        search: (prev) => ({ ...prev, model: undefined, section: undefined }),
++        search: (prev) => ({
++          ...prev,
++          model: undefined,
++          section: undefined,
++          format: undefined,
++        }),
+       });
+       return;
+     }
+@@ -1559,6 +1596,7 @@ export function ModelsPage() {
+           section: undefined,
+           model: undefined,
+           kind: undefined,
++          format: undefined,
+         }),
+       });
+     },
+@@ -1827,6 +1865,12 @@ export function ModelsPage() {
      if (isFeedMode) {
        return (
          <div className="flex flex-col gap-6 pt-6">
@@ -412,7 +638,7 @@ index b8ee4cfd63..d71535ac73 100644
            {allModelsView !== "split" && (
              <HubFeed
                trending={{
-@@ -1889,6 +1920,8 @@ export function ModelsPage() {
+@@ -1889,6 +1933,8 @@ export function ModelsPage() {
    }, [
      isDiscoverTab,
      isFeedMode,
@@ -505,7 +731,7 @@ index 0c7263e398..18bbd5a988 100644
    type NpuCatalog,
    type NpuPickerSource,
 diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
-index 688f32c964..aec4a56a15 100644
+index 688f32c964..28886fcc90 100644
 --- a/studio/frontend/src/features/npu/npu-setup-notice.tsx
 +++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
 @@ -15,8 +15,8 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
@@ -519,7 +745,7 @@ index 688f32c964..aec4a56a15 100644
        </p>
        {status.error || problems.length > 0 ? (
          <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-destructive">
-@@ -105,3 +105,33 @@ export function NpuPoweredBy({
+@@ -105,3 +105,34 @@ export function NpuPoweredBy({
      </p>
    );
  }
@@ -542,9 +768,10 @@ index 688f32c964..aec4a56a15 100644
 +          aria-hidden={true}
 +          className="size-1.5 shrink-0 rounded-full bg-format-npu"
 +        />
-+        <span className="truncate">
-+          {status.hardware.name ?? "AMD NPU"} found. Models built for it run on
-+          the NPU, separately from the GPU.
++        {/* Wraps rather than truncates: the split view leaves this row a narrow column. */}
++        <span className="min-w-0 text-pretty">
++          {status.hardware.name ?? "AMD NPU"} found. Run models on it, apart
++          from the GPU.
 +        </span>
 +      </span>
 +      <Button size="sm" variant="outline" onClick={onBrowse}>
@@ -870,7 +1097,7 @@ index b80bda0458..711863672b 100644
      if model:
          repo, variant = _split_repo_variant(model)
 diff --git a/unsloth_cli/commands/studio.py b/unsloth_cli/commands/studio.py
-index a173bf6867..8a9e1e856a 100644
+index a173bf6867..7a8dd48065 100644
 --- a/unsloth_cli/commands/studio.py
 +++ b/unsloth_cli/commands/studio.py
 @@ -2359,7 +2359,8 @@ def run(
@@ -937,12 +1164,58 @@ index a173bf6867..8a9e1e856a 100644
          if not silent:
              typer.echo(f"Loading model: {model}...")
          try:
+@@ -3016,7 +3054,8 @@ def run(
+             typer.echo(context_length_line)
+         typer.echo(f"  API Key:      {api_key}")
+         typer.echo("")
+-        typer.echo("  OpenAI / Anthropic SDK base URL:")
++        # An NPU model serves /v1/chat/completions only: no Anthropic or streaming Responses example.
++        typer.echo("  OpenAI SDK base URL:" if npu_path else "  OpenAI / Anthropic SDK base URL:")
+         typer.echo(f"    {sdk_base_url}")
+         typer.echo("=" * 56)
+         typer.secho(_tool_notice, fg = _tool_notice_fg, bold = True)
+@@ -3029,20 +3068,21 @@ def run(
+             """    -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'"""
+         )
+         typer.echo("")
+-        typer.echo("Anthropic Messages:")
+-        typer.echo(f"  curl {sdk_base_url}/messages \\")
+-        typer.echo(f'    -H "Authorization: Bearer {api_key}" \\')
+-        typer.echo('    -H "Content-Type: application/json" \\')
+-        typer.echo(
+-            """    -d '{"max_tokens": 256, "messages": [{"role": "user", "content": "Hello"}], "stream": true}'"""
+-        )
+-        typer.echo("")
+-        typer.echo("OpenAI Responses:")
+-        typer.echo(f"  curl {sdk_base_url}/responses \\")
+-        typer.echo(f'    -H "Authorization: Bearer {api_key}" \\')
+-        typer.echo('    -H "Content-Type: application/json" \\')
+-        typer.echo("""    -d '{"input": "Hello", "stream": true}'""")
+-        typer.echo("")
++        if not npu_path:
++            typer.echo("Anthropic Messages:")
++            typer.echo(f"  curl {sdk_base_url}/messages \\")
++            typer.echo(f'    -H "Authorization: Bearer {api_key}" \\')
++            typer.echo('    -H "Content-Type: application/json" \\')
++            typer.echo(
++                """    -d '{"max_tokens": 256, "messages": [{"role": "user", "content": "Hello"}], "stream": true}'"""
++            )
++            typer.echo("")
++            typer.echo("OpenAI Responses:")
++            typer.echo(f"  curl {sdk_base_url}/responses \\")
++            typer.echo(f'    -H "Authorization: Bearer {api_key}" \\')
++            typer.echo('    -H "Content-Type: application/json" \\')
++            typer.echo("""    -d '{"input": "Hello", "stream": true}'""")
++            typer.echo("")
+     else:
+         if secure and _cf_url:
+             typer.echo(f"URL:     {_cf_url}")
 diff --git a/unsloth_cli/tests/test_npu_cli.py b/unsloth_cli/tests/test_npu_cli.py
 new file mode 100644
-index 0000000000..778d2476a8
+index 0000000000..a52fe30c32
 --- /dev/null
 +++ b/unsloth_cli/tests/test_npu_cli.py
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,193 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1123,3 +1396,16 @@ index 0000000000..778d2476a8
 +    with pytest.raises((typer.Exit, SystemExit)):
 +        start_mod._preflight_agent_gguf(start_mod._CLAUDE_GGUF_AGENT, "lemonade:qwen3-0.6b-FLM")
 +    assert "is an AMD NPU model" in capsys.readouterr().err
++
++
++def test_the_run_banner_offers_no_endpoint_an_npu_model_refuses():
++    import inspect
++
++    from unsloth_cli.commands import studio as studio_mod
++
++    # Structural: the banner prints after a live server load, which this suite cannot start.
++    src = inspect.getsource(studio_mod.run)
++    assert '"  OpenAI SDK base URL:" if npu_path' in src
++    banner = src[src.index('typer.echo("OpenAI Chat Completions:")') :]
++    assert banner.index("if not npu_path:") < banner.index('typer.echo("Anthropic Messages:")')
++    assert banner.index("if not npu_path:") < banner.index('typer.echo("OpenAI Responses:")')
