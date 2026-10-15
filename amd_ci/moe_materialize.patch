@@ -1,0 +1,516 @@
+From 533edbff60ebfa1c33837bed01732121f91488a7 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 15 Oct 2026 00:43:33 -0700
+Subject: [PATCH] llama : MoE cache: copy memory-mapped experts that the device
+ lookup cannot map
+
+The device lookup maps the host experts into the device address space with
+ggml_backend_host_map (cudaHostRegister / hipHostRegister). A model loaded
+with mmap keeps them in a read-only file mapping, which often cannot be
+registered: on ROCm hipHostRegister becomes a KFD userptr that is always
+faulted in for writing (the read-only flag is the coarse-grained flag on
+HIP), and on CUDA a read-only mapping needs cudaHostRegisterReadOnly, which
+not every device or driver supports. The cache then fell back to host
+lookups for every layer, losing most of the gain of the cache under mmap.
+
+When mapping a group fails, its memory-mapped expert tensors are copied once
+into one anonymous host buffer owned by the model (what --load-mode none does
+for every weight) and the mapping is retried, if they fit in the available
+system memory (MemAvailable within the cgroup limit, or the available
+physical memory on Windows) less max(2 GiB, 1/16). The other tensors stay
+memory-mapped. LLAMA_MOE_CACHE_MATERIALIZE=0 keeps the host lookups.
+
+test-moe-cache-materialize checks the copy and repointing on CPU.
+---
+ src/llama-ext.h                      |   5 +
+ src/llama-model.cpp                  |   9 ++
+ src/llama-model.h                    |   5 +
+ src/llama-moe-cache.cpp              | 231 +++++++++++++++++++++++----
+ tests/CMakeLists.txt                 |   2 +
+ tests/test-moe-cache-materialize.cpp | 113 +++++++++++++
+ 6 files changed, 334 insertions(+), 31 deletions(-)
+ create mode 100644 tests/test-moe-cache-materialize.cpp
+
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index b3471ec82e..21fddc2f17 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -149,3 +149,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
+ 
+ // the backend of the device can map host memory for the device lookup of the MoE cache (moe_cache_size)
+ LLAMA_API bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev);
++
++// copies the tensors that live in memory-mapped file buffers (CPU_Mapped) into one new anonymous host buffer and points them at it
++// the other tensors are left untouched; the new buffer has usage WEIGHTS and is returned (the caller owns it), nullptr if no tensor was moved
++// used by the MoE cache when the device lookup cannot map memory-mapped experts (for example hipHostRegister on a read-only file mapping)
++LLAMA_API ggml_backend_buffer_t llama_moe_cache_materialize_mapped(struct ggml_tensor ** tensors, size_t n_tensors);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6872589fa4..891657098d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1250,6 +1250,9 @@ struct llama_model::impl {
+     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+ 
++    // buffers that model tensors were moved into after loading, see adopt_buffer
++    std::vector<ggml_backend_buffer_ptr> adopted_bufs;
++
+     buft_list_t cpu_buft_list;
+     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+ 
+@@ -2658,6 +2661,12 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
+     return pimpl->dev_layer.at(il).dev;
+ }
+ 
++void llama_model::adopt_buffer(ggml_backend_buffer_ptr buf) const {
++    if (buf) {
++        pimpl->adopted_bufs.push_back(std::move(buf));
++    }
++}
++
+ ggml_backend_dev_t llama_model::dev_output() const {
+     return pimpl->dev_output.dev;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index dff84c5743..7e4c7d1ead 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -7,6 +7,8 @@
+ #include "llama-memory.h"
+ #include "llama-vocab.h"
+ 
++#include "ggml-cpp.h"
++
+ #include <map>
+ #include <memory>
+ #include <string>
+@@ -820,6 +822,9 @@ struct llama_model {
+     void print_info() const;
+ 
+     ggml_backend_dev_t dev_layer(int il) const;
++
++    // keeps a buffer that model tensors were moved into after loading (for example by the MoE cache) alive as long as the model
++    void adopt_buffer(ggml_backend_buffer_ptr buf) const;
+     ggml_backend_dev_t dev_output() const;
+ 
+     ggml_backend_buffer_type_t select_buft(int il) const;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 53049c4f88..2249951e3c 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -7,13 +7,27 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <cstdint>
++#include <fstream>
+ #include <map>
+ #include <cstdlib>
+ #include <cstring>
++#include <set>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
++#if defined(_WIN32)
++#    ifndef WIN32_LEAN_AND_MEAN
++#        define WIN32_LEAN_AND_MEAN
++#    endif
++#    ifndef NOMINMAX
++#        define NOMINMAX
++#    endif
++#    include <windows.h>
++#endif
++
+ bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
+     if (dev == nullptr) {
+         return false;
+@@ -24,6 +38,106 @@ bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
+         ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") != nullptr;
+ }
+ 
++// whether the buffer is a memory-mapped file (see ggml_backend_cpu_buffer_from_ptr), the device lookup may fail to map it
++static bool llama_moe_cache_is_mapped_file(ggml_backend_buffer_t buf) {
++    return buf != nullptr && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)), "CPU_Mapped") == 0;
++}
++
++ggml_backend_buffer_t llama_moe_cache_materialize_mapped(ggml_tensor ** tensors, size_t n_tensors) {
++    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
++    const size_t alignment = ggml_backend_buft_get_alignment(buft);
++
++    std::vector<ggml_tensor *> moved;
++    std::set<ggml_tensor *> seen;
++    size_t size = 0;
++    for (size_t i = 0; i < n_tensors; ++i) {
++        ggml_tensor * t = tensors[i];
++        if (t == nullptr || t->data == nullptr || t->view_src != nullptr || !llama_moe_cache_is_mapped_file(t->buffer) || !seen.insert(t).second) {
++            continue;
++        }
++        moved.push_back(t);
++        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
++    }
++    if (moved.empty()) {
++        return nullptr;
++    }
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
++    if (buf == nullptr) {
++        return nullptr;
++    }
++    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
++    size_t offs = 0;
++    for (ggml_tensor * t : moved) {
++        uint8_t * dst = base + offs;
++        memcpy(dst, t->data, ggml_nbytes(t));
++        t->data   = dst;
++        t->buffer = buf;
++        offs += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
++    }
++    return buf;
++}
++
++// system memory that can still be allocated: MemAvailable within the cgroup limit (Linux), available physical memory (Windows), 0 if unknown
++static uint64_t llama_moe_cache_available_memory() {
++#if defined(__linux__)
++    uint64_t res = 0;
++    {
++        std::ifstream f("/proc/meminfo");
++        std::string key;
++        uint64_t value = 0;
++        std::string unit;
++        while (f >> key >> value) {
++            std::getline(f, unit);
++            if (key == "MemAvailable:") {
++                res = value*1024;
++                break;
++            }
++        }
++    }
++    // cgroup v2 limit of this process
++    std::ifstream fc("/proc/self/cgroup");
++    std::string line;
++    while (std::getline(fc, line)) {
++        if (line.rfind("0::", 0) != 0) {
++            continue;
++        }
++        const std::string dir = "/sys/fs/cgroup" + line.substr(3);
++        uint64_t max = 0;
++        uint64_t cur = 0;
++        std::ifstream fmax(dir + "/memory.max");
++        std::ifstream fcur(dir + "/memory.current");
++        if ((fmax >> max) && (fcur >> cur)) {
++            // the page cache charged to the cgroup is reclaimed before the limit is hit
++            std::ifstream fstat(dir + "/memory.stat");
++            std::string k;
++            uint64_t v = 0;
++            while (fstat >> k >> v) {
++                if (k == "file") {
++                    cur -= std::min(cur, v);
++                    break;
++                }
++            }
++            const uint64_t left = max > cur ? max - cur : 0;
++            res = res == 0 ? left : std::min(res, left);
++        }
++    }
++    return res;
++#elif defined(_WIN32)
++    MEMORYSTATUSEX status;
++    status.dwLength = sizeof(status);
++    return GlobalMemoryStatusEx(&status) ? (uint64_t) status.ullAvailPhys : 0;
++#else
++    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    size_t free = 0;
++    size_t total = 0;
++    if (cpu != nullptr) {
++        ggml_backend_dev_memory(cpu, &free, &total);
++    }
++    return free;
++#endif
++}
++
+ namespace {
+ 
+ // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+@@ -603,7 +717,7 @@ struct llama_moe_cache::impl {
+         }
+ 
+         if (device_lookup && !model.hparams.no_alloc) {
+-            init_device_lookup();
++            init_device_lookup(model);
+         } else if (device_lookup) {
+             // memory measurement: build the graphs of the device lookup for the groups whose device can run it (mapping is only known after loading)
+             for (group & g : groups) {
+@@ -673,9 +787,52 @@ struct llama_moe_cache::impl {
+         return ggml_backend_supports_op(backend, op);
+     }
+ 
++    // the device lookup reads the misses from host memory mapped into the device address space; a memory-mapped model file often cannot be
++    // mapped: ROCm registers host memory as a KFD userptr that is always faulted in for writing, so a read-only file mapping fails, and CUDA
++    // needs cudaHostRegisterReadOnly, which not every device or driver supports (cudaDevAttrHostRegisterReadOnlySupported, e.g. Windows WDDM)
++    // the memory-mapped experts of the group are then copied once into anonymous host memory owned by the model (what --load-mode none does
++    // for every weight), if they fit in the available system memory less a margin; LLAMA_MOE_CACHE_MATERIALIZE=0 keeps the host lookups
++    bool materialize_mapped(const llama_model & model, const group & g, ggml_backend_t backend) {
++        const char * env = getenv("LLAMA_MOE_CACHE_MATERIALIZE");
++        if (env != nullptr && atoi(env) == 0) {
++            return false;
++        }
++        std::vector<ggml_tensor *> tensors;
++        std::set<ggml_tensor *> seen;
++        uint64_t need = 0;
++        for (int32_t il : g.layers) {
++            for (ggml_tensor * t : layers[il].experts) {
++                if (llama_moe_cache_is_mapped_file(t->buffer) && seen.insert(t).second) {
++                    tensors.push_back(t);
++                    need += ggml_nbytes(t);
++                }
++            }
++        }
++        if (tensors.empty()) {
++            return false;
++        }
++        const uint64_t avail  = llama_moe_cache_available_memory();
++        const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
++        if (avail > 0 && need + margin > avail) {
++            LLAMA_LOG_WARN("%s: %s: %.0f MiB of memory-mapped host experts do not fit in the %.0f MiB of system memory available (less a %.0f MiB margin), not copied\n",
++                __func__, ggml_backend_name(backend), need/1048576.0, avail/1048576.0, margin/1048576.0);
++            return false;
++        }
++        const int64_t t_start = ggml_time_us();
++        ggml_backend_buffer_t buf = llama_moe_cache_materialize_mapped(tensors.data(), tensors.size());
++        if (buf == nullptr) {
++            LLAMA_LOG_WARN("%s: %s: failed to allocate %.0f MiB of host memory for the memory-mapped host experts\n", __func__, ggml_backend_name(backend), need/1048576.0);
++            return false;
++        }
++        model.adopt_buffer(ggml_backend_buffer_ptr(buf));
++        LLAMA_LOG_INFO("%s: %s: the memory-mapped host experts of %zu layers cannot be mapped for the device lookup, copied %.0f MiB of them into host memory in %.1f s (LLAMA_MOE_CACHE_MATERIALIZE=0 to disable)\n",
++            __func__, ggml_backend_name(backend), g.layers.size(), need/1048576.0, (ggml_time_us() - t_start)/1e6);
++        return true;
++    }
++
+     // for each group: checks that its device supports the lookup and maps the host experts into its address space
+     // the groups of devices without the lookup op or the host_map function (backend capability) keep the host lookups
+-    void init_device_lookup() {
++    void init_device_lookup(const llama_model & model) {
+ 
+         // device pointer of each mapped host buffer, per device (the device address of a host buffer may differ between devices)
+         std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
+@@ -694,41 +851,53 @@ struct llama_moe_cache::impl {
+             auto host_map   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
+             auto host_unmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
+ 
+-            // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
+-            const size_t n_mapped = mapped.size();
+-            std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
+-
+-            bool ok = true;
+-            std::vector<std::vector<const void *>> host_dev(g.layers.size());
+-            for (size_t i = 0; i < g.layers.size() && ok; ++i) {
+-                for (const ggml_tensor * t : layers[g.layers[i]].experts) {
+-                    auto it = dev_base.find({ dev, t->buffer });
+-                    if (it == dev_base.end()) {
+-                        void * base = ggml_backend_buffer_get_base(t->buffer);
+-                        bool registered = false;
+-                        void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
+-                        if (registered) {
+-                            mapped.emplace_back(host_unmap, base);
+-                            added.emplace_back(dev, t->buffer);
++            std::vector<std::vector<const void *>> host_dev;
++            // maps the host experts of the group, on failure the mappings registered for this group only are released again,
++            // so that the host experts do not stay page-locked until the cache is destroyed
++            auto map_group = [&]() -> bool {
++                // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
++                const size_t n_mapped = mapped.size();
++                std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
++
++                bool ok = true;
++                host_dev.assign(g.layers.size(), {});
++                for (size_t i = 0; i < g.layers.size() && ok; ++i) {
++                    for (const ggml_tensor * t : layers[g.layers[i]].experts) {
++                        auto it = dev_base.find({ dev, t->buffer });
++                        if (it == dev_base.end()) {
++                            void * base = ggml_backend_buffer_get_base(t->buffer);
++                            bool registered = false;
++                            void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
++                            if (registered) {
++                                mapped.emplace_back(host_unmap, base);
++                                added.emplace_back(dev, t->buffer);
++                            }
++                            it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
++                        }
++                        if (it->second == nullptr) {
++                            ok = false;
++                            break;
+                         }
+-                        it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
++                        host_dev[i].push_back(it->second + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(t->buffer)));
+                     }
+-                    if (it->second == nullptr) {
+-                        ok = false;
+-                        break;
++                }
++                if (!ok) {
++                    for (size_t i = n_mapped; i < mapped.size(); ++i) {
++                        mapped[i].first(mapped[i].second);
++                    }
++                    mapped.resize(n_mapped);
++                    for (const auto & key : added) {
++                        dev_base.erase(key);
+                     }
+-                    host_dev[i].push_back(it->second + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(t->buffer)));
+                 }
++                return ok;
++            };
++
++            bool ok = map_group();
++            if (!ok && materialize_mapped(model, g, backend)) {
++                ok = map_group();
+             }
+             if (!ok) {
+-                // release the mappings registered for this group only, so that the host experts do not stay page-locked until the cache is destroyed
+-                for (size_t i = n_mapped; i < mapped.size(); ++i) {
+-                    mapped[i].first(mapped[i].second);
+-                }
+-                mapped.resize(n_mapped);
+-                for (const auto & key : added) {
+-                    dev_base.erase(key);
+-                }
+                 LLAMA_LOG_WARN("%s: %s cannot map the host experts (pageable or memory-mapped), the MoE cache uses host lookups for %zu layers\n",
+                     __func__, ggml_backend_name(backend), g.layers.size());
+                 continue;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index daccea0639..6ff4e10fbb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -371,6 +371,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
+     llama_build_and_test(test-alloc.cpp LINK ggml)
+ endif()
+ 
++llama_build_and_test(test-moe-cache-materialize.cpp)
++
+ llama_build(test-export-graph-ops.cpp)
+ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+diff --git a/tests/test-moe-cache-materialize.cpp b/tests/test-moe-cache-materialize.cpp
+new file mode 100644
+index 0000000000..b511d09c88
+--- /dev/null
++++ b/tests/test-moe-cache-materialize.cpp
+@@ -0,0 +1,113 @@
++// llama_moe_cache_materialize_mapped: tensors in memory-mapped file buffers (CPU_Mapped) are copied into one anonymous host buffer
++// and repointed, the other tensors are left untouched (CPU only)
++
++#include "../src/llama-ext.h"
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#if defined(__unix__) || defined(__APPLE__)
++#    include <fcntl.h>
++#    include <sys/mman.h>
++#    include <unistd.h>
++#    define TEST_HAVE_MMAP 1
++#endif
++
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
++
++int main() {
++    ggml_init_params params = { 16*ggml_tensor_overhead(), nullptr, true };
++    ggml_context_ptr ctx(ggml_init(params));
++
++    // two "expert" tensors of a quantized type and an f32 one, laid out like a model file region
++    ggml_tensor * a = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q4_0, 64, 3, 4);
++    ggml_tensor * b = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32,  7, 5, 4);
++    ggml_tensor * c = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 16, 2); // in an anonymous buffer, must stay
++    const size_t align = 64;
++    const size_t off_a = 0;
++    const size_t off_b = GGML_PAD(off_a + ggml_nbytes(a), align) + 4096; // a gap like the bytes of other tensors in the file
++    const size_t size  = GGML_PAD(off_b + ggml_nbytes(b), align);
++
++    std::vector<uint8_t> content(size);
++    for (size_t i = 0; i < size; ++i) {
++        content[i] = (uint8_t) (i*2654435761u >> 13);
++    }
++
++    void * region = nullptr;
++#ifdef TEST_HAVE_MMAP
++    char path[] = "/tmp/test-moe-cache-materialize-XXXXXX";
++    int fd = mkstemp(path);
++    CHECK(fd >= 0);
++    CHECK(write(fd, content.data(), size) == (ssize_t) size);
++    region = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0); // read-only file mapping, as llama_mmap does
++    CHECK(region != MAP_FAILED);
++    close(fd);
++    unlink(path);
++#else
++    std::vector<uint8_t> storage(size + 4096);
++    region = (void *) GGML_PAD((uintptr_t) storage.data(), 4096);
++    memcpy(region, content.data(), size);
++#endif
++
++    ggml_backend_buffer_ptr mapped(ggml_backend_cpu_buffer_from_ptr(region, size));
++    CHECK(strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(mapped.get())), "CPU_Mapped") == 0);
++    ggml_backend_buffer_set_usage(mapped.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    CHECK(ggml_backend_tensor_alloc(mapped.get(), a, (uint8_t *) region + off_a) == GGML_STATUS_SUCCESS);
++    CHECK(ggml_backend_tensor_alloc(mapped.get(), b, (uint8_t *) region + off_b) == GGML_STATUS_SUCCESS);
++
++    ggml_backend_buffer_ptr anon(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(c)));
++    CHECK(ggml_backend_tensor_alloc(anon.get(), c, ggml_backend_buffer_get_base(anon.get())) == GGML_STATUS_SUCCESS);
++    void * c_data = c->data;
++
++    // nothing to move
++    {
++        ggml_tensor * only_c[] = { c };
++        CHECK(llama_moe_cache_materialize_mapped(only_c, 1) == nullptr);
++        CHECK(c->data == c_data && c->buffer == anon.get());
++    }
++
++    ggml_tensor * tensors[] = { a, b, c, a, nullptr }; // duplicates and nullptr are skipped
++    ggml_backend_buffer_ptr moved(llama_moe_cache_materialize_mapped(tensors, 5));
++    CHECK(moved != nullptr);
++    CHECK(ggml_backend_buffer_is_host(moved.get()));
++    CHECK(ggml_backend_buffer_get_usage(moved.get()) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    CHECK(strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(moved.get())), "CPU_Mapped") != 0);
++
++    CHECK(a->buffer == moved.get() && b->buffer == moved.get());
++    CHECK(c->buffer == anon.get() && c->data == c_data);
++
++    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(moved.get());
++    const size_t    bsz  = ggml_backend_buffer_get_size(moved.get());
++    for (ggml_tensor * t : { a, b }) {
++        const uint8_t * p = (const uint8_t *) t->data;
++        CHECK(p >= base && p + ggml_nbytes(t) <= base + bsz);
++        CHECK(((uintptr_t) p) % ggml_backend_buffer_get_alignment(moved.get()) == 0);
++    }
++    CHECK(memcmp(a->data, content.data() + off_a, ggml_nbytes(a)) == 0);
++    CHECK(memcmp(b->data, content.data() + off_b, ggml_nbytes(b)) == 0);
++    // the copies do not overlap
++    CHECK((const uint8_t *) a->data + ggml_nbytes(a) <= (const uint8_t *) b->data || (const uint8_t *) b->data + ggml_nbytes(b) <= (const uint8_t *) a->data);
++
++    // the source can go away, the tensors keep their bytes
++    mapped.reset();
++#ifdef TEST_HAVE_MMAP
++    munmap(region, size);
++#else
++    memset(region, 0, size);
++#endif
++    CHECK(memcmp(a->data, content.data() + off_a, ggml_nbytes(a)) == 0);
++    CHECK(memcmp(b->data, content.data() + off_b, ggml_nbytes(b)) == 0);
++
++    // already moved: nothing left to do
++    CHECK(llama_moe_cache_materialize_mapped(tensors, 5) == nullptr);
++
++    printf("OK\n");
++    return 0;
++}
+-- 
+2.43.0
+
