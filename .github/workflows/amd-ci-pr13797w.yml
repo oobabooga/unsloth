@@ -127,6 +127,18 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Backend test deps, as Backend CI installs them (CPU torch).
+          $req = "$env:AMD_CI_WORK\states\head\studio\backend\requirements"
+          & $py -m pip install -q -r "$req\studio.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth unpdf requests "numpy<3" httpx soundfile librosa
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch>=2.4,<2.11" "torchaudio<2.11"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q "transformers>=4.51,<=5.17.0" torchao
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $peft = (Select-String -Path "$req\extras-no-deps.txt" -Pattern '^peft==' | Select-Object -First 1).Line
+          if ($peft) { & $py -m pip install -q $peft }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
           # --require rocm gpu --expect-arch gfx1151. The gate EXITS 1 when it is
