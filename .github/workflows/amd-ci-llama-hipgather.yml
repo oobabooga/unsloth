@@ -1,0 +1,132 @@
+name: "AMD CI: MoE cache copy_regions fallback on HIP, experts spilled (gfx1151)"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-llama-hipgather]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "268"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  gpu:
+    name: "hipgather GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "hipgather-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Build llama.cpp 6e14ff88a (base) and base + amd_ci/hipgather.patch (head), fetch the model
+        timeout-minutes: 90
+        run: |
+          set +e
+          W="$AMD_CI_WORK"; OUT="$W/out"
+          WANT=6e14ff88a6d1bcbca3cd8f0cdebf55744ae8096e
+          REV=5bc3e238d916f48a861bac2f8a1990a0e9b7e98d
+          MODEL="$W/model/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+          mkdir -p "$W/model"
+          ( curl -fL --retry 8 --retry-delay 10 -s -S -o "$MODEL" "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/$REV/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" > "$OUT/curl.log" 2>&1; echo "curl rc=$?" >> "$OUT/curl.log" ) &
+          CURL_PID=$!
+          { echo "## runner: ${RUNNER_NAME:-?}"; free -m; nproc; hipconfig --version; } > "$OUT/diag.txt" 2>&1; cat "$OUT/diag.txt"
+          export HIPCXX=/opt/rocm/llvm/bin/clang HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm PATH="/opt/rocm/bin:$PATH"
+          build() { # dir
+            cmake -S "$1" -B "$1/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 \
+              -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_EXE_LINKER_FLAGS=-no-pie -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DCMAKE_HIP_COMPILER="$HIPCXX" \
+              -DCMAKE_PREFIX_PATH=/opt/rocm > "$OUT/$(basename $1)_configure.log" 2>&1 || { tail -40 "$OUT/$(basename $1)_configure.log"; return 1; }
+            cmake --build "$1/build" --target llama-completion llama-tokenize -j "$(nproc)" > "$OUT/$(basename $1)_build.log" 2>&1 || { grep -E "error|FAILED" "$OUT/$(basename $1)_build.log" | head -30; return 1; }
+          }
+          SRC="$W/base"; mkdir -p "$SRC"
+          git -C "$SRC" init -q; git -C "$SRC" remote add origin https://github.com/unslothai/llama.cpp
+          git -C "$SRC" fetch -q --depth 1 origin "$WANT" || { echo "FATAL: fetch $WANT"; exit 1; }
+          git -C "$SRC" checkout -q --detach "$WANT"
+          [ "$(git -C "$SRC" rev-parse HEAD)" = "$WANT" ] || { echo "FATAL: checkout"; exit 1; }
+          echo "base = $WANT" | tee "$OUT/source.txt"
+          cp -r "$SRC" "$W/head"
+          git -C "$W/head" apply "$GITHUB_WORKSPACE/amd_ci/hipgather.patch" || { echo "FATAL: patch"; exit 1; }
+          git -C "$W/head" diff --stat | tee -a "$OUT/source.txt"
+          T0=$(date +%s); build "$SRC" || exit 1; build "$W/head" || exit 1
+          echo "builds $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt"
+          cat "$SRC"/README.md "$SRC"/docs/*.md "$SRC"/docs/*/*.md "$SRC"/tools/server/README.md > "$W/corpus.txt" 2>/dev/null
+          wait "$CURL_PID"; cat "$OUT/curl.log"; ls -la "$MODEL"
+          [ "$(stat -c %s "$MODEL")" = "22853663008" ] || { echo "FATAL: model size"; exit 1; }
+          {
+            echo "AMD_CI_MODEL=$MODEL"; echo "AMD_CI_LLAMA_BIN=$SRC/build/bin"; echo "AMD_CI_LLAMA_BIN_HEAD=$W/head/build/bin"
+            echo "AMD_CI_CORPUS=$W/corpus.txt"; echo "HIP_PATH=/opt/rocm"; echo "ROCM_PATH=/opt/rocm"
+          } >> "$GITHUB_ENV"
+
+      - name: Bench (interleaved arms, 3 reps)
+        timeout-minutes: 150
+        run: |
+          set +e
+          python3 -u amd_ci/probes/spill_bench.py --llama-bin "$AMD_CI_LLAMA_BIN" --llama-bin-head "$AMD_CI_LLAMA_BIN_HEAD" \
+            --model "$AMD_CI_MODEL" --corpus "$AMD_CI_CORPUS" --out "$AMD_CI_WORK/out/bench" --cache-gib 16 --reps 3 \
+            --arms B_spill,H_spill,H_spill_k,B_spill_b,B_ub512,H_ub512
+          echo "bench rc=$?"
+          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
+          python3 - "$AMD_CI_WORK/out/bench/rows.jsonl" <<'PY'
+          import json, sys
+          for r in map(json.loads, open(sys.argv[1], encoding="utf-8")):
+              cp = [l for l in r.get("lines", []) if "copies per ubatch" in l]
+              print(r["arm"], r["prompt"], r["rep"], r["rc"], r.get("pp_tps"), r.get("tg_tps"), r["md5"][:8], cp[-1].split("I llama_moe_cache:")[-1] if cp else "-")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hipgather-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn

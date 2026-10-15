@@ -1,0 +1,128 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index eff75f774d..44a057e346 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6615,22 +6615,116 @@ static bool ggml_cuda_copy_queue_kernel(int device) {
+ }
+ #endif
+ 
++// the copies of ggml_backend_cuda_copy_regions_async without cudaMemcpyBatchAsync (HIP, MUSA, CUDA < 12.8, or GGML_CUDA_COPY_BATCH_FALLBACK=1):
++// the device copies with one kernel (GGML_CUDA_COPY_REGIONS_KERNEL=0: one device copy per region), one upload per region
++// without it the caller copies only long runs of cached MoE experts from the cache (see llama_moe_cache copy_experts) and uploads the rest
++static bool ggml_backend_cuda_copy_regions_fallback(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return false;
++    }
++    if (n_regions == 0) {
++        return true;
++    }
++
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++
++    static const bool d2d_kernel = [] {
++        const char * env = getenv("GGML_CUDA_COPY_REGIONS_KERNEL");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    std::vector<void *>       dsts;
++    std::vector<const void *> srcs;
++    std::vector<size_t>       sizes;
++    std::vector<void *>       d2d_dsts;
++    std::vector<const void *> d2d_srcs;
++    std::vector<size_t>       d2d_sizes;
++    dsts.reserve(n_regions);
++    srcs.reserve(n_regions);
++    sizes.reserve(n_regions);
++    // every region is checked before anything is copied: a refusal copies nothing
++    for (size_t i = 0; i < n_regions; i++) {
++        const ggml_backend_copy_region & r = regions[i];
++        ggml_backend_buffer_t buf_dst = r.dst->view_src ? r.dst->view_src->buffer : r.dst->buffer;
++        ggml_backend_buffer_t buf_src = r.src->view_src ? r.src->view_src->buffer : r.src->buffer;
++        if (buf_dst == nullptr || !ggml_backend_buffer_is_cuda(buf_dst) ||
++            ((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx->device) {
++            return false;
++        }
++        // device memory of the same device, or pinned host memory (pageable memory cannot be read in stream order)
++        const bool src_dev  = buf_src != nullptr && ggml_backend_buffer_is_cuda(buf_src) &&
++            ((ggml_backend_cuda_buffer_context *) buf_src->context)->device == cuda_ctx->device;
++        const bool src_host = buf_src != nullptr && !src_dev &&
++            (ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src)) ||
++             (ggml_backend_buffer_is_host(buf_src) && ggml_cuda_host_is_mapped((const char *) r.src->data + r.src_offset, r.size)));
++        if (!src_dev && !src_host) {
++            return false;
++        }
++        GGML_ASSERT(r.dst_offset + r.size <= ggml_nbytes(r.dst) && r.src_offset + r.size <= ggml_nbytes(r.src));
++        if (r.size == 0) {
++            continue;
++        }
++        void       * d = (char *) r.dst->data + r.dst_offset;
++        const void * s = (const char *) r.src->data + r.src_offset;
++        if (src_dev) {
++            d2d_dsts.push_back(d);
++            d2d_srcs.push_back(s);
++            d2d_sizes.push_back(r.size);
++        } else {
++            dsts.push_back(d);
++            srcs.push_back(s);
++            sizes.push_back(r.size);
++        }
++    }
++
++    ggml_cuda_set_device(cuda_ctx->device);
++    if (!d2d_dsts.empty()) {
++        // the device copies and the uploads write different regions, the uploads do not wait for the device copies
++        cudaStream_t stream = ggml_cuda_copy_peer_begin(cuda_ctx);
++        if (d2d_kernel) {
++            ggml_cuda_copy_regions_d2d(stream, ggml_cuda_info().devices[cuda_ctx->device].nsm,
++                d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
++        } else {
++            for (size_t i = 0; i < d2d_dsts.size(); i++) {
++                CUDA_CHECK(cudaMemcpyAsync(d2d_dsts[i], d2d_srcs[i], d2d_sizes[i], cudaMemcpyDeviceToDevice, stream));
++            }
++        }
++        if (stream != cuda_ctx->stream()) {
++            // the uploads are queued before the copy queue waits for the device copies
++            for (size_t i = 0; i < dsts.size(); i++) {
++                CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, cuda_ctx->stream()));
++            }
++            dsts.clear();
++            ggml_cuda_copy_peer_end(cuda_ctx, stream);
++        }
++    }
++    for (size_t i = 0; i < dsts.size(); i++) {
++        CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, cuda_ctx->stream()));
++    }
++    return true;
++}
++
+ // many small copies in two calls: uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8), device copies with one kernel
+-// GGML_CUDA_COPY_REGIONS_KERNEL=0 puts the device copies in the batch, GGML_CUDA_COPY_BATCH=0 disables both
++// GGML_CUDA_COPY_REGIONS_KERNEL=0 puts the device copies in the batch, GGML_CUDA_COPY_BATCH=0 disables both (and the fallback)
+ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
+-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+-    GGML_UNUSED(backend);
+-    GGML_UNUSED(regions);
+-    GGML_UNUSED(n_regions);
+-    return false;
+-#else
+     static const bool enabled = [] {
+         const char * env = getenv("GGML_CUDA_COPY_BATCH");
+         return env == nullptr || atoi(env) != 0;
+     }();
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
++    return enabled && ggml_backend_cuda_copy_regions_fallback(backend, regions, n_regions);
++#else
+     if (!enabled || !ggml_backend_is_cuda(backend)) {
+         return false;
+     }
++    // GGML_CUDA_COPY_BATCH_FALLBACK=1: the copies of a build without cudaMemcpyBatchAsync (to measure that path on this device)
++    static const bool fallback = [] {
++        const char * env = getenv("GGML_CUDA_COPY_BATCH_FALLBACK");
++        return env != nullptr && atoi(env) != 0;
++    }();
++    if (fallback) {
++        return ggml_backend_cuda_copy_regions_fallback(backend, regions, n_regions);
++    }
+     if (n_regions == 0) {
+         return true;
+     }
