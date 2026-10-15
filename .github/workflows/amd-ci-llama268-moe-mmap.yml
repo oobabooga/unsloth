@@ -106,7 +106,7 @@ jobs:
           python3 -m venv "$W/venv" || uv venv "$W/venv" || { echo "FATAL: no venv"; exit 1; }
           VP="$W/venv/bin/python"
           "$VP" -m pip --version >/dev/null 2>&1 || uv pip install --python "$VP" pip
-          "$VP" -m pip install -q cmake ninja numpy || { echo "FATAL: pip cmake ninja"; exit 1; }
+          "$VP" -m pip install -q cmake ninja numpy pyyaml || { echo "FATAL: pip cmake ninja"; exit 1; }
           export PATH="$W/venv/bin:$PATH"
 
           TC=""
@@ -185,7 +185,7 @@ jobs:
           print(int(b / 3 / 2**20), file=sys.stdout)
           print(f"expert bytes {b/2**20:.1f} MiB over {sum(1 for t in r.tensors if '_exps' in t.name)} tensors", file=sys.stderr)
           PY
-          )
+          ) || MIB=""
           case "$MIB" in ''|*[!0-9]*) echo "expert size probe failed, using 2600"; MIB=2600 ;; esac
           echo "cache_mib=$MIB" | tee -a "$OUT/toolchain.txt"
           { echo "AMD_CI_MODEL=$MODEL"; echo "AMD_CI_CACHE_MIB=$MIB"; echo "AMD_CI_PY=python3"; } >> "$GITHUB_ENV"
