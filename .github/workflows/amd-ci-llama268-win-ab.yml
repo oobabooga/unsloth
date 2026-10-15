@@ -205,8 +205,18 @@ jobs:
           Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue
           if (-not (Test-Path $MODEL) -or (Get-Item $MODEL).Length -lt 9000000000) { Write-Host "FATAL: model download"; exit 1 }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_MODEL=$MODEL"
-          # smoke: does the base binary start and see the GPU?
-          & "$W\states\base\bin\llama-completion.exe" --list-devices *> "$OUT\list_devices.txt"
+          # Windows searches the exe dir before System32, so put TheRock's HIP runtime beside the exes;
+          # otherwise the driver's System32 amdhip64_7.dll is loaded against TheRock-built hipBLAS / rocBLAS.
+          Get-ChildItem "$ROCM\bin\*.dll" | ForEach-Object { Log "rocm dll: $($_.Name) $($_.VersionInfo.FileVersion)" }
+          foreach ($s in "base", "head") { Copy-Item "$ROCM\bin\*.dll" "$W\states\$s\bin\" -Force }
+          $rb = Get-ChildItem -Path $ROCM -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq "rocblas" } | Select-Object -First 1
+          $hl = Get-ChildItem -Path $ROCM -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq "hipblaslt" } | Select-Object -First 1
+          if ($rb) { Add-Content -Path $env:GITHUB_ENV -Value "ROCBLAS_TENSILE_LIBPATH=$($rb.FullName)"; $env:ROCBLAS_TENSILE_LIBPATH = $rb.FullName; Log "rocblas lib = $($rb.FullName)" }
+          if ($hl) { Add-Content -Path $env:GITHUB_ENV -Value "HIPBLASLT_TENSILE_LIBPATH=$($hl.FullName)"; $env:HIPBLASLT_TENSILE_LIBPATH = $hl.FullName; Log "hipblaslt lib = $($hl.FullName)" }
+          Get-ChildItem "C:\Windows\System32\amdhip64*" -ErrorAction SilentlyContinue | ForEach-Object { Log "system32: $($_.Name) $($_.VersionInfo.FileVersion)" }
+          # smoke: does the base binary start and see the GPU (memory must not read 0 MiB)?
+          $ErrorActionPreference = "Continue"
+          cmd /c "`"$W\states\base\bin\llama-completion.exe`" --list-devices > `"$OUT\list_devices.txt`" 2>&1"
           Get-Content "$OUT\list_devices.txt"
 
       - name: Differential
