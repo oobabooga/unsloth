@@ -231,7 +231,7 @@ def dl(checkpoint):
 
 
 def cli():
-    ready = r"OpenAI / Anthropic SDK base URL:\s*\n\s*\S+"
+    ready = r"OpenAI(?: / Anthropic)? SDK base URL:\s*\n\s*\S+"
 
     def serve_and_chat(text):
         url = re.search(r"Unsloth Studio running at (https?://\S+)", text)
