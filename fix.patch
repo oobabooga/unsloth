@@ -1,5 +1,5 @@
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index 7eda56981e..a2391b6dde 100644
+index 7eda56981e..4a32165969 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -10913,7 +10913,10 @@ async def _reject_unservable_model(
@@ -14,7 +14,7 @@ index 7eda56981e..a2391b6dde 100644
          path = getattr(getattr(fastapi_request, "url", None), "path", None)
          raise HTTPException(
              status_code = 404,
-@@ -11155,6 +11158,83 @@ def _audio_cpp_switch_target(requested_model: Optional[str]) -> Optional[tuple]:
+@@ -11155,6 +11158,103 @@ def _audio_cpp_switch_target(requested_model: Optional[str]) -> Optional[tuple]:
      return (model.id, model.variant.key, model.id, False)
  
  
@@ -65,8 +65,9 @@ index 7eda56981e..a2391b6dde 100644
 +) -> None:
 +    """Load a downloaded ``lemonade:<id>`` model a request names, when auto-switch is on.
 +
-+    Same lock and gates as a GGUF switch; ``_load_npu_model`` keeps the owner-only and
-+    not-downloaded refusals. Off, the request still gets the not-loaded 404.
++    Same lock, gates, waiter count and cancellation as a GGUF switch; ``_load_npu_model``
++    drains active inference and keeps the owner-only and not-downloaded refusals. Off, the
++    request still gets the not-loaded 404.
 +    """
 +    from core.inference.gpu_arbiter import require_no_foreign_generations
 +    from core.inference.llama_keepwarm import inference_lifecycle_gate, model_load_gate
@@ -76,29 +77,48 @@ index 7eda56981e..a2391b6dde 100644
 +        return
 +    if await asyncio.to_thread(_loaded_satisfies, named_model):
 +        return
++    cancel_event = getattr(getattr(fastapi_request, "state", None), "generation_cancel_event", None)
++
++    def _raise_if_cancelled() -> None:
++        if cancel_event is not None and cancel_event.is_set():
++            raise HTTPException(status_code = 409, detail = "Generation cancelled")
++
++    _raise_if_cancelled()
 +    switch_path = getattr(getattr(fastapi_request, "url", None), "path", None)
-+    async with _auto_switch_lock():
-+        await _acquire_swap_gate()
-+        try:
-+            async with model_load_gate(), inference_lifecycle_gate():
-+                # Re-read under the gate: another request may have loaded it while this one waited.
-+                if await asyncio.to_thread(_loaded_satisfies, named_model):
-+                    return
-+                require_no_foreign_generations(path = switch_path)
-+                await _load_model_impl(
-+                    LoadRequest(model_path = named_model),
-+                    fastapi_request,
-+                    current_subject,
-+                    current_request_counted = True,
-+                )
-+        finally:
-+            _auto_switch_process_lock.release()
++    # Counted as a queued switch, so another switch's drain does not wait on this request.
++    key = _switch_key(named_model, None)
++    _note_switch_waiter(key, 1)
++    try:
++        async with _auto_switch_lock():
++            await _acquire_swap_gate()
++            try:
++                async with model_load_gate(), inference_lifecycle_gate():
++                    # Re-read under the gate: another request may have loaded it while this one waited.
++                    if await asyncio.to_thread(_loaded_satisfies, named_model):
++                        return
++                    require_no_foreign_generations(path = switch_path)
++                    await _load_model_impl(
++                        LoadRequest(model_path = named_model),
++                        fastapi_request,
++                        current_subject,
++                        current_request_counted = True,
++                        **({"load_cancel_event": cancel_event} if cancel_event is not None else {}),
++                    )
++                    _raise_if_cancelled()
++            finally:
++                # Deregister before releasing the gate, as the GGUF switch does.
++                _note_switch_waiter(key, -1)
++                key = None
++                _auto_switch_process_lock.release()
++    finally:
++        if key is not None:
++            _note_switch_waiter(key, -1)
 +
 +
  async def _maybe_auto_switch_model(
      requested_model: Optional[str],
      fastapi_request: Request,
-@@ -11345,6 +11425,30 @@ async def _maybe_auto_switch_model(
+@@ -11345,6 +11445,31 @@ async def _maybe_auto_switch_model(
              await _reject_unservable_model(requested_model, fastapi_request)
              return
  
@@ -110,7 +130,8 @@ index 7eda56981e..a2391b6dde 100644
 +            named_model,
 +            fastapi_request,
 +            gguf_only = gguf_only,
-+            needs_vision = gguf_requires_vision,
++            # Not gguf_requires_vision: NPU chat rejects tool-result images too.
++            needs_vision = require_vision,
 +            needs_audio = bool(
 +                require_audio_input
 +                or require_video
@@ -129,7 +150,40 @@ index 7eda56981e..a2391b6dde 100644
      async def _resolve_and_switch() -> None:
          from core.inference.openai_auto_download import looks_like_quant, split_model_ref
  
-@@ -29801,6 +29905,17 @@ _NPU_CUT_SHORT_ERROR = {
+@@ -18512,6 +18637,23 @@ async def _load_npu_model(
+         await asyncio.to_thread(npu.loadable_model, model_id)
+     except NpuError as exc:
+         raise HTTPException(status_code = 400, detail = str(exc)) from None
++    llama_backend = get_llama_cpp_backend()
++    unsloth_backend = _peek_inference_backend()
++    serving = bool(
++        getattr(llama_backend, "is_active", getattr(llama_backend, "is_loaded", False))
++        or (unsloth_backend is not None and unsloth_backend.active_model_name)
++        or resident is not None
++    )
++    if serving:
++        # As for GGUF: refuse a non-forced swap fast, then drain active inference (the caller
++        # holds the lifecycle gate) before anything is unloaded. An auto-switch has no
++        # on_reload_confirmed, so this drain is all that keeps it from cutting a reply short.
++        if on_reload_confirmed is not None:
++            on_reload_confirmed(cancel = False)
++        await _wait_for_model_switch_idle(
++            current_request_counted = current_request_counted,
++            cancel_pending = on_reload_confirmed is not None and bool(request.force_cancel_active),
++        )
+     if load_cancel_event is not None and load_cancel_event.is_set():
+         raise HTTPException(status_code = 409, detail = "Model load cancelled")
+     if on_reload_confirmed is not None:
+@@ -18522,7 +18664,7 @@ async def _load_npu_model(
+                 timeout_s = _POST_CANCEL_DRAIN_TIMEOUT_S,
+             )
+     _set_preview_resident(None)
+-    await _unload_llama_before_standard_load(get_llama_cpp_backend())
++    await _unload_llama_before_standard_load(llama_backend)
+     backend = _peek_inference_backend()
+     if backend is not None and backend.active_model_name:
+         logger.info(
+@@ -29801,6 +29943,17 @@ _NPU_CUT_SHORT_ERROR = {
  }
  
  
@@ -147,10 +201,11 @@ index 7eda56981e..a2391b6dde 100644
  class _NpuStreamRelay:
      """Normalize model IDs, enforce stop sequences, and collect non-streaming replies.
  
-@@ -29843,15 +29958,14 @@ class _NpuStreamRelay:
+@@ -29842,16 +29995,22 @@ class _NpuStreamRelay:
+         self._pending = buffer[len(buffer) - keep :] if keep else ""
          return buffer[: len(buffer) - keep] if keep else buffer
  
-     def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
+-    def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
 -        return "data: " + json.dumps(
 -            {
 -                "id": self.completion_id or "chatcmpl-npu",
@@ -160,6 +215,12 @@ index 7eda56981e..a2391b6dde 100644
 -                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
 -            }
 -        )
++    def _chunk(
++        self,
++        delta: dict,
++        finish_reason: Optional[str],
++        tool_event: Optional[dict] = None,
++    ) -> str:
 +        chunk = {
 +            "id": self.completion_id or "chatcmpl-npu",
 +            "object": "chat.completion.chunk",
@@ -167,11 +228,13 @@ index 7eda56981e..a2391b6dde 100644
 +            "model": self.public_model,
 +            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
 +        }
++        if tool_event is not None:
++            chunk["_toolEvent"] = tool_event
 +        return "data: " + json.dumps(chunk)
  
      def feed(self, line: str) -> list[str]:
          """The lines to send on for one line of the upstream stream."""
-@@ -29919,6 +30033,10 @@ class _NpuStreamRelay:
+@@ -29919,6 +30078,11 @@ class _NpuStreamRelay:
              elif isinstance(content, str):
                  self.content += content
              if choice.get("finish_reason") is not None:
@@ -179,10 +242,11 @@ index 7eda56981e..a2391b6dde 100644
 +                    # FastFlowLM says "stop" when the reply filled the context; without this the
 +                    # chat saved a reasoning-only turn as complete and showed no answer and no reason.
 +                    choice["finish_reason"] = "length"
++                    out.append(self._chunk({}, None, {"type": "context_window_exceeded"}))
                  self.finish_reason = choice["finish_reason"]
                  if self._pending:
                      # The reply ended partway into a stop sequence, so what was held back is text.
-@@ -29930,7 +30048,9 @@ class _NpuStreamRelay:
+@@ -29930,7 +30094,9 @@ class _NpuStreamRelay:
          return out
  
      def completion(self) -> dict:
@@ -193,7 +257,7 @@ index 7eda56981e..a2391b6dde 100644
          if self.reasoning:
              message["reasoning_content"] = self.reasoning
          if self.tool_calls:
-@@ -42092,6 +42212,17 @@ async def anthropic_messages(
+@@ -42092,6 +42258,17 @@ async def anthropic_messages(
      # so validation runs before the reload hook gets a chance to restore the model.
      # Plain detail, not _no_model_loaded_error: that helper leaves this case unchanged.
      if not llama_backend.is_loaded and not _automatic_model_load_may_run():
@@ -212,7 +276,7 @@ index 7eda56981e..a2391b6dde 100644
              status_code = 503,
              detail = _no_model_loaded_detail("No GGUF model loaded. Load a GGUF model first."),
 diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
-index 922b9c8557..15d0689bdf 100644
+index 922b9c8557..489336be63 100644
 --- a/studio/backend/tests/test_npu_chat_route.py
 +++ b/studio/backend/tests/test_npu_chat_route.py
 @@ -69,7 +69,38 @@ _FLM_TIMINGS = {
@@ -254,7 +318,58 @@ index 922b9c8557..15d0689bdf 100644
      if "FAULT" in prompt:
          return (
              _chunk({"content": "par"})
-@@ -1278,3 +1309,36 @@ def test_a_tool_loop_turn_dropped_after_a_tool_call_is_cut_short():
+@@ -826,6 +857,50 @@ def test_an_npu_load_it_would_refuse_keeps_the_gpu_resident(monkeypatch):
+     assert teardowns == []
+ 
+ 
++def test_an_npu_load_drains_active_inference_before_unloading(monkeypatch):
++    # An auto-switch passes no on_reload_confirmed, so without the drain it cut a reply short.
++    import routes.inference as routes
++    from core.inference import npu_backend as nb
++    from models.inference import LoadRequest
++
++    order: list[str] = []
++    model = SimpleNamespace(id = "qwen3-0.6b-FLM", model_path = "lemonade:qwen3-0.6b-FLM")
++
++    class _Npu:
++        def resident(self):
++            return None
++
++        def loadable_model(self, model_id):
++            return model
++
++        def load(self, model_id, ctx):
++            order.append("load")
++
++    async def _drain(**kwargs):
++        order.append("drain")
++
++    async def _unload_gpu(_backend):
++        order.append("unload")
++
++    monkeypatch.setattr(nb, "get_npu_backend", lambda: _Npu())
++    monkeypatch.setattr(routes, "get_llama_cpp_backend", lambda: SimpleNamespace(is_active = True))
++    monkeypatch.setattr(routes, "_peek_inference_backend", lambda: None)
++    monkeypatch.setattr(routes, "_wait_for_model_switch_idle", _drain)
++    monkeypatch.setattr(routes, "_unload_llama_before_standard_load", _unload_gpu)
++    monkeypatch.setattr(routes, "release_chat_gpu_claim", lambda: True)
++    with pytest.raises(HTTPException):
++        # The stub never becomes resident, so the load ends in a 409 after the steps above.
++        asyncio.run(
++            routes._load_npu_model(
++                LoadRequest(model_path = model.model_path),
++                current_request_counted = True,
++                on_reload_confirmed = None,
++                load_cancel_event = None,
++            )
++        )
++    assert order == ["drain", "unload", "load"]
++
++
+ def test_a_reply_cut_short_is_not_reported_complete(flm):
+     flm()
+     status, body = _call(stream = False, messages = [{"role": "user", "content": "CUT"}])
+@@ -1278,3 +1353,40 @@ def test_a_tool_loop_turn_dropped_after_a_tool_call_is_cut_short():
      plain = _TurnFinish()
      plain.see(_chunk({}, "stop").strip())
      assert plain.finished is True
@@ -266,6 +381,9 @@ index 922b9c8557..15d0689bdf 100644
 +    status, lines = _call(stream = True, messages = full)
 +    assert status == 200
 +    chunks = _data(lines)
++    assert [c["_toolEvent"] for c in chunks if "_toolEvent" in c] == [
++        {"type": "context_window_exceeded"}
++    ]
 +    finishes = [
 +        c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]
 +    ]
@@ -279,6 +397,7 @@ index 922b9c8557..15d0689bdf 100644
 +    status, lines = _call(stream = True, messages = [{"role": "user", "content": "TIMED"}])
 +    assert status == 200
 +    chunks = _data(lines)
++    assert not any("_toolEvent" in c for c in chunks)
 +    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 +
 +
@@ -292,10 +411,10 @@ index 922b9c8557..15d0689bdf 100644
 +    assert message["content"] is None
 +    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
 diff --git a/studio/backend/tests/test_openai_auto_switch.py b/studio/backend/tests/test_openai_auto_switch.py
-index 9e84e6cac6..dee02bf77e 100644
+index 9e84e6cac6..436316f6aa 100644
 --- a/studio/backend/tests/test_openai_auto_switch.py
 +++ b/studio/backend/tests/test_openai_auto_switch.py
-@@ -12367,3 +12367,117 @@ def test_tensor_split_requires_matching_gpu_ids_at_the_settings_boundary(ids):
+@@ -12367,3 +12367,156 @@ def test_tensor_split_requires_matching_gpu_ids_at_the_settings_boundary(ids):
          settings_route.ModelOverridePayload(
              model_id = "org/split-GGUF", gpu_ids = ids, tensor_split = [3, 1]
          )
@@ -413,6 +532,45 @@ index 9e84e6cac6..dee02bf77e 100644
 +        )
 +    )
 +    assert [call.model_path for call in rec.calls] == [_NPU_MODEL]
++
++
++def test_a_cancelled_request_never_switches_to_an_npu_model(monkeypatch):
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    cancel = threading.Event()
++    cancel.set()
++    request = SimpleNamespace(state = SimpleNamespace(generation_cancel_event = cancel))
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(inference_route._maybe_auto_switch_model(_NPU_MODEL, request, "tester"))
++    assert excinfo.value.status_code == 409
++    assert rec.calls == []
++
++
++def test_a_tool_result_image_never_switches_to_a_text_only_npu_model(monkeypatch):
++    # A text-only GGUF reads a tool-result image as a note; NPU chat rejects it after the load.
++    backend, rec = _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    _npu_catalog_entry(monkeypatch, vision = False)
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(
++            inference_route._maybe_auto_switch_model(
++                _NPU_MODEL, object(), "tester", require_vision = True, tool_images_only = True
++            )
++        )
++    assert "cannot read images" in str(excinfo.value.detail)
++    assert rec.calls == []
++
++
++def test_an_npu_switch_counts_as_a_queued_switch_while_it_loads(monkeypatch):
++    # Uncounted, a GGUF switch waiting on the lock this one holds kept its drain from finishing.
++    _wired(monkeypatch, _FakeBackend("unsloth/A-GGUF"), None)
++    seen = []
++
++    async def _load(*_args, **_kwargs):
++        seen.append(inference_route._switch_waiter_count())
++
++    monkeypatch.setattr(inference_route, "_load_model_impl", _load)
++    _run_hook(_NPU_MODEL)
++    assert seen == [1]
++    assert inference_route._switch_waiter_count() == 0
 diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
 index d2bc85f2a0..1cc80017a0 100644
 --- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
