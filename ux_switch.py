@@ -11,7 +11,8 @@ import ux_ab as AB
 import ux_ab2 as AB2
 
 GGUF = {"model_path": "unsloth/Qwen3-0.6B-GGUF", "gguf_variant": "Q4_K_M"}
-LONG = "Count from 1 to 400, one number per line, with no other text."
+LONG = ("Write a detailed essay of at least 1500 words on the history of ocean navigation, "
+        "from Polynesian wayfinding to satellite positioning. Use many paragraphs.")
 
 
 def loaded():
@@ -32,13 +33,23 @@ def body():
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = browser.new_context(locale="en-US").new_page()
+        ctx = browser.new_context(locale="en-US", viewport={"width": 1440, "height": 1000})
+        if not U.WIN:
+            ctx.add_init_script("document.addEventListener('DOMContentLoaded',()=>{const s=document.createElement('style');s.textContent='*{font-family:\"DejaVu Sans\",sans-serif!important}';document.head.appendChild(s)})")
+        page = ctx.new_page()
+        page.set_default_timeout(30000)
         U.page = page
-        page.goto(U.BASE + "/", wait_until="networkidle")
-        time.sleep(2)
-        step("login", X.ensure_login, shoot=False)
-        U.page = None
-        browser.close()
+        try:
+            page.goto(U.BASE + "/", wait_until="networkidle")
+            time.sleep(2)
+            step("login", X.ensure_login, shoot=False)
+            checks()
+        finally:
+            U.page = None
+            browser.close()
+
+
+def checks():
     step("enable", lambda: (api("POST", "/api/npu/enable", timeout=900), X.npu_status()["ready"])[1], shoot=False)
     small = step("download_small", lambda: AB.dl(AB.SMALL), shoot=False)
     key = small["model_path"]
@@ -55,18 +66,22 @@ def body():
         api("PUT", "/api/settings/openai-auto-switch", json={"enabled": True})
         out = {"gguf": {}, "npu": {}}
 
+        started = threading.Event()
+
         def stream_gguf():
             t = time.monotonic()
             lines, err = [], None
             try:
                 r = U.session.post(U.BASE + "/v1/chat/completions", timeout=900, stream=True, json={
-                    "model": gguf_id, "stream": True, "max_tokens": 1500,
+                    "model": gguf_id, "stream": True, "max_tokens": 1200,
                     "chat_template_kwargs": {"enable_thinking": False},
                     "messages": [{"role": "user", "content": LONG}]})
                 out["gguf"]["status"] = r.status_code
                 for line in r.iter_lines(decode_unicode=True):
                     if line:
                         lines.append(line)
+                        if len(lines) >= 40:
+                            started.set()
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)[:300]
             text = ""
@@ -87,7 +102,8 @@ def body():
         t0 = time.monotonic()
         th = threading.Thread(target=stream_gguf)
         th.start()
-        time.sleep(3)
+        started.wait(300)
+        out["npu_sent_at"] = round(time.monotonic() - t0, 1)
         r = U.session.post(U.BASE + "/v1/chat/completions", timeout=900, json={
             "model": key, "max_tokens": 30, "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": "Reply with the single word: ok"}]})
