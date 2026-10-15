@@ -1,0 +1,183 @@
+name: "AMD CI: validate PR 13786"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-pr13786]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "13786"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  gpu:
+    name: "PR 13786 GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr13786-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          ARGS=""
+          [ "$MERGED" = "1" ] && ARGS="--merged"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
+          # tree pinning the newest unsloth fails to resolve. pip.conf already adds pypi.org as an
+          # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
+          # the ROCm torch index, whose wheels carry no upload time.
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          # Now with torch present, the gate is meaningful. It EXITS 1 on a miss.
+          # Absolute path: this step cd'd into the head worktree, which has no amd_ci/.
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Vulkan prebuilt, models, harness deps
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Same tag both trees pin (the probe records each tree's DEFAULT_TAG; the PR does not touch it).
+          TAG=$("$AMD_CI_PY" -c "import sys; sys.path.insert(0, '$AMD_CI_WORK/states/head/studio'); import install_sd_cpp_prebuilt as i; print(i.DEFAULT_TAG)")
+          BTAG=$("$AMD_CI_PY" -c "import sys; sys.path.insert(0, '$AMD_CI_WORK/states/base/studio'); import install_sd_cpp_prebuilt as i; print(i.DEFAULT_TAG)")
+          echo "head tag $TAG / base tag $BTAG"
+          [ "$TAG" = "$BTAG" ] || { echo "FATAL: base and head pin different sd.cpp builds"; exit 1; }
+          mkdir -p "$AMD_CI_WORK/vk" "$AMD_CI_WORK/models" "$AMD_CI_WORK/hf" "$AMD_CI_WORK/out/render"
+          curl -fsSL -o "$AMD_CI_WORK/vk/b.zip" "https://github.com/unslothai/stable-diffusion.cpp/releases/download/$TAG/sd-$TAG-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip"
+          unzip -q "$AMD_CI_WORK/vk/b.zip" -d "$AMD_CI_WORK/vk"
+          rm -f "$AMD_CI_WORK/vk/b.zip"
+          VK=$(find "$AMD_CI_WORK/vk" -name sd-cli -type f | head -1 || true)
+          [ -n "$VK" ] || { echo "FATAL: no sd-cli in the Vulkan prebuilt"; exit 1; }
+          chmod +x "$VK"
+          echo "VK=$VK" >> "$GITHUB_ENV"
+          echo "MODELS=$AMD_CI_WORK/models" >> "$GITHUB_ENV"
+          echo "OUT=$AMD_CI_WORK/out/render" >> "$GITHUB_ENV"
+          "$VK" --list-devices > "$AMD_CI_WORK/out/list_devices.txt" 2>&1
+          cat "$AMD_CI_WORK/out/list_devices.txt"
+          "$AMD_CI_PY" -m pip install -q vulkan "huggingface_hub[hf_xet]"
+          HF_HOME="$AMD_CI_WORK/hf" MODELS="$AMD_CI_WORK/models" "$AMD_CI_PY" -c "
+          import os
+          from huggingface_hub import hf_hub_download
+          for f in ['minimax_h3_fl2va_pruned-Q4_K.gguf', 'qwen3vl_32b_minimax_h3-Q4_K_M.gguf', 'vae/minimax_h3_video_vae_fp16.safetensors', 'vae/minimax_h3_audio_vae_fp32.safetensors']:
+              print(hf_hub_download('unsloth/MiniMax-H3-GGUF', f, local_dir=os.environ['MODELS']), flush=True)
+          "
+          ls -la "$AMD_CI_WORK/models" "$AMD_CI_WORK/models/vae"
+          # The merge state is code-identical to head for the three touched modules (main has not changed them since
+          # the merge base), so only base and head render; each render is minutes.
+          "$AMD_CI_PY" -c "
+          import json, sys
+          p = sys.argv[1]
+          d = json.load(open(p, encoding='utf-8'))
+          d['paths'] = {k: v for k, v in d['paths'].items() if k in ('base', 'head')}
+          json.dump(d, open(p, 'w', encoding='utf-8'), indent=2)
+          print(d['commits'])
+          " "$AMD_CI_WORK/out/states.json"
+          for d in /sys/class/drm/card*/device; do [ -f "$d/mem_info_gtt_total" ] && echo "$d vram_total=$(cat "$d/mem_info_vram_total") gtt_total=$(cat "$d/mem_info_gtt_total") gtt_used=$(cat "$d/mem_info_gtt_used")"; done
+          free -g
+
+      - name: Differential, GTT held to 22.5 GiB free
+        timeout-minutes: 120
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/h3_uma_render_probe.py \
+            --criteria amd_ci/criteria/h3_uma_held.py \
+            --fixture amd_ci/probes/gtt_hold_fixture.py --fixture-arg=--gtt-free-gib --fixture-arg=22.5 \
+            --out-dir "$AMD_CI_WORK/out/held" \
+            --python "$AMD_CI_PY" -- --case held --render 864x480,1344x768 --fit-modes low_vram --repeats 1
+          cat "$AMD_CI_WORK/out/held/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/held"
+
+      - name: Regression, full GTT (healthy host)
+        if: always()
+        timeout-minutes: 120
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/h3_uma_render_probe.py \
+            --criteria amd_ci/criteria/h3_uma_full.py \
+            --out-dir "$AMD_CI_WORK/out/full" \
+            --python "$AMD_CI_PY" -- --case full --render 864x480 --repeats 3
+          cat "$AMD_CI_WORK/out/full/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/full"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr13786-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
