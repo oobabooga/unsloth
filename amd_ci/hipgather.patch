@@ -2,7 +2,7 @@ diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index eff75f774d..44a057e346 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6615,22 +6615,116 @@ static bool ggml_cuda_copy_queue_kernel(int device) {
+@@ -6615,22 +6615,108 @@ static bool ggml_cuda_copy_queue_kernel(int device) {
  }
  #endif
  
@@ -70,8 +70,8 @@ index eff75f774d..44a057e346 100644
 +
 +    ggml_cuda_set_device(cuda_ctx->device);
 +    if (!d2d_dsts.empty()) {
-+        // the device copies and the uploads write different regions, the uploads do not wait for the device copies
-+        cudaStream_t stream = ggml_cuda_copy_peer_begin(cuda_ctx);
++        // this base (#268 6e14ff88a) has no copy-peer stream: the device copies run on the stream of the context, as its batched path does
++        cudaStream_t stream = cuda_ctx->stream();
 +        if (d2d_kernel) {
 +            ggml_cuda_copy_regions_d2d(stream, ggml_cuda_info().devices[cuda_ctx->device].nsm,
 +                d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
@@ -79,14 +79,6 @@ index eff75f774d..44a057e346 100644
 +            for (size_t i = 0; i < d2d_dsts.size(); i++) {
 +                CUDA_CHECK(cudaMemcpyAsync(d2d_dsts[i], d2d_srcs[i], d2d_sizes[i], cudaMemcpyDeviceToDevice, stream));
 +            }
-+        }
-+        if (stream != cuda_ctx->stream()) {
-+            // the uploads are queued before the copy queue waits for the device copies
-+            for (size_t i = 0; i < dsts.size(); i++) {
-+                CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, cuda_ctx->stream()));
-+            }
-+            dsts.clear();
-+            ggml_cuda_copy_peer_end(cuda_ctx, stream);
 +        }
 +    }
 +    for (size_t i = 0; i < dsts.size(); i++) {
