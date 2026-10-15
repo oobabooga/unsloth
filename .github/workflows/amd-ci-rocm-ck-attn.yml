@@ -1,0 +1,176 @@
+name: "AMD CI: ROCm attention options without a CK build, gfx1151 (Linux)"
+
+# Measurement only, upstream main as installed by Studio's own install.sh. No secret is referenced.
+
+on:
+  push:
+    branches: [amd-ci-rocm-ck-attn]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  BASE_SHA: "54e08ff3c6044a4a95702b84bd7be415aed8306b"
+  FA_REPO: "https://github.com/Dao-AILab/flash-attention"
+  FA_TRITON_SHA: "bbe25bacff9f337568b66e69950e549df9839068"
+  PREBUILT_FA_URL: ""
+
+jobs:
+
+  gpu:
+    name: "attention options on gfx1151 (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "rocm-ck-attn"
+
+      - name: Studio install (upstream main) and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/out"
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" checkout -q "$BASE_SHA"
+          cd "$AMD_CI_WORK/repo"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          T0=$(date +%s)
+          set +e
+          bash install.sh --local > "$AMD_CI_WORK/out/studio_install.log" 2>&1
+          rc=$?
+          set -e
+          echo "studio install rc=$rc in $(( $(date +%s) - T0 )) s"; tail -15 "$AMD_CI_WORK/out/studio_install.log"
+          grep -n -i -E "flash|aiter" "$AMD_CI_WORK/out/studio_install.log" | head -20 || true
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: What Studio installed (attention packages)
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          "$AMD_CI_PY" -m pip list 2>/dev/null | tee "$O/pip_list.txt" | grep -i -E "^(torch|triton|rocm|flash|aiter|kernels|xformers|sageattention)" | tee "$O/attn_pkgs.txt"
+          SP=$("$AMD_CI_PY" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          ls "$SP" | grep -i -E "flash|aiter|composable|^ck" | tee "$O/site_attn_dirs.txt"
+          echo "(end of list)"
+          exit 0
+
+      - name: "A: SDPA as installed, TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL unset"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL ATTN_BENCH_FA_HUB=0 HF_HOME="$AMD_CI_WORK/hf_home" \
+            "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/A_sdpa_noexp.json" > "$O/A_sdpa_noexp.log" 2>&1
+          echo "rc=$?"; head -c 3000 "$O/A_sdpa_noexp.json"
+          exit 0
+
+      - name: "B: SDPA with TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (Studio sets this), CK preference attempted"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 ATTN_BENCH_FA_HUB=0 HF_HOME="$AMD_CI_WORK/hf_home" \
+            "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/B_sdpa_exp.json" > "$O/B_sdpa_exp.log" 2>&1
+          echo "rc=$?"; head -c 3000 "$O/B_sdpa_exp.json"
+          exit 0
+
+      - name: "Install: kernels (HF hub kernels), flash-attn Triton AMD from PyPI, flash-attn Triton at a known SHA, prebuilt wheel"
+        timeout-minutes: 60
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          J="$O/installs.jsonl"
+          t() { local name=$1; shift; local T0=$(date +%s); "$@" > "$O/install_$name.log" 2>&1; local rc=$?;
+                echo "{\"name\": \"$name\", \"rc\": $rc, \"seconds\": $(( $(date +%s) - T0 ))}" | tee -a "$J"; }
+          t kernels "$AMD_CI_PY" -m pip install kernels
+          t fa_triton_pypi env FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install -v --no-build-isolation --no-deps --target "$AMD_CI_WORK/fa_pypi" flash-attn
+          grep -m3 -E "Successfully installed|flash_attn-|Downloading flash" "$O/install_fa_triton_pypi.log"
+          tail -5 "$O/install_fa_triton_pypi.log"
+          t fa_triton_git bash -c "git clone -q '$FA_REPO' '$AMD_CI_WORK/src/fa-triton' && git -C '$AMD_CI_WORK/src/fa-triton' checkout -q '$FA_TRITON_SHA' && cd '$AMD_CI_WORK/src/fa-triton' && FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE '$AMD_CI_PY' -m pip install --no-build-isolation --no-deps --target '$AMD_CI_WORK/fa_git' ."
+          tail -3 "$O/install_fa_triton_git.log"
+          if [ -n "$PREBUILT_FA_URL" ]; then
+            t fa_prebuilt "$AMD_CI_PY" -m pip install --no-deps --target "$AMD_CI_WORK/fa_prebuilt" "$PREBUILT_FA_URL"
+            tail -3 "$O/install_fa_prebuilt.log"
+          fi
+          exit 0
+
+      - name: "C: flash-attn Triton AMD (PyPI), plus HF hub kernels (aiter, flash-attn2), experimental=1"
+        timeout-minutes: 40
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          [ -d "$AMD_CI_WORK/fa_pypi/flash_attn" ] && FA_DIR="$AMD_CI_WORK/fa_pypi" || FA_DIR="$AMD_CI_WORK/fa_git"
+          echo "flash_attn from $FA_DIR"
+          PYTHONPATH="$FA_DIR" FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 HF_HOME="$AMD_CI_WORK/hf_home" \
+            "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/C_fa_triton.json" > "$O/C_fa_triton.log" 2>&1
+          echo "rc=$?"; head -c 4000 "$O/C_fa_triton.json"
+          exit 0
+
+      - name: "D: flash-attn Triton AMD at the known SHA (only if PyPI and git differ)"
+        timeout-minutes: 40
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          if [ -d "$AMD_CI_WORK/fa_pypi/flash_attn" ] && [ -d "$AMD_CI_WORK/fa_git/flash_attn" ]; then
+            PYTHONPATH="$AMD_CI_WORK/fa_git" FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
+              ATTN_BENCH_FA_HUB=0 HF_HOME="$AMD_CI_WORK/hf_home" \
+              "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/D_fa_triton_git.json" > "$O/D_fa_triton_git.log" 2>&1
+            echo "rc=$?"
+          fi
+          if [ -d "$AMD_CI_WORK/fa_prebuilt/flash_attn" ]; then
+            PYTHONPATH="$AMD_CI_WORK/fa_prebuilt" TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 ATTN_BENCH_FA_HUB=0 HF_HOME="$AMD_CI_WORK/hf_home" \
+              "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/E_fa_prebuilt.json" > "$O/E_fa_prebuilt.log" 2>&1
+            echo "prebuilt rc=$?"
+          fi
+          exit 0
+
+      - name: "A2: repeat of A (A/A noise)"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          env -u TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL ATTN_BENCH_FA_HUB=0 HF_HOME="$AMD_CI_WORK/hf_home" \
+            "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/A2_sdpa_noexp.json" > "$O/A2_sdpa_noexp.log" 2>&1
+          echo "rc=$?"
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            [ "$pid" = "$$" ] && continue
+            cwd=$(readlink "$d/cwd" 2>/dev/null)
+            case "$cwd" in
+              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
+            esac
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rocm-ck-attn
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+          retention-days: 14
+          if-no-files-found: warn
