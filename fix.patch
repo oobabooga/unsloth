@@ -1,18 +1,3 @@
-diff --git a/README.md b/README.md
-index 8db45e3224..72e2a6254a 100644
---- a/README.md
-+++ b/README.md
-@@ -423,6 +423,10 @@ Setup also installs [audio.cpp](https://github.com/0xShug0/audio.cpp) (prebuilt
- - `UNSLOTH_AUDIO_CPP_ACCELERATOR=cpu` (or `cuda`, `vulkan`, `metal`) picks the bundle instead of auto-detecting.
- - `AUDIOCPP_SERVER_PATH=/path/to/audiocpp_server` uses your own build.
- 
-+#### AMD Ryzen AI NPU:
-+
-+On a Ryzen AI PC with an XDNA2 NPU (Linux x86_64 or Windows, NPU driver installed), Studio can chat on the NPU through [FastFlowLM](https://github.com/ROCm/FastFlowLM) and [Lemonade](https://github.com/lemonade-sdk/lemonade). In Chat, open **Select model**, expand **NPU** and click **Enable NPU** (about 47 MB), then pick a model; the Model hub lists them under the **NPU** format filter. `unsloth run --model qwen3-0.6b-FLM` works too. NPU models serve `/v1/chat/completions` only, so the Anthropic API and the coding agents in `unsloth start` need a GGUF model.
-+
- #### Uninstall
- 
- **MacOS, WSL, Linux:** `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.sh | sh`
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
 index 7eda56981e..b8614fb1bd 100644
 --- a/studio/backend/routes/inference.py

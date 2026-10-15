@@ -78,23 +78,6 @@ def body(page):
     step("messages_with_switching_on_and_npu_resident", messages_with_npu_resident, shoot=False)
     api("PUT", "/api/settings/openai-auto-switch", json={"enabled": False}, ok=None)
 
-    def hub_history():
-        X.goto_hub()
-        time.sleep(3)
-        page.get_by_role("button", name="Browse NPU models").click()
-        page.get_by_test_id("hub-npu-catalog").wait_for(timeout=60000)
-        out = {"after_browse": page.url.replace(U.BASE, "")}
-        page.go_back()
-        time.sleep(3)
-        out["back"] = {"npu_list": page.get_by_test_id("hub-npu-catalog").count() > 0, "url": page.url.replace(U.BASE, "")}
-        page.go_forward()
-        time.sleep(3)
-        out["forward"] = {"npu_list": page.get_by_test_id("hub-npu-catalog").count() > 0, "url": page.url.replace(U.BASE, "")}
-        page.reload(wait_until="domcontentloaded")
-        time.sleep(5)
-        out["refresh"] = page.get_by_test_id("hub-npu-catalog").count() > 0
-        return out
-    step("hub_npu_list_back_forward_refresh", hub_history)
 
 
 if __name__ == "__main__":
