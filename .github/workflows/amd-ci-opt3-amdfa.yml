@@ -1,4 +1,4 @@
-name: "AMD CI: fused attention candidates (CK / Triton flash_attn, aiter, SDPA) on gfx1151 (Linux)"
+name: "AMD CI: ROCm flash admission by whole-block timing, base vs head, gfx1151 (Linux)"
 
 # Measurement only, origin/main. No secret is referenced; every model is a public download.
 
@@ -42,11 +42,16 @@ jobs:
           mkdir -p "$AMD_CI_WORK/out"
           exit 0
 
-      - name: Resolve state (origin/main pinned)
+      - name: Resolve states (main, and main + opt3_amdfa.patch)
         run: |
           set -euo pipefail
           git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
           git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/opt3_amdfa.patch"
+          git -C "$AMD_CI_WORK/states/head" diff --cached --stat
+          python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK" \
+            --base-sha "$BASE_SHA" --patch opt3_amdfa.patch --out "$AMD_CI_WORK/out/states.json"
 
       - name: Studio install and real gate
         timeout-minutes: 60
@@ -100,14 +105,8 @@ jobs:
           rc=$?
           T1=$(date +%s)
           echo "CK build rc=$rc in $((T1-T0)) s"; grep -m5 -E "error:|FAILED" "$O/fa_ck_build.log" | cut -c1-300; tail -5 "$O/fa_ck_build.log"
-          # Triton AMD backend at the SHA the v6 run built (newer SHAs pull aiter at metadata time), in its own dir.
-          git clone -q "$FA_REPO" "$AMD_CI_WORK/src/fa-triton" && git -C "$AMD_CI_WORK/src/fa-triton" checkout -q "$FA_TRITON_SHA"
-          cd "$AMD_CI_WORK/src/fa-triton"
-          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps --target "$AMD_CI_WORK/fa_triton" . > "$O/fa_triton_build.log" 2>&1
-          trc=$?
-          echo "Triton build rc=$trc"; tail -3 "$O/fa_triton_build.log"
+          trc=-1
           echo "{\"ck_build_rc\": $rc, \"ck_build_s\": $((T1-T0)), \"triton_build_rc\": $trc, \"rocm_root\": \"$ROOT\"}" > "$O/fa_build.json"
-          sed "s#@FA_TRITON_DIR@#$AMD_CI_WORK/fa_triton#" "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_fa.json" > "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_fa_run.json"
           exit 0
 
       - name: "Attention alone + whole synthetic block at DiT shapes"
@@ -118,25 +117,23 @@ jobs:
           export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 HF_HOME="$AMD_CI_WORK/hf_home"
           "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_ck.json" > "$O/attn_ck.log" 2>&1
           echo "ck rc=$?"
-          PYTHONPATH="$AMD_CI_WORK/fa_triton" FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_triton.json" > "$O/attn_triton.log" 2>&1
-          echo "triton rc=$?"
-          "$AMD_CI_PY" amd_ci/probes/attn_bench.py --out "$O/attn_ck_rep.json" > "$O/attn_ck_rep.log" 2>&1
-          echo "ck repeat rc=$?"
           head -c 6000 "$O/attn_ck.json"
           exit 0
 
-      - name: "End to end: klein + Z-Image, native vs flash (CK / Triton) vs auto"
-        timeout-minutes: 240
+      - name: "Differential: auto attention on ROCm with flash_attn CK installed (klein, Z-Image)"
+        timeout-minutes: 300
         run: |
           set +e
           export TORCH_HOME="$AMD_CI_WORK/torch_home"
           export HF_HOME="$AMD_CI_WORK/hf_home"
-          "$AMD_CI_PY" diffusion_bench/amd/diffusion_probe.py --state base --checkout "$AMD_CI_WORK/states/base" \
-            --out "$AMD_CI_WORK/out/e2e/obs_base.json" --spec diffusion_bench/specs/amd_fa_run.json \
-            --budget-min 200.0 --cell-timeout 3600.0 --only 'klein_*' --only 'zimg_*' > "$AMD_CI_WORK/out/e2e_probe.log" 2>&1
-          echo "e2e rc=$?"
-          tail -30 "$AMD_CI_WORK/out/e2e_probe.log"
-          exit 0
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_differential.py \
+            --out-dir "$AMD_CI_WORK/out/ab" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_fa_ab.json --budget-min 200.0 --cell-timeout 3600.0 --only 'klein_*' --only 'zimg_*' --defect slow:zimg_auto:zimg_nat:0.95
+          cat "$AMD_CI_WORK/out/ab/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/ab"
 
       - name: Stop anything this job started
         if: always()
@@ -158,6 +155,7 @@ jobs:
           name: opt3-amdfa
           path: |
             ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/cell.log
             ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/record.json
             ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.png
             ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.log
