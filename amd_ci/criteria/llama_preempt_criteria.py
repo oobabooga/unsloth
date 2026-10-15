@@ -15,8 +15,9 @@ NEEDS = ["rocm", "gpu"]
 
 
 def _on_gpu(o: dict) -> bool:
-    lines = " ".join((o.get("single") or {}).get("default", {}).get("device_lines") or [])
-    return any(k in lines for k in ("ROCm", "Vulkan", "HIP"))
+    # The probe pins --device to the GPU it listed, so a started server is on it.
+    runs = ((o.get("single") or {}).get("default") or {}).get("runs") or []
+    return bool(o.get("device")) and o.get("device") != "CPU" and bool(runs)
 
 
 def _texts(o: dict, arm: str) -> list:
@@ -31,8 +32,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                                                                      "clone_error", "error"))
         out.append((f"{name} built llama-server ({o.get('backend')}, {o.get('llama_sha', '')[:9]})", built,
                     o.get("error") or (o.get("build_tail") or "")[-200:].replace("\n", " ")))
-        out.append((f"{name} model is on the GPU", _on_gpu(o),
-                    "; ".join((o.get("single") or {}).get("default", {}).get("device_lines") or [])[:300]))
+        out.append((f"{name} model is on the GPU", _on_gpu(o), f"--device {o.get('device')}"))
         over = o.get("over") or {}
         out.append((f"{name} oversubscribed run finished", "results" in over, over.get("error", "")))
     b, h = obs.get("base") or {}, obs.get("head") or {}

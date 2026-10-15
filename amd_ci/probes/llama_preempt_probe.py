@@ -62,7 +62,11 @@ def build(url: str, sha: str, root: Path, backend_args: list[str], obs: dict) ->
         src.mkdir(parents = True)
         for cmd in (["git", "init", "-q"], ["git", "fetch", "-q", "--depth", "1", url, sha],
                     ["git", "checkout", "-q", "FETCH_HEAD"]):
-            rc, out = sh(cmd, cwd = src, timeout = 1800)
+            for attempt in range(4):
+                rc, out = sh(cmd, cwd = src, timeout = 1800)
+                if not rc:
+                    break
+                time.sleep(15 * (attempt + 1))
             if rc:
                 obs["clone_error"] = out[-2000:]
                 return None
@@ -224,8 +228,15 @@ def main() -> int:
     model = model_path(root, obs)
     if not model:
         return done()
-    obs["help_has_preempt_ram"] = "--preempt-ram" in sh([str(exe), "--help"], env = dict(
-        os.environ, LD_LIBRARY_PATH = str(exe.parent)))[1]
+    env = dict(os.environ, LD_LIBRARY_PATH = str(exe.parent))
+    obs["help_has_preempt_ram"] = "--preempt-ram" in sh([str(exe), "--help"], env = env)[1]
+    # The server no longer logs its buffers at the default verbosity: pin the device instead, so a run
+    # that is not on the GPU fails to start rather than silently falling back to the CPU.
+    devices = sh([str(exe), "--list-devices"], env = env)[1]
+    obs["devices"] = devices[-1500:]
+    gpu = next((d for d in ("ROCm0", "Vulkan0", "CUDA0") if d in devices), None)
+    obs["device"] = gpu
+    dev_args = ["--device", gpu] if gpu else []
 
     logs = args.out.parent
     port = 18500 + (abs(hash(args.state)) % 200)
@@ -235,7 +246,8 @@ def main() -> int:
         else {"default": []}
     obs["single"] = {}
     for arm, extra in arms.items():
-        srv = Server(exe, model, port, ["-c", "8192", "--parallel", "1", *extra], logs / f"srv_{args.state}_{arm}.log")
+        srv = Server(exe, model, port, ["-c", "8192", "--parallel", "1", *dev_args, *extra],
+                     logs / f"srv_{args.state}_{arm}.log")
         try:
             if not srv.ready():
                 obs["single"][arm] = {"error": "server did not start", "log_tail": srv.text()[-2000:]}
@@ -249,7 +261,7 @@ def main() -> int:
 
     # 2. four chats that do not fit together: base errors, head should park and finish all
     extra = ["--preempt-ram", "2048"] if obs["help_has_preempt_ram"] else []
-    srv = Server(exe, model, port, ["-c", str(args.ctx), "--parallel", "4", "--kv-unified", *extra],
+    srv = Server(exe, model, port, ["-c", str(args.ctx), "--parallel", "4", "--kv-unified", *dev_args, *extra],
                  logs / f"srv_{args.state}_over.log")
     try:
         if srv.ready():
