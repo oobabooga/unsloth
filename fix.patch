@@ -1,17 +1,14 @@
 diff --git a/README.md b/README.md
-index 8db45e3224..7278f4a7a2 100644
+index 8db45e3224..72e2a6254a 100644
 --- a/README.md
 +++ b/README.md
-@@ -423,6 +423,13 @@ Setup also installs [audio.cpp](https://github.com/0xShug0/audio.cpp) (prebuilt
+@@ -423,6 +423,10 @@ Setup also installs [audio.cpp](https://github.com/0xShug0/audio.cpp) (prebuilt
  - `UNSLOTH_AUDIO_CPP_ACCELERATOR=cpu` (or `cuda`, `vulkan`, `metal`) picks the bundle instead of auto-detecting.
  - `AUDIOCPP_SERVER_PATH=/path/to/audiocpp_server` uses your own build.
  
 +#### AMD Ryzen AI NPU:
 +
-+On a Ryzen AI PC with an XDNA2 NPU (Linux x86_64 or Windows, NPU driver installed), Studio runs chat models on the NPU through [FastFlowLM](https://github.com/ROCm/FastFlowLM) and [Lemonade](https://github.com/lemonade-sdk/lemonade), separately from the GPU:
-+- In Chat, open **Select model**: the **NPU** group has an **Enable NPU** button that downloads Lemonade and FastFlowLM (about 47 MB) and checks the driver. Clicking an NPU model then downloads and loads it. The Model hub lists them under **Browse NPU models**.
-+- From a terminal: `unsloth run --model qwen3-0.6b-FLM`, or `unsloth chat qwen3-0.6b-FLM` while Studio is running.
-+- Over the API, NPU models serve `/v1/chat/completions` as `lemonade:<id>` (for example `lemonade:qwen3-0.6b-FLM`). With **Switch model by request** on (Settings > API), naming a downloaded NPU model loads it. They do not take `response_format`, `seed`, `frequency_penalty` or `logprobs`, and the coding agents in `unsloth start` need a GGUF model.
++On a Ryzen AI PC with an XDNA2 NPU (Linux x86_64 or Windows, NPU driver installed), Studio can chat on the NPU through [FastFlowLM](https://github.com/ROCm/FastFlowLM) and [Lemonade](https://github.com/lemonade-sdk/lemonade). In Chat, open **Select model**, expand **NPU** and click **Enable NPU** (about 47 MB), then pick a model; the Model hub lists them under the **NPU** format filter. `unsloth run --model qwen3-0.6b-FLM` works too. NPU models serve `/v1/chat/completions` only, so the Anthropic API and the coding agents in `unsloth start` need a GGUF model.
 +
  #### Uninstall
  
@@ -445,210 +442,8 @@ index 9e84e6cac6..dee02bf77e 100644
 +        )
 +    )
 +    assert [call.model_path for call in rec.calls] == [_NPU_MODEL]
-diff --git a/studio/frontend/src/app/routes/hub.tsx b/studio/frontend/src/app/routes/hub.tsx
-index d353f1ee0a..40f45614b9 100644
---- a/studio/frontend/src/app/routes/hub.tsx
-+++ b/studio/frontend/src/app/routes/hub.tsx
-@@ -32,6 +32,8 @@ export interface ModelsSearch {
-   kind?: "models" | "datasets";
-   capability?: CapabilityKey;
-   audioTask?: PipelineType[];
-+  /** The NPU list, kept in the URL so a refresh or a link lands back on it. */
-+  format?: "npu";
- }
- 
- export const Route = createRoute({
-@@ -75,6 +77,7 @@ export const Route = createRoute({
-     }
-     const audioTask = hubAudioTaskSearch(search.audioTask, next.capability);
-     if (audioTask) next.audioTask = audioTask;
-+    if (search.format === "npu") next.format = "npu";
-     return next;
-   },
- });
-diff --git a/studio/frontend/src/features/hub/hub-page.tsx b/studio/frontend/src/features/hub/hub-page.tsx
-index b8ee4cfd63..62f1eab4a9 100644
---- a/studio/frontend/src/features/hub/hub-page.tsx
-+++ b/studio/frontend/src/features/hub/hub-page.tsx
-@@ -26,7 +26,12 @@ import {
-   requestModelConfigHandoff,
- } from "@/features/model-picker";
- import { taskForMediaPick } from "@/features/model-picker/components/model-selector/audio-picker-policy";
--import { type NpuModel, type NpuPickerSource, useNpuStatus } from "@/features/npu";
-+import {
-+  type NpuModel,
-+  NpuHubPrompt,
-+  type NpuPickerSource,
-+  useNpuStatus,
-+} from "@/features/npu";
- import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
- import { GuidedTour, useGuidedTourController } from "@/features/tour";
- import { useDebouncedValue } from "@/hooks/use-debounced-value";
-@@ -619,26 +624,45 @@ export function ModelsPage() {
-   const npuSource: NpuPickerSource | undefined = npuStatus?.supported
-     ? { status: npuStatus, onStatusChange: setNpuStatus }
-     : undefined;
--  const formatFilter = isDiscoverTab ? discoverFormat : downloadedFormat;
-+  // The URL alone holds the Discover NPU list: a refresh during a long NPU download used to drop
-+  // back to the feed, and a link or Back lands on it. Every other choice clears `format`. A link to
-+  // it on a machine without an NPU shows the feed rather than an empty list.
-+  const urlFormat = hubSearch.format ?? null;
-+  const shownDiscoverFormat =
-+    urlFormat === "npu" && !(npuStatus && !npuStatus.supported)
-+      ? "npu"
-+      : discoverFormat;
-+  const formatFilter = isDiscoverTab ? shownDiscoverFormat : downloadedFormat;
-   const npuCatalogSource =
-     formatFilter === "npu" && !isDatasetMode ? npuSource : undefined;
-   const showNpuCatalog = npuCatalogSource !== undefined;
-   const setFormatFilter = useCallback(
-     (next: ModelFormatFilter) => {
-       if (isDiscoverTab) {
-+        if (next === "npu") {
-+          void navigate({
-+            to: "/hub",
-+            search: (prev) => ({ ...prev, section: undefined, format: "npu" }),
-+          });
-+          return;
-+        }
-         setDiscoverFormat(next);
--        if (urlSection) {
-+        if (urlSection || urlFormat) {
-           // Exit the section so its preset does not re-impose its own format.
-           void navigate({
-             to: "/hub",
--            search: (prev) => ({ ...prev, section: undefined }),
-+            search: (prev) => ({
-+              ...prev,
-+              section: undefined,
-+              format: undefined,
-+            }),
-           });
-         }
-       } else {
-         setDownloadedFormat(next);
-       }
-     },
--    [isDiscoverTab, urlSection, navigate],
-+    [isDiscoverTab, urlSection, urlFormat, navigate],
-   );
-   const hubSource = useHubSource();
-   const [storedSearchFilters, setSearchFilters] = useState<ModelSearchFilters>(
-@@ -718,6 +742,7 @@ export function ModelsPage() {
-           kind: next === "datasets" ? "datasets" : undefined,
-           section: undefined,
-           model: undefined,
-+          format: undefined,
-         }),
-         replace: true,
-       });
-@@ -741,7 +766,12 @@ export function ModelsPage() {
-       setQuery("");
-       void navigate({
-         to: "/hub",
--        search: (prev) => ({ ...prev, section, model: undefined }),
-+        search: (prev) => ({
-+          ...prev,
-+          section,
-+          model: undefined,
-+          format: undefined,
-+        }),
-       });
-     },
-     [urlSection, navigate],
-@@ -756,7 +786,7 @@ export function ModelsPage() {
-     setSortBrowseActive(false);
-     void navigate({
-       to: "/hub",
--      search: (prev) => ({ ...prev, section: undefined }),
-+      search: (prev) => ({ ...prev, section: undefined, format: undefined }),
-     });
-   }, [navigate]);
-   const handleResetToDiscover = useCallback(() => {
-@@ -780,6 +810,7 @@ export function ModelsPage() {
-         section: undefined,
-         model: undefined,
-         kind: undefined,
-+        format: undefined,
-       }),
-     });
-   }, [navigate, setModelsTab]);
-@@ -813,6 +844,7 @@ export function ModelsPage() {
-         audioTask: undefined,
-         section: undefined,
-         model: undefined,
-+        format: undefined,
-       }),
-       replace: true,
-     });
-@@ -1274,10 +1306,10 @@ export function ModelsPage() {
-   const handleClearFilters = useCallback(() => {
-     if (isDiscoverTab) {
-       setDiscoverFormat("all");
--      if (urlSection) {
-+      if (urlSection || urlFormat) {
-         void navigate({
-           to: "/hub",
--          search: (prev) => ({ ...prev, section: undefined }),
-+          search: (prev) => ({ ...prev, section: undefined, format: undefined }),
-           replace: true,
-         });
-       }
-@@ -1287,7 +1319,7 @@ export function ModelsPage() {
-     }
-     setCapabilityFilter("all");
-     setSearchFilters({});
--  }, [isDiscoverTab, urlSection, navigate]);
-+  }, [isDiscoverTab, urlSection, urlFormat, navigate]);
-   const handleDiscoverFetchIntent = useCallback(() => {
-     setDiscoverFetchIntent((value) => value + 1);
-   }, []);
-@@ -1377,7 +1409,12 @@ export function ModelsPage() {
-       setQuery("");
-       void navigate({
-         to: "/hub",
--        search: (prev) => ({ ...prev, model: undefined, section: undefined }),
-+        search: (prev) => ({
-+          ...prev,
-+          model: undefined,
-+          section: undefined,
-+          format: undefined,
-+        }),
-       });
-       return;
-     }
-@@ -1559,6 +1596,7 @@ export function ModelsPage() {
-           section: undefined,
-           model: undefined,
-           kind: undefined,
-+          format: undefined,
-         }),
-       });
-     },
-@@ -1827,6 +1865,12 @@ export function ModelsPage() {
-     if (isFeedMode) {
-       return (
-         <div className="flex flex-col gap-6 pt-6">
-+          {npuStatus?.supported && !isDatasetMode ? (
-+            <NpuHubPrompt
-+              status={npuStatus}
-+              onBrowse={() => setFormatFilter("npu")}
-+            />
-+          ) : null}
-           {allModelsView !== "split" && (
-             <HubFeed
-               trending={{
-@@ -1889,6 +1933,8 @@ export function ModelsPage() {
-   }, [
-     isDiscoverTab,
-     isFeedMode,
-+    npuStatus,
-+    setFormatFilter,
-     isChannelListMode,
-     isSortBrowseMode,
-     channelSection,
 diff --git a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
-index d2bc85f2a0..e7b4f78b30 100644
+index d2bc85f2a0..1cc80017a0 100644
 --- a/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
 +++ b/studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx
 @@ -495,10 +495,25 @@ function ListLabel({
@@ -681,57 +476,8 @@ index d2bc85f2a0..e7b4f78b30 100644
        {(action || onToggle) && (
          <div className="flex items-center gap-0.5">
            {action}
-@@ -3869,7 +3884,25 @@ export function HubModelPicker({
-     offeredFormatFilters,
-   );
-   const [npuOnDeviceCollapsed, setNpuOnDeviceCollapsed] = useState(false);
--  const [npuBrowseCollapsed, setNpuBrowseCollapsed] = useState(true);
-+  // Null until the user folds or opens the NPU group themselves. Folded by default once the NPU
-+  // is set up and holds a model; a fresh install showed only a bare "NPU" heading, hiding Enable NPU.
-+  const [npuBrowseCollapsedChoice, setNpuBrowseCollapsedChoice] = useState<
-+    boolean | null
-+  >(null);
-+  const npuNeedsAttention =
-+    npuCatalog !== null &&
-+    (!npuCatalog.ready ||
-+      !npuCatalog.status.runtime_installed ||
-+      (npuCatalog.models !== null &&
-+        !npuCatalog.models.some((model) => model.downloaded)));
-+  // Stays open for this picker once shown, so finishing Enable NPU does not fold it under the user.
-+  // Adjusted during render rather than in an effect, so the group never paints folded in between.
-+  const [npuAttentionShown, setNpuAttentionShown] = useState(false);
-+  if (npuNeedsAttention && !npuAttentionShown) {
-+    setNpuAttentionShown(true);
-+  }
-+  const npuBrowseCollapsed =
-+    npuBrowseCollapsedChoice ?? (!npuNeedsAttention && !npuAttentionShown);
-   // What this picker's task filter has already established about every row it can show; chat
-   // passes none and keeps the full set.
-   const capabilityScope = useMemo<readonly (keyof ModelCapabilities)[] | null>(() => {
-@@ -8336,7 +8369,7 @@ export function HubModelPicker({
-                       onToggle={
-                         npuBrowseForcedOpen
-                           ? undefined
--                          : () => setNpuBrowseCollapsed((v) => !v)
-+                          : () => setNpuBrowseCollapsedChoice(!npuBrowseFolded)
-                       }
-                     >
-                       NPU
-diff --git a/studio/frontend/src/features/npu/index.ts b/studio/frontend/src/features/npu/index.ts
-index 0c7263e398..18bbd5a988 100644
---- a/studio/frontend/src/features/npu/index.ts
-+++ b/studio/frontend/src/features/npu/index.ts
-@@ -12,7 +12,7 @@ export {
-   npuRowsFor,
-   npuSizeLabel,
- } from "./api";
--export { NpuPoweredBy, NpuSetupNotice } from "./npu-setup-notice";
-+export { NpuHubPrompt, NpuPoweredBy, NpuSetupNotice } from "./npu-setup-notice";
- export {
-   type NpuCatalog,
-   type NpuPickerSource,
 diff --git a/studio/frontend/src/features/npu/npu-setup-notice.tsx b/studio/frontend/src/features/npu/npu-setup-notice.tsx
-index 688f32c964..28886fcc90 100644
+index 688f32c964..60e917ab1d 100644
 --- a/studio/frontend/src/features/npu/npu-setup-notice.tsx
 +++ b/studio/frontend/src/features/npu/npu-setup-notice.tsx
 @@ -15,8 +15,8 @@ export function NpuSetupNotice({ catalog }: { catalog: NpuCatalog }) {
@@ -745,41 +491,6 @@ index 688f32c964..28886fcc90 100644
        </p>
        {status.error || problems.length > 0 ? (
          <div className="flex gap-2 rounded-lg bg-destructive/10 p-2.5 text-destructive">
-@@ -105,3 +105,34 @@ export function NpuPoweredBy({
-     </p>
-   );
- }
-+
-+/** The Hub feed's pointer to the NPU list, which otherwise sits behind the format menu. */
-+export function NpuHubPrompt({
-+  status,
-+  onBrowse,
-+}: {
-+  status: NpuStatus;
-+  onBrowse: () => void;
-+}) {
-+  return (
-+    <div
-+      data-testid="hub-npu-prompt"
-+      className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-muted/40 px-4 py-3 text-ui-13"
-+    >
-+      <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
-+        <span
-+          aria-hidden={true}
-+          className="size-1.5 shrink-0 rounded-full bg-format-npu"
-+        />
-+        {/* Wraps rather than truncates: the split view leaves this row a narrow column. */}
-+        <span className="min-w-0 text-pretty">
-+          {status.hardware.name ?? "AMD NPU"} found. Run models on it, apart
-+          from the GPU.
-+        </span>
-+      </span>
-+      <Button size="sm" variant="outline" onClick={onBrowse}>
-+        Browse NPU models
-+      </Button>
-+    </div>
-+  );
-+}
 diff --git a/unsloth_cli/_inference.py b/unsloth_cli/_inference.py
 index 97ced9e1c8..c23d039c64 100644
 --- a/unsloth_cli/_inference.py
@@ -944,7 +655,7 @@ index 0000000000..b17bf7cc72
 +            f"The download of {model_id} ended early. Run the command again to resume it."
 +        )
 diff --git a/unsloth_cli/commands/chat.py b/unsloth_cli/commands/chat.py
-index f5fb38e5ab..d5cd354dfd 100644
+index f5fb38e5ab..ed2918f2ae 100644
 --- a/unsloth_cli/commands/chat.py
 +++ b/unsloth_cli/commands/chat.py
 @@ -2,6 +2,7 @@
@@ -955,56 +666,7 @@ index f5fb38e5ab..d5cd354dfd 100644
  from typing import List, Optional
  
  import typer
-@@ -128,11 +129,47 @@ def _drain_available_stdin() -> None:
-         return
- 
- 
-+def _running_studio_npu_entries() -> list:
-+    """Downloaded NPU models, when an Unsloth Studio is running: they live in Studio, not on disk here."""
-+    from unsloth_cli._inference import (
-+        HttpChatBackend,
-+        _studio_token,
-+        find_studio_server,
-+        is_loopback_url,
-+    )
-+    from unsloth_cli._model_catalog import ModelEntry
-+    from unsloth_cli._npu import NPU_MODEL_PREFIX
-+
-+    base_url = find_studio_server(timeout = 1.0)
-+    token = _studio_token() if base_url and is_loopback_url(base_url) else None
-+    if not token:
-+        return []
-+    try:
-+        import json
-+        with HttpChatBackend(base_url, token)._request(
-+            "GET", "/api/npu/models", timeout = 10
-+        ) as response:
-+            models = json.loads(response.read()).get("models") or []
-+    except Exception:
-+        return []
-+    return [
-+        ModelEntry(
-+            group = "AMD NPU (Unsloth Studio)",
-+            name = str(m["id"]),
-+            detail = "NPU"
-+            + (f" · {m['size_gb']:.1f} GB" if isinstance(m.get("size_gb"), (int, float)) else ""),
-+            model = NPU_MODEL_PREFIX + str(m["id"]),
-+        )
-+        for m in models
-+        if isinstance(m, dict) and m.get("downloaded") and m.get("id")
-+    ]
-+
-+
- def _pick_model(console) -> str:
-     ensure_studio_backend_path()
-     from unsloth_cli._model_catalog import list_chat_models
- 
--    entries = list_chat_models()
-+    entries = list_chat_models() + _running_studio_npu_entries()
-     if not entries:
-         typer.echo(
-             "No local models found. Pass a model id or path: `unsloth chat <model>`.",
-@@ -285,9 +322,32 @@ def chat(
+@@ -285,9 +286,32 @@ def chat(
              raise typer.Exit(code = 1)
          model = _pick_model(console)
  
@@ -1040,7 +702,7 @@ index f5fb38e5ab..d5cd354dfd 100644
      compare_blocked = _compare_blocked_reason(model_config)
      if is_mlx_distributed:
          compare_blocked = (
-@@ -318,6 +378,16 @@ def chat(
+@@ -318,6 +342,16 @@ def chat(
          else connect_studio_server(model, **server_load_opts(ctx, load_opts))
      )
      server_mode = chat_backend is not None
@@ -1212,10 +874,10 @@ index a173bf6867..7a8dd48065 100644
              typer.echo(f"URL:     {_cf_url}")
 diff --git a/unsloth_cli/tests/test_npu_cli.py b/unsloth_cli/tests/test_npu_cli.py
 new file mode 100644
-index 0000000000..a52fe30c32
+index 0000000000..91dfd99842
 --- /dev/null
 +++ b/unsloth_cli/tests/test_npu_cli.py
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,192 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1379,7 +1041,6 @@ index 0000000000..a52fe30c32
 +    from unsloth_cli.commands import chat as chat_mod
 +
 +    monkeypatch.setattr(chat_mod, "connect_studio_server", lambda *_a, **_k: None)
-+    monkeypatch.setattr(chat_mod, "_running_studio_npu_entries", lambda: [])
 +    result = CliRunner().invoke(app, ["chat", "qwen3-0.6b-FLM"])
 +    assert result.exit_code == 1
 +    assert "runs on the AMD NPU inside Unsloth Studio" in result.output

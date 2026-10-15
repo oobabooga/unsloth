@@ -39,6 +39,8 @@ jobs:
 
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab2.py" -o "$root/h/ux_ab2.py"
 
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab3.py" -o "$root/h/ux_ab3.py"
+
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
 
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/fix.patch" -o "$root/h/fix.patch"
@@ -83,7 +85,7 @@ jobs:
         UX_SUITE: ab
         UX_OS: Linux
         UX_SIDE: B
-      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_ab2.py"
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_ab3.py"
     - name: Collect Studio logs
       if: always()
       run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
