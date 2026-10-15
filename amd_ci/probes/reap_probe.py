@@ -23,6 +23,8 @@ checkout, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
 res = {"mode": mode}
 try:
     import unsloth  # noqa: F401  (user path: Unsloth's MoE patches active)
+    from unsloth_zoo.temporary_patches.moe_utils import select_moe_backend
+    res["moe_backend"] = select_moe_backend()
 except Exception as e:
     res["unsloth_import_error"] = f"{type(e).__name__}: {e}"[:300]
 import torch, transformers
@@ -51,13 +53,16 @@ cfgs = {
         num_experts = 16, num_experts_per_tok = 4),
 }
 res["models"] = {}
+import copy
 for name, cfg in cfgs.items():
+    cfg = copy.deepcopy(cfg)
     r = {}
     try:
         torch.manual_seed(1234)
         model = AutoModelForCausalLM.from_config(cfg, dtype = dtype).to(device).eval()
         reap.reap_prune(model, None, sparsity = 0.5, dataset = rows, device = device)
         r["kept"] = model._unsloth_reap_report
+        r["saliency"] = model._unsloth_reap_saliency
         r["num_experts_after"] = model.config.num_experts
         r["expert_rows"] = sorted({tuple(p.shape)[0] for n, p in model.named_parameters() if ".experts." in n})
         with torch.no_grad():
@@ -69,7 +74,7 @@ for name, cfg in cfgs.items():
 json.dump(res, open(out, "w"))
 '''
 
-MODES = ("cpu_fp32", "gpu_fp32", "gpu_bf16")
+MODES = ("cpu_fp32", "gpu_fp32", "cpu_bf16", "gpu_bf16")
 
 
 def main() -> int:

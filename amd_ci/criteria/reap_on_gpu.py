@@ -3,9 +3,9 @@
 
 Base has no REAP (the PR adds it), so the "defect" is its absence. Head must, for every model:
 prune to half the experts on CPU fp32, GPU fp32 and GPU bf16, leave every expert tensor at the
-new count, give finite logits, and keep >= 75% of the CPU fp32 experts on GPU fp32. Near ties flip
-between kernels (a CUDA B200 run kept 47/48 of them, one OLMoE layer differing), so exact equality
-is not the bar; bf16 is only required to run.
+new count, give finite logits, and keep >= 75% of the CPU's experts at the same dtype (GPU fp32 vs CPU
+fp32, GPU bf16 vs CPU bf16: same weights, so only the kernels differ). Near ties flip between
+kernels (a CUDA B200 run kept 47/48 in fp32), so exact equality is not the bar.
 
 Pairs with probes/reap_probe.py.
 """
@@ -34,7 +34,7 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
     for name in ("base", "head"):
         modes = (obs.get(name) or {}).get("modes") or {}
         ran = [m for m, v in modes.items() if v.get("torch")]
-        out.append((f"{name}: every mode started torch", len(ran) == 3, ", ".join(ran) or "none"))
+        out.append((f"{name}: every mode started torch", len(ran) == 4, ", ".join(ran) or "none"))
     head_gpu = ((obs.get("head") or {}).get("modes") or {}).get("gpu_fp32") or {}
     out.append(("head GPU is ROCm", bool(head_gpu.get("hip")), f"hip={head_gpu.get('hip')} arch={head_gpu.get('arch')}"))
     return out
@@ -51,7 +51,7 @@ def table(obs: dict) -> str:
                 continue
             for name in MODELS:
                 r = _model(o, mode, name)
-                ref = _model(o, "cpu_fp32", name).get("kept") or {}
+                ref = _model(o, "cpu_" + mode.split("_")[1], name).get("kept") or {}
                 kept = r.get("kept") or {}
                 same = sum(kept.get(k) == ref.get(k) for k in ref)
                 res = r.get("error", "ok")[:120]
@@ -71,9 +71,10 @@ def _ok(r: dict) -> bool:
 
 def head_is_fixed(head: dict) -> bool:
     for name in MODELS:
-        cpu, gpu, bf16 = (_model(head, m, name) for m in ("cpu_fp32", "gpu_fp32", "gpu_bf16"))
-        if not (_ok(cpu) and _ok(gpu) and _ok(bf16)):
-            return False
-        if _overlap(gpu.get("kept") or {}, cpu.get("kept") or {}) < MIN_OVERLAP:
-            return False
+        for dtype in ("fp32", "bf16"):
+            cpu, gpu = _model(head, "cpu_" + dtype, name), _model(head, "gpu_" + dtype, name)
+            if not (_ok(cpu) and _ok(gpu)):
+                return False
+            if _overlap(gpu.get("kept") or {}, cpu.get("kept") or {}) < MIN_OVERLAP:
+                return False
     return True
