@@ -117,7 +117,10 @@ jobs:
           $MODEL = "$W\model\Qwen3-30B-A3B-UD-IQ1_S.gguf"
           $URL = "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-UD-IQ1_S.gguf"
           # Model download in the background (python, no progress bar), waited on below.
-          $dl = Start-Process -FilePath $env:AMD_CI_PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" -ArgumentList @("-c", "import urllib.request,shutil,sys; r=urllib.request.urlopen(sys.argv[1]); f=open(sys.argv[2],'wb'); shutil.copyfileobj(r,f,16<<20); f.close(); print('ok')", $URL, $MODEL)
+          $dlpy = "$W\dl.py"
+          [IO.File]::WriteAllText($dlpy, "import urllib.request, shutil, sys`nr = urllib.request.urlopen(sys.argv[1])`nwith open(sys.argv[2], 'wb') as f:`n    shutil.copyfileobj(r, f, 16 << 20)`nprint('download ok')`n", (New-Object System.Text.UTF8Encoding $false))
+          $dl = Start-Process -FilePath $env:AMD_CI_PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" -ArgumentList @("`"$dlpy`"", $URL, "`"$MODEL`"")
+          function Log($s) { Write-Host $s; Add-Content -Encoding utf8 -Path "$OUT\toolchain.txt" -Value $s }
 
           & $env:AMD_CI_PY -m venv "$W\venv"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -131,8 +134,7 @@ jobs:
           Get-Content "$OUT\therock_init.log" -Tail 5
           $ROCM = (& "$W\venv\Scripts\rocm-sdk.exe" path --root).Trim()
           Write-Host "TheRock install took $([int]((Get-Date) - $t0).TotalSeconds) s, root $ROCM"
-          & $VP -m pip list 2>$null | Select-String -Pattern "rocm" | Out-File -Encoding utf8 "$OUT\therock_versions.txt"
-          Get-Content "$OUT\therock_versions.txt"
+          & $VP -m pip list 2>$null | Select-String -Pattern "rocm" | ForEach-Object { Log "$_" }
           $CLANG = "$ROCM\lib\llvm\bin\clang.exe"; $CLANGXX = "$ROCM\lib\llvm\bin\clang++.exe"
           if (-not (Test-Path $CLANG)) { Write-Host "FATAL: no clang at $CLANG"; Get-ChildItem $ROCM, "$ROCM\lib" | Select-Object -First 60 | ForEach-Object { $_.FullName }; exit 1 }
 
@@ -144,9 +146,8 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "HIP_PATH=$ROCM"
           Add-Content -Path $env:GITHUB_ENV -Value "ROCM_PATH=$ROCM"
           Add-Content -Path $env:GITHUB_PATH -Value "$ROCM\bin"
-          & $CLANG --version | Out-File -Encoding utf8 "$OUT\toolchain.txt"
-          "ROCM=$ROCM" | Add-Content -Encoding utf8 "$OUT\toolchain.txt"
-          Get-Content "$OUT\toolchain.txt"
+          Log ((& $CLANG --version) -join " | ")
+          Log "ROCM=$ROCM"
 
           $SRC = "$W\llama"
           New-Item -ItemType Directory -Force -Path $SRC | Out-Null
@@ -154,11 +155,14 @@ jobs:
           git -C $SRC config core.autocrlf false
           git -C $SRC remote add origin https://github.com/unslothai/llama.cpp
           git -C $SRC fetch -q --depth 1 origin refs/pull/268/head
-          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: fetch"; exit 1 }
-          git -C $SRC checkout -q --detach FETCH_HEAD
+          $NOW = (git -C $SRC rev-parse FETCH_HEAD).Trim()
+          Log "pull/268/head now = $NOW (pinned base = $WANT)"
+          git -C $SRC fetch -q --depth 1 origin $WANT
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: fetch $WANT"; exit 1 }
+          git -C $SRC checkout -q --detach $WANT
           $GOT = (git -C $SRC rev-parse HEAD).Trim()
-          "pull/268/head = $GOT" | Tee-Object -FilePath "$OUT\source.txt"
-          if ($GOT -ne $WANT) { Write-Host "FATAL: head moved $GOT"; exit 1 }
+          Log "checked out = $GOT"
+          if ($GOT -ne $WANT) { Write-Host "FATAL: checkout $GOT"; exit 1 }
 
           $SRCF = $SRC.Replace('\', '/')
           $t0 = Get-Date
@@ -173,7 +177,7 @@ jobs:
           cmake --build "$SRC\build" --target llama-completion llama-server llama-cli -j 32 *> "$OUT\build_base.log"
           $brc = $LASTEXITCODE
           if ($brc -ne 0) { Get-Content "$OUT\build_base.log" | Select-String -Pattern "error|FAILED" | Select-Object -First 40; exit 1 }
-          "base build took $([int]((Get-Date) - $t0).TotalSeconds) s" | Tee-Object -Append -FilePath "$OUT\toolchain.txt"
+          Log "base build took $([int]((Get-Date) - $t0).TotalSeconds) s"
           foreach ($s in "base", "head") { New-Item -ItemType Directory -Force -Path "$W\states\$s\bin" | Out-Null }
           Copy-Item "$SRC\build\bin\*" "$W\states\base\bin\" -Recurse
           git -C $SRC apply --index "$env:GITHUB_WORKSPACE\amd_ci\moe_materialize.patch"
@@ -182,9 +186,9 @@ jobs:
           $t0 = Get-Date
           cmake --build "$SRC\build" --target llama-completion llama-server llama-cli -j 32 *> "$OUT\build_fix.log"
           if ($LASTEXITCODE -ne 0) { Get-Content "$OUT\build_fix.log" | Select-String -Pattern "error|FAILED" | Select-Object -First 40; exit 1 }
-          "fix rebuild took $([int]((Get-Date) - $t0).TotalSeconds) s" | Tee-Object -Append -FilePath "$OUT\toolchain.txt"
+          Log "fix rebuild took $([int]((Get-Date) - $t0).TotalSeconds) s"
           Copy-Item "$SRC\build\bin\*" "$W\states\head\bin\" -Recurse
-          Get-ChildItem "$W\states\*\bin\llama-completion.exe" | ForEach-Object { "$($_.FullName) $((Get-FileHash $_.FullName -Algorithm MD5).Hash) materialize=$((Select-String -Path $_.FullName -Pattern 'materialize_mapped' -SimpleMatch -Quiet))" } | Tee-Object -Append -FilePath "$OUT\toolchain.txt"
+          Get-ChildItem "$W\states\*\bin\llama-completion.exe" | ForEach-Object { "$($_.FullName) $((Get-FileHash $_.FullName -Algorithm MD5).Hash) materialize=$((Select-String -Path $_.FullName -Pattern 'materialize_mapped' -SimpleMatch -Quiet))" } | ForEach-Object { Log $_ }
 
           $states = @{ pr = 268; merged = $false; commits = @{ base = $GOT; head = "$GOT+materialize-533edbff60" }; paths = @{ base = "$W\states\base"; head = "$W\states\head" } }
           [IO.File]::WriteAllText("$OUT\states.json", ($states | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false))
