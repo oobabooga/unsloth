@@ -1,0 +1,163 @@
+name: "AMD CI: llama.cpp 268 vs Strata, experts spilled (gfx1151)"
+
+# Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
+# values, and the tests/args, rather than the plumbing.
+#
+# Two jobs, because two jobs of this workflow may land on the SAME machine and
+# then share its one GPU:
+#   suites  masks the GPU, so it cannot perturb a measurement running beside it
+#   gpu     is the only job allowed to allocate, and is serialised against every
+#           other run of the same concurrency group
+#
+# They may equally land on different machines: the Linux pool is at least seven
+# (a 24-way matrix ran essentially concurrently across seven distinct hosts).
+# Nothing is shared between them, including the Docker image cache, so a job that
+# pulls an image does not make it available to the next one.
+#
+# This is the LINUX template. For the Windows boxes use
+# `scaffold.py --windows`, which emits templates/workflow_windows.yml.
+#
+# If your change needs no GPU measurement, delete the gpu job. If it needs no
+# test suites, delete suites. Do not delete the gate: it fails rather than
+# skipping, because a skip misreports missing hardware as nothing to see.
+
+on:
+  push:
+    branches: [amd-ci-llama268-strata-spill]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "268"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+
+jobs:
+
+  gpu:
+    name: "PR 268 GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    # A shared constant, deliberately: it serialises every GPU measurement across
+    # all branches. That is stricter than co-tenancy strictly requires now that the
+    # pool is many machines, but nothing in the label set can pin or exclude a
+    # machine, so "two GPU jobs never run at once" is the only enforceable version
+    # of "no co-tenant moved my number".
+    # The cost is that the group holds one runner plus one waiter,
+    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
+    # the job already running, not the one queued behind it. Re-run the job.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr268-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Build llama.cpp 87f5c3deb and Strata 296b59d2f7, fetch the model
+        timeout-minutes: 90
+        run: |
+          set +e
+          W="$AMD_CI_WORK"; OUT="$W/out"
+          WANT=87f5c3debd4fb1e95f1a330d1cbea3bf7e64e0fc
+          SWANT=296b59d2f73c8f04a805df29c2fa97655adace78
+          REV=5bc3e238d916f48a861bac2f8a1990a0e9b7e98d
+          MODEL="$W/model/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+          mkdir -p "$W/model"
+          ( curl -fL --retry 8 --retry-delay 10 -s -S -o "$MODEL" "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/$REV/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" > "$OUT/curl.log" 2>&1; echo "curl rc=$?" >> "$OUT/curl.log" ) &
+          CURL_PID=$!
+          {
+            echo "## runner: ${RUNNER_NAME:-?}"; free -m; nproc
+            cat /sys/class/drm/card*/device/mem_info_vram_total /sys/class/drm/card*/device/mem_info_gtt_total 2>/dev/null
+            hipconfig --version; echo; ls /opt/rocm/bin | grep -i rocprof
+          } > "$OUT/diag.txt" 2>&1; cat "$OUT/diag.txt"
+          export HIPCXX=/opt/rocm/llvm/bin/clang HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm PATH="/opt/rocm/bin:$PATH"
+
+          SRC="$W/llama"; mkdir -p "$SRC"
+          git -C "$SRC" init -q; git -C "$SRC" remote add origin https://github.com/unslothai/llama.cpp
+          git -C "$SRC" fetch -q --depth 1 origin refs/pull/268/head
+          NOW=$(git -C "$SRC" rev-parse FETCH_HEAD); echo "pull/268/head = $NOW (want $WANT)" | tee "$OUT/source.txt"
+          git -C "$SRC" fetch -q --depth 1 origin "$WANT" || { echo "FATAL: fetch $WANT"; exit 1; }
+          git -C "$SRC" checkout -q --detach "$WANT"
+          [ "$(git -C "$SRC" rev-parse HEAD)" = "$WANT" ] || { echo "FATAL: checkout"; exit 1; }
+          T0=$(date +%s)
+          cmake -S "$SRC" -B "$SRC/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 \
+            -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_EXE_LINKER_FLAGS=-no-pie -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DCMAKE_HIP_COMPILER="$HIPCXX" \
+            -DCMAKE_PREFIX_PATH=/opt/rocm > "$OUT/llama_configure.log" 2>&1 || { tail -40 "$OUT/llama_configure.log"; exit 1; }
+          cmake --build "$SRC/build" --target llama-completion llama-tokenize -j "$(nproc)" > "$OUT/llama_build.log" 2>&1 || { grep -E "error|FAILED" "$OUT/llama_build.log" | head -30; exit 1; }
+          echo "llama.cpp build $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt"
+
+          SS="$W/strata"; mkdir -p "$SS"
+          git -C "$SS" init -q; git -C "$SS" remote add origin https://github.com/Niko1221/Strata
+          git -C "$SS" fetch -q --depth 1 origin "$SWANT" || { echo "FATAL: fetch Strata $SWANT"; exit 1; }
+          git -C "$SS" checkout -q --detach "$SWANT"
+          echo "strata = $(git -C "$SS" rev-parse HEAD)" | tee -a "$OUT/source.txt"
+          T0=$(date +%s)
+          cmake -S "$SS" -B "$SS/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+            -DSTRATA_PREFILL_MMQ=ON -DCMAKE_HIP_ARCHITECTURES=gfx1151 -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm -DCMAKE_PREFIX_PATH=/opt/rocm > "$OUT/strata_configure.log" 2>&1 || { tail -60 "$OUT/strata_configure.log"; exit 1; }
+          cmake --build "$SS/build" --target strata-q36 -j "$(nproc)" > "$OUT/strata_build.log" 2>&1 || { grep -E "error|FAILED" "$OUT/strata_build.log" | head -40; exit 1; }
+          echo "strata build $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt"
+          STRATA_EXE=$(find "$SS/build" -name strata-q36 -type f -perm -u+x | head -1 || true)
+          [ -n "$STRATA_EXE" ] || { echo "FATAL: no strata-q36"; exit 1; }
+
+          cat "$SRC"/README.md "$SRC"/docs/*.md "$SRC"/docs/*/*.md "$SRC"/tools/server/README.md > "$W/corpus.txt" 2>/dev/null
+          wc -c "$W/corpus.txt"
+          wait "$CURL_PID"; cat "$OUT/curl.log"; ls -la "$MODEL"
+          [ "$(stat -c %s "$MODEL")" = "22853663008" ] || { echo "FATAL: model size"; exit 1; }
+          {
+            echo "AMD_CI_MODEL=$MODEL"; echo "AMD_CI_STRATA=$STRATA_EXE"; echo "AMD_CI_LLAMA_BIN=$SRC/build/bin"
+            echo "AMD_CI_CORPUS=$W/corpus.txt"; echo "HIP_PATH=/opt/rocm"; echo "ROCM_PATH=/opt/rocm"
+          } >> "$GITHUB_ENV"
+
+      - name: Bench (interleaved arms, 3 reps)
+        timeout-minutes: 120
+        run: |
+          set +e
+          python3 -u amd_ci/probes/spill_bench.py --llama-bin "$AMD_CI_LLAMA_BIN" --strata "$AMD_CI_STRATA" \
+            --model "$AMD_CI_MODEL" --corpus "$AMD_CI_CORPUS" --out "$AMD_CI_WORK/out/bench" --cache-gib 16 --reps 3
+          rc=$?
+          echo "bench rc=$rc"
+          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
+
+      - name: Profile p8k spill (rocprofv3 stats, one run per engine)
+        timeout-minutes: 40
+        run: |
+          set +e
+          RP=$(command -v rocprofv3 || ls /opt/rocm/bin/rocprofv3 2>/dev/null)
+          [ -n "$RP" ] || { echo "no rocprofv3"; exit 0; }
+          P="$AMD_CI_WORK/out/prof"; mkdir -p "$P"
+          B="$AMD_CI_WORK/out/bench"
+          "$RP" --kernel-trace --memory-copy-trace --stats --output-format csv -d "$P/llama" -o run -- \
+            "$AMD_CI_LLAMA_BIN/llama-completion" -m "$AMD_CI_MODEL" -ngl 99 -fa on -c 10240 --temp 0 --seed 42 -no-cnv \
+            --no-display-prompt --load-mode none -n 16 -cmoe --moe-cache-mib 16384 -ub 2048 -b 2048 -f "$B/prompt_p8k.txt" \
+            > "$P/llama.stdout" 2> "$P/llama.stderr"
+          echo "llama prof rc=$?"
+          "$RP" --kernel-trace --memory-copy-trace --stats --output-format csv -d "$P/strata" -o run -- \
+            "$AMD_CI_STRATA" --model "$AMD_CI_MODEL" --max-context 10240 --mtp 0 --expert-vram 16 --n 16 \
+            --tokens "$(cat "$B/prompt_p8k.ids")" > "$P/strata.stdout" 2> "$P/strata.stderr"
+          echo "strata prof rc=$?"
+          find "$P" -name "*stats*.csv" | head -20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr268-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
