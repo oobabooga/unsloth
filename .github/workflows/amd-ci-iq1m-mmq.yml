@@ -1,0 +1,173 @@
+name: "AMD CI: llama.cpp IQ1_M MMQ on gfx1151"
+
+# One GPU job on the Linux half of the pool. It builds the public ggml-org/llama.cpp
+# at BASE_SHA (base) and the same commit plus iq1m.patch from this branch (head) with
+# ggml-hip for gfx1151, on the same host in the same job, then runs test-backend-ops
+# for both through amd_ci/lib/differential.py:
+#   probe     amd_ci/probes/llama_tbo_probe.py   observes (eval + perf, JSON to file)
+#   criteria  amd_ci/criteria/llama_iq1m_mmq.py  judges (VOID if base does not show the old path)
+# Windows is not covered: it would need the HIP SDK for Windows and a separate build.
+
+on:
+  push:
+    branches: [amd-ci-iq1m-mmq]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_REPO: "https://github.com/ggml-org/llama.cpp"
+  BASE_SHA: "843e7dcc15098dd6b3aaf33b4847052293d8ef1a"
+  ROCM_GFX: "gfx1151"
+
+jobs:
+
+  gpu:
+    name: "IQ1_M MMQ base vs head (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "iq1m-mmq-gpu"
+
+      - name: Host diagnostics
+        run: |
+          set +e
+          uname -a
+          nproc
+          free -g
+          ls -d /opt/rocm* || echo "no /opt/rocm"
+          for b in hipconfig hipcc rocminfo amd-smi cmake ninja python3 git; do
+            printf '%-10s %s\n' "$b" "$(command -v $b || echo MISSING)"
+          done
+          ls -l /dev/kfd /dev/dri || echo "no /dev/kfd or /dev/dri"
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json"
+
+      - name: ROCm toolchain
+        timeout-minutes: 45
+        run: |
+          set -eu
+          V="$AMD_CI_WORK/venv"
+          python3 -m venv "$V"
+          "$V/bin/python" -m pip install -q --upgrade pip
+          "$V/bin/python" -m pip install -q "cmake>=3.28" ninja
+          ROOT=""
+          if command -v hipconfig > /dev/null; then
+            ROOT="$(hipconfig -R)"
+            echo "using the host ROCm at $ROOT"
+          else
+            ok=0
+            for idx in "https://rocm.nightlies.amd.com/v2/${ROCM_GFX}/" "https://repo.amd.com/rocm/whl/${ROCM_GFX}/"; do
+              if "$V/bin/python" -m pip install -q --index-url "$idx" "rocm[libraries,devel]"; then
+                ok=1
+                echo "ROCm SDK wheels from $idx"
+                break
+              fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "FATAL: no ROCm SDK on the host and the wheel install failed"
+              exit 1
+            fi
+            ROOT="$("$V/bin/rocm-sdk" path --root)"
+          fi
+          if [ ! -x "$ROOT/bin/hipconfig" ] && [ ! -x "$ROOT/bin/hipcc" ]; then
+            echo "FATAL: ROCm root $ROOT has no hipconfig/hipcc"
+            exit 1
+          fi
+          CLANG="$ROOT/lib/llvm/bin/clang"
+          if [ ! -x "$CLANG" ]; then
+            CLANG="$(PATH="$ROOT/bin:$PATH" hipconfig -l)/clang"
+          fi
+          {
+            echo "ROCM_ROOT=$ROOT"
+            echo "HIP_PATH=$ROOT"
+            echo "ROCM_PATH=$ROOT"
+            echo "CMAKE_PREFIX_PATH=$ROOT"
+            echo "HIPCXX=$CLANG"
+            echo "PATH=$V/bin:$ROOT/bin:$PATH"
+            echo "LD_LIBRARY_PATH=$ROOT/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          "$CLANG" --version
+
+      - name: Hardware gate (fails, never skips)
+        run: |
+          set +e
+          rocminfo > "$AMD_CI_WORK/out/rocminfo.txt" 2>&1
+          rc=$?
+          grep -m3 -E "Name: +gfx" "$AMD_CI_WORK/out/rocminfo.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "GATE FAILED: rocminfo exit $rc"
+            exit 1
+          fi
+          if ! grep -q "$ROCM_GFX" "$AMD_CI_WORK/out/rocminfo.txt"; then
+            echo "GATE FAILED: no $ROCM_GFX agent"
+            exit 1
+          fi
+          echo "gate ok"
+
+      - name: Resolve states
+        run: |
+          set -eu
+          python3 amd_ci/lib/llama_states.py --repo "$LLAMA_REPO" --base-sha "$BASE_SHA" \
+            --patch "$GITHUB_WORKSPACE/iq1m.patch" \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Build base and head (ggml-hip, test-backend-ops)
+        timeout-minutes: 120
+        run: |
+          set +e
+          fail=0
+          for s in base head; do
+            d="$AMD_CI_WORK/states/$s"
+            cmake -S "$d" -B "$d/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_HIP=ON -DGPU_TARGETS="$ROCM_GFX" -DAMDGPU_TARGETS="$ROCM_GFX" \
+              -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF > "$AMD_CI_WORK/out/cmake_$s.log" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "cmake failed for $s (rc $rc)"
+              tail -40 "$AMD_CI_WORK/out/cmake_$s.log"
+              fail=1
+              continue
+            fi
+            start=$(date +%s)
+            cmake --build "$d/build" -j "$(nproc)" --target test-backend-ops > "$AMD_CI_WORK/out/build_$s.log" 2>&1
+            rc=$?
+            echo "$s build rc=$rc in $(( $(date +%s) - start )) s"
+            if [ "$rc" -ne 0 ]; then
+              tail -60 "$AMD_CI_WORK/out/build_$s.log"
+              fail=1
+            fi
+            ls -l "$d/build/bin/libggml-hip.so" "$d/build/bin/test-backend-ops"
+          done
+          exit "$fail"
+
+      - name: Differential
+        timeout-minutes: 120
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/llama_tbo_probe.py \
+            --criteria amd_ci/criteria/llama_iq1m_mmq.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python python3 \
+            -- --tbo "$AMD_CI_WORK/states/head/build/bin/test-backend-ops"
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iq1m-mmq-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
