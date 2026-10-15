@@ -1,4 +1,4 @@
-name: FastFlow NPU fixes A/B
+name: FastFlow NPU context-full parity
 'on':
   push:
     branches:
@@ -42,6 +42,8 @@ jobs:
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab3.py" -o "$root/h/ux_ab3.py"
 
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_final.py" -o "$root/h/ux_final.py"
+
+        curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_parity.py" -o "$root/h/ux_parity.py"
 
         curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -o "$root/h/probe_hw.py"
 
@@ -87,7 +89,7 @@ jobs:
         UX_SUITE: ab
         UX_OS: Linux
         UX_SIDE: B
-      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_final.py"
+      run: env -u LD_LIBRARY_PATH "$UX_ROOT/pw/bin/python" -u "$UX_ROOT/h/ux_parity.py"
     - name: Collect Studio logs
       if: always()
       run: find "$HOME/.unsloth" -name '*.log' -size -50M -exec cp {} "$UX_ROOT/evidence/" \; 2>/dev/null; true
@@ -137,6 +139,8 @@ jobs:
         Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_ab3.py" -OutFile "$root\h\ux_ab3.py"
 
         Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_final.py" -OutFile "$root\h\ux_final.py"
+
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/ux_parity.py" -OutFile "$root\h\ux_parity.py"
 
         Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}/probe_hw.py" -OutFile "$root\h\probe_hw.py"
 
@@ -200,7 +204,7 @@ jobs:
         UX_SUITE: ab
         UX_OS: Windows
         UX_SIDE: B
-      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h\ux_final.py"'
+      run: '& "$env:UX_ROOT\pw\Scripts\python.exe" -u "$env:UX_ROOT\h\ux_parity.py"'
     - name: Collect Studio logs
       if: always()
       run: Get-ChildItem -Recurse "$env:UNSLOTH_STUDIO_HOME" -Include *.log -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 50MB } | ForEach-Object { Copy-Item $_.FullName "$env:UX_ROOT\evidence\"

@@ -1,5 +1,5 @@
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index 7eda56981e..b8614fb1bd 100644
+index 7eda56981e..a2391b6dde 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -10913,7 +10913,10 @@ async def _reject_unservable_model(
@@ -147,11 +147,10 @@ index 7eda56981e..b8614fb1bd 100644
  class _NpuStreamRelay:
      """Normalize model IDs, enforce stop sequences, and collect non-streaming replies.
  
-@@ -29842,16 +29957,22 @@ class _NpuStreamRelay:
-         self._pending = buffer[len(buffer) - keep :] if keep else ""
+@@ -29843,15 +29958,14 @@ class _NpuStreamRelay:
          return buffer[: len(buffer) - keep] if keep else buffer
  
--    def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
+     def _chunk(self, delta: dict, finish_reason: Optional[str]) -> str:
 -        return "data: " + json.dumps(
 -            {
 -                "id": self.completion_id or "chatcmpl-npu",
@@ -161,12 +160,6 @@ index 7eda56981e..b8614fb1bd 100644
 -                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
 -            }
 -        )
-+    def _chunk(
-+        self,
-+        delta: dict,
-+        finish_reason: Optional[str],
-+        tool_event: Optional[dict] = None,
-+    ) -> str:
 +        chunk = {
 +            "id": self.completion_id or "chatcmpl-npu",
 +            "object": "chat.completion.chunk",
@@ -174,13 +167,11 @@ index 7eda56981e..b8614fb1bd 100644
 +            "model": self.public_model,
 +            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
 +        }
-+        if tool_event is not None:
-+            chunk["_toolEvent"] = tool_event
 +        return "data: " + json.dumps(chunk)
  
      def feed(self, line: str) -> list[str]:
          """The lines to send on for one line of the upstream stream."""
-@@ -29919,6 +30040,11 @@ class _NpuStreamRelay:
+@@ -29919,6 +30033,10 @@ class _NpuStreamRelay:
              elif isinstance(content, str):
                  self.content += content
              if choice.get("finish_reason") is not None:
@@ -188,11 +179,10 @@ index 7eda56981e..b8614fb1bd 100644
 +                    # FastFlowLM says "stop" when the reply filled the context; without this the
 +                    # chat saved a reasoning-only turn as complete and showed no answer and no reason.
 +                    choice["finish_reason"] = "length"
-+                    out.append(self._chunk({}, None, {"type": "context_window_exceeded"}))
                  self.finish_reason = choice["finish_reason"]
                  if self._pending:
                      # The reply ended partway into a stop sequence, so what was held back is text.
-@@ -29930,7 +30056,9 @@ class _NpuStreamRelay:
+@@ -29930,7 +30048,9 @@ class _NpuStreamRelay:
          return out
  
      def completion(self) -> dict:
@@ -203,7 +193,7 @@ index 7eda56981e..b8614fb1bd 100644
          if self.reasoning:
              message["reasoning_content"] = self.reasoning
          if self.tool_calls:
-@@ -42092,6 +42220,17 @@ async def anthropic_messages(
+@@ -42092,6 +42212,17 @@ async def anthropic_messages(
      # so validation runs before the reload hook gets a chance to restore the model.
      # Plain detail, not _no_model_loaded_error: that helper leaves this case unchanged.
      if not llama_backend.is_loaded and not _automatic_model_load_may_run():
@@ -222,7 +212,7 @@ index 7eda56981e..b8614fb1bd 100644
              status_code = 503,
              detail = _no_model_loaded_detail("No GGUF model loaded. Load a GGUF model first."),
 diff --git a/studio/backend/tests/test_npu_chat_route.py b/studio/backend/tests/test_npu_chat_route.py
-index 922b9c8557..31445b12eb 100644
+index 922b9c8557..15d0689bdf 100644
 --- a/studio/backend/tests/test_npu_chat_route.py
 +++ b/studio/backend/tests/test_npu_chat_route.py
 @@ -69,7 +69,38 @@ _FLM_TIMINGS = {
@@ -264,7 +254,7 @@ index 922b9c8557..31445b12eb 100644
      if "FAULT" in prompt:
          return (
              _chunk({"content": "par"})
-@@ -1278,3 +1309,40 @@ def test_a_tool_loop_turn_dropped_after_a_tool_call_is_cut_short():
+@@ -1278,3 +1309,36 @@ def test_a_tool_loop_turn_dropped_after_a_tool_call_is_cut_short():
      plain = _TurnFinish()
      plain.see(_chunk({}, "stop").strip())
      assert plain.finished is True
@@ -276,9 +266,6 @@ index 922b9c8557..31445b12eb 100644
 +    status, lines = _call(stream = True, messages = full)
 +    assert status == 200
 +    chunks = _data(lines)
-+    assert [c["_toolEvent"] for c in chunks if "_toolEvent" in c] == [
-+        {"type": "context_window_exceeded"}
-+    ]
 +    finishes = [
 +        c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]
 +    ]
@@ -292,7 +279,6 @@ index 922b9c8557..31445b12eb 100644
 +    status, lines = _call(stream = True, messages = [{"role": "user", "content": "TIMED"}])
 +    assert status == 200
 +    chunks = _data(lines)
-+    assert not any("_toolEvent" in c for c in chunks)
 +    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 +
 +
