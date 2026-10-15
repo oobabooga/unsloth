@@ -53,7 +53,10 @@ def open_pr_states(src: Path, pr: int) -> dict[str, str]:
         ["git", "fetch", "-q", "origin", f"refs/pull/{pr}/merge:pr{pr}-merge"],
         cwd = src, capture_output = True,
     ).returncode == 0
-    base = run(["git", "merge-base", "origin/main", f"pr{pr}-head"], cwd = src)
+    # The merge ref's first parent is the tip of the PR's own base branch, so a PR stacked on
+    # another branch gets that branch as its base, not main.
+    target = f"pr{pr}-merge^1" if have_merge else "origin/main"
+    base = run(["git", "merge-base", target, f"pr{pr}-head"], cwd = src)
     states = {"base": base, "head": run(["git", "rev-parse", f"pr{pr}-head"], cwd = src)}
     if have_merge:
         states["merge"] = run(["git", "rev-parse", f"pr{pr}-merge"], cwd = src)

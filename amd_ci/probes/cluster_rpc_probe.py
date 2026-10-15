@@ -78,7 +78,7 @@ def main() -> int:
         procs.append(
             subprocess.Popen(
                 [rpc, "-H", "127.0.0.1", "-p", str(PORT_RPC)],
-                stdout = open(work / "rpc-server.log", "w"),
+                stdout = open(work / "rpc-server.log", "w", encoding = "utf-8"),
                 stderr = subprocess.STDOUT,
                 preexec_fn = os.setsid,
             )
@@ -94,7 +94,7 @@ def main() -> int:
             capture_output = True, text = True, timeout = 120,
         )
         obs["coordinator_devices"] = [l.strip() for l in listing.stdout.splitlines() if ":" in l and "MiB" in l]
-        obs["worker_log_head"] = (work / "rpc-server.log").read_text(errors = "replace")[:1500]
+        obs["worker_log_head"] = (work / "rpc-server.log").read_text(encoding = "utf-8", errors = "replace")[:1500]
 
         request = SimpleNamespace(
             model_path = model, gguf_variant = None, llama_extra_args = [], max_seq_length = 2048,
@@ -108,7 +108,7 @@ def main() -> int:
         argv = [server, "-m", model, "--port", str(PORT_SERVER), "-c", "2048", "-lv", "4"] + obs["planned_args"]
         log = work / "llama-server.log"
         t0 = time.time()
-        procs.append(subprocess.Popen(argv, stdout = open(log, "w"), stderr = subprocess.STDOUT, preexec_fn = os.setsid))
+        procs.append(subprocess.Popen(argv, stdout = open(log, "w", encoding = "utf-8"), stderr = subprocess.STDOUT, preexec_fn = os.setsid))
         healthy = False
         while time.time() - t0 < 600 and procs[-1].poll() is None:
             try:
@@ -127,7 +127,7 @@ def main() -> int:
             res = json.load(urllib.request.urlopen(req, timeout = 300))
             obs["text"] = res.get("content")
             obs["tok_s"] = (res.get("timings") or {}).get("predicted_per_second")
-        text = log.read_text(errors = "replace")
+        text = log.read_text(encoding = "utf-8", errors = "replace")
         obs["buffers"] = re.findall(r"load_tensors:\s+(\S+) model buffer size =\s+([\d.]+) MiB", text)
         m = re.search(r"offloaded (\d+)/(\d+) layers", text)
         obs["offloaded"] = [int(m.group(1)), int(m.group(2))] if m else None
