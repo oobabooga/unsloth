@@ -1,0 +1,174 @@
+{
+ "name": "amd_rocm_compile",
+ "description": "ROCm regional compile A/B on gfx1151: *_cmp = speed default with the compile allowed (head: probe-gated regional compile; base: refused, so eager), *_nc = same with UNSLOTH_DIFFUSION_ROCM_COMPILE=0 (eager at both states). Base *_cmp vs *_nc is the A/A pair. *_nc0 = a second eager cell run FIRST (absorbs first-cell warm-up effects; with *_nc it is the A/A pair at both states). n=5.",
+ "models": {
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "flux2_klein_4b": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 2,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "klein_nc0",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "klein_nc",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   }
+  },
+  {
+   "tag": "klein_cmp",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "zimg_nc0",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_nc",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "guidance": 0.0
+  },
+  {
+   "tag": "zimg_cmp",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nc",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "n": 5,
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "default"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "guidance": 0.0
+  }
+ ]
+}
