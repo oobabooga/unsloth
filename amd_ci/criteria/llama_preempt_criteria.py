@@ -9,7 +9,7 @@ llama_preempt_probe.py.
 
 from __future__ import annotations
 
-TITLE = "llama.cpp #269 KV preemption on gfx1151, upstream b11612 versus head"
+TITLE = "llama.cpp #269 KV preemption on gfx1151, upstream b11642 versus head"
 MODE = "differential"
 NEEDS = ["rocm", "gpu"]
 

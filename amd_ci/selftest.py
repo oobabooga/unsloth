@@ -311,6 +311,30 @@ def test_linux_gpu_step_hands_the_pytest_probe_its_tests() -> None:
               and text.count("bash install.sh --local") > 0)
 
 
+def test_custom_probe_args_follow_the_separator() -> None:
+    print("\na custom probe's --probe-args reach it after `--` on both templates")
+    import subprocess, tempfile
+    # differential.py takes probe args as a REMAINDER; spliced bare, argparse rejected them
+    # ("unrecognized arguments") and the job ended with no verdict before probing anything.
+    for extra in ([], ["--windows"]):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "ci"
+            r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                                "--out", str(out), "--branch", "b", *extra,
+                                "--probe", "amd_ci/probes/gpu_summary_probe.py",
+                                "--criteria", "amd_ci/criteria/gpu_summary_sees_others.py",
+                                "--probe-args", "--run-chosen --hazard"],
+                               capture_output = True, text = True)
+            wf = out / ".github" / "workflows" / "b.yml"
+            text = wf.read_text(encoding = "utf-8") if wf.is_file() else ""
+            label = "windows" if extra else "linux"
+            check(f"{label}: scaffold succeeds", r.returncode == 0, (r.stdout + r.stderr)[-200:])
+            check(f"{label}: probe args follow `--`", "-- --run-chosen --hazard" in text)
+            check(f"{label}: no bare probe args",
+                  text.count("--run-chosen --hazard") == text.count("-- --run-chosen --hazard"))
+            check(f"{label}: no placeholder is left behind", "__" + "DIFF_ARGS" + "__" not in text)
+
+
 def test_spoof_flag_targets_the_gpu_job() -> None:
     print("\n--spoof-devices lands in the gpu job, not the suites job")
     import subprocess, tempfile
@@ -740,6 +764,7 @@ def main() -> int:
     test_fixture_metadata_is_not_mistaken_for_a_state()
     test_spoofed_devices_cannot_satisfy_multi_gpu()
     test_spoof_flag_targets_the_gpu_job()
+    test_custom_probe_args_follow_the_separator()
     test_linux_gpu_step_hands_the_pytest_probe_its_tests()
     test_a_pytest_run_that_never_ran_is_not_a_pass()
     test_windows_is_reachable_but_docker_on_windows_is_not()

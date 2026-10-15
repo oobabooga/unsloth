@@ -132,7 +132,8 @@ def main() -> int:
         if args.probe_args:
             diff_args += " " + args.probe_args
     else:
-        diff_args = args.probe_args
+        # differential.py collects probe args as a REMAINDER: without `--` it rejects them.
+        diff_args = ("-- " + args.probe_args) if args.probe_args.strip() else ""
 
     text = template.read_text(encoding = "utf-8")
     text = (text
