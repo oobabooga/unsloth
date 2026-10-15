@@ -165,10 +165,17 @@ jobs:
           if ($GOT -ne $WANT) { Write-Host "FATAL: checkout $GOT"; exit 1 }
 
           $SRCF = $SRC.Replace('\', '/')
+          $ocml = Get-ChildItem -Path $ROCM -Recurse -Filter "ocml.bc" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $ocml) { Write-Host "FATAL: no ocml.bc under $ROCM"; exit 1 }
+          $BC = $ocml.DirectoryName
+          $env:HIP_DEVICE_LIB_PATH = $BC
+          Log "device libs = $BC"
+          $ROCMF = $ROCM.Replace('\', '/'); $BCF = $BC.Replace('\', '/')
+          $HFLAGS = "--rocm-path=$ROCMF --rocm-device-lib-path=$BCF -Wno-unused-command-line-argument"
           $t0 = Get-Date
           cmake -S $SRC -B "$SRC\build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_C_COMPILER=$CLANG" "-DCMAKE_CXX_COMPILER=$CLANGXX" "-DCMAKE_HIP_COMPILER=$CLANGXX" `
-            "-DCMAKE_PREFIX_PATH=$ROCM" "-DROCM_DIR=$ROCM" `
+            "-DCMAKE_PREFIX_PATH=$ROCM" "-DROCM_DIR=$ROCM" "-DCMAKE_CXX_FLAGS=$HFLAGS" "-DCMAKE_HIP_FLAGS=$HFLAGS" `
             -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=OFF `
             -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF *> "$OUT\cmake_configure.log"
           $crc = $LASTEXITCODE
