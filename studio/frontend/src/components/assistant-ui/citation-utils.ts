@@ -152,6 +152,70 @@ export function citedPagesPerDocument(
   );
 }
 
+/** An empty chunk would render as a blank card, so it is not a passage. */
+export function isPassage(citation: Citation): boolean {
+  return citation.text.trim().length > 0;
+}
+
+/** rank: 1-based among scored passages, across a merged thread + project search; null for a whole-document read. */
+export interface Passage {
+  citation: Citation;
+  rank: number | null;
+}
+
+export interface DocumentPassages {
+  key: string;
+  filename: string;
+  passages: Passage[];
+}
+
+/**
+ * Documents in chip order. Ranks skip unscored passages, so ranked ones after a whole-document read start at #1.
+ * `limit` keeps the first passages in retrieval order, not per document.
+ */
+export function passagesPerDocument(
+  citations: readonly Citation[],
+  limit = Number.POSITIVE_INFINITY,
+): DocumentPassages[] {
+  const groups = new Map<string, DocumentPassages>();
+  let ranked = 0;
+  let kept = 0;
+  for (const citation of citations) {
+    if (!isPassage(citation)) continue;
+    if (kept++ >= limit) break;
+    const key = documentKey(citation);
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, filename: citation.filename, passages: [] };
+      groups.set(key, group);
+    }
+    group.passages.push({
+      citation,
+      rank: citation.score != null ? ++ranked : null,
+    });
+  }
+  return Array.from(groups.values());
+}
+
+/** Only PDFs drop `#` markers (added by their Markdown conversion); code and config keep their `#` comments. */
+export function passageDisplayText(text: string, filename = ""): string {
+  const folded = text.trim().replace(/\n(?:[ \t]*\n)+/g, "\n");
+  return /\.pdf$/i.test(filename)
+    ? folded.replace(/^#{1,6}[ \t]+/gm, "")
+    : folded;
+}
+
+// About four lines of text-xs in the desktop chat column, so shorter passages are not clamped for nothing.
+const PASSAGE_CLAMP_CHARS = 450;
+const PASSAGE_CLAMP_LINES = 4;
+
+export function passageNeedsClamp(text: string): boolean {
+  return (
+    text.length > PASSAGE_CLAMP_CHARS ||
+    text.split("\n").length > PASSAGE_CLAMP_LINES
+  );
+}
+
 /** "p.3", "p.1–5" or "pp.1–3, 7": runs of consecutive pages collapse into ranges. */
 export function pageLabel(pages: readonly number[]): string {
   const runs: string[] = [];
