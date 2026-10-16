@@ -1,0 +1,116 @@
+name: RD-727 Windows flash-attn repro
+
+on:
+  push:
+    branches: [rd727-win-repro]
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: install + update (rate ${{ matrix.rate }} B/s)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        # 0 = no proxy. Otherwise GitHub asset downloads are paced to this many bytes/s
+        # while a flash_attn install or import process is running.
+        rate: [0, 1048576, 262144]
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      GH_TOKEN: ${{ github.token }}
+      # No NVIDIA GPU on the runner: pin the same CUDA 13 torch family the reporters have.
+      UNSLOTH_TORCH_INDEX_FAMILY: cu130
+      RATE: ${{ matrix.rate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber | Format-List
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          "RAM GiB: {0:N1}" -f ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+          try { Get-MpComputerStatus | Select-Object AMServiceEnabled, AntivirusEnabled, RealTimeProtectionEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled | Format-List } catch { "Get-MpComputerStatus failed: $_" }
+          try { (Get-MpPreference).ExclusionPath } catch {}
+          where.exe python uv nvidia-smi 2>&1
+          $PSVersionTable.PSVersion
+          exit 0
+
+      - name: Install with the public one-liner, then update
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $flag = Join-Path $env:RUNNER_TEMP 'throttle.flag'
+          $mon = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-File', '.github/rd727/monitor.ps1', '-Flag', $flag, '-Log', (Resolve-Path logs).Path + '\monitor.log')
+          if ($env:RATE -ne '0') {
+            $proxy = Start-Process python -PassThru -WindowStyle Hidden -ArgumentList @(
+              '.github/rd727/proxy.py', '18080', $env:RATE, $flag, (Resolve-Path logs).Path + '\proxy.log')
+            Start-Sleep -Seconds 3
+            Get-Content logs/proxy.log
+            $env:HTTPS_PROXY = 'http://127.0.0.1:18080'
+            $env:https_proxy = 'http://127.0.0.1:18080'
+            $env:NO_PROXY = 'localhost,127.0.0.1,::1'
+            $env:no_proxy = 'localhost,127.0.0.1,::1'
+          }
+
+          function Invoke-Timed([string]$Label, [string]$Command, [string]$LogPath) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            Write-Host "=== $Label start $(Get-Date -Format o)"
+            powershell -NoProfile -ExecutionPolicy Bypass -Command $Command 2>&1 |
+              ForEach-Object { '[{0,6:N0}s] {1}' -f $sw.Elapsed.TotalSeconds, $_ } |
+              Tee-Object -FilePath $LogPath | Out-Host
+            $code = $LASTEXITCODE
+            Write-Host "=== $Label exit=$code after $([int]$sw.Elapsed.TotalSeconds)s"
+            return $code
+          }
+
+          $installCode = Invoke-Timed 'install' 'irm https://unsloth.ai/install.ps1 | iex' logs/install.log
+          $env:PATH = "$env:USERPROFILE\.unsloth\studio\bin;$env:PATH"
+          $updateCode = Invoke-Timed 'update' 'unsloth studio update' logs/update.log
+          "install=$installCode update=$updateCode" | Set-Content logs/exit.txt
+          Get-Content logs/exit.txt
+          Stop-Process -Id $mon.Id -Force -ErrorAction SilentlyContinue
+          if ($proxy) { Stop-Process -Id $proxy.Id -Force -ErrorAction SilentlyContinue }
+
+      - name: flash-attn state in the Studio venv
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $py = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
+          & $py -c "import torch, sys; print(sys.version); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+          & $py -m pip show flash-attn 2>&1
+          Get-ChildItem "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Lib\site-packages" -Filter 'flash_attn*' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName }
+          Get-ChildItem "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Lib\site-packages" -Filter 'flash_attn_2_cuda*' -ErrorAction SilentlyContinue |
+            ForEach-Object { "{0} {1:N0} MB" -f $_.Name, ($_.Length / 1MB) }
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          & $py -c "import flash_attn; print('flash_attn', flash_attn.__version__)" 2>&1
+          "import exit=$LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s"
+          exit 0
+
+      - name: Logs
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-Content logs/exit.txt -ErrorAction SilentlyContinue
+          Write-Host '##### flash-attn / deps lines (install)'
+          Select-String -Path logs/install.log -Pattern 'flash|deps|torchao|dependency|17' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
+          Write-Host '##### flash-attn / deps lines (update)'
+          Select-String -Path logs/update.log -Pattern 'flash|deps|torchao|dependency|17' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
+          Write-Host '##### proxy.log'
+          Get-Content logs/proxy.log -ErrorAction SilentlyContinue
+          Write-Host '##### monitor.log'
+          Get-Content logs/monitor.log -ErrorAction SilentlyContinue
+          exit 0
