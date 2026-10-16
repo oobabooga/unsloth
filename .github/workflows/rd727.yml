@@ -50,18 +50,25 @@ jobs:
           $ErrorActionPreference = 'Continue'
           New-Item -ItemType Directory -Force -Path logs | Out-Null
           $flag = Join-Path $env:RUNNER_TEMP 'throttle.flag'
+          $logDir = (Resolve-Path logs).Path
+          $monLog = Join-Path $logDir 'monitor.log'
+          $proxyLog = Join-Path $logDir 'proxy.log'
           $mon = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
-            '-NoProfile', '-File', '.github/rd727/monitor.ps1', '-Flag', $flag, '-Log', (Resolve-Path logs).Path + '\monitor.log')
+            '-NoProfile', '-File', '.github/rd727/monitor.ps1', '-Flag', $flag, '-Log', $monLog)
           if ($env:RATE -ne '0') {
             $proxy = Start-Process python -PassThru -WindowStyle Hidden -ArgumentList @(
-              '.github/rd727/proxy.py', '18080', $env:RATE, $flag, (Resolve-Path logs).Path + '\proxy.log')
-            Start-Sleep -Seconds 3
-            Get-Content logs/proxy.log
+              '.github/rd727/proxy.py', '18080', $env:RATE, $flag, $proxyLog)
+            for ($w = 0; $w -lt 30 -and -not (Test-Path $proxyLog); $w++) { Start-Sleep -Seconds 1 }
+            Get-Content $proxyLog
+            if (-not (Get-Content $proxyLog -ErrorAction SilentlyContinue)) { throw 'proxy did not start' }
             $env:HTTPS_PROXY = 'http://127.0.0.1:18080'
             $env:https_proxy = 'http://127.0.0.1:18080'
             $env:NO_PROXY = 'localhost,127.0.0.1,::1'
             $env:no_proxy = 'localhost,127.0.0.1,::1'
           }
+
+          for ($w = 0; $w -lt 30 -and -not (Test-Path $monLog); $w++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $monLog)) { throw 'monitor did not start' }
 
           function Invoke-Timed([string]$Label, [string]$Command, [string]$LogPath) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
