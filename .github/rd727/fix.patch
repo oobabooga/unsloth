@@ -1,5 +1,5 @@
 diff --git a/studio/backend/utils/wheel_utils.py b/studio/backend/utils/wheel_utils.py
-index a1988d2b30..c80fc67e7e 100644
+index a1988d2b30..2249a72b32 100644
 --- a/studio/backend/utils/wheel_utils.py
 +++ b/studio/backend/utils/wheel_utils.py
 @@ -12,7 +12,9 @@ import re
@@ -23,7 +23,7 @@ index a1988d2b30..c80fc67e7e 100644
 +def _uv_project_config_found() -> bool:
 +    """Whether uv would discover a project config from the working directory.
 +
-+    uv reads only the nearest one, so running it elsewhere would drop that file: never wanted
++    uv reads only one, so pointing --project elsewhere would drop that file: never wanted
 +    for an input setup.sh / setup.ps1 already honour (_mirror_uv_project_config).
 +    """
 +    try:
@@ -79,7 +79,7 @@ index a1988d2b30..c80fc67e7e 100644
  def install_wheel(
      wheel_url: str,
      *,
-@@ -498,15 +560,22 @@ def install_wheel(
+@@ -498,15 +560,23 @@ def install_wheel(
          if reinstall:
              uv_cmd.append("--reinstall")
          uv_cmd.append(wheel_url)
@@ -94,8 +94,10 @@ index a1988d2b30..c80fc67e7e 100644
 -        )
 +        config_dir = tempfile.mkdtemp(prefix = "unsloth-uv-")
 +        try:
-+            # uv finds the uv.toml as its project config; user and system configs still apply.
-+            cwd = config_dir if _uv_static_metadata_config(wheel_url, config_dir) else None
++            # --project, not cwd: uv takes the uv.toml as its project config while relative paths
++            # (UV_CACHE_DIR, UV_CONSTRAINT, ...) still resolve here. User and system configs apply.
++            if _uv_static_metadata_config(wheel_url, config_dir):
++                uv_cmd[1:1] = ["--project", config_dir]
 +            result = run(
 +                uv_cmd,
 +                stdout = subprocess.PIPE,
@@ -104,7 +106,6 @@ index a1988d2b30..c80fc67e7e 100644
 +                encoding = "utf-8",
 +                errors = "replace",
 +                env = child_env_without_native_path_secret(),
-+                cwd = cwd,
 +            )
 +        finally:
 +            shutil.rmtree(config_dir, ignore_errors = True)
