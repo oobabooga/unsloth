@@ -58,13 +58,15 @@ def main() -> int:
             a.out.write_text(json.dumps(res, indent = 2), encoding = "utf-8")
             return 0
     env = dict(os.environ, PYTHONPATH = str(site) + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    r = sh([sys.executable, "-c", "import torch, json, unsloth_zoo, importlib.util as u; "
-            "print(json.dumps({'torch': torch.__version__, 'hip': torch.version.hip, "
+    r = sh([sys.executable, "-c", "import torch, json, unsloth, unsloth_zoo, importlib.util as u; "
+            "print('CUMENV=' + json.dumps({'torch': torch.__version__, 'hip': torch.version.hip, "
             "'arch': getattr(torch.cuda.get_device_properties(0), 'gcnArchName', None), "
             "'zoo': unsloth_zoo.__file__, 'unsloth': u.find_spec('unsloth').origin}))"], env = env)
     try:
-        res["env"] = json.loads(r.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
+        # Import-time warnings (ROCm CK notices) share the stream: take the marked line only.
+        line = next(l for l in reversed((r.stdout or "").splitlines()) if l.startswith("CUMENV="))
+        res["env"] = json.loads(line[len("CUMENV="):])
+    except (ValueError, StopIteration):
         res["env"] = {"error": (r.stdout + r.stderr)[-800:]}
     for spec in [s for s in a.jobs.split(";") if s.strip()]:
         stem, _, args = spec.partition(":")
