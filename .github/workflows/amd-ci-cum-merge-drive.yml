@@ -112,7 +112,7 @@ jobs:
             --probe amd_ci/probes/cum_jobs_probe.py \
             --criteria amd_ci/criteria/cum_jobs_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --u-base ec411c3f74495cabbe9236be9e1b6ad32d4960ba --u-head e539ad5edac16079d1a29d53cf0ecfeca0584d0b --z-base 2292a04a6dd6ec7141f440c86738cf89246a3917 --z-head 9df5d50bdcad46e369455fd730671ce15d95c777 --repeat 2 --jobs 'sft:--max-steps 20;inference_smoke:;dpo:--max-steps 10;vision_sft:--preset gemma4'
+            --python "$AMD_CI_PY" -- --u-base ec411c3f74495cabbe9236be9e1b6ad32d4960ba --u-head 65d1fdb03c190ae8724319fdf94d88c37e752e28 --z-base 2292a04a6dd6ec7141f440c86738cf89246a3917 --z-head 974aedd2ce6140460ef00694a4888f0f0cfb3d20 --repeat 2 --jobs 'sft:--max-steps 20;inference_smoke:;dpo:--max-steps 10;vision_sft:--preset gemma4'
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
