@@ -1,4 +1,4 @@
-name: RD-727 Windows flash-attn A/B
+name: RD-727 Windows flash-attn A/B (cold and warm uv cache)
 
 on:
   push:
@@ -38,20 +38,25 @@ jobs:
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           powershell -NoProfile -ExecutionPolicy Bypass -Command 'irm https://unsloth.ai/install.ps1 | iex' 2>&1 |
             ForEach-Object { '[{0,6:N0}s] {1}' -f $sw.Elapsed.TotalSeconds, $_ } |
-            Tee-Object -FilePath logs/install.log | Select-String -Pattern 'deps|flash|unsloth \d|torch 2' | ForEach-Object { $_.Line }
+            Tee-Object -FilePath logs/install.log | Select-String -Pattern 'deps|flash|unsloth \d|torch 2|uv cache' | ForEach-Object { $_.Line }
           "install exit=$LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s"
 
-      - name: Remove flash-attn so the update has to install it
+      - name: Remove flash-attn and the uv cache, so the first update is cold like the reporters'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User') + ';' + $env:PATH
           $py = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
           $uv = (Get-Command uv -ErrorAction Stop).Source
+          "uv: $uv ($(& $uv --version))"
           & $uv pip uninstall --python $py flash-attn 2>&1
           & $py -c "import flash_attn" 2>&1
           "import flash_attn exit=$LASTEXITCODE (nonzero expected)"
           & $py -c "import importlib.metadata as m; print('unsloth', m.version('unsloth'))"
+          $cache = "$env:USERPROFILE\.unsloth\studio\cache\uv"
+          "Studio uv cache before: {0:N2} GB" -f ((Get-ChildItem $cache -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB)
+          Remove-Item -Recurse -Force $cache -ErrorAction SilentlyContinue
+          "Studio uv cache removed: $(-not (Test-Path $cache))"
           exit 0
 
       - name: Apply the fix (arm B only)
@@ -60,10 +65,10 @@ jobs:
         run: |
           SP="$USERPROFILE/.unsloth/studio/unsloth_studio/Lib/site-packages"
           cd "$SP" && patch -p1 < "$GITHUB_WORKSPACE/.github/rd727/fix.patch"
-          grep -c "def download_wheel" studio/backend/utils/wheel_utils.py
-          grep -c '_download_progress("flash-attn")' studio/install_python_stack.py
+          grep -c "def _uv_static_metadata_config" studio/backend/utils/wheel_utils.py
+          grep -c 'with _install_heartbeat("flash-attn")' studio/install_python_stack.py
 
-      - name: Update at the throttled rate
+      - name: Update twice at the throttled rate (cold cache, then warm)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
@@ -73,8 +78,7 @@ jobs:
           $proxyLog = Join-Path $logDir 'proxy.log'
           $mon = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
             '-NoProfile', '-File', '.github/rd727/monitor.ps1', '-Flag', "$flag.monitor", '-Log', $monLog)
-          # Throttle every GitHub asset byte of the update in both arms; arm B downloads from the
-          # installer process itself, whose command line the monitor's flash_attn match cannot see.
+          # Throttle every GitHub asset byte of both updates in both arms.
           New-Item -ItemType File -Force -Path $flag | Out-Null
           $proxy = Start-Process python -PassThru -WindowStyle Hidden -ArgumentList @(
             '.github/rd727/proxy.py', '18080', $env:RATE, $flag, $proxyLog)
@@ -85,16 +89,26 @@ jobs:
           $env:NO_PROXY = 'localhost,127.0.0.1,::1'
           # Same version as PyPI latest, so force the dependency pass a version change would run.
           $env:UNSLOTH_STUDIO_FULL_DEPS = '1'
-          $env:PATH = "$env:USERPROFILE\.unsloth\studio\bin;$env:PATH"
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          powershell -NoProfile -ExecutionPolicy Bypass -Command 'unsloth studio update' 2>&1 |
-            ForEach-Object { '[{0,6:N0}s] {1}' -f $sw.Elapsed.TotalSeconds, $_ } |
-            Tee-Object -FilePath logs/update.log | Out-Host
-          "update exit=$LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s" | Tee-Object -FilePath logs/exit.txt
+          $env:PATH = "$env:USERPROFILE\.unsloth\studio\bin;" + [Environment]::GetEnvironmentVariable('PATH', 'User') + ';' + $env:PATH
+          $py = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
+          $uv = (Get-Command uv -ErrorAction Stop).Source
+          foreach ($phase in 'cold', 'warm') {
+            if ($phase -eq 'warm') {
+              & $uv pip uninstall --python $py flash-attn 2>&1 | Out-Host
+            }
+            Copy-Item $proxyLog (Join-Path $logDir "proxy-before-$phase.log")
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            powershell -NoProfile -ExecutionPolicy Bypass -Command 'unsloth studio update' 2>&1 |
+              ForEach-Object { '[{0,6:N0}s] {1}' -f $sw.Elapsed.TotalSeconds, $_ } |
+              Tee-Object -FilePath (Join-Path $logDir "update-$phase.log") | Out-Host
+            "$phase update exit=$LASTEXITCODE after $([int]$sw.Elapsed.TotalSeconds)s" | Tee-Object -FilePath logs/exit.txt -Append
+            Start-Sleep -Seconds 2
+            Copy-Item $proxyLog (Join-Path $logDir "proxy-after-$phase.log")
+          }
           Stop-Process -Id $mon.Id -Force -ErrorAction SilentlyContinue
           Stop-Process -Id $proxy.Id -Force -ErrorAction SilentlyContinue
 
-      - name: flash-attn state after the update
+      - name: flash-attn state after the updates
         if: always()
         shell: pwsh
         run: |
@@ -102,7 +116,7 @@ jobs:
           $py = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
           & $py -c "import flash_attn; print('flash_attn', flash_attn.__version__)" 2>&1
           "import exit=$LASTEXITCODE"
-          Get-ChildItem $env:TEMP -Filter 'unsloth-wheel-*' -ErrorAction SilentlyContinue | ForEach-Object { "leftover temp dir: $($_.FullName)" }
+          Get-ChildItem $env:TEMP -Filter 'unsloth-uv-*' -ErrorAction SilentlyContinue | ForEach-Object { "leftover temp dir: $($_.FullName)" }
           exit 0
 
       - name: Summary
@@ -111,16 +125,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           Get-Content logs/exit.txt -ErrorAction SilentlyContinue
-          Write-Host '##### update: deps and flash-attn lines'
-          Select-String -Path logs/update.log -Pattern 'deps|flash' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
-          Write-Host '##### proxy: release-asset transfers'
-          Select-String -Path logs/proxy.log -Pattern 'release-assets' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
-          $bytes = 0
-          Select-String -Path logs/proxy.log -Pattern 'close release-assets\S+ down=(\d+)' -ErrorAction SilentlyContinue |
-            ForEach-Object { $bytes += [long]$_.Matches[0].Groups[1].Value }
-          "release-asset bytes during the update: $bytes"
-          Write-Host '##### monitor: flash_attn processes'
-          Select-String -Path logs/monitor.log -Pattern 'fa_procs=[1-9]' -Context 0,8 -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.Line; $_.Context.PostContext | Where-Object { $_ -match 'uv.exe|pip|flash' } } |
-            Select-Object -First 40
+          foreach ($phase in 'cold', 'warm') {
+            Write-Host "##### $phase update: flash-attn lines"
+            Select-String -Path "logs/update-$phase.log" -Pattern 'flash' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
+            $before = @(Get-Content "logs/proxy-before-$phase.log" -ErrorAction SilentlyContinue)
+            $after = @(Get-Content "logs/proxy-after-$phase.log" -ErrorAction SilentlyContinue)
+            $new = @($after | Select-Object -Skip $before.Count)
+            Write-Host "##### $phase update: release-asset transfers"
+            $new | Where-Object { $_ -match 'close release-assets' }
+            $bytes = 0
+            $new | ForEach-Object { if ($_ -match 'close release-assets\S+ down=(\d+)') { $bytes += [long]$Matches[1] } }
+            "$phase update: release-asset bytes = $bytes"
+          }
           exit 0
