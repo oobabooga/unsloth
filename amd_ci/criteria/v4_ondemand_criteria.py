@@ -57,6 +57,13 @@ def _ok(run: dict) -> bool:
             and not run.get("train_error"))
 
 
+def _dec(m: dict) -> str:
+    d = _data(m.get("decode"))
+    if d.get("decode_tokens"):
+        return f"{d.get('path')} {d.get('decode_s')}s {d.get('text', '')[:40]!r}"
+    return str(d.get("decode_error") or (m.get("decode") or {}).get("rc") or "")[:60] if d or m.get("decode") else "-"
+
+
 def _kset(m: dict) -> tuple:
     k = _data(m.get("kernels"))
     return (k.get("causal-conv1d"), k.get("mamba-ssm"))
@@ -120,7 +127,7 @@ def table(obs: dict) -> str:
                 f"{r0.get('path')} | {_ok(r0)} {err[:80]} | {l1} | "
                 f"{[round(x, 4) for x in (r0.get('losses') or [])]} | "
                 f"{round(r0.get('peak_alloc_gb') or 0, 3)} | "
-                f"{'ok' if r0.get('decode_tokens') else (r0.get('decode_error') or '')[:60]} | "
+                f"{_dec(m)} | "
                 f"{', '.join((r0.get('kernels') or [])[:3])[:120]} |")
         lines.append("")
     return "\n".join(lines)
@@ -138,8 +145,9 @@ def head_is_worse(base: dict, head: dict):
         br, hr = _runs(b), _runs(h)
         if br and hr and _ok(br[0]) and not _ok(hr[0]):
             bad.append(f"{k}: trains at base, fails at head ({hr[0].get('load_error') or hr[0].get('train_error')})")
-        if br and hr and br[0].get("decode_tokens") and not hr[0].get("decode_tokens"):
-            bad.append(f"{k}: decode works at base, fails at head")
+        db, dh = _data(b.get("decode")), _data(h.get("decode"))
+        if db.get("decode_tokens") and not dh.get("decode_tokens"):
+            bad.append(f"{k}: decode works at base, fails at head ({dh.get('decode_error')})")
         if _data(b.get("infer")).get("ok") is not False and _data(h.get("infer")).get("ok") is False:
             bad.append(f"{k}: inference SSM step fails at head only: {_data(h.get('infer')).get('responses')}")
         if _data(h.get("train_block")).get("error") and not _data(b.get("train_block")).get("error"):

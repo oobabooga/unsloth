@@ -173,6 +173,40 @@ for m in ("causal_conv1d", "causal_conv1d_cuda", "mamba_ssm", "selective_scan_cu
 print("STATE_JSON " + json.dumps(out), flush = True)
 """
 
+DECODE = r"""
+import json, sys, time
+model_id = sys.argv[1]
+out = {"model": model_id}
+import torch
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+t0 = time.time()
+try:
+    try:
+        from unsloth import FastLanguageModel
+        model, tok = FastLanguageModel.from_pretrained(model_id, max_seq_length = 512,
+            dtype = torch.bfloat16, load_in_4bit = False)
+        FastLanguageModel.for_inference(model)
+        out["path"] = "unsloth"
+    except BaseException as e:
+        out["unsloth_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype = torch.bfloat16,
+                                                     attn_implementation = "eager").to(dev).eval()
+        out["path"] = "transformers"
+    ids = tok("The capital of France is", return_tensors = "pt").input_ids.to(dev)
+    t1 = time.time()
+    with torch.no_grad():
+        gen = model.generate(input_ids = ids, max_new_tokens = 16, do_sample = False)
+    out["decode_s"] = round(time.time() - t1, 2)
+    out["decode_tokens"] = gen[0, ids.shape[1]:].tolist()
+    out["text"] = tok.decode(gen[0, ids.shape[1]:])
+except BaseException as e:
+    out["decode_error"] = f"{type(e).__name__}: {str(e)[:500]}"
+out["total_s"] = round(time.time() - t0, 2)
+print("DECODE_JSON " + json.dumps(out, default = str), flush = True)
+"""
+
 TRAIN = r"""
 import json, os, re, sys, time
 model_id = sys.argv[1]
@@ -208,8 +242,13 @@ if model is None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model
         tok = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype = torch.bfloat16).to(dev)
-        model = get_peft_model(model, LoraConfig(r = 8, lora_alpha = 8, target_modules = "all-linear"))
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype = torch.bfloat16,
+                                                     attn_implementation = "eager").to(dev)
+        try:
+            model = get_peft_model(model, LoraConfig(r = 8, lora_alpha = 8, target_modules = "all-linear"))
+        except ValueError:
+            # PEFT refuses out_proj / conv1d on Mamba models; in_proj is the LoRA-able projection.
+            model = get_peft_model(model, LoraConfig(r = 8, lora_alpha = 8, target_modules = ["in_proj"]))
         out["path"] = "transformers"
     except BaseException as e:
         out["load_error"] = f"{type(e).__name__}: {str(e)[:500]}"
@@ -251,15 +290,6 @@ except BaseException as e:
     out["train_error"] = f"{type(e).__name__}: {str(e)[:500]}"
 out["losses"] = losses
 out["kernels"] = sorted(kernels)
-try:
-    model.eval()
-    if out.get("path") == "unsloth":
-        FastLanguageModel.for_inference(model)
-    with torch.no_grad():
-        gen = model.generate(input_ids = ids[:1, :8], max_new_tokens = 16, do_sample = False)
-    out["decode_tokens"] = gen[0, 8:].tolist()
-except BaseException as e:
-    out["decode_error"] = f"{type(e).__name__}: {str(e)[:500]}"
 out["total_s"] = round(time.time() - t_start, 2)
 print("TRAIN_JSON " + json.dumps(out, default = str), flush = True)
 """
@@ -357,6 +387,7 @@ def main() -> int:
         runs = 2 if key == "qwen35" else 1
         m["run"] = [_run([py, "-c", TRAIN, model], env, str(work), 2400, "TRAIN_JSON")
                     for _ in range(runs)]
+        m["decode"] = _run([py, "-c", DECODE, model], env, str(work), 1800, "DECODE_JSON")
         obs["models"][key] = m
         args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
     obs["reset_after"] = _uninstall(py, env)
