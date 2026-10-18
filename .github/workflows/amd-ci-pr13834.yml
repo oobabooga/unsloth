@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 13834"
 
 on:
   push:
-    branches: [amd-ci-pr13834]
+    branches: [amd-ci-pr13834-train]
   workflow_dispatch:
 
 permissions:
