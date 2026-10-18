@@ -32,8 +32,12 @@ jobs:
       - name: Hardware gate
         run: |
           set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
-            --out "$AMD_CI_WORK/out/host.json"
+          # No torch here (llama.cpp only), and the gate's rocm/gpu/arch checks come from torch: gate on
+          # the ROCm tools, then check the arch with rocminfo.
+          python3 amd_ci/lib/gate.py --no-torch --require rocm_smi --out "$AMD_CI_WORK/out/host.json"
+          ARCHS=$( (rocminfo 2>/dev/null || /opt/rocm/bin/rocminfo 2>/dev/null) | grep -o 'gfx[0-9a-f]*' | sort -u | tr '\n' ' ')
+          echo "rocminfo archs: $ARCHS"
+          case " $ARCHS " in *" gfx1151 "*) ;; *) echo "FATAL: no gfx1151 GPU (rocminfo: $ARCHS)"; exit 1 ;; esac
 
       - name: Toolchain
         run: |
