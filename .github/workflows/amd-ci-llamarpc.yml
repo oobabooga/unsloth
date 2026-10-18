@@ -1,0 +1,79 @@
+name: "AMD CI: llama.cpp RPC PRs 187 191 199 203 on gfx1151"
+
+# Builds unslothai/llama.cpp base (af50f2f24, RPC on and off) and the heads of PRs 187, 191, 199
+# and 203 with HIP for gfx1151, then runs amd_ci/rpc_harness/bench.py: single-device llama-bench +
+# llama-server A/B per build, greedy correctness (local vs RPC loopback on the same GPU) per model,
+# and the rpc-server teardown cases. No secrets are used; every model is a public GGUF.
+
+on:
+  push:
+    branches: [amd-ci-llamarpc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    name: "llama.cpp RPC PRs, GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 340
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "llamarpc"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Toolchain
+        run: |
+          set -uo pipefail
+          for c in "${ROCM_PATH:-}" /opt/rocm /opt/rocm-*; do
+            if [ -n "$c" ] && [ -x "$c/bin/hipcc" ] && [ -x "$c/llvm/bin/clang" ]; then
+              echo "ROCM_PATH=$c" >> "$GITHUB_ENV"; echo "found $c"; break
+            fi
+          done
+          command -v cmake ccache git; cmake --version | head -1; nproc; free -g | head -2
+          df -h "$RUNNER_TEMP" | tail -1; ls -d /opt/rocm* 2>/dev/null; true
+
+      - name: Build and bench
+        timeout-minutes: 320
+        run: |
+          set -uo pipefail
+          test -n "${ROCM_PATH:-}" || { echo "FATAL: no ROCm with hipcc + llvm clang on this runner"; exit 1; }
+          python3 -m pip install --user -q huggingface_hub 2>&1 | tail -2
+          export HF_HOME="$AMD_CI_WORK/hf" RPC_WORK="$AMD_CI_WORK/llama"
+          cd "$AMD_CI_WORK/out"
+          set +e
+          python3 -u "$GITHUB_WORKSPACE/amd_ci/rpc_harness/job_gpu.py" --plan AMD --backend hip --arch gfx1151 \
+            --gpus 0,0 --builds base,base_norpc,h187,h191,h199,h203 2>&1 | tee "$AMD_CI_WORK/out/job.log"
+          rc=${PIPESTATUS[0]}
+          cp "$RPC_WORK"/build_*.log "$RPC_WORK"/cmake_*.log "$AMD_CI_WORK/out/" 2>/dev/null
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/results_AMD.json"
+
+      - name: Stop leftovers
+        if: always()
+        run: |
+          for n in llama-server ggml-rpc-server; do
+            for p in $(pgrep -u "$(id -u)" -x "$n" 2>/dev/null); do kill "$p" 2>/dev/null; done
+          done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llamarpc-amd
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
