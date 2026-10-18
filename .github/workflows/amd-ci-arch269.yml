@@ -112,7 +112,7 @@ jobs:
             --probe amd_ci/probes/llama_arch_probe.py \
             --criteria amd_ci/criteria/llama_arch_criteria.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --map base=https://github.com/ggml-org/llama.cpp@2639a3b4e029d1be80ca4a472d62dfea23609075 --map head=https://github.com/unslothai/llama.cpp@f57ea1b98c1473956d65064990c00c2f739d2dbf --map merge=https://github.com/unslothai/llama.cpp@f57ea1b98c1473956d65064990c00c2f739d2dbf
+            --python "$AMD_CI_PY" -- --map base=https://github.com/ggml-org/llama.cpp@2639a3b4e029d1be80ca4a472d62dfea23609075 --map head=https://github.com/unslothai/llama.cpp@fcb5f3319908a058c7fe6082a0b59aaeeda0a6c4 --map merge=https://github.com/unslothai/llama.cpp@fcb5f3319908a058c7fe6082a0b59aaeeda0a6c4
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
