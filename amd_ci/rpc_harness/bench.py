@@ -208,10 +208,15 @@ def wait_health(port, proc, timeout):
 class Env:
     def __init__(self, gpus, vendor, threads):
         self.gpus, self.vendor, self.threads = list(gpus), vendor, threads
+        # Inside a GPU-queue lease the mask is already set: --gpus indexes into it.
+        var = "HIP_VISIBLE_DEVICES" if vendor == "amd" else "CUDA_VISIBLE_DEVICES"
+        inherited = [x for x in (os.environ.get(var) or "").split(",") if x.strip() not in ("", "-1")]
+        self.physical = [inherited[g] if g < len(inherited) else str(g) for g in self.gpus] if inherited else [str(g) for g in self.gpus]
+        self._map = dict(zip(self.gpus, self.physical))
 
     def visible(self, gpus):
         env = dict(os.environ)
-        val = ",".join(str(g) for g in gpus) if gpus else ""
+        val = ",".join(self._map.get(g, str(g)) for g in gpus) if gpus else ""
         if self.vendor == "amd":
             env["HIP_VISIBLE_DEVICES"] = val
             env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -242,6 +247,7 @@ class Topology:
         self.env, self.bindir, self.model, self.kind = env, bindir, model, kind
         self.ctx, self.parallel, self.extra, self.workdir = ctx, parallel, list(extra), workdir
         self.n_rpc, self.rpc_cache, self.order, self.label = n_rpc, rpc_cache, order, label
+        self.ts = ""  # explicit -ts in --device order; empty = equal shares
         self.rpcs, self.server, self.port = [], None, None
         self.load_s = None
 
@@ -261,7 +267,7 @@ class Topology:
         elif self.kind == "native2":
             env = self.env.visible(g[:2])
             names = self.env.local_name(self.bindir, g[:2])
-            extra += ["--device", ",".join(names[:2]), "-sm", "layer", "-ts", "1,1"]
+            extra += ["--device", ",".join(names[:2]), "-sm", "layer", "-ts", self.ts or "1,1"]
         else:  # rpcN
             endpoints = []
             for i in range(self.n_rpc):
@@ -269,7 +275,10 @@ class Topology:
                 argv = [os.path.join(self.bindir, "ggml-rpc-server"), "-H", "127.0.0.1", "-p", str(port)]
                 if self.rpc_cache:
                     argv.append("-c")
-                rpc = Proc(argv, self.env.visible([g[1 + i]]), os.path.join(self.workdir, f"rpc{i}.log"))
+                renv = self.env.visible([g[1 + i]])
+                if os.environ.get("BENCH_TRACE"):
+                    renv["GGML_RPC_TRACE"] = os.path.join(self.workdir, f"trace_rpc{i}.jsonl")
+                rpc = Proc(argv, renv, os.path.join(self.workdir, f"rpc{i}.log"))
                 if not wait_port(port, 120):
                     raise RuntimeError(f"rpc-server {i} did not listen:\n{rpc.tail()}")
                 self.rpcs.append(rpc)
@@ -279,10 +288,12 @@ class Topology:
             remote = [f"RPC{i}" for i in range(self.n_rpc)]
             devs = remote + local if self.order == "rpc_first" else local + remote
             extra += ["--rpc", ",".join(endpoints), "--device", ",".join(devs), "-sm", "layer",
-                      "-ts", ",".join(["1"] * len(devs))]
+                      "-ts", self.ts or ",".join(["1"] * len(devs))]
         self.port = free_port()
         argv = server_argv(self.bindir, self.model, self.port, self.ctx, self.parallel, extra, self.env.threads)
         t = time.time()
+        if os.environ.get("BENCH_TRACE"):
+            env = dict(env, GGML_RPC_TRACE = os.path.join(self.workdir, "trace_client.jsonl"))
         self.server = Proc(argv, env, os.path.join(self.workdir, "server.log"))
         ok = wait_health(self.port, self.server, timeout)
         self.load_s = round(time.time() - t, 2)
@@ -443,6 +454,7 @@ def patterns(scale, parallel):
         "equal": {"specs": [(make_prompt(256, 100 + i), 128) for i in range(P)], "conc": P},
         "mixed": {"specs": [(make_prompt(32, 200 + i), 32) if i % 2 == 0 else (make_prompt(1500 if not q else 800, 300 + i), 192)
                             for i in range(2 * P)], "conc": P},
+        "saturate": {"specs": [(make_prompt(128, 600 + i), 256) for i in range(4 * P)], "conc": P},
         "burst": {"idle_s": 5, "specs": [(make_prompt(128, 400 + i), 64) for i in range(3 * P)], "conc": 3 * P},
         "flood": {"flood": True, "rate_end": 2.0 * P / 8, "dur": 30 if q else 60, "prompt": 128, "n": 64},
         "long_chat": {"users": 4 if q else 8, "turns": 4 if q else 6, "user_tokens": 300, "n": 96},
@@ -634,23 +646,33 @@ def suite_groups(a, env, bins, models, R, sampler):
         for b in a.groups_builds:
             for kind in a.groups_topologies:
                 n_rpc = int(kind[3:]) - 1 if kind.startswith("rpc") else 0
-                if len(env.gpus) < max(2, n_rpc + 1):
+                if len(env.gpus) < (1 if kind == "single" else max(2, n_rpc + 1)):
                     continue
-                for rnd in range(a.rounds):
-                    for g in a.groups:
+                for rnd, P, g, ts in [(r, P, g, ts) for r in range(a.rounds) for P in a.groups_parallel
+                                      for g in a.groups for ts in (a.groups_ts if kind != "single" else [""])]:
                         for order in (a.orders if n_rpc else ["-"]):
-                            extra = ["--pipeline-groups", str(g)] if g > 1 else []
-                            par = max(a.parallel, g) // g * g
-                            top = Topology(env, bins[b], models[mname], "rpcN" if n_rpc else kind, a.ctx, par, extra,
-                                           os.path.join(a.work, f"gr_{mname}_{b}_{kind}_{g}_{order}"), n_rpc = n_rpc,
+                            extra = ["--pipeline-groups", str(g)] if g > 1 and kind != "single" else []
+                            par = max(P, g) // g * g
+                            if a.groups_batch:
+                                par = a.groups_batch * g  # fixed sequences per group
+                            if kind == "single":
+                                # Ideal for G groups over N stages = N x one device at the per-group batch.
+                                par = max(1, par // g)
+                            # Each group's context gets the whole -c (#187), so -c / G keeps every slot at
+                            # the same context, and the KV total equal to one group's.
+                            ctx = (a.groups_ctx_per_slot * par // (g if kind != "single" else 1)
+                                   if a.groups_ctx_per_slot else a.ctx)
+                            top = Topology(env, bins[b], models[mname], "rpcN" if n_rpc else kind, ctx, par, extra,
+                                           os.path.join(a.work, f"gr_{mname}_{b}_{kind}_{g}_{order}_{P}_{ts.replace(',', '-')}"), n_rpc = n_rpc,
                                            order = order if order != "-" else "rpc_first")
+                            top.ts = ts
                             case = {"suite": "groups", "model": mname, "build": b, "topology": kind, "groups": g,
-                                    "order": order, "round": rnd, "parallel": par}
+                                    "order": order, "round": rnd, "parallel": par, "P": P, "ctx": ctx, "ts": ts}
                             try:
                                 top.start()
                                 rows = []
                                 pats = patterns(a.scale, par)
-                                for pn in ("single", "equal", "mixed", "flood"):
+                                for pn in a.groups_patterns:
                                     run_pattern(top, sampler, pn, pats[pn], rows)
                                 case["patterns"] = rows
                             except Exception as e:  # noqa: BLE001
@@ -784,6 +806,11 @@ def main():
     ap.add_argument("--groups-topologies", default = "rpc2")
     ap.add_argument("--groups", default = "1,2")
     ap.add_argument("--orders", default = "rpc_first,local_first")
+    ap.add_argument("--groups-parallel", default = "", help = "slot counts to sweep (default: --parallel)")
+    ap.add_argument("--groups-batch", type = int, default = 0, help = "sequences per group (slots = this x G)")
+    ap.add_argument("--groups-ts", default = "", help = "tensor splits to sweep, ';'-separated, in --device order")
+    ap.add_argument("--groups-patterns", default = "single,equal,saturate,mixed,flood")
+    ap.add_argument("--groups-ctx-per-slot", type = int, default = 0, help = "ctx = this x slots (0: --ctx)")
     ap.add_argument("--load-models", default = "")
     ap.add_argument("--teardown-model", default = "")
     a = ap.parse_args()
@@ -792,6 +819,9 @@ def main():
               "groups_models", "groups_builds", "groups_topologies", "load_models", "orders"):
         setattr(a, k, [x for x in getattr(a, k).split(",") if x])
     a.groups = [int(x) for x in a.groups.split(",") if x]
+    a.groups_parallel = [int(x) for x in a.groups_parallel.split(",") if x] or [a.parallel]
+    a.groups_patterns = [x for x in a.groups_patterns.split(",") if x]
+    a.groups_ts = [x for x in a.groups_ts.split(";")] if a.groups_ts else [""]
     gpus = [int(x) for x in a.gpus.split(",") if x != ""]
     env = Env(gpus, a.vendor, a.threads)
     os.makedirs(a.work, exist_ok = True)
@@ -806,7 +836,7 @@ def main():
         meta["nvidia_smi"] = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version,compute_cap",
                                              "--format=csv,noheader"], capture_output = True, text = True).stdout.strip()
     R = Results(a.out, meta)
-    sampler = Sampler(gpus, a.vendor) if a.vendor != "cpu" and gpus else None
+    sampler = Sampler(sorted(set(int(x) for x in env.physical)), a.vendor) if a.vendor != "cpu" and gpus else None
     if sampler:
         sampler.start()
     try:

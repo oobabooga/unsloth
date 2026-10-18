@@ -75,6 +75,10 @@ def main():
     t0 = time.time()
     os.makedirs(WORK, exist_ok = True)
     vendor = "amd" if a.backend == "hip" else "nvidia"
+    try:
+        import huggingface_hub  # noqa: F401
+    except ImportError:
+        sh([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"])
     if vendor == "nvidia":
         sh("(command -v ccache || (apt-get -qq update && apt-get -qq install -y ccache) || pip install -q ccache) >/dev/null 2>&1; true")
         sh([sys.executable, "-m", "pip", "install", "-q", "nvidia-ml-py"])
@@ -112,11 +116,48 @@ def main():
         sb = [b for b in ("base", "h187", "h199", "h203") if b in bins]
         args = ["--suite", "groups,stress,load",
                 "--groups-models", "gemma4-12b,qwen3.6-35b-a3b", "--groups-builds", "h187" if "h187" in bins else "",
-                "--groups-topologies", "rpc2,native2", "--groups", "1,2", "--orders", "rpc_first,local_first",
+                "--groups-topologies", "single,rpc2,native2", "--groups", "1,2", "--orders", "rpc_first,local_first",
                 "--stress-models", "gemma4-26b-a4b,qwen3.6-35b-a3b,gpt-oss-20b", "--stress-builds", ",".join(sb),
                 "--stress-topologies", "rpc2",
                 "--load-models", "gemma4-26b-a4b,gpt-oss-20b",
                 "--rounds", "2", "--parallel", "16", "--ctx", "16384"]
+    elif a.plan == "PP":
+        # Pipeline-groups scaling: per-group batch sweep, so the ideal N x X1(P/G) is measured
+        # where X1 is not in the small-batch kernel regime.
+        real = ["gemma4-12b", "lfm2-8b-a1b"]
+        models = fetch(real, [])
+        args = ["--suite", "groups", "--groups-models", ",".join(real), "--groups-builds", "h187",
+                "--groups-topologies", "single,rpc2,native2", "--groups", "1,2", "--orders", "rpc_first",
+                "--groups-parallel", "16,32,64", "--groups-patterns", "single,equal,saturate",
+                "--groups-ctx-per-slot", "512", "--rounds", "1"]
+    elif a.plan == "TRACE":
+        # Where the idle time goes with 2 groups over RPC: #191's tracer on both processes, then
+        # device_idle.py per case. 16 sequences per group (the efficient CUDA regime).
+        real = ["gemma4-12b"]
+        models = fetch(real, [])
+        os.environ["BENCH_TRACE"] = "1"
+        args = ["--suite", "groups", "--groups-models", "gemma4-12b", "--groups-builds", "h191",
+                "--groups-topologies", "rpc2", "--groups", "1,2", "--orders", "rpc_first",
+                "--groups-parallel", "32", "--groups-patterns", "saturate",
+                "--groups-ctx-per-slot", "512", "--rounds", "1"]
+    elif a.plan == "TS":
+        # Stage balance with 2 groups: the output-head stage (the coordinator's GPU, last) is the
+        # slow one at -ts 1,1, so give the first stage more layers.
+        real = ["gemma4-12b", "lfm2-8b-a1b"]
+        models = fetch(real, [])
+        args = ["--suite", "groups", "--groups-models", ",".join(real), "--groups-builds", "h187",
+                "--groups-topologies", "rpc2,native2", "--groups", "2", "--orders", "rpc_first",
+                "--groups-parallel", "32", "--groups-patterns", "saturate",
+                "--groups-ts", "1,1;1.2,1;1.4,1;1.7,1", "--groups-ctx-per-slot", "512", "--rounds", "1"]
+    elif a.plan == "PP2":
+        # Groups beyond the stage count hide the per-step latency (activation copy, sampling): 16
+        # sequences per group, G = 1..4 over 2 stages; ideal = 2 x one device at 16 sequences.
+        real = ["gemma4-12b", "lfm2-8b-a1b"]
+        models = fetch(real, [])
+        args = ["--suite", "groups", "--groups-models", ",".join(real), "--groups-builds", "h187",
+                "--groups-topologies", "single,rpc2,native2", "--groups", "1,2,3,4", "--orders", "rpc_first",
+                "--groups-batch", "16", "--groups-patterns", "saturate",
+                "--groups-ctx-per-slot", "512", "--rounds", "1"]
     elif a.plan == "AMD":
         real = ["qwen3-0.6b", "qwen3.5-0.8b", "gemma4-e2b", "lfm2-8b-a1b", "gpt-oss-20b", "glm-4.7-flash-mla"]
         models = fetch(real, [])
@@ -138,6 +179,15 @@ def main():
     cmd += [f"--bin={k}={v}" for k, v in bins.items()] + [f"--model={k}={v}" for k, v in models.items()] + args
     rc = sh(cmd).returncode
     print(f"bench rc={rc} total {time.time() - t0:.0f}s", flush = True)
+    if a.plan == "TRACE":
+        import glob
+        for d in sorted(glob.glob(os.path.join(WORK, "run", "gr_*"))):
+            traces = sorted(glob.glob(os.path.join(d, "trace_*.jsonl")))
+            if len(traces) < 2:
+                continue
+            out = f"device_idle_{os.path.basename(d)}.txt"
+            sh([sys.executable, os.path.join(HERE, "device_idle.py"), *traces, "--out", out])
+            print(open(out).read()[:6000], flush = True)
     return rc
 
 

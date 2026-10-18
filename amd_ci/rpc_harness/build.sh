@@ -7,6 +7,9 @@ set -uo pipefail
 OUT=$1; BACKEND=$2; ARCHS=$3; shift 3
 SRC=$OUT/src
 mkdir -p "$OUT"
+[ -d /usr/local/cuda/bin ] && export PATH="/usr/local/cuda/bin:$PATH"
+command -v cmake >/dev/null 2>&1 || python3 -m pip install -q cmake >/dev/null 2>&1 || pip install -q cmake >/dev/null 2>&1
+echo "toolchain: cmake=$(command -v cmake) $(cmake --version 2>&1 | head -1) nvcc=$(command -v nvcc) git=$(command -v git)"
 [ -d "$SRC/.git" ] || git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$SRC" || exit 1
 export CCACHE_DIR=$OUT/ccache CCACHE_BASEDIR=$OUT CCACHE_NOHASHDIR=true CCACHE_MAXSIZE=30G CCACHE_SLOPPINESS=time_macros
 JOBS=${JOBS:-$(nproc)}
@@ -14,7 +17,14 @@ LAUNCH=""
 command -v ccache >/dev/null 2>&1 && LAUNCH="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache"
 COMMON="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF"
 case "$BACKEND" in
-  cuda) BK="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$ARCHS" ;;
+  cuda)
+    BK="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
+    # Kaggle's toolkit ships no libcuda stub, so FindCUDAToolkit misses CUDA::cuda_driver: point it at one.
+    DRV=$(ls /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so 2>/dev/null | head -1)
+    [ -n "$DRV" ] || DRV=$(ls /usr/local/nvidia/lib64/libcuda.so* /usr/lib/x86_64-linux-gnu/libcuda.so* /usr/lib64/libcuda.so* 2>/dev/null | head -1)
+    [ -n "$DRV" ] || DRV=$(ldconfig -p 2>/dev/null | awk '/libcuda\.so(\.1)? /{print $NF; exit}')
+    [ -n "$DRV" ] && BK="$BK -DCUDA_cuda_driver_LIBRARY=$DRV"
+    echo "cuda driver lib: ${DRV:-none}" ;;
   hip)
     ROCM=${ROCM_PATH:-/opt/rocm}
     export HIPCXX="$ROCM/llvm/bin/clang" HIP_PATH="$ROCM" ROCM_PATH="$ROCM"
@@ -44,7 +54,9 @@ for spec in "$@"; do
   if [ $rc -eq 0 ] && [ -x "$wt/build/bin/llama-server" ]; then
     echo "BUILD_OK $name $sha $(( $(date +%s) - t0 ))s $wt/build/bin"
   else
-    echo "BUILD_FAIL $name rc=$rc"; tail -30 "$OUT/build_$name.log" "$OUT/cmake_$name.log" 2>/dev/null; rc_all=1
+    echo "BUILD_FAIL $name rc=$rc"; for f in "$OUT/cmake_$name.log" "$OUT/build_$name.log"; do
+      if [ -f "$f" ]; then echo "--- $f"; grep -iE "error|not found|could not" "$f" | head -15; tail -15 "$f"; else echo "--- $f missing"; fi
+    done; rc_all=1
   fi
 done
 command -v ccache >/dev/null 2>&1 && ccache -s | grep -iE "hit|miss" | head -4
