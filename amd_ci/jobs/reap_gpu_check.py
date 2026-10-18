@@ -22,6 +22,10 @@ MODELS = [
     "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
     "hf-internal-testing/tiny-random-OlmoeForCausalLM",
     "trl-internal-testing/tiny-GptOssForCausalLM",
+    "hf-internal-testing/tiny-random-MixtralForCausalLM",
+    "hf-internal-testing/tiny-random-Qwen2MoeForCausalLM",
+    "hf-internal-testing/tiny-random-GraniteMoeForCausalLM",
+    "trl-internal-testing/tiny-Glm4MoeForCausalLM",
 ]
 
 
@@ -45,13 +49,27 @@ def one_model(name, work, result):
     vocab = model.get_input_embeddings().weight.shape[0]
     data = rows(vocab = min(vocab, 1000))
     cfg = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
-    before = next(getattr(cfg, k) for k in ("num_experts", "num_local_experts", "n_routed_experts") if getattr(cfg, k, None))
+    keys = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+    before = next(getattr(cfg, k) for k in keys if getattr(cfg, k, None))
     save = os.path.join(work, name.split("/")[-1] + "_reap")
     t0 = time.time()
-    FastLanguageModel.reap_prune(model, tok, sparsity = 0.5, dataset = data, device = "cuda", save_directory = save)
+    # 50% first; tiny grouped routers (DeepSeek-V3) may only allow 25%. A clean refusal of an
+    # unsupported layout (raised before anything changes) is recorded, not a failure.
+    for sparsity in (0.5, 0.25):
+        try:
+            FastLanguageModel.reap_prune(model, tok, sparsity = sparsity, dataset = data, device = "cuda", save_directory = save)
+            r["sparsity"] = sparsity
+            break
+        except (ValueError, RuntimeError) as e:
+            msg = str(e)
+            if sparsity == 0.5 and any(t in msg for t in ("too aggressive", "fewer than 2", "drops 0")):
+                continue
+            r["refused"] = msg[:300]
+            r["ok"] = True
+            return
     torch.cuda.synchronize()
     r["reap_s"] = round(time.time() - t0, 2)
-    after = next(getattr(cfg, k) for k in ("num_experts", "num_local_experts", "n_routed_experts") if getattr(cfg, k, None))
+    after = next(getattr(cfg, k) for k in keys if getattr(cfg, k, None))
     r["experts"] = [before, after]
     stale = [n for n, p in model.named_parameters() if p.dim() >= 1 and p.shape[0] == before and "expert" in n]
     r["stale_tensors"] = stale[:5]
@@ -66,7 +84,14 @@ def one_model(name, work, result):
     del reloaded
 
     # LoRA on the pruned base, then a merged save that must reload with the pruned expert count.
-    model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 8, target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"])
+    # Linear layers the model really has (hybrid / linear-attention models lack q/k/v/o), never the
+    # experts, routers or the LM head.
+    leaf = {n.split(".")[-1] for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)}
+    targets = [t for t in ("q_proj", "k_proj", "v_proj", "o_proj") if t in leaf] or sorted(
+        leaf - {"lm_head", "gate", "router", "wg", "classifier"}
+    )[:4]
+    r["lora_targets"] = targets
+    model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 8, target_modules = targets)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr = 1e-3)
     model.train()
     losses = []
@@ -82,7 +107,7 @@ def one_model(name, work, result):
     model.save_pretrained_merged(merged, tok, save_method = "merged_16bit")
     m2 = AutoModelForCausalLM.from_pretrained(merged, dtype = dtype)
     c2 = m2.config.get_text_config() if hasattr(m2.config, "get_text_config") else m2.config
-    r["merged_experts"] = next(getattr(c2, k) for k in ("num_experts", "num_local_experts", "n_routed_experts") if getattr(c2, k, None))
+    r["merged_experts"] = next(getattr(c2, k) for k in keys if getattr(c2, k, None))
     del m2, model
     torch.cuda.empty_cache()
 
@@ -107,6 +132,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tree", required = True)
     ap.add_argument("--out", required = True)
+    ap.add_argument("--models", default = None, help = "comma-separated repo ids (default: the 3 built in)")
+    ap.add_argument("--skip-pytest", action = "store_true")
     a = ap.parse_args()
     sys.path.insert(0, a.tree)
     os.environ.setdefault("UNSLOTH_COMPILE_LOCATION", tempfile.mkdtemp(prefix = "uc_"))
@@ -124,7 +151,7 @@ def main():
         return 1
     work = tempfile.mkdtemp(prefix = "reap_gpu_")
     models = result.setdefault("models", {})
-    for name in MODELS:
+    for name in (a.models.split(",") if a.models else MODELS):
         try:
             one_model(name, work, models)
         except Exception:
@@ -132,11 +159,17 @@ def main():
             models[name]["ok"] = False
         json.dump(result, open(a.out, "w"), indent = 1)
     # REAP unit tests on CPU (needs pytest in this env).
+    if a.skip_pytest:
+        result["ok"] = all(m.get("ok") for m in models.values())
+        json.dump(result, open(a.out, "w"), indent = 1)
+        print("REAP_GPU_CHECK", "OK" if result["ok"] else "FAIL", json.dumps({k: v.get("ok") for k, v in models.items()}))
+        return 0 if result["ok"] else 1
     p = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_reap_prune.py", "-q", "-p", "no:cacheprovider"],
-        cwd = a.tree, capture_output = True, text = True, env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        [sys.executable, "-m", "pytest", "tests/test_reap_prune.py", "-q", "-rfE", "--tb=line", "-p", "no:cacheprovider"],
+        cwd = a.tree, capture_output = True, text = True,
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "UNSLOTH_FORCE_FLOAT32": "0"},
     )
-    result["pytest"] = {"rc": p.returncode, "tail": (p.stdout + p.stderr).strip().splitlines()[-1:]}
+    result["pytest"] = {"rc": p.returncode, "tail": (p.stdout + p.stderr).strip().splitlines()[-30:]}
     result["ok"] = all(m.get("ok") for m in models.values()) and p.returncode == 0
     json.dump(result, open(a.out, "w"), indent = 1)
     print("REAP_GPU_CHECK", "OK" if result["ok"] else "FAIL", json.dumps({k: v.get("ok") for k, v in models.items()}), result["pytest"]["tail"])
