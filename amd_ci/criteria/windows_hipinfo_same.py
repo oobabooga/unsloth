@@ -16,7 +16,7 @@ TITLE = "Windows hipinfo gfx selection per mask on real gfx1151, round 7 reverte
 MODE = "regression"
 NEEDS = ["windows", "rocm", "gpu", "multi_gpu_amd"]
 EXPECT_GFX = "gfx1151"
-KEYS = ("has_rocm", "rocm_gfx_target", "rocm_gfx_targets", "error")
+KEYS = ("has_rocm", "rocm_gfx_target", "rocm_gfx_targets", "has_amd_gpu_without_rocm", "error")
 INTENDED = {"rocr_empty", "rocr_minus1"}
 
 
@@ -36,9 +36,16 @@ def gates(obs):
         out.append((f"{name} probe wrote observations", o.get("_probe_rc") == 0 and bool(cells),
                     f"rc={o.get('_probe_rc')}, {len(cells)} cells"))
         u = cells.get("none") or {}
-        out.append((f"{name} unmasked detect_host resolves {EXPECT_GFX}",
-                    u.get("rocm_gfx_target") == EXPECT_GFX,
-                    f"target={u.get('rocm_gfx_target')!r} targets={u.get('rocm_gfx_targets')} err={u.get('error')}"))
+        host = o.get("host") or {}
+        if host.get("hipinfo_on_path") or host.get("hip_path"):
+            out.append((f"{name} unmasked detect_host resolves {EXPECT_GFX}",
+                        u.get("rocm_gfx_target") == EXPECT_GFX,
+                        f"target={u.get('rocm_gfx_target')!r} targets={u.get('rocm_gfx_targets')} err={u.get('error')}"))
+        else:
+            # No HIP SDK on this box: the no-SDK path (AMD GPU, no ROCm) is what gets compared.
+            out.append((f"{name} no HIP SDK: unmasked detect_host sees an AMD GPU without ROCm",
+                        u.get("has_amd_gpu_without_rocm") is True and not u.get("error"),
+                        f"has_amd_gpu_without_rocm={u.get('has_amd_gpu_without_rocm')} err={u.get('error')}"))
     return out
 
 
