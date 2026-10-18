@@ -55,7 +55,10 @@ jobs:
         run: |
           set -uo pipefail
           test -n "${ROCM_PATH:-}" || { echo "FATAL: no ROCm with hipcc + llvm clang on this runner"; exit 1; }
-          python3 -m pip install --user -q huggingface_hub 2>&1 | tail -2
+          # PEP 668 host Python: a throwaway venv for the one dependency (huggingface_hub).
+          python3 -m venv "$AMD_CI_WORK/venv" || { echo "FATAL: python3 -m venv failed"; exit 1; }
+          . "$AMD_CI_WORK/venv/bin/activate"
+          python3 -m pip install -q huggingface_hub || { echo "FATAL: pip install failed"; exit 1; }
           export HF_HOME="$AMD_CI_WORK/hf" RPC_WORK="$AMD_CI_WORK/llama"
           cd "$AMD_CI_WORK/out"
           set +e
