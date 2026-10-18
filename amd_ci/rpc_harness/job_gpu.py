@@ -56,7 +56,15 @@ def fetch(names, fakes):
             print(f"no file for {n} {pat}", flush = True)
             continue
         t = time.time()
-        paths = [hf_hub_download(repo, f) for f in files]  # split GGUFs: llama.cpp opens part 1
+        paths = None
+        for attempt in range(4):  # mirrors time out mid-file; hf_hub_download resumes
+            try:
+                paths = [hf_hub_download(repo, f) for f in files]
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"download {n} attempt {attempt}: {type(e).__name__}: {str(e)[:200]}", flush = True)
+        if paths is None:
+            continue  # split GGUFs: llama.cpp opens part 1
         out[n] = paths[0]
         print(f"fetched {n}: {files} in {time.time() - t:.0f}s", flush = True)
     for n in fakes:
@@ -159,7 +167,8 @@ def main():
                 "--groups-batch", "16", "--groups-patterns", "saturate",
                 "--groups-ctx-per-slot", "512", "--rounds", "1"]
     elif a.plan == "AMD":
-        real = ["qwen3-0.6b", "qwen3.5-0.8b", "gemma4-e2b", "lfm2-8b-a1b", "gpt-oss-20b", "glm-4.7-flash-mla"]
+        # The runner reaches the Hub through a slow mirror: small public models only.
+        real = ["qwen3-0.6b", "qwen3.5-0.8b", "gemma4-e2b", "lfm2-8b-a1b"]
         models = fetch(real, [])
         # One GPU: the RPC topology runs the rpc-server on the same device (the RPC code path, not overlap).
         args = ["--suite", "single,correct,teardown",
