@@ -1,0 +1,67 @@
+name: "AMD CI: Windows Studio training repro (unslothai/unsloth#9932)"
+
+# Real install.ps1 --local Studio on a Windows gfx1151 box, then a LoRA job through
+# POST /api/train/start: once as installed, once with ROCM_HOME at the wheel's _rocm_sdk_core.
+
+on:
+  push:
+    branches: [amd-ci-studio-win-train-9932]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  windows:
+    name: "Windows gfx1151: Studio train as installed vs ROCM_HOME"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "studio9932-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python found."; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Studio train
+        timeout-minutes: 220
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\studio_win_train.py" `
+            --ref 26e246d4071bd988d482c3b43a4612eddb12c7e8 `
+            --work "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\studio"
+          Write-Host "probe rc=$LASTEXITCODE"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio9932-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
