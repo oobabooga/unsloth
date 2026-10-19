@@ -366,7 +366,7 @@ def main() -> int:
         if url not in seeded:
             seeded[url] = seed(url)
     args.out.parent.mkdir(parents = True, exist_ok = True)
-    with sync_playwright() as pw, open(args.out, "a") as fh:
+    with sync_playwright() as pw, open(args.out, "a", encoding = "utf-8") as fh:
         browser = pw.chromium.launch(channel = args.channel, headless = not args.headed,
                                      ignore_default_args = ["--hide-scrollbars"])
         print(f"browser {args.channel} {browser.version} headed={args.headed}", flush = True)
