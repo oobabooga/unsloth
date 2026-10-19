@@ -142,12 +142,16 @@ def main() -> int:
     err = build(front, dists["plain"], env, npm, npx, blog)
     if not err:
         patch = HERE / "fence_drag_guard.patch"
-        if subprocess.run(["git", "apply", str(patch)], cwd = checkout, capture_output = True).returncode != 0:
-            err = "guard patch did not apply"
+        # A Windows checkout can carry CRLF line ends, which the LF patch's context lines do not.
+        flags = ["--ignore-whitespace", "--whitespace=nowarn"]
+        applied = subprocess.run(["git", "apply", *flags, str(patch)], cwd = checkout, capture_output = True, text = True)
+        if applied.returncode != 0:
+            err = "guard patch did not apply: " + (applied.stderr or "")[-500:]
         else:
             err = build(front, dists["guard"], env, npm, npx, blog)
-            subprocess.run(["git", "apply", "-R", str(patch)], cwd = checkout, capture_output = True)
+            subprocess.run(["git", "apply", "-R", *flags, str(patch)], cwd = checkout, capture_output = True)
     obs["builds"]["error"] = err
+    obs["build_log_tail"] = blog.read_text(encoding = "utf-8", errors = "replace")[-1500:] if blog.exists() else ""
     if err:
         obs["error"] = err
         obs["build_log_tail"] = blog.read_text(encoding = "utf-8", errors = "replace")[-3000:]
