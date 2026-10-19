@@ -1,0 +1,126 @@
+name: "AMD CI: ROCm torch build matrix (unslothai/unsloth#9932)"
+
+# Which newer ROCm torch builds run Unsloth on gfx1151, against the build main installs today.
+# Plumbing follows amd_ci/templates (preamble, gate, GPU concurrency group, announce-style
+# exit); the probe is a torch-build matrix rather than a base/head differential.
+
+on:
+  push:
+    branches: [amd-ci-rocm-torch-matrix-9932]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  linux:
+    name: "Linux gfx1151: torch build matrix"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "rocm9932-linux"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran with no torch; the probe's info cell re-gates per arm (control failing it = VOID)"
+
+      - name: Matrix
+        timeout-minutes: 280
+        run: |
+          set +e
+          # No UV_EXTRA_INDEX_URL: an extra index outranks --default-index in uv, so PyPI CUDA
+          # torch would win. The driver passes --no-config and explicit indexes instead.
+          python3 -u amd_ci/probes/rocm_torch_matrix_driver.py --os linux \
+            --work "$AMD_CI_WORK" --out-dir "$AMD_CI_WORK/out/matrix"
+          echo "driver rc=$?"
+
+      - name: Judge
+        run: |
+          set +e
+          python3 amd_ci/criteria/rocm_torch_matrix_judge.py "$AMD_CI_WORK/out/matrix"
+          rc=$?
+          cat "$AMD_CI_WORK/out/matrix/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rocm9932-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  windows:
+    name: "Windows gfx1151: torch build matrix"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "rocm9932-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python found."; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Matrix
+        timeout-minutes: 220
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\rocm_torch_matrix_driver.py" --os windows `
+            --work "$env:AMD_CI_WORK" --out-dir "$env:AMD_CI_WORK\out\matrix"
+          Write-Host "driver rc=$LASTEXITCODE"
+
+      - name: Judge
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\criteria\rocm_torch_matrix_judge.py" `
+            "$env:AMD_CI_WORK\out\matrix"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:AMD_CI_WORK\out\matrix\VERDICT.md" -Encoding UTF8 |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rocm9932-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
