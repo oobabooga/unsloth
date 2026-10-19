@@ -1,0 +1,228 @@
+name: "AMD CI (Windows): zoo PR 1866 fused linear r9"
+
+# Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows.
+#
+# The Windows half of the devlab-dispatch pool: four GMKtec NucBox EVO-X2 Strix
+# Halo boxes running Windows 11 Pro, with an AMD Radeon 8060S visible to Windows.
+# They match in seconds and never queue. Everything below is measured on them:
+#
+#   shell: powershell     the ONLY correct value. `pwsh` is not installed (there
+#                         is no PowerShell 7, only 5.1 Desktop) and neither is
+#                         `bash`. Either one fails before the step's first line.
+#                         Set as a job default so no step can drift off it.
+#   no docker             not installed on any of the four. Containerised work
+#                         stays on the Linux runners; there is no Windows target
+#                         for it on this pool.
+#   RUNNER_OS             has been observed EMPTY on these jobs, and correct on
+#                         others. Echo it before branching on it; a bash-style
+#                         ${RUNNER_OS:-?} in a PowerShell block is always "".
+#   machine names         the X2-LA01-* prefix is SHARED with the Linux pool, so
+#                         the name does not tell you which OS answered.
+#   no shared state       jobs land on DIFFERENT machines and share no image
+#                         cache and no disk. Anything fetched in one job must be
+#                         fetched again in the next.
+#
+# The linux-control job exists to be diagnostic, not useful. A label that matches
+# no runner does not fail a job, it queues it forever, and that looks exactly like
+# a busy pool from the run list. This job differs from the Windows one ONLY in the
+# OS label, so if it starts and the Windows job does not, the selector is wrong.
+# Keep it, or reproduce it by pushing the same workflow twice.
+
+on:
+  push:
+    branches: [amd-ci-fused-linear-r9-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "1866"
+  UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
+  # Set to "1" for a PR already merged: compares the merge commit to its parent.
+  MERGED: "0"
+  # unsloth pinned to ONE commit for both zoo states (PR unslothai/unsloth#14185 head); only unsloth-zoo varies.
+  UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
+  UNSLOTH_PR: "14185"
+  UNSLOTH_SHA: "e8e0a37c4d5f8cc15f5b870fbc3b5a074dc00e13"
+  # Expected zoo states (informational: states.py resolves them live; the probe records the real SHAs).
+  EXPECT_ZOO_BASE: "cda2b273b53384a9a1765f2c037d5dc78a8370de"
+  EXPECT_ZOO_HEAD: "bfa05a53cba546496234b9b7d4af519ddbc8001c"
+  # AMD's Windows torch for gfx1151, the same index and pin unsloth's install.ps1 uses (multi-arch, rocm7.14.0).
+  AMD_TORCH_INDEX: "https://repo.amd.com/rocm/whl-multi-arch/"
+  AMD_TORCH_SPEC: "torch[device-gfx1151]==2.11.0+rocm7.14.0"
+
+jobs:
+
+  linux-control:
+    name: "PR 1866 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows"
+          echo "selector matched no runner. If BOTH stay queued, the pool is busy."
+
+  windows:
+    name: "PR 1866 on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    # Enabled: this job runs GPU tests. It is off by default
+    # because the four Windows boxes are four separate machines with four separate
+    # GPUs, so serialising all of them costs throughput for nothing; the labels
+    # cannot pin one machine, so there is no finer group to ask for. `lint_workflow.py`
+    # raises W101 if a step here touches GPU memory without a group.
+    concurrency:
+      group: amd-ci-strix-halo-windows-gpu
+      cancel-in-progress: false
+    env:
+      # unsloth_zoo is imported outside pytest (zoo_env_diag.py, the env check below): the import guard.
+      UNSLOTH_IS_PRESENT: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr1866-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            Write-Host "Not skipping: a run that cannot start is a failure, not nothing to see."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          $extra = @()
+          if ($env:MERGED -eq "1") { $extra += "--merged" }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test environment
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Content "$env:AMD_CI_WORK\out\states.json"
+          Write-Host "expected zoo base $env:EXPECT_ZOO_BASE head $env:EXPECT_ZOO_HEAD"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 1. AMD's ROCm torch for gfx1151 (AMD index only, as install.ps1 does), then with PyPI as an extra index.
+          $kind = "rocm"
+          & $py -m pip install --index-url "$env:AMD_TORCH_INDEX" "$env:AMD_TORCH_SPEC"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "AMD index alone failed; retrying with PyPI as an extra index"
+            & $py -m pip install --index-url "$env:AMD_TORCH_INDEX" --extra-index-url "https://pypi.org/simple" "$env:AMD_TORCH_SPEC"
+          }
+          if ($LASTEXITCODE -ne 0) {
+            # Labelled, never silent: the CPU re-decision step below reports this as a CPU run on Windows.
+            Write-Host "::warning::AMD ROCm torch for gfx1151 did not install; falling back to CPU torch (CPU RUN)"
+            $kind = "cpu-fallback"
+            & $py -m pip install --index-url "https://download.pytorch.org/whl/cpu" torch
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $tv = & $py -c "import torch; print(torch.__version__)"
+          $gpu = & $py -c "import torch; print(int(torch.cuda.is_available()))"
+          & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda', torch.version.cuda, 'gpu', torch.cuda.is_available())"
+          Set-Content -Path "$env:AMD_CI_WORK\constraints.txt" -Value "torch==$tv" -Encoding ASCII
+          # 2. zoo dependencies (zoo base, torch held by the constraint); torchao / cut_cross_entropy may have no
+          #    Windows wheel, so fall back to the plain dependency list. Each state's zoo goes first on PYTHONPATH.
+          & $py -m pip install -q -c "$env:AMD_CI_WORK\constraints.txt" "$env:AMD_CI_WORK\states\base"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "full zoo dependency set failed on Windows; installing the plain list"
+            & $py -m pip install -q -c "$env:AMD_CI_WORK\constraints.txt" "transformers>=4.52.4,<=5.17.0" "trl>=0.18.2,<=1.15.0" "peft>=0.18.0" "accelerate>=0.34.1" "datasets>=3.4.1,<5.0.0" tyro einops packaging sentencepiece tqdm psutil numpy protobuf "huggingface_hub>=0.34.0" pillow regex msgspec typing_extensions filelock requests
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          # 3. unsloth at the pinned commit, no deps (the zoo conftest imports it if it can; failure is recorded).
+          $u = "$env:AMD_CI_WORK\unsloth"
+          git clone -q --filter=blob:none "$env:UNSLOTH_REPO" "$u"
+          git -C "$u" fetch -q origin "$env:UNSLOTH_SHA"
+          if ($LASTEXITCODE -ne 0) { git -C "$u" fetch -q origin "refs/pull/$env:UNSLOTH_PR/head" }
+          git -C "$u" checkout -q --detach "$env:UNSLOTH_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q --no-deps -e "$u"
+          & $py -m pip install -q -c "$env:AMD_CI_WORK\constraints.txt" typer rich pydantic pyyaml nest-asyncio structlog click
+          & $py -c "import unsloth; print('unsloth import ok', unsloth.__file__)"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::import unsloth failed on Windows (recorded; zoo tests do not need it)" }
+          & $py -m pip list
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_TORCH_KIND=$kind"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_TORCH_GPU=$gpu"
+          # Gate the host only (windows): a torch without a GPU still yields the labelled CPU run below.
+          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Differential (GPU run)
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_win_tests.py" `
+            --out-dir "$env:AMD_CI_WORK\out\windows" `
+            --python "$env:AMD_CI_PY" -- --diag --only-states base,head --tests tests/test_fused_linear.py `
+            tests/test_fused_linear_routing.py tests/test_chunked_ce.py tests/test_chunked_logprob.py `
+            tests/test_grpo_logprob_recompute.py tests/test_compile_disable_keeps_optimizations.py
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE, e.g. no GPU test ran) does not.
+          # This is the last command, so its exit status is the step's.
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" `
+            "$env:AMD_CI_WORK\out\windows"
+
+      - name: CPU re-decision (only when torch saw no GPU)
+        if: ${{ !cancelled() }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "torch kind=$env:AMD_CI_TORCH_KIND gpu=$env:AMD_CI_TORCH_GPU"
+          if ($env:AMD_CI_TORCH_GPU -eq "1") { Write-Host "GPU visible: the GPU verdict above stands, no CPU re-decision"; exit 0 }
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\windows\observations.json")) { Write-Host "no observations to re-decide"; exit 1 }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\redecide.py" --dir "$env:AMD_CI_WORK\out\windows" `
+            --criteria "$env:GITHUB_WORKSPACE\amd_ci\criteria\zoo_win_tests_cpu.py"
+          Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT_redecided.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr1866-r9-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
