@@ -1,4 +1,4 @@
-name: "k6 d589f58080: Windows build with LLAMA_BUILD_TESTS=ON (hosted windows-2022, release CPU recipe) + the k6 unit tests"
+name: "k6 tip: Windows build with LLAMA_BUILD_TESTS=ON (hosted windows-2022, release CPU recipe) + the k6 unit tests"
 
 on:
   push:
