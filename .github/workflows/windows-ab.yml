@@ -36,6 +36,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'pytest install failed' }
           $env:PYTHONPATH = Join-Path $work 'repo\tests\_shared'
           Set-Location (Join-Path $work 'repo')
+          # The tests prefer pwsh when available; select Windows PowerShell 5.1 explicitly.
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and -not (Test-Path -LiteralPath (Join-Path $_ 'pwsh.exe')) }) -join ';'
+          if (Get-Command pwsh -ErrorAction SilentlyContinue) { throw 'pwsh is still on PATH' }
+          & powershell -NoProfile -Command '$PSVersionTable.PSVersion'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell is missing' }
           & $testPython (Join-Path $work 'verify.py')
           if ($LASTEXITCODE -ne 0) { throw 'verification failed' }
       - name: Keep test logs
