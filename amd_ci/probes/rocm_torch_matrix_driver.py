@@ -151,6 +151,10 @@ for name, index, specs in ARMS[a.os]:
     if rc == 0:
         fr = subprocess.run([uv, "pip", "freeze", "--python", py], capture_output = True, text = True)
         rec["freeze"] = fr.stdout
+        # As an activated venv: triton finds the ROCm SDK headers through `rocm-sdk path --root`,
+        # a console script in the venv's Scripts / bin, so it must be on PATH.
+        base_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.path.dirname(py) + os.pathsep + base_path
         if win:
             # Studio's training worker (studio/backend/core/_msvc_env.py, #9897): when clang-cl cannot
             # build Triton's hip_utils.c, switch CC to the TinyCC triton-windows bundles if that builds.
@@ -172,6 +176,7 @@ for name, index, specs in ARMS[a.os]:
         if os.path.exists(obs_path):
             with open(obs_path, encoding = "utf-8") as f:
                 rec["obs"] = json.load(f)
+        os.environ["PATH"] = base_path
         shutil.rmtree(work, ignore_errors = True)
     else:
         rec["install_tail"] = tail(log)
