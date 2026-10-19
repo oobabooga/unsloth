@@ -45,6 +45,25 @@ ARMS = {
     ],
 }
 OVERRIDES = ["torch", "torchvision", "torchaudio", "triton"]
+CC_GATE = r"""
+import os, sysconfig
+import torch  # before triton: triton-windows >= 3.8 imported first breaks torch_hip.dll
+def builds():
+    from triton.runtime import build, driver
+    for n in ("_find_compiler", "get_cc"):
+        c = getattr(getattr(build, n, None), "cache_clear", None)
+        c and c()
+    try:
+        driver.active.get_current_target(); return True
+    except Exception as e:
+        print("driver build failed:", type(e).__name__, str(e)[-300:]); return False
+if builds():
+    print("CC=")
+else:
+    tcc = os.path.join(sysconfig.get_path("platlib"), "triton", "runtime", "tcc", "tcc.exe")
+    os.environ["CC"] = tcc
+    print("CC=" + tcc if os.path.isfile(tcc) and builds() else "CC=")
+"""
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--os", choices = sorted(ARMS), required = True)
@@ -132,6 +151,16 @@ for name, index, specs in ARMS[a.os]:
     if rc == 0:
         fr = subprocess.run([uv, "pip", "freeze", "--python", py], capture_output = True, text = True)
         rec["freeze"] = fr.stdout
+        if win:
+            # Studio's training worker (studio/backend/core/_msvc_env.py, #9897): when clang-cl cannot
+            # build Triton's hip_utils.c, switch CC to the TinyCC triton-windows bundles if that builds.
+            gate = subprocess.run([py, "-c", CC_GATE], capture_output = True, text = True, timeout = 600)
+            rec["cc_gate"] = (gate.stdout + gate.stderr)[-1500:]
+            cc = next((l[3:] for l in gate.stdout.splitlines() if l.startswith("CC=")), "")
+            if cc:
+                os.environ["CC"] = cc
+            else:
+                os.environ.pop("CC", None)
         obs_path = os.path.join(a.out_dir, f"{name}.obs.json")
         work = os.path.join(a.work, "runs", name)
         os.makedirs(work, exist_ok = True)
