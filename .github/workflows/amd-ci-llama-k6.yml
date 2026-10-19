@@ -1,0 +1,339 @@
+name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix (gfx1151 Linux + Windows, hosted Windows CUDA/CPU, macOS Metal)"
+
+# k6 = upstream ggml-org b11721 (ff5a2337) + k6p/k6.patch.gz (moe-combined-k6 tip, k6p/K6_SHA). Release = the published
+# b11696-mix-7baeb9a bundle for each platform. Arms rel / rel2 (release twice, A/A) and k6 / k6b (k6 twice, A/A), rotated per rep.
+# Derived from the r273 / hipgather llama.cpp workflows (amd_ci/templates/workflow.yml + workflow_windows.yml plumbing).
+#   linux-build    builds k6 for gfx1151 with the release's flags, GPU masked, no group (it measures nothing)
+#   gpu-linux      the only Linux job that allocates; holds the shared GPU group
+#   gpu-windows    builds (TheRock) and measures on a Windows 11 box; holds the shared GPU group
+#   hosted-*       GitHub-hosted: Windows CUDA build (no GPU), Windows CPU build + CPU correctness, macOS 15 Metal build + run
+
+on:
+  push:
+    branches: [amd-ci-llama-k6]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  linux-build:
+    name: "k6 HIP gfx1151 build, Linux (no GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k6-linux-build"
+      - name: Build k6 (b11721 + k6 patch), release flags
+        timeout-minutes: 110
+        run: |
+          set +e
+          bash k6p/linux_build.sh
+          rc=$?
+          echo "build rc=$rc"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k6bin-linux
+          path: ${{ env.AMD_CI_WORK }}/art
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-linux-build-logs
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  gpu-linux:
+    name: "k6 vs release, Linux ROCm gfx1151 (exclusive)"
+    needs: linux-build
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k6-linux-gpu"
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+      - uses: actions/download-artifact@v4
+        with:
+          name: k6bin-linux
+          path: ${{ env.AMD_CI_WORK }}/art
+      - name: Cells, KLD, test-backend-ops
+        timeout-minutes: 310
+        run: |
+          set +e
+          bash k6p/linux_gpu.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/rows_linux.jsonl"
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x llama-perplexit; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
+          echo "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-linux-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows selector matched no runner."
+
+  gpu-windows:
+    name: "k6 vs release, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "k6-windows"
+      - name: Build k6 with TheRock, cells, KLD, test-backend-ops
+        timeout-minutes: 320
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
+          & "$env:GITHUB_WORKSPACE\k6p\win_gpu.ps1"
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\rows_win.jsonl")) { exit 1 }
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Process -Name llama-server, llama-perplexity, test-backend-ops -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-windows-gpu
+          path: ${{ env.AMD_CI_WORK }}\out
+          retention-days: 7
+          if-no-files-found: warn
+
+  hosted-win-cuda:
+    name: "k6 Windows CUDA 12.8 build (hosted, no GPU)"
+    runs-on: windows-2022
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Source (b11721 + k6 patch)
+        run: |
+          $BASE = "ff5a23376725e5a889fa0bfb987b7541dc304da0"
+          git init -q src; git -C src config core.autocrlf false
+          git -C src remote add origin https://github.com/ggml-org/llama.cpp
+          git -C src fetch -q --depth 1 origin $BASE; git -C src checkout -q --detach $BASE
+          python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" k6p\k6.patch.gz k6.patch
+          git -C src apply --whitespace=nowarn ..\k6.patch
+          if ($LASTEXITCODE -ne 0) { throw "k6 patch does not apply" }
+          git -C src diff --shortstat
+      - name: "CUDA 12.8.0 (NVIDIA redist, as unsloth-cuda-windows-setup)"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $components = @('cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_nvrtc:12.8.61', 'libcublas:12.8.3.14', 'cuda_nvtx:12.8.55', 'cuda_profiler_api:12.8.55', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55')
+          $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+          foreach ($cv in $components) {
+            $comp, $ver = $cv.Split(':')
+            $name = "$comp-windows-x86_64-$ver-archive"
+            $zip = Join-Path $stage "$name.zip"
+            curl.exe -fsSL --retry 3 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
+            tar.exe -xf $zip -C $stage
+            robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copy failed: $name" }
+            Remove-Item -Recurse -Force $zip, (Join-Path $stage $name)
+          }
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V12_8=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure + build (release flags, sm_89 only), then test-backend-ops
+        working-directory: src
+        run: |
+          nvcc --version
+          pip install -q ninja
+          $t0 = Get-Date
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=ON -DGGML_CUDA=ON -DGGML_CUDA_CUB_3DOT2=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=OFF -DCMAKE_CUDA_ARCHITECTURES=89-real
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build -j 3 2>&1 | Tee-Object -FilePath ..\build_cuda.log | Select-String -Pattern "error|FAILED|warning C4" | Select-Object -First 60
+          $rc = $LASTEXITCODE
+          "build rc=$rc $([int]((Get-Date) - $t0).TotalSeconds) s"
+          if (-not (Test-Path build\bin\llama-server.exe) -or -not (Test-Path build\bin\ggml-cuda.dll)) { "FATAL: missing outputs"; Get-ChildItem build\bin | Select-Object -First 60; exit 1 }
+          cmake -S . -B build -DLLAMA_BUILD_TESTS=ON
+          cmake --build build -j 3 --target test-backend-ops 2>&1 | Select-Object -Last 5
+          "test-backend-ops build: $(Test-Path build\bin\test-backend-ops.exe)"
+          Get-ChildItem build\bin -Filter *.dll | ForEach-Object { "$($_.Name) $($_.Length)" }
+          build\bin\llama-server.exe --version
+          build\bin\llama-server.exe --list-devices
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-win-cuda-build
+          path: build_cuda.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  hosted-win-cpu:
+    name: "k6 Windows CPU build + CPU correctness vs release (hosted)"
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Source (b11721 + k6 patch)
+        run: |
+          $BASE = "ff5a23376725e5a889fa0bfb987b7541dc304da0"
+          git init -q src; git -C src config core.autocrlf false
+          git -C src remote add origin https://github.com/ggml-org/llama.cpp
+          git -C src fetch -q --depth 1 origin $BASE; git -C src checkout -q --detach $BASE
+          python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" k6p\k6.patch.gz k6.patch
+          git -C src apply --whitespace=nowarn ..\k6.patch
+          if ($LASTEXITCODE -ne 0) { throw "k6 patch does not apply" }
+      - name: "Build (release CPU recipe - clang toolchain, OpenMP, BACKEND_DL, CPU_ALL_VARIANTS)"
+        working-directory: src
+        shell: cmd
+        run: |
+          pip install -q ninja
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=ON -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release > ..\build_cpu.log 2>&1
+          set BRC=%ERRORLEVEL%
+          findstr /i /c:"error" ..\build_cpu.log
+          echo build rc=%BRC%
+          if not "%BRC%"=="0" exit /b 1
+          for /r "%VSDIR%\VC" %%f in (libomp140.x86_64.dll) do if exist "%%f" copy /y "%%f" build\bin\Release\ >nul
+          dir build\bin\Release\*.dll
+      - name: CPU cells + KLD vs release windows-x64-cpu
+        run: |
+          $ErrorActionPreference = "Continue"
+          $R = "$env:RUNNER_TEMP\k6p"; New-Item -ItemType Directory -Force -Path "$R\bins\rel", "$R\bins\k6", "$R\models" | Out-Null
+          Copy-Item src\build\bin\Release\* "$R\bins\k6\" -Recurse
+          Set-Content -Encoding utf8 -Path "$R\bins\k6\TAG" -Value "k6 $((Get-Content k6p\K6_SHA).Substring(0,10)) windows-x64-cpu"
+          $TAG = "b11696-mix-7baeb9a"
+          curl.exe -fL --retry 5 -s -S -o "$R\rel.zip" "https://github.com/unslothai/llama.cpp/releases/download/$TAG/app-$TAG-windows-x64-cpu.zip"
+          Expand-Archive -Force -Path "$R\rel.zip" -DestinationPath "$R\bins\rel"
+          Set-Content -Encoding utf8 -Path "$R\bins\rel\TAG" -Value "$TAG windows-x64-cpu"
+          $env:K6P_DIR = $R; $env:K6P_DEV = ""; $env:ARMS = "rel:rel,rel2:rel,k6:k6,k6b:k6"; $env:PYTHONIOENCODING = "utf-8"
+          $B = "$env:GITHUB_WORKSPACE\k6p\k6p_bench.py"
+          python -u $B dl --models q35,lfm2 | Where-Object { -not $_.StartsWith("ROW") }
+          python -u $B devinfo | Where-Object { -not $_.StartsWith("ROW") }
+          foreach ($c in @("q35:full", "lfm2:full")) { python -u $B time --cell $c --reps 3 | Where-Object { -not $_.StartsWith("ROW") } }
+          python -u $B kld --model q35 --modes full --arms rel,rel2,k6 | Where-Object { -not $_.StartsWith("ROW") }
+          python -u $B kld --model lfm2 --modes full --arms rel,rel2,k6 | Where-Object { -not $_.StartsWith("ROW") }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "$R\out\rows.jsonl" out\rows_wincpu.jsonl; Copy-Item "$R\out\logs" out\logs -Recurse; Copy-Item ..\build_cpu.log out\ -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-win-cpu
+          path: out
+          retention-days: 7
+          if-no-files-found: warn
+
+  hosted-mac:
+    name: "k6 macOS 15 arm64 Metal build + Metal/CPU correctness vs release (hosted)"
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Source, build (release macOS flags), test-backend-ops
+        run: |
+          set +e
+          BASE=ff5a23376725e5a889fa0bfb987b7541dc304da0
+          git init -q src; git -C src remote add origin https://github.com/ggml-org/llama.cpp
+          git -C src fetch -q --depth 1 origin $BASE && git -C src checkout -q --detach $BASE || exit 1
+          gunzip -c k6p/k6.patch.gz > k6.patch; git -C src apply --whitespace=nowarn ../k6.patch || { echo "FATAL: patch"; exit 1; }
+          sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu; sw_vers
+          cd src
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DLLAMA_OPENSSL=OFF > ../cfg_mac.log 2>&1 || { tail -30 ../cfg_mac.log; exit 1; }
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" > ../build_mac.log 2>&1
+          brc=$?; echo "build rc=$brc"; grep -E "error:|warning:" ../build_mac.log | sort | uniq -c | sort -rn | head -30
+          [ $brc = 0 ] || exit 1
+          cmake -B build -DLLAMA_BUILD_TESTS=ON >> ../cfg_mac.log 2>&1 && cmake --build build -j "$(sysctl -n hw.logicalcpu)" --target test-backend-ops > ../build_mac_tbo.log 2>&1
+          echo "test-backend-ops build rc=$?"
+          ls build/bin | head -60
+      - name: Metal/CPU cells, KLD, test-backend-ops vs release macos-arm64
+        run: |
+          set +e
+          R="$RUNNER_TEMP/k6p"; mkdir -p "$R/bins/rel" "$R/bins/k6" "$R/models" out
+          cp -a src/build/bin/* "$R/bins/k6/"; echo "k6 $(cut -c1-10 k6p/K6_SHA) macos-arm64 metal" > "$R/bins/k6/TAG"
+          TAG=b11696-mix-7baeb9a
+          curl -fL --retry 5 -s -S "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama-$TAG-bin-macos-arm64.tar.gz" | tar xz -C "$R/bins/rel"
+          echo "$TAG macos-arm64" > "$R/bins/rel/TAG"; find "$R/bins/rel" -maxdepth 3 | head -20
+          export K6P_DIR="$R" K6P_DEV=MTL0 ARMS="rel:rel,rel2:rel,k6:k6,k6b:k6"
+          B="python3 -u k6p/k6p_bench.py"
+          $B dl --models q35,lfm2 | grep -v '^ROW'
+          $B devinfo | grep -v '^ROW'
+          $B tbo --bin k6 --ops RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,GET_ROWS,SET_ROWS,CPY,TOPK_MOE,TOP_K,MUL_MAT_ID --timeout 1800 | grep TBO
+          for c in q35:full q35:cpu lfm2:full lfm2:spill1024; do $B time --cell $c --reps 3 | grep -v '^ROW'; done
+          $B kld --model q35 --modes full,cpu --arms rel,rel2,k6 | grep KLD
+          $B kld --model lfm2 --modes full,spill1024 --arms rel,rel2,k6 | grep KLD
+          cp "$R/out/rows.jsonl" out/rows_mac.jsonl; cp -r "$R/out/logs" out/logs; cp build_mac.log out/ 2>/dev/null
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-mac
+          path: out
+          retention-days: 7
+          if-no-files-found: warn
