@@ -74,7 +74,7 @@ cmake -S $SRC -B "$SRC\build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
 $crc = $LASTEXITCODE
 Get-Content "$OUT\k6_configure.log" -Tail 25
 if ($crc -ne 0) { Write-Host "FATAL: configure"; exit 1 }
-cmake --build "$SRC\build" -j 32 *> "$OUT\k6_build.log"
+cmake --build "$SRC\build" -j 32 -- -k 0 *> "$OUT\k6_build.log"
 $brc = $LASTEXITCODE
 Log "k6 build rc=$brc $([int]((Get-Date) - $t0).TotalSeconds) s"
 if ($brc -ne 0) { Get-Content "$OUT\k6_build.log" | Select-String -Pattern "error:|FAILED" -Context 2, 6 | Select-Object -First 40; exit 1 }

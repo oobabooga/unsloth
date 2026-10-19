@@ -27,7 +27,7 @@ cmake -S "$S" -B "$S/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
 crc=$?
 tail -30 "$OUT/k6_configure.log"
 [ $crc = 0 ] || { echo "FATAL: configure rc=$crc"; exit 1; }
-cmake --build "$S/build" -j "$(nproc)" > "$OUT/k6_build.log" 2>&1
+cmake --build "$S/build" -j "$(nproc)" -- -k 0 > "$OUT/k6_build.log" 2>&1
 brc=$?
 echo "build rc=$brc in $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt"
 if [ $brc != 0 ]; then grep -E -B2 -A6 "error:|FAILED" "$OUT/k6_build.log" | head -120; exit 1; fi

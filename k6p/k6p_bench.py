@@ -62,11 +62,13 @@ def find_bindir(d):
     return None
 
 
+# ARMS "name:dir[:VAR=VAL;VAR2=VAL2]": the optional third field is extra environment for that arm (kill-switch arms)
 ARMS_SPEC = os.environ.get("ARMS", "rel:rel,rel2:rel,k6:k6,k6b:k6")
-BINS = {}
+BINS, ARM_ENV = {}, {}
 for x in ARMS_SPEC.split(","):
-    n, d = x.split(":")
+    n, d = x.split(":")[:2]
     BINS[n] = find_bindir(os.path.join(K, "bins", d)) or os.path.join(K, "bins", d)
+    ARM_ENV[n] = dict(kv.split("=", 1) for kv in x.split(":", 2)[2].split(";") if kv) if x.count(":") >= 2 else {}
 ARMS = [x.split(":")[0] for x in ARMS_SPEC.split(",")]
 if a.arms:
     ARMS = a.arms.split(",")
@@ -80,6 +82,7 @@ for n, d in BINS.items():
 
 def benv(arm):
     e = dict(os.environ)
+    e.update(ARM_ENV.get(arm, {}))
     d = BINS[arm]
     if WIN:
         e["PATH"] = d + os.pathsep + e.get("PATH", "")
@@ -411,7 +414,7 @@ def do_time():
         for arm in order:
             tag = "%s_%s_%s_r%d" % (model, mode, arm, rep)
             s = run_server(arm, model, mode, target, tag)
-            row(dict(s, kind="server", model=model, mode=mode, arm=arm, rep=rep, fit_target=target, budget=budget))
+            row(dict(s, kind="server", model=model, mode=mode, arm=arm, rep=rep, fit_target=target, budget=budget, arm_env=ARM_ENV.get(arm)))
             d, p = s.get("dec") or {}, s.get("p2k") or {}
             log(tag, "ok", s["ok"], "load", s["load_s"], "dec", d.get("tg_tps"), (d.get("md5") or "")[:8], "pp2k", p.get("pp_tps"), "tg2k",
                 p.get("tg_tps"), (p.get("md5") or "")[:8], "dev", s["dev_peak_mib"], "rss", s["rss_peak_mib"], s.get("err", ""),
@@ -454,7 +457,7 @@ def do_kld():
             mem = smp.done()
         s = rd(lp)
         g = lambda pat: (re.findall(pat, s) or [None])[-1]
-        d = {"kind": "kld", "model": model, "mode": mode, "arm": arm, "ref": ref + ":full", "rc": rc, "wall_s": round(time.time() - t),
+        d = {"kind": "kld", "model": model, "mode": mode, "arm": arm, "arm_env": ARM_ENV.get(arm), "ref": ref + ":full", "rc": rc, "wall_s": round(time.time() - t),
              "fit_target": target, "budget": budget, "ppl": g(r"Final estimate: PPL = ([\d.]+ \+/- [\d.]+)"),
              "mean_kld": g(r"Mean +KLD: +(-?[\d.e+-]+)"), "max_kld": g(r"Maximum KLD: +(-?[\d.e+-]+)"),
              "p99_kld": g(r"99\.0% +KLD: +(-?[\d.e+-]+)"), "same_top": g(r"Same top p: +([\d.]+ ± [\d.]+)"),
@@ -491,9 +494,16 @@ def do_tbo():
                 kill(p)
                 rc = "timeout"
         s = rd(lp)
-        m = re.findall(r"(\d+)/(\d+) tests passed", s)
+        # per backend: "Backend i/n: NAME" ... "x/y tests passed" (the device under test, not the skipped ones)
+        per = {}
+        for blk in re.split(r"\nBackend \d+/\d+: ", "\n" + s)[1:]:
+            name = blk.split("\n", 1)[0].strip()
+            mm = re.findall(r"(\d+)/(\d+) tests passed", blk)
+            if mm:
+                per[name] = mm[-1]
+        m = [per[DEV]] if DEV in per else re.findall(r"(\d+)/(\d+) tests passed", s)
         fl = [re.sub(r"\x1b\[[0-9;]*m", "", l.strip())[:240] for l in s.splitlines() if "FAIL" in l]
-        r = {"kind": "tbo", "bin": arm, "op": op, "rc": rc, "passed": m[-1] if m else None, "n_fail": len(fl), "fails": fl[:40],
+        r = {"kind": "tbo", "bin": arm, "op": op, "rc": rc, "passed": m[-1] if m else None, "per_backend": per, "n_fail": len(fl), "fails": fl[:40],
              "n_ok": len(re.findall(r"\bOK\b", s)), "not_supported": len(re.findall(r"not supported", s)), "wall_s": round(time.time() - t),
              "backend_line": re.findall(r"Backend \d+/\d+: [^\n]*", s)[:4], "status": re.findall(r"\d+/\d+ backends passed[^\n]*", s)[-1:],
              "tail": s[-400:]}
@@ -509,6 +519,6 @@ def do_dl():
         download(m)
 
 
-log("HOST", json.dumps(HOST), "BINS", BINS, "TAGS", TAG, "DEV", DEV)
+log("HOST", json.dumps(HOST), "BINS", BINS, "ARM_ENV", ARM_ENV, "TAGS", TAG, "DEV", DEV)
 {"time": do_time, "kld": do_kld, "tbo": do_tbo, "dl": do_dl, "devinfo": do_devinfo}[a.what]()
 log("=== K6P %s %s DONE ===" % (a.what, a.cell or a.model or a.ops[:40]))
