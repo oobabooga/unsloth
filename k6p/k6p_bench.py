@@ -34,7 +34,7 @@ ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--arms", default="")
 ap.add_argument("--bin", default="k6")
 ap.add_argument("--ops", default="")
-ap.add_argument("--chunks", type=int, default=int(os.environ.get("KLD_CHUNKS", "20")))
+ap.add_argument("--chunks", type=int, default=int(os.environ.get("KLD_CHUNKS", "40")))
 ap.add_argument("--timeout", type=int, default=2400)
 a = ap.parse_args()
 
@@ -390,11 +390,19 @@ def warm_cache(model):
     log("page cache warm %s %.0f s" % (model, time.time() - t), meminfo())
 
 
-def cell_target(model, mode):
+_TGT = {}
+
+
+def cell_target(model, mode, arm):
+    """spillN: --fit-target = this arm's own free device memory - N MiB, so every arm gets the same N MiB budget even when the
+    builds' HIP runtimes report different free memory (run 2 Windows: release 100414 MiB vs TheRock 7.14 build 78471 MiB)"""
     if not mode.startswith("spill"):
         return None, None
     budget = int(mode[5:])
-    free = dev_free(ARMS[0])
+    key = (BINS[arm], tuple(sorted(ARM_ENV.get(arm, {}).items())))
+    if key not in _TGT:
+        _TGT[key] = dev_free(arm)
+    free = _TGT[key]
     if free is None:
         return None, budget
     return max(free - budget, 0), budget
@@ -407,11 +415,12 @@ def do_time():
         row({"kind": "server", "model": model, "mode": mode, "err": "model missing"})
         return
     warm_cache(model)
-    target, budget = cell_target(model, mode)
-    log("cell", a.cell, "fit-target", target, "budget", budget)
+    for arm in ARMS:
+        log("cell", a.cell, arm, "fit-target / budget", cell_target(model, mode, arm))
     for rep in range(a.reps):
         order = ARMS[rep % len(ARMS):] + ARMS[:rep % len(ARMS)]
         for arm in order:
+            target, budget = cell_target(model, mode, arm)
             tag = "%s_%s_%s_r%d" % (model, mode, arm, rep)
             s = run_server(arm, model, mode, target, tag)
             row(dict(s, kind="server", model=model, mode=mode, arm=arm, rep=rep, fit_target=target, budget=budget, arm_env=ARM_ENV.get(arm)))
@@ -436,11 +445,8 @@ def do_kld():
         for arm in ARMS:
             if (arm, mode) != (ref, "full"):
                 pairs.append((arm, mode, False))
-    targets = {}
     for arm, mode, is_ref in pairs:
-        if mode not in targets:
-            targets[mode] = cell_target(model, mode)
-        target, budget = targets[mode]
+        target, budget = cell_target(model, mode, arm)
         lp = os.path.join(LOGS, "kld_%s_%s_%s.log" % (model, mode, arm))
         argv = [binp(arm, "llama-perplexity"), "-m", mpath(model), "-f", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wiki.test.raw"),
                 "-c", "512", "--chunks", str(a.chunks), "-fa", "on"] + mode_flags(model, mode, target) + ["--kl-divergence-base", f] + \

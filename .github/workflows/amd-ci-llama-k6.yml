@@ -11,94 +11,13 @@ name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix (gfx1151 Linux + 
 
 on:
   push:
-    branches: [amd-ci-llama-k6r2]
+    branches: [amd-ci-llama-k6r3w]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-
-  linux-build:
-    name: "k6 HIP gfx1151 build, Linux (no GPU)"
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 120
-    env:
-      HIP_VISIBLE_DEVICES: ""
-      ROCR_VISIBLE_DEVICES: ""
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "k6-linux-build"
-      - name: Build k6 (b11721 + k6 patch), release flags
-        timeout-minutes: 110
-        run: |
-          set +e
-          bash k6p/linux_build.sh
-          rc=$?
-          echo "build rc=$rc"
-          exit $rc
-      - uses: actions/upload-artifact@v4
-        with:
-          name: k6bin-linux
-          path: ${{ env.AMD_CI_WORK }}/art
-          retention-days: 3
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k6-linux-build-logs
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
-
-  gpu-linux:
-    name: "k6 vs release, Linux ROCm gfx1151 (exclusive)"
-    needs: linux-build
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "k6-linux-gpu"
-      - name: Hardware gate
-        run: |
-          set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 \
-            --out "$AMD_CI_WORK/out/host.json"
-      - uses: actions/download-artifact@v4
-        with:
-          name: k6bin-linux
-          path: ${{ env.AMD_CI_WORK }}/art
-      - name: Cells, KLD, test-backend-ops
-        timeout-minutes: 310
-        run: |
-          set +e
-          bash k6p/linux_gpu.sh
-          rc=$?
-          echo "job rc=$rc"
-          test -s "$AMD_CI_WORK/out/rows_linux.jsonl"
-      - name: Stop leftover servers
-        if: always()
-        run: |
-          set +e
-          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x llama-perplexit; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
-          echo "cleanup done"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k6-linux-gpu
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
 
   linux-control:
     name: "linux control (selector diagnosis)"
@@ -113,6 +32,7 @@ jobs:
           set +e
           echo "machine: $(uname -n)"
           echo "If this job runs and the windows job stays queued, the Windows selector matched no runner."
+
 
   gpu-windows:
     name: "k6 vs release, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
@@ -151,55 +71,3 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  hosted-mac:
-    name: "k6 macOS 15 arm64 Metal build + Metal/CPU correctness vs release, unfixed k6u as the base arm (hosted)"
-    runs-on: macos-15
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Sources (fixed k6 and unfixed k6u), builds (release macOS flags), test-backend-ops
-        run: |
-          set +e
-          BASE=ff5a23376725e5a889fa0bfb987b7541dc304da0
-          sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu; sw_vers
-          for t in k6:k6.patch.gz k6u:k6base.patch.gz; do
-            n=${t%%:*}; pz=${t#*:}
-            git init -q src_$n; git -C src_$n remote add origin https://github.com/ggml-org/llama.cpp
-            git -C src_$n fetch -q --depth 1 origin $BASE && git -C src_$n checkout -q --detach $BASE || exit 1
-            gunzip -c k6p/$pz > $n.patch; git -C src_$n apply --whitespace=nowarn ../$n.patch || { echo "FATAL: patch $n"; exit 1; }
-            cmake -S src_$n -B src_$n/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_INSTALL_RPATH='@loader_path' \
-              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
-              -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DLLAMA_OPENSSL=OFF > cfg_$n.log 2>&1 || { tail -30 cfg_$n.log; exit 1; }
-            cmake --build src_$n/build --config Release -j "$(sysctl -n hw.logicalcpu)" --target llama-server llama-perplexity > build_$n.log 2>&1
-            echo "build $n rc=$?"; grep -E "error:" build_$n.log | head -20
-          done
-          cmake -S src_k6 -B src_k6/build -DLLAMA_BUILD_TESTS=ON >> cfg_k6.log 2>&1 && cmake --build src_k6/build -j "$(sysctl -n hw.logicalcpu)" --target test-backend-ops > build_k6_tbo.log 2>&1
-          echo "test-backend-ops build rc=$?"
-          test -x src_k6/build/bin/llama-server && test -x src_k6u/build/bin/llama-server
-      - name: Metal cells, KLD, test-backend-ops vs release macos-arm64
-        run: |
-          set +e
-          R="$RUNNER_TEMP/k6p"; mkdir -p "$R/bins/rel" "$R/bins/k6" "$R/bins/k6u" "$R/models" out
-          cp -a src_k6/build/bin/* "$R/bins/k6/"; echo "k6 $(cut -c1-10 k6p/K6_SHA) macos-arm64 metal" > "$R/bins/k6/TAG"
-          cp -a src_k6u/build/bin/* "$R/bins/k6u/"; echo "k6u $(cut -c1-10 k6p/K6BASE_SHA) macos-arm64 metal (unfixed)" > "$R/bins/k6u/TAG"
-          TAG=b11696-mix-7baeb9a
-          curl -fL --retry 5 -s -S "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama-$TAG-bin-macos-arm64.tar.gz" | tar xz -C "$R/bins/rel"
-          echo "$TAG macos-arm64" > "$R/bins/rel/TAG"
-          export K6P_DIR="$R" K6P_DEV=MTL0 ARMS="rel:rel,rel2:rel,k6u:k6u,k6:k6,k6b:k6,k6s:k6:GGML_SCHED_ASYNC_UPLOAD=0"
-          B="python3 -u k6p/k6p_bench.py"
-          $B dl --models q35,lfm2 | grep -v '^ROW'
-          $B devinfo | grep -v '^ROW'
-          $B tbo --bin k6 --ops RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,GET_ROWS,SET_ROWS,CPY,TOPK_MOE,TOP_K,MUL_MAT_ID,MUL_MAT --timeout 1800 | grep TBO
-          for c in q35:full lfm2:full lfm2:spill1024; do $B time --cell $c --reps 2 | grep -v '^ROW'; done
-          $B kld --model q35 --modes full --arms rel,rel2,k6u,k6,k6s | grep KLD
-          $B kld --model lfm2 --modes full,spill1024 --arms rel,rel2,k6u,k6,k6s | grep KLD
-          cp "$R/out/rows.jsonl" out/rows_mac.jsonl; cp -r "$R/out/logs" out/logs; cp build_*.log out/ 2>/dev/null
-          exit 0
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k6-mac
-          path: out
-          retention-days: 7
-          if-no-files-found: warn

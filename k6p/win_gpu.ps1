@@ -14,7 +14,7 @@ Log "python $PY"
 Get-CimInstance Win32_ComputerSystem | ForEach-Object { Log "RAM $($_.TotalPhysicalMemory) procs $($_.NumberOfLogicalProcessors)" }
 Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) driver $($_.DriverVersion) AdapterRAM $($_.AdapterRAM)" }
 
-$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,rel2:rel,k6:k6,k6b:k6"; $env:PYTHONIOENCODING = "utf-8"
+$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,rel2:rel,rs:rs,ub:ub,k6:k6,k6b:k6,k6nf:k6:GGML_CUDA_DISABLE_FUSION=1,k6x:k6:GGML_CUDA_DISABLE_FUSION=1;GGML_CUDA_DISABLE_NORM_Q8_1_FUSION=1;GGML_CUDA_DISABLE_PRODUCER_Q8_1=1;GGML_CUDA_DISABLE_Q8_1_CACHE=1;GGML_CUDA_DISABLE_Q8_1_RESHAPE=1;GGML_CUDA_DISABLE_SIDE_MATVEC=1;GGML_CUDA_DISABLE_GATE_MUL_FUSION=1;GGML_CUDA_DISABLE_EW_CHAIN=1;GGML_CUDA_DISABLE_ADD_UNARY_MUL_FUSION=1;GGML_CUDA_DISABLE_COPY_KERNEL=1"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
   -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", "q35,lfm2,gptoss")
 
@@ -54,43 +54,58 @@ git -C $SRC fetch -q --depth 1 origin $BASE
 git -C $SRC checkout -q --detach $BASE
 if ((git -C $SRC rev-parse HEAD).Trim() -ne $BASE) { Write-Host "FATAL: checkout"; exit 1 }
 & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\k6.patch.gz" "$W\k6.patch"
-git -C $SRC apply --whitespace=nowarn "$W\k6.patch"
-if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: k6 patch does not apply"; exit 1 }
-git -C $SRC diff --shortstat | ForEach-Object { Log "k6 diff $_" }
 
 $ocml = Get-ChildItem -Path $ROCM -Recurse -Filter "ocml.bc" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -eq $ocml) { Write-Host "FATAL: no ocml.bc"; exit 1 }
 $ROCMF = $ROCM.Replace('\', '/'); $BCF = $ocml.DirectoryName.Replace('\', '/')
 $env:HIP_DEVICE_LIB_PATH = $ocml.DirectoryName
 $HFLAGS = "--rocm-path=$ROCMF --rocm-device-lib-path=$BCF -Wno-unused-command-line-argument"
-$t0 = Get-Date
-cmake -S $SRC -B "$SRC\build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  "-DCMAKE_C_COMPILER=$CLANG" "-DCMAKE_CXX_COMPILER=$CLANGXX" "-DCMAKE_HIP_COMPILER=$CLANGXX" `
-  "-DCMAKE_PREFIX_PATH=$ROCM" "-DROCM_DIR=$ROCM" "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types" `
-  "-DCMAKE_CXX_FLAGS=-I$ROCMF/include $HFLAGS" "-DCMAKE_HIP_FLAGS=$HFLAGS" `
-  -DGPU_TARGETS=gfx1151 -DAMDGPU_TARGETS=gfx1151 -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
-  -DGGML_HIP=ON -DGGML_OPENMP=OFF -DGGML_CUDA_FORCE_CUBLAS=OFF -DGGML_RPC=ON -DGGML_HIP_ROCWMMA_FATTN=OFF -DGGML_NATIVE=OFF `
-  -DGGML_STATIC=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF *> "$OUT\k6_configure.log"
-$crc = $LASTEXITCODE
-Get-Content "$OUT\k6_configure.log" -Tail 25
-if ($crc -ne 0) { Write-Host "FATAL: configure"; exit 1 }
-cmake --build "$SRC\build" -j 32 -- -k 0 *> "$OUT\k6_build.log"
-$brc = $LASTEXITCODE
-Log "k6 build rc=$brc $([int]((Get-Date) - $t0).TotalSeconds) s"
-if ($brc -ne 0) { Get-Content "$OUT\k6_build.log" | Select-String -Pattern "error:|FAILED" -Context 2, 6 | Select-Object -First 40; exit 1 }
-cmake -S $SRC -B "$SRC\build" -DLLAMA_BUILD_TESTS=ON *>> "$OUT\k6_configure.log"
-cmake --build "$SRC\build" -j 32 --target test-backend-ops *> "$OUT\k6_build_tbo.log"
-Log "test-backend-ops build rc=$LASTEXITCODE"
-if ($LASTEXITCODE -ne 0) { Get-Content "$OUT\k6_build_tbo.log" | Select-String -Pattern "error:|FAILED" -Context 2, 6 | Select-Object -First 20 }
-Copy-Item "$SRC\build\bin\*" "$R\bins\k6\" -Recurse -Force
-# TheRock runtime beside the exes (Windows searches the exe dir before System32), rocblas / hipblaslt kernels in bin\<lib>\library
-Copy-Item "$ROCM\bin\*.dll" "$R\bins\k6\" -Force
-foreach ($lib in "rocblas", "hipblaslt") {
-  $d = Get-ChildItem -Path $ROCM -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq $lib } | Select-Object -First 1
-  if ($d) { New-Item -ItemType Directory -Force -Path "$R\bins\k6\$lib" | Out-Null; Copy-Item -Path $d.FullName -Destination "$R\bins\k6\$lib\library" -Recurse -Force; Log "$lib library from $($d.FullName)" }
+# one release-flag build of a source tree into $R\bins\<name>, TheRock runtime + rocblas / hipblaslt kernels beside the exes
+function Build-Tree($tree, $name, $tests) {
+  $t0 = Get-Date
+  cmake -S $tree -B "$tree\build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    "-DCMAKE_C_COMPILER=$CLANG" "-DCMAKE_CXX_COMPILER=$CLANGXX" "-DCMAKE_HIP_COMPILER=$CLANGXX" `
+    "-DCMAKE_PREFIX_PATH=$ROCM" "-DROCM_DIR=$ROCM" "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types" `
+    "-DCMAKE_CXX_FLAGS=-I$ROCMF/include $HFLAGS" "-DCMAKE_HIP_FLAGS=$HFLAGS" `
+    -DGPU_TARGETS=gfx1151 -DAMDGPU_TARGETS=gfx1151 -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
+    -DGGML_HIP=ON -DGGML_OPENMP=OFF -DGGML_CUDA_FORCE_CUBLAS=OFF -DGGML_RPC=ON -DGGML_HIP_ROCWMMA_FATTN=OFF -DGGML_NATIVE=OFF `
+    -DGGML_STATIC=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF *> "$OUT\${name}_configure.log"
+  if ($LASTEXITCODE -ne 0) { Get-Content "$OUT\${name}_configure.log" -Tail 25; Log "$name configure FAILED"; return $false }
+  cmake --build "$tree\build" -j 32 -- -k 0 *> "$OUT\${name}_build.log"
+  $brc = $LASTEXITCODE
+  Log "$name build rc=$brc $([int]((Get-Date) - $t0).TotalSeconds) s"
+  if ($brc -ne 0) { Get-Content "$OUT\${name}_build.log" | Select-String -Pattern "error:|FAILED" -Context 2, 6 | Select-Object -First 40; return $false }
+  if ($tests) {
+    cmake -S $tree -B "$tree\build" -DLLAMA_BUILD_TESTS=ON *>> "$OUT\${name}_configure.log"
+    cmake --build "$tree\build" -j 32 --target test-backend-ops *> "$OUT\${name}_build_tbo.log"
+    Log "$name test-backend-ops build rc=$LASTEXITCODE"
+  }
+  $d = "$R\bins\$name"
+  New-Item -ItemType Directory -Force -Path $d | Out-Null
+  Copy-Item "$tree\build\bin\*" "$d\" -Recurse -Force
+  Copy-Item "$ROCM\bin\*.dll" "$d\" -Force
+  foreach ($lib in "rocblas", "hipblaslt") {
+    $ld = Get-ChildItem -Path $ROCM -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq $lib } | Select-Object -First 1
+    if ($ld) { New-Item -ItemType Directory -Force -Path "$d\$lib" | Out-Null; Copy-Item -Path $ld.FullName -Destination "$d\$lib\library" -Recurse -Force }
+  }
+  return $true
 }
-Set-Content -Encoding utf8 -Path "$R\bins\k6\TAG" -Value "k6 $((Get-Content "$J\K6_SHA").Substring(0,10)) hip gfx1151 TheRock $((& $VP -m pip show rocm 2>$null | Select-String '^Version').ToString())"
-# the release bundle's own rocblas library dir, and ours, are found next to rocblas.dll; no global env so each arm uses its own
+$TRV = (& $VP -m pip show rocm 2>$null | Select-String '^Version').ToString()
+# ub = plain upstream b11721 (k6's upstream base), built from the checkout before the patch
+if (-not (Build-Tree $SRC "ub" $false)) { Write-Host "FATAL: ub build"; exit 1 }
+Set-Content -Encoding utf8 -Path "$R\bins\ub\TAG" -Value "upstream b11721 ff5a2337 hip gfx1151 TheRock $TRV"
+git -C $SRC apply --whitespace=nowarn "$W\k6.patch"
+if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: k6 patch does not apply"; exit 1 }
+git -C $SRC diff --shortstat | ForEach-Object { Log "k6 diff $_" }
+if (-not (Build-Tree $SRC "k6" $true)) { Write-Host "FATAL: k6 build"; exit 1 }
+Set-Content -Encoding utf8 -Path "$R\bins\k6\TAG" -Value "k6 $((Get-Content "$J\K6_SHA").Substring(0,10)) hip gfx1151 TheRock $TRV"
+# rs = the release's own source tarball, same toolchain as k6 (rel vs rs = toolchain / runtime, rs vs k6 = code)
+& curl.exe -fL --retry 5 -s -S -o "$W\rs.tar.gz" "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama.cpp-source-$TAG.tar.gz"
+New-Item -ItemType Directory -Force -Path "$W\src_rs" | Out-Null
+tar.exe -xzf "$W\rs.tar.gz" -C "$W\src_rs"
+$RSD = (Get-ChildItem -Directory "$W\src_rs" | Select-Object -First 1).FullName
+if (-not (Build-Tree $RSD "rs" $false)) { Write-Host "rs build failed (arm dropped)" }
+Set-Content -Encoding utf8 -Path "$R\bins\rs\TAG" -Value "$TAG source hip gfx1151 TheRock $TRV"
 Get-ChildItem "C:\Windows\System32\amdhip64*" -ErrorAction SilentlyContinue | ForEach-Object { Log "system32: $($_.Name) $($_.VersionInfo.FileVersion)" }
 Get-ChildItem -Recurse "$R\bins\rel" -Filter "amdhip64*.dll" | ForEach-Object { Log "release: $($_.FullName) $($_.VersionInfo.FileVersion)" }
 Get-ChildItem "$R\bins\k6" -Filter "amdhip64*.dll" | ForEach-Object { Log "k6: $($_.Name) $($_.VersionInfo.FileVersion)" }
@@ -106,9 +121,9 @@ Bench @("devinfo") "devinfo.log"
 foreach ($c in @("q35:full", "lfm2:full", "lfm2:spill1536", "gptoss:full", "gptoss:spill6144")) {
   Bench @("time", "--cell", $c, "--reps", "3") "time_$($c.Replace(':','_')).log"
 }
-Bench @("kld", "--model", "q35", "--modes", "full", "--arms", "rel,rel2,k6") "kld_q35.log"
-Bench @("kld", "--model", "lfm2", "--modes", "full,spill1536", "--arms", "rel,rel2,k6") "kld_lfm2.log"
-Bench @("kld", "--model", "gptoss", "--modes", "full,spill6144", "--arms", "rel,rel2,k6") "kld_gptoss.log"
+Bench @("kld", "--model", "q35", "--modes", "full", "--arms", "rel,rel2,rs,ub,k6,k6nf,k6x") "kld_q35.log"
+Bench @("kld", "--model", "lfm2", "--modes", "full,spill1536", "--arms", "rel,rel2,rs,ub,k6,k6nf,k6x") "kld_lfm2.log"
+Bench @("kld", "--model", "gptoss", "--modes", "full,spill6144", "--arms", "rel,rel2,rs,ub,k6") "kld_gptoss.log"
 $OPS = "RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,RMS_NORM_MUL_ROPE,MUL_MAT_VEC_SHARED_SRC1,MUL_MAT_ID_FALLBACK_SHARED_SRC1,MUL_MAT_ID_SHARED,MUL_MAT_VEC_FUSION,MUL_MAT_ID_FUSION,HC_POST_NORM,EW_CHAIN,TOPK_MOE,TOP_K,GET_ROWS,SET_ROWS,CPY,MUL_MAT_ID"
 Bench @("tbo", "--bin", "k6", "--ops", $OPS, "--timeout", "2400") "tbo.log"
 Copy-Item "$R\out\rows.jsonl" "$OUT\rows_win.jsonl" -ErrorAction SilentlyContinue
