@@ -109,7 +109,8 @@ def sdpa_check(backend_name):
         go = torch.randn(shape, generator = g)
 
         def go_fn(dev, dtype, backend):
-            q, k, v = (t.to(dev, dtype).requires_grad_() for t in (q0, k0, v0))
+            # detach + clone: a fresh leaf per run, or .grad stays None on the converted copy.
+            q, k, v = (t.detach().to(dev, dtype).clone().requires_grad_() for t in (q0, k0, v0))
             ctx = sdpa_kernel([backend]) if backend is not None else None
             if ctx is not None:
                 with ctx:

@@ -27,16 +27,21 @@ ARMS = {
          ["torch>=2.11.0,<2.12.0", "torchvision>=0.26.0,<0.27.0", "torchaudio>=2.11.0,<2.12.0"]),
         ("pytorch_rocm7.2_2.14.1", PT + "rocm7.2", ["torch==2.14.1+rocm7.2", "torchvision==0.29.1+rocm7.2"]),
         ("pytorch_rocm7.14_2.14.1", PT + "rocm7.14", ["torch==2.14.1+rocm7.14", "torchvision==0.29.1+rocm7.14"]),
-        ("amd_whlnext_2.14.0_rocm10.1", AMD_NEXT,
-         ["torch[device-gfx1151]==2.14.0+rocm10.1.0", "torchvision[device-gfx1151]==0.28.0+rocm10.1.0"]),
+        # whl-next pairs torchvision 0.29 only with rocm10.0, so 10.1's newest matched pair is torch 2.13.
+        ("amd_whlnext_2.13.0_rocm10.1", AMD_NEXT,
+         ["torch[device-gfx1151]==2.13.0+rocm10.1.0", "torchvision[device-gfx1151]==0.28.0+rocm10.1.0"]),
+        ("amd_whlnext_2.14.0_rocm10.0", AMD_NEXT,
+         ["torch[device-gfx1151]==2.14.0+rocm10.0.0", "torchvision[device-gfx1151]==0.29.0+rocm10.0.0"]),
         ("amd_multiarch_2.11.0_rocm7.14.0", AMD_MULTI,
          ["torch[device-gfx1151]==2.11.0+rocm7.14.0", "torchvision[device-gfx1151]==0.26.0+rocm7.14.0"]),
     ],
     "windows": [
         ("control_amd_multiarch_2.11.0_rocm7.14.0", AMD_MULTI,
          ["torch[device-gfx1151]==2.11.0+rocm7.14.0", "torchvision[device-gfx1151]==0.26.0+rocm7.14.0"]),
-        ("amd_whlnext_2.14.0_rocm10.1", AMD_NEXT,
-         ["torch[device-gfx1151]==2.14.0+rocm10.1.0", "torchvision[device-gfx1151]==0.28.0+rocm10.1.0"]),
+        # whl-next pairs torchvision 0.29 only with rocm10.0, so 10.1's newest matched pair is torch 2.13.
+        ("amd_whlnext_2.13.0_rocm10.1", AMD_NEXT,
+         ["torch[device-gfx1151]==2.13.0+rocm10.1.0", "torchvision[device-gfx1151]==0.28.0+rocm10.1.0"]),
+        # No Windows torch 2.14.0+rocm10.0.0 wheel on whl-next.
     ],
 }
 OVERRIDES = ["torch", "torchvision", "torchaudio", "triton"]
@@ -115,6 +120,15 @@ for name, index, specs in ARMS[a.os]:
             [uv, "pip", "install", "--no-config", "--python", py, f"unsloth[amd] @ {UNSLOTH}", f"unsloth_zoo @ {ZOO}",
              "--override", ov, "--default-index", PYPI], log, 2400)
         rec["unsloth_install_rc"] = rc
+    if rc == 0 and win:
+        # As studio/setup.ps1 Get-TritonWindowsSpec: Unsloth imports triton, and Studio installs
+        # triton-windows paired with the torch minor.
+        minor = int(subprocess.run([py, "-c", "import torch; print(torch.__version__.split('.')[1])"],
+                                   capture_output = True, text = True).stdout.strip() or 0)
+        spec = {13: "triton-windows>=3.7,<3.8", 14: "triton-windows>=3.8,<3.9"}.get(minor, "triton-windows<3.7")
+        rc, rec["triton_install_s"] = sh(
+            [uv, "pip", "install", "--no-config", "--python", py, spec, "--default-index", PYPI], log, 900)
+        rec["triton_install_rc"] = rc
     if rc == 0:
         fr = subprocess.run([uv, "pip", "freeze", "--python", py], capture_output = True, text = True)
         rec["freeze"] = fr.stdout
