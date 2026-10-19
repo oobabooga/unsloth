@@ -132,7 +132,7 @@ jobs:
           HEAD_DIR=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["paths"]["head"])' "$AMD_CI_WORK/out/states.json")
           mkdir -p "$AMD_CI_WORK/out/diag"
           cd "$HEAD_DIR"
-          PYTHONPATH="$HEAD_DIR" "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/fl_scale_diag.py" 2>&1 | tee "$AMD_CI_WORK/out/diag/diag.log"
+          UNSLOTH_IS_PRESENT=1 PYTHONPATH="$HEAD_DIR" "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/probes/fl_scale_diag.py" 2>&1 | tee "$AMD_CI_WORK/out/diag/diag.log"
           PYTHONPATH="$HEAD_DIR" "$AMD_CI_PY" -m pytest -q -p no:cacheprovider tests/test_fused_linear.py -k "incoming_gradient or pre_ampere" 2>&1 | tail -40 | tee -a "$AMD_CI_WORK/out/diag/diag.log"
           exit 0
 
