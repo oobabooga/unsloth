@@ -47,8 +47,8 @@ for p in libhipblas.so* librocblas.so* libamdhip64.so* librocsolver.so* libroctx
          librocroller.so* liborigami.so* libtensilelite-host.so* librocm_kpack.so* rocm_sysdeps/lib/librocm_sysdeps_z.so* \
          rocm_sysdeps/lib/librocm_sysdeps_zstd.so* llvm/lib/libLLVM.so* llvm/lib/libclang-cpp.so* llvm/lib/libomp.so \
          rocm_sysdeps/lib/librocm_sysdeps_elf.so* rocm_sysdeps/lib/librocm_sysdeps_drm.so* rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* \
-         rocm_sysdeps/lib/librocm_sysdeps_bz2.so*; do cp -a /opt/rocm/lib/$p "$B/" 2>/dev/null; done
-[ -e "$B/libomp.so" ] || { lo=$(find /opt/rocm -name 'libomp.so' 2>/dev/null | head -1); echo "libomp from ${lo:-none}"; [ -n "$lo" ] && cp -L "$lo" "$B/libomp.so"; }
+         rocm_sysdeps/lib/librocm_sysdeps_bz2.so*; do cp -L /opt/rocm/lib/$p "$B/" 2>/dev/null; done  # -L: no symlink may point outside the bundle
+[ -e "$B/libomp.so" ] || { rm -f "$B/libomp.so"; lo=$(find /opt/rocm -name 'libomp.so' 2>/dev/null | head -1); echo "libomp from ${lo:-none}"; [ -n "$lo" ] && cp -L "$lo" "$B/libomp.so"; }
 la="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"; [ -n "$la" ] && cp -L "$la" "$B/"
 ( cd "$B" && for f in *.so* llama-* test-backend-ops; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null; done )
 case $N in
