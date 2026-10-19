@@ -23,7 +23,7 @@ name: "AMD CI: zoo PR 1866 fused linear r8b diag"
 
 on:
   push:
-    branches: [amd-ci-fused-linear-r8]
+    branches: [amd-ci-fused-linear-r8b]
   workflow_dispatch:
 
 permissions:
