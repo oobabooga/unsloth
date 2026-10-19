@@ -1,4 +1,4 @@
-name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix, gfx1151 Linux + Windows, same-toolchain controls (run 4)"
+name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix, gfx1151 Linux + Windows, same-toolchain controls (run 5)"
 
 # k6 = upstream ggml-org b11721 (ff5a2337) + k6p/k6.patch.gz (moe-combined-k6 tip 901101c06c + the two platform fixes, k6p/K6_SHA).
 # Every build uses the release's own recipe and its weekly TheRock pin (10.2.0a20261010): Linux on GitHub-hosted ubuntu-22.04
@@ -8,7 +8,7 @@ name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix, gfx1151 Linux + 
 
 on:
   push:
-    branches: [amd-ci-llama-k6r4]
+    branches: [amd-ci-llama-k6r5]
   workflow_dispatch:
 
 permissions:
@@ -57,10 +57,15 @@ jobs:
           source amd_ci/lib/preamble.sh "k6-linux-gpu"
       - name: Hardware gate
         run: |
-          set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 \
-            --out "$AMD_CI_WORK/out/host.json"
+          set +e
+          # gate.py needs torch to count GPUs; without it (no venv here) it records the host and reports 0 GPUs, so the hard
+          # check is torch-free: the KFD node and rocminfo naming gfx1151. A miss FAILS the job (no skip).
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json" > /dev/null
+          ls -la /dev/kfd /dev/dri 2>&1 | head -5
+          R=$(command -v rocminfo || echo /opt/rocm/bin/rocminfo)
+          "$R" 2>&1 | grep -m3 -E "Marketing Name|gfx1151" | tee "$AMD_CI_WORK/out/rocminfo.txt"
+          if [ ! -e /dev/kfd ] || ! grep -q gfx1151 "$AMD_CI_WORK/out/rocminfo.txt"; then echo "GATE FAILED: no gfx1151 via KFD"; exit 1; fi
+          echo "gate ok"
       - uses: actions/download-artifact@v4
         with:
           name: bin_k6
@@ -110,9 +115,9 @@ jobs:
           echo "If this job runs and the windows job stays queued, the Windows selector matched no runner."
 
   gpu-windows:
-    name: "k6 vs release, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    name: "k6 Windows 11 gfx1151 test-backend-ops MUL_MAT differential (exclusive)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
+    timeout-minutes: 140
     concurrency:
       group: amd-ci-gfx1151-gpu
       cancel-in-progress: false
@@ -125,13 +130,13 @@ jobs:
       - name: Preamble
         run: |
           .\amd_ci\lib\preamble.ps1 -Name "k6-windows"
-      - name: Build ub / k6 / rs with the release's TheRock, cells, KLD, test-backend-ops
-        timeout-minutes: 320
+      - name: test-backend-ops MUL_MAT differential (k6 / release source, same TheRock; k6 with the release's rocblas library)
+        timeout-minutes: 120
         run: |
           $ErrorActionPreference = "Continue"
           Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
-          & "$env:GITHUB_WORKSPACE\k6p\win_gpu.ps1"
-          if (-not (Test-Path "$env:AMD_CI_WORK\out\rows_win.jsonl")) { exit 1 }
+          & "$env:GITHUB_WORKSPACE\k6p\win_tbo.ps1"
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\rows_wintbo.jsonl")) { exit 1 }
       - name: Stop leftover servers
         if: always()
         run: |
@@ -143,5 +148,49 @@ jobs:
         with:
           name: k6-windows-gpu
           path: ${{ env.AMD_CI_WORK }}\out
+          retention-days: 7
+          if-no-files-found: warn
+
+  hosted-mac:
+    name: "k6 macOS 15 arm64 Metal: async upload gated to the CUDA family (k6) vs forced on (k6a) vs release (hosted)"
+    runs-on: macos-15
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Source, build (release macOS flags)
+        run: |
+          set +e
+          BASE=ff5a23376725e5a889fa0bfb987b7541dc304da0
+          git init -q src_k6; git -C src_k6 remote add origin https://github.com/ggml-org/llama.cpp
+          git -C src_k6 fetch -q --depth 1 origin $BASE && git -C src_k6 checkout -q --detach $BASE || exit 1
+          gunzip -c k6p/k6.patch.gz > k6.patch; git -C src_k6 apply --whitespace=nowarn ../k6.patch || { echo "FATAL: patch"; exit 1; }
+          cmake -S src_k6 -B src_k6/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DLLAMA_OPENSSL=OFF > cfg_k6.log 2>&1 || { tail -30 cfg_k6.log; exit 1; }
+          cmake --build src_k6/build --config Release -j "$(sysctl -n hw.logicalcpu)" --target llama-server llama-perplexity > build_k6.log 2>&1
+          echo "build k6 rc=$?"; grep -E "error:" build_k6.log | head -20
+          test -x src_k6/build/bin/llama-server
+      - name: Metal cells and KLD vs release macos-arm64
+        run: |
+          set +e
+          R="$RUNNER_TEMP/k6p"; mkdir -p "$R/bins/rel" "$R/bins/k6" "$R/models" out
+          cp -a src_k6/build/bin/* "$R/bins/k6/"; echo "k6 $(cut -c1-10 k6p/K6_SHA) macos-arm64 metal" > "$R/bins/k6/TAG"
+          TAG=b11696-mix-7baeb9a
+          curl -fL --retry 5 -s -S "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama-$TAG-bin-macos-arm64.tar.gz" | tar xz -C "$R/bins/rel"
+          echo "$TAG macos-arm64" > "$R/bins/rel/TAG"
+          export K6P_DIR="$R" K6P_DEV=MTL0 KLD_CHUNKS=20 ARMS="rel:rel,rel2:rel,k6:k6,k6b:k6,k6a:k6:GGML_SCHED_ASYNC_UPLOAD=1"
+          B="python3 -u k6p/k6p_bench.py"
+          $B dl --models q35,lfm2 | grep -v '^ROW'
+          for c in q35:full lfm2:full; do $B time --cell $c --reps 2 | grep -v '^ROW'; done
+          $B kld --model q35 --modes full --arms rel,k6,k6a | grep KLD
+          $B kld --model lfm2 --modes full --arms rel,k6,k6a | grep KLD
+          cp "$R/out/rows.jsonl" out/rows_mac.jsonl; cp -r "$R/out/logs" out/logs; cp build_*.log out/ 2>/dev/null
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-mac
+          path: out
           retention-days: 7
           if-no-files-found: warn

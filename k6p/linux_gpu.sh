@@ -16,9 +16,13 @@ for n in k6 rs ub; do
   tar xzf "$W/art/bin_$n/bin_$n.tgz" -C "$R/bins" 2>/dev/null || tar xzf "$W/art/bin_$n.tgz" -C "$R/bins"
   mv "$R/bins/bin_$n" "$R/bins/$n"; echo "bin $n: $(cat "$R/bins/$n/TAG") $(ls "$R/bins/$n" | wc -l) files" | tee -a "$OUT/gpu_diag.txt"
 done
+# a bundle without libomp.so (TheRock 10.2.0a20261010 keeps it elsewhere): the release bundle's copy (LLVM OpenMP runtime)
+for n in k6 rs ub; do [ -e "$R/bins/$n/libomp.so" ] || { cp -L "$R/bins/rel/libomp.so" "$R/bins/$n/" && echo "libomp.so for $n from rel" | tee -a "$OUT/gpu_diag.txt"; }; done
 for n in rel k6; do ( cd "$R/bins/$n" && LD_LIBRARY_PATH=. ldd ./libggml-hip.so | grep -E "amdhip|rocblas|not found" ) | sed "s/^/$n: /" | tee -a "$OUT/gpu_diag.txt"; done
 wait $DLP; grep -v '^ROW' "$OUT/dl.log" | tail -5
 OPS=RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,RMS_NORM_MUL_ROPE,MUL_MAT_VEC_SHARED_SRC1,MUL_MAT_ID_FALLBACK_SHARED_SRC1,MUL_MAT_ID_SHARED,MUL_MAT_VEC_FUSION,MUL_MAT_ID_FUSION,HC_POST_NORM,EW_CHAIN,TOPK_MOE,TOP_K,GET_ROWS,SET_ROWS,CPY,MUL_MAT_ID,MUL_MAT
 python3 -u "$J/k6p_plan.py" "$OUT/plan" "$OPS"
+# MUL_MAT on the release source built with the same toolchain: tells a k6 failure from a toolchain / rocBLAS one
+[ -x "$R/bins/rs/test-backend-ops" ] && python3 -u "$J/k6p_bench.py" tbo --bin rs --ops MUL_MAT,MUL_MAT_ID --timeout 2400 > "$OUT/plan/tbo_rs.log" 2>&1; grep TBO "$OUT/plan/tbo_rs.log"
 cp "$R/out/rows.jsonl" "$OUT/rows_linux.jsonl"; mkdir -p "$OUT/logs"; cp "$R"/out/logs/*.filtered.log "$OUT/logs/" 2>/dev/null
 test -s "$OUT/rows_linux.jsonl"
