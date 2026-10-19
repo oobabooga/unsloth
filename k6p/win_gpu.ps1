@@ -14,7 +14,7 @@ Log "python $PY"
 Get-CimInstance Win32_ComputerSystem | ForEach-Object { Log "RAM $($_.TotalPhysicalMemory) procs $($_.NumberOfLogicalProcessors)" }
 Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) driver $($_.DriverVersion) AdapterRAM $($_.AdapterRAM)" }
 
-$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,rel2:rel,rs:rs,ub:ub,k6:k6,k6b:k6,k6nf:k6:GGML_CUDA_DISABLE_FUSION=1,k6x:k6:GGML_CUDA_DISABLE_FUSION=1;GGML_CUDA_DISABLE_NORM_Q8_1_FUSION=1;GGML_CUDA_DISABLE_PRODUCER_Q8_1=1;GGML_CUDA_DISABLE_Q8_1_CACHE=1;GGML_CUDA_DISABLE_Q8_1_RESHAPE=1;GGML_CUDA_DISABLE_SIDE_MATVEC=1;GGML_CUDA_DISABLE_GATE_MUL_FUSION=1;GGML_CUDA_DISABLE_EW_CHAIN=1;GGML_CUDA_DISABLE_ADD_UNARY_MUL_FUSION=1;GGML_CUDA_DISABLE_COPY_KERNEL=1"; $env:PYTHONIOENCODING = "utf-8"
+$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,rs:rs,ub:ub,k6:k6"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
   -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", "q35,lfm2,gptoss")
 
@@ -25,19 +25,23 @@ Log "release zip rc=$LASTEXITCODE"
 Expand-Archive -Force -Path "$R\rel.zip" -DestinationPath "$R\bins\rel"
 Set-Content -Encoding utf8 -Path "$R\bins\rel\TAG" -Value "$TAG windows-x64-rocm-gfx1151"
 
-# TheRock toolchain
+# TheRock toolchain: the dist tarball the release's weekly pin resolves to for b11696 (built 2026-10-16 -> cutoff 2026-10-10)
+$ROCM_VER = if ($env:ROCM_VER) { $env:ROCM_VER } else { "10.2.0a20261010" }
+$t0 = Get-Date
+& curl.exe -fL --retry 5 -s -S -o "$W\rocm.tar.gz" "https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-$ROCM_VER.tar.gz"
+Log "TheRock tarball rc=$LASTEXITCODE size $((Get-Item "$W\rocm.tar.gz").Length)"
+$ROCM = "$W\rocm"
+New-Item -ItemType Directory -Force -Path $ROCM | Out-Null
+tar.exe -xzf "$W\rocm.tar.gz" -C $ROCM --strip-components=1
+Remove-Item -Force "$W\rocm.tar.gz"
+Log "TheRock $ROCM_VER extracted in $([int]((Get-Date) - $t0).TotalSeconds) s to $ROCM"
 & $PY -m venv "$W\venv"
 $VP = "$W\venv\Scripts\python.exe"
-$t0 = Get-Date
-& $VP -m pip install -q --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ "rocm[libraries,devel]" *> "$OUT\therock_pip.log"
-if ($LASTEXITCODE -ne 0) { Get-Content "$OUT\therock_pip.log" -Tail 20; Write-Host "FATAL: TheRock pip"; exit 1 }
-& "$W\venv\Scripts\rocm-sdk.exe" init *> "$OUT\therock_init.log"
-$ROCM = (& "$W\venv\Scripts\rocm-sdk.exe" path --root).Trim()
-Log "TheRock $([int]((Get-Date) - $t0).TotalSeconds) s root $ROCM"
-& $VP -m pip list 2>$null | Select-String -Pattern "rocm" | ForEach-Object { Log "$_" }
 $CLANG = "$ROCM\lib\llvm\bin\clang.exe"; $CLANGXX = "$ROCM\lib\llvm\bin\clang++.exe"
 if (-not (Test-Path $CLANG)) { Write-Host "FATAL: no clang at $CLANG"; exit 1 }
-$vc = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+$vsp = (& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+$vc = if ($vsp) { "$vsp\VC\Auxiliary\Build\vcvars64.bat" } else { "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" }
+Log "vcvars $vc"
 cmd /c "`"$vc`" >nul 2>&1 && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2]) } }
 $env:HIP_PATH = $ROCM; $env:ROCM_PATH = $ROCM; $env:HIP_PLATFORM = "amd"
 $env:PATH = "$ROCM\bin;$ROCM\lib\llvm\bin;$env:PATH"
@@ -90,7 +94,7 @@ function Build-Tree($tree, $name, $tests) {
   }
   return $true
 }
-$TRV = (& $VP -m pip show rocm 2>$null | Select-String '^Version').ToString()
+$TRV = $ROCM_VER
 # ub = plain upstream b11721 (k6's upstream base), built from the checkout before the patch
 if (-not (Build-Tree $SRC "ub" $false)) { Write-Host "FATAL: ub build"; exit 1 }
 Set-Content -Encoding utf8 -Path "$R\bins\ub\TAG" -Value "upstream b11721 ff5a2337 hip gfx1151 TheRock $TRV"
@@ -111,21 +115,9 @@ Get-ChildItem -Recurse "$R\bins\rel" -Filter "amdhip64*.dll" | ForEach-Object { 
 Get-ChildItem "$R\bins\k6" -Filter "amdhip64*.dll" | ForEach-Object { Log "k6: $($_.Name) $($_.VersionInfo.FileVersion)" }
 
 $dl.WaitForExit()
-Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-Object { -not $_.StartsWith("ROW") }
-function Bench($argv, $logname) {
-  & $PY -u "$J\k6p_bench.py" @argv *> "$OUT\$logname"
-  Write-Host "$logname rc=$LASTEXITCODE"
-  Get-Content "$OUT\$logname" | Where-Object { -not $_.StartsWith("ROW") } | Select-Object -Last 14
-}
-Bench @("devinfo") "devinfo.log"
-foreach ($c in @("q35:full", "lfm2:full", "lfm2:spill1536", "gptoss:full", "gptoss:spill6144")) {
-  Bench @("time", "--cell", $c, "--reps", "3") "time_$($c.Replace(':','_')).log"
-}
-Bench @("kld", "--model", "q35", "--modes", "full", "--arms", "rel,rel2,rs,ub,k6,k6nf,k6x") "kld_q35.log"
-Bench @("kld", "--model", "lfm2", "--modes", "full,spill1536", "--arms", "rel,rel2,rs,ub,k6,k6nf,k6x") "kld_lfm2.log"
-Bench @("kld", "--model", "gptoss", "--modes", "full,spill6144", "--arms", "rel,rel2,rs,ub,k6") "kld_gptoss.log"
-$OPS = "RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,RMS_NORM_MUL_ROPE,MUL_MAT_VEC_SHARED_SRC1,MUL_MAT_ID_FALLBACK_SHARED_SRC1,MUL_MAT_ID_SHARED,MUL_MAT_VEC_FUSION,MUL_MAT_ID_FUSION,HC_POST_NORM,EW_CHAIN,TOPK_MOE,TOP_K,GET_ROWS,SET_ROWS,CPY,MUL_MAT_ID"
-Bench @("tbo", "--bin", "k6", "--ops", $OPS, "--timeout", "2400") "tbo.log"
+Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-Object { -not $_.StartsWith("ROW") } | Select-Object -Last 5
+$OPS = "RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,RMS_NORM_MUL_ROPE,MUL_MAT_VEC_SHARED_SRC1,MUL_MAT_ID_FALLBACK_SHARED_SRC1,MUL_MAT_ID_SHARED,MUL_MAT_VEC_FUSION,MUL_MAT_ID_FUSION,HC_POST_NORM,EW_CHAIN,TOPK_MOE,TOP_K,GET_ROWS,SET_ROWS,CPY,MUL_MAT_ID,MUL_MAT"
+& $PY -u "$J\k6p_plan.py" "$OUT\plan" $OPS
 Copy-Item "$R\out\rows.jsonl" "$OUT\rows_win.jsonl" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path "$OUT\logs" | Out-Null
 Copy-Item "$R\out\logs\*.filtered.log" "$OUT\logs\" -ErrorAction SilentlyContinue

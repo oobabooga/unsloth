@@ -1,23 +1,99 @@
-name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix (gfx1151 Linux + Windows, hosted Windows CUDA/CPU, macOS Metal)"
+name: "AMD CI: llama.cpp moe-combined-k6 vs release b11696-mix, gfx1151 Linux + Windows, same-toolchain controls (run 4)"
 
-# k6 = upstream ggml-org b11721 (ff5a2337) + k6p/k6.patch.gz (moe-combined-k6 tip 901101c06c + the two platform fixes of
-# k6-amd, k6p/K6_SHA); k6u = the unfixed tip (k6p/k6base.patch.gz), macOS only, as the base arm of the Metal fix. Release = the published
-# b11696-mix-7baeb9a bundle for each platform. Arms rel / rel2 (release twice, A/A) and k6 / k6b (k6 twice, A/A), rotated per rep.
-# Derived from the r273 / hipgather llama.cpp workflows (amd_ci/templates/workflow.yml + workflow_windows.yml plumbing).
-#   linux-build    builds k6 for gfx1151 with the release's flags, GPU masked, no group (it measures nothing)
-#   gpu-linux      the only Linux job that allocates; holds the shared GPU group
-#   gpu-windows    builds (TheRock) and measures on a Windows 11 box; holds the shared GPU group
-#   hosted-*       GitHub-hosted: Windows CUDA build (no GPU), Windows CPU build + CPU correctness, macOS 15 Metal build + run
+# k6 = upstream ggml-org b11721 (ff5a2337) + k6p/k6.patch.gz (moe-combined-k6 tip 901101c06c + the two platform fixes, k6p/K6_SHA).
+# Every build uses the release's own recipe and its weekly TheRock pin (10.2.0a20261010): Linux on GitHub-hosted ubuntu-22.04
+# (the self-hosted Linux build ran > 100 min for one tree), Windows on the strix-halo box from the Windows dist tarball.
+# Arms: rel / rel2 = the published bundle (A/A), rs = the release's source tarball built here (same toolchain as k6), ub = plain
+# upstream b11721, k6 / k6b (A/A), k6nf (fusions off), spill-only kill-switch arms. Matrix: k6p/k6p_plan.py.
 
 on:
   push:
-    branches: [amd-ci-llama-k6r3w]
+    branches: [amd-ci-llama-k6r4]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+
+  hosted-linux-build:
+    name: "Linux HIP gfx1151 build ${{ matrix.n }} (hosted ubuntu-22.04, release recipe)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [k6, rs, ub]
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
+      - name: Build
+        run: |
+          bash k6p/hosted_linux_build.sh ${{ matrix.n }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin_${{ matrix.n }}
+          path: ${{ runner.temp }}/art
+          retention-days: 3
+          if-no-files-found: error
+
+  gpu-linux:
+    name: "k6 vs release, Linux ROCm gfx1151 (exclusive)"
+    needs: hosted-linux-build
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k6-linux-gpu"
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_k6
+          path: ${{ env.AMD_CI_WORK }}/art/bin_k6
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_rs
+          path: ${{ env.AMD_CI_WORK }}/art/bin_rs
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_ub
+          path: ${{ env.AMD_CI_WORK }}/art/bin_ub
+      - name: Cells, KLD, test-backend-ops
+        timeout-minutes: 310
+        run: |
+          set +e
+          bash k6p/linux_gpu.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/rows_linux.jsonl"
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x llama-perplexit; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
+          echo "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-linux-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
 
   linux-control:
     name: "linux control (selector diagnosis)"
@@ -32,7 +108,6 @@ jobs:
           set +e
           echo "machine: $(uname -n)"
           echo "If this job runs and the windows job stays queued, the Windows selector matched no runner."
-
 
   gpu-windows:
     name: "k6 vs release, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
@@ -50,7 +125,7 @@ jobs:
       - name: Preamble
         run: |
           .\amd_ci\lib\preamble.ps1 -Name "k6-windows"
-      - name: Build k6 with TheRock, cells, KLD, test-backend-ops
+      - name: Build ub / k6 / rs with the release's TheRock, cells, KLD, test-backend-ops
         timeout-minutes: 320
         run: |
           $ErrorActionPreference = "Continue"
@@ -70,4 +145,3 @@ jobs:
           path: ${{ env.AMD_CI_WORK }}\out
           retention-days: 7
           if-no-files-found: warn
-

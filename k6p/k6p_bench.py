@@ -290,18 +290,25 @@ def prompt_tokens(port, model):
         return json.load(fh)
 
 
-def mode_flags(model, mode, target):
-    moe = MODELS[model][4]
+def mode_flags(model, mode, target, arm=None):
+    """mode[_ubN]: full / spillN / cpu, _ubN appends -ub N. Arm keys (ARMS third field): K6P_NO_MOE=1 drops --moe-cache-mib (plain
+    upstream does not know it), K6P_ARGS="..." appends arguments (e.g. -ub 4096)."""
+    moe = MODELS[model][4] and not ARM_ENV.get(arm, {}).get("K6P_NO_MOE")
+    ub = None
+    if "_ub" in mode:
+        mode, ub = mode.split("_ub")
     f = []
     if mode == "cpu":
         f += ["-ngl", "0"]
     else:
         f += ["--fit", "on"]
-        if mode.startswith("spill"):
+        if mode.startswith("spill") and target is not None:
             f += ["--fit-target", str(target)]
     if moe and mode != "cpu":
         f += ["--moe-cache-mib", "auto"]
-    return f + os.environ.get("K6P_EXTRA", "").split()
+    if ub:
+        f += ["-ub", ub]
+    return f + os.environ.get("K6P_EXTRA", "").split() + ARM_ENV.get(arm, {}).get("K6P_ARGS", "").split()
 
 
 def kill(p):
@@ -335,7 +342,7 @@ def run_server(arm, model, mode, target, tag):
     port = PORT[0]
     lp = os.path.join(LOGS, tag + ".log")
     argv = [binp(arm, "llama-server"), "-m", mpath(model), "-c", "8192", "-fa", "on", "-np", "1", "--host", "127.0.0.1",
-            "--port", str(port), "-lv", "4"] + mode_flags(model, mode, target)
+            "--port", str(port), "-lv", "4"] + mode_flags(model, mode, target, arm)
     fh = open(lp, "w", encoding="utf-8")
     fh.write("CMD %s\n" % " ".join(argv))
     fh.flush()
@@ -398,7 +405,7 @@ def cell_target(model, mode, arm):
     builds' HIP runtimes report different free memory (run 2 Windows: release 100414 MiB vs TheRock 7.14 build 78471 MiB)"""
     if not mode.startswith("spill"):
         return None, None
-    budget = int(mode[5:])
+    budget = int(mode[5:].split("_")[0])
     key = (BINS[arm], tuple(sorted(ARM_ENV.get(arm, {}).items())))
     if key not in _TGT:
         _TGT[key] = dev_free(arm)
@@ -449,7 +456,7 @@ def do_kld():
         target, budget = cell_target(model, mode, arm)
         lp = os.path.join(LOGS, "kld_%s_%s_%s.log" % (model, mode, arm))
         argv = [binp(arm, "llama-perplexity"), "-m", mpath(model), "-f", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wiki.test.raw"),
-                "-c", "512", "--chunks", str(a.chunks), "-fa", "on"] + mode_flags(model, mode, target) + ["--kl-divergence-base", f] + \
+                "-c", "512", "--chunks", str(a.chunks), "-fa", "on"] + mode_flags(model, mode, target, arm) + ["--kl-divergence-base", f] + \
                ([] if is_ref else ["--kl-divergence"])
         t = time.time()
         with open(lp, "w", encoding="utf-8") as fh:
