@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 1910"
 
 on:
   push:
-    branches: [amd-ci-pr1910]
+    branches: [amd-ci-zoo1910]
   workflow_dispatch:
 
 permissions:
