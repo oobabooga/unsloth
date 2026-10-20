@@ -104,7 +104,7 @@ for arm, specs in ARMS.items():
         rc = subprocess.run([uv, "venv", "--no-config", "--python", "3.12", "--seed", v], stdout = lf, stderr = subprocess.STDOUT).returncode
         py = os.path.join(v, "bin", "python")
         rc = rc or subprocess.run([uv, "pip", "install", "--no-config", "--python", py, *specs, "--default-index", IDX], stdout = lf, stderr = subprocess.STDOUT).returncode
-        rc = rc or subprocess.run([uv, "pip", "install", "--no-config", "--python", py, f"unsloth @ {UNSLOTH}", f"unsloth_zoo @ {ZOO}", "--override", ov, "--default-index", "https://pypi.org/simple"], stdout = lf, stderr = subprocess.STDOUT).returncode
+        rc = rc or subprocess.run([uv, "pip", "install", "--no-config", "--python", py, f"unsloth[amd] @ {UNSLOTH}", f"unsloth_zoo @ {ZOO}", "--override", ov, "--default-index", "https://pypi.org/simple"], stdout = lf, stderr = subprocess.STDOUT).returncode
     res["install"][arm] = rc
     pys[arm] = py
 def gpu_procs():
