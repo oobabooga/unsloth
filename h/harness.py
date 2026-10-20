@@ -343,23 +343,83 @@ def nav_click(page, label):
 
 
 def hover_hint(page, label):
-    btn = page.locator('[data-sidebar="menu-button"]').filter(has_text=re.compile(rf"^\s*{label}\b", re.I)).first
-    if btn.count() == 0:
-        return None
-    btn.hover(timeout=10000)
-    time.sleep(2)
-    tips = page.locator('[role="tooltip"], [data-radix-popper-content-wrapper]')
-    texts = []
-    for i in range(tips.count()):
-        try:
-            t = tips.nth(i).inner_text().strip()
-            if t:
-                texts.append(t)
-        except Exception:
-            pass
-    shot(page, f"hover-{label.lower()}")
-    page.mouse.move(5, 5)
-    return texts
+    """Move the mouse over a sidebar row like a user and read any tooltip. Never raises."""
+    try:
+        btn = page.locator('[data-sidebar="menu-button"]').filter(has_text=re.compile(rf"^\s*{label}\b", re.I)).first
+        if btn.count() == 0:
+            return None
+        btn.scroll_into_view_if_needed(timeout=5000)
+        box = btn.bounding_box()
+        page.mouse.move(5, 5)
+        time.sleep(0.3)
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=5)
+        time.sleep(2)
+        tips = page.locator('[role="tooltip"], [data-slot="tooltip-content"]')
+        texts = []
+        for i in range(tips.count()):
+            try:
+                t = tips.nth(i).inner_text().strip()
+                if t and t not in texts:
+                    texts.append(t)
+            except Exception:
+                pass
+        shot(page, f"hover-{label.lower()}")
+        page.mouse.move(5, 5)
+        return texts
+    except Exception as e:
+        return f"err {str(e)[:300]}"
+
+
+def more_menu(page):
+    """Open the sidebar 'More' row and list what it offers."""
+    try:
+        if not nav_click(page, "More"):
+            return None
+        time.sleep(1.5)
+        shot(page, "more-menu")
+        items = page.evaluate(
+            """() => Array.from(document.querySelectorAll('[role="menuitem"], [data-radix-popper-content-wrapper] [data-sidebar="menu-button"], [data-radix-popper-content-wrapper] a, [data-radix-popper-content-wrapper] button')).map(b => ({
+                text: (b.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80),
+                disabled: b.getAttribute('aria-disabled') || b.getAttribute('data-disabled') || (b.disabled ? 'true' : null),
+            })).filter(x => x.text)"""
+        )
+        dismiss_overlays(page)
+        return items
+    except Exception as e:
+        dismiss_overlays(page)
+        return f"err {str(e)[:300]}"
+
+
+def more_item_page(page, label):
+    try:
+        nav_click(page, "More")
+        time.sleep(1.2)
+        item = page.get_by_role("menuitem", name=re.compile(rf"^\s*{label}", re.I))
+        if item.count() == 0:
+            item = page.locator("[data-radix-popper-content-wrapper]").get_by_text(re.compile(rf"^\s*{label}", re.I))
+        if item.count() == 0:
+            dismiss_overlays(page)
+            return "not in More"
+        disabled = item.first.get_attribute("aria-disabled") or item.first.get_attribute("data-disabled")
+        # Hover first so a disabled item's tooltip is captured.
+        b = item.first.bounding_box()
+        if b:
+            page.mouse.move(b["x"] + b["width"] / 2, b["y"] + b["height"] / 2, steps=4)
+            time.sleep(1.5)
+        tips = [page.locator('[role="tooltip"]').nth(i).inner_text().strip() for i in range(page.locator('[role="tooltip"]').count())]
+        shot(page, f"more-hover-{label.lower()}")
+        if disabled:
+            dismiss_overlays(page)
+            return {"disabled": disabled, "tooltips": tips}
+        item.first.click(timeout=5000)
+        time.sleep(4)
+        res = {"disabled": disabled, "tooltips": tips, "url": page.url, "text": body_text(page, 1200)}
+        shot(page, f"page-{label.lower()}")
+        dismiss_overlays(page)
+        return res
+    except Exception as e:
+        dismiss_overlays(page)
+        return f"err {str(e)[:300]}"
 
 
 def open_settings(page):
@@ -435,26 +495,41 @@ def find_repair_row(page):
 def check_all_pages(page):
     inv = sidebar_inventory(page)
     rec("sidebar", inv)
-    hints = {}
-    for label in ["Train", "Video", "Images", "Audio", "Export", "Recipes", "Data"]:
-        try:
-            hints[label] = hover_hint(page, label)
-        except Exception as e:
-            hints[label] = f"err {e}"
-    rec("hover_hints", hints)
+    rec("hover_hints", {label: hover_hint(page, label) for label in ["Train", "Images"]})
+    rec("more_menu", more_menu(page))
+    rec("more_pages", {label: more_item_page(page, label) for label in ["Video", "Audio", "Recipes", "Data", "Export", "API", "Projects"]})
     pages = {}
-    for label in ["Hub", "Images", "Train", "Video", "Audio", "Recipes", "Data", "Export", "API", "Library", "Projects"]:
+    for label in ["Model hub", "Images", "Library"]:
         try:
-            ok = nav_click(page, label)
-            if not ok:
+            if not nav_click(page, label):
                 pages[label] = "no nav item"
                 continue
-            time.sleep(2)
-            pages[label] = {"url": page.url, "text": body_text(page, 900)}
-            shot(page, f"page-{label.lower()}")
+            time.sleep(3)
+            pages[label] = {"url": page.url, "text": body_text(page, 1500)}
+            shot(page, f"page-{label.lower().replace(' ', '-')}")
             dismiss_overlays(page)
         except Exception as e:
-            pages[label] = f"err {e}"
+            pages[label] = f"err {str(e)[:300]}"
+    # Hub search: does a chat-only install offer models it cannot run?
+    try:
+        nav_click(page, "Model hub")
+        time.sleep(3)
+        box = page.locator('input[type="search"], input[placeholder*="Search" i]').first
+        box.click()
+        box.fill("Qwen3-0.6B")
+        page.keyboard.press("Enter")
+        time.sleep(8)
+        pages["hub_search_Qwen3-0.6B"] = body_text(page, 2500)
+        shot(page, "hub-search-qwen3-0.6b")
+        rows = page.locator("a, [role='row'], [data-hub-model-card], [data-testid*='model']").filter(has_text=re.compile(r"^Qwen/Qwen3-0\.6B$|Qwen3-0\.6B$", re.I))
+        if rows.count():
+            rows.first.click()
+            time.sleep(5)
+            pages["hub_model_safetensors"] = body_text(page, 2500)
+            shot(page, "hub-safetensors-model")
+        dismiss_overlays(page)
+    except Exception as e:
+        pages["hub_search"] = f"err {str(e)[:300]}"
     rec("pages", pages)
 
 
@@ -497,14 +572,15 @@ def load_model_via_ui(page, port, token):
     target.click()
     time.sleep(4)
     shot(page, "picker-after-click")
-    # A quant list may open; prefer Q8_0 then Q4_K_M.
-    for q in ["Q8_0", "Q4_K_M", "Q4_0"]:
-        cand = page.locator("[data-model-picker-option]").filter(has_text=re.compile(rf"\b{q}\b"))
+    # The row expands into a quantization list; pick Q8_0 like a user would.
+    for q in ["Q8_0", "Q4_K_M"]:
+        cand = pop.get_by_text(q, exact=True)
         if visible(cand):
             cand.first.click()
             log(f"picked quant {q}")
             time.sleep(3)
             break
+    rec("picker_after_quant_text", body_text(page, 1500))
     shot(page, "picker-after-quant")
     # Accept any download / load confirmation.
     for name in ["Download", "Download and load", "Load", "Continue"]:
@@ -513,8 +589,13 @@ def load_model_via_ui(page, port, token):
             b.first.click()
             log(f"clicked {name}")
             time.sleep(2)
-    end = time.time() + 900
+    end = time.time() + 600
+    n = 0
     while time.time() < end:
+        n += 1
+        if n % 6 == 1:
+            log("load screen: " + body_text(page, 400))
+            shot(page, f"model-loading-{n:03d}")
         st, body = api(port, "/api/inference/status", token)
         if st == 200 and isinstance(body, dict) and body.get("active_model"):
             rec("ui_loaded_model", {k: body.get(k) for k in ("active_model", "backend", "gguf_variant", "is_gguf") if k in body})
