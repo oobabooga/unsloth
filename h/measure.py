@@ -32,6 +32,10 @@ if root.exists():
     res["children"] = {}
     for c in sorted(root.iterdir()):
         res["children"][c.name] = gb(size(c)) if c.is_dir() else gb(c.stat().st_size)
+    for sub in ["cache", "llama.cpp", "python"]:
+        d = root / sub
+        if d.is_dir():
+            res[f"{sub}_children_gb"] = {c.name: gb(size(c)) if c.is_dir() else gb(c.stat().st_size) for c in d.iterdir()}
     venv = root / "unsloth_studio"
     sp = venv / "Lib" / "site-packages"
     if sp.exists():

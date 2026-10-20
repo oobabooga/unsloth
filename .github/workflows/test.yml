@@ -124,6 +124,7 @@ jobs:
 
       - name: "Phase 3: break the venv, let startup auto-repair fix it"
         run: |
+          $ErrorActionPreference = 'Continue'
           . "$env:H_W\h\h\session1.ps1"
           $sp = "$env:H_ROOT\unsloth_studio\Lib\site-packages"
           # Corrupt the install: the local checkout is an editable overlay, so hide its import hook.
