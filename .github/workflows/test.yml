@@ -64,7 +64,10 @@ jobs:
           $src = "$env:H_B\src"
           $exe = "$env:H_B\target\debug\unsloth-studio.exe"
           $stamp = "$env:H_B\built-sha.txt"
-          if ((Test-Path $exe) -and (Test-Path $stamp) -and ((Get-Content $stamp) -eq $env:SRC_SHA)) { Write-Host "cached build"; exit 0 }
+          $want = "$env:SRC_SHA-cdp"
+          if ((Test-Path $exe) -and (Test-Path $stamp) -and ((Get-Content $stamp) -eq $want)) { Write-Host "cached build"; exit 0 }
+          git -C $src checkout -- studio/src-tauri/tauri.conf.json
+          python "$env:H_W\h\h\patch_conf.py" "$src\studio\src-tauri\tauri.conf.json"
           Push-Location "$src\studio\frontend"
           npm ci --no-fund --no-audit 2>&1 | Select-Object -Last 5
           npm run build 2>&1 | Select-Object -Last 15
@@ -79,7 +82,7 @@ jobs:
           rustc --version
           cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 25
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
-          Set-Content $stamp $env:SRC_SHA
+          Set-Content $stamp $want
           Get-Item $exe | Select-Object FullName,Length
           exit 0
 

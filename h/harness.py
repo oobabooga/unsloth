@@ -590,6 +590,8 @@ def phase_firstrun(pw, root_hint):
         page = main_page(browser)
         page.set_default_timeout(20000)
         log(f"page url {page.url}")
+        # The console is 640x480; render the first-run screen at the app's real 760x560.
+        page.set_viewport_size({"width": 760, "height": 560})
         page.get_by_role("button", name="Get Started").wait_for(state="visible", timeout=120000)
         time.sleep(2)
         shot(page, "01-first-run")
@@ -644,6 +646,7 @@ def phase_firstrun(pw, root_hint):
         shot(page, "05-after-install")
         if not ok:
             return
+        page.set_viewport_size({"width": 1440, "height": 900})
         time.sleep(10)
         dismiss_overlays(page)
         shot(page, "06-home")
@@ -693,6 +696,7 @@ def phase_relaunch(pw, root_hint, label):
         browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
         page = main_page(browser)
         page.set_default_timeout(20000)
+        page.set_viewport_size({"width": 1440, "height": 900})
         t = time.time()
         ok = wait_ready(page, 60 * 45, label)
         rec("ready", ok)
