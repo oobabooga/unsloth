@@ -63,7 +63,79 @@ def body_text(page, limit=1500):
         return f"<err {e}>"
 
 
+def prepare_desktop():
+    """Bigger console resolution, and close the Windows 'Get Started' app that sits on top."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DEVMODE(ctypes.Structure):
+        _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD), ("dmDriverVersion", wintypes.WORD),
+                    ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD), ("dmFields", wintypes.DWORD),
+                    ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long), ("dmDisplayOrientation", wintypes.DWORD),
+                    ("dmDisplayFixedOutput", wintypes.DWORD), ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
+                    ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", wintypes.WCHAR * 32), ("dmLogPixels", wintypes.WORD), ("dmBitsPerPel", wintypes.DWORD),
+                    ("dmPelsWidth", wintypes.DWORD), ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD), ("dmICMIntent", wintypes.DWORD),
+                    ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD), ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD), ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD)]
+
+    try:
+        u = ctypes.windll.user32
+        modes = []
+        i = 0
+        while True:
+            dm = DEVMODE()
+            dm.dmSize = ctypes.sizeof(DEVMODE)
+            if not u.EnumDisplaySettingsW(None, i, ctypes.byref(dm)):
+                break
+            modes.append((dm.dmPelsWidth, dm.dmPelsHeight))
+            i += 1
+        cur = DEVMODE()
+        cur.dmSize = ctypes.sizeof(DEVMODE)
+        u.EnumDisplaySettingsW(None, -1, ctypes.byref(cur))
+        log(f"display now {cur.dmPelsWidth}x{cur.dmPelsHeight}; modes {sorted(set(modes))[-8:]}")
+        good = [m for m in set(modes) if m[0] <= 1920 and m[1] <= 1200]
+        if good:
+            w, h = max(good, key=lambda m: m[0] * m[1])
+            cur.dmPelsWidth, cur.dmPelsHeight = w, h
+            cur.dmFields = 0x80000 | 0x100000
+            rc = u.ChangeDisplaySettingsW(ctypes.byref(cur), 0)
+            log(f"ChangeDisplaySettings {w}x{h} -> {rc}")
+    except Exception as e:
+        log(f"resolution change failed: {e}")
+    try:
+        from pywinauto import Desktop
+
+        for w in Desktop(backend="uia").windows():
+            try:
+                if w.window_text() == "Get Started" and "unsloth" not in w.element_info.process_id.__str__():
+                    pid = w.element_info.process_id
+                    name = subprocess.run(["powershell", "-NoProfile", "-Command", f"(Get-Process -Id {pid}).Name"], capture_output=True, text=True).stdout.strip()
+                    if "unsloth" not in name.lower():
+                        w.close()
+                        log(f"closed Windows window 'Get Started' ({name})")
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"window cleanup failed: {e}")
+
+
+def webview_diag():
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | Where-Object { $_.CommandLine -notmatch '--type=' } | ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.CommandLine.Substring(0, [Math]::Min(700, $_.CommandLine.Length)) }; "
+         "Get-NetTCPConnection -State Listen | Where-Object { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name -eq 'msedgewebview2' } | ForEach-Object { 'listen ' + $_.LocalAddress + ':' + $_.LocalPort }"],
+        capture_output=True, text=True,
+    ).stdout
+    log("webview diag:\n" + out)
+
+
 def launch_app():
+    # Policy route too: some WebView2 builds ignore the env var when the host passes its own args.
+    exe_name = Path(APP).name
+    subprocess.run(["reg", "add", r"HKCU\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments",
+                    "/v", exe_name, "/t", "REG_SZ", "/d", f"--remote-debugging-port={CDP_PORT}", "/f"], capture_output=True)
     env = dict(os.environ)
     env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"--remote-debugging-port={CDP_PORT}"
     for k in list(env):
@@ -83,6 +155,8 @@ def wait_cdp(timeout=180):
                 return json.loads(r.read())
         except Exception:
             time.sleep(1)
+    webview_diag()
+    desktop_shot("no-cdp")
     raise RuntimeError("CDP endpoint never came up")
 
 
@@ -735,6 +809,7 @@ def main():
     from playwright.sync_api import sync_playwright
 
     root = os.environ.get("H_ROOT", "")
+    prepare_desktop()
     try:
         with sync_playwright() as pw:
             if PHASE == "firstrun":

@@ -123,6 +123,7 @@ jobs:
         run: |
           . "$env:H_W\h\h\session1.ps1"
           $sp = "$env:H_ROOT\unsloth_studio\Lib\site-packages"
+          if (-not (Test-Path "$sp\unsloth_cli")) { Write-Host "::error::no install to break"; exit 0 }
           Rename-Item -LiteralPath "$sp\unsloth_cli" -NewName "unsloth_cli.broken-by-test"
           Write-Host "renamed unsloth_cli"
           $rc = Invoke-InSession1 -Name autorepair -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" autorepair" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
@@ -191,4 +192,5 @@ jobs:
             if ((Test-Path -LiteralPath $to) -and -not (Test-Path -LiteralPath $from)) { Rename-Item -LiteralPath $to -NewName (Split-Path $from -Leaf); Write-Host "restored $from" }
           }
           Remove-Item -LiteralPath $env:H_W -Recurse -Force -ErrorAction SilentlyContinue
+          reg delete "HKCU\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments" /v unsloth-studio.exe /f 2>$null
           exit 0
