@@ -99,65 +99,33 @@ jobs:
           & "$env:H_W\hv\Scripts\python.exe" -c "import playwright, pywinauto, PIL; print('ok')"
           exit 0
 
-      - name: "Phase 1: first run, custom location, Chat only, explore UI, load model, chat"
+      - name: "Run 9 A: default location, Chat only"
         run: |
           . "$env:H_W\h\h\session1.ps1"
-          $pick = "$env:H_W\My Apps"
-          New-Item -ItemType Directory -Force -Path $pick | Out-Null
-          $root = "$pick\Unsloth\studio"
-          "H_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $rc = Invoke-InSession1 -Name firstrun -TimeoutMin 75 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" firstrun" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_PICK = $pick; H_ROOT = $root }
-          Get-ChildItem "$env:USERPROFILE\.unsloth" -Force -ErrorAction SilentlyContinue | Format-Table Name,Length
-          Get-Content "$env:USERPROFILE\.unsloth\desktop_studio_home" -ErrorAction SilentlyContinue
+          $uvBefore = (Get-ChildItem "$env:LOCALAPPDATA\uv" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          "UV_BEFORE=$uvBefore" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $root = "$env:USERPROFILE\.unsloth\studio"
+          $rc = Invoke-InSession1 -Name defaultchat -TimeoutMin 40 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" firstrun" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = "$env:H_ART\A"; H_PICK = ""; H_ROOT = $root; H_EXPLORE = "0" }
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" $root "A-default-chat-only" "$env:H_ART"
+          $uvAfter = (Get-ChildItem "$env:LOCALAPPDATA\uv" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          Write-Host ("LOCALAPPDATA\uv grew by {0:N3} GB" -f (($uvAfter - $uvBefore) / 1GB))
+          Get-ChildItem "$root\cache" -ErrorAction SilentlyContinue | Format-Table Name
+          Get-Content "$root\cache\uv-cache-dir" -ErrorAction SilentlyContinue
           exit 0
 
-      - name: Measure after chat-only install
-        run: |
-          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "1-chat-only" "$env:H_ART"
-          exit 0
-
-      - name: "Phase 2: Desktop backend update (start_backend_update), relaunch"
-        run: |
-          . "$env:H_W\h\h\session1.ps1"
-          $rc = Invoke-InSession1 -Name update -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" update" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
-          exit 0
-
-      - name: Measure after update
-        run: |
-          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "2-after-update" "$env:H_ART"
-          exit 0
-
-      - name: "Phase 3: break the venv, let startup auto-repair fix it"
+      - name: "Run 9 B: custom location, default (full) install"
         run: |
           $ErrorActionPreference = 'Continue'
           . "$env:H_W\h\h\session1.ps1"
-          $sp = "$env:H_ROOT\unsloth_studio\Lib\site-packages"
-          # Corrupt the install: the local checkout is an editable overlay, so hide its import hook.
-          if (Test-Path "$sp\unsloth_cli") { Rename-Item -LiteralPath "$sp\unsloth_cli" -NewName "unsloth_cli.broken-by-test"; Write-Host "renamed unsloth_cli (wheel install)" ; $hooks = @('dir') }
-          else { $hooks = @(Get-ChildItem $sp -File | Where-Object { $_.Name -match '^(__editable__.*unsloth-2|_unsloth.*editable)' -and $_.Name -notmatch 'zoo' })
-          if (-not $hooks) { $hooks = @(Get-ChildItem $sp -File -Filter '*.pth' | Where-Object { (Get-Content $_.FullName -Raw) -match 'unsloth' -and $_.Name -notmatch 'zoo' }) }
-          $hooks | Format-Table Name
-          if (-not $hooks) { Write-Host "::error::no unsloth import hook found to break"; exit 0 }
-          foreach ($h in $hooks) { Rename-Item -LiteralPath $h.FullName -NewName ($h.Name + '.broken-by-test') } }
-          & "$env:H_ROOT\unsloth_studio\Scripts\python.exe" -c "import unsloth_cli" 2>&1 | Select-Object -Last 1
-          $rc = Invoke-InSession1 -Name autorepair -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" autorepair" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
-          Get-ChildItem $sp -Directory | Where-Object Name -match 'unsloth_cli' | Format-Table Name
-          exit 0
-
-      - name: Measure after auto-repair
-        run: |
-          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "3-after-autorepair" "$env:H_ART"
-          exit 0
-
-      - name: "Phase 4: upgrade to full from Settings > Repair installation"
-        run: |
-          . "$env:H_W\h\h\session1.ps1"
-          $rc = Invoke-InSession1 -Name upgrade -TimeoutMin 90 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" upgrade" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
-          exit 0
-
-      - name: Measure after upgrade
-        run: |
-          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "4-after-upgrade" "$env:H_ART"
+          taskkill /F /T /IM unsloth-studio.exe 2>$null
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '\.unsloth' -and $_.Name -match 'python|llama' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Start-Sleep 5
+          Remove-Item -LiteralPath "$env:USERPROFILE\.unsloth" -Recurse -Force -ErrorAction SilentlyContinue
+          $pick = "$env:H_W\Full Root"
+          New-Item -ItemType Directory -Force -Path $pick | Out-Null
+          $root = "$pick\Unsloth\studio"
+          $rc = Invoke-InSession1 -Name defaultfull -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" firstrun" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = "$env:H_ART\B"; H_PICK = $pick; H_ROOT = $root; H_CHAT_ONLY = "0"; H_EXPLORE = "0" }
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" $root "B-full-install" "$env:H_ART"
           exit 0
 
       - name: Collect logs

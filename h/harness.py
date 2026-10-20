@@ -731,7 +731,8 @@ def phase_firstrun(pw, root_hint):
                 rec("location_text_after_pick", body_text(page))
                 shot(page, "02-location-picked")
         # Tick Chat only by clicking its label, like a user.
-        page.get_by_text("Chat only (GGUF): smaller install, no training").click()
+        if os.environ.get("H_CHAT_ONLY", "1") == "1":
+            page.get_by_text("Chat only (GGUF): smaller install, no training").click()
         time.sleep(0.5)
         rec("checkbox_after_click", cb.get_attribute("data-state") or cb.get_attribute("aria-checked"))
         shot(page, "03-chat-only-ticked")
@@ -761,6 +762,10 @@ def phase_firstrun(pw, root_hint):
         rec("backend_port", port)
         if port:
             health_summary(port)
+        if os.environ.get("H_EXPLORE", "1") != "1":
+            rec("sidebar", sidebar_inventory(page))
+            rec("train_hint", hover_hint(page, "Train"))
+            return
         check_all_pages(page)
         token = api_login(port, root_hint) if port else None
         rec("have_token", bool(token))
