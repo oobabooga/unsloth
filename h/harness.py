@@ -160,20 +160,35 @@ def wait_cdp(timeout=180):
     raise RuntimeError("CDP endpoint never came up")
 
 
-def main_page(browser, timeout=120):
+def page_targets():
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=3) as r:
+            return [t for t in json.loads(r.read()) if t.get("type") == "page"]
+    except Exception:
+        return []
+
+
+def attach(pw, timeout=180):
+    """Connect once WebView2 lists a page target; reconnect until Playwright sees it."""
     end = time.time() + timeout
-    while time.time() < end:
-        pages = [p for c in browser.contexts for p in c.pages]
-        for p in pages:
-            if "tauri.localhost" in p.url or p.url.startswith("tauri://"):
-                return p
-        if pages and time.time() > end - timeout / 2:
-            log(f"no tauri page yet; pages: {[p.url for p in pages]}")
+    while time.time() < end and not page_targets():
         time.sleep(1)
-    pages = [p for c in browser.contexts for p in c.pages]
-    if pages:
-        return pages[0]
-    raise RuntimeError("no page")
+    log(f"page targets: {[(t.get('url'), t.get('title')) for t in page_targets()]}")
+    for attempt in range(8):
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+        for _ in range(20):
+            pages = [p for c in browser.contexts for p in c.pages]
+            if pages:
+                pick = next((p for p in pages if "tauri.localhost" in p.url), pages[0])
+                log(f"attached on attempt {attempt}: {[p.url for p in pages]}")
+                return browser, pick
+            time.sleep(1)
+        try:
+            browser.close()
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError("no page after reconnects")
 
 
 def kill_app(proc):
@@ -212,6 +227,10 @@ def wait_ready(page, timeout_s, label):
             last = txt
         if n % 6 == 0:
             shot(page, f"{label}-progress-{n:03d}")
+        if label != "install" and "To install Unsloth, click Get Started" in txt:
+            shot(page, f"{label}-not-installed")
+            log(f"{label}: app shows the first-run screen; nothing installed")
+            return False
         n += 1
         if re.search(r"(Installation failed|Repair failed|Update failed|could not|Something went wrong)", txt, re.I):
             shot(page, f"{label}-failure")
@@ -667,8 +686,7 @@ def phase_firstrun(pw, root_hint):
     proc = launch_app()
     try:
         wait_cdp()
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-        page = main_page(browser)
+        browser, page = attach(pw)
         page.set_default_timeout(20000)
         log(f"page url {page.url}")
         # The console is 640x480; render the first-run screen at the app's real 760x560.
@@ -774,8 +792,7 @@ def phase_relaunch(pw, root_hint, label):
     proc = launch_app()
     try:
         wait_cdp()
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-        page = main_page(browser)
+        browser, page = attach(pw)
         page.set_default_timeout(20000)
         page.set_viewport_size({"width": 1440, "height": 900})
         t = time.time()
