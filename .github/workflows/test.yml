@@ -64,7 +64,7 @@ jobs:
           $src = "$env:H_B\src"
           $exe = "$env:H_B\target\debug\unsloth-studio.exe"
           $stamp = "$env:H_B\built-sha.txt"
-          $want = "$env:SRC_SHA-cdp"
+          $want = "$env:SRC_SHA-cdp-rel"
           if ((Test-Path $exe) -and (Test-Path $stamp) -and ((Get-Content $stamp) -eq $want)) { Write-Host "cached build"; exit 0 }
           git -C $src checkout -- studio/src-tauri/tauri.conf.json
           python "$env:H_W\h\h\patch_conf.py" "$src\studio\src-tauri\tauri.conf.json"
@@ -82,6 +82,11 @@ jobs:
           rustc --version
           cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 25
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
+          # Release build too: startup auto-repair only runs when debug_assertions are off. It runs the
+          # bundled install.ps1 from its resource dir, which for a bare exe is the exe's folder.
+          cargo build --release --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 5
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo release build failed"; exit 1 }
+          Copy-Item "$src\install.ps1" "$env:H_B\target\release\install.ps1" -Force
           Set-Content $stamp $want
           Get-Item $exe | Select-Object FullName,Length
           exit 0
@@ -135,7 +140,7 @@ jobs:
           if (-not $hooks) { Write-Host "::error::no unsloth import hook found to break"; exit 0 }
           foreach ($h in $hooks) { Rename-Item -LiteralPath $h.FullName -NewName ($h.Name + '.broken-by-test') } }
           & "$env:H_ROOT\unsloth_studio\Scripts\python.exe" -c "import unsloth_cli" 2>&1 | Select-Object -Last 1
-          $rc = Invoke-InSession1 -Name autorepair -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" autorepair" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
+          $rc = Invoke-InSession1 -Name autorepair -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" autorepair" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
           Get-ChildItem $sp -Directory | Where-Object Name -match 'unsloth_cli' | Format-Table Name
           exit 0
 
@@ -147,7 +152,7 @@ jobs:
       - name: "Phase 4: upgrade to full from Settings > Repair installation"
         run: |
           . "$env:H_W\h\h\session1.ps1"
-          $rc = Invoke-InSession1 -Name upgrade -TimeoutMin 90 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" upgrade" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
+          $rc = Invoke-InSession1 -Name upgrade -TimeoutMin 90 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" upgrade" -Env @{ H_APP = "$env:H_B\target\release\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
           exit 0
 
       - name: Measure after upgrade

@@ -215,6 +215,7 @@ def wait_ready(page, timeout_s, label):
     end = time.time() + timeout_s
     last = ""
     n = 0
+    fail_since = 0
     while time.time() < end:
         if visible(page.locator('textarea[aria-label="Message input"]')) or visible(
             page.locator('[data-sidebar="menu-button"]')
@@ -233,8 +234,15 @@ def wait_ready(page, timeout_s, label):
             return False
         n += 1
         if re.search(r"(Installation failed|Repair failed|Update failed|could not|Something went wrong)", txt, re.I):
-            shot(page, f"{label}-failure")
-            log(f"{label}: failure text on screen")
+            if not fail_since:
+                fail_since = time.time()
+                shot(page, f"{label}-failure")
+                log(f"{label}: failure text on screen")
+            elif time.time() - fail_since > 180:
+                log(f"{label}: failure screen persisted 3 min; giving up")
+                return False
+        else:
+            fail_since = 0
         time.sleep(10)
     shot(page, f"{label}-timeout")
     return False
