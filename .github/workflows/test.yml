@@ -71,6 +71,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::frontend build failed"; exit 1 }
           Pop-Location
           $env:CARGO_TARGET_DIR = "$env:H_B\target"
+          # The box's rustup has no default toolchain; keep a private one in the build cache.
+          $env:RUSTUP_HOME = "$env:H_B\rustup"
+          $env:CARGO_HOME = "$env:H_B\cargo"
+          rustup toolchain install stable --profile minimal --no-self-update 2>&1 | Select-Object -Last 3
+          $env:RUSTUP_TOOLCHAIN = "stable"
+          rustc --version
           cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 25
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
           Set-Content $stamp $env:SRC_SHA
