@@ -69,6 +69,9 @@ def main() -> int:
                            "--windows. Wiring only: capability.py keeps `nvidia` UNMET "
                            "and names the spoof. See lib/nvidia_identity.py.")
     args = ap.parse_args()
+    # owner/repo shorthand: states.py clones UPSTREAM as given, so it must be a URL.
+    if "://" not in args.repo and args.repo.count("/") == 1:
+        args.repo = f"https://github.com/{args.repo}"
 
     branch = args.branch or f"amd-ci-pr{args.pr}"
     out = args.out

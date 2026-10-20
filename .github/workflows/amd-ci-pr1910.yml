@@ -31,7 +31,7 @@ permissions:
 
 env:
   PR: "1910"
-  UPSTREAM: "unslothai/unsloth-zoo"
+  UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
 
