@@ -16,7 +16,7 @@ Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) dri
 
 $env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,k8:k8,k9:k9"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
-  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", $(if ($env:K9P_CELLS) { $env:K9P_CELLS } else { "q35,gptoss,q3m" }))
+  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", $(if ($env:K9P_CELLS) { $env:K9P_CELLS -replace "q3mu", "q3m" } else { "q35,gptoss,q3m" }))
 
 # release bundle
 $TAG = "b11734-mix-c208e5f"

@@ -44,7 +44,7 @@ jobs:
     needs: [hosted-linux-build, gpu-windows]
     if: ${{ always() && needs.hosted-linux-build.result == 'success' }}
     env:
-      K9P_CELLS: q3m
+      K9P_CELLS: q3m,q3mu
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 330
     concurrency:
@@ -99,7 +99,7 @@ jobs:
     name: "k9 vs k8 vs release, Windows 11 ROCm gfx1151 (build + ctest + measure, exclusive)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K9P_CELLS: q3m
+      K9P_CELLS: q3m,q3mu
     timeout-minutes: 330
     concurrency:
       group: amd-ci-gfx1151-gpu

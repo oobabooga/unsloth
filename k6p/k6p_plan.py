@@ -10,7 +10,8 @@ J = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["K6P_DIR"], "plan_logs")
 os.makedirs(OUT, exist_ok=True)
 ALL = ",".join(["rel:rel", "k8:k8", "k8b:k8", "k9:k9", "k9b:k9", "k9lm0:k9:LLAMA_MOE_LAYER_MAJOR=0",
-                "k9df0:k9:LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0", "k9gs0:k9:GGML_GALLOCR_SPARSE_RESET=0"])
+                "k9df0:k9:LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0", "k9gs0:k9:GGML_GALLOCR_SPARSE_RESET=0",
+                "k8u2:k8:K6P_ARGS=-ub 2048", "k9u2:k9:K6P_ARGS=-ub 2048", "k9u2df0:k9:K6P_ARGS=-ub 2048;LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0"])
 MTP = "--spec-type draft-mtp --spec-draft-n-max 2"
 
 
@@ -28,12 +29,15 @@ def step(name, *args, arms=None, extra=""):
 
 
 CELLS = os.environ.get("K9P_CELLS", "q35,q3m,gptoss").split(",")
-step("dl", "dl", "--models", ",".join(CELLS))
+step("dl", "dl", "--models", ",".join(sorted({c.rstrip("u") for c in CELLS})))
 step("devinfo", "devinfo", arms="rel,k8,k9")
 if "q35" in CELLS:
     step("time_q35_full", "time", "--cell", "q35:full", "--reps", "3", arms="rel,k8,k9,k9b")
 if "q3m" in CELLS:
     step("time_q3m_spill8192_mtp", "time", "--cell", "q3m:spill8192", "--reps", "3", arms="rel,k8,k8b,k9,k9b,k9lm0,k9gs0", extra=MTP)
+if "q3mu" in CELLS:
+    # -ub 2048 (Studio-style explicit ubatch): where the device-seed fallback (1222b90931) can engage; df0 = its kill switch
+    step("time_q3m_spill8192_mtp_ub2048", "time", "--cell", "q3m:spill8192", "--reps", "2", arms="k8u2,k9u2,k9u2df0", extra=MTP)
 if "gptoss" in CELLS:
     step("time_gptoss_spill6144", "time", "--cell", "gptoss:spill6144", "--reps", "3", arms="rel,k8,k9,k9b,k9df0")
 print("=== PLAN DONE ===")
