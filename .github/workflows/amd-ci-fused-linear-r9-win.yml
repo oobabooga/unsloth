@@ -44,10 +44,10 @@ env:
   # unsloth pinned to ONE commit for both zoo states (PR unslothai/unsloth#14185 head); only unsloth-zoo varies.
   UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
   UNSLOTH_PR: "14185"
-  UNSLOTH_SHA: "e8e0a37c4d5f8cc15f5b870fbc3b5a074dc00e13"
+  UNSLOTH_SHA: "0b3714da8517b6097c1372b564346a15516b0fd5"
   # Expected zoo states (informational: states.py resolves them live; the probe records the real SHAs).
   EXPECT_ZOO_BASE: "cda2b273b53384a9a1765f2c037d5dc78a8370de"
-  EXPECT_ZOO_HEAD: "bfa05a53cba546496234b9b7d4af519ddbc8001c"
+  EXPECT_ZOO_HEAD: "c0193421887889d5575de0277bee34171e8db816"
   # AMD's Windows torch for gfx1151, the same index and pin unsloth's install.ps1 uses (multi-arch, rocm7.14.0).
   AMD_TORCH_INDEX: "https://repo.amd.com/rocm/whl-multi-arch/"
   AMD_TORCH_SPEC: "torch[device-gfx1151]==2.11.0+rocm7.14.0"
