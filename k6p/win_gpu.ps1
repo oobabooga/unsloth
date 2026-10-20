@@ -1,10 +1,10 @@
-# win_gpu.ps1: gfx1151 Windows 11. Build k6 (b11721 + k6.patch.gz) with TheRock (pip, gfx1151 nightly index) and the release's
+# win_gpu.ps1 (k9 platforms): gfx1151 Windows 11. Build k8 / k9 (b11721 + k8 / k9 .patch.gz) with TheRock (pip, gfx1151 nightly index) and the release's
 # Windows ROCm flags (unsloth-prebuilt-rocm.yml windows leg: shared libs, GGML_BACKEND_DL, CPU_ALL_VARIANTS, RPC, OPENMP off,
 # ROCWMMA FA off), ship TheRock's DLLs + rocblas/hipblaslt libraries beside the exes (as the release does), then measure release
-# b11696-mix-7baeb9a windows-x64-rocm-gfx1151 (rel / rel2) vs k6 (k6 / k6b) with k6p_bench.py. Rows -> out\rows_win.jsonl
+# b11734-mix-c208e5f windows-x64-rocm-gfx1151 (rel) vs k8 vs k9 (arms in k6p_plan.py) with k6p_bench.py. Rows -> out\rows_win.jsonl
 $ErrorActionPreference = "Continue"
 $W = $env:AMD_CI_WORK; $OUT = "$W\out"; $J = "$env:GITHUB_WORKSPACE\k6p"; $R = "$W\k6p"
-New-Item -ItemType Directory -Force -Path $OUT, "$R\bins\rel", "$R\bins\k6", "$R\models" | Out-Null
+New-Item -ItemType Directory -Force -Path $OUT, "$R\bins\rel", "$R\models" | Out-Null
 function Log($s) { Write-Host $s; Add-Content -Encoding utf8 -Path "$OUT\win_diag.txt" -Value $s }
 Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
 $PY = $null
@@ -14,19 +14,19 @@ Log "python $PY"
 Get-CimInstance Win32_ComputerSystem | ForEach-Object { Log "RAM $($_.TotalPhysicalMemory) procs $($_.NumberOfLogicalProcessors)" }
 Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) driver $($_.DriverVersion) AdapterRAM $($_.AdapterRAM)" }
 
-$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,rs:rs,ub:ub,k6:k6"; $env:PYTHONIOENCODING = "utf-8"
+$env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,k8:k8,k9:k9"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
-  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", "q35,lfm2,gptoss")
+  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", "q35,gptoss,q3m")
 
 # release bundle
-$TAG = "b11696-mix-7baeb9a"
+$TAG = "b11734-mix-c208e5f"
 & curl.exe -fL --retry 5 -s -S -o "$R\rel.zip" "https://github.com/unslothai/llama.cpp/releases/download/$TAG/app-$TAG-windows-x64-rocm-gfx1151.zip"
 Log "release zip rc=$LASTEXITCODE"
 Expand-Archive -Force -Path "$R\rel.zip" -DestinationPath "$R\bins\rel"
 Set-Content -Encoding utf8 -Path "$R\bins\rel\TAG" -Value "$TAG windows-x64-rocm-gfx1151"
 
-# TheRock toolchain: the dist tarball the release's weekly pin resolves to for b11696 (built 2026-10-16 -> cutoff 2026-10-10)
-$ROCM_VER = if ($env:ROCM_VER) { $env:ROCM_VER } else { "10.2.0a20261010" }
+# TheRock toolchain: the dist tarball the release's weekly pin resolves to for b11734 (built 2026-10-19 -> cutoff 2026-10-17)
+$ROCM_VER = if ($env:ROCM_VER) { $env:ROCM_VER } else { "10.2.0a20261017" }
 $t0 = Get-Date
 & curl.exe -fL --retry 5 -s -S -o "$W\rocm.tar.gz" "https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-$ROCM_VER.tar.gz"
 Log "TheRock tarball rc=$LASTEXITCODE size $((Get-Item "$W\rocm.tar.gz").Length)"
@@ -47,17 +47,7 @@ $env:HIP_PATH = $ROCM; $env:ROCM_PATH = $ROCM; $env:HIP_PLATFORM = "amd"
 $env:PATH = "$ROCM\bin;$ROCM\lib\llvm\bin;$env:PATH"
 Log ((& $CLANG --version) -join " | ")
 
-# source = upstream b11721 + k6 patch
 $BASE = "ff5a23376725e5a889fa0bfb987b7541dc304da0"
-$SRC = "$W\src_k6"
-New-Item -ItemType Directory -Force -Path $SRC | Out-Null
-git -C $SRC init -q
-git -C $SRC config core.autocrlf false
-git -C $SRC remote add origin https://github.com/ggml-org/llama.cpp
-git -C $SRC fetch -q --depth 1 origin $BASE
-git -C $SRC checkout -q --detach $BASE
-if ((git -C $SRC rev-parse HEAD).Trim() -ne $BASE) { Write-Host "FATAL: checkout"; exit 1 }
-& $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\k6.patch.gz" "$W\k6.patch"
 
 $ocml = Get-ChildItem -Path $ROCM -Recurse -Filter "ocml.bc" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -eq $ocml) { Write-Host "FATAL: no ocml.bc"; exit 1 }
@@ -81,8 +71,14 @@ function Build-Tree($tree, $name, $tests) {
   if ($brc -ne 0) { Get-Content "$OUT\${name}_build.log" | Select-String -Pattern "error:|FAILED" -Context 2, 6 | Select-Object -First 40; return $false }
   if ($tests) {
     cmake -S $tree -B "$tree\build" -DLLAMA_BUILD_TESTS=ON *>> "$OUT\${name}_configure.log"
-    cmake --build "$tree\build" -j 32 --target test-backend-ops *> "$OUT\${name}_build_tbo.log"
-    Log "$name test-backend-ops build rc=$LASTEXITCODE"
+    cmake --build "$tree\build" -j 32 -- -k 0 *> "$OUT\${name}_build_tests.log"
+    Log "$name tests build rc=$LASTEXITCODE"
+    $op = $env:PATH; $env:PATH = "$tree\build\bin;$ROCM\bin;$env:PATH"
+    Push-Location "$tree\build"
+    & ctest -L main --output-on-failure --timeout 900 *> "$OUT\${name}_ctest.log"
+    Log "$name ctest rc=$LASTEXITCODE $((Get-Content "$OUT\${name}_ctest.log" | Select-String 'tests passed') -join ' ')"
+    Get-Content "$OUT\${name}_ctest.log" | Select-String -Pattern "\*\*\*Failed|Not Run|Timeout|Exception" | Select-Object -First 20 | ForEach-Object { Log "  $_" }
+    Pop-Location; $env:PATH = $op
   }
   $d = "$R\bins\$name"
   New-Item -ItemType Directory -Force -Path $d | Out-Null
@@ -95,29 +91,35 @@ function Build-Tree($tree, $name, $tests) {
   return $true
 }
 $TRV = $ROCM_VER
-# ub = plain upstream b11721 (k6's upstream base), built from the checkout before the patch
-if (-not (Build-Tree $SRC "ub" $false)) { Write-Host "FATAL: ub build"; exit 1 }
-Set-Content -Encoding utf8 -Path "$R\bins\ub\TAG" -Value "upstream b11721 ff5a2337 hip gfx1151 TheRock $TRV"
-git -C $SRC apply --whitespace=nowarn "$W\k6.patch"
-if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: k6 patch does not apply"; exit 1 }
-git -C $SRC diff --shortstat | ForEach-Object { Log "k6 diff $_" }
-if (-not (Build-Tree $SRC "k6" $true)) { Write-Host "FATAL: k6 build"; exit 1 }
-Set-Content -Encoding utf8 -Path "$R\bins\k6\TAG" -Value "k6 $((Get-Content "$J\K6_SHA").Substring(0,10)) hip gfx1151 TheRock $TRV"
-# rs = the release's own source tarball, same toolchain as k6 (rel vs rs = toolchain / runtime, rs vs k6 = code)
-& curl.exe -fL --retry 5 -s -S -o "$W\rs.tar.gz" "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama.cpp-source-$TAG.tar.gz"
-New-Item -ItemType Directory -Force -Path "$W\src_rs" | Out-Null
-tar.exe -xzf "$W\rs.tar.gz" -C "$W\src_rs"
-$RSD = (Get-ChildItem -Directory "$W\src_rs" | Select-Object -First 1).FullName
-if (-not (Build-Tree $RSD "rs" $false)) { Write-Host "rs build failed (arm dropped)" }
-Set-Content -Encoding utf8 -Path "$R\bins\rs\TAG" -Value "$TAG source hip gfx1151 TheRock $TRV"
+# k8 / k9 = upstream b11721 + the k8 / k9 patch, one source tree each
+foreach ($n in "k8", "k9") {
+  $S = "$W\src_$n"
+  New-Item -ItemType Directory -Force -Path $S | Out-Null
+  git -C $S init -q
+  git -C $S config core.autocrlf false
+  git -C $S remote add origin https://github.com/ggml-org/llama.cpp
+  git -C $S fetch -q --depth 1 origin $BASE
+  git -C $S checkout -q --detach $BASE
+  if ((git -C $S rev-parse HEAD).Trim() -ne $BASE) { Write-Host "FATAL: checkout $n"; exit 1 }
+  & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\$n.patch.gz" "$W\$n.patch"
+  git -C $S apply --whitespace=nowarn "$W\$n.patch"
+  if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: $n patch does not apply"; exit 1 }
+  git -C $S diff --shortstat | ForEach-Object { Log "$n diff $_" }
+  if (-not (Build-Tree $S $n $true)) { Write-Host "FATAL: $n build"; exit 1 }
+  $sha = (Get-Content "$J\$($n.ToUpper())_SHA").Substring(0, 10)
+  Set-Content -Encoding utf8 -Path "$R\bins\$n\TAG" -Value "$n $sha hip gfx1151 TheRock $TRV"
+}
 Get-ChildItem "C:\Windows\System32\amdhip64*" -ErrorAction SilentlyContinue | ForEach-Object { Log "system32: $($_.Name) $($_.VersionInfo.FileVersion)" }
 Get-ChildItem -Recurse "$R\bins\rel" -Filter "amdhip64*.dll" | ForEach-Object { Log "release: $($_.FullName) $($_.VersionInfo.FileVersion)" }
-Get-ChildItem "$R\bins\k6" -Filter "amdhip64*.dll" | ForEach-Object { Log "k6: $($_.Name) $($_.VersionInfo.FileVersion)" }
+Get-ChildItem "$R\bins\k9" -Filter "amdhip64*.dll" | ForEach-Object { Log "k9: $($_.Name) $($_.VersionInfo.FileVersion)" }
 
 $dl.WaitForExit()
 Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-Object { -not $_.StartsWith("ROW") } | Select-Object -Last 5
-$OPS = "RMS_NORM,RMS_NORM_MUL_ADD,ADD_RMS_NORM,RMS_NORM_MUL_ROPE,MUL_MAT_VEC_SHARED_SRC1,MUL_MAT_ID_FALLBACK_SHARED_SRC1,MUL_MAT_ID_SHARED,MUL_MAT_VEC_FUSION,MUL_MAT_ID_FUSION,HC_POST_NORM,EW_CHAIN,TOPK_MOE,TOP_K,GET_ROWS,SET_ROWS,CPY,MUL_MAT_ID,MUL_MAT"
-& $PY -u "$J\k6p_plan.py" "$OUT\plan" $OPS
+# a server per arm must see ROCm0 (a bundle that falls back to the CPU would measure nothing)
+$op = $env:PATH
+foreach ($n in "rel", "k8", "k9") { $sv = Get-ChildItem -Recurse "$R\bins\$n" -Filter "llama-server.exe" | Select-Object -First 1; $env:PATH = "$($sv.DirectoryName);$op"; $c = (& $sv.FullName --list-devices 2>&1 | Select-String "ROCm0").Count; Log "devices $n : ROCm0 x$c"; if ($c -lt 1) { Write-Host "FATAL: $n sees no ROCm0"; exit 1 } }
+$env:PATH = $op
+& $PY -u "$J\k6p_plan.py" "$OUT\plan"
 Copy-Item "$R\out\rows.jsonl" "$OUT\rows_win.jsonl" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path "$OUT\logs" | Out-Null
 Copy-Item "$R\out\logs\*.filtered.log" "$OUT\logs\" -ErrorAction SilentlyContinue

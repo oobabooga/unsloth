@@ -42,6 +42,7 @@ MODELS = {
     "q35": ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", 532517120, False),
     "lfm2": ("unsloth/LFM2-8B-A1B-GGUF", "LFM2-8B-A1B-Q2_K.gguf", "01c1c9ba807324289806d69f5895e11aff6de784", 3079650368, True),
     "gptoss": ("unsloth/gpt-oss-20b-GGUF", "gpt-oss-20b-Q2_K.gguf", "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4", 11468317888, True),
+    "q3m": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "Qwen3.6-35B-A3B-UD-Q3_K_M.gguf", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d", 17104402720, True),
 }
 MD = os.environ.get("MODEL_DIR", os.path.join(K, "models"))
 
@@ -181,7 +182,16 @@ def memstats(s):
             "load_mode": [l.strip()[:200] for l in g(r"[^\n]*(?:load mode|load_mode|--load-mode|with mmap|use_mmap)[^\n]*")][:4],
             "oom": bool(re.search(r"out of memory|failed to allocate|hipMalloc failed|cudaMalloc failed", s)),
             "abort": bool(re.search(r"GGML_ASSERT|Segmentation|Aborted|core dumped|CUDA error|HIP error|ROCm error|exception", s)),
-            "err_lines": [l.strip()[:240] for l in g(r"[^\n]*(?:GGML_ASSERT|CUDA error|HIP error|error:|ERROR|terminate called)[^\n]*")][:4]}
+            "err_lines": [l.strip()[:240] for l in g(r"[^\n]*(?:GGML_ASSERT|CUDA error|HIP error|error:|ERROR|terminate called)[^\n]*")][:4],
+            # k9: layer-major groups (merged graphs), refusals / splits, the auto-on line, the device-seed fallback, prefetch disabled
+            "n_batch": [int(x) for x in g(r"llama_context: n_batch\s+=\s+(\d+)")][:3],
+            "n_ubatch_ctx": [int(x) for x in g(r"llama_context: n_ubatch\s+=\s+(\d+)")][:3],
+            "lm_n_groups": len(g(r"decode_layer_major: \d+ ubatches")),
+            "lm_lines": [l.strip()[-260:] for l in g(r"[^\n]*decode_layer_major:[^\n]*")][:12],
+            "lm_cfg": [l.strip()[-240:] for l in g(r"[^\n]*layer-major[^\n]*") if "CMD" not in l][:6],
+            "devseed": [l.strip()[-260:] for l in g(r"[^\n]*(?:device seed from prompt|host seed of a prompt does not fit|seed the cache on the device)[^\n]*")][:4],
+            "prefetch_disabled": len(g(r"host weight prefetch disabled")),
+            "spec": [l.strip()[-200:] for l in g(r"[^\n]*(?:draft acceptance|n_draft|accept)[^\n]*")][-2:]}
 
 
 def filt(lp, s, head=120):
