@@ -80,7 +80,16 @@ ap.add_argument("--work", required = True)
 ap.add_argument("--out", required = True)
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok = True)
-uv = shutil.which("uv") or sys.exit("no uv")
+uv = shutil.which("uv")
+if uv is None:
+    boot = os.path.join(a.work, "boot")
+    if subprocess.run([sys.executable, "-m", "venv", boot]).returncode == 0:
+        subprocess.run([os.path.join(boot, "bin", "python"), "-m", "pip", "install", "-q", "uv"], check = True)
+        uv = os.path.join(boot, "bin", "uv")
+    else:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--user", "uv"], check = True)
+        uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
+print("uv:", uv, flush = True)
 bench = os.path.join(a.work, "bench.py")
 open(bench, "w", encoding = "utf-8").write(BENCH)
 ov = os.path.join(a.work, "ov.txt")
