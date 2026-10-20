@@ -1,0 +1,37 @@
+name: AMD DevLab Windows probe
+on:
+  push:
+    branches: [amd-devlab-14245-probe]
+permissions: {}
+jobs:
+  probe:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 20
+    steps:
+      - name: Session and desktop
+        shell: powershell
+        run: |
+          whoami
+          "SessionId=" + [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+          [Environment]::UserInteractive
+          query user 2>&1
+          Get-Process explorer,dwm,winlogon -ErrorAction SilentlyContinue | Select-Object Name,Id,SessionId | Format-Table
+          Get-Process -Id $PID | Select-Object Name,SessionId
+          $p = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"; $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ParentProcessId)"; "parent=" + $pp.Name
+          Get-Service | Where-Object {$_.DisplayName -like '*runner*' -or $_.Name -like 'actions*'} | Format-Table Name,Status,StartType
+          try { Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "screen=$($b.Width)x$($b.Height)"; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); "screenshot ok" } catch { "screenshot failed: $_" }
+          exit 0
+      - name: Tooling and state
+        shell: powershell
+        run: |
+          "HOME=$env:USERPROFILE RUNNER_TEMP=$env:RUNNER_TEMP WORKSPACE=$env:GITHUB_WORKSPACE LOCALAPPDATA=$env:LOCALAPPDATA"
+          foreach ($t in 'cargo','rustc','rustup','node','npm','python','py','git','uv','cmake','winget') { $c = Get-Command $t -ErrorAction SilentlyContinue; "{0,-8} {1}" -f $t, $(if ($c) {$c.Source} else {'ABSENT'}) }
+          Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue | Select-Object pv
+          Get-ItemProperty 'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue | Select-Object pv
+          Get-ChildItem "$env:USERPROFILE\.unsloth" -Force -ErrorAction SilentlyContinue | Format-Table Name,LastWriteTime
+          Get-ChildItem "$env:LOCALAPPDATA" -Directory -ErrorAction SilentlyContinue | Where-Object Name -match 'nsloth|ai.unsloth' | Format-Table FullName
+          Get-ChildItem "$env:RUNNER_TEMP\.." -Directory -ErrorAction SilentlyContinue | Format-Table Name,LastWriteTime
+          Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM | Format-List
+          Get-PSDrive C | Select-Object Used,Free
+          Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio' -ErrorAction SilentlyContinue
+          exit 0
