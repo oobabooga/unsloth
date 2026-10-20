@@ -1,0 +1,185 @@
+name: "AMD CI: home cluster link across two machines (#14274)"
+
+# The #14274 user flow on two physical strix-halo boxes on one LAN (proven by the LAN probe, run
+# 39440003005: same L2, multicast both ways, ~42 us RTT, ~940 Mbit/s). The worker job publishes a
+# control address + per-run nonce as an artifact; the master job finds it through the API with its own
+# run token, pairs (`unsloth cluster pair` -> token over the nonce-authenticated control channel ->
+# `unsloth cluster join --token-stdin` on the worker box), starts `unsloth worker` there, checks
+# list / LAN discovery, plans with Studio, serves through the relay (base vs coalesced llama.cpp
+# builds, greedy text vs a same-box direct RPC reference), moves the worker's port (discovery must
+# find it), checks an unpaired client is refused and that `cluster remove` cuts a live session.
+# CPU builds only (no GPU concurrency group); ggml-rpc-server never listens beyond loopback.
+
+on:
+  push:
+    branches: [amd-ci-homelink-lan-tryout]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  HIP_VISIBLE_DEVICES: ""
+  ROCR_VISIBLE_DEVICES: ""
+  HL_REF: cluster/home-link
+
+jobs:
+  worker:
+    name: "worker box (Linux)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "hl-worker"
+
+      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced CPU builds)
+        timeout-minutes: 40
+        run: |
+          set -uo pipefail
+          bash amd_ci/homelink/setup.sh worker 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
+          grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
+
+      - name: Start worker control
+        run: |
+          set -uo pipefail
+          export HOME="$AMD_CI_WORK/home" HF_HOME="$AMD_CI_WORK/hf"
+          . "$AMD_CI_WORK/venv/bin/activate"
+          D="$AMD_CI_WORK/out/worker"; mkdir -p "$D"
+          L="$AMD_CI_WORK/llama"
+          setsid python3 -u "$GITHUB_WORKSPACE/amd_ci/homelink/lan_tryout.py" worker --repo "$AMD_CI_WORK/src/unsloth" \
+            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin" --out-dir "$D" --window-s 2700 \
+            > "$D/control.log" 2>&1 < /dev/null &
+          echo $! > "$D/control.pid"
+          for i in $(seq 60); do [ -s "$D/self.json" ] && break; sleep 0.5; done
+          cat "$D/control.log"; test -s "$D/self.json" || { echo "FATAL: control did not start"; exit 1; }
+          echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr; ip route show default
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hl-worker-self-${{ github.run_attempt }}
+          path: ${{ env.AMD_CI_WORK }}/out/worker/self.json
+          retention-days: 3
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Serve the master until it is done
+        timeout-minutes: 50
+        run: |
+          set -uo pipefail
+          D="$AMD_CI_WORK/out/worker"; PID=$(cat "$D/control.pid")
+          while kill -0 "$PID" 2>/dev/null; do sleep 10; done
+          tail -40 "$D/control.log"
+          test -s "$D/worker_result.json"
+
+      - name: Stop leftovers
+        if: always()
+        run: |
+          D="$AMD_CI_WORK/out/worker"; touch "$D/STOP" 2>/dev/null
+          PID=$(cat "$D/control.pid" 2>/dev/null); [ -n "$PID" ] && kill "$PID" 2>/dev/null
+          sleep 3
+          # Only processes started from this job's work tree: other jobs on a shared box are not ours.
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do kill "$p" 2>/dev/null; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hl-result-worker-${{ github.run_attempt }}
+          path: |
+            ${{ env.AMD_CI_WORK }}/out/worker/*.json
+            ${{ env.AMD_CI_WORK }}/out/worker/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+  master:
+    name: "master box (Linux)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "hl-master"
+
+      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced CPU builds, model)
+        timeout-minutes: 40
+        run: |
+          set -uo pipefail
+          bash amd_ci/homelink/setup.sh master 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
+          grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
+
+      - name: Two-machine tryout (master side)
+        timeout-minutes: 55
+        env:
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          export HOME="$AMD_CI_WORK/home" HF_HOME="$AMD_CI_WORK/hf"
+          . "$AMD_CI_WORK/venv/bin/activate"
+          D="$AMD_CI_WORK/out/master"; mkdir -p "$D"
+          L="$AMD_CI_WORK/llama"
+          echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
+          python3 -u "$GITHUB_WORKSPACE/amd_ci/homelink/lan_tryout.py" master --repo "$AMD_CI_WORK/src/unsloth" \
+            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin" --gguf "$(cat "$AMD_CI_WORK/model.txt")" \
+            --out-dir "$D" --wait-s 1800 --threads 8 --n-predict 64 --repeats 3 --rounds 3 2>&1 | tee "$D/master.log"
+          echo "master rc=${PIPESTATUS[0]}"
+          test -s "$D/master_result.json"
+
+      - name: Stop leftovers
+        if: always()
+        run: |
+          # Only processes started from this job's work tree: other jobs on a shared box are not ours.
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do kill "$p" 2>/dev/null; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hl-result-master-${{ github.run_attempt }}
+          path: |
+            ${{ env.AMD_CI_WORK }}/out/master/*.json
+            ${{ env.AMD_CI_WORK }}/out/master/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+  summary:
+    name: "two-machine verdict"
+    needs: [worker, master]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hl-result-*-${{ github.run_attempt }}
+          path: results
+
+      - name: Verdict
+        run: |
+          set -uo pipefail
+          python3 amd_ci/homelink/lan_tryout.py summarize --in results --out verdict
+          cat verdict/VERDICT.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hl-verdict-${{ github.run_attempt }}
+          path: verdict
+          retention-days: 7
+          overwrite: true

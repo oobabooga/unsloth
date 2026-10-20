@@ -1,0 +1,172 @@
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 0d5343853..cb659d954 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -16,11 +16,13 @@
+ #  include <netinet/tcp.h>
+ #  include <netdb.h>
+ #  include <unistd.h>
++#  include <sys/uio.h>
+ #endif
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <optional>
++#include <vector>
+ 
+ #ifdef GGML_RPC_RDMA
+ #  include <infiniband/verbs.h>
+@@ -133,6 +135,15 @@ struct socket_t::impl {
+     void get_caps(uint8_t * local_caps);
+     void update_caps(const uint8_t * remote_caps);
+ 
++    // TCP: small writes of one message (command byte, size, payload) are held here and leave in a
++    // single send at flush(), which every message ends with, instead of one tiny segment each.
++    // The bytes on the wire are unchanged, only how they are split into syscalls.
++    bool tcp_send(const void * data, size_t size);
++    bool tcp_send2(const void * a, size_t na, const void * b, size_t nb);
++    bool tcp_flush();
++    static constexpr size_t TCP_COALESCE_MAX = 64 * 1024;
++    std::vector<uint8_t> pending;
++
+ #ifdef GGML_RPC_RDMA
+     std::optional<rdma_gid_t> rdma_build_target_gid();
+ 
+@@ -156,6 +167,9 @@ struct socket_t::impl {
+ };
+ 
+ socket_t::impl::~impl() {
++    if (!use_rdma && !pending.empty()) {
++        tcp_flush();
++    }
+ #ifdef GGML_RPC_RDMA
+     rdma.reset();
+ #endif // GGML_RPC_RDMA
+@@ -531,17 +545,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
+ 
+ #endif // GGML_RPC_RDMA
+ 
+-bool socket_t::impl::send_data(const void * data, size_t size) {
+-    LOG_DBG3("[%s] transport: %s, size: %zu\n", __func__, use_rdma ? "RDMA" : "TCP", size);
+-#ifdef GGML_RPC_RDMA_APPLE
+-    if (use_rdma) {
+-        return rdma->send(data, size);
+-    }
+-#elif defined(GGML_RPC_RDMA)
+-    if (use_rdma) {
+-        return rdma_send(data, size);
+-    }
+-#endif
++bool socket_t::impl::tcp_send(const void * data, size_t size) {
+     size_t bytes_sent = 0;
+     while (bytes_sent < size) {
+         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
+@@ -556,6 +560,79 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+     return true;
+ }
+ 
++// Send a then b with as few syscalls as possible and without copying b (a large payload).
++bool socket_t::impl::tcp_send2(const void * a, size_t na, const void * b, size_t nb) {
++    if (nb > MAX_CHUNK_SIZE) {
++        return tcp_send(a, na) && tcp_send(b, nb);
++    }
++#ifdef _WIN32
++    WSABUF bufs[2];
++    bufs[0].buf = (CHAR *)a;
++    bufs[0].len = (ULONG)na;
++    bufs[1].buf = (CHAR *)b;
++    bufs[1].len = (ULONG)nb;
++    DWORD n = 0;
++    if (WSASend(fd, bufs, 2, &n, 0, nullptr, nullptr) != 0) {
++        GGML_LOG_ERROR("send failed (bytes_sent=0, size_to_send=%zu)\n", na + nb);
++        return false;
++    }
++    size_t sent = (size_t)n;
++#else
++    struct iovec iov[2];
++    iov[0].iov_base = const_cast<void *>(a);
++    iov[0].iov_len  = na;
++    iov[1].iov_base = const_cast<void *>(b);
++    iov[1].iov_len  = nb;
++    struct msghdr msg = {};
++    msg.msg_iov    = iov;
++    msg.msg_iovlen = 2;
++    ssize_t n = sendmsg(fd, &msg, 0);
++    if (n < 0) {
++        GGML_LOG_ERROR("send failed (bytes_sent=0, size_to_send=%zu)\n", na + nb);
++        return false;
++    }
++    size_t sent = (size_t)n;
++#endif
++    // a partial send finishes with plain sends of whatever is left of a, then of b
++    if (sent < na) {
++        return tcp_send((const char *)a + sent, na - sent) && tcp_send(b, nb);
++    }
++    sent -= na;
++    return sent >= nb || tcp_send((const char *)b + sent, nb - sent);
++}
++
++bool socket_t::impl::tcp_flush() {
++    if (pending.empty()) {
++        return true;
++    }
++    bool ok = tcp_send(pending.data(), pending.size());
++    pending.clear();
++    return ok;
++}
++
++bool socket_t::impl::send_data(const void * data, size_t size) {
++#ifdef GGML_RPC_RDMA_APPLE
++    if (use_rdma) {
++        return rdma->send(data, size);
++    }
++#elif defined(GGML_RPC_RDMA)
++    if (use_rdma) {
++        return rdma_send(data, size);
++    }
++#endif
++    if (pending.size() + size <= TCP_COALESCE_MAX) {
++        const uint8_t * p = (const uint8_t *)data;
++        pending.insert(pending.end(), p, p + size);
++        return true;
++    }
++    if (pending.empty()) {
++        return tcp_send(data, size);
++    }
++    bool ok = tcp_send2(pending.data(), pending.size(), data, size);
++    pending.clear();
++    return ok;
++}
++
+ bool socket_t::impl::recv_data(void * data, size_t size) {
+     LOG_DBG3("[%s] transport: %s, size: %zu\n", __func__, use_rdma ? "RDMA" : "TCP", size);
+ #ifdef GGML_RPC_RDMA_APPLE
+@@ -567,6 +644,10 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+         return rdma_recv(data, size);
+     }
+ #endif
++    // never wait for a reply while part of our own request is still held back
++    if (!pending.empty() && !tcp_flush()) {
++        return false;
++    }
+     size_t bytes_recv = 0;
+     while (bytes_recv < size) {
+         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+@@ -616,6 +697,8 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
+ }
+ 
+ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
++    // the caps just written go over TCP: send them before the transport may switch to RDMA
++    tcp_flush();
+ #ifdef GGML_RPC_RDMA
+     // a peer that has no RDMA advertises all-zero caps and takes no further part
+     // in the negotiation, so drop to TCP without reporting a failure
+@@ -654,7 +737,7 @@ bool socket_t::impl::flush() {
+         return rdma->flush();
+     }
+ #endif
+-    return true;
++    return tcp_flush();
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////
