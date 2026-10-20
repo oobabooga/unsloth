@@ -95,7 +95,7 @@ jobs:
             --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/suites" \
             --python "${AMD_CI_PY:-python3}" \
-            -- --tests tests/test_fused_add_rms_layernorm_inference.py tests/test_rms_layernorm_multirow.py
+            -- --subdir . --tests tests/test_fused_add_rms_layernorm_inference.py tests/test_rms_layernorm_multirow.py
           cat "$AMD_CI_WORK/out/suites/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/suites"
@@ -183,7 +183,7 @@ jobs:
             --probe amd_ci/probes/pytest_probe.py \
             --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --tests tests/test_fused_add_rms_layernorm_inference.py tests/test_rms_layernorm_multirow.py
+            --python "$AMD_CI_PY" -- --subdir . --tests tests/test_fused_add_rms_layernorm_inference.py tests/test_rms_layernorm_multirow.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
