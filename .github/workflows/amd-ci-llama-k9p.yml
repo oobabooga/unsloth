@@ -1,11 +1,11 @@
-name: "AMD CI + hosted: llama.cpp moe-combined-k9 vs k8 vs release b11734-mix, gfx1151 Linux + Windows, MSVC, macOS Metal"
+name: "k9 platforms run 3: macOS 15 Metal MoE cache cells (trimmed, rows kept on timeout)"
 
 # k9 = upstream ggml-org b11721 (ff5a2337) + k6p/k9.patch.gz (moe-combined-k9 ccaa52783b), k8 = b11721 + k6p/k8.patch.gz (927aeaa8c5).
 # ROCm builds use the release recipe and the TheRock weekly pin of b11734-mix-c208e5f (10.2.0a20261017). Matrix: k6p/k6p_plan.py.
 
 on:
   push:
-    branches: [amd-ci-llama-k9p]
+    branches: [amd-ci-llama-k9p3]
   workflow_dispatch:
 
 permissions:
@@ -13,204 +13,10 @@ permissions:
 
 jobs:
 
-  hosted-linux-build:
-    name: "Linux HIP gfx1151 build + CPU ctest ${{ matrix.n }} (hosted ubuntu-22.04, release recipe)"
-    runs-on: ubuntu-22.04
-    timeout-minutes: 170
-    strategy:
-      fail-fast: false
-      matrix:
-        n: [k9, k8]
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Free disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
-      - name: Build
-        run: |
-          bash k6p/hosted_linux_build.sh ${{ matrix.n }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bin_${{ matrix.n }}
-          path: ${{ runner.temp }}/art
-          retention-days: 3
-          if-no-files-found: error
-
-  hosted-linux-gfx1100:
-    name: "Linux HIP gfx1100 compile check + CPU ctest k9 (hosted ubuntu-22.04, TheRock gfx110X-all)"
-    runs-on: ubuntu-22.04
-    timeout-minutes: 170
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Free disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
-      - name: Build
-        run: |
-          bash k6p/hosted_linux_build.sh k9x
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: logs_k9x
-          path: ${{ runner.temp }}/art
-          retention-days: 3
-          if-no-files-found: warn
-
-  gpu-linux:
-    name: "k9 vs k8 vs release, Linux ROCm gfx1151 (exclusive)"
-    needs: hosted-linux-build
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "k9-linux-gpu"
-      - name: Hardware gate
-        run: |
-          set +e
-          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json" > /dev/null
-          ls -la /dev/kfd /dev/dri 2>&1 | head -5
-          R=$(command -v rocminfo || echo /opt/rocm/bin/rocminfo)
-          "$R" 2>&1 | grep -m3 -E "Marketing Name|gfx1151" | tee "$AMD_CI_WORK/out/rocminfo.txt"
-          if [ ! -e /dev/kfd ] || ! grep -q gfx1151 "$AMD_CI_WORK/out/rocminfo.txt"; then echo "GATE FAILED: no gfx1151 via KFD"; exit 1; fi
-          echo "gate ok"
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin_k9
-          path: ${{ env.AMD_CI_WORK }}/art/bin_k9
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin_k8
-          path: ${{ env.AMD_CI_WORK }}/art/bin_k8
-      - name: Cells
-        timeout-minutes: 310
-        run: |
-          set +e
-          bash k6p/linux_gpu.sh
-          rc=$?
-          echo "job rc=$rc"
-          test -s "$AMD_CI_WORK/out/rows_linux.jsonl"
-      - name: Stop leftover servers
-        if: always()
-        run: |
-          set +e
-          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x llama-perplexit; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
-          echo "cleanup done"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k9-linux-gpu
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
-
-  gpu-windows:
-    name: "k9 vs k8 vs release, Windows 11 ROCm gfx1151 (build + ctest + measure, exclusive)"
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Preamble
-        run: |
-          .\amd_ci\lib\preamble.ps1 -Name "k9-windows"
-      - name: Build k8 / k9 with the release's TheRock, ctest, cells
-        timeout-minutes: 320
-        run: |
-          $ErrorActionPreference = "Continue"
-          Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
-          & "$env:GITHUB_WORKSPACE\k6p\win_gpu.ps1"
-          if (-not (Test-Path "$env:AMD_CI_WORK\out\rows_win.jsonl")) { exit 1 }
-      - name: Stop leftover servers
-        if: always()
-        run: |
-          $ErrorActionPreference = "Continue"
-          Get-Process -Name llama-server, llama-perplexity, test-backend-ops -ErrorAction SilentlyContinue | Stop-Process -Force
-          Write-Host "cleanup done"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k9-windows-gpu
-          path: ${{ env.AMD_CI_WORK }}\out
-          retention-days: 7
-          if-no-files-found: warn
-
-  hosted-win-msvc:
-    name: "Windows MSVC CPU build + ctest ${{ matrix.n }} (hosted windows-latest)"
-    runs-on: windows-latest
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        n: [k9, k8]
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Source (b11721 + patch)
-        run: |
-          $BASE = "ff5a23376725e5a889fa0bfb987b7541dc304da0"
-          git init -q src; git -C src config core.autocrlf false
-          git -C src remote add origin https://github.com/ggml-org/llama.cpp
-          git -C src fetch -q --depth 1 origin $BASE; git -C src checkout -q --detach $BASE
-          python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" k6p\${{ matrix.n }}.patch.gz p.patch
-          git -C src apply --whitespace=nowarn ..\p.patch
-          if ($LASTEXITCODE -ne 0) { throw "patch does not apply" }
-          git -C src diff --shortstat
-      - name: Build (MSVC cl, Visual Studio generator, tests ON)
-        working-directory: src
-        run: |
-          cmake -S . -B build -A x64 -DGGML_NATIVE=OFF -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF `
-            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=OFF *> ..\cfg.log
-          if ($LASTEXITCODE -ne 0) { Get-Content ..\cfg.log -Tail 40; exit 1 }
-          Select-String -Path ..\cfg.log -Pattern "C compiler identification|CXX compiler identification"
-          cmake --build build --config Release -j 4 *> ..\build.log
-          $brc = $LASTEXITCODE
-          Select-String -Path ..\build.log -Pattern " error C| error LNK|fatal error" | Select-Object -First 40
-          Select-String -Path ..\build.log -Pattern "ggml-alloc.c.*warning|ggml-backend.cpp.*warning|llama-context.cpp.*warning" | Select-Object -First 20
-          "build rc=$brc"
-          exit $brc
-      - name: ctest -L main
-        working-directory: src/build
-        run: |
-          ctest -C Release -L main --output-on-failure --timeout 900 *> ..\..\ctest.log
-          $rc = $LASTEXITCODE
-          Get-Content ..\..\ctest.log | Select-String -Pattern "tests passed|\*\*\*Failed|Not Run|Timeout|Exception" | Select-Object -First 40
-          "ctest rc=$rc"
-          exit 0
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: k9-win-msvc-${{ matrix.n }}
-          path: |
-            cfg.log
-            build.log
-            ctest.log
-          retention-days: 7
-          if-no-files-found: warn
-
   hosted-mac:
     name: "macOS 15 arm64 Metal: k8 / k9 build + ctest, LFM2 MoE (MoE cache on) full + spill1024, Qwen3.5 dense (hosted)"
     runs-on: macos-15
-    timeout-minutes: 240
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -224,36 +30,34 @@ jobs:
             git -C src_$n fetch -q --depth 1 origin $BASE && git -C src_$n checkout -q --detach $BASE || exit 1
             gunzip -c k6p/$n.patch.gz > $n.patch; git -C src_$n apply --whitespace=nowarn ../$n.patch || { echo "FATAL: patch $n"; exit 1; }
             cmake -S src_$n -B src_$n/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_INSTALL_RPATH='@loader_path' \
-              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON \
+              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
               -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DLLAMA_OPENSSL=OFF > out/cfg_$n.log 2>&1 || { tail -30 out/cfg_$n.log; exit 1; }
             t0=$(date +%s)
-            cmake --build src_$n/build --config Release -j "$(sysctl -n hw.logicalcpu)" -- -k > out/build_$n.log 2>&1
+            cmake --build src_$n/build --config Release -j "$(sysctl -n hw.logicalcpu)" --target llama-server -- > out/build_$n.log 2>&1
             echo "build $n rc=$? in $(( $(date +%s) - t0 )) s"; grep -E "error:|warning: .*(ggml-alloc|ggml-backend|llama-context)" out/build_$n.log | head -20
-            ( cd src_$n/build && ctest -L main --output-on-failure --timeout 900 ) > out/ctest_$n.log 2>&1
-            echo "ctest $n rc=$?"; grep -E "tests passed|\*\*\*Failed|Not Run|Timeout|Exception" out/ctest_$n.log | head -20
             test -x src_$n/build/bin/llama-server || exit 1
           done
       - name: Metal cells k9 vs k8 vs release macos-arm64
+        timeout-minutes: 165
         run: |
           set +e
-          R="$RUNNER_TEMP/k6p"; mkdir -p "$R/bins/rel" "$R/models" out
+          R="$GITHUB_WORKSPACE/out/k6p"; mkdir -p "$R/bins/rel" "$R/models" out
           for n in k8 k9; do mkdir -p "$R/bins/$n"; cp -a src_$n/build/bin/* "$R/bins/$n/"; K=$(echo $n | tr a-z A-Z); echo "$n $(cut -c1-10 k6p/${K}_SHA) macos-arm64 metal" > "$R/bins/$n/TAG"; done
           TAG=b11734-mix-c208e5f
           curl -fL --retry 5 -s -S "https://github.com/unslothai/llama.cpp/releases/download/$TAG/llama-$TAG-bin-macos-arm64.tar.gz" | tar xz -C "$R/bins/rel"
           echo "$TAG macos-arm64" > "$R/bins/rel/TAG"
-          export K6P_DIR="$R" K6P_DEV=MTL0 ARMS="rel:rel,k8:k8,k8b:k8,k9:k9,k9b:k9,k9gs0:k9:GGML_GALLOCR_SPARSE_RESET=0,k9lm1:k9:LLAMA_MOE_LAYER_MAJOR=1"
+          export MODEL_DIR="$RUNNER_TEMP/models" K6P_DIR="$R" K6P_DEV=MTL0 ARMS="rel:rel,k8:k8,k8b:k8,k9:k9,k9b:k9,k9gs0:k9:GGML_GALLOCR_SPARSE_RESET=0,k9lm1:k9:LLAMA_MOE_LAYER_MAJOR=1"
           B="python3 -u k6p/k6p_bench.py"
-          $B dl --models q35,lfm2 | grep -v '^ROW'
+          $B dl --models lfm2 | grep -v '^ROW'
           $B devinfo --arms rel,k8,k9 | grep -v '^ROW'
-          $B time --cell q35:full --reps 2 --arms rel,k8,k9,k9b | grep -v '^ROW'
-          $B time --cell lfm2:full --reps 3 --arms rel,k8,k8b,k9,k9b | grep -v '^ROW'
-          $B time --cell lfm2:spill1024 --reps 3 --arms rel,k8,k8b,k9,k9b,k9gs0,k9lm1 | grep -v '^ROW'
-          cp "$R/out/rows.jsonl" out/rows_mac.jsonl; cp -r "$R/out/logs" out/logs
+          $B time --cell lfm2:spill1024 --reps 2 --arms k8,k9,k9b,rel | grep -v '^ROW'
+          $B time --cell lfm2:full --reps 2 --arms k8,k9,k9b | grep -v '^ROW'
+          rm -rf "${R:?}/bins"
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k9-mac
+          name: k9-mac3
           path: out
           retention-days: 7
           if-no-files-found: warn
