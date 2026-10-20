@@ -122,6 +122,12 @@ def _patch(torch):
     cuda.get_device_properties = get_device_properties
     cuda.get_device_name = get_device_name
     cuda.get_device_capability = get_device_capability
+    # torch queues sm_XX arch checks at import; with version.cuda faked they parse ROCm's
+    # gfx arch list (`"gfx1151".split("_")[1]` -> IndexError at lazy init), so drop them.
+    queued = getattr(cuda, "_queued_calls", None)
+    if isinstance(queued, list):
+        queued[:] = [c for c in queued
+                     if getattr(c[0], "__name__", "") not in ("_check_capability", "_check_cubins")]
     torch._amd_ci_nvidia_identity = True
 
 
