@@ -111,7 +111,7 @@ jobs:
         timeout-minutes: 150
         run: |
           $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\embed_cpu_diag.py" "$env:AMD_CI_WORK\out"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\probes\embed_onednn_diag.py" "$env:AMD_CI_WORK\out"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
