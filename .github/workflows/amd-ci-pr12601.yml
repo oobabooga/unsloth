@@ -188,6 +188,19 @@ jobs:
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
 
+      - name: RL training on the GPU
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/rl_train_probe.py \
+            --criteria amd_ci/criteria/rl_trains_on_gpu.py \
+            --out-dir "$AMD_CI_WORK/out/rl_train" \
+            --python "$AMD_CI_PY"
+          cat "$AMD_CI_WORK/out/rl_train/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/rl_train"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
