@@ -37,10 +37,10 @@ env:
   # unsloth is pinned to ONE commit for every zoo state (PR unslothai/unsloth#14185 head); only unsloth-zoo varies.
   UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
   UNSLOTH_PR: "14185"
-  UNSLOTH_SHA: "0b3714da8517b6097c1372b564346a15516b0fd5"
+  UNSLOTH_SHA: "ea23ebeedd9895b5eba74c572af86361f83afee9"
   # Expected zoo states (informational: states.py resolves them live from the PR; the probes record the real SHAs).
   EXPECT_ZOO_BASE: "cda2b273b53384a9a1765f2c037d5dc78a8370de"
-  EXPECT_ZOO_HEAD: "c0193421887889d5575de0277bee34171e8db816"
+  EXPECT_ZOO_HEAD: "4ba8e7c6addd3e56eda3a9b218d8c127fafcd6b0"
 
 jobs:
 
