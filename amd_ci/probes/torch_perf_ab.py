@@ -98,13 +98,28 @@ for arm, specs in ARMS.items():
         rc = rc or subprocess.run([uv, "pip", "install", "--no-config", "--python", py, f"unsloth @ {UNSLOTH}", f"unsloth_zoo @ {ZOO}", "--override", ov, "--default-index", "https://pypi.org/simple"], stdout = lf, stderr = subprocess.STDOUT).returncode
     res["install"][arm] = rc
     pys[arm] = py
+def gpu_procs():
+    # Other tenants on this box's GPU void a timing run (a private concurrency group cannot evict
+    # us, but cannot keep a second job off the same machine either).
+    for cmd in (["amd-smi", "process", "--json"], ["rocm-smi", "--showpids", "--json"]):
+        try:
+            r = subprocess.run(cmd, capture_output = True, text = True, timeout = 60)
+            if r.returncode == 0:
+                return {"cmd": cmd[0], "out": r.stdout[-4000:]}
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return {"cmd": None, "out": ""}
+
+
 for i, arm in enumerate(ORDER):
     o = os.path.join(a.out, f"run{i}_{arm}.json")
+    procs_before = gpu_procs()
     log = os.path.join(a.out, f"run{i}_{arm}.log")
     t = time.time()
     with open(log, "w", encoding = "utf-8") as lf:
         rc = subprocess.run([pys[arm], "-u", bench, o, os.path.join(a.work, f"sft{i}")], stdout = lf, stderr = subprocess.STDOUT, env = env, timeout = 3600).returncode
-    r = {"i": i, "arm": arm, "rc": rc, "s": round(time.time() - t, 1)}
+    r = {"i": i, "arm": arm, "rc": rc, "s": round(time.time() - t, 1),
+         "gpu_procs_before": procs_before, "gpu_procs_after": gpu_procs()}
     if os.path.exists(o):
         r.update(json.load(open(o, encoding = "utf-8")))
     else:
