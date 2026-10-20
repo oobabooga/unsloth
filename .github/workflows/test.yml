@@ -1,0 +1,188 @@
+name: PR 14245 Desktop chat-only on Windows AMD
+
+on:
+  push:
+    branches: [amd-devlab-14245-win]
+
+permissions: {}
+
+env:
+  SRC_SHA: f1f283a24e2dcda1166f45ddafa73e53f8d38c2d
+
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Setup paths and set existing state aside
+        run: |
+          $W = Join-Path $env:RUNNER_TEMP "pr14245-$env:GITHUB_RUN_ID"
+          $B = Join-Path $env:RUNNER_TEMP "pr14245-build"
+          New-Item -ItemType Directory -Force -Path $W, "$W\art", $B | Out-Null
+          "H_W=$W" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "H_B=$B" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "H_ART=$W\art" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled | Select-Object LongPathsEnabled
+          node --version; npm --version; rustc --version; cargo --version; python --version
+          Get-Process | Where-Object { $_.Name -match 'unsloth|llama' } | Format-Table Name,Id,SessionId
+          $aside = @()
+          foreach ($p in @("$env:USERPROFILE\.unsloth", "$env:APPDATA\ai.unsloth.studio", "$env:LOCALAPPDATA\ai.unsloth.studio")) {
+            if (Test-Path -LiteralPath $p) {
+              $to = "$p.aside-$env:GITHUB_RUN_ID"
+              Rename-Item -LiteralPath $p -NewName (Split-Path $to -Leaf)
+              $aside += "$p|$to"
+              Write-Host "set aside: $p -> $to"
+            }
+          }
+          Set-Content -LiteralPath "$W\aside.txt" -Value $aside
+          Get-ChildItem "$env:LOCALAPPDATA" -Directory | Where-Object Name -match '^uv$' | ForEach-Object { "LOCALAPPDATA\uv exists" }
+          exit 0
+
+      - name: Fetch harness and source
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git init -q "$env:H_W\h" 2>&1 | Out-Null
+          git -C "$env:H_W\h" fetch -q --depth 1 https://github.com/oobabooga/unsloth $env:GITHUB_SHA
+          git -C "$env:H_W\h" checkout -q FETCH_HEAD
+          $src = "$env:H_B\src"
+          if (-not (Test-Path "$src\.git")) { git init -q $src }
+          $head = git -C $src rev-parse HEAD 2>$null
+          if ($head -ne $env:SRC_SHA) {
+            git -C $src fetch -q --depth 1 https://github.com/unslothai/unsloth $env:SRC_SHA
+            git -C $src checkout -q -f FETCH_HEAD
+          }
+          git -C $src log --oneline -1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          exit 0
+
+      - name: Build the Desktop app (debug, main at SRC_SHA)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $src = "$env:H_B\src"
+          $exe = "$env:H_B\target\debug\unsloth-studio.exe"
+          $stamp = "$env:H_B\built-sha.txt"
+          if ((Test-Path $exe) -and (Test-Path $stamp) -and ((Get-Content $stamp) -eq $env:SRC_SHA)) { Write-Host "cached build"; exit 0 }
+          Push-Location "$src\studio\frontend"
+          npm ci --no-fund --no-audit 2>&1 | Select-Object -Last 5
+          npm run build 2>&1 | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::frontend build failed"; exit 1 }
+          Pop-Location
+          $env:CARGO_TARGET_DIR = "$env:H_B\target"
+          cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 25
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
+          Set-Content $stamp $env:SRC_SHA
+          Get-Item $exe | Select-Object FullName,Length
+          exit 0
+
+      - name: Harness venv
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m venv "$env:H_W\hv"
+          & "$env:H_W\hv\Scripts\python.exe" -m pip install -q playwright==1.55.0 pywinauto==0.6.9 pillow 2>&1 | Select-Object -Last 3
+          & "$env:H_W\hv\Scripts\python.exe" -c "import playwright, pywinauto, PIL; print('ok')"
+          exit 0
+
+      - name: "Phase 1: first run, custom location, Chat only, explore UI, load model, chat"
+        run: |
+          . "$env:H_W\h\h\session1.ps1"
+          $pick = "$env:H_W\My Apps"
+          New-Item -ItemType Directory -Force -Path $pick | Out-Null
+          $root = "$pick\Unsloth\studio"
+          "H_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $rc = Invoke-InSession1 -Name firstrun -TimeoutMin 75 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" firstrun" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_PICK = $pick; H_ROOT = $root }
+          Get-ChildItem "$env:USERPROFILE\.unsloth" -Force -ErrorAction SilentlyContinue | Format-Table Name,Length
+          Get-Content "$env:USERPROFILE\.unsloth\desktop_studio_home" -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Measure after chat-only install
+        run: |
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "1-chat-only" "$env:H_ART"
+          exit 0
+
+      - name: "Phase 2: Desktop backend update (start_backend_update), relaunch"
+        run: |
+          . "$env:H_W\h\h\session1.ps1"
+          $rc = Invoke-InSession1 -Name update -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" update" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
+          exit 0
+
+      - name: Measure after update
+        run: |
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "2-after-update" "$env:H_ART"
+          exit 0
+
+      - name: "Phase 3: break the venv, let startup auto-repair fix it"
+        run: |
+          . "$env:H_W\h\h\session1.ps1"
+          $sp = "$env:H_ROOT\unsloth_studio\Lib\site-packages"
+          Rename-Item -LiteralPath "$sp\unsloth_cli" -NewName "unsloth_cli.broken-by-test"
+          Write-Host "renamed unsloth_cli"
+          $rc = Invoke-InSession1 -Name autorepair -TimeoutMin 60 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" autorepair" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
+          Get-ChildItem $sp -Directory | Where-Object Name -match 'unsloth_cli' | Format-Table Name
+          exit 0
+
+      - name: Measure after auto-repair
+        run: |
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "3-after-autorepair" "$env:H_ART"
+          exit 0
+
+      - name: "Phase 4: upgrade to full from Settings > Repair installation"
+        run: |
+          . "$env:H_W\h\h\session1.ps1"
+          $rc = Invoke-InSession1 -Name upgrade -TimeoutMin 90 -Command "`"$env:H_W\hv\Scripts\python.exe`" `"$env:H_W\h\h\harness.py`" upgrade" -Env @{ H_APP = "$env:H_B\target\debug\unsloth-studio.exe"; H_ART = $env:H_ART; H_ROOT = $env:H_ROOT }
+          exit 0
+
+      - name: Measure after upgrade
+        run: |
+          & "$env:H_W\hv\Scripts\python.exe" "$env:H_W\h\h\measure.py" "$env:H_ROOT" "4-after-upgrade" "$env:H_ART"
+          exit 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force "$env:H_ART\logs" | Out-Null
+          Copy-Item "$env:H_W\*.log" "$env:H_ART\logs\" -ErrorAction SilentlyContinue
+          foreach ($d in @("$env:LOCALAPPDATA\ai.unsloth.studio", "$env:APPDATA\ai.unsloth.studio", "$env:USERPROFILE\.unsloth")) {
+            if (Test-Path $d) {
+              Get-ChildItem $d -Recurse -File -Include *.log,*.json,*.txt -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 20MB -and $_.FullName -notmatch 'EBWebView' } | ForEach-Object {
+                $rel = $_.FullName.Substring(3) -replace '[\\:]', '_'
+                Copy-Item $_.FullName "$env:H_ART\logs\$rel" -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          if ($env:H_ROOT -and (Test-Path $env:H_ROOT)) {
+            Get-ChildItem $env:H_ROOT -Recurse -File -Include *.log -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'site-packages' -and $_.Length -lt 20MB } | ForEach-Object {
+              $rel = $_.FullName.Substring($env:H_ROOT.Length) -replace '[\\:]', '_'
+              Copy-Item $_.FullName "$env:H_ART\logs\root$rel" -ErrorAction SilentlyContinue
+            }
+          }
+          exit 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: pr14245-win
+          path: ${{ env.H_ART }}
+          if-no-files-found: warn
+
+      - name: Cleanup and restore
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-ScheduledTask -TaskName 'pr14245-*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+          taskkill /F /T /IM unsloth-studio.exe 2>$null
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'pr14245' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Start-Sleep 5
+          foreach ($p in @("$env:USERPROFILE\.unsloth", "$env:APPDATA\ai.unsloth.studio", "$env:LOCALAPPDATA\ai.unsloth.studio")) {
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          foreach ($line in (Get-Content "$env:H_W\aside.txt" -ErrorAction SilentlyContinue)) {
+            if (-not $line) { continue }
+            $from, $to = $line -split '\|'
+            if ((Test-Path -LiteralPath $to) -and -not (Test-Path -LiteralPath $from)) { Rename-Item -LiteralPath $to -NewName (Split-Path $from -Leaf); Write-Host "restored $from" }
+          }
+          Remove-Item -LiteralPath $env:H_W -Recurse -Force -ErrorAction SilentlyContinue
+          exit 0
