@@ -15,7 +15,7 @@ import sys
 import time
 
 UNSLOTH = "git+https://github.com/unslothai/unsloth@a9d3f1e159d67cff61b26f7944927ae0348d1d1e"
-ZOO = "git+https://github.com/unslothai/unsloth-zoo@e782f78c6f47ec77d06bf764f5c9fd920cdd0861"
+ZOO = "git+https://github.com/unslothai/unsloth-zoo@994d277872025adf0787cf62e014b3316d7001d6"
 IDX = "https://download.pytorch.org/whl/rocm7.2"
 ARMS = {
     "A_2.11.0": ["torch==2.11.0+rocm7.2", "torchvision==0.26.0+rocm7.2", "torchaudio==2.11.0+rocm7.2"],
@@ -120,13 +120,19 @@ def gpu_procs():
     return {"cmd": None, "out": ""}
 
 
+json.dump(res, open(os.path.join(a.out, "perf.json"), "w", encoding = "utf-8"), indent = 1)
+if any(res["install"].values()):
+    sys.exit(f"install failed: {res['install']}")
 for i, arm in enumerate(ORDER):
     o = os.path.join(a.out, f"run{i}_{arm}.json")
     procs_before = gpu_procs()
     log = os.path.join(a.out, f"run{i}_{arm}.log")
     t = time.time()
     with open(log, "w", encoding = "utf-8") as lf:
-        rc = subprocess.run([pys[arm], "-u", bench, o, os.path.join(a.work, f"sft{i}")], stdout = lf, stderr = subprocess.STDOUT, env = env, timeout = 3600).returncode
+        try:
+            rc = subprocess.run([pys[arm], "-u", bench, o, os.path.join(a.work, f"sft{i}")], stdout = lf, stderr = subprocess.STDOUT, env = env, timeout = 2400).returncode
+        except subprocess.TimeoutExpired:
+            rc = -999
     r = {"i": i, "arm": arm, "rc": rc, "s": round(time.time() - t, 1),
          "gpu_procs_before": procs_before, "gpu_procs_after": gpu_procs()}
     if os.path.exists(o):
