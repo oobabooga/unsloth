@@ -16,7 +16,7 @@ Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) dri
 
 $env:K6P_DIR = $R; $env:K6P_DEV = "ROCm0"; $env:ARMS = "rel:rel,k8:k8,k9:k9"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
-  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", "q35,gptoss,q3m")
+  -ArgumentList @("-u", "`"$J\k6p_bench.py`"", "dl", "--models", $(if ($env:K9P_CELLS) { $env:K9P_CELLS } else { "q35,gptoss,q3m" }))
 
 # release bundle
 $TAG = "b11734-mix-c208e5f"
@@ -87,6 +87,13 @@ function Build-Tree($tree, $name, $tests) {
   foreach ($lib in "rocblas", "hipblaslt") {
     $ld = Get-ChildItem -Path $ROCM -Recurse -Directory -Filter "library" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq $lib } | Select-Object -First 1
     if ($ld) { New-Item -ItemType Directory -Force -Path "$d\$lib" | Out-Null; Copy-Item -Path $ld.FullName -Destination "$d\$lib\library" -Recurse -Force }
+  }
+  # the release's kpack step (unslothai/unsloth#13663): rocBLAS / hipBLASLt kernels from $ROCM\.kpack into rocblas\k, references rewritten
+  if ($env:K9P_KPACK -ne "0") {
+    & curl.exe -fsSL -o "$W\relocate_kpack.py" "https://raw.githubusercontent.com/unslothai/llama.cpp/f95b52162ed4b916a58d4f16b72662483cc55075/scripts/unsloth/relocate_kpack.py"
+    & $PY "$W\relocate_kpack.py" --bundle $d --kpack-src "$ROCM\.kpack" --archs gfx1151 *>> "$OUT\win_diag.txt"
+    Log "$name kpack rc=$LASTEXITCODE $((Get-ChildItem "$d\rocblas\k" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ' ')"
+    if ($LASTEXITCODE -ne 0) { return $false }
   }
   return $true
 }

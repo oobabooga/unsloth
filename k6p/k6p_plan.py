@@ -27,9 +27,13 @@ def step(name, *args, arms=None, extra=""):
                 print("   ", l.rstrip()[:300], flush=True)
 
 
-step("dl", "dl", "--models", "q35,gptoss,q3m")
+CELLS = os.environ.get("K9P_CELLS", "q35,q3m,gptoss").split(",")
+step("dl", "dl", "--models", ",".join(CELLS))
 step("devinfo", "devinfo", arms="rel,k8,k9")
-step("time_q35_full", "time", "--cell", "q35:full", "--reps", "3", arms="rel,k8,k9,k9b")
-step("time_q3m_spill8192_mtp", "time", "--cell", "q3m:spill8192", "--reps", "3", arms="rel,k8,k8b,k9,k9b,k9lm0,k9gs0", extra=MTP)
-step("time_gptoss_spill6144", "time", "--cell", "gptoss:spill6144", "--reps", "3", arms="rel,k8,k9,k9b,k9df0")
+if "q35" in CELLS:
+    step("time_q35_full", "time", "--cell", "q35:full", "--reps", "3", arms="rel,k8,k9,k9b")
+if "q3m" in CELLS:
+    step("time_q3m_spill8192_mtp", "time", "--cell", "q3m:spill8192", "--reps", "3", arms="rel,k8,k8b,k9,k9b,k9lm0,k9gs0", extra=MTP)
+if "gptoss" in CELLS:
+    step("time_gptoss_spill6144", "time", "--cell", "gptoss:spill6144", "--reps", "3", arms="rel,k8,k9,k9b,k9df0")
 print("=== PLAN DONE ===")

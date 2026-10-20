@@ -8,7 +8,7 @@ TAG=b11734-mix-c208e5f
 { echo "runner ${RUNNER_NAME:-?}"; uname -a; nproc; free -m; cat /sys/fs/cgroup/cpu.max 2>/dev/null; head -5 /proc/meminfo; for f in /sys/class/drm/card*/device/mem_info_*_total; do echo "$f $(cat $f)"; done; ls /opt/rocm* -d; rocminfo 2>/dev/null | grep -m3 -E "Marketing Name|gfx1"; df -h "$W" | tail -1; } > "$OUT/gpu_diag.txt" 2>&1
 cat "$OUT/gpu_diag.txt"
 export K6P_DIR="$R" K6P_DEV=ROCm0 ARMS="rel:rel,k8:k8,k9:k9"
-( python3 -u "$J/k6p_bench.py" dl --models q35,gptoss,q3m > "$OUT/dl.log" 2>&1 ) &
+( python3 -u "$J/k6p_bench.py" dl --models "${K9P_CELLS:-q35,gptoss,q3m}" > "$OUT/dl.log" 2>&1 ) &
 DLP=$!
 curl -fL --retry 5 -s -S "https://github.com/unslothai/llama.cpp/releases/download/$TAG/app-$TAG-linux-x64-rocm-gfx1151.tar.gz" | tar xz -C "$R/bins/rel"
 echo "release $TAG rc=$?" | tee -a "$OUT/gpu_diag.txt"; echo "$TAG linux-x64-rocm-gfx1151" > "$R/bins/rel/TAG"

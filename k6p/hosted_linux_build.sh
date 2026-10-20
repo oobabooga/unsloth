@@ -53,8 +53,12 @@ for p in libhipblas.so* librocblas.so* libamdhip64.so* librocsolver.so* libroctx
          rocm_sysdeps/lib/librocm_sysdeps_elf.so* rocm_sysdeps/lib/librocm_sysdeps_drm.so* rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* \
          rocm_sysdeps/lib/librocm_sysdeps_bz2.so*; do cp -L /opt/rocm/lib/$p "$B/" 2>/dev/null; done  # -L: no symlink may point outside the bundle
 [ -e "$B/libomp.so" ] || { rm -f "$B/libomp.so"; lo=$(find /opt/rocm -name 'libomp.so' 2>/dev/null | head -1); echo "libomp from ${lo:-none}"; [ -n "$lo" ] && cp -L "$lo" "$B/libomp.so"; }
-la="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"; [ -n "$la" ] && cp -L "$la" "$B/"
 ( cd "$B" && for f in *.so* llama-* test-*; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null; done )
+# the release's kpack step (unslothai/unsloth#13663): TheRock keeps the rocBLAS / hipBLASLt kernels in /opt/rocm/.kpack; a flat
+# bundle without them aborts in hipblasSgemm (hipErrorInvalidKernelFile). Same script and step as unsloth-prebuilt-rocm.yml.
+KP=https://raw.githubusercontent.com/unslothai/llama.cpp/f95b52162ed4b916a58d4f16b72662483cc55075/scripts/unsloth/relocate_kpack.py
+if [ "${K9P_KPACK:-1}" = 1 ]; then curl -fsSL "$KP" -o "$T/relocate_kpack.py" && python3 "$T/relocate_kpack.py" --bundle "$B" --kpack-src /opt/rocm/.kpack --archs gfx1151 || { echo "FATAL: kpack"; exit 1; }; ls -la "$B/rocblas/k"; fi
+la="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"; [ -n "$la" ] && cp -L "$la" "$B/"
 K=$(echo $N | tr a-z A-Z); echo "$N $(cut -c1-10 "$J/${K}_SHA") hip gfx1151 TheRock $ROCM_VER (hosted ubuntu-22.04)" > "$B/TAG"
 ( cd "$B" && ldd ./llama-server ./libggml-hip.so 2>/dev/null | grep "not found" ) && echo "WARNING: unresolved libs"
 mkdir -p "$T/art" "$T/bin_$N"; cp -a "$B"/. "$T/bin_$N/"
