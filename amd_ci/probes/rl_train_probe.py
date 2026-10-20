@@ -93,6 +93,7 @@ def main() -> int:
             import torch
             obs["device"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
             obs["hip"] = getattr(torch.version, "hip", None)
+            obs["cuda"] = getattr(torch.version, "cuda", None)
             from unsloth import FastLanguageModel  # noqa: F401  (patches TRL first)
             from datasets import Dataset
             from core.training import rewards, rl
