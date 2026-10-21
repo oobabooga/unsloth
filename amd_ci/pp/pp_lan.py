@@ -11,7 +11,9 @@
             pipeline groups, saturating load; efficiency = X(S, G) / (S x X1(P / G)). The master is a stage
             too: -ngl n_layer - k keeps the first k layers AND the output layer on its CPU (llama.cpp takes no
             CPU in --device), so the logits never cross the LAN; the other layers split evenly over S - 1
-            workers.
+            workers. A logits arm compares, on 2 workers holding every repeating layer, the output layer
+            on the last worker (-ngl 999: the logits cross the LAN each step) against the output layer on
+            the master's CPU (-ngl n_layer), single-user and saturated.
   summarize --in DIR --out DIR      VERDICT.md / verdict.json
 
 No plaintext RPC on the LAN: every rpc-server listens with mutual TLS 1.3 and an allowlist holding only
@@ -525,6 +527,16 @@ class Master:
                 args += ["--pipeline-groups", str(g)]
             return args, p
 
+        def logits(out_remote, g):
+            # 2 workers hold every repeating layer; the output layer on the last worker or on this CPU
+            p = g * B
+            args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(endpoints[:2]),
+                    "--device", "RPC0,RPC1", "-ngl", "999" if out_remote else str(a.n_layer),
+                    "-sm", "layer", "-ts", "1,1"]
+            if g > 1:
+                args += ["--pipeline-groups", str(g)]
+            return args, p
+
         plan = []
         stages = sorted({2, min(4, a.workers + 1), a.workers + 1})
         for rnd in range(a.rounds):
@@ -534,9 +546,18 @@ class Master:
             for s in stages:
                 for g in sorted({1, s, s + 1}):
                     plan.append(("rpc", s, g, g * B))
+            if a.workers >= 2:
+                for out_remote in (True, False):
+                    for g, conc in ((1, 1), (1, B), (3, 3 * B)):
+                        plan.append(("logits_remote" if out_remote else "logits_local", 2, g, conc))
         for rnd_i, (kind, s, g, p) in enumerate(plan):
             if kind.startswith("x1"):
                 res = self.measure(f"{kind}_{p}_{rnd_i}", local(p), p)
+            elif kind.startswith("logits"):
+                args, slots = logits(kind == "logits_remote", g)
+                res = self.measure(f"{kind}_g{g}_c{p}_{rnd_i}", args, p, ctls[:2], tls_env)
+                res["conc"] = p
+                p = slots
             else:
                 args, p = split(s, g)
                 res = self.measure(f"rpc_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], tls_env)
@@ -582,7 +603,12 @@ def summarize_cases(cases, B):
     x1 = [c["tok_s"] for c in ok if c["kind"] == "x1"]
     x1_med = statistics.median(x1) if x1 else None
     big = [c["tok_s"] for c in ok if c["kind"] == "x1_big"]
-    rows = []
+    rows, logit_rows = [], []
+    for kind in ("logits_remote", "logits_local"):
+        for (g, conc) in sorted({(c["groups"], c.get("conc")) for c in ok if c["kind"] == kind}):
+            xs = [c["tok_s"] for c in ok if c["kind"] == kind and c["groups"] == g and c.get("conc") == conc]
+            logit_rows.append({"output": "last worker (-ngl 999)" if kind == "logits_remote" else "master CPU (-ngl n_layer)",
+                               "groups": g, "concurrency": conc, "tok_s": round(statistics.median(xs), 2), "runs": xs})
     for (s, g) in sorted({(c["stages"], c["groups"]) for c in ok if c["kind"] == "rpc"}):
         xs = [c["tok_s"] for c in ok if c["kind"] == "rpc" and c["stages"] == s and c["groups"] == g]
         busy = [c.get("busy") for c in ok if c["kind"] == "rpc" and c["stages"] == s and c["groups"] == g and c.get("busy")]
@@ -592,7 +618,8 @@ def summarize_cases(cases, B):
                      "efficiency": round(med / (s * x1_med), 3) if x1_med else None,
                      "mean_util": busy[-1]["mean_util"] if busy else None,
                      "all_busy_share": busy[-1]["all_busy_share"] if busy else None})
-    return {"x1_tok_s": x1, "x1_median": x1_med, "x1_big_tok_s": big, "slots_per_group": B, "rows": rows}
+    return {"x1_tok_s": x1, "x1_median": x1_med, "x1_big_tok_s": big, "slots_per_group": B, "rows": rows,
+            "logits": logit_rows}
 
 
 def cmd_summarize(a):
@@ -614,6 +641,11 @@ def cmd_summarize(a):
         for r in sm.get("rows", []):
             lines.append(f"| {r['stages']} | {r['groups']} | {r['slots']} | {r['tok_s']} {r['runs']} | {r['ideal']} | "
                          f"{r['efficiency']} | {r['mean_util']} | {r['all_busy_share']} |")
+        if sm.get("logits"):
+            lines += ["", "Logits arm (2 workers hold every repeating layer):", "",
+                      "| output layer on | groups | concurrency | tok/s (median) |", "|---|---|---|---|"]
+            for r in sm["logits"]:
+                lines.append(f"| {r['output']} | {r['groups']} | {r['concurrency']} | {r['tok_s']} {r['runs']} |")
         lines += ["", "Steps:"] + [f"- {'PASS' if s['ok'] else 'FAIL'} {s['step']}" for s in res.get("steps", [])]
     out = Path(a.out_dir)
     out.mkdir(parents = True, exist_ok = True)
