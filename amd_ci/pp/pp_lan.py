@@ -67,6 +67,8 @@ def host_identity(info):
             "cpus": os.cpu_count(), "load": open("/proc/loadavg").read().split()[:3]}
 
 
+# the output head (a tied model duplicates token_embd for it) on the master CPU
+OUTPUT_ON_CPU = r"(output|token_embd)\.weight=CPU"
 LOCAL = os.environ.get("PP_LOCAL") == "1"  # smoke test on one host: loopback counts as the LAN
 
 
@@ -519,13 +521,15 @@ class Master:
             return ["-t", str(a.threads), "-np", str(slots), "-c", ctx(slots), "-ngl", "0"]
 
         def split(s, g):
-            # s stages: the master (first k layers + output, on its CPU) and s - 1 workers
+            # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
+            # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
+            # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
             eps = endpoints[:s - 1]
             k = round(a.n_layer / s)
             p = g * B
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(eps),
-                    "--device", ",".join(f"RPC{j}" for j in range(s - 1)), "-ngl", str(a.n_layer - k),
-                    "-sm", "layer", "-ts", ",".join(["1"] * (s - 1))]
+                    "--device", ",".join(f"RPC{j}" for j in range(s - 1)), "-ngl", str(a.n_layer - k + 1),
+                    "-sm", "layer", "-ts", ",".join(["1"] * (s - 1)), "-ot", OUTPUT_ON_CPU]
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
@@ -534,8 +538,9 @@ class Master:
             # 2 workers hold every repeating layer; the output layer on the last worker or on this CPU
             p = g * B
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(endpoints[:2]),
-                    "--device", "RPC0,RPC1", "-ngl", "999" if out_remote else str(a.n_layer),
-                    "-sm", "layer", "-ts", "1,1"]
+                    "--device", "RPC0,RPC1", "-ngl", "999", "-sm", "layer", "-ts", "1,1"]
+            if not out_remote:
+                args += ["-ot", OUTPUT_ON_CPU]
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
@@ -610,7 +615,7 @@ def summarize_cases(cases, B):
     for kind in ("logits_remote", "logits_local"):
         for (g, conc) in sorted({(c["groups"], c.get("conc")) for c in ok if c["kind"] == kind}):
             xs = [c["tok_s"] for c in ok if c["kind"] == kind and c["groups"] == g and c.get("conc") == conc]
-            logit_rows.append({"output": "last worker (-ngl 999)" if kind == "logits_remote" else "master CPU (-ngl n_layer)",
+            logit_rows.append({"output": "last worker" if kind == "logits_remote" else "master CPU (-ot)",
                                "groups": g, "concurrency": conc, "tok_s": round(statistics.median(xs), 2), "runs": xs})
     for (s, g) in sorted({(c["stages"], c["groups"]) for c in ok if c["kind"] == "rpc"}):
         xs = [c["tok_s"] for c in ok if c["kind"] == "rpc" and c["stages"] == s and c["groups"] == g]
