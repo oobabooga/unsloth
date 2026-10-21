@@ -1,0 +1,147 @@
+From a31ddda232f4117d64180b46ac1a1d4fa1e18599 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 15:31:14 -0700
+Subject: [PATCH] rpc: synchronize waits for this backend's own last command,
+ not every context sharing the endpoint
+
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 41 ++++++++++++++++++++++++----------
+ 1 file changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 07e2962f0..b376436cc 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -313,6 +313,9 @@ struct ggml_backend_rpc_context {
+     std::string                     endpoint;
+     uint32_t                        device;
+     std::string                     name;
++    // the last command this backend queued: the queue is FIFO, so waiting on it covers all of this backend's
++    // work without waiting for other backends (other llama contexts) that share the endpoint's dispatcher
++    std::shared_future<void>        last;
+ };
+ 
+ struct ggml_backend_rpc_buffer_context {
+@@ -592,8 +595,8 @@ public:
+ 
+     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
+     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+-    void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
+-    void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
++    std::shared_future<void> send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
++    std::shared_future<void> send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+ 
+     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
+     void event_free(ggml_backend_event_t event);
+@@ -602,7 +605,7 @@ public:
+     void synchronize();
+     void busy_spin_acquire();
+     void busy_spin_release();
+-    void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
++    std::shared_future<void> graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+     void free_buffer(std::shared_ptr<const void> request, size_t size);
+ 
+     void start(const std::string & endpoint);
+@@ -675,9 +678,11 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     future.wait();
+ }
+ 
+-void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
++std::shared_future<void> rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+     auto msg = make_msg(cmd, input, input_size, nullptr, 0);
++    std::shared_future<void> done = msg->completion.get_future().share();
+     GGML_ASSERT(queue.push(msg));
++    return done;
+ }
+ 
+ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+@@ -687,9 +692,11 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     future.wait();
+ }
+ 
+-void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
++std::shared_future<void> rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+     auto msg = make_msg(cmd, input, input_size, output, output_size);
++    std::shared_future<void> done = msg->completion.get_future().share();
+     GGML_ASSERT(queue.push(msg));
++    return done;
+ }
+ 
+ void rpc_dispatcher::send_traced(rpc_msg & msg) {
+@@ -1311,7 +1318,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
+     }
+     size_t input_size;
+     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+-    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
++    ctx->last = ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
+ }
+ 
+ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -1320,12 +1327,20 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
+     request->tensor = serialize_tensor(tensor);
+     request->offset = offset;
+     request->size = size;
+-    ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
++    ctx->last = ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+ }
+ 
+ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+-    rpc_ctx->dispatcher->synchronize();
++    // GGML_RPC_SYNC_ALL=1: drain the whole endpoint queue, including other backends' work (A/B only)
++    static const bool sync_all = [] { const char * e = getenv("GGML_RPC_SYNC_ALL"); return e && atoi(e) != 0; }();
++    if (sync_all) {
++        rpc_ctx->dispatcher->synchronize();
++        return;
++    }
++    if (rpc_ctx->last.valid()) {
++        rpc_ctx->last.wait();
++    }
+ }
+ 
+ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const rpc_dispatcher * dispatcher, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+@@ -1386,7 +1401,7 @@ void rpc_dispatcher::free_buffer(std::shared_ptr<const void> request, size_t siz
+     send(RPC_CMD_FREE_BUFFER, request, size);
+ }
+ 
+-void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
++std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
+     std::lock_guard<std::mutex> lock(graph_mutex);
+     GGML_ASSERT(cgraph->n_nodes > 0);
+     auto & device_graph_uids = graph_uids[device];
+@@ -1403,13 +1418,15 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph)
+             msg->dev          = (int) device;
+             msg->serialize_us = msg->t_enq - t_ser0;
+         }
++        std::shared_future<void> done = msg->completion.get_future().share();
+         GGML_ASSERT(queue.push(msg));
++        return done;
+     };
+     if (reuse) {
+         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+         request->device = device;
+         request->uid    = cgraph->uid;
+-        push_graph(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
++        return push_graph(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+     } else {
+         if (cgraph->uid != 0) {
+             if (device_graph_uids.size() >= GRAPH_CACHE_MAX) {
+@@ -1423,13 +1440,13 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph)
+         uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
+         LOG_DBG2("[%s] serialized graph: %zu bytes\n", __func__, input_size);
+         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+-        push_graph(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
++        return push_graph(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+     }
+ }
+ 
+ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+-    rpc_ctx->dispatcher->graph_compute(rpc_ctx->device, cgraph);
++    rpc_ctx->last = rpc_ctx->dispatcher->graph_compute(rpc_ctx->device, cgraph);
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+-- 
+2.43.0
+

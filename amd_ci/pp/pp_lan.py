@@ -584,6 +584,16 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag4:
+            # per-backend RPC synchronize (rpc_sync_per_backend.patch) x serial group submit, head on last worker + -bs
+            plan = [("x1", 1, 1, B), ("bs_v_ps", 2, 1, B)]
+            for g in (2, 3):
+                for variant in ("all_conc", "all_ser", "pb_conc", "pb_ser"):
+                    plan.append((f"bs_v_{variant}", 2, g, g * B))
+            plan.append(("bs_v_pb_ser", 3, 1, B))
+            for g in (2, 3, 4):
+                for variant in ("pb_conc", "pb_ser"):
+                    plan.append((f"bs_v_{variant}", 3, g, g * B))
         if a.diag3:
             # groups submit serially (groups_submit_serial.patch) vs concurrently, head on the last worker + -bs
             plan = [("x1", 1, 1, B)]
@@ -608,6 +618,9 @@ class Master:
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
+                if kind.startswith("bs_v_"):
+                    env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
+                    env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
                 if kind in ("bs_conc", "bs_serial"):
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "1" if kind == "bs_serial" else "0"
                 if kind == "bs_tsplit":
@@ -741,6 +754,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag4", action = "store_true", help = "per-backend RPC synchronize x serial group submit")
     m.add_argument("--diag3", action = "store_true", help = "S = 2, 3 x G = 1..3 x groups submitting serially vs concurrently")
     m.add_argument("--diag2", action = "store_true", help = "2-stage backend-sampling sweep: base / OMP passive / -t T/G / worker repack")
     m.add_argument("--backend-sampling", action = "store_true", help = "add head-on-last-worker cases with --backend-sampling")
