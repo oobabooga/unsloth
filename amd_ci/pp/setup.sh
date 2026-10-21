@@ -30,6 +30,8 @@ git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$L" || {
 git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q FETCH_HEAD || { echo "FATAL: fetch $PR"; exit 1; }
 git -C "$L" rev-parse HEAD | tee "$W/out/llama_sha.txt"
 git -C "$L" apply "$HERE/../homelink/tls_pr$PR.patch" || { echo "FATAL: TLS patch does not apply"; exit 1; }
+# client forgets cached graph uids on FREE_BUFFER like the server does (else --backend-sampling + groups aborts)
+git -C "$L" apply "$HERE/../homelink/rpc_graph_cache_free.patch" || { echo "FATAL: graph cache patch does not apply"; exit 1; }
 FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
 command -v ccache >/dev/null && FLAGS="$FLAGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 if echo '#include <openssl/ssl.h>' | ${CC:-cc} -E -x c - >/dev/null 2>&1; then

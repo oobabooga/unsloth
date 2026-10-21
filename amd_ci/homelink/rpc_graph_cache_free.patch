@@ -1,0 +1,49 @@
+From f086a0a29d0723edf1df5ef2a9a3061e7bc58c9e Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 13:37:25 -0700
+Subject: [PATCH] rpc: forget cached graph uids when a buffer is freed (the
+ server already drops them)
+
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 336fe6baf..ae68311ab 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -598,6 +598,7 @@ public:
+     void busy_spin_acquire();
+     void busy_spin_release();
+     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
++    void free_buffer(std::shared_ptr<const void> request, size_t size);
+ 
+     void start(const std::string & endpoint);
+     void work();
+@@ -874,7 +875,7 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     auto request = std::make_shared<rpc_msg_free_buffer_req>();
+     request->remote_ptr = ctx->remote_ptr;
+     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
+-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
++    ctx->dispatcher->free_buffer(request, sizeof(*request));
+     delete ctx;
+ }
+ 
+@@ -1372,6 +1373,14 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
+     return output;
+ }
+ 
++// the server drops every cached graph when it frees a buffer (their nodes may point into it), so forget
++// them here too, under graph_mutex so no graph_compute can pick RECOMPUTE between the two
++void rpc_dispatcher::free_buffer(std::shared_ptr<const void> request, size_t size) {
++    std::lock_guard<std::mutex> lock(graph_mutex);
++    graph_uids.clear();
++    send(RPC_CMD_FREE_BUFFER, request, size);
++}
++
+ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
+     std::lock_guard<std::mutex> lock(graph_mutex);
+     GGML_ASSERT(cgraph->n_nodes > 0);
+-- 
+2.43.0
+

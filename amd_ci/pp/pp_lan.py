@@ -526,7 +526,7 @@ class Master:
         def local(slots):
             return ["-t", str(a.threads), "-np", str(slots), "-c", ctx(slots), "-ngl", "0"]
 
-        def split(s, g, head_local = True):
+        def split(s, g, head_local = True, bs = False):
             # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
             # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
             # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
@@ -537,17 +537,21 @@ class Master:
                     "--device", ",".join(f"RPC{j}" for j in range(s - 1)),
                     "-ngl", str(a.n_layer - k + (1 if head_local else 0)),
                     "-sm", "layer", "-ts", ",".join(["1"] * (s - 1))] + (HEAD_LOCAL if head_local else [])
+            if bs:  # sample on the device holding the head: only token ids cross back
+                args += ["--backend-sampling"]
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
 
-        def logits(out_remote, g):
+        def logits(out_remote, g, bs = False):
             # 2 workers hold every repeating layer; the output layer on the last worker or on this CPU
             p = g * B
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(endpoints[:2]),
                     "--device", "RPC0,RPC1", "-ngl", "999", "-sm", "layer", "-ts", "1,1"]
             if not out_remote:
                 args += HEAD_LOCAL
+            if bs:
+                args += ["--backend-sampling"]
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
@@ -564,20 +568,23 @@ class Master:
                 for g in sorted({1, s, s + 1}):
                     for hl in heads:
                         plan.append(("rpc" if hl else "rpc_hr", s, g, g * B))
+                    if a.backend_sampling:
+                        plan.append(("rpc_bs", s, g, g * B))
             if a.workers >= 2:
-                for out_remote in (True, False):
+                kinds = ["logits_remote", "logits_local"] + (["logits_bs"] if a.backend_sampling else [])
+                for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
-                        plan.append(("logits_remote" if out_remote else "logits_local", 2, g, conc))
+                        plan.append((kind, 2, g, conc))
         for rnd_i, (kind, s, g, p) in enumerate(plan):
             if kind.startswith("x1"):
                 res = self.measure(f"{kind}_{p}_{rnd_i}", local(p), p)
             elif kind.startswith("logits"):
-                args, slots = logits(kind == "logits_remote", g)
+                args, slots = logits(kind != "logits_local", g, kind == "logits_bs")
                 res = self.measure(f"{kind}_g{g}_c{p}_{rnd_i}", args, p, ctls[:2], tls_env)
                 res["conc"] = p
                 p = slots
             else:
-                args, p = split(s, g, kind == "rpc")
+                args, p = split(s, g, kind == "rpc", kind == "rpc_bs")
                 res = self.measure(f"{kind}_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], tls_env)
             res.update({"kind": kind, "stages": s, "groups": g, "slots": p})
             R["cases"].append(res)
@@ -622,17 +629,18 @@ def summarize_cases(cases, B):
     x1_med = statistics.median(x1) if x1 else None
     big = [c["tok_s"] for c in ok if c["kind"] == "x1_big"]
     rows, logit_rows = [], []
-    for kind in ("logits_remote", "logits_local"):
+    for kind in ("logits_remote", "logits_local", "logits_bs"):
         for (g, conc) in sorted({(c["groups"], c.get("conc")) for c in ok if c["kind"] == kind}):
             xs = [c["tok_s"] for c in ok if c["kind"] == kind and c["groups"] == g and c.get("conc") == conc]
-            logit_rows.append({"output": "last worker" if kind == "logits_remote" else "master CPU (-ot)",
+            logit_rows.append({"output": {"logits_remote": "last worker", "logits_local": "master CPU (-ot)",
+                                          "logits_bs": "last worker + --backend-sampling"}[kind],
                                "groups": g, "concurrency": conc, "tok_s": round(statistics.median(xs), 2), "runs": xs})
-    for (kind, s, g) in sorted({(c["kind"], c["stages"], c["groups"]) for c in ok if c["kind"] in ("rpc", "rpc_hr")}):
+    for (kind, s, g) in sorted({(c["kind"], c["stages"], c["groups"]) for c in ok if c["kind"] in ("rpc", "rpc_hr", "rpc_bs")}):
         same = [c for c in ok if c["kind"] == kind and c["stages"] == s and c["groups"] == g]
         xs = [c["tok_s"] for c in same]
         busy = [c.get("busy") for c in same if c.get("busy")]
         med = statistics.median(xs)
-        rows.append({"head": "master" if kind == "rpc" else "last worker",
+        rows.append({"head": {"rpc": "master", "rpc_hr": "last worker", "rpc_bs": "last worker + backend sampling"}[kind],
                      "stages": s, "groups": g, "slots": g * B, "tok_s": round(med, 2), "runs": xs,
                      "ideal": round(s * x1_med, 2) if x1_med else None,
                      "efficiency": round(med / (s * x1_med), 3) if x1_med else None,
@@ -691,6 +699,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--backend-sampling", action = "store_true", help = "add head-on-last-worker cases with --backend-sampling")
     m.add_argument("--min-workers", type = int, default = 0, help = "run with this many if the rest never start (0 = all)")
     m.add_argument("--out-dir", required = True)
     m.add_argument("--wait-s", type = float, default = 2400)

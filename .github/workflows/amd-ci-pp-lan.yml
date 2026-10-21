@@ -135,7 +135,7 @@ jobs:
           D="$AMD_CI_WORK/out/master"; mkdir -p "$D"
           echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
           python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" master --bin "$AMD_CI_WORK/llama/build-tls/bin" \
-            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 2 --min-workers 2 --stages 2,3 --head-local both --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
+            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 2 --min-workers 2 --stages 2,3 --head-local both --backend-sampling --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
             --n-layer 36 --slots-per-group 16 --n-predict 64 --waves 2 --rounds 1 --wait-s 2700 2>&1 | tee "$D/master.log"
           echo "master rc=${PIPESTATUS[0]}"
           test -s "$D/master_result.json"
