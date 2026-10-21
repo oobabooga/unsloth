@@ -529,12 +529,13 @@ class Master:
         def local(slots):
             return ["-t", str(a.threads), "-np", str(slots), "-c", ctx(slots), "-ngl", "0"]
 
-        def split(s, g, head_local = True, bs = False):
+        def split(s, g, head_local = True, bs = False, master_layers = None):
             # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
             # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
             # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
             eps = endpoints[:s - 1]
-            k = round(a.n_layer / s)
+            # the master holds k + 1 layers when the head is remote (-ngl counts the head first)
+            k = (master_layers - 1) if master_layers else round(a.n_layer / s)
             p = g * B
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(eps),
                     "--device", ",".join(f"RPC{j}" for j in range(s - 1)),
@@ -584,6 +585,15 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag5:
+            # stage balance: fewer layers on the master (it also builds graphs, serializes, samples, serves HTTP)
+            plan = [("x1", 1, 1, B)]
+            for ml in (19, 15, 12):
+                for g in (1, 2, 3):
+                    plan.append((f"bs_m{ml}", 2, g, g * B))
+            for ml in (13, 9):
+                for g in (1, 3):
+                    plan.append((f"bs_m{ml}", 3, g, g * B))
         if a.diag4:
             # per-backend RPC synchronize (rpc_sync_per_backend.patch) x serial group submit, head on last worker + -bs
             plan = [("x1", 1, 1, B), ("bs_v_ps", 2, 1, B)]
@@ -614,10 +624,14 @@ class Master:
                 if want != repacked:
                     restart_workers(want)
                     repacked = want
-                args, p = split(s, g, False, True)
+                ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
+                args, p = split(s, g, False, True, ml)
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
+                if kind.startswith("bs_m"):
+                    env["GGML_RPC_SYNC_ALL"] = "0"
+                    env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -754,6 +768,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag5", action = "store_true", help = "stage balance: layers on the master x groups")
     m.add_argument("--diag4", action = "store_true", help = "per-backend RPC synchronize x serial group submit")
     m.add_argument("--diag3", action = "store_true", help = "S = 2, 3 x G = 1..3 x groups submitting serially vs concurrently")
     m.add_argument("--diag2", action = "store_true", help = "2-stage backend-sampling sweep: base / OMP passive / -t T/G / worker repack")
