@@ -659,7 +659,8 @@ class Master:
         return 0 if all(s["ok"] for s in R["steps"]) else 1
 
     def list_devices(self, env):
-        r = subprocess.run([str(self.bins["tls"] / "llama-server"), "--list-devices"] + env.pop("_RPC_ARGS"),
+        # --rpc first: --list-devices prints and exits as soon as it is parsed.
+        r = subprocess.run([str(self.bins["tls"] / "llama-server")] + env.pop("_RPC_ARGS") + ["--list-devices"],
                            env = env, capture_output = True, text = True, timeout = 120)
         out = r.stdout + r.stderr
         return [s.strip() for s in out.splitlines() if re.match(r"\s*RPC\d*\S*:", s)], out[-800:]

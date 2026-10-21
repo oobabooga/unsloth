@@ -80,10 +80,10 @@ jobs:
         if: always()
         run: |
           D="$AMD_CI_WORK/out/worker"; touch "$D/STOP" 2>/dev/null
-          PID=$(cat "$D/control.pid" 2>/dev/null); [ -n "$PID" ] && kill "$PID" 2>/dev/null
+          PID=$(cat "$D/control.pid" 2>/dev/null); [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
           sleep 3
           # Only processes started from this job's work tree: other jobs on a shared box are not ours.
-          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null; done
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null || true; done
           true
 
       - uses: actions/upload-artifact@v4
@@ -139,7 +139,7 @@ jobs:
         if: always()
         run: |
           # Only processes started from this job's work tree: other jobs on a shared box are not ours.
-          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null; done
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null || true; done
           true
 
       - uses: actions/upload-artifact@v4
