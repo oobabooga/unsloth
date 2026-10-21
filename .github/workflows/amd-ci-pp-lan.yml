@@ -1,0 +1,183 @@
+name: "AMD CI: pipeline parallelism across 5 machines over llama.cpp RPC"
+
+# Does throughput scale with the number of machines? One master and four worker strix-halo boxes on the
+# lab LAN (CPU builds, so no GPU concurrency group). llama.cpp = unslothai/llama.cpp#187
+# (--pipeline-groups) + its mutual TLS RPC transport. Every worker's ggml-rpc-server listens on the LAN
+# only with TLS 1.3 and an allowlist holding this run's master certificate (a CA made for the run signs
+# each worker's CSR; worker keys never leave their box). The master holds the first layers and the
+# output layer on its own CPU, the rest is split evenly over the workers. Efficiency =
+# X(S stages, G groups) / (S x single-box X1 at the per-group batch); per-stage CPU use is sampled.
+
+on:
+  push:
+    branches: [amd-ci-pp-lan]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  HIP_VISIBLE_DEVICES: ""
+  ROCR_VISIBLE_DEVICES: ""
+  PP_MODEL_REPO: unsloth/Qwen3-4B-GGUF
+  PP_MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
+
+jobs:
+  worker:
+    name: "worker ${{ matrix.index }} (Linux)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pp-worker-${{ matrix.index }}"
+
+      - name: Setup (venv, llama.cpp #187 + TLS CPU build)
+        timeout-minutes: 60
+        run: |
+          set -uo pipefail
+          bash amd_ci/pp/setup.sh worker 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
+          grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
+
+      - name: Start worker control
+        run: |
+          set -uo pipefail
+          export HOME="$AMD_CI_WORK/home"
+          . "$AMD_CI_WORK/venv/bin/activate"
+          D="$AMD_CI_WORK/out/worker"; mkdir -p "$D"
+          setsid python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" worker --bin "$AMD_CI_WORK/llama/build-tls/bin" \
+            --out-dir "$D" --index ${{ matrix.index }} --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" --window-s 6000 \
+            > "$D/control.log" 2>&1 < /dev/null &
+          echo $! > "$D/control.pid"
+          for i in $(seq 60); do [ -s "$D/self.json" ] && break; sleep 0.5; done
+          cat "$D/control.log"; test -s "$D/self.json" || { echo "FATAL: control did not start"; exit 1; }
+          echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pp-worker-self-${{ matrix.index }}-${{ github.run_attempt }}
+          path: ${{ env.AMD_CI_WORK }}/out/worker/self.json
+          retention-days: 3
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Serve the master until it is done
+        timeout-minutes: 120
+        run: |
+          set -uo pipefail
+          D="$AMD_CI_WORK/out/worker"; PID=$(cat "$D/control.pid")
+          while kill -0 "$PID" 2>/dev/null; do sleep 10; done
+          tail -40 "$D/control.log"
+          test -s "$D/worker_result.json"
+
+      - name: Stop leftovers
+        if: always()
+        run: |
+          D="$AMD_CI_WORK/out/worker"; touch "$D/STOP" 2>/dev/null || true
+          PID=$(cat "$D/control.pid" 2>/dev/null); [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+          sleep 3
+          # Only processes started from this job's work tree: other jobs on a shared box are not ours.
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null || true; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pp-result-worker-${{ matrix.index }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.AMD_CI_WORK }}/out/worker/*.json
+            ${{ env.AMD_CI_WORK }}/out/worker/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+  master:
+    name: "master (Linux)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pp-master"
+
+      - name: Setup (venv, llama.cpp #187 + TLS CPU build, model)
+        timeout-minutes: 60
+        run: |
+          set -uo pipefail
+          bash amd_ci/pp/setup.sh master 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
+          grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
+
+      - name: Pipeline-parallel sweep (master side)
+        timeout-minutes: 120
+        env:
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          export HOME="$AMD_CI_WORK/home"
+          . "$AMD_CI_WORK/venv/bin/activate"
+          D="$AMD_CI_WORK/out/master"; mkdir -p "$D"
+          echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
+          python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" master --bin "$AMD_CI_WORK/llama/build-tls/bin" \
+            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
+            --n-layer 36 --slots-per-group 16 --n-predict 64 --waves 2 --rounds 2 --wait-s 2700 2>&1 | tee "$D/master.log"
+          echo "master rc=${PIPESTATUS[0]}"
+          test -s "$D/master_result.json"
+
+      - name: Stop leftovers
+        if: always()
+        run: |
+          for p in $(pgrep -u "$(id -u)" -f "$AMD_CI_WORK/" 2>/dev/null); do [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill "$p" 2>/dev/null || true; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pp-result-master-${{ github.run_attempt }}
+          path: |
+            ${{ env.AMD_CI_WORK }}/out/master/*.json
+            ${{ env.AMD_CI_WORK }}/out/master/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.log
+            ${{ env.AMD_CI_WORK }}/out/*.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+  summary:
+    name: "pipeline verdict"
+    needs: [worker, master]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pp-result-*-${{ github.run_attempt }}
+          path: results
+
+      - name: Summarize
+        run: |
+          python3 amd_ci/pp/pp_lan.py summarize --in results --out verdict || true
+          cat verdict/VERDICT.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pp-verdict-${{ github.run_attempt }}
+          path: verdict
+          retention-days: 14
+          if-no-files-found: warn
