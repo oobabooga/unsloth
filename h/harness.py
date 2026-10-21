@@ -953,6 +953,10 @@ def capture_export(page, port, root, tag):
         time.sleep(5)
         loc = page.evaluate("() => ({language: navigator.language, languages: navigator.languages, stored: localStorage.getItem('unsloth_locale'), htmlLang: document.documentElement.lang})")
     res["locale"] = loc
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Emulation.setDeviceMetricsOverride", {"width": 1200, "height": 820, "deviceScaleFactor": 2, "mobile": False})
+    time.sleep(2)
+    res["css_viewport"] = page.evaluate("() => ({width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio})")
     nav = more_item_page(page, "Export")
     res["nav"] = nav if isinstance(nav, str) else {k: nav.get(k) for k in ("disabled", "url")}
     if isinstance(nav, dict) and nav.get("url", "").find("/export") < 0:
@@ -967,6 +971,9 @@ def capture_export(page, port, root, tag):
         res["banner"] = re.sub(r"\s+", " ", alert.first.inner_text()).strip()
         alert.first.scroll_into_view_if_needed()
         time.sleep(1)
+        page.mouse.move(5, 5)
+        time.sleep(1)
+        res["banner_box_static"] = alert.first.bounding_box()
         shot(page, f"{tag}-export-banner")
     else:
         res["banner"] = None
@@ -992,7 +999,7 @@ def capture_export(page, port, root, tag):
         res["card_tooltip"] = read_tooltips(page)
         tip = page.locator('[data-slot="tooltip-content"], [role="tooltip"]').first
         res["boxes"] = {
-            "viewport": page.viewport_size,
+            "viewport": page.evaluate("() => ({width: window.innerWidth, height: window.innerHeight})"),
             "banner": alert.first.bounding_box() if alert.count() else None,
             "card": box,
             "tooltip": tip.bounding_box() if tip.count() else None,
