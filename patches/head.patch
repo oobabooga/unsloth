@@ -1,7 +1,7 @@
 From 73a6e4f3582984c99a341df1a7522646b5690ac2 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Tue, 20 Oct 2026 20:37:30 -0700
-Subject: [PATCH] FP8 block dequant on ROCm: decode e4m3fn bytes on archs
+Subject: [PATCH 1/2] FP8 block dequant on ROCm: decode e4m3fn bytes on archs
  without OCP fp8 hardware
 
 On ROCm archs without OCP e4m3fn hardware (gfx1151 and other RDNA3 / RDNA2 / CDNA2 / CDNA3) the
@@ -287,6 +287,184 @@ index 4e5564ad3d..5ca26567f4 100644
      # An fp8 dtype this device cannot compile: fall back instead of raising from the fallback.
      kernel_fp8_unsupported = _fp8_kernel_unsupported(weight)
      if (
+-- 
+2.43.0
+
+
+From b65631b7eea0b6c50cac7f9537355080a5a363a8 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Tue, 20 Oct 2026 20:52:59 -0700
+Subject: [PATCH 2/2] Byte dequant on gfx11 only; other ROCm archs keep their
+ route
+
+---
+ tests/test_fp8_pre_sm89_byte_dequant.py     | 39 +++++++++++----------
+ tests/test_fp8_pre_sm89_dequant_fallback.py |  4 +--
+ unsloth/kernels/fp8.py                      | 17 ++++-----
+ 3 files changed, 31 insertions(+), 29 deletions(-)
+
+diff --git a/tests/test_fp8_pre_sm89_byte_dequant.py b/tests/test_fp8_pre_sm89_byte_dequant.py
+index a30a8f8634..0c42e91172 100644
+--- a/tests/test_fp8_pre_sm89_byte_dequant.py
++++ b/tests/test_fp8_pre_sm89_byte_dequant.py
+@@ -17,14 +17,14 @@ needs_cuda = pytest.mark.skipif(not CUDA, reason = "needs CUDA")
+ @pytest.fixture
+ def pre_sm89(monkeypatch):
+     # Real pre-sm89 cards take this path anyway; newer ones are told they are an A100.
+-    # On ROCm the real device decides: gfx1151 and other archs without OCP fp8 take the byte decoder.
++    # On ROCm the real device decides: gfx11 (gfx1151) takes the byte decoder.
+     fp8._fp8_device_lacks_kernel.cache_clear()
+-    fp8._rocm_lacks_ocp_fp8.cache_clear()
++    fp8._rocm_bytes_dequant_arch.cache_clear()
+     if CUDA and torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 9):
+         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 0))
+     yield
+     fp8._fp8_device_lacks_kernel.cache_clear()
+-    fp8._rocm_lacks_ocp_fp8.cache_clear()
++    fp8._rocm_bytes_dequant_arch.cache_clear()
+ 
+ 
+ def _weight(
+@@ -187,10 +187,10 @@ def _router(monkeypatch):
+                     mp.setattr(torch.cuda, "get_device_properties", _no_props)
+                 mp.setattr(fp8.triton, "__version__", triton_version)
+             fp8._fp8_device_lacks_kernel.cache_clear()
+-            fp8._rocm_lacks_ocp_fp8.cache_clear()
++            fp8._rocm_bytes_dequant_arch.cache_clear()
+             fp8._blockwise_weight_dequant_any_shape(weight, s, list(block), torch.bfloat16)
+         fp8._fp8_device_lacks_kernel.cache_clear()
+-        fp8._rocm_lacks_ocp_fp8.cache_clear()
++        fp8._rocm_bytes_dequant_arch.cache_clear()
+         return {1: "bytes", 2: "triton_fp8"}.get(calls[0], "?") if calls else "torch"
+ 
+     return route, w
+@@ -206,24 +206,25 @@ def test_routes_to_bytes_kernel_only_on_nvidia_pre_sm89(monkeypatch):
+     assert route((8, 9)) == "triton_fp8"
+     assert route((9, 0)) == "triton_fp8"
+     assert route((9, 0), weight = _weight(130, 256, "cuda")) == "torch"
+-    # ROCm without fp8e4nv (triton 3.2 on gfx90a) used to keep the torch loop; it now takes the byte decoder.
+-    assert route((9, 4), hip = "6.4.0") == "bytes"
++    # CDNA (gfx90a here, triton 3.2 without fp8e4nv) keeps the torch loop; only gfx11 takes the byte decoder.
++    assert route((9, 4), hip = "6.4.0") == "torch"
++    assert route((11, 5), hip = "6.4.0", arch = "gfx1151") == "bytes"
+     # e5m2 weights are compiled natively before sm89 and never reach the byte decoder.
+     assert route((8, 0), weight = w.float().to(torch.float8_e5m2)) == "triton_fp8"
+ 
+ 
+ ROCM_ROUTES = [
+     # (gcnArchName, triton, route, route with UNSLOTH_FP8_HIP_BYTES_DEQUANT=0 = the old one).
+-    # Archs without OCP fp8 take the byte decoder whatever triton can compile.
++    # gfx11 (RDNA3 / 3.5) takes the byte decoder whatever triton can compile; other archs keep their route.
+     ("gfx1151", "3.6.0", "bytes", "triton_fp8"),  # Strix Halo: fp8e4nv emulated, ~10x slower
+     ("gfx1151", "3.4.0", "bytes", "torch"),  # no fp8e4nv here: was the torch loop
+     ("gfx1100", "3.3.1", "bytes", "torch"),
+-    ("gfx1030", "3.5.0", "bytes", "triton_fp8"),
+-    ("gfx90a:sramecc+:xnack-", "3.5.0", "bytes", "triton_fp8"),
+-    ("gfx942:sramecc+:xnack-", "3.5.0", "bytes", "triton_fp8"),  # fnuz hardware only
+-    ("gfx942:sramecc+:xnack-", "3.4.0", "bytes", "triton_fp8"),
+-    ("gfx942:sramecc+:xnack-", "3.2.0", "bytes", "torch"),
+-    # OCP e4m3fn hardware keeps its route: native kernel when triton has fp8e4nv, else the torch loop.
++    ("gfx1030", "3.5.0", "triton_fp8", "triton_fp8"),
++    ("gfx90a:sramecc+:xnack-", "3.5.0", "triton_fp8", "triton_fp8"),
++    ("gfx942:sramecc+:xnack-", "3.5.0", "triton_fp8", "triton_fp8"),
++    ("gfx942:sramecc+:xnack-", "3.4.0", "triton_fp8", "triton_fp8"),
++    ("gfx942:sramecc+:xnack-", "3.2.0", "torch", "torch"),
++    # OCP e4m3fn hardware: native kernel when triton has fp8e4nv, else the torch loop.
+     ("gfx950", "3.5.0", "triton_fp8", "triton_fp8"),
+     ("gfx950", "3.2.0", "torch", "torch"),
+     ("gfx1201", "3.4.0", "triton_fp8", "triton_fp8"),
+@@ -271,9 +272,9 @@ def test_rocm_unknown_arch_keeps_its_route(monkeypatch):
+     _boom = _no_props
+     with monkeypatch.context() as mp:
+         mp.setattr(torch.cuda, "get_device_properties", _boom)
+-        fp8._rocm_lacks_ocp_fp8.cache_clear()
+-        assert not fp8._rocm_lacks_ocp_fp8(torch.device("cuda", 0))
+-    fp8._rocm_lacks_ocp_fp8.cache_clear()
++        fp8._rocm_bytes_dequant_arch.cache_clear()
++        assert not fp8._rocm_bytes_dequant_arch(torch.device("cuda", 0))
++    fp8._rocm_bytes_dequant_arch.cache_clear()
+     # Triton 3.5+ needs no arch for fp8e4nv, so the native kernel stays.
+     assert route((11, 5), hip = "6.4.0", arch = None, triton_version = "3.6.0") == "triton_fp8"
+ 
+@@ -285,7 +286,7 @@ HIP = CUDA and torch.version.hip is not None
+ @pytest.mark.parametrize("shape", [(4096, 4096), (14336, 4096), (4096, 14336), (130, 200)])
+ @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+ def test_real_rocm_device_takes_bytes_kernel_bit_exact(pre_sm89, monkeypatch, shape, out_dtype):
+-    # Unmocked ROCm: archs without OCP fp8 must run the byte decoder, bit-equal to the torch loop
++    # Unmocked ROCm: gfx11 must run the byte decoder, bit-equal to the torch loop
+     # and, where triton compiles fp8e4nv, to the emulated fp8 kernel it replaces.
+     m, n = shape
+     w = _weight(m, n, "cuda")
+@@ -296,7 +297,7 @@ def test_real_rocm_device_takes_bytes_kernel_bit_exact(pre_sm89, monkeypatch, sh
+         fp8, "_e4m3fn_bytes_dequant", lambda *a, **k: calls.append(1) or orig(*a, **k)
+     )
+     out = fp8.weight_dequant(w, s, out_dtype)
+-    if not fp8._rocm_lacks_ocp_fp8(w.device):
++    if not fp8._rocm_bytes_dequant_arch(w.device):
+         assert not calls
+         pytest.skip("OCP fp8 hardware: keeps the native kernel")
+     assert calls == [1]
+diff --git a/tests/test_fp8_pre_sm89_dequant_fallback.py b/tests/test_fp8_pre_sm89_dequant_fallback.py
+index 2aac560c43..5309166660 100644
+--- a/tests/test_fp8_pre_sm89_dequant_fallback.py
++++ b/tests/test_fp8_pre_sm89_dequant_fallback.py
+@@ -18,10 +18,10 @@ def _clear_capability_cache():
+     from unsloth.kernels import fp8
+ 
+     fp8._fp8_device_lacks_kernel.cache_clear()
+-    fp8._rocm_lacks_ocp_fp8.cache_clear()
++    fp8._rocm_bytes_dequant_arch.cache_clear()
+     yield
+     fp8._fp8_device_lacks_kernel.cache_clear()
+-    fp8._rocm_lacks_ocp_fp8.cache_clear()
++    fp8._rocm_bytes_dequant_arch.cache_clear()
+ 
+ 
+ def _make(
+diff --git a/unsloth/kernels/fp8.py b/unsloth/kernels/fp8.py
+index 5ca26567f4..ee3582c29a 100644
+--- a/unsloth/kernels/fp8.py
++++ b/unsloth/kernels/fp8.py
+@@ -514,20 +514,21 @@ def _fp8_device_lacks_kernel(device):
+     return torch.cuda.get_device_capability(device) < (8, 9)
+ 
+ 
+-# ROCm archs without OCP fp8 hardware either cannot compile fp8e4nv or emulate it in software, and both
+-# routes (torch loop / emulated weight_dequant_kernel) measured up to ~10x slower than one pass over the
+-# weight on gfx1151. The e4m3fn byte decoder is bit-identical, so they take it; 0 restores the old routes.
++# On gfx1151 (RDNA 3.5, no OCP fp8 hardware) both old routes (torch loop / emulated weight_dequant_kernel)
++# measured up to ~10x slower than one pass over the weight. The e4m3fn byte decoder is bit-identical, so
++# gfx11 takes it; 0 restores the old routes.
+ _HIP_FP8_BYTES_DEQUANT = os.environ.get("UNSLOTH_FP8_HIP_BYTES_DEQUANT", "1") != "0"
+ 
+ 
+ @functools.lru_cache(maxsize = None)
+-def _rocm_lacks_ocp_fp8(device):
+-    # OCP e4m3fn hardware: gfx950 (MI350) and gfx12 (RDNA4). Unknown archs keep their current route.
++def _rocm_bytes_dequant_arch(device):
++    # RDNA3 / 3.5 (gfx11): no OCP e4m3fn hardware, byte decode measured on gfx1151. Other archs
++    # (CDNA, RDNA2, gfx950 / gfx12 with native e4m3fn, unknown) keep their current route.
+     try:
+         arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0].lower()
+     except Exception:
+         return False
+-    return arch.startswith("gfx") and not (arch == "gfx950" or arch.startswith("gfx12"))
++    return arch.startswith("gfx11")
+ 
+ 
+ def _fp8_kernel_unsupported(tensor, kernel_dtype = None):
+@@ -774,9 +775,9 @@ def _blockwise_weight_dequant_any_shape(weight, weight_scale, block_size, out_dt
+         and weight.is_cuda
+         and weight.dtype == torch.float8_e4m3fn
+         and weight_scale.ndim == 2
+-        and _rocm_lacks_ocp_fp8(weight.device)
++        and _rocm_bytes_dequant_arch(weight.device)
+     ):
+-        # ROCm without OCP fp8 hardware: e4m3fn only (e4m3fnuz / e5m2 keep their routes).
++        # gfx11: e4m3fn only (e4m3fnuz / e5m2 keep their routes).
+         return _e4m3fn_bytes_dequant(
+             weight, weight_scale, int(block_size[0]), int(block_size[1]), out_dtype
+         )
 -- 
 2.43.0
 
