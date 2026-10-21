@@ -47,7 +47,7 @@ env:
   UNSLOTH_SHA: "6eefb76d0aba920a045bb16347eb9609e1c88401"
   # Expected zoo states (informational: states.py resolves them live; the probe records the real SHAs).
   EXPECT_ZOO_BASE: "cda2b273b53384a9a1765f2c037d5dc78a8370de"
-  EXPECT_ZOO_HEAD: "5915e113ea743870ee918b7601dc078683a11629"
+  EXPECT_ZOO_HEAD: "56f99f2c69bd084e20439230817de8094743e128"
   # AMD's Windows torch for gfx1151, the same index and pin unsloth's install.ps1 uses (multi-arch, rocm7.14.0).
   AMD_TORCH_INDEX: "https://repo.amd.com/rocm/whl-multi-arch/"
   AMD_TORCH_SPEC: "torch[device-gfx1151]==2.11.0+rocm7.14.0"
