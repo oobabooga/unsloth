@@ -1,0 +1,171 @@
+From 0ad4cdb5dde3d7e7714bd92c3eca4d20e388003f Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Tue, 20 Oct 2026 20:44:27 -0700
+Subject: [PATCH] MXFP4 dequant on ROCm: build the e8m0 scale from its fp32
+ bits so the fused kernel's self-check can pass
+
+On gfx1151 (ROCm torch 2.11, Triton 3.6) mxfp4_kernel_available() is False and every gpt-oss
+expert dequant runs mxfp4_dequantize_torch, ~29x slower than one pass. On ROCm the torch
+reference now forms 2^e from bits instead of torch.ldexp (x * pow(2, e)); values are the same as
+transformers (checked against fp64 for every byte under every scale). NVIDIA and CPU unchanged.
+UNSLOTH_MXFP4_HIP_EXACT_SCALE=0 restores ldexp.
+---
+ tests/test_mxfp4_packed_experts.py | 94 ++++++++++++++++++++++++++++++
+ unsloth_zoo/mxfp4_dequant.py       | 19 +++++-
+ 2 files changed, 111 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test_mxfp4_packed_experts.py b/tests/test_mxfp4_packed_experts.py
+index b201b7e5..51c20d08 100644
+--- a/tests/test_mxfp4_packed_experts.py
++++ b/tests/test_mxfp4_packed_experts.py
+@@ -88,6 +88,100 @@ def test_torch_reference_is_exact_on_every_torch(monkeypatch, dtype, old_torch_p
+ 
+ 
+ 
++def _every_byte_under_every_scale(device):
++    blocks = torch.arange(256, dtype = torch.uint8).reshape(16, 1, 16).repeat(256, 1, 1)
++    scales = torch.arange(256, dtype = torch.uint8).repeat_interleave(16).reshape(4096, 1)
++    lut = torch.tensor(_FP4, dtype = torch.float64)
++    want = torch.empty(4096, 1, 32, dtype = torch.float64)
++    want[..., 0::2] = lut[(blocks & 0x0F).long()]
++    want[..., 1::2] = lut[(blocks >> 4).long()]
++    want = (want * torch.exp2(scales.double() - 127).unsqueeze(-1)).reshape(4096, 32)
++    return blocks.to(device), scales.to(device), want
++
++
++@needs_cuda
++@pytest.mark.parametrize("scale_path", ["default", "ldexp", "ldexp_fp32", "exact_bits"])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++def test_device_reference_is_exact(monkeypatch, dtype, scale_path):
++    # On the GPU (ROCm included), not just the CPU: the fused kernel is checked against this reference.
++    # "default" is what this device runs; the forced paths are only required exact where they are used.
++    if scale_path != "default":
++        monkeypatch.setattr(mxd, "_HIP_EXACT_SCALE", scale_path == "exact_bits")
++        if scale_path == "ldexp_fp32":
++            monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
++        if scale_path.startswith("ldexp") and torch.version.hip is not None:
++            pytest.skip("ROCm builds 2^e from bits; ldexp there is the kill-switch path, observed separately")
++    blocks, scales, want = _every_byte_under_every_scale("cuda")
++    got = mxfp4_dequantize_torch(blocks, scales, dtype = dtype)
++    assert torch.equal(_bits(got), _bits(want.to(dtype)))
++
++
++@pytest.mark.parametrize("hip, env, expected", [(None, None, False), ("6.4", None, True), ("6.4", "0", False),
++                                                (None, "1", False)])
++def test_hip_exact_scale_switch(hip, env, expected):
++    # Read at import; NVIDIA keeps ldexp whatever the variable says.
++    code = (
++        "import torch; torch.version.hip = %r; import unsloth_zoo.mxfp4_dequant as m; "
++        "print('FLAG', m._HIP_EXACT_SCALE)" % (hip,)
++    )
++    run_env = dict(os.environ)
++    run_env.pop("UNSLOTH_MXFP4_HIP_EXACT_SCALE", None)
++    if env is not None:
++        run_env["UNSLOTH_MXFP4_HIP_EXACT_SCALE"] = env
++    run_env.setdefault("UNSLOTH_IS_PRESENT", "1")
++    out = subprocess.run([sys.executable, "-c", code], env = run_env, capture_output = True, text = True, timeout = 600)
++    line = [ln for ln in out.stdout.splitlines() if ln.startswith("FLAG ")]
++    assert line and line[-1] == f"FLAG {expected}", out.stdout[-2000:] + out.stderr[-2000:]
++
++
++def test_exact_scale_path_only_on_gpu_tensors(monkeypatch):
++    # Faked ROCm: CPU tensors keep their path; the bit-built path matches fp64 on CPU too when forced.
++    monkeypatch.setattr(mxd, "_HIP_EXACT_SCALE", True)
++    blocks, scales, want = _every_byte_under_every_scale("cpu")
++    for dtype in (torch.bfloat16, torch.float16, torch.float32):
++        assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, dtype = dtype)), _bits(want.to(dtype)))
++
++
++@needs_cuda
++@needs_triton
++@pytest.mark.skipif(torch.version.hip is None, reason = "needs a real ROCm device")
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_rocm_uses_the_fused_kernel(monkeypatch, dtype):
++    # Unmocked ROCm: the self-check must pass and mxfp4_dequantize must launch the kernel, bit-equal
++    # to the reference on gpt-oss-like scales and on every byte under every scale.
++    monkeypatch.setattr(mxd, "_KERNEL_VERIFIED", {})
++    assert mxd.mxfp4_kernel_available(dtype = dtype)
++    calls = []
++    real = mxd._kernel_dequantize
++    monkeypatch.setattr(mxd, "_kernel_dequantize", lambda *a: calls.append(1) or real(*a))
++    blocks, scales = _random_mxfp4(4, 288, 2880, device = "cuda", low = 110, high = 135)
++    for transpose in (False, True):
++        got = mxfp4_dequantize(blocks, scales, dtype = dtype, transpose = transpose)
++        want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
++        assert torch.equal(_bits(got), _bits(want))
++    assert len(calls) == 2
++    if dtype == torch.bfloat16:
++        b, s, want = _every_byte_under_every_scale("cuda")
++        got = mxd._kernel_dequantize(b.view(4096, 1, 1, 16), s.view(4096, 1, 1), dtype, False, None, None, None)
++        assert torch.equal(_bits(got.view(4096, 32)), _bits(want.to(dtype)))
++
++
++@needs_cuda
++@needs_triton
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_faked_rocm_exact_scale_reference_keeps_the_kernel(monkeypatch, dtype):
++    # The ROCm reference (2^e from bits) must pass the kernel's self-check wherever the ldexp one does.
++    monkeypatch.setattr(mxd, "_HIP_EXACT_SCALE", True)
++    monkeypatch.setattr(mxd, "_KERNEL_VERIFIED", {})
++    assert mxd.mxfp4_kernel_available(dtype = dtype)
++    calls = []
++    real = mxd._kernel_dequantize
++    monkeypatch.setattr(mxd, "_kernel_dequantize", lambda *a: calls.append(1) or real(*a))
++    blocks, scales = _random_mxfp4(2, 64, 128, device = "cuda")
++    got = mxfp4_dequantize(blocks, scales, dtype = dtype, transpose = True)
++    monkeypatch.setattr(mxd, "_HIP_EXACT_SCALE", False)
++    assert calls == [1] and torch.equal(_bits(got), _bits(mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = True)))
++
+ @pytest.mark.parametrize("transpose", [False, True])
+ @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
+ def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
+diff --git a/unsloth_zoo/mxfp4_dequant.py b/unsloth_zoo/mxfp4_dequant.py
+index 3a21a682..1e67f2d3 100644
+--- a/unsloth_zoo/mxfp4_dequant.py
++++ b/unsloth_zoo/mxfp4_dequant.py
+@@ -16,6 +16,8 @@
+ 
+ """MXFP4 (e2m1 nibbles + e8m0 block scales) to bf16 / fp16, matching transformers' convert_moe_packed_tensors; Triton kernel with a torch fallback."""
+ 
++import os
++
+ import torch
+ 
+ __all__ = [
+@@ -45,10 +47,16 @@ _TORCH_CHUNK_BYTES = 256 << 20
+ # torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
+ _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 12)
+ 
++# ROCm: the fused kernel's self-check failed on gfx1151, leaving dequant on this torch path. torch.ldexp
++# is x * pow(2, e) through HIP's pow, so on ROCm 2^e is built from its fp32 bits instead (exact, the
++# same values as transformers); 0 restores ldexp.
++_HIP_EXACT_SCALE = torch.version.hip is not None and os.environ.get("UNSLOTH_MXFP4_HIP_EXACT_SCALE", "1") != "0"
++
+ 
+ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
+     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
+-    work = dtype if _LDEXP_EXACT else torch.float32
++    exact_scale = _HIP_EXACT_SCALE and blocks.device.type == "cuda"
++    work = dtype if _LDEXP_EXACT and not exact_scale else torch.float32
+     lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
+     *prefix, G, B = blocks.shape
+     if transpose and not prefix:
+@@ -71,7 +79,14 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
+         piece[..., 0::2] = lut[(b & 0x0F).long()]
+         piece[..., 1::2] = lut[(b >> 4).long()]
+         exponent = (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)
+-        if _LDEXP_EXACT:
++        if exact_scale:
++            # 2^(s - 127) as fp32 bits (s 0 is the subnormal 2^-127; 255 is 2^127 then 2), one rounding.
++            biased = exponent + 127
++            pow2 = (biased.clamp(1, 254) << 23).view(torch.float32)
++            pow2 = torch.where(biased == 0, torch.full_like(pow2, 2.0 ** -127), pow2)
++            piece = piece * pow2
++            piece = torch.where(biased == 255, piece * 2, piece).to(dtype)
++        elif _LDEXP_EXACT:
+             piece = torch.ldexp(piece, exponent).to(dtype)
+         else:
+             # Exact in fp32, then one rounding; 255 as 2^127 then 2.
+-- 
+2.43.0
+
