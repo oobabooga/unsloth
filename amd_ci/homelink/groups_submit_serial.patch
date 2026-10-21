@@ -1,0 +1,41 @@
+From 0e62f9878dc7547f0dd353e1eb07cbc016d8deb9 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 15:04:23 -0700
+Subject: [PATCH] server: groups submit one at a time so a local CPU stage
+ pipelines with remote stages
+
+---
+ tools/server/server-context.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index dfa9977a3..62e8a6b23 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1074,6 +1074,10 @@ private:
+ 
+     int n_groups = 1;
+     std::vector<std::unique_ptr<server_group>> groups;
++    // groups submit one at a time: a group's local (CPU) stage computes inside llama_process, and two groups
++    // computing it at once share the cores and stay in phase, so no group runs while another waits on a
++    // remote stage. A GPU stage already serialises its kernels, so this costs only the host-side enqueue there.
++    std::mutex submit_mutex;
+ 
+     int n_seq_per_group = 1;
+ 
+@@ -4771,6 +4775,12 @@ private:
+             } window(&grp, &lk);
+ 
+             {
++                // LLAMA_GROUP_SUBMIT_SERIAL=0 lets groups submit concurrently again (A/B only)
++                static const bool serial = [] { const char * e = getenv("LLAMA_GROUP_SUBMIT_SERIAL"); return !e || atoi(e) != 0; }();
++                std::unique_lock<std::mutex> submit_lock(submit_mutex, std::defer_lock);
++                if (serial) {
++                    submit_lock.lock();
++                }
+                 server_trace_scope span("submit", grp.id, batch.view.size());
+                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             }
+-- 
+2.43.0
+

@@ -584,6 +584,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag3:
+            # groups submit serially (groups_submit_serial.patch) vs concurrently, head on the last worker + -bs
+            plan = [("x1", 1, 1, B)]
+            for s_ in (2, 3):
+                for variant in ("conc", "serial"):
+                    for g in (1, 2, 3):
+                        plan.append((f"bs_{variant}", s_, g, g * B))
         if a.diag2:
             # 2 stages, head on the last worker + backend sampling; what makes groups overlap on a CPU master
             plan = [("x1", 1, 1, B)]
@@ -601,6 +608,8 @@ class Master:
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
+                if kind in ("bs_conc", "bs_serial"):
+                    env["LLAMA_GROUP_SUBMIT_SERIAL"] = "1" if kind == "bs_serial" else "0"
                 if kind == "bs_tsplit":
                     args[args.index("-t") + 1] = str(max(1, a.threads // g))
                 res = self.measure(f"{kind}_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], env)
@@ -732,6 +741,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag3", action = "store_true", help = "S = 2, 3 x G = 1..3 x groups submitting serially vs concurrently")
     m.add_argument("--diag2", action = "store_true", help = "2-stage backend-sampling sweep: base / OMP passive / -t T/G / worker repack")
     m.add_argument("--backend-sampling", action = "store_true", help = "add head-on-last-worker cases with --backend-sampling")
     m.add_argument("--min-workers", type = int, default = 0, help = "run with this many if the rest never start (0 = all)")
