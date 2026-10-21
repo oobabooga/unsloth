@@ -23,12 +23,13 @@ python3 -m venv "$W/venv" || { echo "FATAL: venv"; exit 1; }
 python3 -m pip install -q --upgrade pip >/dev/null 2>&1
 python3 -m pip install -q cryptography psutil huggingface_hub || { echo "FATAL: pip"; exit 1; }
 
-echo "== llama.cpp pull/187/head + TLS, CPU + RPC"
+PR="${PP_LLAMA_PR:-187}"
+echo "== llama.cpp pull/$PR/head + TLS, CPU + RPC"
 L="$W/llama"
 git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$L" || { echo "FATAL: llama clone"; exit 1; }
-git -C "$L" fetch -q origin pull/187/head && git -C "$L" checkout -q FETCH_HEAD || { echo "FATAL: fetch 187"; exit 1; }
+git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q FETCH_HEAD || { echo "FATAL: fetch $PR"; exit 1; }
 git -C "$L" rev-parse HEAD | tee "$W/out/llama_sha.txt"
-git -C "$L" apply "$HERE/../homelink/tls_pr187.patch" || { echo "FATAL: TLS patch does not apply"; exit 1; }
+git -C "$L" apply "$HERE/../homelink/tls_pr$PR.patch" || { echo "FATAL: TLS patch does not apply"; exit 1; }
 FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
 command -v ccache >/dev/null && FLAGS="$FLAGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 if echo '#include <openssl/ssl.h>' | ${CC:-cc} -E -x c - >/dev/null 2>&1; then
@@ -43,6 +44,7 @@ rc=$?
   || { echo "FATAL: build rc=$rc"; tail -30 "$W/out/make.log"; exit 1; }
 "$L/build-tls/bin/ggml-rpc-server" --help 2>&1 | grep -q -- --tls-cert || { echo "FATAL: no TLS flags"; exit 1; }
 "$L/build-tls/bin/llama-server" --help 2>&1 | grep -q -- --pipeline-groups || { echo "FATAL: no --pipeline-groups"; exit 1; }
+if [ "$PR" = 191 ]; then "$L/build-tls/bin/ggml-rpc-server" --help 2>&1 | grep -q -- --trace || { echo "FATAL: no --trace"; exit 1; }; fi
 
 if [ "$ROLE" = master ]; then
   echo "== model"

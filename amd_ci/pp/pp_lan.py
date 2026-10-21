@@ -69,6 +69,8 @@ def host_identity(info):
 
 # the output head (a tied model duplicates token_embd for it) on the master CPU
 OUTPUT_ON_CPU = r"(output|token_embd)\.weight=CPU"
+HEAD_LOCAL = ["-ot", OUTPUT_ON_CPU]
+TRACE = os.environ.get("PP_TRACE") == "1"  # #191 event traces on the master and every rpc-server
 LOCAL = os.environ.get("PP_LOCAL") == "1"  # smoke test on one host: loopback counts as the LAN
 
 
@@ -181,6 +183,8 @@ class Worker:
                     "--tls-ca", str(self.tls / "ca.pem"), "--tls-allow", str(self.tls / "allow.txt")]
             if args.get("cache"):
                 argv += ["-c"]
+            if TRACE:
+                argv += ["--trace", str(self.out / f"trace_rpc_{port}.jsonl")]
             log = self.out / f"rpc_{port}_{int(time.time())}.log"
             env = dict(os.environ, HOME = str(self.out / "home"), LD_LIBRARY_PATH = str(self.bin))
             self.proc = subprocess.Popen(argv, stdout = open(log, "w"), stderr = subprocess.STDOUT, env = env,
@@ -396,6 +400,8 @@ class Master:
                 "--no-warmup", "--temp", "0"] + extra
         log = self.out / f"server_{tag}.log"
         env = dict(os.environ, LD_LIBRARY_PATH = str(self.bin), **(env_extra or {}))
+        if TRACE:
+            env["GGML_RPC_TRACE"] = str(self.out / f"trace_{tag}.jsonl")
         p = subprocess.Popen(argv, stdout = open(log, "w"), stderr = subprocess.STDOUT, env = env, start_new_session = True)
         end = time.time() + self.a.load_timeout_s
         while time.time() < end and p.poll() is None:
@@ -520,7 +526,7 @@ class Master:
         def local(slots):
             return ["-t", str(a.threads), "-np", str(slots), "-c", ctx(slots), "-ngl", "0"]
 
-        def split(s, g):
+        def split(s, g, head_local = True):
             # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
             # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
             # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
@@ -528,8 +534,9 @@ class Master:
             k = round(a.n_layer / s)
             p = g * B
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(eps),
-                    "--device", ",".join(f"RPC{j}" for j in range(s - 1)), "-ngl", str(a.n_layer - k + 1),
-                    "-sm", "layer", "-ts", ",".join(["1"] * (s - 1)), "-ot", OUTPUT_ON_CPU]
+                    "--device", ",".join(f"RPC{j}" for j in range(s - 1)),
+                    "-ngl", str(a.n_layer - k + (1 if head_local else 0)),
+                    "-sm", "layer", "-ts", ",".join(["1"] * (s - 1))] + (HEAD_LOCAL if head_local else [])
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
@@ -540,20 +547,23 @@ class Master:
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(endpoints[:2]),
                     "--device", "RPC0,RPC1", "-ngl", "999", "-sm", "layer", "-ts", "1,1"]
             if not out_remote:
-                args += ["-ot", OUTPUT_ON_CPU]
+                args += HEAD_LOCAL
             if g > 1:
                 args += ["--pipeline-groups", str(g)]
             return args, p
 
         plan = []
-        stages = sorted({2, min(4, a.workers + 1), a.workers + 1})
+        stages = sorted({int(x) for x in a.stages.split(",")} if a.stages else {2, min(4, a.workers + 1), a.workers + 1})
+        stages = [x for x in stages if 2 <= x <= a.workers + 1]
+        heads = {"on": [True], "off": [False], "both": [False, True]}[a.head_local]
         for rnd in range(a.rounds):
             plan.append(("x1", 1, 1, B))
             if rnd == 0:
                 plan.append(("x1_big", 1, 1, (a.workers + 2) * B))
             for s in stages:
                 for g in sorted({1, s, s + 1}):
-                    plan.append(("rpc", s, g, g * B))
+                    for hl in heads:
+                        plan.append(("rpc" if hl else "rpc_hr", s, g, g * B))
             if a.workers >= 2:
                 for out_remote in (True, False):
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
@@ -567,8 +577,8 @@ class Master:
                 res["conc"] = p
                 p = slots
             else:
-                args, p = split(s, g)
-                res = self.measure(f"rpc_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], tls_env)
+                args, p = split(s, g, kind == "rpc")
+                res = self.measure(f"{kind}_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], tls_env)
             res.update({"kind": kind, "stages": s, "groups": g, "slots": p})
             R["cases"].append(res)
             print("CASE", json.dumps({k: v for k, v in res.items() if k != "log"}, default = str)[:700], flush = True)
@@ -617,11 +627,13 @@ def summarize_cases(cases, B):
             xs = [c["tok_s"] for c in ok if c["kind"] == kind and c["groups"] == g and c.get("conc") == conc]
             logit_rows.append({"output": "last worker" if kind == "logits_remote" else "master CPU (-ot)",
                                "groups": g, "concurrency": conc, "tok_s": round(statistics.median(xs), 2), "runs": xs})
-    for (s, g) in sorted({(c["stages"], c["groups"]) for c in ok if c["kind"] == "rpc"}):
-        xs = [c["tok_s"] for c in ok if c["kind"] == "rpc" and c["stages"] == s and c["groups"] == g]
-        busy = [c.get("busy") for c in ok if c["kind"] == "rpc" and c["stages"] == s and c["groups"] == g and c.get("busy")]
+    for (kind, s, g) in sorted({(c["kind"], c["stages"], c["groups"]) for c in ok if c["kind"] in ("rpc", "rpc_hr")}):
+        same = [c for c in ok if c["kind"] == kind and c["stages"] == s and c["groups"] == g]
+        xs = [c["tok_s"] for c in same]
+        busy = [c.get("busy") for c in same if c.get("busy")]
         med = statistics.median(xs)
-        rows.append({"stages": s, "groups": g, "slots": g * B, "tok_s": round(med, 2), "runs": xs,
+        rows.append({"head": "master" if kind == "rpc" else "last worker",
+                     "stages": s, "groups": g, "slots": g * B, "tok_s": round(med, 2), "runs": xs,
                      "ideal": round(s * x1_med, 2) if x1_med else None,
                      "efficiency": round(med / (s * x1_med), 3) if x1_med else None,
                      "mean_util": busy[-1]["mean_util"] if busy else None,
@@ -644,10 +656,10 @@ def cmd_summarize(a):
         lines.append(f"Single box X1 at {sm.get('slots_per_group')} slots: {sm.get('x1_tok_s')} tok/s "
                      f"(median {sm.get('x1_median')}); single box at {(len(res.get('workers', [])) + 1) * (sm.get('slots_per_group') or 0)} "
                      f"slots: {sm.get('x1_big_tok_s')}")
-        lines += ["", "| stages | groups | slots | tok/s (median) | ideal S x X1 | efficiency | stage CPU use | all stages busy |",
-                  "|---|---|---|---|---|---|---|---|"]
+        lines += ["", "| head on | stages | groups | slots | tok/s (median) | ideal S x X1 | efficiency | stage CPU use | all stages busy |",
+                  "|---|---|---|---|---|---|---|---|---|"]
         for r in sm.get("rows", []):
-            lines.append(f"| {r['stages']} | {r['groups']} | {r['slots']} | {r['tok_s']} {r['runs']} | {r['ideal']} | "
+            lines.append(f"| {r.get('head', 'last worker')} | {r['stages']} | {r['groups']} | {r['slots']} | {r['tok_s']} {r['runs']} | {r['ideal']} | "
                          f"{r['efficiency']} | {r['mean_util']} | {r['all_busy_share']} |")
         if sm.get("logits"):
             lines += ["", "Logits arm (2 workers hold every repeating layer):", "",
@@ -676,6 +688,9 @@ def main():
     m.add_argument("--bin", required = True)
     m.add_argument("--gguf", required = True)
     m.add_argument("--workers", type = int, default = 4)
+    m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
+    m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
+                   help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--min-workers", type = int, default = 0, help = "run with this many if the rest never start (0 = all)")
     m.add_argument("--out-dir", required = True)
     m.add_argument("--wait-s", type = float, default = 2400)

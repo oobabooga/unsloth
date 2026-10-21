@@ -1,0 +1,947 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index f9fa61788..2c0850d8e 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -27,6 +27,12 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint,
+ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+ 
++// Mutual TLS 1.3 for the server started next (GGML_RPC_TLS builds; returns false otherwise): clients must
++// present a certificate that chains to `ca` and whose SHA-256 fingerprint is listed in `allow_file`
++// (one hex digest per line, re-read on every connection). Clients use "tls://<server fingerprint>@host:port"
++// endpoints with GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA set.
++GGML_BACKEND_API bool ggml_backend_rpc_server_set_tls(const char * cert, const char * key, const char * ca, const char * allow_file);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
+diff --git a/ggml/src/ggml-rpc/CMakeLists.txt b/ggml/src/ggml-rpc/CMakeLists.txt
+index e3d0c9b4c..4c36e8461 100644
+--- a/ggml/src/ggml-rpc/CMakeLists.txt
++++ b/ggml/src/ggml-rpc/CMakeLists.txt
+@@ -49,3 +49,35 @@ if (GGML_RPC_RDMA)
+ else()
+     message(STATUS "  RDMA transport disabled")
+ endif()
++
++# Mutual TLS 1.3 transport ("tls://<fingerprint>@host:port" endpoints, rpc-server --tls-*)
++option(GGML_RPC_TLS           "ggml: mutual TLS transport for RPC"                     OFF)
++option(GGML_RPC_TLS_BORINGSSL "ggml: build a static BoringSSL for the RPC TLS transport" OFF)
++
++if (GGML_RPC_TLS)
++    if (GGML_RPC_TLS_BORINGSSL)
++        set(BORINGSSL_GIT     "https://boringssl.googlesource.com/boringssl" CACHE STRING "BoringSSL git repository")
++        set(BORINGSSL_VERSION "0.20260929.0"                                CACHE STRING "BoringSSL version")
++        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++        include(FetchContent)
++        FetchContent_Declare(boringssl GIT_REPOSITORY ${BORINGSSL_GIT} GIT_TAG ${BORINGSSL_VERSION})
++        # BoringSSL builds with its own -Werror set: keep ggml's directory warning flags away from it
++        get_directory_property(GGML_RPC_SAVED_OPTIONS COMPILE_OPTIONS)
++        set_directory_properties(PROPERTIES COMPILE_OPTIONS "")
++        # static, so the TLS code lives inside ggml-rpc and no libssl / libcrypto ships beside it
++        set(GGML_RPC_SAVED_SHARED ${BUILD_SHARED_LIBS})
++        set(BUILD_SHARED_LIBS OFF)
++        FetchContent_MakeAvailable(boringssl)
++        set(BUILD_SHARED_LIBS ${GGML_RPC_SAVED_SHARED})
++        set_directory_properties(PROPERTIES COMPILE_OPTIONS "${GGML_RPC_SAVED_OPTIONS}")
++        target_link_libraries(ggml-rpc PRIVATE ssl crypto)
++        message(STATUS "  TLS transport enabled (static BoringSSL ${BORINGSSL_VERSION})")
++    else()
++        find_package(OpenSSL REQUIRED)
++        target_link_libraries(ggml-rpc PRIVATE OpenSSL::SSL OpenSSL::Crypto)
++        message(STATUS "  TLS transport enabled (OpenSSL ${OPENSSL_VERSION})")
++    endif()
++    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_TLS)
++else()
++    message(STATUS "  TLS transport disabled")
++endif()
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 94ec98caa..336fe6baf 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -404,14 +404,33 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+     return ok;
+ }
+ 
+-static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
+-    size_t pos = endpoint.find(':');
++// "host:port", or "tls://<server sha-256 fingerprint>@host:port" for a mutual TLS connection
++static constexpr const char * RPC_TLS_SCHEME = "tls://";
++
++static bool is_tls_endpoint(const std::string & endpoint) {
++    return endpoint.rfind(RPC_TLS_SCHEME, 0) == 0;
++}
++
++static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port, std::string * tls_fingerprint = nullptr) {
++    std::string rest = endpoint;
++    if (is_tls_endpoint(rest)) {
++        rest = rest.substr(strlen(RPC_TLS_SCHEME));
++        const size_t at = rest.find('@');
++        if (at == std::string::npos || at == 0) {
++            return false;
++        }
++        if (tls_fingerprint) {
++            *tls_fingerprint = rest.substr(0, at);
++        }
++        rest = rest.substr(at + 1);
++    }
++    size_t pos = rest.find(':');
+     if (pos == std::string::npos) {
+         return false;
+     }
+-    host = endpoint.substr(0, pos);
++    host = rest.substr(0, pos);
+     try {
+-        port = std::stoi(endpoint.substr(pos + 1));
++        port = std::stoi(rest.substr(pos + 1));
+     } catch (...) {
+         return false;
+     }
+@@ -754,7 +773,8 @@ void rpc_dispatcher::busy_spin_release() {
+ void rpc_dispatcher::start(const std::string & endpoint) {
+     std::string host;
+     int port;
+-    if (!parse_endpoint(endpoint, host, port)) {
++    std::string tls_fingerprint;
++    if (!parse_endpoint(endpoint, host, port, &tls_fingerprint)) {
+         GGML_ABORT("Failed to parse endpoint: %s\n", endpoint.c_str());
+     }
+     if (!rpc_transport_init()) {
+@@ -765,6 +785,9 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+     if (sock == nullptr) {
+         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     }
++    if (is_tls_endpoint(endpoint) && !sock->tls_connect(tls_fingerprint)) {
++        GGML_ABORT("TLS connection to %s failed\n", endpoint.c_str());
++    }
+     int server_minor = 0;
+     if (!negotiate_hello(sock, &server_minor)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+@@ -2354,6 +2377,11 @@ void rpc_server::sync_all_backends() {
+ // so it gets the same transport upgrades (e.g. RDMA).
+ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
+     response.ok = 0;
++    if (rpc_tls_server_enabled()) {
++        // the pairwise peer link would be a plaintext socket outside the authenticated channel
++        LOG_WARN("[%s] refused: no pairwise peer links on a TLS server\n", __func__);
++        return true;
++    }
+     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
+         return true;
+     }
+@@ -2935,6 +2963,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+     }
+ }
+ 
++bool ggml_backend_rpc_server_set_tls(const char * cert, const char * key, const char * ca, const char * allow_file) {
++    return rpc_tls_server_configure(cert, key, ca, allow_file);
++}
++
+ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+     if (n_devices == 0 || devices == nullptr) {
+@@ -2976,11 +3008,16 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         return;
+     }
+ 
++    const bool tls = rpc_tls_server_enabled();
++    if (tls) {
++        LOG_INFO("  transport      : TLS 1.3 (mutual, client allowlist)\n");
++    } else {
+ #ifdef GGML_RPC_RDMA
+-    LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
++        LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+ #else
+-    LOG_INFO("  transport      : TCP\n");
++        LOG_INFO("  transport      : TCP\n");
+ #endif // GGML_RPC_RDMA
++    }
+     if (!rpc_transport_init()) {
+         LOG_ERROR("Failed to initialize RPC transport\n");
+         return;
+@@ -2996,7 +3033,16 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+             LOG_ERROR("Failed to accept client connection\n");
+             return;
+         }
+-        LOG_INFO("Accepted client connection\n");
++        if (tls) {
++            std::string fingerprint;
++            if (!client_socket->tls_accept(fingerprint)) {
++                LOG_WARN("Refused client connection (TLS)\n");
++                continue;
++            }
++            LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
++        } else {
++            LOG_INFO("Accepted client connection\n");
++        }
+         rpc_serve_client(backends, cache_dir, client_socket);
+         LOG_INFO("Client connection closed\n");
+     }
+@@ -3177,6 +3223,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
+             return nullptr;
+         }
+         ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
++        if (is_tls_endpoint(rpc_ctx->endpoint)) {
++            return nullptr; // peer links between servers would bypass TLS
++        }
+         // one rank per endpoint: a server processes its socket sequentially, so a second
+         // COMM_INIT on the same connection would deadlock behind the first
+         for (const auto & rank : ranks) {
+@@ -3278,6 +3327,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++#ifdef GGML_RPC_TLS
++    if (std::strcmp(name, "ggml_backend_rpc_server_set_tls") == 0) {
++        return (void *)ggml_backend_rpc_server_set_tls;
++    }
++#endif // GGML_RPC_TLS
+     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_rpc_comm_init;
+     }
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 0d5343853..f39c94c62 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -21,6 +21,17 @@
+ #include <cstring>
+ #include <mutex>
+ #include <optional>
++#include <string>
++#include <vector>
++
++#ifdef GGML_RPC_TLS
++#  include <openssl/err.h>
++#  include <openssl/evp.h>
++#  include <openssl/ssl.h>
++#  include <openssl/x509.h>
++#  include <cctype>
++#  include <fstream>
++#endif // GGML_RPC_TLS
+ 
+ #ifdef GGML_RPC_RDMA
+ #  include <infiniband/verbs.h>
+@@ -153,12 +164,29 @@ struct socket_t::impl {
+ #endif // GGML_RPC_RDMA
+     bool     use_rdma;
+     sockfd_t fd;
++
++#ifdef GGML_RPC_TLS
++    // one TLS record per message: the small writes of a message are held and leave together at flush()
++    static constexpr size_t TLS_COALESCE_MAX = 64 * 1024;
++    SSL *                ssl = nullptr;
++    std::vector<uint8_t> tls_out;
++    bool tls_write(const void * data, size_t size);
++    bool tls_send(const void * data, size_t size);
++    bool tls_flush();
++    bool tls_recv(void * data, size_t size);
++#endif // GGML_RPC_TLS
+ };
+ 
+ socket_t::impl::~impl() {
+ #ifdef GGML_RPC_RDMA
+     rdma.reset();
+ #endif // GGML_RPC_RDMA
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        SSL_free(ssl);
++        ssl = nullptr;
++    }
++#endif // GGML_RPC_TLS
+     LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
+ #ifdef _WIN32
+     if (fd != INVALID_SOCKET) closesocket(this->fd);
+@@ -533,6 +561,11 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
+ 
+ bool socket_t::impl::send_data(const void * data, size_t size) {
+     LOG_DBG3("[%s] transport: %s, size: %zu\n", __func__, use_rdma ? "RDMA" : "TCP", size);
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        return tls_send(data, size);
++    }
++#endif // GGML_RPC_TLS
+ #ifdef GGML_RPC_RDMA_APPLE
+     if (use_rdma) {
+         return rdma->send(data, size);
+@@ -558,6 +591,11 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+ 
+ bool socket_t::impl::recv_data(void * data, size_t size) {
+     LOG_DBG3("[%s] transport: %s, size: %zu\n", __func__, use_rdma ? "RDMA" : "TCP", size);
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        return tls_recv(data, size);
++    }
++#endif // GGML_RPC_TLS
+ #ifdef GGML_RPC_RDMA_APPLE
+     if (use_rdma) {
+         return rdma->recv(data, size);
+@@ -587,6 +625,11 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+ 
+ void socket_t::impl::get_caps(uint8_t * local_caps) {
+     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        return; // no RDMA under TLS: every byte stays inside the authenticated channel
++    }
++#endif // GGML_RPC_TLS
+ #ifdef GGML_RPC_RDMA
+     if (std::getenv("GGML_RPC_NO_RDMA")) {
+         return;
+@@ -616,6 +659,12 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
+ }
+ 
+ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        (void)remote_caps;
++        return;
++    }
++#endif // GGML_RPC_TLS
+ #ifdef GGML_RPC_RDMA
+     // a peer that has no RDMA advertises all-zero caps and takes no further part
+     // in the negotiation, so drop to TCP without reporting a failure
+@@ -649,6 +698,11 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
+ }
+ 
+ bool socket_t::impl::flush() {
++#ifdef GGML_RPC_TLS
++    if (ssl) {
++        return tls_flush();
++    }
++#endif // GGML_RPC_TLS
+ #ifdef GGML_RPC_RDMA_APPLE
+     if (use_rdma) {
+         return rdma->flush();
+@@ -684,9 +738,20 @@ void socket_t::update_caps(const uint8_t * remote_caps) {
+ }
+ 
+ const char * socket_t::transport_name() const {
++    if (is_tls()) {
++        return "TLS";
++    }
+     return pimpl->use_rdma ? "RDMA" : "TCP";
+ }
+ 
++bool socket_t::is_tls() const {
++#ifdef GGML_RPC_TLS
++    return pimpl->ssl != nullptr;
++#else
++    return false;
++#endif // GGML_RPC_TLS
++}
++
+ static bool is_valid_fd(sockfd_t sockfd) {
+ #ifdef _WIN32
+     return sockfd != INVALID_SOCKET;
+@@ -807,3 +872,321 @@ void rpc_transport_shutdown() {
+     g_rpc_transport_wsa_started = false;
+ #endif
+ }
++
++/////////////////////////////////////////////////////////////////////////////
++// Mutual TLS 1.3. Identity is the SHA-256 fingerprint of the peer's leaf certificate (DER), on top of a
++// chain that must verify against the configured CA; host names play no part.
++
++#ifdef GGML_RPC_TLS
++
++static constexpr int    TLS_HANDSHAKE_TIMEOUT_S = 10;
++static constexpr size_t TLS_WRITE_CHUNK         = 16u * 1024u * 1024u;
++
++static void tls_log_errors(const char * what) {
++    unsigned long e;
++    bool any = false;
++    while ((e = ERR_get_error()) != 0) {
++        char buf[256];
++        ERR_error_string_n(e, buf, sizeof(buf));
++        LOG_ERROR("%s: %s\n", what, buf);
++        any = true;
++    }
++    if (!any) {
++        LOG_ERROR("%s\n", what);
++    }
++}
++
++static std::string tls_normalize_fp(const std::string & in) {
++    std::string out;
++    for (char c : in) {
++        if (std::isxdigit((unsigned char) c)) {
++            out += (char) std::tolower((unsigned char) c);
++        }
++    }
++    return out;
++}
++
++static std::string tls_peer_fingerprint(SSL * ssl) {
++#if defined(OPENSSL_IS_BORINGSSL) || OPENSSL_VERSION_NUMBER < 0x30000000L
++    X509 * cert = SSL_get_peer_certificate(ssl);
++#else
++    X509 * cert = SSL_get1_peer_certificate(ssl);
++#endif
++    if (!cert) {
++        return "";
++    }
++    unsigned char md[EVP_MAX_MD_SIZE];
++    unsigned int  n = 0;
++    const bool    ok = X509_digest(cert, EVP_sha256(), md, &n) == 1;
++    X509_free(cert);
++    if (!ok) {
++        return "";
++    }
++    static const char * hex = "0123456789abcdef";
++    std::string fp;
++    for (unsigned int i = 0; i < n; i++) {
++        fp += hex[md[i] >> 4];
++        fp += hex[md[i] & 15];
++    }
++    return fp;
++}
++
++static SSL_CTX * tls_ctx_new(bool server, const char * cert, const char * key, const char * ca) {
++    SSL_CTX * ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
++    if (!ctx) {
++        tls_log_errors("TLS: cannot create context");
++        return nullptr;
++    }
++    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
++    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
++    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
++#ifndef OPENSSL_IS_BORINGSSL
++    SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384");
++    SSL_CTX_set_num_tickets(ctx, 0);
++#endif
++    if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1 ||
++        SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 ||
++        SSL_CTX_check_private_key(ctx) != 1 ||
++        SSL_CTX_load_verify_locations(ctx, ca, nullptr) != 1) {
++        tls_log_errors("TLS: cannot load certificate, key or CA");
++        SSL_CTX_free(ctx);
++        return nullptr;
++    }
++    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
++    return ctx;
++}
++
++// bound the handshake so a silent peer cannot hold the (single) accept loop
++static void tls_set_timeouts(sockfd_t fd, int seconds) {
++#ifdef _WIN32
++    DWORD ms = (DWORD) seconds * 1000;
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &ms, sizeof(ms));
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &ms, sizeof(ms));
++#else
++    struct timeval tv;
++    tv.tv_sec  = seconds;
++    tv.tv_usec = 0;
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++#endif
++}
++
++struct tls_server_state {
++    std::mutex  mu;
++    SSL_CTX *   ctx = nullptr;
++    std::string allow_file;
++};
++
++static tls_server_state & tls_server() {
++    static tls_server_state st;
++    return st;
++}
++
++static bool tls_allowed(const std::string & allow_file, const std::string & fp) {
++    std::ifstream in(allow_file);
++    if (!in) {
++        LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file.c_str());
++        return false;
++    }
++    std::string line;
++    while (std::getline(in, line)) {
++        const size_t hash = line.find('#');
++        if (hash != std::string::npos) {
++            line.resize(hash);
++        }
++        const std::string entry = tls_normalize_fp(line);
++        if (!entry.empty() && entry == fp) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool socket_t::impl::tls_write(const void * data, size_t size) {
++    const char * p = (const char *) data;
++    while (size > 0) {
++        const int n = SSL_write(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
++        if (n <= 0) {
++            tls_log_errors("TLS: write failed");
++            return false;
++        }
++        p += n;
++        size -= (size_t) n;
++    }
++    return true;
++}
++
++bool socket_t::impl::tls_send(const void * data, size_t size) {
++    if (tls_out.size() + size <= TLS_COALESCE_MAX) {
++        const uint8_t * p = (const uint8_t *) data;
++        tls_out.insert(tls_out.end(), p, p + size);
++        return true;
++    }
++    return tls_flush() && tls_write(data, size);
++}
++
++bool socket_t::impl::tls_flush() {
++    if (tls_out.empty()) {
++        return true;
++    }
++    const bool ok = tls_write(tls_out.data(), tls_out.size());
++    tls_out.clear();
++    return ok;
++}
++
++bool socket_t::impl::tls_recv(void * data, size_t size) {
++    // never wait for a reply while part of our own request is still held back
++    if (!tls_flush()) {
++        return false;
++    }
++    char * p = (char *) data;
++    while (size > 0) {
++        const int n = SSL_read(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
++        if (n <= 0) {
++            if (SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN) {
++                LOG_WARN("TLS: peer closed the connection\n");
++            } else {
++                tls_log_errors("TLS: read failed");
++            }
++            return false;
++        }
++        p += n;
++        size -= (size_t) n;
++    }
++    return true;
++}
++
++bool socket_t::tls_connect(const std::string & server_fingerprint) {
++    const char * cert = std::getenv("GGML_RPC_TLS_CERT");
++    const char * key  = std::getenv("GGML_RPC_TLS_KEY");
++    const char * ca   = std::getenv("GGML_RPC_TLS_CA");
++    if (!cert || !key || !ca) {
++        LOG_ERROR("TLS: a tls:// endpoint needs GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA\n");
++        return false;
++    }
++    const std::string want = tls_normalize_fp(server_fingerprint);
++    if (want.size() != 64) {
++        LOG_ERROR("TLS: the endpoint fingerprint must be a SHA-256 hex digest (64 hex digits)\n");
++        return false;
++    }
++    SSL_CTX * ctx = tls_ctx_new(false, cert, key, ca);
++    if (!ctx) {
++        return false;
++    }
++    SSL * ssl = SSL_new(ctx);
++    SSL_CTX_free(ctx); // the SSL keeps its own reference
++    if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
++        tls_log_errors("TLS: cannot create session");
++        SSL_free(ssl);
++        return false;
++    }
++    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
++    if (SSL_connect(ssl) != 1) {
++        tls_log_errors("TLS: handshake with the server failed");
++        SSL_free(ssl);
++        return false;
++    }
++    const std::string got = tls_peer_fingerprint(ssl);
++    if (got != want) {
++        LOG_ERROR("TLS: server certificate %s is not the pinned %s\n", got.c_str(), want.c_str());
++        SSL_free(ssl);
++        return false;
++    }
++    tls_set_timeouts(pimpl->fd, 0);
++    pimpl->ssl = ssl;
++    return true;
++}
++
++bool socket_t::tls_accept(std::string & client_fingerprint) {
++    tls_server_state & st = tls_server();
++    SSL *              ssl = nullptr;
++    std::string        allow_file;
++    {
++        std::lock_guard<std::mutex> lock(st.mu);
++        if (!st.ctx) {
++            return false;
++        }
++        ssl        = SSL_new(st.ctx);
++        allow_file = st.allow_file;
++    }
++    if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
++        tls_log_errors("TLS: cannot create session");
++        SSL_free(ssl);
++        return false;
++    }
++    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
++    if (SSL_accept(ssl) != 1) {
++        tls_log_errors("TLS: handshake with the client failed");
++        SSL_free(ssl);
++        return false;
++    }
++    client_fingerprint = tls_peer_fingerprint(ssl);
++    if (client_fingerprint.empty() || !tls_allowed(allow_file, client_fingerprint)) {
++        LOG_WARN("TLS: client certificate %s is not in the allowlist\n", client_fingerprint.c_str());
++        SSL_free(ssl);
++        return false;
++    }
++    tls_set_timeouts(pimpl->fd, 0);
++    pimpl->ssl = ssl;
++    return true;
++}
++
++bool rpc_tls_supported() {
++    return true;
++}
++
++bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file) {
++    if (!cert || !key || !ca || !allow_file) {
++        LOG_ERROR("TLS: the server needs a certificate, a key, a CA and an allowlist\n");
++        return false;
++    }
++    SSL_CTX * ctx = tls_ctx_new(true, cert, key, ca);
++    if (!ctx) {
++        return false;
++    }
++    if (!std::ifstream(allow_file)) {
++        LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file);
++        SSL_CTX_free(ctx);
++        return false;
++    }
++    tls_server_state &          st = tls_server();
++    std::lock_guard<std::mutex> lock(st.mu);
++    if (st.ctx) {
++        SSL_CTX_free(st.ctx);
++    }
++    st.ctx        = ctx;
++    st.allow_file = allow_file;
++    return true;
++}
++
++bool rpc_tls_server_enabled() {
++    tls_server_state &          st = tls_server();
++    std::lock_guard<std::mutex> lock(st.mu);
++    return st.ctx != nullptr;
++}
++
++#else // !GGML_RPC_TLS
++
++bool socket_t::tls_connect(const std::string &) {
++    LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
++    return false;
++}
++
++bool socket_t::tls_accept(std::string &) {
++    return false;
++}
++
++bool rpc_tls_supported() {
++    return false;
++}
++
++bool rpc_tls_server_configure(const char *, const char *, const char *, const char *) {
++    LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
++    return false;
++}
++
++bool rpc_tls_server_enabled() {
++    return false;
++}
++
++#endif // GGML_RPC_TLS
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 59b8845c0..11da1790f 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -3,6 +3,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ 
+ struct socket_t;
+ typedef std::shared_ptr<socket_t> socket_ptr;
+@@ -26,6 +27,14 @@ struct socket_t {
+     void update_caps(const uint8_t * remote_caps);
+     const char * transport_name() const;
+ 
++    // Mutual TLS 1.3 on an already connected TCP socket (GGML_RPC_TLS builds; false otherwise).
++    // Client: verifies the server chain against GGML_RPC_TLS_CA and pins its leaf SHA-256 fingerprint,
++    // presenting GGML_RPC_TLS_CERT / GGML_RPC_TLS_KEY. Server: uses the rpc_tls_server_configure() setup
++    // and admits only client leaves whose fingerprint is in the allowlist file, re-read per connection.
++    bool tls_connect(const std::string & server_fingerprint);
++    bool tls_accept(std::string & client_fingerprint);
++    bool is_tls() const;
++
+     static socket_ptr create_server(const char * host, int port);
+     static socket_ptr connect(const char * host, int port);
+ 
+@@ -37,3 +46,8 @@ private:
+ 
+ bool rpc_transport_init();
+ void rpc_transport_shutdown();
++
++bool rpc_tls_supported();
++// load the server certificate, key and CA once; the allowlist path is re-read on every accept
++bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file);
++bool rpc_tls_server_enabled();
+diff --git a/tests/test-rpc-tls.cpp b/tests/test-rpc-tls.cpp
+new file mode 100644
+index 000000000..fb9a355ae
+--- /dev/null
++++ b/tests/test-rpc-tls.cpp
+@@ -0,0 +1,63 @@
++// Byte-exact SET_TENSOR / GET_TENSOR through one RPC endpoint (plain "host:port" or "tls://<fp>@host:port").
++// usage: test-rpc-tls <endpoint> [MiB]   (exit 0 = round trip exact; a refused TLS peer aborts non-zero)
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-rpc.h"
++#include "ggml.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <endpoint> [MiB]\n", argv[0]);
++        return 2;
++    }
++    ggml_backend_load_all();
++    const char * endpoint = argv[1];
++    const size_t mib      = argc > 2 ? (size_t) atoi(argv[2]) : 64;
++    const int64_t n       = (int64_t) (mib * 1024 * 1024 / sizeof(float));
++
++    ggml_backend_t backend = ggml_backend_rpc_init(endpoint, 0);
++    if (!backend) {
++        fprintf(stderr, "cannot init %s\n", endpoint);
++        return 1;
++    }
++    ggml_init_params params = { ggml_tensor_overhead() * 2, nullptr, true };
++    ggml_context * ctx = ggml_init(params);
++    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (!buf) {
++        fprintf(stderr, "cannot allocate %zu MiB on %s\n", mib, endpoint);
++        return 1;
++    }
++
++    std::vector<uint8_t> src(ggml_nbytes(t)), dst(ggml_nbytes(t));
++    std::mt19937 rng(1234);
++    for (auto & b : src) {
++        b = (uint8_t) rng();
++    }
++    // one large write, then small writes at odd offsets (many messages, each its own TLS record)
++    ggml_backend_tensor_set(t, src.data(), 0, src.size());
++    for (size_t off = 1; off < 4096; off += 509) {
++        src[off] ^= 0x5a;
++        ggml_backend_tensor_set(t, src.data() + off, off, 1);
++    }
++    ggml_backend_tensor_get(t, dst.data(), 0, dst.size());
++    const bool exact = memcmp(src.data(), dst.data(), src.size()) == 0;
++    size_t small_ok = 0;
++    for (size_t off = 3; off < 2048; off += 211) {
++        uint8_t b = 0;
++        ggml_backend_tensor_get(t, &b, off, 1);
++        small_ok += b == src[off];
++    }
++    printf("%s: %zu MiB round trip %s, small reads %zu/10\n", endpoint, mib, exact ? "exact" : "MISMATCH", small_ok);
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    ggml_backend_free(backend);
++    return exact && small_ok == 10 ? 0 : 1;
++}
+diff --git a/tests/test-rpc-tls.sh b/tests/test-rpc-tls.sh
+new file mode 100755
+index 000000000..33ef7523e
+--- /dev/null
++++ b/tests/test-rpc-tls.sh
+@@ -0,0 +1,79 @@
++#!/usr/bin/env bash
++# Mutual TLS transport: accepted peer, refusals (wrong CA, unlisted client, wrong server pin, plaintext
++# either way, revoked fingerprint), byte-exact transfers. Every client run is bounded: a hang fails.
++set -uo pipefail
++
++server=$1
++client=$2
++dir=$(mktemp -d)
++port=$((42000 + $$ % 10000))
++pids=()
++cleanup() {
++    for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
++    rm -rf "$dir"
++}
++trap cleanup EXIT
++fail=0
++
++ca() { # name
++    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj "/CN=$1" \
++        -keyout "$dir/$1.key" -out "$dir/$1.crt" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign >/dev/null 2>&1
++}
++leaf() { # name ca
++    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$1" \
++        -keyout "$dir/$1.key" -out "$dir/$1.csr" >/dev/null 2>&1
++    printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth,clientAuth\n" > "$dir/$1.ext"
++    openssl x509 -req -in "$dir/$1.csr" -CA "$dir/$2.crt" -CAkey "$dir/$2.key" -CAcreateserial -days 1 \
++        -extfile "$dir/$1.ext" -out "$dir/$1.crt" >/dev/null 2>&1
++}
++fp() { openssl x509 -in "$dir/$1.crt" -outform DER | sha256sum | cut -d' ' -f1; }
++
++ca caA; ca caB
++leaf server caA; leaf client caA; leaf other caA; leaf rogue caB
++fp client > "$dir/allow"
++
++wait_port() {
++    for _ in $(seq 200); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0; sleep 0.05; done
++    return 1
++}
++
++"$server" --device CPU -H 127.0.0.1 -p "$port" --tls-cert "$dir/server.crt" --tls-key "$dir/server.key" \
++    --tls-ca "$dir/caA.crt" --tls-allow "$dir/allow" > "$dir/tls_server.log" 2>&1 &
++pids+=($!)
++"$server" --device CPU -H 127.0.0.1 -p $((port + 1)) > "$dir/plain_server.log" 2>&1 &
++pids+=($!)
++wait_port "$port" && wait_port $((port + 1)) || { echo "servers did not start"; cat "$dir"/*.log; exit 1; }
++
++run() { # expect(ok|refused) label cert endpoint [MiB]
++    local expect=$1 label=$2 who=$3 ep=$4 mib=${5:-16}
++    ( GGML_RPC_TLS_CERT="$dir/$who.crt" GGML_RPC_TLS_KEY="$dir/$who.key" GGML_RPC_TLS_CA="$dir/caA.crt" \
++        exec timeout 60 "$client" "$ep" "$mib" > "$dir/run.log" 2>&1 )
++    local rc=$?
++    local why
++    why=$( { grep -h -m1 -E "TLS:|failed|crashed" "$dir/run.log"; tail -n 1 "$dir/tls_server.log"; } | tr '\n' ' ' | cut -c1-200)
++    if [ $rc -eq 124 ]; then
++        echo "FAIL $label: client hung"; fail=1
++    elif [ "$expect" = ok ] && [ $rc -ne 0 ]; then
++        echo "FAIL $label: expected success, rc=$rc"; tail -5 "$dir/run.log"; fail=1
++    elif [ "$expect" = refused ] && [ $rc -eq 0 ]; then
++        echo "FAIL $label: expected refusal, got through"; fail=1
++    else
++        echo "ok   $label (rc=$rc) $([ "$expect" = refused ] && echo "[$why]")"
++    fi
++}
++
++S=$(fp server)
++run ok      "accepted client, 64 MiB byte-exact"   client "tls://$S@127.0.0.1:$port" 64
++grep -q "Accepted TLS client $(fp client)" "$dir/tls_server.log" && echo "ok   server logged the client fingerprint" \
++    || { echo "FAIL server did not log the client fingerprint"; fail=1; }
++run refused "client from another CA"               rogue  "tls://$S@127.0.0.1:$port"
++run refused "client not in the allowlist"          other  "tls://$S@127.0.0.1:$port"
++run refused "wrong server pin"                     client "tls://$(fp other)@127.0.0.1:$port"
++run refused "plaintext client to the TLS server"   client "127.0.0.1:$port"
++run refused "TLS client to a plaintext server"     client "tls://$S@127.0.0.1:$((port + 1))"
++: > "$dir/allow"
++run refused "revoked (allowlist emptied)"          client "tls://$S@127.0.0.1:$port"
++fp client > "$dir/allow"
++run ok      "re-allowed, server still serving"     client "tls://$S@127.0.0.1:$port"
++run ok      "plain server unaffected"              client "127.0.0.1:$((port + 1))"
++exit $fail
+diff --git a/tools/rpc/CMakeLists.txt b/tools/rpc/CMakeLists.txt
+index 2891c7d03..9f0f0e00d 100644
+--- a/tools/rpc/CMakeLists.txt
++++ b/tools/rpc/CMakeLists.txt
+@@ -15,6 +15,17 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
+     set_property(TEST test-rpc-multi-server PROPERTY LABELS main)
+ endif()
+ 
++if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL AND GGML_RPC_TLS)
++    add_executable(test-rpc-tls ${PROJECT_SOURCE_DIR}/tests/test-rpc-tls.cpp)
++    target_link_libraries(test-rpc-tls PRIVATE ggml ggml-rpc)
++    add_test(
++        NAME test-rpc-tls
++        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-tls.sh
++            $<TARGET_FILE:ggml-rpc-server>
++            $<TARGET_FILE:test-rpc-tls>)
++    set_property(TEST test-rpc-tls PROPERTY LABELS main)
++endif()
++
+ if(LLAMA_TOOLS_INSTALL)
+     install(TARGETS ${TARGET} RUNTIME)
+ endif()
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+index cc6ed94c0..984763be8 100644
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -99,8 +99,20 @@ struct rpc_server_params {
+     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+     std::vector<std::string> devices;
+     std::string              trace;
++    std::string              tls_cert;
++    std::string              tls_key;
++    std::string              tls_ca;
++    std::string              tls_allow;
+ };
+ 
++typedef bool (*rpc_server_set_tls_t)(const char * cert, const char * key, const char * ca, const char * allow_file);
++
++// present only in builds with the TLS transport (GGML_RPC_TLS)
++static rpc_server_set_tls_t get_set_tls_fn() {
++    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
++    return reg ? (rpc_server_set_tls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_tls") : nullptr;
++}
++
+ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
+     fprintf(stderr, "options:\n");
+@@ -111,6 +123,12 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+     fprintf(stderr, "      --trace FILE                 write an event trace to FILE (same as GGML_RPC_TRACE)\n");
++    if (get_set_tls_fn()) {
++        fprintf(stderr, "  --tls-cert FILE                  mutual TLS 1.3: server certificate (PEM)\n");
++        fprintf(stderr, "  --tls-key FILE                   mutual TLS 1.3: server private key (PEM)\n");
++        fprintf(stderr, "  --tls-ca FILE                    mutual TLS 1.3: CA that client certificates must chain to\n");
++        fprintf(stderr, "  --tls-allow FILE                 mutual TLS 1.3: allowed client SHA-256 fingerprints, re-read per connection\n");
++    }
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -163,6 +181,13 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params &
+             params.trace = argv[i];
+         } else if (arg == "-c" || arg == "--cache") {
+             params.use_cache = true;
++        } else if (arg == "--tls-cert" || arg == "--tls-key" || arg == "--tls-ca" || arg == "--tls-allow") {
++            if (++i >= argc) {
++                return false;
++            }
++            std::string & dst = arg == "--tls-cert" ? params.tls_cert : arg == "--tls-key" ? params.tls_key
++                              : arg == "--tls-ca"   ? params.tls_ca   : params.tls_allow;
++            dst = argv[i];
+         } else if (arg == "-h" || arg == "--help") {
+             print_usage(argc, argv, params);
+             exit(0);
+@@ -229,7 +254,24 @@ int main(int argc, char * argv[]) {
+         return 1;
+     }
+ 
+-    if (params.host != "127.0.0.1") {
++    const bool tls = !params.tls_cert.empty() || !params.tls_key.empty() || !params.tls_ca.empty() || !params.tls_allow.empty();
++    if (tls) {
++        if (params.tls_cert.empty() || params.tls_key.empty() || params.tls_ca.empty() || params.tls_allow.empty()) {
++            fprintf(stderr, "error: --tls-cert, --tls-key, --tls-ca and --tls-allow are required together\n");
++            return 1;
++        }
++        auto set_tls_fn = get_set_tls_fn();
++        if (!set_tls_fn) {
++            fprintf(stderr, "error: this build has no TLS transport (build with -DGGML_RPC_TLS=ON)\n");
++            return 1;
++        }
++        if (!set_tls_fn(params.tls_cert.c_str(), params.tls_key.c_str(), params.tls_ca.c_str(), params.tls_allow.c_str())) {
++            fprintf(stderr, "error: cannot set up TLS\n");
++            return 1;
++        }
++    }
++
++    if (params.host != "127.0.0.1" && !tls) {
+         fprintf(stderr, "\n");
+         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+         fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
