@@ -184,7 +184,9 @@ class Worker:
             if args.get("cache"):
                 argv += ["-c"]
             if TRACE:
-                argv += ["--trace", str(self.out / f"trace_rpc_{port}.jsonl")]
+                argv += ["--trace", str(self.out / f"trace_rpc_{port}{'_repack' if args.get('repack') else ''}.jsonl")]
+            if args.get("repack"):  # amd_ci/homelink/rpc_repack.patch: repack CPU matmul weights on the server
+                argv += ["--repack"]
             log = self.out / f"rpc_{port}_{int(time.time())}.log"
             env = dict(os.environ, HOME = str(self.out / "home"), LD_LIBRARY_PATH = str(self.bin))
             self.proc = subprocess.Popen(argv, stdout = open(log, "w"), stderr = subprocess.STDOUT, env = env,
@@ -510,11 +512,12 @@ class Master:
         R["control_rtt_us"] = round(statistics.median(rtts), 1)
         ca = CA(self.out / "tls")
         cert, key, master_fp = ca.client()
-        endpoints = []
+        endpoints, starts = [], []
         for i, (c, (host, port)) in enumerate(zip(ctls, addrs)):
             csr = c("csr")["csr"]
-            r = c("start_rpc", cert = ca.sign_csr(csr), ca = ca.pem, allow = [master_fp], host = host, port = port,
-                  threads = a.threads, cache = True)
+            starts.append(dict(cert = ca.sign_csr(csr), ca = ca.pem, allow = [master_fp], host = host, port = port,
+                               threads = a.threads, cache = True))
+            r = c("start_rpc", **starts[-1])
             if not self.step(f"worker {i + 1} serves TLS RPC on {host}:{port}", r.get("ok"), r.get("tail", "")):
                 R["verdict"] = "RPC_DOWN"
                 return 1
@@ -556,6 +559,12 @@ class Master:
                 args += ["--pipeline-groups", str(g)]
             return args, p
 
+        def restart_workers(repack):
+            # same cert, key, port and allowlist: only the server flags change
+            for i, (c, st) in enumerate(zip(ctls, starts)):
+                r = c("start_rpc", **st, repack = repack)
+                self.step(f"worker {i + 1} restarted (repack={repack})", r.get("ok"), r.get("tail", ""))
+
         plan = []
         stages = sorted({int(x) for x in a.stages.split(",")} if a.stages else {2, min(4, a.workers + 1), a.workers + 1})
         stages = [x for x in stages if 2 <= x <= a.workers + 1]
@@ -575,7 +584,31 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag2:
+            # 2 stages, head on the last worker + backend sampling; what makes groups overlap on a CPU master
+            plan = [("x1", 1, 1, B)]
+            for variant in ("base", "passive", "tsplit", "repack"):
+                for g in (1, 2, 3):
+                    plan.append((f"bs_{variant}", 2, g, g * B))
+        repacked = False
         for rnd_i, (kind, s, g, p) in enumerate(plan):
+            if kind.startswith("bs_"):
+                want = kind == "bs_repack"
+                if want != repacked:
+                    restart_workers(want)
+                    repacked = want
+                args, p = split(s, g, False, True)
+                env = dict(tls_env)
+                if kind == "bs_passive":
+                    env["OMP_WAIT_POLICY"] = "PASSIVE"
+                if kind == "bs_tsplit":
+                    args[args.index("-t") + 1] = str(max(1, a.threads // g))
+                res = self.measure(f"{kind}_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], env)
+                res.update({"kind": kind, "stages": s, "groups": g, "slots": p})
+                R["cases"].append(res)
+                print("CASE", json.dumps({k: v for k, v in res.items() if k != "log"}, default = str)[:700], flush = True)
+                lp.write_json(str(self.out / "master_result.json"), R)
+                continue
             if kind.startswith("x1"):
                 res = self.measure(f"{kind}_{p}_{rnd_i}", local(p), p)
             elif kind.startswith("logits"):
@@ -635,12 +668,12 @@ def summarize_cases(cases, B):
             logit_rows.append({"output": {"logits_remote": "last worker", "logits_local": "master CPU (-ot)",
                                           "logits_bs": "last worker + --backend-sampling"}[kind],
                                "groups": g, "concurrency": conc, "tok_s": round(statistics.median(xs), 2), "runs": xs})
-    for (kind, s, g) in sorted({(c["kind"], c["stages"], c["groups"]) for c in ok if c["kind"] in ("rpc", "rpc_hr", "rpc_bs")}):
+    for (kind, s, g) in sorted({(c["kind"], c["stages"], c["groups"]) for c in ok if c["kind"].startswith(("rpc", "bs_"))}):
         same = [c for c in ok if c["kind"] == kind and c["stages"] == s and c["groups"] == g]
         xs = [c["tok_s"] for c in same]
         busy = [c.get("busy") for c in same if c.get("busy")]
         med = statistics.median(xs)
-        rows.append({"head": {"rpc": "master", "rpc_hr": "last worker", "rpc_bs": "last worker + backend sampling"}[kind],
+        rows.append({"head": {"rpc": "master", "rpc_hr": "last worker", "rpc_bs": "last worker + backend sampling"}.get(kind, kind),
                      "stages": s, "groups": g, "slots": g * B, "tok_s": round(med, 2), "runs": xs,
                      "ideal": round(s * x1_med, 2) if x1_med else None,
                      "efficiency": round(med / (s * x1_med), 3) if x1_med else None,
@@ -699,6 +732,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag2", action = "store_true", help = "2-stage backend-sampling sweep: base / OMP passive / -t T/G / worker repack")
     m.add_argument("--backend-sampling", action = "store_true", help = "add head-on-last-worker cases with --backend-sampling")
     m.add_argument("--min-workers", type = int, default = 0, help = "run with this many if the rest never start (0 = all)")
     m.add_argument("--out-dir", required = True)
