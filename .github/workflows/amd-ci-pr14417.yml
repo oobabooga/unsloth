@@ -147,12 +147,33 @@ jobs:
           python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" $ARGS \
             --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
 
-      - name: Environment and host gate (no Studio)
+      - name: Environment and real gate
+        timeout-minutes: 60
         run: |
           set -euo pipefail
-          echo "AMD_CI_PY=$(command -v python3)" >> "$GITHUB_ENV"
-          # No torch here, so rocm/gpu read UNDETERMINED: the criteria gates prove the GPU ran.
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --no-torch --out "$AMD_CI_WORK/out/host.json"
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
+          # tree pinning the newest unsloth fails to resolve. pip.conf already adds pypi.org as an
+          # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
+          # the ROCm torch index, whose wheels carry no upload time.
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          # Now with torch present, the gate is meaningful. It EXITS 1 on a miss.
+          # Absolute path: this step cd'd into the head worktree, which has no amd_ci/.
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
       - name: Differential
         run: |

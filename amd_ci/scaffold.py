@@ -161,6 +161,13 @@ def main() -> int:
     if f'UPSTREAM: "{args.repo}"' not in text:
         raise SystemExit("template has no UPSTREAM line to point at --repo")
 
+    if not args.repo.rstrip("/").endswith("/unslothai/unsloth"):
+        # install.sh lives in unslothai/unsloth: build the Studio venv from its main, then the probe runs
+        # pytest inside each state's checkout, whose own package shadows the installed one (Linux only).
+        studio_src = ('git clone -q --depth 1 https://github.com/unslothai/unsloth "$AMD_CI_WORK/unsloth_main"\n'
+                      '          cd "$AMD_CI_WORK/unsloth_main"')
+        text = text.replace('cd "$AMD_CI_WORK/states/head"', studio_src)
+
     if args.no_studio:
         if args.windows:
             raise SystemExit("--no-studio applies to the Linux GPU job; the Windows template installs no Studio")
