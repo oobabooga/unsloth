@@ -20,7 +20,11 @@ local, and none of them need a runner:
         The toolkit lives at $GITHUB_WORKSPACE; a state worktree does not
         contain it, so the command dies with ENOENT.
   W101  A GPU-measuring job without a concurrency group. Two GPU jobs can land
-        on the same machine and move each other's numbers.
+        on the same machine and move each other's numbers. Silent for a job that
+        declares `AMD_CI_SHARED_GPU: "1"` (scaffold.py --shared-gpu): there the
+        sharing is deliberate and capability.py reports `exclusive_gpu` as a gap.
+  E108  A `--shared-gpu` job running a timing probe or criteria (perf / bench /
+        timing). A co-tenant on the card moves the number being measured.
   W102  `--fail-under`-style skips: `exit 0` on a missing device, which reports
         "nothing to see" for "we did not get the hardware".
 
@@ -278,6 +282,14 @@ def lint_shell_syntax(where: str, body: str) -> list[Finding]:
     return []
 
 
+# Same timing pattern as scaffold.py's TIMING_MODULE, anchored to a probe / criteria path.
+TIMING_REF = re.compile(r"(?:probes|criteria)/[\w.-]*(?:perf|bench|timing)[\w.-]*", re.I)
+
+
+def _shared_gpu(job: dict) -> bool:
+    return str((job.get("env") or {}).get("AMD_CI_SHARED_GPU", "")) == "1"
+
+
 def lint_workflow(path: Path) -> list[Finding]:
     doc = yaml.safe_load(path.read_text(encoding = "utf-8"))
     findings: list[Finding] = []
@@ -338,9 +350,21 @@ def lint_workflow(path: Path) -> list[Finding]:
                                  "since a skip misreports missing hardware as nothing to see"))
                 break
 
+    for job_name, job in (doc.get("jobs") or {}).items():
+        if not _shared_gpu(job):
+            continue
+        for step in job.get("steps") or []:
+            hit = TIMING_REF.search(str(step.get("run") or ""))
+            if hit:
+                findings.append(("E108", job_name,
+                                 f"runs `{hit.group(0)}` with AMD_CI_SHARED_GPU=1. A shared card "
+                                 f"may have a co-tenant that moves the number being measured; "
+                                 f"drop --shared-gpu for timing work"))
+                break
+
     for job_name in sorted(gpu_jobs):
         job = doc["jobs"][job_name]
-        if not job.get("concurrency"):
+        if not job.get("concurrency") and not _shared_gpu(job):
             findings.append(("W101", job_name,
                              "touches GPU memory but declares no concurrency group. The pool is "
                              "many machines, not one, so this is no longer a certainty; but two "

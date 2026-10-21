@@ -69,6 +69,11 @@ KNOWN_GAPS = {
         "nvidia-smi parsing and capability gates only, never NVIDIA kernels, CUDA-only "
         "wheels (bitsandbytes CUDA, flash-attn, xformers, vLLM CUDA), NVML or performance"
     ),
+    "exclusive_gpu": (
+        "the GPU job ran with `scaffold.py --shared-gpu`: no `amd-ci-gfx1151-gpu` concurrency "
+        "group, so another job may have shared the card. Decisions, dtypes, losses and crashes "
+        "hold; timing, throughput and peak-memory comparisons are not evidence"
+    ),
     "mig": "needs a MIG-capable NVIDIA GPU",
     "gpu_partitions": "needs a partitionable accelerator (MI300 class)",
     "xpu": "needs an Intel GPU",
@@ -112,6 +117,9 @@ class HostProfile:
     # "nvidia" when lib/nvidia_identity.py is active: torch.version and the device
     # names above were read from the ORIGINALS it stashes, and `nvidia` is forced False.
     spoofed_vendor: str = ""
+    # True under `scaffold.py --shared-gpu` (AMD_CI_SHARED_GPU=1): the card may have a
+    # co-tenant, so `exclusive_gpu` is False and the report says so unconditionally.
+    shared_gpu: bool = False
     # Read once in detect(), so capabilities_for() stays a pure function of the
     # profile and selftest can exercise the Windows/Docker rule on a host whose
     # own docker presence is irrelevant to the runner being described.
@@ -201,6 +209,7 @@ def detect(require_torch: bool = True) -> HostProfile:
     p.docker_cli = shutil.which("docker") is not None
     p.spoofed_devices = detect_spoofed_devices()
     p.spoofed_vendor = os.environ.get("AMD_CI_SPOOFED_VENDOR", "").strip().lower()
+    p.shared_gpu = os.environ.get("AMD_CI_SHARED_GPU", "").strip() == "1"
     p.capabilities = capabilities_for(p)
     return p
 
@@ -260,6 +269,7 @@ def capabilities_for(p: "HostProfile") -> dict[str, bool]:
         "mlx": p.system == "Darwin" and p.machine == "arm64",
         "exfat_or_smb": False,
         "no_symlink_privilege": False,
+        "exclusive_gpu": real_gpu_count > 0 and not p.shared_gpu,
         "amd_smi": shutil.which("amd-smi") is not None,
         "rocm_smi": shutil.which("rocm-smi") is not None,
     }
@@ -296,6 +306,9 @@ def untested_section(profile: HostProfile, needed: list[str]) -> str:
     if profile.spoofed_vendor:
         spoof += ["", f"- **The {profile.spoofed_vendor.upper()} identity is FABRICATED**: "
                       f"{KNOWN_GAPS['nvidia_spoofed']}."]
+
+    if profile.shared_gpu:
+        spoof += ["", f"- **The GPU was SHARED**: {KNOWN_GAPS['exclusive_gpu']}."]
 
     if missing or spoof:
         lines = ["### Not tested here", ""]
