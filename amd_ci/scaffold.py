@@ -15,6 +15,7 @@ turns "a run I will lose in ten minutes" into "a message I read in one second".
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,31 @@ ROOT = Path(__file__).parent
 
 # Must match pytest_probe.py's --subdir default; selftest.py asserts they agree.
 PYTEST_SUBDIR = "studio/backend"
+
+# Probe / criteria names that measure time; lint_workflow.py E108 uses the same pattern.
+TIMING_MODULE = re.compile(r"perf|bench|timing", re.I)
+
+
+def shared_gpu_job(text: str) -> str:
+    """The gpu job without the shared concurrency group, marked so capability.py and lint see it.
+
+    The group holds one runner plus one waiter and a third arrival evicts the waiter, so
+    under contention a queued correctness probe can be cancelled indefinitely. Dropping it
+    trades exclusivity (a co-tenant may share the card) for starting at all.
+    """
+    head, sep, gpu_job = text.partition("  gpu:")
+    block = re.search(r"    # A shared constant, deliberately:.*?\n    concurrency:\n"
+                      r"      group: amd-ci-gfx1151-gpu\n      cancel-in-progress: false\n",
+                      gpu_job, re.S)
+    if not sep or not block:
+        raise SystemExit("template has no concurrency group in the gpu job to drop")
+    gpu_job = (gpu_job[:block.start()]
+               + "    # --shared-gpu: no concurrency group, so a co-tenant may share the card.\n"
+                 "    # Correctness only; capability.py reports `exclusive_gpu` as a gap.\n"
+                 "    env:\n      AMD_CI_SHARED_GPU: \"1\"\n"
+               + gpu_job[block.end():])
+    gpu_job = gpu_job.replace("GPU measurement (exclusive)", "GPU check (shared GPU)", 1)
+    return head + sep + gpu_job
 
 
 def main() -> int:
@@ -54,6 +80,14 @@ def main() -> int:
     ap.add_argument("--no-gpu", action = "store_true",
                     help = "drop the GPU job; use when nothing needs measuring")
     ap.add_argument("--no-suites", action = "store_true")
+    ap.add_argument("--shared-gpu", action = "store_true",
+                    help = "Linux GPU job: drop the shared `amd-ci-gfx1151-gpu` concurrency group "
+                           "so the job starts as soon as a runner is free instead of waiting "
+                           "behind (and being evicted by) every other branch's measurement. For "
+                           "correctness probes only (decisions, dtypes, losses, crashes): the card "
+                           "may have a co-tenant, so capability.py reports `exclusive_gpu` as a gap "
+                           "and timing / throughput / peak-memory numbers are not evidence. "
+                           "Refused for timing probes and criteria.")
     ap.add_argument("--spoof-devices", type = int, default = 0, metavar = "N",
                     help = "present N EXTRA HIP devices to torch via LD_PRELOAD, so "
                            "multi-GPU code paths become reachable on this one-GPU "
@@ -89,6 +123,18 @@ def main() -> int:
                        if flag == "--spoof-devices" else
                        "The Windows template emits one `windows` job plus a `linux-control` "
                        "job; drop the flag."))
+
+    if args.shared_gpu:
+        if args.windows:
+            raise SystemExit("--shared-gpu applies to the Linux GPU job; the Windows template "
+                             "declares no concurrency group, so it is already shared")
+        if args.no_gpu:
+            raise SystemExit("--shared-gpu needs the GPU job; drop --no-gpu")
+        timing = [m for m in (args.probe, args.criteria) if TIMING_MODULE.search(Path(m).name)]
+        if timing:
+            raise SystemExit(
+                f"--shared-gpu refuses timing modules ({', '.join(timing)}): a co-tenant on the "
+                f"card moves the number being measured. Keep the exclusive group for timing.")
 
     # `--tests` is relative to the probe's --subdir (studio/backend by default),
     # so passing a repo-root path silently doubles the prefix, selects nothing,
@@ -230,6 +276,9 @@ def main() -> int:
         text = head + sep + tail.replace(anchor, step + anchor, 1)
         if "nvidia_identity.py" not in text:
             raise SystemExit("failed to insert the NVIDIA identity step")
+
+    if args.shared_gpu:
+        text = shared_gpu_job(text)
 
     if args.no_gpu:
         text = text.split("  gpu:")[0].rstrip() + "\n"

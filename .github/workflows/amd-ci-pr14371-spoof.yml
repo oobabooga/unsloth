@@ -38,20 +38,13 @@ env:
 jobs:
 
   gpu:
-    name: "PR 14371 GPU measurement (exclusive)"
+    name: "PR 14371 GPU check (shared GPU)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 120
-    # A shared constant, deliberately: it serialises every GPU measurement across
-    # all branches. That is stricter than co-tenancy strictly requires now that the
-    # pool is many machines, but nothing in the label set can pin or exclude a
-    # machine, so "two GPU jobs never run at once" is the only enforceable version
-    # of "no co-tenant moved my number".
-    # The cost is that the group holds one runner plus one waiter,
-    # so a third arrival evicts the waiter. `cancel-in-progress: false` protects
-    # the job already running, not the one queued behind it. Re-run the job.
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
