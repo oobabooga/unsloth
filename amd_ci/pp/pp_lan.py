@@ -294,7 +294,7 @@ def wait_peers(n, wait_s, attempt, peer_dirs = None):
             if all(p.exists() for p in paths):
                 return [lp.read_json(str(p)) for p in paths]
             time.sleep(1)
-        return []
+        return [lp.read_json(str(p)) for p in paths if p.exists()]
     token = os.environ["GH_API_TOKEN"]
     repo, run_id = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]
     found, end = {}, time.time() + wait_s
@@ -463,10 +463,13 @@ class Master:
         peers = wait_peers(a.workers, a.wait_s, os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
                            a.peer_dirs.split(",") if a.peer_dirs else None)
         R["workers"] = [{k: p.get(k) for k in ("index", "hostname", "runner", "macs", "nets", "cpus", "load")} for p in peers]
-        if not self.step(f"{a.workers} workers published their control address", len(peers) == a.workers,
+        need = min(a.min_workers or a.workers, a.workers)
+        if not self.step(f"at least {need} of {a.workers} workers published their control address", len(peers) >= need,
                          f"got {[p.get('index') for p in peers]}"):
             R["verdict"] = "NOT_CONCURRENT"
             return 3
+        # a lab box that never got scheduled shrinks the sweep instead of voiding the boxes that did
+        R["workers_requested"], a.workers = a.workers, len(peers)
         boxes = {R["master"]["hostname"], *(p["hostname"] for p in peers)}
         if not self.step("master and every worker are different machines", LOCAL or len(boxes) == a.workers + 1, sorted(boxes)):
             R["verdict"] = "SHARED_MACHINE"
@@ -668,6 +671,7 @@ def main():
     m.add_argument("--bin", required = True)
     m.add_argument("--gguf", required = True)
     m.add_argument("--workers", type = int, default = 4)
+    m.add_argument("--min-workers", type = int, default = 0, help = "run with this many if the rest never start (0 = all)")
     m.add_argument("--out-dir", required = True)
     m.add_argument("--wait-s", type = float, default = 2400)
     m.add_argument("--threads", type = int, default = 16)
