@@ -1,0 +1,553 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci-pr14524-ui]
+
+permissions: {}
+
+jobs:
+  amd:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    env:
+      BASE_SHA: 4a5a3e5828c20717e6f7a6738b93a1043890cd29
+      HEAD_SHA: c2cee171be7665cd379799d0bd73cd6346bdc9d5
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu | head -20
+          free -h
+          df -h "$RUNNER_TEMP"
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          ls -l /dev/accel* 2>/dev/null || true
+          for d in /sys/bus/pci/devices/*; do
+            if [ "$(cat "$d/vendor")" = 0x1022 ] && grep -qE '0x(17f0|1502)' "$d/device"; then
+              echo "NPU at $d: device=$(cat "$d/device") vbnv=$(cat "$d/vbnv" 2>/dev/null) fw=$(cat "$d/fw_version" 2>/dev/null) driver=$(basename "$(readlink -f "$d/driver")")"
+            fi
+          done
+          cat /sys/module/amdxdna/version 2>/dev/null || true
+          sudo -n true 2>/dev/null && echo "passwordless sudo: yes" || echo "passwordless sudo: no"
+          fc-list 2>/dev/null | grep -ciE 'dejavu|liberation' || true
+
+      - name: Work dirs
+        run: |
+          W="$RUNNER_TEMP/uidiff"
+          mkdir -p "$W"/{tmp,cache/uv,cache/xdg,cache/hf,out,logs}
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "TMPDIR=$W/tmp" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$W/cache/uv" >> "$GITHUB_ENV"
+
+      - name: Check out both commits
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/unslothai/unsloth "$W/repo"
+          cd "$W/repo"
+          git fetch --filter=blob:none origin "$BASE_SHA" "$HEAD_SHA"
+          git worktree add --detach "$W/src_before" "$BASE_SHA"
+          git worktree add --detach "$W/src_after" "$HEAD_SHA"
+          git -C "$W/src_before" log -1 --format='before %H %s'
+          git -C "$W/src_after" log -1 --format='after  %H %s'
+
+      - name: Install both Studios
+        run: |
+          install_side() {
+            ( cd "$W/src_$1" && \
+              UNSLOTH_STUDIO_HOME="$W/home_$1" \
+              UNSLOTH_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+              bash install.sh --local ) > "$W/logs/install_$1.log" 2>&1
+          }
+          install_side before & pb=$!
+          install_side after & pa=$!
+          rb=0; ra=0
+          wait $pb || rb=$?
+          wait $pa || ra=$?
+          tail -25 "$W/logs/install_before.log"
+          tail -25 "$W/logs/install_after.log"
+          echo "install before=$rb after=$ra"
+          test "$rb" = 0 && test "$ra" = 0
+          ls -l "$W/home_before/bin/unsloth" "$W/home_after/bin/unsloth"
+
+      - name: Browser
+        run: |
+          python3 -m venv "$W/venv_pw"
+          "$W/venv_pw/bin/pip" install -q 'playwright>=1.45,<2' pillow
+          export PLAYWRIGHT_BROWSERS_PATH="$W/ms-playwright"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+          "$W/venv_pw/bin/python" -m playwright install chromium
+          if sudo -n true 2>/dev/null; then
+            sudo -n -E "$W/venv_pw/bin/python" -m playwright install-deps chromium || true
+          fi
+          "$W/venv_pw/bin/python" - <<'EOF'
+          import asyncio
+          from playwright.async_api import async_playwright
+          async def main():
+              async with async_playwright() as p:
+                  b = await p.chromium.launch(headless=True)
+                  print("chromium", b.version)
+                  await b.close()
+          asyncio.run(main())
+          EOF
+
+      - name: Screenshots
+        run: |
+          cat > "$W/npu_shots.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Before/after screenshots of the Studio AMD NPU section for unslothai/unsloth#14524.
+
+          Each side is its own Studio install (its own frontend build and backend). Per side:
+
+            gate   UNSLOTH_STUDIO_ENABLE_NPU unset: model picker + Hub Format filter
+            setup  UNSLOTH_STUDIO_ENABLE_NPU=1: setup notice in the picker and in the Hub NPU list
+            ready  UNSLOTH_STUDIO_ENABLE_NPU=1, after a real POST /api/npu/enable: picker NPU section
+
+          Every shot uses a new browser context (no profile, no cookies) with the en-US locale. A
+          `facts.json` records what each server's own /api/npu/status said at every step.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import asyncio
+          import json
+          import os
+          import secrets
+          import signal
+          import socket
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          from PIL import Image, ImageDraw, ImageFont
+          from playwright.async_api import async_playwright
+
+          RED = (229, 72, 77)
+          INK = (40, 40, 40)
+          CAPTION_H = 44
+          PICKER_H = 560
+          VIEWPORT = (1400, 900)
+          FONT_CANDIDATES = (
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+          )
+
+          SECTION_JS = """(btn) => {
+            const root = btn.closest('div');
+            const next = root.nextElementSibling;
+            const a = root.getBoundingClientRect();
+            const b = next ? next.getBoundingClientRect() : a;
+            const left = Math.min(a.left, b.left), right = Math.max(a.right, b.right);
+            return {x: left, y: a.top, w: right - left, h: b.bottom - a.top,
+                    text: next ? next.innerText : null};
+          }"""
+
+
+          def font(size: int):
+              for path in FONT_CANDIDATES:
+                  try:
+                      return ImageFont.truetype(path, size)
+                  except OSError:
+                      continue
+              return ImageFont.load_default()
+
+
+          def wrap(draw, text: str, f, width: int) -> list[str]:
+              lines, line = [], ""
+              for word in text.split():
+                  trial = f"{line} {word}".strip()
+                  if line and draw.textlength(trial, font=f) > width:
+                      lines.append(line)
+                      line = word
+                  else:
+                      line = trial
+              return lines + ([line] if line else [])
+
+
+          def annotate(path: Path, caption: str, box: dict | None = None, tag: str | None = None) -> None:
+              """Red box over the changed region (tag on its top border) and a wrapped caption bar."""
+              img = Image.open(path).convert("RGB")
+              f = font(15)
+              lines = wrap(ImageDraw.Draw(img), caption, f, img.width - 28)
+              bar = 18 + 22 * len(lines)
+              canvas = Image.new("RGB", (img.width, img.height + bar), "white")
+              canvas.paste(img, (0, 0))
+              draw = ImageDraw.Draw(canvas)
+              if box:
+                  x0, y0 = max(2, box["x"] - 4), max(12, box["y"] - 4)
+                  x1 = min(img.width - 3, box["x"] + box["w"] + 4)
+                  y1 = min(img.height - 3, box["y"] + box["h"] + 4)
+                  draw.rounded_rectangle((x0, y0, x1, y1), radius=8, outline=RED, width=3)
+                  if tag:
+                      tf = font(13)
+                      tw = draw.textlength(tag, font=tf)
+                      tx, ty = max(4, x1 - tw - 24), y0 - 10
+                      draw.rounded_rectangle((tx, ty, tx + tw + 12, ty + 20), radius=4, fill=RED)
+                      draw.text((tx + 6, ty + 2), tag, fill="white", font=tf)
+              draw.line((0, img.height, canvas.width, img.height), fill=(220, 220, 220), width=1)
+              for i, line in enumerate(lines):
+                  draw.text((14, img.height + 10 + 22 * i), line, fill=INK, font=f)
+              canvas.save(path)
+
+
+          def compose(left: Path, right: Path, out: Path, gap: int = 24, label_h: int = 56) -> None:
+              """BEFORE | AFTER on one canvas. Halves are padded, never rescaled."""
+              li, ri = Image.open(left).convert("RGB"), Image.open(right).convert("RGB")
+              h = max(li.height, ri.height)
+              canvas = Image.new("RGB", (li.width + gap + ri.width, h + label_h), "white")
+              canvas.paste(li, (0, label_h))
+              canvas.paste(ri, (li.width + gap, label_h))
+              draw = ImageDraw.Draw(canvas)
+              draw.line((li.width + gap // 2, 8, li.width + gap // 2, h + label_h - 8),
+                        fill=(200, 200, 200), width=2)
+              f = font(28)
+              draw.text((16, 14), "BEFORE (main)", fill="black", font=f)
+              draw.text((li.width + gap + 16, 14), "AFTER (#14524)", fill="black", font=f)
+              canvas.save(out)
+
+
+          def rel(box: dict, origin: dict) -> dict:
+              return {"x": box["x"] - origin["x"], "y": box["y"] - origin["y"], "w": box["w"], "h": box["h"]}
+
+
+          # ---------------------------------------------------------------------------- Studio process
+
+
+          def free_port() -> int:
+              with socket.socket() as s:
+                  s.bind(("127.0.0.1", 0))
+                  return s.getsockname()[1]
+
+
+          def http_json(url: str, payload: dict | None = None, token: str | None = None,
+                        timeout: int = 120) -> dict:
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(url, data=data, headers=headers,
+                                           method="POST" if payload is not None else "GET")
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read())
+
+
+          class Studio:
+              def __init__(self, home: Path, label: str, log_dir: Path, password: str):
+                  self.home, self.label, self.log_dir, self.password = home, label, log_dir, password
+                  self.proc: subprocess.Popen | None = None
+                  self.port = 0
+                  self.token = ""
+                  self.refresh = ""
+
+              @property
+              def base(self) -> str:
+                  return f"http://127.0.0.1:{self.port}"
+
+              def start(self, phase: str, extra_env: dict) -> None:
+                  cli = self.home / "bin" / "unsloth"
+                  if not cli.exists():
+                      raise FileNotFoundError(f"no unsloth CLI at {cli}")
+                  self.port = free_port()
+                  env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_STUDIO_ENABLE_NPU"}
+                  env.update({"UNSLOTH_STUDIO_HOME": str(self.home), **extra_env})
+                  log = (self.log_dir / f"studio_{self.label}_{phase}.log").open("w")
+                  self.proc = subprocess.Popen([str(cli), "studio", "-H", "127.0.0.1", "-p", str(self.port)],
+                                               env=env, stdout=log, stderr=subprocess.STDOUT,
+                                               stdin=subprocess.DEVNULL, start_new_session=True)
+                  deadline = time.time() + 300
+                  while time.time() < deadline:
+                      if self.proc.poll() is not None:
+                          raise RuntimeError(f"{self.label} Studio exited ({self.proc.returncode}); "
+                                             f"see studio_{self.label}_{phase}.log")
+                      try:
+                          body = http_json(f"{self.base}/api/health", timeout=5)
+                          if isinstance(body, dict):
+                              break
+                      except (urllib.error.URLError, OSError, ValueError):
+                          pass
+                      time.sleep(2)
+                  else:
+                      raise TimeoutError(f"{self.label} Studio did not answer /api/health")
+                  self.login()
+
+              def login(self) -> None:
+                  boot = self.home / "auth" / ".bootstrap_password"
+                  if boot.exists():
+                      first = boot.read_text().strip()
+                      tok = http_json(f"{self.base}/api/auth/login", {"username": "unsloth", "password": first})
+                      tok = http_json(f"{self.base}/api/auth/change-password",
+                                      {"current_password": first, "new_password": self.password},
+                                      token=tok["access_token"])
+                  else:
+                      tok = http_json(f"{self.base}/api/auth/login",
+                                      {"username": "unsloth", "password": self.password})
+                  self.token, self.refresh = tok["access_token"], tok.get("refresh_token", "")
+
+              def get(self, path: str, timeout: int = 120) -> dict:
+                  return http_json(f"{self.base}{path}", token=self.token, timeout=timeout)
+
+              def post(self, path: str, payload: dict, timeout: int = 120) -> dict:
+                  return http_json(f"{self.base}{path}", payload, token=self.token, timeout=timeout)
+
+              def stop(self) -> None:
+                  if self.proc is None or self.proc.poll() is not None:
+                      return
+                  try:
+                      os.killpg(self.proc.pid, signal.SIGTERM)
+                      self.proc.wait(timeout=60)
+                  except (subprocess.TimeoutExpired, ProcessLookupError):
+                      try:
+                          os.killpg(self.proc.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+
+
+          # ---------------------------------------------------------------------------- browser
+
+
+          def init_script(studio: Studio) -> str:
+              seed = {"unsloth_auth_token": studio.token, "unsloth_refresh_token": studio.refresh,
+                      "unsloth_locale": "en"}
+              return ("(() => { const s = %s; for (const [k, v] of Object.entries(s)) "
+                      "{ try { localStorage.setItem(k, v); } catch (e) {} } })();" % json.dumps(seed))
+
+
+          async def new_page(pw, studio: Studio):
+              browser = await pw.chromium.launch(headless=True)
+              context = await browser.new_context(viewport={"width": VIEWPORT[0], "height": VIEWPORT[1]},
+                                                  locale="en-US", timezone_id="UTC")
+              await context.add_init_script(init_script(studio))
+              return browser, context, await context.new_page()
+
+
+          async def open_picker(page, base: str):
+              await page.goto(f"{base}/chat", wait_until="domcontentloaded")
+              await page.wait_for_timeout(5_000)
+              await page.locator(".unsloth-model-selector-trigger:visible").first.click(timeout=30_000)
+              popper = page.locator("[data-radix-popper-content-wrapper]").first
+              await popper.wait_for(timeout=30_000)
+              tab = popper.get_by_role("tab", name="Recommended")
+              if await tab.count():
+                  await tab.first.click()
+              await page.wait_for_timeout(3_000)
+              return popper
+
+
+          async def picker_shot(page, popper, out: Path, facts: dict, phase: str) -> None:
+              npu = popper.get_by_role("button", name="NPU", exact=True)
+              facts["picker_npu_section"] = bool(await npu.count())
+              box = None
+              if facts["picker_npu_section"]:
+                  if (await npu.first.get_attribute("aria-expanded")) == "false":
+                      await npu.first.click()
+                      await page.wait_for_timeout(2_000)
+                  if phase == "ready":
+                      await page.wait_for_timeout(8_000)  # the model list comes from the live runtime
+                  await npu.first.scroll_into_view_if_needed()
+                  await page.wait_for_timeout(500)
+                  box = await npu.first.evaluate(SECTION_JS)
+                  facts["picker_notice"] = " ".join((box.pop("text") or "").split())
+              pb = await popper.bounding_box()
+              height = min(PICKER_H, pb["height"], VIEWPORT[1] - pb["y"])
+              await page.screenshot(path=str(out), clip={"x": pb["x"], "y": pb["y"],
+                                                         "width": pb["width"], "height": height})
+              if phase == "gate":
+                  caption = ("Model picker, UNSLOTH_STUDIO_ENABLE_NPU unset: "
+                             + ("NPU section shown" if box else "no NPU section"))
+                  tag = "Shown by default"
+              elif phase == "setup":
+                  caption = "Model picker NPU section before setup (UNSLOTH_STUDIO_ENABLE_NPU=1)"
+                  tag = "Setup notice"
+              else:
+                  caption = "Model picker NPU section after Enable NPU (UNSLOTH_STUDIO_ENABLE_NPU=1)"
+                  tag = "Notice once enabled"
+              annotate(out, caption, rel(box, pb) if box else None, tag if box else None)
+
+
+          async def open_hub_discover(page, base: str) -> None:
+              await page.goto(f"{base}/hub", wait_until="domcontentloaded")
+              await page.locator('[data-tour="hub-tabs"]').wait_for(timeout=60_000)
+              await page.get_by_role("radio", name="Discover").click()
+              await page.wait_for_timeout(3_000)
+
+
+          async def hub_menu_shot(page, out: Path, facts: dict) -> None:
+              trigger = page.get_by_role("button", name="Format filter")
+              await trigger.click()
+              listbox = page.get_by_role("listbox").first
+              await listbox.wait_for(timeout=15_000)
+              await page.wait_for_timeout(800)
+              facts["hub_format_options"] = [" ".join(t.split()) for t in
+                                             await page.get_by_role("option").all_inner_texts()]
+              npu = page.get_by_role("option", name="NPU")
+              facts["hub_npu_option"] = bool(await npu.count())
+              tb, lb = await trigger.bounding_box(), await listbox.bounding_box()
+              x1 = max(tb["x"] + tb["width"], lb["x"] + lb["width"]) + 16
+              y1 = max(tb["y"] + tb["height"], lb["y"] + lb["height"]) + 16
+              x0 = min(min(tb["x"], lb["x"]) - 16, x1 - 470)
+              y0 = min(tb["y"], lb["y"]) - 16
+              origin = {"x": x0, "y": y0}
+              await page.screenshot(path=str(out), clip={"x": x0, "y": y0, "width": x1 - x0,
+                                                         "height": y1 - y0})
+              box = None
+              if facts["hub_npu_option"]:
+                  ob = await npu.first.bounding_box()
+                  box = rel({"x": ob["x"], "y": ob["y"], "w": ob["width"], "h": ob["height"]}, origin)
+              annotate(out, "Hub > Discover > Format filter, UNSLOTH_STUDIO_ENABLE_NPU unset: "
+                       + ("NPU listed" if box else "no NPU entry"), box)
+              await page.keyboard.press("Escape")
+
+
+          async def hub_list_shot(page, out: Path, facts: dict) -> None:
+              # Narrower than the picker shots: the notice spans the list, so a wide window leaves the
+              # composite too flat to read once GitHub scales it down.
+              await page.set_viewport_size({"width": 1060, "height": VIEWPORT[1]})
+              await page.wait_for_timeout(1_000)
+              await page.get_by_role("button", name="Format filter").click()
+              await page.get_by_role("option", name="NPU").click()
+              catalog = page.locator('[data-testid="hub-npu-catalog"]')
+              await catalog.wait_for(timeout=60_000)
+              await page.wait_for_timeout(2_500)
+              facts["hub_notice"] = " ".join((await catalog.inner_text()).split())[:400]
+              cb = await catalog.bounding_box()
+              inner = await catalog.evaluate("""(el) => {
+                const c = el.firstElementChild || el; const r = c.getBoundingClientRect();
+                return {x: r.left, y: r.top, w: r.width, h: r.height};
+              }""")
+              origin = {"x": cb["x"] - 12, "y": cb["y"] - 12}
+              height = min(inner["y"] + inner["h"] + 20 - origin["y"], VIEWPORT[1] - origin["y"])
+              await page.screenshot(path=str(out), clip={"x": origin["x"], "y": origin["y"],
+                                                         "width": cb["width"] + 24, "height": height})
+              box = rel(inner, origin)
+              box["h"] = min(box["h"], height - box["y"] - 8)
+              annotate(out, "Hub NPU list before setup (UNSLOTH_STUDIO_ENABLE_NPU=1)", box, "Setup notice")
+
+
+          def status_facts(studio: Studio) -> dict:
+              s = studio.get("/api/npu/status")
+              hw = s.get("hardware") or {}
+              return {"supported": s.get("supported"), "present": hw.get("present"),
+                      "family": hw.get("family"), "name": hw.get("name"), "enabled": hw.get("enabled"),
+                      "state": s.get("state"), "ready": s.get("ready"),
+                      "runtime_installed": s.get("runtime_installed"), "error": s.get("error"),
+                      "problems": (s.get("validation") or {}).get("problems")}
+
+
+          async def run_side(studio: Studio, shots: Path, extra_env: dict, do_enable: bool) -> dict:
+              facts: dict = {}
+              async with async_playwright() as pw:
+                  # gate: variable unset
+                  studio.start("gate", extra_env)
+                  try:
+                      f = facts["gate"] = {"server": status_facts(studio)}
+                      browser, _, page = await new_page(pw, studio)
+                      popper = await open_picker(page, studio.base)
+                      await picker_shot(page, popper, shots / f"{studio.label}_1_gate_picker.png", f, "gate")
+                      await page.keyboard.press("Escape")
+                      await open_hub_discover(page, studio.base)
+                      await hub_menu_shot(page, shots / f"{studio.label}_2_gate_hub_menu.png", f)
+                      await browser.close()
+                  finally:
+                      studio.stop()
+
+                  # setup + ready: variable = 1
+                  studio.start("setup", {**extra_env, "UNSLOTH_STUDIO_ENABLE_NPU": "1"})
+                  try:
+                      f = facts["setup"] = {"server": status_facts(studio)}
+                      browser, _, page = await new_page(pw, studio)
+                      popper = await open_picker(page, studio.base)
+                      await picker_shot(page, popper, shots / f"{studio.label}_3_setup_picker.png", f, "setup")
+                      await page.keyboard.press("Escape")
+                      await open_hub_discover(page, studio.base)
+                      await hub_list_shot(page, shots / f"{studio.label}_4_setup_hub_list.png", f)
+                      await browser.close()
+
+                      if do_enable:
+                          f = facts["ready"] = {}
+                          t0 = time.time()
+                          try:
+                              f["enable_response"] = {k: v for k, v in studio.post(
+                                  "/api/npu/enable", {}, timeout=1800).items()
+                                  if k in ("state", "ready", "error", "validation", "versions")}
+                          except urllib.error.HTTPError as exc:
+                              f["enable_error"] = f"{exc.code} {exc.read().decode()[:500]}"
+                          except Exception as exc:  # noqa: BLE001 -- still photograph whatever state it left
+                              f["enable_error"] = f"{type(exc).__name__}: {exc}"
+                          f["enable_seconds"] = round(time.time() - t0, 1)
+                          f["server"] = status_facts(studio)
+                          browser, _, page = await new_page(pw, studio)
+                          popper = await open_picker(page, studio.base)
+                          await picker_shot(page, popper, shots / f"{studio.label}_5_ready_picker.png", f,
+                                            "ready")
+                          await browser.close()
+                  finally:
+                      studio.stop()
+              return facts
+
+
+          def main() -> int:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--home-before", type=Path, required=True)
+              ap.add_argument("--home-after", type=Path, required=True)
+              ap.add_argument("--out", type=Path, required=True)
+              ap.add_argument("--studio-env", action="append", default=[], metavar="KEY=VALUE")
+              ap.add_argument("--no-enable", action="store_true", help="skip the real Enable NPU step")
+              ap.add_argument("--password-dir", type=Path, default=None,
+                              help="reuse studio_password_<home name>.txt for already-rotated homes")
+              args = ap.parse_args()
+              extra = dict(kv.split("=", 1) for kv in args.studio_env)
+              shots, logs, pairs = args.out / "shots", args.out / "logs", args.out / "pairs"
+              for d in (shots, logs, pairs):
+                  d.mkdir(parents=True, exist_ok=True)
+
+              facts = {}
+              for label, home in (("before", args.home_before), ("after", args.home_after)):
+                  saved = args.password_dir / f"studio_password_{home.name}.txt" if args.password_dir else None
+                  password = (saved.read_text().strip() if saved and saved.exists()
+                              else "uidiff-" + secrets.token_hex(8))
+                  studio = Studio(home, label, logs, password)
+                  print(f"[{label}] driving {home}", flush=True)
+                  facts[label] = asyncio.run(run_side(studio, shots, extra, not args.no_enable))
+                  print(f"[{label}] {json.dumps(facts[label])}", flush=True)
+              (args.out / "facts.json").write_text(json.dumps(facts, indent=2))
+
+              identical = []
+              for b in sorted(shots.glob("before_*.png")):
+                  a = shots / b.name.replace("before_", "after_", 1)
+                  if not a.exists():
+                      print(f"missing AFTER shot for {b.name}", flush=True)
+                      continue
+                  compose(b, a, pairs / b.name.replace("before_", "pair_", 1))
+                  if b.read_bytes() == a.read_bytes():
+                      identical.append(b.name)
+              print("pairs:", *sorted(p.name for p in pairs.glob("*.png")), sep="\n  ")
+              if identical:
+                  print("IDENTICAL halves:", identical, flush=True)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          "$W/venv_pw/bin/python" "$W/npu_shots.py" \
+            --home-before "$W/home_before" --home-after "$W/home_after" --out "$W/out" \
+            --studio-env "HF_HOME=$W/cache/hf" --studio-env "HF_HUB_CACHE=$W/cache/hf/hub" \
+            --studio-env "XDG_CACHE_HOME=$W/cache/xdg"
+          cat "$W/out/facts.json"
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p "$W/out/logs"
+          cp -f "$W"/logs/*.log "$W/out/logs/" 2>/dev/null || true
+          find "$W/out" -type f | sort
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr14524-npu-screenshots
+          path: ${{ runner.temp }}/uidiff/out
+          retention-days: 7
