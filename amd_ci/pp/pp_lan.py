@@ -585,6 +585,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag6:
+            # steady state: run with --waves 8 so the prefill burst and the drain tail are a small part of the window
+            plan = [("x1", 1, 1, B)]
+            for g in (1, 2, 3):
+                plan.append(("bs_m19", 2, g, g * B))
+            for g in (1, 3, 4):
+                plan.append(("bs_m13", 3, g, g * B))
         if a.diag5:
             # stage balance: fewer layers on the master (it also builds graphs, serializes, samples, serves HTTP)
             plan = [("x1", 1, 1, B)]
@@ -768,6 +775,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag6", action = "store_true", help = "steady-state rerun of the best splits (use with --waves 8)")
     m.add_argument("--diag5", action = "store_true", help = "stage balance: layers on the master x groups")
     m.add_argument("--diag4", action = "store_true", help = "per-backend RPC synchronize x serial group submit")
     m.add_argument("--diag3", action = "store_true", help = "S = 2, 3 x G = 1..3 x groups submitting serially vs concurrently")
