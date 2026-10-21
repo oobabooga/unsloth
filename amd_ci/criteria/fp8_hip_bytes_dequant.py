@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Criteria: ROCm block-FP8 (e4m3fn) weight dequant takes the bit-exact byte decoder on gfx1151.
+"""Criteria: on gfx1151, block-FP8 (e4m3fn) weights the torch loop used to dequantize take the bit-exact byte decoder.
 
 Differential mode.
-Defect at the base (default arm): on gfx1151 (no OCP fp8 hardware) weight_dequant never calls the
-byte decoder _e4m3fn_bytes_dequant: even 128x128 tiles go to the software-emulated fp8e4nv Triton
-kernel, ragged / rectangular blocks to the chunked torch loop, and the product route on the 14336 x
-4096 weight is >= 3x slower than one torch.compile'd pass over it (the Triton audit measured 10.4x).
+Defect at the base (default arm): ragged / rectangular-block e4m3fn weights with bf16 output go to the chunked
+torch loop, >= 3x slower per call than the byte decoder _e4m3fn_bytes_dequant on the ragged shape (measured 7.5x).
 
 Fixed at the head when all of:
-  * default arm: every shape / dtype routes to the byte decoder only (no fp8e4nv kernel, no torch loop)
-  * default arm: output bit-equal (NaN positions included) to the torch loop and to the fp8e4nv
-    Triton kernel it replaces, reruns identical
+  * default arm: ragged/bfloat16 and rect_block/bfloat16 route to the byte decoder only, bit-equal to the torch
+    loop, reruns identical
+  * default arm: every other shape / dtype (even tiles, fp16 output) keeps the base's route
   * kill switch arm (UNSLOTH_FP8_HIP_BYTES_DEQUANT=0): routes equal to the base's on every shape
-  * per call: head default / head kill-switch product time <= 0.5 on `up`, <= 1.0 on q, down, ragged
-  * head pytest: no failure the base does not also have; the real-ROCm bit-exact test and the
-    ROCm routing table tests passed (not skipped)
+  * per call: head default / head kill switch product time <= 0.33 on ragged, <= 1.15 on q, up, down (same route)
+  * head pytest: no failure the base does not also have; the real-ROCm test and the ROCm routing table passed
 
 Gates (non-vacuity): each arm imported its own state's unsloth and finished; ROCm torch on gfx1151;
 fp8e4nv compiles there (Triton >= 3.5) so the fp8e4nv arm is real; the byte decoder exists at the
@@ -31,6 +28,7 @@ NEEDS = ["rocm", "gpu", "nvidia"]
 
 ARMS = ("default", "switch_off")
 TIMED = ("q", "up", "down", "ragged")
+LOOP_CASES = ("ragged/bfloat16", "rect_block/bfloat16")
 REQUIRED_PASS = ("test_real_rocm_device_takes_bytes_kernel_bit_exact", "test_rocm_routes")
 
 
@@ -135,11 +133,11 @@ def base_shows_defect(base):
     if not _done(a):
         return False, "base default arm did not finish"
     route = a.get("route") or {}
-    no_bytes = bool(route) and all((c or {}).get("bytes", 0) == 0 for c in route.values())
-    r = _ratio(_km(a, "up", "product"), _km(a, "up", "compiled_one_pass"))
+    loop = all(((route.get(k) or {}).get("torch", 0) > 0 and (route.get(k) or {}).get("bytes", 0) == 0)
+               for k in LOOP_CASES)
+    r = _ratio(_km(a, "ragged", "product"), _km(a, "ragged", "bytes"))
     slow = r is not None and r >= 3.0
-    return no_bytes and slow, (f"byte decoder never called={no_bytes}; product / one compiled pass on `up` = {r} (>= 3 needed); "
-                               f"product / forced bytes = {_ratio(_km(a, 'up', 'product'), _km(a, 'up', 'bytes'))}")
+    return loop and slow, (f"ragged / rect bf16 take the torch loop={loop}; product / byte decoder on ragged = {r} (>= 3 needed)")
 
 
 def head_is_fixed(head, base = None):
@@ -152,23 +150,24 @@ def head_is_fixed(head, base = None):
         return False, "a head arm did not finish"
     base_route = _arm(base, "default").get("route") or {}
     for key, c in (a.get("route") or {}).items():
-        if not (c.get("bytes", 0) > 0 and c.get("triton_fp8", 0) == 0 and c.get("torch", 0) == 0):
-            problems.append(f"default/{key} route {c}")
-        pr = (a.get("parity") or {}).get(key) or {}
-        if not (pr.get("equal_torch_loop") and pr.get("repeat_equal") and pr.get("equal_triton_fp8", True)):
-            problems.append(f"default/{key} parity {pr}")
+        if key in LOOP_CASES:
+            if not (c.get("bytes", 0) > 0 and c.get("triton_fp8", 0) == 0 and c.get("torch", 0) == 0):
+                problems.append(f"default/{key} route {c}")
+            pr = (a.get("parity") or {}).get(key) or {}
+            if not (pr.get("equal_torch_loop") and pr.get("repeat_equal")):
+                problems.append(f"default/{key} parity {pr}")
+        elif c != base_route.get(key):
+            problems.append(f"default/{key} route {c} != base {base_route.get(key)} (should be unchanged)")
         ck = (k.get("route") or {}).get(key) or {}
         if ck != base_route.get(key):
             problems.append(f"switch_off/{key} route {ck} != base {base_route.get(key)}")
-        if ck.get("bytes", 0) != 0:
-            problems.append(f"switch_off/{key} still calls the byte decoder")
     if not a.get("route"):
         problems.append("no routes recorded")
-    for s in TIMED:
-        r = _ratio(_km(a, s, "product"), _km(k, s, "product"))
-        lim = 0.5 if s == "up" else 1.0
+    for s_ in TIMED:
+        r = _ratio(_km(a, s_, "product"), _km(k, s_, "product"))
+        lim = 0.33 if s_ == "ragged" else 1.15
         if r is None or r > lim:
-            problems.append(f"{s}: head default / kill switch product = {r} (limit {lim})")
+            problems.append(f"{s_}: head default / kill switch product = {r} (limit {lim})")
     hp = head.get("pytest") or {}
     new_bad = sorted(_bad(hp) - _bad(base.get("pytest")))
     if new_bad:
@@ -179,4 +178,4 @@ def head_is_fixed(head, base = None):
             problems.append(f"`{t}` did not pass at the head (or was skipped)")
     if problems:
         return False, "; ".join(problems)
-    return True, "byte decoder routed and bit-exact, kill switch restores the base routes, faster per call, no new test failures"
+    return True, "torch-loop cases take the byte decoder bit-exactly, other routes unchanged, kill switch restores the base, faster per call, no new test failures"

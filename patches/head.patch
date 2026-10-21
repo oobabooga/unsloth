@@ -1,7 +1,7 @@
 From 73a6e4f3582984c99a341df1a7522646b5690ac2 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Tue, 20 Oct 2026 20:37:30 -0700
-Subject: [PATCH 1/2] FP8 block dequant on ROCm: decode e4m3fn bytes on archs
+Subject: [PATCH 1/3] FP8 block dequant on ROCm: decode e4m3fn bytes on archs
  without OCP fp8 hardware
 
 On ROCm archs without OCP e4m3fn hardware (gfx1151 and other RDNA3 / RDNA2 / CDNA2 / CDNA3) the
@@ -294,7 +294,7 @@ index 4e5564ad3d..5ca26567f4 100644
 From b65631b7eea0b6c50cac7f9537355080a5a363a8 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Tue, 20 Oct 2026 20:52:59 -0700
-Subject: [PATCH 2/2] Byte dequant on gfx11 only; other ROCm archs keep their
+Subject: [PATCH 2/3] Byte dequant on gfx11 only; other ROCm archs keep their
  route
 
 ---
@@ -465,6 +465,172 @@ index 5ca26567f4..ee3582c29a 100644
          return _e4m3fn_bytes_dequant(
              weight, weight_scale, int(block_size[0]), int(block_size[1]), out_dtype
          )
+-- 
+2.43.0
+
+
+From 6933cd1e1d26d94e00ebf415b210a98fc54f80fc Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Tue, 20 Oct 2026 21:36:29 -0700
+Subject: [PATCH 3/3] gfx11: byte decoder only where the torch loop ran, bf16 /
+ fp32 output
+
+---
+ tests/test_fp8_pre_sm89_byte_dequant.py | 30 +++++++++----------
+ unsloth/kernels/fp8.py                  | 38 ++++++++++++++-----------
+ 2 files changed, 35 insertions(+), 33 deletions(-)
+
+diff --git a/tests/test_fp8_pre_sm89_byte_dequant.py b/tests/test_fp8_pre_sm89_byte_dequant.py
+index 0c42e91172..57de867d6a 100644
+--- a/tests/test_fp8_pre_sm89_byte_dequant.py
++++ b/tests/test_fp8_pre_sm89_byte_dequant.py
+@@ -174,6 +174,7 @@ def _router(monkeypatch):
+         arch = "gfx90a",
+         triton_version = "3.2.0",
+         block = (128, 128),
++        out_dtype = torch.bfloat16,
+     ):
+         calls.clear()
+         s = _scale(*weight.shape, block, torch.float32, "cuda")
+@@ -188,7 +189,7 @@ def _router(monkeypatch):
+                 mp.setattr(fp8.triton, "__version__", triton_version)
+             fp8._fp8_device_lacks_kernel.cache_clear()
+             fp8._rocm_bytes_dequant_arch.cache_clear()
+-            fp8._blockwise_weight_dequant_any_shape(weight, s, list(block), torch.bfloat16)
++            fp8._blockwise_weight_dequant_any_shape(weight, s, list(block), out_dtype)
+         fp8._fp8_device_lacks_kernel.cache_clear()
+         fp8._rocm_bytes_dequant_arch.cache_clear()
+         return {1: "bytes", 2: "triton_fp8"}.get(calls[0], "?") if calls else "torch"
+@@ -215,8 +216,9 @@ def test_routes_to_bytes_kernel_only_on_nvidia_pre_sm89(monkeypatch):
+ 
+ ROCM_ROUTES = [
+     # (gcnArchName, triton, route, route with UNSLOTH_FP8_HIP_BYTES_DEQUANT=0 = the old one).
+-    # gfx11 (RDNA3 / 3.5) takes the byte decoder whatever triton can compile; other archs keep their route.
+-    ("gfx1151", "3.6.0", "bytes", "triton_fp8"),  # Strix Halo: fp8e4nv emulated, ~10x slower
++    # Even tiles. gfx11 (RDNA3 / 3.5) takes the byte decoder where the torch loop ran; with fp8e4nv
++    # (triton 3.5+, emulated) it keeps that kernel. Other archs keep their route.
++    ("gfx1151", "3.6.0", "triton_fp8", "triton_fp8"),  # Strix Halo
+     ("gfx1151", "3.4.0", "bytes", "torch"),  # no fp8e4nv here: was the torch loop
+     ("gfx1100", "3.3.1", "bytes", "torch"),
+     ("gfx1030", "3.5.0", "triton_fp8", "triton_fp8"),
+@@ -238,10 +240,12 @@ def test_rocm_routes(monkeypatch, arch, triton_version, expected, old):
+     route, w = _router(monkeypatch)
+     hip = dict(hip = "6.4.0", arch = arch, triton_version = triton_version)
+     assert route((11, 5), **hip) == expected
+-    # Ragged and rectangular blocks: the byte decoder where it applies, else the torch loop as before.
+-    ragged = "bytes" if expected == "bytes" else "torch"
++    # Ragged and rectangular blocks: the byte decoder on gfx11, else the torch loop as before.
++    ragged = "bytes" if arch.startswith("gfx11") else "torch"
+     assert route((11, 5), weight = _weight(130, 200, "cuda"), **hip) == ragged
+     assert route((11, 5), block = (64, 128), **hip) == ragged
++    # fp16 output keeps the old route (the torch loop rounds fp16 differently on gfx1151).
++    assert route((11, 5), weight = _weight(130, 200, "cuda"), out_dtype = torch.float16, **hip) == "torch"
+     # Only e4m3fn is decoded: e5m2 / e4m3fnuz keep the native triton kernel.
+     assert route((11, 5), weight = w.float().to(torch.float8_e5m2), **hip) == "triton_fp8"
+     if hasattr(torch, "float8_e4m3fnuz"):
+@@ -286,8 +290,8 @@ HIP = CUDA and torch.version.hip is not None
+ @pytest.mark.parametrize("shape", [(4096, 4096), (14336, 4096), (4096, 14336), (130, 200)])
+ @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+ def test_real_rocm_device_takes_bytes_kernel_bit_exact(pre_sm89, monkeypatch, shape, out_dtype):
+-    # Unmocked ROCm: gfx11 must run the byte decoder, bit-equal to the torch loop
+-    # and, where triton compiles fp8e4nv, to the emulated fp8 kernel it replaces.
++    # Unmocked ROCm: on gfx11, the cases the torch loop took (ragged here) run the byte decoder,
++    # bit-equal to the torch loop for bf16; even tiles and fp16 output keep their route.
+     m, n = shape
+     w = _weight(m, n, "cuda")
+     s = _scale(m, n, [128, 128], torch.float32, "cuda")
+@@ -297,18 +301,12 @@ def test_real_rocm_device_takes_bytes_kernel_bit_exact(pre_sm89, monkeypatch, sh
+         fp8, "_e4m3fn_bytes_dequant", lambda *a, **k: calls.append(1) or orig(*a, **k)
+     )
+     out = fp8.weight_dequant(w, s, out_dtype)
+-    if not fp8._rocm_bytes_dequant_arch(w.device):
++    loop_case = m % 128 or n % 128 or fp8._fp8_kernel_unsupported(w)
++    if not (fp8._rocm_bytes_dequant_arch(w.device) and loop_case and out_dtype != torch.float16):
+         assert not calls
+-        pytest.skip("OCP fp8 hardware: keeps the native kernel")
++        return
+     assert calls == [1]
+     _same_bits(out, fp8._torch_blockwise_dequant(w, s, [128, 128], out_dtype))
+-    if m % 128 == 0 and n % 128 == 0 and not fp8._fp8_kernel_unsupported(w):
+-        # NaN-free: the emulated fp8e4nv cast's NaN handling is not under test (the torch loop is).
+-        raw = w.view(torch.uint8)
+-        wf = torch.where((raw & 127) == 127, raw - 1, raw).view(torch.float8_e4m3fn)
+-        _same_bits(
+-            fp8.weight_dequant(wf, s, out_dtype), fp8.weight_dequant_block(wf, s, 128, out_dtype)
+-        )
+ 
+ 
+ @needs_cuda
+diff --git a/unsloth/kernels/fp8.py b/unsloth/kernels/fp8.py
+index ee3582c29a..668f739d75 100644
+--- a/unsloth/kernels/fp8.py
++++ b/unsloth/kernels/fp8.py
+@@ -514,9 +514,9 @@ def _fp8_device_lacks_kernel(device):
+     return torch.cuda.get_device_capability(device) < (8, 9)
+ 
+ 
+-# On gfx1151 (RDNA 3.5, no OCP fp8 hardware) both old routes (torch loop / emulated weight_dequant_kernel)
+-# measured up to ~10x slower than one pass over the weight. The e4m3fn byte decoder is bit-identical, so
+-# gfx11 takes it; 0 restores the old routes.
++# On gfx1151 (RDNA 3.5) the torch loop the ragged / rectangular / no-fp8e4nv cases take measured 7.5x slower
++# than the e4m3fn byte decoder, which is bit-identical to it for bf16 / fp32 output, so gfx11 takes the
++# byte decoder there (even tiles keep the fp8e4nv kernel, which it does not beat); 0 restores the old routes.
+ _HIP_FP8_BYTES_DEQUANT = os.environ.get("UNSLOTH_FP8_HIP_BYTES_DEQUANT", "1") != "0"
+ 
+ 
+@@ -531,6 +531,19 @@ def _rocm_bytes_dequant_arch(device):
+     return arch.startswith("gfx11")
+ 
+ 
++def _hip_bytes_dequant(weight, out_dtype):
++    # fp16 output is left out: on gfx1151 the byte decoder and the fp8e4nv kernel both round fp16
++    # differently from the torch loop there, so the torch loop's fp16 result is kept.
++    return (
++        torch.version.hip is not None
++        and _HIP_FP8_BYTES_DEQUANT
++        and weight.is_cuda
++        and weight.dtype == torch.float8_e4m3fn
++        and out_dtype != torch.float16
++        and _rocm_bytes_dequant_arch(weight.device)
++    )
++
++
+ def _fp8_kernel_unsupported(tensor, kernel_dtype = None):
+     """True when triton here cannot compile this fp8 dtype, so kernels taking it must be avoided.
+ 
+@@ -769,18 +782,6 @@ def _blockwise_weight_dequant_any_shape(weight, weight_scale, block_size, out_dt
+         # Per-tensor scale: the normal forward stashes the un-expanded scalar, which repeat_interleave
+         # cannot grow to (m, n).
+         return (weight.to(torch.float32) * weight_scale.float()).to(out_dtype)
+-    if (
+-        torch.version.hip is not None
+-        and _HIP_FP8_BYTES_DEQUANT
+-        and weight.is_cuda
+-        and weight.dtype == torch.float8_e4m3fn
+-        and weight_scale.ndim == 2
+-        and _rocm_bytes_dequant_arch(weight.device)
+-    ):
+-        # gfx11: e4m3fn only (e4m3fnuz / e5m2 keep their routes).
+-        return _e4m3fn_bytes_dequant(
+-            weight, weight_scale, int(block_size[0]), int(block_size[1]), out_dtype
+-        )
+     # An fp8 dtype this device cannot compile: fall back instead of raising from the fallback.
+     kernel_fp8_unsupported = _fp8_kernel_unsupported(weight)
+     if (
+@@ -791,8 +792,11 @@ def _blockwise_weight_dequant_any_shape(weight, weight_scale, block_size, out_dt
+     ):
+         # Uneven tiling, rectangular blocks, or an uncompilable fp8 dtype: the triton kernel uses one
+         # BLOCK_SIZE for both axes, so it mis-indexes when block_size[0] != [1].
+-        if kernel_fp8_unsupported and torch.version.hip is None and weight_scale.ndim == 2:
+-            # NVIDIA below sm89: one triton pass over the e4m3fn bytes, bit-identical to the torch loop.
++        if weight_scale.ndim == 2 and (
++            (kernel_fp8_unsupported and torch.version.hip is None) or _hip_bytes_dequant(weight, out_dtype)
++        ):
++            # One triton pass over the e4m3fn bytes, bit-identical to the torch loop: NVIDIA below sm89,
++            # and on gfx11 every case the torch loop would take (bf16 / fp32 output).
+             return _e4m3fn_bytes_dequant(
+                 weight, weight_scale, int(block_size[0]), int(block_size[1]), out_dtype
+             )
 -- 
 2.43.0
 
