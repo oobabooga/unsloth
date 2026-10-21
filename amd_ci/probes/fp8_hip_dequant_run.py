@@ -58,7 +58,7 @@ def main() -> int:
             torch = torch.__version__, hip = torch.version.hip, triton = triton.__version__,
             gpu = torch.cuda.get_device_name(0), arch = getattr(props, "gcnArchName", None),
             hip_bytes_flag = getattr(F, "_HIP_FP8_BYTES_DEQUANT", None),
-            lacks_ocp_fp8 = (F._rocm_lacks_ocp_fp8(dev) if hasattr(F, "_rocm_lacks_ocp_fp8") else None),
+            bytes_dequant_arch = (F._rocm_bytes_dequant_arch(dev) if hasattr(F, "_rocm_bytes_dequant_arch") else None),
             fp8e4nv_unsupported = bool(F._fp8_kernel_unsupported(probe_w)),
             has_bytes_kernel = hasattr(F, "_e4m3fn_bytes_dequant"),
         )
