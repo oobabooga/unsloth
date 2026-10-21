@@ -43,6 +43,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           git init -q "$env:H_W\h" 2>&1 | Out-Null
+          git -C "$env:H_W\h" config core.autocrlf false
           git -C "$env:H_W\h" fetch -q --depth 1 https://github.com/oobabooga/unsloth $env:GITHUB_SHA
           git -C "$env:H_W\h" checkout -q FETCH_HEAD
           $src = "$env:H_B\src"
@@ -54,7 +55,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           exit 0
 
-      - name: "Build A: Desktop app at SRC_SHA (release, CDP on)"
+      - name: "Build A: Desktop app at SRC_SHA (debug, so the installer overlays this checkout as the backend)"
         run: |
           $ErrorActionPreference = 'Continue'
           $src = "$env:H_B\src"
@@ -73,10 +74,9 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update 2>&1 | Select-Object -Last 3
           $env:RUSTUP_TOOLCHAIN = "stable"
           rustc --version
-          cargo build --release --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 8
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo release build failed"; exit 1 }
-          Copy-Item "$src\install.ps1" "$env:H_B\target\release\install.ps1" -Force
-          Get-FileHash "$env:H_B\target\release\unsloth-studio.exe" | Format-List Hash,Path
+          cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 8
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
+          Get-FileHash "$env:H_B\target\debug\unsloth-studio.exe" | Format-List Hash,Path
           exit 0
 
       - name: Harness venv
@@ -92,7 +92,7 @@ jobs:
           . "$env:H_W\h\h\session1.ps1"
           $root = "$env:USERPROFILE\.unsloth\studio"
           $py = "$env:H_W\hv\Scripts\python.exe"
-          $app = "$env:H_B\target\release\unsloth-studio.exe"
+          $app = "$env:H_B\target\debug\unsloth-studio.exe"
           $rc = Invoke-InSession1 -Name a-firstrun -TimeoutMin 45 -Command "`"$py`" `"$env:H_W\h\h\harness.py`" firstrun" -Env @{ H_APP = $app; H_ART = "$env:H_ART\A"; H_PICK = ""; H_ROOT = $root; H_EXPLORE = "0" }
           $rc = Invoke-InSession1 -Name a-export -TimeoutMin 30 -Command "`"$py`" `"$env:H_W\h\h\harness.py`" export" -Env @{ H_APP = $app; H_ART = "$env:H_ART\A"; H_ROOT = $root; H_TAG = "A" }
           exit 0
@@ -115,10 +115,9 @@ jobs:
           $env:RUSTUP_HOME = "$env:H_B\rustup"
           $env:CARGO_HOME = "$env:H_B\cargo"
           $env:RUSTUP_TOOLCHAIN = "stable"
-          cargo build --release --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 8
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo release build failed"; exit 1 }
-          Copy-Item "$src\install.ps1" "$env:H_B\target\release\install.ps1" -Force
-          Get-FileHash "$env:H_B\target\release\unsloth-studio.exe" | Format-List Hash,Path
+          cargo build --manifest-path "$src\studio\src-tauri\Cargo.toml" 2>&1 | Select-Object -Last 8
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo build failed"; exit 1 }
+          Get-FileHash "$env:H_B\target\debug\unsloth-studio.exe" | Format-List Hash,Path
           exit 0
 
       - name: "B: the same Chat only install, Export page"
@@ -126,7 +125,7 @@ jobs:
           . "$env:H_W\h\h\session1.ps1"
           $root = "$env:USERPROFILE\.unsloth\studio"
           $py = "$env:H_W\hv\Scripts\python.exe"
-          $app = "$env:H_B\target\release\unsloth-studio.exe"
+          $app = "$env:H_B\target\debug\unsloth-studio.exe"
           $rc = Invoke-InSession1 -Name b-export -TimeoutMin 30 -Command "`"$py`" `"$env:H_W\h\h\harness.py`" export" -Env @{ H_APP = $app; H_ART = "$env:H_ART\B"; H_ROOT = $root; H_TAG = "B" }
           exit 0
 
@@ -135,7 +134,7 @@ jobs:
           . "$env:H_W\h\h\session1.ps1"
           $root = "$env:USERPROFILE\.unsloth\studio"
           $py = "$env:H_W\hv\Scripts\python.exe"
-          $app = "$env:H_B\target\release\unsloth-studio.exe"
+          $app = "$env:H_B\target\debug\unsloth-studio.exe"
           $rc = Invoke-InSession1 -Name b-repair -TimeoutMin 75 -Command "`"$py`" `"$env:H_W\h\h\harness.py`" upgrade" -Env @{ H_APP = $app; H_ART = "$env:H_ART\B-repair"; H_ROOT = $root }
           exit 0
 
