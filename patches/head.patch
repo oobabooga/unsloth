@@ -1,8 +1,8 @@
 From ab5255fa370a47e1f07c9ad43bd7199c33f1ae43 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Tue, 20 Oct 2026 20:00:12 -0700
-Subject: [PATCH] NF4 GEMV: eager batch-1 decode takes the Triton GEMV on HIP
- from Triton 3.6
+Subject: [PATCH 1/2] NF4 GEMV: eager batch-1 decode takes the Triton GEMV on
+ HIP from Triton 3.6
 
 On gfx1151 with Triton 3.6 the words kernel ran Llama 8B decode shapes 1.5x to
 3.4x faster per call than bitsandbytes' ctypes GEMV, which HIP kept since the
@@ -164,6 +164,33 @@ index 97c73e6c94..a78e4e0fce 100644
  
  
  def _word_aligned(W):
+-- 
+2.43.0
+
+
+From ebb1a1bf311125a1d937cfa2096d4a25edeab1e9 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Tue, 20 Oct 2026 20:11:19 -0700
+Subject: [PATCH 2/2] Plan reuse test needs the direct launcher
+
+---
+ tests/test_nf4_triton_gemv.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/tests/test_nf4_triton_gemv.py b/tests/test_nf4_triton_gemv.py
+index 32a3370a72..d74d9671de 100644
+--- a/tests/test_nf4_triton_gemv.py
++++ b/tests/test_nf4_triton_gemv.py
+@@ -248,6 +248,9 @@ def test_one_row_into_a_taller_out_writes_only_that_row():
+ def test_planned_rows_are_reused_without_an_out(monkeypatch):
+     # fast_geglu_inference calls the gate and up projections with out = None.
+     utils = _utils_with_kernels()
++    from unsloth.kernels import triton_launch
++    if not triton_launch._ENABLED:
++        pytest.skip("plans are kept only with the direct launcher (off on HIP)")
+     monkeypatch.setattr(utils, "_gemv_rows_cap", lambda device: 4)
+     proj = _linear4bit(1024, 4096)
+     W, W_quant = utils.get_lora_parameters_bias(proj)[:2]
 -- 
 2.43.0
 
