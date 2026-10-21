@@ -28,7 +28,7 @@ jobs:
   worker:
     name: "worker box (Linux)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 75
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -37,8 +37,8 @@ jobs:
         run: |
           source amd_ci/lib/preamble.sh "hl-worker"
 
-      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced CPU builds)
-        timeout-minutes: 40
+      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced + TLS CPU builds)
+        timeout-minutes: 65
         run: |
           set -uo pipefail
           bash amd_ci/homelink/setup.sh worker 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
@@ -52,7 +52,7 @@ jobs:
           D="$AMD_CI_WORK/out/worker"; mkdir -p "$D"
           L="$AMD_CI_WORK/llama"
           setsid python3 -u "$GITHUB_WORKSPACE/amd_ci/homelink/lan_tryout.py" worker --repo "$AMD_CI_WORK/src/unsloth" \
-            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin" --out-dir "$D" --window-s 2700 \
+            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin,tls=$L/build-tls/bin" --out-dir "$D" --window-s 4500 \
             > "$D/control.log" 2>&1 < /dev/null &
           echo $! > "$D/control.pid"
           for i in $(seq 60); do [ -s "$D/self.json" ] && break; sleep 0.5; done
@@ -68,7 +68,7 @@ jobs:
           if-no-files-found: error
 
       - name: Serve the master until it is done
-        timeout-minutes: 50
+        timeout-minutes: 100
         run: |
           set -uo pipefail
           D="$AMD_CI_WORK/out/worker"; PID=$(cat "$D/control.pid")
@@ -102,7 +102,7 @@ jobs:
   master:
     name: "master box (Linux)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 75
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -111,15 +111,15 @@ jobs:
         run: |
           source amd_ci/lib/preamble.sh "hl-master"
 
-      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced CPU builds, model)
-        timeout-minutes: 40
+      - name: Setup (unsloth clone, venv, llama.cpp base + coalesced + TLS CPU builds, model)
+        timeout-minutes: 65
         run: |
           set -uo pipefail
           bash amd_ci/homelink/setup.sh master 2>&1 | tee "$AMD_CI_WORK/out/setup.log"
           grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
 
       - name: Two-machine tryout (master side)
-        timeout-minutes: 55
+        timeout-minutes: 80
         env:
           GH_API_TOKEN: ${{ github.token }}
         run: |
@@ -130,7 +130,7 @@ jobs:
           L="$AMD_CI_WORK/llama"
           echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
           python3 -u "$GITHUB_WORKSPACE/amd_ci/homelink/lan_tryout.py" master --repo "$AMD_CI_WORK/src/unsloth" \
-            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin" --gguf "$(cat "$AMD_CI_WORK/model.txt")" \
+            --bins "base=$L/build-base/bin,coal=$L/build-coal/bin,tls=$L/build-tls/bin" --gguf "$(cat "$AMD_CI_WORK/model.txt")" \
             --out-dir "$D" --wait-s 1800 --threads 8 --n-predict 64 --repeats 3 --rounds 3 2>&1 | tee "$D/master.log"
           echo "master rc=${PIPESTATUS[0]}"
           test -s "$D/master_result.json"

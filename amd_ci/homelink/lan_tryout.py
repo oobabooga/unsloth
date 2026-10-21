@@ -2,20 +2,23 @@
 """The home cluster link (#14274) across two physical machines: the real `unsloth` CLI and Studio's planner,
 master on one box, worker on another, over the lab LAN.
 
-  worker    --repo R --bins base=DIR,coal=DIR --out-dir D [--window-s 2700] [--local]
+  worker    --repo R --bins base=DIR,coal=DIR,tls=DIR --out-dir D [--window-s 4500] [--local]
             writes D/self.json (addresses, a control port, a per-run nonce) and obeys the master's
-            nonce-authenticated commands (join, start/stop the worker, done) until done or the window ends
+            nonce-authenticated commands (join, leave, start/stop the worker, native_state, done)
   master    --repo R --bins ... --gguf M --out-dir D [--peer-dir P | GitHub artifacts] [--local]
-            pairs, joins the worker, checks list / LAN discovery, plans with Studio, serves through the
-            relay, compares greedy text with a same-box direct RPC run, measures base vs coalesced
-            builds, moves the worker's port (discovery must find it), unpaired client, remove
+            pairs, joins the worker, checks list / LAN discovery, plans with Studio, then per round
+            the arms link (relay, base build), link_coal (relay, coalesced build) and native (llama.cpp's
+            own mutual TLS straight to the worker, TLS build), each against a same-box direct RPC
+            reference; moves the worker's port (discovery must find it), unpaired client, remove; with a
+            TLS build: re-pair, a stranger's certificate refused at the TLS port, remove cuts the TLS session
   summarize --in DIR --out DIR      VERDICT.md / verdict.json from the master and worker results
 
-No raw ggml-rpc-server is ever reachable from the LAN: the worker's rpc-server stays on loopback behind
-the agent, and the direct-RPC reference runs on the master box over loopback only. The control channel
-carries only commands with an HMAC over a per-run nonce (published in the run's own artifact); the
-pairing token it carries is single use, expires in minutes, and only adds a worker to this run's
-throwaway cluster."""
+No plaintext ggml-rpc-server is ever reachable from the LAN: in the relay arms the worker's rpc-server
+stays on loopback behind the agent; in the native arm it listens on the LAN only with llama.cpp's mutual
+TLS 1.3 and an allowlist holding the master's certificate. The direct-RPC reference runs on the master
+box over loopback only. The control channel carries only commands with an HMAC over a per-run nonce
+(published in the run's own artifact); the pairing token it carries is single use, expires in minutes,
+and only adds a worker to this run's throwaway cluster."""
 
 import argparse
 import asyncio
@@ -83,8 +86,14 @@ def cli_cmd():
     return [sys.executable, "-c", "import sys; sys.argv[0] = 'unsloth'; from unsloth_cli import app; app()"]
 
 
-def base_env(repo, state, run_dir, bin_dir):
+NATIVE_ENV = "UNSLOTH_CLUSTER_NATIVE_TLS"  # "0" keeps a link on the relay even when both builds have TLS
+# arm -> llama.cpp build: the relay on the base and coalesced builds, llama.cpp's own TLS on the TLS build
+ARMS = {"link": "base", "link_coal": "coal", "native": "tls"}
+
+
+def base_env(repo, state, run_dir, bin_dir, native = False):
     env = dict(os.environ)
+    env[NATIVE_ENV] = "1" if native else "0"
     env["PYTHONPATH"] = os.pathsep.join([str(repo), str(repo / "studio" / "backend")])
     env["UNSLOTH_CLUSTER_STATE_DIR"] = str(state)
     env["UNSLOTH_CLUSTER_RUN_DIR"] = str(run_dir)
@@ -124,8 +133,8 @@ class Worker:
         self.proc, self.log_path, self.events, self.done = None, None, [], False
         self.nonce = secrets.token_hex(16)
 
-    def env(self, arm):
-        return base_env(self.repo, self.state, self.run_dir, self.bins[arm])
+    def env(self, arm, native = False):
+        return base_env(self.repo, self.state, self.run_dir, self.bins[arm], native)
 
     def ev(self, **kw):
         kw["t"] = round(time.time(), 3)
@@ -152,11 +161,13 @@ class Worker:
             return {"ok": r.returncode == 0, "rc": r.returncode, "out": text[-1500:], "leaked": token in r.stdout + r.stderr}
         if cmd == "start_worker":
             self.stop_worker()
-            arm, port = args["arm"], int(args["port"])
+            arm, port, native = args["arm"], int(args["port"]), bool(args.get("native"))
             self.log_path = self.out / f"worker_{arm}_{port}_{int(time.time())}.log"
-            self.proc = subprocess.Popen(cli_cmd() + ["worker", "--port", str(port), "--rpc-port", str(free_port())],
-                                         env = self.env(arm), stdout = open(self.log_path, "w"), stderr = subprocess.STDOUT,
-                                         cwd = str(self.out), start_new_session = True)
+            argv = cli_cmd() + ["worker", "--port", str(port), "--rpc-port", str(free_port())]
+            if args.get("native_port"):
+                argv += ["--native-port", str(int(args["native_port"]))]
+            self.proc = subprocess.Popen(argv, env = self.env(arm, native), stdout = open(self.log_path, "w"),
+                                         stderr = subprocess.STDOUT, cwd = str(self.out), start_new_session = True)
             up, end = False, time.time() + 180
             while time.time() < end:
                 text = self.log_path.read_text(errors = "replace")
@@ -165,11 +176,19 @@ class Worker:
                     break
                 time.sleep(0.3)
             tail = self.log_path.read_text(errors = "replace")[-1500:]
-            self.ev(cmd = "start_worker", arm = arm, port = port, up = up)
+            self.ev(cmd = "start_worker", arm = arm, port = port, native = native, up = up)
             return {"ok": up, "tail": tail}
         if cmd == "stop_worker":
             self.stop_worker()
             return {"ok": True}
+        if cmd == "native_state":
+            return self.native_state(int(args["port"]))
+        if cmd == "leave":
+            self.stop_worker()
+            r = subprocess.run(cli_cmd() + ["cluster", "leave", "--yes"], capture_output = True, text = True,
+                               timeout = 120, env = self.env("base"), cwd = str(self.out))
+            self.ev(cmd = "leave", rc = r.returncode, out = (r.stdout + r.stderr)[-400:])
+            return {"ok": r.returncode == 0, "out": (r.stdout + r.stderr)[-1500:]}
         if cmd == "tail":
             return {"ok": True, "tail": self.log_path.read_text(errors = "replace")[-3000:] if self.log_path else ""}
         if cmd == "done":
@@ -177,6 +196,30 @@ class Worker:
             self.done = True
             return {"ok": True}
         return {"ok": False, "error": "unknown command"}
+
+    def native_state(self, port):
+        """The rpc-server this worker's agent runs on the native TLS port: its argv (TLS flags), the
+        allowlist it reads, and the peers holding an ESTABLISHED connection to it right now."""
+        import psutil
+        if self.proc is None or self.proc.poll() is not None:
+            return {"ok": False, "error": "no worker"}
+        found = []
+        for k in psutil.Process(self.proc.pid).children(recursive = True):
+            try:
+                cmd = k.cmdline()
+                if not any(c.endswith("rpc-server") for c in cmd) or str(port) not in cmd:
+                    continue
+                allow_path = cmd[cmd.index("--tls-allow") + 1] if "--tls-allow" in cmd else None
+                allow = [s.strip() for s in Path(allow_path).read_text().splitlines() if s.strip()] if allow_path else []
+                lister = getattr(k, "net_connections", None) or k.connections
+                peers = sorted({c.raddr.ip for c in lister(kind = "tcp")
+                                if c.laddr and c.laddr.port == port and c.status == "ESTABLISHED" and c.raddr})
+                found.append({"pid": k.pid, "tls": "--tls-cert" in cmd, "allow": allow, "peers": peers,
+                              "argv": [c for c in cmd if not c.endswith((".pem", ".key"))][-12:]})
+            except (psutil.Error, OSError, ValueError, IndexError):
+                continue
+        self.ev(cmd = "native_state", port = port, found = found)
+        return {"ok": bool(found), "found": found}
 
     def serve(self):
         info = lp.interfaces()
@@ -292,18 +335,18 @@ class Master:
         print(f"[{'PASS' if ok else 'FAIL'}] {name} {'' if ok else str(detail)[-400:]}", flush = True)
         return ok
 
-    def env(self, arm):
-        return base_env(self.repo, self.state, self.run_dir, self.bins[arm])
+    def env(self, arm, native = False):
+        return base_env(self.repo, self.state, self.run_dir, self.bins[arm], native)
 
     def cli(self, *args, stdin = None, timeout = 120, arm = "base"):
         return subprocess.run(cli_cmd() + list(args), env = self.env(arm), input = stdin, capture_output = True,
                               text = True, timeout = timeout, cwd = str(self.out))
 
-    def use_arm(self, arm):
-        os.environ.update(self.env(arm))
+    def use_arm(self, arm, native = False):
+        os.environ.update(self.env(arm, native))
 
-    def plan(self, arm):
-        self.use_arm(arm)
+    def plan(self, arm, native = False):
+        self.use_arm(arm, native)
         self.cs.reset_for_tests()
         req = SimpleNamespace(model_path = self.a.gguf, gguf_variant = None, llama_extra_args = None,
                               max_seq_length = 512, cache_type_kv = None, disable_vision = False)
@@ -330,27 +373,67 @@ class Master:
                 time.sleep(0.5)
         return p, None, log
 
-    def ask(self, port, n, timeout = 600):
+    def ask(self, port, n, timeout = None):
+        timeout = timeout or self.a.ask_timeout
         body = json.dumps({"prompt": "The capital of France is", "n_predict": n, "temperature": 0,
                            "cache_prompt": False, "ignore_eos": True}).encode()
         req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", body, {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout = timeout) as r:
             return json.loads(r.read())
 
-    def complete(self, arm, args, env, tag):
+    def complete(self, arm, args, env, tag, during = None):
+        """Greedy text and ms/token through llama-server; `during` runs once while the session is live."""
+        self.during = None
         p, port, log = self.llama(arm, args, env, tag)
         if port is None:
             kill_group(p)
             return None, [], log.read_text(errors = "replace")
         texts, per_tok = [], []
         try:
-            for _ in range(1 + self.a.repeats):
+            for i in range(1 + self.a.repeats):
                 o = self.ask(port, self.a.n_predict)
                 texts.append(o["content"])
                 per_tok.append(o["timings"]["predicted_per_token_ms"])
+                if i == 0 and during is not None:
+                    try:
+                        self.during = during()
+                    except Exception as exc:
+                        self.during = {"ok": False, "error": repr(exc)[:300]}
         finally:
             kill_group(p)
         return texts[0], per_tok[1:], log.read_text(errors = "replace")
+
+    def pair(self, ctl, m_ip, name, port, tag):
+        """`cluster pair` on this box, the token to `cluster join --token-stdin` on the worker box."""
+        pport = free_port("0.0.0.0")
+        plog = self.out / f"pair_{tag}.log"
+        pairer = subprocess.Popen(cli_cmd() + ["cluster", "pair", "--ttl", "5m", "--addr", m_ip, "--port", str(pport)],
+                                  env = self.env("base"), stdout = open(plog, "w"), stderr = subprocess.STDOUT,
+                                  cwd = str(self.out), start_new_session = True)
+        self.procs.append(pairer)
+        token = None
+        for _ in range(300):
+            m = re.search(r"^\s+(unsloth-pair-1\.\S+)\s*$", plog.read_text(), re.M)
+            if m:
+                token = m.group(1)
+                break
+            time.sleep(0.1)
+        if token is None:
+            kill_group(pairer)
+            return None, {}, plog.read_text()
+        j = ctl("join", token = token, name = name, port = port)
+        try:
+            pairer.wait(60)
+        except subprocess.TimeoutExpired:
+            pass
+        return token, j, plog.read_text().replace(token, "<token>")
+
+    def master_fp(self, env):
+        cert = env.get("GGML_RPC_TLS_CERT")
+        if not cert:
+            return None
+        import ssl
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(Path(cert).read_text())).hexdigest()
 
     def linked_env(self, args, arm):
         rpc = args[args.index("--rpc") + 1] if "--rpc" in args else ""
@@ -421,31 +504,14 @@ class Master:
         a, R = self.a, self.R
         name = "box-w"
         # agent ports that are free on the worker box (the paired one, then the one only discovery can find)
-        p1, p2 = ctl("free_ports", n = 2)["ports"]
+        # agent ports (paired, moved, re-paired) and the native TLS port, all free on the worker box
+        p1, p2, p3, npt = ctl("free_ports", n = 4)["ports"]
         # 1. pairing through the real CLI, token handed to the worker over the control channel
-        pport = free_port("0.0.0.0")
-        plog = self.out / "pair.log"
-        pairer = subprocess.Popen(cli_cmd() + ["cluster", "pair", "--ttl", "5m", "--addr", m_ip, "--port", str(pport)],
-                                  env = self.env("base"), stdout = open(plog, "w"), stderr = subprocess.STDOUT,
-                                  cwd = str(self.out), start_new_session = True)
-        self.procs.append(pairer)
-        token = None
-        for _ in range(300):
-            m = re.search(r"^\s+(unsloth-pair-1\.\S+)\s*$", plog.read_text(), re.M)
-            if m:
-                token = m.group(1)
-                break
-            time.sleep(0.1)
-        if not self.step("cluster pair prints a one-time token", token is not None, plog.read_text()):
+        token, j, ptxt = self.pair(ctl, m_ip, name, p1, "first")
+        if not self.step("cluster pair prints a one-time token", token is not None, ptxt):
             return 1
-        j = ctl("join", token = token, name = name, port = p1)
         self.step("cluster join on the worker box (token over stdin, never echoed)", j.get("ok") and not j.get("leaked"), j.get("out", ""))
-        try:
-            pairer.wait(60)
-        except subprocess.TimeoutExpired:
-            pass
-        ptxt = plog.read_text()
-        self.step("cluster pair on the master reports the worker", f"Paired {name}" in ptxt, ptxt.replace(token, "<token>"))
+        self.step("cluster pair on the master reports the worker", f"Paired {name}" in ptxt, ptxt)
         # 2. the worker serves (base build first)
         s = ctl("start_worker", arm = "base", port = p1)
         if not self.step("unsloth worker serves on the worker box (rpc-server on its loopback)", s.get("ok"), s.get("tail", "")):
@@ -478,31 +544,52 @@ class Master:
         # 4. same-box direct reference (loopback rpc-server on the master box only)
         ref, ref_tok, _ = self.direct("base", args, eps, "ref")
         R["texts"]["direct_base"] = ref
-        # 5. arms: relayed over the LAN, base vs coalesced, alternating; plus same-box direct per arm
-        order = [("base", "coal")[i % 2] for i in range(2 * a.rounds)]
-        if "coal" not in self.bins:
-            order = ["base"] * a.rounds
-        served_all, equal_all = True, True
-        for i, arm in enumerate(order):
-            if arm != "base" or i:
-                s = ctl("start_worker", arm = arm, port = p1)
+        # 5. arms, rotated each round: the relay on the base and coalesced builds (native off on both
+        # ends) and llama.cpp's own TLS on the TLS build; plus a same-box direct reference per arm
+        wanted = [x for x in self.a.arms.split(",") if x]
+        arms = [x for x in ("link", "link_coal", "native") if ARMS[x] in self.bins and x in wanted]
+        link_ok, native_ok, equal_all, native_detail = True, True, True, []
+        for i in range(a.rounds):
+            k = i % len(arms)
+            for arm in arms[k:] + arms[:k]:
+                build, nat = ARMS[arm], arm == "native"
+                s = ctl("start_worker", arm = build, port = p1, native = nat, native_port = npt)
                 if not s.get("ok"):
-                    served_all = False
-                    self.step(f"worker restarts on the {arm} build", False, s.get("tail", ""))
+                    link_ok, native_ok = (link_ok and nat), (native_ok and not nat)
+                    self.step(f"worker restarts for the {arm} arm ({build} build)", False, s.get("tail", ""))
                     continue
-            args, eps, _ = self.plan(arm)
-            text, tok, log = self.complete(arm, args, self.linked_env(args, arm), f"linked_{arm}_{i}")
-            buf = bool(eps) and (f"[{eps[0]}] model buffer size" in log or re.search(rf"RPC\d*\[{re.escape(eps[0])}\].*buffer size", log))
-            dtext, dtok, _ = self.direct(arm, args, eps, f"direct_{arm}_{i}")
-            served_all &= bool(text) and bool(buf)
-            equal_all &= text == ref and dtext == ref
-            R["perf"].append({"round": i, "arm": arm, "linked_ms_per_token": tok, "direct_same_box_ms_per_token": dtok,
-                              "text_equal": text == ref, "direct_text_equal": dtext == ref})
-            R["texts"][f"linked_{arm}_{i}"] = text
-            print("ROUND", json.dumps(R["perf"][-1]), flush = True)
-        self.step("llama-server on the master serves through the relay, model buffer on the remote worker (every round)", served_all,
-                  json.dumps(R["perf"])[-1200:])
-        self.step("greedy text through the LAN link equals same-box direct RPC (every round, both builds)", equal_all,
+                args, eps, status = self.plan(build, native = nat)
+                nodes = status.get("nodes") or []
+                transport = nodes[0].get("transport") if nodes else None
+                lenv = self.linked_env(args, build)
+                during = (lambda: ctl("native_state", port = npt)) if nat else None
+                text, tok, log = self.complete(build, args, lenv, f"{arm}_{i}", during = during)
+                if nat:
+                    mfp = self.master_fp(lenv)
+                    st = (self.during or {}).get("found") or [{}]
+                    ok = (transport == "native_tls" and bool(eps) and eps[0].startswith("tls://") and f"@{w_ip}:{npt}" in eps[0]
+                          and bool(text) and st[0].get("tls") and st[0].get("allow") == [mfp] and m_ip in (st[0].get("peers") or []))
+                    native_ok &= bool(ok)
+                    native_detail.append({"round": i, "transport": transport, "endpoint": eps[0] if eps else None,
+                                          "master_fp": mfp, "worker_rpc": st[0]})
+                else:
+                    buf = bool(eps) and (f"[{eps[0]}] model buffer size" in log or re.search(rf"RPC\d*\[{re.escape(eps[0])}\].*buffer size", log))
+                    link_ok &= bool(text) and bool(buf) and transport == "link"
+                dtext, dtok, _ = self.direct(build, args, eps, f"direct_{arm}_{i}")
+                equal_all &= text == ref and dtext == ref
+                R["perf"].append({"round": i, "arm": arm, "build": build, "transport": transport,
+                                  "linked_ms_per_token": tok, "direct_same_box_ms_per_token": dtok,
+                                  "text_equal": text == ref, "direct_text_equal": dtext == ref})
+                R["texts"][f"{arm}_{i}"] = text
+                print("ROUND", json.dumps(R["perf"][-1]), flush = True)
+        self.step("llama-server on the master serves through the relay, model buffer on the remote worker (every link round)",
+                  link_ok, json.dumps([r for r in R["perf"] if r["arm"] != "native"])[-1200:])
+        if "native" in arms:
+            R["native_rounds"] = native_detail
+            self.step("native: Studio plans tls://<worker fp> (transport native_tls); the worker's rpc-server runs TLS, "
+                      "allowlists only the master and holds the master's session (every native round)",
+                      native_ok, json.dumps(native_detail, default = str)[-1500:])
+        self.step("greedy text over the LAN equals same-box direct RPC (every round, every arm)", equal_all,
                   json.dumps({k: v for k, v in R["texts"].items()}, ensure_ascii = False)[-1200:])
         R["perf_summary"] = summarize_perf(R["perf"])
         # 6. the worker moves to another port: only LAN discovery can find it
@@ -567,7 +654,105 @@ class Master:
         except Exception as exc:  # no worker left: refusing to plan is also "no remote worker"
             eps, detail = [], f"planner refused: {exc!r}"[:600]
         self.step("after remove the plan has no remote worker", not eps, detail)
+        if "tls" in self.bins:
+            self.native_remove(ctl, m_ip, w_ip, name, p3, npt)
         return 0 if all(s["ok"] for s in R["steps"]) else 1
+
+    def list_devices(self, env):
+        r = subprocess.run([str(self.bins["tls"] / "llama-server"), "--list-devices"] + env.pop("_RPC_ARGS"),
+                           env = env, capture_output = True, text = True, timeout = 120)
+        out = r.stdout + r.stderr
+        return [s.strip() for s in out.splitlines() if re.match(r"\s*RPC\d*\S*:", s)], out[-800:]
+
+    def stranger(self):
+        """A key and self-signed certificate this cluster never issued (a LAN peer that was never paired)."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        import datetime
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "stranger")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes = 5))
+                .not_valid_after(now + datetime.timedelta(days = 1)).sign(key, hashes.SHA256()))
+        d = self.out / "stranger"
+        d.mkdir(exist_ok = True)
+        (d / "key.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                      serialization.NoEncryption()))
+        (d / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        return str(d / "cert.pem"), str(d / "key.pem")
+
+    def native_remove(self, ctl, m_ip, w_ip, name, port, npt):
+        """Re-pair the worker (leave + pair + join), serve over llama.cpp's own TLS, refuse a stranger's
+        certificate at the TLS port, then `cluster remove` must cut the live TLS session."""
+        R = self.R
+        lv = ctl("leave")
+        token, j, ptxt = self.pair(ctl, m_ip, name, port, "again")
+        ok = lv.get("ok") and token is not None and j.get("ok") and f"Paired {name}" in ptxt
+        if not self.step("re-pair after remove (cluster leave on the worker, then pair + join again)", ok,
+                         json.dumps({"leave": lv, "join": j, "pair": ptxt[-400:]}, default = str)):
+            return
+        s = ctl("start_worker", arm = "tls", port = port, native = True, native_port = npt)
+        if not self.step("unsloth worker serves on the TLS build after re-pairing", s.get("ok"), s.get("tail", "")):
+            return
+        time.sleep(6.5)
+        args, eps, status = self.plan("tls", native = True)
+        nodes = status.get("nodes") or []
+        if not self.step("Studio plans the re-paired worker over native TLS",
+                         bool(eps) and eps[0].startswith("tls://") and nodes and nodes[0].get("transport") == "native_tls",
+                         json.dumps({"args": args, "nodes": nodes}, default = str)):
+            return
+        lenv = self.linked_env(args, "tls")
+        rpc_args = ["--rpc", eps[0]]
+        good, good_out = self.list_devices({**lenv, "_RPC_ARGS": list(rpc_args)})
+        cert, key = self.stranger()
+        bad, bad_out = self.list_devices({**lenv, "GGML_RPC_TLS_CERT": cert, "GGML_RPC_TLS_KEY": key, "_RPC_ARGS": list(rpc_args)})
+        self.step("a TLS client with a certificate this cluster never issued gets no device from the worker's TLS port "
+                  "(the master's own certificate does)", bool(good) and not bad,
+                  json.dumps({"master_devices": good, "stranger_devices": bad, "stranger_out": bad_out[-500:],
+                              "master_out": good_out[-300:]}))
+        # remove while a generation runs over native TLS
+        cut, detail = False, {}
+        p, lport, log = self.llama("tls", args, lenv, "remove_native")
+        if lport:
+            box = {}
+
+            def long_gen():
+                t = time.time()
+                try:
+                    o = self.ask(lport, 4000, timeout = 900)
+                    box["n"] = o.get("timings", {}).get("predicted_n")
+                except Exception as exc:
+                    box["err"] = repr(exc)[:200]
+                box["t"] = time.time() - t
+
+            th = threading.Thread(target = long_gen, daemon = True)
+            th.start()
+            time.sleep(3)
+            live = ctl("native_state", port = npt)
+            t_rm = time.time()
+            rm = self.cli("cluster", "remove", name)
+            # The worker still trusts this master; the master's next status pass (Studio polls it) sends
+            # native_close, and the worker restarts its rpc-server. Record whether it ends sooner on its own.
+            th.join(10)
+            cut_alone = not th.is_alive()
+            if not cut_alone:
+                try:
+                    self.ss.status()
+                except Exception as exc:
+                    detail["status_error"] = repr(exc)[:200]
+            th.join(30)
+            ended = time.time() - t_rm
+            cut = rm.returncode == 0 and not th.is_alive() and (box.get("err") or (box.get("n") or 0) < 4000) and ended < 45
+            detail.update({"remove_rc": rm.returncode, "remove_out": rm.stdout[-300:], "gen": box,
+                           "ended_s_after_remove": round(ended, 1), "cut_without_a_status_pass": cut_alone,
+                           "live_before_remove": live, "llama_alive": p.poll() is None})
+        kill_group(p)
+        R["native_remove"] = detail
+        self.step("cluster remove cuts the live native TLS session within seconds (on Studio's next status pass)",
+                  cut, json.dumps(detail, default = str))
 
     def main(self):
         rc = 1
@@ -591,7 +776,8 @@ def summarize_perf(perf):
         rows = [r for r in perf if r["arm"] == arm]
         lk = [statistics.median(r["linked_ms_per_token"]) for r in rows if r["linked_ms_per_token"]]
         dr = [statistics.median(r["direct_same_box_ms_per_token"]) for r in rows if r["direct_same_box_ms_per_token"]]
-        out[arm] = {"rounds": len(rows),
+        out[arm] = {"rounds": len(rows), "build": rows[0].get("build", arm),
+                    "transport": sorted({str(r.get("transport")) for r in rows}),
                     "linked_lan_ms_per_token": {"median": round(statistics.median(lk), 3), "min": round(min(lk), 3), "max": round(max(lk), 3)} if lk else None,
                     "direct_same_box_ms_per_token": {"median": round(statistics.median(dr), 3), "min": round(min(dr), 3), "max": round(max(dr), 3)} if dr else None}
     return out
@@ -626,16 +812,22 @@ def cmd_summarize(a):
         ps = m.get("perf_summary")
         if ps:
             lines.append("")
-            lines.append("| build | rounds | relayed over LAN ms/token (median, min-max) | same-box direct ms/token (median, min-max) |")
-            lines.append("|---|---|---|---|")
+            lines.append("| arm | build | transport | rounds | over the LAN ms/token (median, min-max) | same-box direct ms/token (median, min-max) |")
+            lines.append("|---|---|---|---|---|---|")
             for arm, r in ps.items():
                 lk, dr = r.get("linked_lan_ms_per_token") or {}, r.get("direct_same_box_ms_per_token") or {}
-                lines.append(f"| {arm} | {r['rounds']} | {lk.get('median')} ({lk.get('min')}-{lk.get('max')}) | {dr.get('median')} ({dr.get('min')}-{dr.get('max')}) |")
+                lines.append(f"| {arm} | {r.get('build', arm)} | {','.join(r.get('transport') or [])} | {r['rounds']} | "
+                             f"{lk.get('median')} ({lk.get('min')}-{lk.get('max')}) | {dr.get('median')} ({dr.get('min')}-{dr.get('max')}) |")
+        nr = m.get("native_remove")
+        if nr:
+            lines.append("")
+            lines.append(f"- native remove: session ended {nr.get('ended_s_after_remove')} s after `cluster remove`; "
+                         f"ended before Studio's next status pass: {nr.get('cut_without_a_status_pass')}")
     if w:
         lines.append("")
         lines.append(f"- worker side: done={w.get('done')}, events={len(w.get('events', []))}, rejected={sum(1 for e in w.get('events', []) if e.get('cmd') == 'rejected')}")
     lines.append("")
-    lines.append("Not covered: a Windows worker (inbound blocked on the Windows boxes), GPUs (CPU builds; the GPU group serializes GPU jobs), a raw direct-RPC run across the LAN (never exposed).")
+    lines.append("Not covered: a Windows worker (inbound blocked on the Windows boxes), GPUs (CPU builds; the GPU group serializes GPU jobs), a raw plaintext direct-RPC run across the LAN (never exposed; the native arm is llama.cpp's own TLS straight to the worker).")
     os.makedirs(a.out, exist_ok = True)
     Path(a.out, "VERDICT.md").write_text("\n".join(lines) + "\n", encoding = ENC)
     lp.write_json(os.path.join(a.out, "verdict.json"), {"verdict": verdict, "master": m, "worker": w})
@@ -649,7 +841,7 @@ def main():
     for role in ("worker", "master"):
         p = sub.add_parser(role)
         p.add_argument("--repo", required = True)
-        p.add_argument("--bins", required = True, help = "base=DIR[,coal=DIR]")
+        p.add_argument("--bins", required = True, help = "base=DIR[,coal=DIR][,tls=DIR]")
         p.add_argument("--out-dir", required = True)
         p.add_argument("--local", action = "store_true", help = "self-test on one host over loopback")
         if role == "worker":
@@ -663,6 +855,8 @@ def main():
             p.add_argument("--repeats", type = int, default = 3)
             p.add_argument("--rounds", type = int, default = 3)
             p.add_argument("--allow-same-machine", action = "store_true")
+            p.add_argument("--arms", default = "link,link_coal,native", help = "subset of link,link_coal,native")
+            p.add_argument("--ask-timeout", type = float, default = 600, help = "seconds per completion request")
     p = sub.add_parser("summarize")
     p.add_argument("--in", dest = "input", required = True)
     p.add_argument("--out", required = True)

@@ -3,7 +3,9 @@
 #   1. clone unslothai/unsloth at $HL_REF (the #14274 branch by default)
 #   2. a throwaway venv with what the cluster CLI and Studio's planner import (probe loop installs the rest)
 #   3. llama.cpp CPU + RPC from unslothai/llama.cpp pull/187/head: build-base, then the same tree with
-#      amd_ci/homelink/coalesce_pr187.patch applied: build-coal (targets llama-server, ggml-rpc-server)
+#      amd_ci/homelink/coalesce_pr187.patch applied: build-coal, then the pristine tree with
+#      amd_ci/homelink/tls_pr187.patch (llama.cpp's own mutual TLS RPC transport): build-tls
+#      (system OpenSSL headers when the box has them, else a static BoringSSL fetched by CMake)
 #   4. master only: the public GGUF (no token)
 # Usage: bash amd_ci/homelink/setup.sh master|worker
 set -uo pipefail
@@ -58,7 +60,7 @@ FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_HIP=OFF
 command -v ccache >/dev/null && FLAGS="$FLAGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 J=$(nproc)
 build() {
-  cmake -S "$L" -B "$L/$1" $FLAGS > "$W/out/cmake_$1.log" 2>&1 \
+  cmake -S "$L" -B "$L/$1" $FLAGS ${2:-} > "$W/out/cmake_$1.log" 2>&1 \
     && cmake --build "$L/$1" -j "$J" --target llama-server ggml-rpc-server > "$W/out/make_$1.log" 2>&1
   local rc=$?
   [ $rc -eq 0 ] && [ -x "$L/$1/bin/ggml-rpc-server" ] && [ -x "$L/$1/bin/llama-server" ] \
@@ -69,6 +71,14 @@ build build-base
 git -C "$L" apply "$HERE/coalesce_pr187.patch" || { echo "FATAL: coalesce patch does not apply"; exit 1; }
 git -C "$L" diff --stat | tail -1
 build build-coal
+git -C "$L" checkout -q -- . && git -C "$L" apply "$HERE/tls_pr187.patch" || { echo "FATAL: TLS patch does not apply"; exit 1; }
+if echo '#include <openssl/ssl.h>' | ${CC:-cc} -E -x c - >/dev/null 2>&1; then
+  TLS_FLAGS="-DGGML_RPC_TLS=ON"; echo "TLS: system OpenSSL"
+else
+  TLS_FLAGS="-DGGML_RPC_TLS=ON -DGGML_RPC_TLS_BORINGSSL=ON"; echo "TLS: no OpenSSL headers, static BoringSSL"
+fi
+build build-tls "$TLS_FLAGS"
+"$L/build-tls/bin/ggml-rpc-server" --help 2>&1 | grep -q -- --tls-cert || { echo "FATAL: build-tls has no TLS flags"; exit 1; }
 
 if [ "$ROLE" = master ]; then
   echo "== model"
