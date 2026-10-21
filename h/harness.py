@@ -935,6 +935,20 @@ def read_tooltips(page):
     return out
 
 
+def hires_shot(page, name):
+    """The viewport re-rendered at 2x through CDP, so text stays sharp in a cropped figure."""
+    import base64
+    try:
+        cdp = page.context.new_cdp_session(page)
+        vp = page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+        data = cdp.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False,
+                                                   "clip": {"x": 0, "y": 0, "width": vp["w"], "height": vp["h"], "scale": 2}})
+        (SHOTS / f"{PHASE}-{name}@2x.png").write_bytes(base64.b64decode(data["data"]))
+        cdp.detach()
+    except Exception as e:
+        log(f"hires shot {name} failed: {e}")
+
+
 def capture_export(page, port, root, tag):
     """Open More > Export like a user; record the banner, the method cards and the API verdict."""
     res = {}
@@ -953,8 +967,8 @@ def capture_export(page, port, root, tag):
         time.sleep(5)
         loc = page.evaluate("() => ({language: navigator.language, languages: navigator.languages, stored: localStorage.getItem('unsloth_locale'), htmlLang: document.documentElement.lang})")
     res["locale"] = loc
-    cdp = page.context.new_cdp_session(page)
-    cdp.send("Emulation.setDeviceMetricsOverride", {"width": 1200, "height": 820, "deviceScaleFactor": 2, "mobile": False})
+    # Narrower so the banner wraps into a crop that stays legible at comment width.
+    page.set_viewport_size({"width": 1100, "height": 820})
     time.sleep(2)
     res["css_viewport"] = page.evaluate("() => ({width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio})")
     nav = more_item_page(page, "Export")
@@ -975,6 +989,7 @@ def capture_export(page, port, root, tag):
         time.sleep(1)
         res["banner_box_static"] = alert.first.bounding_box()
         shot(page, f"{tag}-export-banner")
+        hires_shot(page, f"{tag}-export-banner")
     else:
         res["banner"] = None
         time.sleep(5)
@@ -1005,6 +1020,7 @@ def capture_export(page, port, root, tag):
             "tooltip": tip.bounding_box() if tip.count() else None,
         }
         shot(page, f"{tag}-export-card-hover")
+        hires_shot(page, f"{tag}-export-card-hover")
         page.mouse.move(5, 5)
     except Exception as e:
         res["card_tooltip"] = f"err {str(e)[:300]}"
