@@ -21,7 +21,7 @@ for v in "${VARIANTS[@]}"; do
   ( cd "$v"
     git -c user.name=ab -c user.email=ab@example.com checkout -q -b ab
     $PY "$H/make_variant.py" "$v" .pre-commit-config.yaml
-    git add .pre-commit-config.yaml
+    git add -A
     git -c user.name=ab -c user.email=ab@example.com commit -qm "variant $v" --allow-empty
     git tag clean
     $PY "$H/perturb.py" . "$EXCLUDE" 400

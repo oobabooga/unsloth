@@ -37,6 +37,27 @@ elif variant == "split":
         types: [python]
         exclude: {exclude}
 """
+elif variant in ("split2_py_first", "split2_ruff_first"):
+    py = f"""      - id: kwargs-spacing
+        name: Kwarg spacing (python passes)
+        entry: python .git/ab_kwargs_both.py
+        language: python
+        types: [python]
+        exclude: {exclude}
+"""
+    rf = f"""      - id: ruff-format-with-kwargs
+        name: Ruff format
+        entry: ruff format
+        language: python
+        types: [python]
+        exclude: {exclude}
+        additional_dependencies:
+          - ruff==0.6.9
+        require_serial: true
+"""
+    new = py + rf if variant == "split2_py_first" else rf + py
+    import shutil
+    shutil.copy(Path(__file__).resolve().parent / "kwargs_both.py", path.parent / ".git" / "ab_kwargs_both.py")
 else:
     raise SystemExit(f"unknown variant {variant}")
 path.write_text(text[:start] + new + text[end:])
