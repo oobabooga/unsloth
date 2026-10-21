@@ -89,6 +89,8 @@ jobs:
 
       - name: "A: first-run Chat only install, then the Export page"
         run: |
+          foreach ($p in @("$env:USERPROFILE\.unsloth", "$env:APPDATA\ai.unsloth.studio", "$env:LOCALAPPDATA\ai.unsloth.studio")) { Write-Host "fresh profile check: $p exists=$(Test-Path -LiteralPath $p)" }
+          Get-WinUserLanguageList | Select-Object -First 1 LanguageTag | Format-List
           . "$env:H_W\h\h\session1.ps1"
           $root = "$env:USERPROFILE\.unsloth\studio"
           $py = "$env:H_W\hv\Scripts\python.exe"

@@ -135,9 +135,9 @@ def launch_app():
     # Policy route too: some WebView2 builds ignore the env var when the host passes its own args.
     exe_name = Path(APP).name
     subprocess.run(["reg", "add", r"HKCU\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments",
-                    "/v", exe_name, "/t", "REG_SZ", "/d", f"--remote-debugging-port={CDP_PORT}", "/f"], capture_output=True)
+                    "/v", exe_name, "/t", "REG_SZ", "/d", f"--remote-debugging-port={CDP_PORT} --lang=en-US", "/f"], capture_output=True)
     env = dict(os.environ)
-    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"--remote-debugging-port={CDP_PORT}"
+    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"--remote-debugging-port={CDP_PORT} --lang=en-US"
     for k in list(env):
         if k.startswith("H_"):
             env.pop(k)
@@ -945,6 +945,14 @@ def capture_export(page, port, root, tag):
             res["api"] = {k: hw.get(k) for k in ("export_supported", "export_unsupported_reason", "export_unsupported_message")}
         else:
             res["api"] = {"status": st, "body": str(hw)[:300]}
+    loc = page.evaluate("() => ({language: navigator.language, languages: navigator.languages, stored: localStorage.getItem('unsloth_locale'), htmlLang: document.documentElement.lang})")
+    if not str(loc.get("language", "")).lower().startswith("en") or loc.get("stored") not in (None, "auto", "en"):
+        page.evaluate("() => localStorage.setItem('unsloth_locale', 'en')")
+        page.reload()
+        wait_ready(page, 300, f"{tag}-reload")
+        time.sleep(5)
+        loc = page.evaluate("() => ({language: navigator.language, languages: navigator.languages, stored: localStorage.getItem('unsloth_locale'), htmlLang: document.documentElement.lang})")
+    res["locale"] = loc
     nav = more_item_page(page, "Export")
     res["nav"] = nav if isinstance(nav, str) else {k: nav.get(k) for k in ("disabled", "url")}
     if isinstance(nav, dict) and nav.get("url", "").find("/export") < 0:
@@ -982,6 +990,13 @@ def capture_export(page, port, root, tag):
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
         time.sleep(2)
         res["card_tooltip"] = read_tooltips(page)
+        tip = page.locator('[data-slot="tooltip-content"], [role="tooltip"]').first
+        res["boxes"] = {
+            "viewport": page.viewport_size,
+            "banner": alert.first.bounding_box() if alert.count() else None,
+            "card": box,
+            "tooltip": tip.bounding_box() if tip.count() else None,
+        }
         shot(page, f"{tag}-export-card-hover")
         page.mouse.move(5, 5)
     except Exception as e:
