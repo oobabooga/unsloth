@@ -151,6 +151,8 @@ def main() -> int:
             .replace("__PR__", str(args.pr))
             .replace("__BRANCH__", branch)
             .replace("__MERGED__", "1" if args.merged else "0")
+            # The suites job always runs pytest_probe: it takes the same pytest-probe args (e.g. --subdir .).
+            .replace("__SUITE_ARGS__", (" " + args.probe_args) if args.probe.endswith("pytest_probe.py") and args.probe_args.strip() else "")
             .replace("__TESTS__", " ".join(args.tests))
             .replace("__PROBE__", args.probe)
             .replace("__CRITERIA__", args.criteria)
@@ -158,6 +160,13 @@ def main() -> int:
             .replace('UPSTREAM: "https://github.com/unslothai/unsloth"', f'UPSTREAM: "{args.repo}"'))
     if f'UPSTREAM: "{args.repo}"' not in text:
         raise SystemExit("template has no UPSTREAM line to point at --repo")
+
+    if not args.repo.rstrip("/").endswith("/unslothai/unsloth"):
+        # install.sh lives in unslothai/unsloth: build the Studio venv from its main, then the probe runs
+        # pytest inside each state's checkout, whose own package shadows the installed one (Linux only).
+        studio_src = ('git clone -q --depth 1 https://github.com/unslothai/unsloth "$AMD_CI_WORK/unsloth_main"\n'
+                      '          cd "$AMD_CI_WORK/unsloth_main"')
+        text = text.replace('cd "$AMD_CI_WORK/states/head"', studio_src)
 
     if args.no_studio:
         if args.windows:
