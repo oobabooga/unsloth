@@ -1,0 +1,293 @@
+From 347ec0bc39245597bb51da9dcda0e590d72426a2 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 09:52:49 -0700
+Subject: [PATCH] llama: read a ubatch's backend sampled tokens with one copy,
+ keep the scheduler across sampler changes
+
+With backend sampling every output row's sampled token id is its own
+tensor, so a decode step with 16 rows did 16 tensor reads. On an RPC
+device each one is a GET_TENSOR request/reply on the head endpoint's
+single in-order command loop, shared by every pipeline group.
+
+build_sampling now gathers the sampled ids of each run of consecutive
+backend sampled rows into one contiguous I32 tensor (GGML_OP_CONCAT on
+the output device), and decode reads each run with one async copy
+straight into the host token buffer. Rows without a backend sampler
+(grammar, CPU sampling) break the run and keep their per-row path.
+Logits/probs/candidates keep the lazy readback.
+
+Every llama_set_sampler change also re-reserved through sched_new,
+which frees and allocates every compute buffer (ALLOC_BUFFER,
+BUFFER_GET_BASE, FREE_BUFFER per buffer on each RPC endpoint, and the
+server drops its cached graphs) on every request start and end. A
+reserve that is only due to a sampler change now keeps the scheduler
+when its graph size still fits; the reserves only grow the buffers.
+Other reasons (LoRA, control vectors, nextn/layer embeddings, training)
+still create a new scheduler.
+
+LLAMA_BS_BATCH_READBACK=0 restores the per-row reads and sched_new on
+every sampler change. The gather is also off when the output device
+does not support an I32 concat.
+---
+ src/llama-context.cpp | 66 +++++++++++++++++++++++++++++++++++++++++--
+ src/llama-context.h   |  6 ++++
+ src/llama-cparams.h   |  1 +
+ src/llama-graph.cpp   | 38 +++++++++++++++++++++++++
+ src/llama-graph.h     |  9 ++++++
+ 5 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dbe76c47c..23162fbe6 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -380,6 +380,31 @@ llama_context::llama_context(
+         sampling.lazy_readback = LLAMA_BACKEND_SAMPLING_LAZY_READBACK ? (atoi(LLAMA_BACKEND_SAMPLING_LAZY_READBACK) != 0) : true;
+     }
+ 
++    {
++        // backend sampling: read the sampled token ids of a ubatch with one copy (one request per ubatch on an
++        // RPC device instead of one per output row) and keep the scheduler across backend sampler changes.
++        // LLAMA_BS_BATCH_READBACK=0 reads one row at a time and creates a new scheduler on every sampler change
++        const char * LLAMA_BS_BATCH_READBACK = getenv("LLAMA_BS_BATCH_READBACK");
++        bool enable = LLAMA_BS_BATCH_READBACK ? (atoi(LLAMA_BS_BATCH_READBACK) != 0) : true;
++
++        if (enable) {
++            // the token ids are gathered with GGML_OP_CONCAT on the output device
++            ggml_init_params params = {
++                /*.mem_size   =*/ 4*ggml_tensor_overhead(),
++                /*.mem_buffer =*/ nullptr,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context_ptr ctx_probe { ggml_init(params) };
++            ggml_tensor * a = ggml_new_tensor_1d(ctx_probe.get(), GGML_TYPE_I32, 1);
++            ggml_tensor * b = ggml_new_tensor_1d(ctx_probe.get(), GGML_TYPE_I32, 1);
++            ggml_tensor * c = ggml_concat(ctx_probe.get(), a, b, 0);
++            ggml_backend_dev_t dev = model.dev_output();
++            enable = dev == nullptr || ggml_backend_dev_supports_op(dev, c);
++        }
++
++        cparams.sampling_batch_readback = enable;
++    }
++
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+ 
+@@ -715,6 +740,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     sched.reset(ggml_backend_sched_new(
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
++    sched_max_nodes = max_nodes;
++    sched_parallel  = parallel;
++    sched_need_new  = false;
++
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+@@ -745,7 +774,15 @@ void llama_context::sched_reserve() {
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+     gf_res_prev_active = nullptr;
+ 
+-    sched_new(max_nodes, cparams.pipeline_parallel);
++    // a reserve that is only due to a backend sampler change keeps the scheduler: freeing and allocating every
++    // compute buffer again costs a round trip per buffer on RPC devices (and drops their cached graphs) on
++    // every request. the reserves below only grow the buffers, so they still fit the new sampler graphs
++    if (cparams.sampling_batch_readback && sched && !sched_need_new &&
++        max_nodes <= sched_max_nodes && sched_parallel == cparams.pipeline_parallel) {
++        LLAMA_LOG_DEBUG("%s: keeping the scheduler (max_nodes = %zu <= %zu)\n", __func__, max_nodes, sched_max_nodes);
++    } else {
++        sched_new(max_nodes, cparams.pipeline_parallel);
++    }
+ 
+     llama_memory_context_ptr mctx;
+     if (memory) {
+@@ -1419,6 +1456,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+         // these flags change the graph shape
+         sched_need_reserve = true;
++        sched_need_new     = true;
+     }
+ 
+     cparams.embeddings_nextn        = value;
+@@ -1434,6 +1472,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+ 
+     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+     sched_need_reserve = true;
++    sched_need_new     = true;
+ }
+ 
+ void llama_context::set_nextn_layer_offset(int32_t offset) {
+@@ -1543,6 +1582,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
+     }
+ 
+     sched_need_reserve = true;
++    sched_need_new     = true;
+ }
+ 
+ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+@@ -1582,6 +1622,7 @@ bool llama_context::set_adapter_cvec(
+     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+ 
+     sched_need_reserve = true;
++    sched_need_new     = true;
+ 
+     return res;
+ }
+@@ -2253,7 +2294,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const auto stride = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
++            if (res->t_sampled_runs.empty()) {
++                copy_tensor_async_rows(res->t_sampled, sampling.sampled, 1, n_outputs_prev, sched.get());
++            } else {
++                // one copy per run of consecutive rows, see llm_graph_context::build_sampling
++                std::vector<ggml_tensor *> rest = res->t_sampled;
++                for (const auto & run : res->t_sampled_runs) {
++                    GGML_ASSERT(ggml_nbytes(run.tensor) == run.n_rows*sizeof(llama_token));
++                    GGML_ASSERT((size_t) n_outputs_prev + run.row + run.n_rows <= sampling.sampled.size);
++                    GGML_ASSERT((size_t) run.row + run.n_rows <= rest.size());
++
++                    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), run.tensor);
++                    ggml_backend_tensor_get_async(backend, run.tensor, sampling.sampled.data + n_outputs_prev + run.row, 0, ggml_nbytes(run.tensor));
++
++                    std::fill_n(rest.begin() + run.row, run.n_rows, nullptr);
++                }
++                copy_tensor_async_rows(rest, sampling.sampled, 1, n_outputs_prev, sched.get());
++            }
+             // the logits / probs / candidates rows are only needed when the caller asks for them
+             // (CPU samplers continue the chain, n_probs, ...), so with lazy readback they stay on the backend
+             const bool lazy = sampling.lazy_readback;
+@@ -2663,6 +2720,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
+     for (const auto & [seq_id, sampler] : sampling.samplers) {
+         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
++        if (cparams.sampling_batch_readback) {
++            // a reshape and a concat per row to gather the sampled token ids
++            res += 2 * cparams.n_outputs_max_per_seq;
++        }
+     }
+ 
+     if (cparams.training) {
+@@ -3903,6 +3964,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
+ 
+     // the training graph is different, need to reserve again
+     sched_need_reserve = true;
++    sched_need_new     = true;
+     sched_reserve();
+ 
+     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 46f69f9ba..c9defbfb4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -393,6 +393,12 @@ private:
+ 
+     bool sched_need_reserve = true;
+ 
++    // LLAMA_BS_BATCH_READBACK (default on): a reserve that is only due to a backend sampler change reuses the
++    // scheduler and its compute buffers (they only grow) instead of freeing and allocating them again
++    bool   sched_need_new  = true;  // a change other than the samplers needs a fresh scheduler
++    size_t sched_max_nodes = 0;     // graph size of the current scheduler
++    bool   sched_parallel  = false; // pipeline parallelism of the current scheduler
++
+     // state of sched_copy_experts, reset before each graph compute
+     struct copy_experts_info {
+         const ggml_tensor *  ids = nullptr;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f4eb181a7..3c36630ed 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -53,6 +53,7 @@ struct llama_cparams {
+     bool op_offload;
+     bool kv_unified;
+     bool pipeline_parallel;
++    bool sampling_batch_readback; // backend sampling: gather a ubatch's sampled token ids into one tensor (one read)
+     bool training;           // set by llama_opt_init()
+ 
+     size_t moe_cache_size;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f06b94d15..c2d41f363 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1391,6 +1391,7 @@ void llm_graph_result::reset() {
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+     t_candidates.clear();
++    t_sampled_runs.clear();
+ 
+     params = {};
+ 
+@@ -1444,6 +1445,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+             ggml_set_output(tensor);
+         }
+     }
++    for (const auto & run : t_sampled_runs) {
++        ggml_set_output(run.tensor);
++    }
+     for (auto * tensor : t_sampled_probs) {
+         if (tensor != nullptr) {
+             ggml_set_output(tensor);
+@@ -4160,6 +4164,40 @@ void llm_graph_context::build_sampling() const {
+         }
+     }
+ 
++    // gather the sampled token ids of each run of consecutive rows into one contiguous tensor, so that the
++    // context reads them with one copy (one request on an RPC device) instead of one per row. only the rows
++    // that were sampled on the backend take part, so the gather adds no compute to the inactive chains
++    if (cparams.sampling_batch_readback) {
++        const auto usable = [](const ggml_tensor * t) {
++            return t != nullptr && t->type == GGML_TYPE_I32 && ggml_nelements(t) == 1 && ggml_is_contiguous(t);
++        };
++
++        for (uint32_t row = 0; row < n_rows; ) {
++            if (!usable(res->t_sampled[row])) {
++                ++row;
++                continue;
++            }
++
++            uint32_t end = row + 1;
++            while (end < n_rows && usable(res->t_sampled[end])) {
++                ++end;
++            }
++
++            if (end - row > 1) {
++                ggml_tensor * cur = ggml_reshape_1d(ctx0, res->t_sampled[row], 1);
++                for (uint32_t r = row + 1; r < end; ++r) {
++                    cur = ggml_concat(ctx0, cur, ggml_reshape_1d(ctx0, res->t_sampled[r], 1), 0);
++                }
++                ggml_format_name(cur, "sampled_tokens_%u_%u", row, end - row);
++                ggml_build_forward_expand(gf, cur);
++
++                res->t_sampled_runs.push_back({ row, end - row, cur });
++            }
++
++            row = end;
++        }
++    }
++
+     // TODO: Call backend_accept after all samplers have been applied.
+     /*
+     for (const auto & [seq_id, sampler] : samplers) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index fbbe67f25..99fef8260 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -969,6 +969,15 @@ public:
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+ 
++    // backend sampling with batched readback: the sampled token ids of consecutive output rows
++    // [row, row + n_rows) gathered into one contiguous I32 tensor, so they are read with one copy
++    struct sampled_run {
++        uint32_t      row;
++        uint32_t      n_rows;
++        ggml_tensor * tensor;
++    };
++    std::vector<sampled_run> t_sampled_runs;
++
+     std::vector<llm_graph_input_ptr> inputs;
+     std::vector<llm_graph_fused_node> fused_nodes;
+ 
+-- 
+2.43.0
+
