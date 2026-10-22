@@ -1,0 +1,118 @@
+{
+ "name": "amd_stream_bf16",
+ "description": "Wan2.2-TI2V-5B on gfx1151 with all defaults (ROCm bf16 VAE decode on): wan_auto = stream encode on (default), wan_stream_off = UNSLOTH_STUDIO_VIDEO_STREAM_ENCODE=0, each twice (A/A). Base: the stream encode falls back ('frames differ') on every clip; head: it streams. Pixels are the frames handed to the encoder, so every arm should be identical.",
+ "models": {
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true,
+   "model_kind": "pipeline"
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": 16,
+   "steps": 6,
+   "short_steps": 3,
+   "save_frames_every": 8,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_STUDIO_VIDEO_STREAM_ENCODE": "0"
+   },
+   "tag": "wan_stream_off",
+   "ref": "wan_stream_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": 16,
+   "steps": 6,
+   "short_steps": 3,
+   "save_frames_every": 8,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {},
+   "tag": "wan_auto",
+   "ref": "wan_stream_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": 16,
+   "steps": 6,
+   "short_steps": 3,
+   "save_frames_every": 8,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_STUDIO_VIDEO_STREAM_ENCODE": "0"
+   },
+   "tag": "wan_stream_off_repeat",
+   "ref": "wan_stream_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": 16,
+   "steps": 6,
+   "short_steps": 3,
+   "save_frames_every": 8,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {},
+   "tag": "wan_auto_repeat",
+   "ref": "wan_auto"
+  }
+ ]
+}

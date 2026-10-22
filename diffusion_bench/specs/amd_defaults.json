@@ -1,0 +1,362 @@
+{
+ "name": "amd_defaults",
+ "description": "Studio diffusion defaults on gfx1151 (Radeon 8060S, unified memory), one GPU. Per family: *_off = speed_mode off + no quant (parity reference), *_auto = nothing set (what the UI's auto sends), and one kill switch per optimization on top of auto (*_nocompile = UNSLOTH_DIFFUSION_ROCM_COMPILE=0, *_norope = UNSLOTH_DIFFUSION_FUSED_ROPE=0, wan_cfg_force / wan_cfg_off = UNSLOTH_DIFFUSION_CFG_BATCH force / 0, wan_vae_fp32 = UNSLOTH_VIDEO_VAE_BF16_DECODE=0). *_auto_repeat = A/A noise floor (new process, run last). Engagement per render is in renders[].extra.engaged (fused RoPE call counts, dynamo graphs / breaks, CFG batch status). Run at both states (base = before the defaults-on merge, head = after).",
+ "models": {
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "flux2_klein_4b": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true,
+   "model_kind": "pipeline"
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "model": "@zimage_turbo",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "tag": "zimg_off",
+   "ref": "zimg_off",
+   "note": "no speed tier, no quant: the parity reference"
+  },
+  {
+   "model": "@zimage_turbo",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "tag": "zimg_auto",
+   "ref": "zimg_off",
+   "note": "all defaults: nothing set, what the UI's auto sends"
+  },
+  {
+   "model": "@zimage_turbo",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1",
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "tag": "zimg_nocompile",
+   "ref": "zimg_off",
+   "note": "defaults minus ROCm regional compile"
+  },
+  {
+   "model": "@zimage_turbo",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "tag": "zimg_auto_repeat",
+   "ref": "zimg_auto",
+   "note": "A/A: zimg_auto again in a new process"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "env": {},
+   "tag": "klein_off",
+   "ref": "klein_off"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein"
+   },
+   "env": {},
+   "tag": "klein_auto",
+   "ref": "klein_off"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "tag": "klein_nocompile",
+   "ref": "klein_nocompile_norope",
+   "note": "eager defaults: fused RoPE runs here"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0",
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "0"
+   },
+   "tag": "klein_nocompile_norope",
+   "ref": "klein_off",
+   "note": "eager defaults minus fused RoPE; klein_nocompile vs this = the fused RoPE A/B (bit-identical claim)"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "0"
+   },
+   "tag": "klein_norope",
+   "ref": "klein_auto"
+  },
+  {
+   "model": "@flux2_klein_4b",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "options": {
+    "family_override": "flux.2-klein"
+   },
+   "env": {},
+   "tag": "klein_auto_repeat",
+   "ref": "klein_auto"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "env": {},
+   "tag": "wan_off",
+   "ref": "wan_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {},
+   "tag": "wan_auto",
+   "ref": "wan_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ROCM_COMPILE": "0"
+   },
+   "tag": "wan_nocompile",
+   "ref": "wan_off"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_CFG_BATCH": "force"
+   },
+   "tag": "wan_cfg_force",
+   "ref": "wan_auto",
+   "note": "CFG batching forced on: is the gate's decline right on gfx1151?"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_CFG_BATCH": "0"
+   },
+   "tag": "wan_cfg_off",
+   "ref": "wan_auto"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {
+    "UNSLOTH_VIDEO_VAE_BF16_DECODE": "0"
+   },
+   "tag": "wan_vae_fp32",
+   "ref": "wan_auto"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 17,
+   "fps": 16,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b"
+   },
+   "env": {},
+   "tag": "wan_auto_repeat",
+   "ref": "wan_auto"
+  }
+ ]
+}
