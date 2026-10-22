@@ -1,0 +1,85 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-npu-hermes-util]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 8f402f50b4
+  MODEL: qwen3.6-moe-35b-a3b-FLM
+  CTX: "32768"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Hardware and counter sets
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name | Format-Table -AutoSize
+          Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match 'NPU|Compute Accelerator' } | Format-Table Status,FriendlyName,InstanceId -AutoSize
+          Get-Counter -ListSet '*' | Where-Object { $_.CounterSetName -match 'GPU|NPU' } | Select-Object CounterSetName | Format-Table -AutoSize
+          (Get-Counter -ListSet 'GPU Engine').PathsWithInstances | Select-Object -First 30
+          exit 0
+      - name: Install Studio at main
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "npu-hermes-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Force -Path "$W\tmp","$W\hf","$W\uv","$W\out" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
+          git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          Set-Location "$W\src"
+          git config core.autocrlf false
+          git checkout -q $env:BASE_SHA
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          $ErrorActionPreference = 'Continue'
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\install.log" -Tail 30
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+      - name: Direct to lemond (setup + legs)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-Location "$env:W\src\studio\backend"
+          & "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\npu_hermes_probe.py" --phase direct --setup --tag direct1 --model $env:MODEL --ctx $env:CTX --hermes "$env:GITHUB_WORKSPACE\harness\hermes_request.json" --sampler "$env:GITHUB_WORKSPACE\harness\npu_sampler.ps1" --out "$env:W\out"
+          exit $LASTEXITCODE
+      - name: Through Studio /v1
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-Location "$env:W\src\studio\backend"
+          & "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\npu_hermes_probe.py" --phase studio --tag studio --model $env:MODEL --ctx $env:CTX --hermes "$env:GITHUB_WORKSPACE\harness\hermes_request.json" --sampler "$env:GITHUB_WORKSPACE\harness\npu_sampler.ps1" --out "$env:W\out"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:W\out\studio-studio-server.log" -Tail 80 -ErrorAction SilentlyContinue
+          exit $rc
+      - name: Direct to lemond again
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-Location "$env:W\src\studio\backend"
+          & "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe" "$env:GITHUB_WORKSPACE\harness\npu_hermes_probe.py" --phase direct --tag direct2 --model $env:MODEL --ctx $env:CTX --hermes "$env:GITHUB_WORKSPACE\harness\hermes_request.json" --sampler "$env:GITHUB_WORKSPACE\harness\npu_sampler.ps1" --out "$env:W\out"
+          exit $LASTEXITCODE
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-hermes-results
+          path: ${{ env.W }}\out
+          if-no-files-found: warn
