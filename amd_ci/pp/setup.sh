@@ -26,8 +26,15 @@ python3 -m pip install -q cryptography psutil huggingface_hub || { echo "FATAL: 
 PR="${PP_LLAMA_PR:-187}"
 echo "== llama.cpp pull/$PR/head + TLS, CPU + RPC"
 L="$W/llama"
-git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$L" || { echo "FATAL: llama clone"; exit 1; }
-git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q FETCH_HEAD || { echo "FATAL: fetch $PR"; exit 1; }
+# GitHub resets long blob-less clones now and then (run 39712628478 lost 2 of 4 workers): retry from scratch
+ok=0
+for try in 1 2 3; do
+  rm -rf "${L:?}"
+  if git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$L" &&
+     git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q FETCH_HEAD; then ok=1; break; fi
+  echo "llama clone/fetch attempt $try failed"; sleep $((try * 20))
+done
+[ "$ok" = 1 ] || { echo "FATAL: llama clone/fetch $PR"; exit 1; }
 git -C "$L" rev-parse HEAD | tee "$W/out/llama_sha.txt"
 git -C "$L" apply "$HERE/../homelink/tls_pr$PR.patch" || { echo "FATAL: TLS patch does not apply"; exit 1; }
 # client forgets cached graph uids on FREE_BUFFER like the server does (else --backend-sampling + groups aborts)
