@@ -1,0 +1,155 @@
+name: "AMD CI: diffusion multi-GPU wiring under a spoofed second device (main vs main + head.patch)"
+
+# Generated from amd_ci/templates/workflow.yml (scaffold.py --shared-gpu --spoof-devices 1), then the
+# states step swapped for a fixed base SHA plus a patch (no PR exists for the head yet) and the
+# suites job dropped: every test here needs the GPU job's spoofed second device.
+#
+# Wiring only: the phantom cuda:1 is the real gfx1151 renumbered. capability.py keeps multi_gpu
+# UNMET and names the fabrication in every verdict.
+
+on:
+  push:
+    branches: [amd-ci-mgpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  # base = origin/main when the branch was cut; head = base + amd_ci/patches/head.patch (empty = base itself)
+  BASE_SHA: "2749eeedaa9920d9ffb6973903b13eeebc00ca3c"
+
+jobs:
+
+  gpu:
+    name: "Multi-GPU wiring, GPU (shared GPU, spoofed second device)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 170
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "mgpu-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states (main, and main + head.patch)
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
+          HEAD_ID="$BASE_SHA"
+          if [ -s "$GITHUB_WORKSPACE/amd_ci/patches/head.patch" ]; then
+            git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/head.patch"
+            git -C "$AMD_CI_WORK/states/head" diff --cached --stat
+            HEAD_ID="tree-$(git -C "$AMD_CI_WORK/states/head" write-tree)"
+          else
+            echo "head.patch is empty: head == base (discovery run)"
+          fi
+          python3 - "$AMD_CI_WORK" "$BASE_SHA" "$HEAD_ID" <<'PY'
+          import json, sys
+          from pathlib import Path
+          work, base, head = sys.argv[1:4]
+          doc = {"pr": 0, "merged": False, "commits": {"base": base, "head": head},
+                 "paths": {"base": f"{work}/states/base", "head": f"{work}/states/head"}}
+          out = Path(work) / "out" / "states.json"
+          out.parent.mkdir(parents = True, exist_ok = True)
+          out.write_text(json.dumps(doc, indent = 2), encoding = "utf-8")
+          PY
+          cat "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
+          # tree pinning the newest unsloth fails to resolve. pip.conf already adds pypi.org as an
+          # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
+          # the ROCm torch index, whose wheels carry no upload time.
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -m pip install -q pytest pytest-asyncio pytest-timeout
+          # Now with torch present, the gate is meaningful. It EXITS 1 on a miss.
+          # Absolute path: this step cd'd into the head worktree, which has no amd_ci/.
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Present extra HIP devices
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/lib/device_multiplier.py" \
+            --build-into "$AMD_CI_WORK/shim" --extra 1 --github-env
+
+      - name: Differential (multi-GPU test files, head's copies, on base vs head code)
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/head_tests_probe.py \
+            --criteria amd_ci/criteria/head_tests_differential.py \
+            --out-dir "$AMD_CI_WORK/out/tests" \
+            --python "$AMD_CI_PY" -- --python "$AMD_CI_PY" --timeout 2400 --tests \
+              tests/test_diffusion_multigpu.py tests/test_diffusion_multigpu_cuda.py \
+              tests/test_diffusion_multigpu_wiring.py tests/test_diffusion_cfg_parallel_tier.py \
+              tests/test_diffusion_zimage_cfg_split.py tests/test_diffusion_layer_split.py \
+              tests/test_diffusion_layer_split_cuda.py tests/test_diffusion_layer_split_lifecycle.py \
+              tests/test_diffusion_layer_split_order.py tests/test_diffusion_layer_split_plan.py \
+              tests/test_diffusion_layer_split_speed.py tests/test_video_multigpu_wiring.py \
+              tests/test_gpu_selection.py tests/test_gpu_selection_sandbox.py \
+              tests/test_diffusion_measured_placement.py tests/test_diffusion_measured_placement_dense.py \
+              tests/test_gpu_residency_coexistence.py tests/test_gpu_order_preserved.py \
+              tests/test_offload_planner.py tests/test_video_fast_pin.py \
+              tests/test_system_poll_no_cuda_context.py
+          cat "$AMD_CI_WORK/out/tests/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/tests"
+
+      - name: Differential (tiny end-to-end renders per multi-GPU path)
+        if: always()
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/mgpu_e2e_probe.py \
+            --criteria amd_ci/criteria/mgpu_e2e.py \
+            --out-dir "$AMD_CI_WORK/out/e2e" \
+            --python "$AMD_CI_PY" -- --python "$AMD_CI_PY" --timeout 1200
+          cat "$AMD_CI_WORK/out/e2e/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/e2e"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mgpu-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
