@@ -600,6 +600,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag15:
+            # master stage (slowest per layer in prefill, profile pp_s5): bs_x{t}{m} = master threads / t, m = 1 gives
+            # the master 3 fewer layers than an even split; p2p on, G=8, --cache-ram 0 + lazy readback
+            plan = [("x1", 1, 1, B)]
+            for s_ in (3, 5):
+                plan += [(k, s_, 8, 8 * B) for k in ("bs_x10", "bs_x20", "bs_x11", "bs_x21")]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag14:
             # direct worker-to-worker copies (rpc_p2p.patch) off / on, G=6, --cache-ram 0 + lazy readback, interleaved
             plan = [("x1", 1, 1, B)]
@@ -726,14 +733,17 @@ class Master:
                 if kind.startswith(("bs_v", "bs_w")):
                     ml = None
                     hd = int(kind[4:]) if kind.startswith("bs_w") else 0
+                if kind.startswith("bs_x"):
+                    hd = 0
+                    ml = (round(a.n_layer / s) + 1 - 3) if kind[5] == "1" else None
                 args, p = split(s, g, False, True, ml, hd)
                 # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
-                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w")):
+                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w", "bs_x")):
                     args += ["--cache-ram", "0"]
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h", "bs_v", "bs_w")):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h", "bs_v", "bs_w", "bs_x")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
@@ -749,6 +759,8 @@ class Master:
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
                 if kind in ("bs_conc", "bs_serial"):
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "1" if kind == "bs_serial" else "0"
+                if kind.startswith("bs_x") and kind[4] != "1":
+                    args[args.index("-t") + 1] = str(max(1, a.threads // int(kind[4])))
                 if kind == "bs_tsplit":
                     args[args.index("-t") + 1] = str(max(1, a.threads // g))
                 tag = f"{kind}_s{s}_g{g}_{rnd_i}"
@@ -889,6 +901,7 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag15", action = "store_true", help = "master stage threads x layers at 3 and 5 stages, p2p on (use with --peer-allow)")
     m.add_argument("--diag14", action = "store_true", help = "direct worker-to-worker copies off / on, 2-5 stages (use with --peer-allow)")
     m.add_argument("--diag13", action = "store_true", help = "prefill pipeline parallel over RPC off / on / on + lighter head, 2-5 stages")
     m.add_argument("--diag12", action = "store_true", help = "worker-to-worker copies x prefill pipeline parallel x stage weights (use with --peer-allow)")

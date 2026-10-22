@@ -1,7 +1,7 @@
 From b9a391705079e7aabd2ca519718d90fd4e58ac91 Mon Sep 17 00:00:00 2001
 From: danielhanchen <danielhanchen@gmail.com>
 Date: Thu, 22 Oct 2026 01:19:54 -0700
-Subject: [PATCH] rpc: direct server-to-server copies of split inputs
+Subject: [PATCH 1/2] rpc: direct server-to-server copies of split inputs
 
 With pipeline parallelism over several rpc-servers every activation that
 crosses from server A to server B was relayed by the client: a GET_TENSOR
@@ -1247,6 +1247,32 @@ index 11da1790f..b7a213ac5 100644
  
      static socket_ptr create_server(const char * host, int port);
      static socket_ptr connect(const char * host, int port);
+-- 
+2.43.0
+
+
+From 3c2d11ef832b4926bfe58df63b1a12ae4b3e5fea Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 05:50:33 -0700
+Subject: [PATCH 2/2] rpc: P2P takes HELLO feature bit 1, bit 0 is the tracer's
+
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 0e3e06c42..28e5ae599 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -153,7 +153,7 @@ struct rpc_msg_hello_req {
+ };
+ 
+ // feature bits in rpc_msg_hello_rsp::features (a zeroed padding byte in older servers)
+-static constexpr uint8_t RPC_FEATURE_P2P = 0x01;
++static constexpr uint8_t RPC_FEATURE_P2P = 0x02; // bit 0 is the tracer (RPC_HELLO_FEATURE_TRACE in #191)
+ 
+ struct rpc_msg_hello_rsp {
+     uint8_t major;
 -- 
 2.43.0
 
