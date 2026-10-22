@@ -585,6 +585,16 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag10:
+            # lazy backend-sampling readback (bs_lazy_readback.patch) off vs on, --cache-ram 0, even split, then
+            # N-box scaling with it on; stages beyond the workers that showed up are dropped
+            plan = [("x1", 1, 1, B), ("x1_c0", 1, 1, B)]
+            for s_, g in ((2, 3), (3, 4)):
+                plan += [("bs_l0", s_, g, g * B), ("bs_l1", s_, g, g * B)]
+            plan += [("bs_l1", 2, 1, B), ("bs_l1", 2, 4, 4 * B), ("bs_l1", 3, 5, 5 * B)]
+            for s_ in (4, 5):
+                plan += [("bs_l0", s_, s_, s_ * B), ("bs_l1", s_, s_, s_ * B), ("bs_l1", s_, s_ + 1, (s_ + 1) * B)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag9:
             # N-box scaling with the full fix chain, as Studio's planner serves (--cache-ram 0), even layer split
             plan = [("x1", 1, 1, B), ("x1_c0", 1, 1, B)]
@@ -659,17 +669,21 @@ class Master:
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
                 if kind.startswith("bs_i") or kind.startswith("bs_c"):
                     ml = int(kind[6:]) if kind[6:] else None
-                if kind.startswith("bs_c") and kind[4] == "0":
+                if kind.startswith("bs_l"):
+                    ml = None
+                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith("bs_l"):
                     args += ["--cache-ram", "0"]
                 args, p = split(s, g, False, True, ml)
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith("bs_m") or kind.startswith("bs_i") or kind.startswith("bs_c"):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
                     env["LLAMA_GROUP_LAUNCH_INBOX"] = kind[4]
+                if kind.startswith("bs_l"):
+                    env["LLAMA_BACKEND_SAMPLING_LAZY_READBACK"] = kind[4]
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -806,6 +820,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag10", action = "store_true", help = "lazy backend-sampling readback off vs on, then 4-5 stages (use with --waves 8)")
     m.add_argument("--diag9", action = "store_true", help = "2..N+1 stages x G in (1, S, S+1), --cache-ram 0, even split (use with --waves 8)")
     m.add_argument("--diag8", action = "store_true", help = "RAM prompt cache on vs off with the launch inbox (use with --waves 8)")
     m.add_argument("--diag7", action = "store_true", help = "launch inbox on vs off at the best splits (use with --waves 8)")
