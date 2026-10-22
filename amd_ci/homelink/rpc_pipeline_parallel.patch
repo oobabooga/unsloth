@@ -1,0 +1,301 @@
+From 3d940215b94b2c8a6cadfeac3a930a9757d7a26c Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 23:49:52 -0700
+Subject: [PATCH 1/2] rpc: copy activations between endpoints without blocking
+ the caller
+
+cpy_tensor_async for RPC compute buffers: a host source is serialized into
+the SET message right away, an RPC source on another endpoint is read by a
+GET queued on that endpoint into a staging buffer, and the destination
+dispatcher sends the SET only after the GET completes. User-input writes into
+RPC compute buffers are queued too (the data is already in the message).
+event_wait on an event of another endpoint queues a dependency marker
+instead of being a no-op. Dependencies always point at earlier queued
+commands, so the per-endpoint dispatchers cannot deadlock.
+
+With this the scheduler's thread no longer waits for stage k to finish a
+ubatch before handing it to stage k+1, so ubatches can pipeline across RPC
+stages. GGML_RPC_ASYNC_COPY=0 restores the blocking copies.
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 120 +++++++++++++++++++++++++++++++--
+ 1 file changed, 116 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 2c96ffb7c..9293b7d63 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -597,11 +597,16 @@ public:
+     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+     std::shared_future<void> send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
+     std::shared_future<void> send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
++    // async command that is not sent before `dep` completes; `keep` stays alive until the command is done
++    std::shared_future<void> send_async_dep(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
++                                            void * output, size_t output_size,
++                                            std::shared_future<void> dep, std::shared_ptr<const void> keep);
+ 
+     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
+     void event_free(ggml_backend_event_t event);
+     void event_synchronize(ggml_backend_event_t event);
+     void event_record(ggml_backend_event_t event);
++    std::shared_future<void> event_wait(ggml_backend_event_t event);
+     void synchronize();
+     void busy_spin_acquire();
+     void busy_spin_release();
+@@ -621,6 +626,9 @@ private:
+         void                        * output;
+         size_t                        output_size;
+         std::promise<void>            completion;
++        // cross-endpoint dependency: the dispatcher waits for it before sending this command
++        std::shared_future<void>      dep;
++        std::shared_ptr<const void>   keep;
+ 
+         int64_t  t_enq        = 0;
+         int      group        = -1;
+@@ -635,6 +643,7 @@ private:
+     struct rpc_event {
+         rpc_msg_ptr              msg;
+         std::shared_future<void> sf;
++        rpc_dispatcher *         owner = nullptr; // the dispatcher whose FIFO holds the marker
+     };
+     static rpc_msg_ptr make_msg(rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+     void send_traced(rpc_msg & msg);
+@@ -699,6 +708,17 @@ std::shared_future<void> rpc_dispatcher::send_async(enum rpc_cmd cmd, std::share
+     return done;
+ }
+ 
++std::shared_future<void> rpc_dispatcher::send_async_dep(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
++                                                        void * output, size_t output_size,
++                                                        std::shared_future<void> dep, std::shared_ptr<const void> keep) {
++    auto msg = make_msg(cmd, input, input_size, output, output_size);
++    msg->dep  = std::move(dep);
++    msg->keep = std::move(keep);
++    std::shared_future<void> done = msg->completion.get_future().share();
++    GGML_ASSERT(queue.push(msg));
++    return done;
++}
++
+ void rpc_dispatcher::send_traced(rpc_msg & msg) {
+     const int64_t t_send0 = ggml_trace_time_us();
+     bool ok = send_rpc_cmd(sock, msg.cmd, msg.input.get(), msg.input_size);
+@@ -741,6 +761,7 @@ ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
+     ev->msg = std::make_shared<rpc_msg>();
+     ev->msg->cmd = RPC_CMD_NONE;
+     ev->sf = ev->msg->completion.get_future().share();
++    ev->owner = this;
+     GGML_ASSERT(queue.push(ev->msg));
+     return new ggml_backend_event {
+         /* .device  = */ dev,
+@@ -763,9 +784,23 @@ void rpc_dispatcher::event_record(ggml_backend_event_t event) {
+     ev->msg = std::make_shared<rpc_msg>();
+     ev->msg->cmd = RPC_CMD_NONE;
+     ev->sf = ev->msg->completion.get_future().share();
++    ev->owner = this;
+     GGML_ASSERT(queue.push(ev->msg));
+ }
+ 
++// An event completes when the dispatcher of its endpoint has sent every command queued before it. The server runs
++// one connection's commands in order, so later commands on the same endpoint already wait for it (no-op). For an
++// event of another endpoint, a marker makes this endpoint's later commands wait for it, without blocking the caller.
++// Dependencies always point at an earlier queued command, so the dispatchers cannot wait on each other in a cycle.
++std::shared_future<void> rpc_dispatcher::event_wait(ggml_backend_event_t event) {
++    rpc_event * ev = (rpc_event *)event->context;
++    if (ev->owner == this || !ev->sf.valid() ||
++        ev->sf.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
++        return {};
++    }
++    return send_async_dep(RPC_CMD_NONE, nullptr, 0, nullptr, 0, ev->sf, nullptr);
++}
++
+ void rpc_dispatcher::synchronize() {
+     // to ensure all messages are processed, submit dummy message and wait for it to complete
+     auto msg = std::make_shared<rpc_msg>();
+@@ -830,6 +865,9 @@ void rpc_dispatcher::work() {
+         } else if (!queue.pop(&msg_ptr)) {
+             break;
+         }
++        if (msg_ptr->dep.valid()) {
++            msg_ptr->dep.wait();
++        }
+         if (msg_ptr->cmd != RPC_CMD_NONE) {
+             LOG_DBG2("[%s] %s (in: %zu, out: %zu)\n", __func__, rpc_cmd_name(msg_ptr->cmd), msg_ptr->input_size, msg_ptr->output_size);
+             const bool trace = rpc_debug_level() >= 3;
+@@ -851,6 +889,7 @@ void rpc_dispatcher::work() {
+             LOG_DBG3("[%s] sync barrier\n", __func__);
+         }
+         msg_ptr->completion.set_value();
++        msg_ptr->keep.reset();
+         last_cmd = std::chrono::steady_clock::now();
+     }
+ }
+@@ -1003,6 +1042,12 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
+     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+ }
+ 
++// GGML_RPC_ASYNC_COPY=0 restores blocking copies into RPC compute buffers (the scheduler's activation and input copies)
++static bool rpc_async_copy_enabled() {
++    static const bool enabled = [] { const char * e = getenv("GGML_RPC_ASYNC_COPY"); return e == nullptr || atoi(e) != 0; }();
++    return enabled;
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
+@@ -1026,6 +1071,12 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+     }
+     size_t input_size;
+     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
++    if (rpc_async_copy_enabled() && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        // the data is already copied into the message and later commands on this endpoint run after it,
++        // so a compute-buffer write (the scheduler's user-input copies) does not have to wait for the wire
++        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
++        return;
++    }
+     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+ }
+ 
+@@ -1456,9 +1507,70 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
+ }
+ 
+ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+-    // this is noop for RPC as we have a single stream
+-    GGML_UNUSED(backend);
+-    GGML_UNUSED(event);
++    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    auto done = rpc_ctx->dispatcher->event_wait(event);
++    if (done.valid()) {
++        rpc_ctx->last = done;
++    }
++}
++
++// Copy into an RPC compute buffer without blocking the caller:
++//  - host source: the data is copied into the SET message now, the dispatcher sends it in FIFO order
++//  - RPC source on another endpoint: a GET is queued on the source endpoint into a staging buffer, and a SET on the
++//    destination endpoint that its dispatcher sends only once the GET has completed
++// Each endpoint runs its commands in order, so the source is read after the work queued before the copy and the
++// destination is written before the work queued after it.
++static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
++    if (!rpc_async_copy_enabled() || src->buffer == nullptr || dst->buffer == nullptr ||
++        !ggml_backend_is_rpc(backend_dst) || !ggml_backend_buffer_is_rpc(dst->buffer) ||
++        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
++        return false;
++    }
++    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
++    if (((ggml_backend_rpc_buffer_context *)dst->buffer->context)->dispatcher != dst_ctx->dispatcher) {
++        return false;
++    }
++    const size_t size = ggml_nbytes(src);
++    const rpc_tensor dst_tensor = serialize_tensor(dst);
++    if (ggml_trace_flag) { ggml_trace_set_subject(dst->name, 0); }
++
++    if (ggml_backend_buffer_is_host(src->buffer)) {
++        if (backend_src != nullptr) {
++            ggml_backend_synchronize(backend_src);
++        }
++        size_t input_size;
++        auto input = serialize_set_tensor(dst_tensor, 0, 0, src->data, size, input_size);
++        dst_ctx->last = dst_ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
++        return true;
++    }
++
++    if (!ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_is_rpc(backend_src)) {
++        return false;
++    }
++    ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
++    if (((ggml_backend_rpc_buffer_context *)src->buffer->context)->dispatcher != src_ctx->dispatcher ||
++        src_ctx->dispatcher == dst_ctx->dispatcher) {
++        return false; // same endpoint: the blocking path uses the server-side COPY_TENSOR
++    }
++
++    // staging = the SET_TENSOR message: | rpc_tensor | cache_flag | offset | data |, the GET fills the data part
++    const size_t header = sizeof(rpc_tensor) + sizeof(uint8_t) + sizeof(uint64_t);
++    std::shared_ptr<uint8_t> staging(new uint8_t[header + size], std::default_delete<uint8_t[]>());
++    const uint8_t  cache_flag = 0;
++    const uint64_t offset     = 0;
++    memcpy(staging.get(), &dst_tensor, sizeof(dst_tensor));
++    memcpy(staging.get() + sizeof(dst_tensor), &cache_flag, sizeof(cache_flag));
++    memcpy(staging.get() + sizeof(dst_tensor) + sizeof(cache_flag), &offset, sizeof(offset));
++
++    auto request = std::make_shared<rpc_msg_get_tensor_req>();
++    request->tensor = serialize_tensor(src);
++    request->offset = 0;
++    request->size   = size;
++    auto got = src_ctx->dispatcher->send_async_dep(RPC_CMD_GET_TENSOR, request, sizeof(*request),
++                                                   staging.get() + header, size, {}, staging);
++    src_ctx->last = got;
++    dst_ctx->last = dst_ctx->dispatcher->send_async_dep(RPC_CMD_SET_TENSOR, staging, header + size, nullptr, 0, got, nullptr);
++    return true;
+ }
+ 
+ static void ggml_backend_rpc_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
+@@ -1480,7 +1592,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
+     /* .set_tensor_2d_async     = */ ggml_backend_rpc_set_tensor_2d_async,
+     /* .get_tensor_2d_async     = */ ggml_backend_rpc_get_tensor_2d_async,
+-    /* .cpy_tensor_async        = */ NULL,
++    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
+     /* .synchronize             = */ ggml_backend_rpc_synchronize,
+     /* .graph_plan_create       = */ NULL,
+     /* .graph_plan_free         = */ NULL,
+-- 
+2.43.0
+
+
+From 9972db8059e2e4241b1efdcddf7a03417521d206 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 23:49:52 -0700
+Subject: [PATCH 2/2] llama: allow pipeline parallelism with a CPU stage before
+ RPC stages
+
+Upstream enables scheduler pipeline parallelism only when every layer and
+the output are on non-CPU devices. When all devices are RPC, the CPU stage
+(first layers on this host) runs synchronously while the RPC backend queues
+compute and copies without blocking, so the remote stages of ubatch i overlap
+the CPU stage of ubatch i+1. LLAMA_RPC_PIPELINE_PARALLEL=0 restores the
+upstream rule; nothing changes when no RPC device is used.
+---
+ src/llama-context.cpp | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0a814e89f..bd5a3d36b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -516,9 +516,24 @@ llama_context::llama_context(
+ 
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
++        // RPC: a CPU stage (the first layers on this host) followed by RPC stages can pipeline too. The CPU split
++        // runs synchronously, while the RPC backend copies activations between stages without blocking this thread,
++        // so the remote stages of ubatch i overlap the CPU stage of ubatch i+1 and each other.
++        // LLAMA_RPC_PIPELINE_PARALLEL=0 restores the upstream rule (all layers and the output on non-CPU devices).
++        bool rpc_pipeline = false;
++        {
++            const char * env = getenv("LLAMA_RPC_PIPELINE_PARALLEL");
++            const bool all_rpc = model.n_devices() > 0 &&
++                std::all_of(model.devices.begin(), model.devices.end(), [](const auto & d) {
++                    return strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d.dev)), "RPC") == 0;
++                });
++            const bool cpu_stage = model.n_gpu_layers() <= model.hparams.n_layer_all;
++            rpc_pipeline = (env == nullptr || atoi(env) != 0) && all_rpc && model.n_gpu_layers() > 0 &&
++                           model.n_devices() + (cpu_stage ? 1 : 0) > 1;
++        }
++
+         bool pipeline_parallel =
+-            model.n_devices() > 1 &&
+-            model.n_gpu_layers() > model.hparams.n_layer_all &&
++            ((model.n_devices() > 1 && model.n_gpu_layers() > model.hparams.n_layer_all) || rpc_pipeline) &&
+             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides() &&
+@@ -547,7 +562,7 @@ llama_context::llama_context(
+         cparams.pipeline_parallel = pipeline_parallel;
+ 
+         if (cparams.pipeline_parallel) {
+-            LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
++            LLAMA_LOG_INFO("%s: pipeline parallelism enabled%s\n", __func__, rpc_pipeline ? " (RPC stages)" : "");
+         }
+ 
+         if (cparams.moe_cache_size > 0) {
+-- 
+2.43.0
+

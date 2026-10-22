@@ -600,6 +600,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag13:
+            # prefill pipeline parallel over RPC alone (rpc_pipeline_parallel.patch, no p2p yet): off / on / on + the
+            # last worker handing 3 layers to the others, G=6, --cache-ram 0 + lazy readback, interleaved per stage count
+            plan = [("x1", 1, 1, B)]
+            for s_ in (2, 3, 4, 5):
+                plan += [(k, s_, 6, 6 * B) for k in ("bs_v00", "bs_v01", "bs_w3")]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag12:
             # bs_v{p}{q}: direct worker-to-worker copies (rpc_p2p.patch, GGML_RPC_P2P) x prefill pipeline parallel over
             # RPC (rpc_pipeline_parallel.patch, LLAMA_RPC_PIPELINE_PARALLEL + GGML_RPC_ASYNC_COPY); bs_w{h} = both on
@@ -875,6 +882,7 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag13", action = "store_true", help = "prefill pipeline parallel over RPC off / on / on + lighter head, 2-5 stages")
     m.add_argument("--diag12", action = "store_true", help = "worker-to-worker copies x prefill pipeline parallel x stage weights (use with --peer-allow)")
     m.add_argument("--diag11", action = "store_true", help = "G sweep up to ~2S at 2-5 stages, --cache-ram 0 + lazy readback (use with --waves 8)")
     m.add_argument("--diag10", action = "store_true", help = "lazy backend-sampling readback off vs on, then 4-5 stages (use with --waves 8)")

@@ -1,0 +1,1252 @@
+From b9a391705079e7aabd2ca519718d90fd4e58ac91 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 01:19:54 -0700
+Subject: [PATCH] rpc: direct server-to-server copies of split inputs
+
+With pipeline parallelism over several rpc-servers every activation that
+crosses from server A to server B was relayed by the client: a GET_TENSOR
+from A followed by a SET_TENSOR to B, both on the client's link, and the
+group thread blocked on the GET before it could queue anything for B.
+
+Implement cpy_tensor_async for RPC backends on different endpoints. The
+client queues PEER_PUSH(src, tag) on A's FIFO and PEER_AWAIT(tag, dst) on
+B's FIFO under one lock, so the push follows the graph producing src, the
+await precedes the graph consuming dst, and every server sees transfers in
+one global order (no deadlock: an await only waits for a push with nothing
+blocking ahead of it). No client round trip is added and the group thread
+no longer waits on the inter-stage GET.
+
+Server side:
+- PEER_CONNECT opens (or reuses) a link from A to B. It uses the same
+  mutual TLS 1.3 as client links: A presents its own server certificate and
+  pins B's fingerprint from the tls://<fp>@host:port endpoint the client
+  already uses; B admits A only if A is in its --tls-allow file. Plaintext
+  links only between plaintext servers on 127.0.0.0/8.
+- PEER_PUSH reads the tensor in command order and hands the bytes to the
+  link's sender thread, so A can compute the next graph meanwhile.
+- The accept loop runs on its own thread and routes a connection by its
+  first command: HELLO to the one-client-at-a-time serve loop, PEER_HELLO
+  to a receiver thread that files PEER_DATA by (source, tag). PEER_AWAIT
+  waits for the entry and writes it like SET_TENSOR, so B receives while it
+  computes.
+- An allowlist line "<fp> peer" admits a certificate for peer transfers
+  only; it cannot send HELLO and drive the server as a client.
+
+The feature is advertised in the HELLO reply's former padding byte, which
+older servers send as zero; the protocol version is unchanged, so old
+clients and old servers keep working and pairs with an old server, a
+refused link or GGML_RPC_P2P=0 (client or server) use the relay path.
+
+Failures do not hang: an await fails when its source's link closes, the
+client hangs up or after GGML_RPC_P2P_TIMEOUT seconds (default 120); a
+push fails when the link failed; either drops the client connection. Links
+close when the client session that opened them ends, so a failure travels
+down the pipeline to whichever server the client waits on. The P2P server
+ignores SIGPIPE so a dead peer fails a write instead of killing it.
+
+Traces: rpc.peer PEER_SEND / PEER_RECV events with bytes and tag.
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp  | 734 ++++++++++++++++++++++++++++++--
+ ggml/src/ggml-rpc/transport.cpp | 180 +++++++-
+ ggml/src/ggml-rpc/transport.h   |  15 +
+ 3 files changed, 881 insertions(+), 48 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 2c96ffb7c..0e3e06c42 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -14,6 +14,7 @@
+ #include <thread>
+ #include <vector>
+ #include <queue>
++#include <deque>
+ #include <condition_variable>
+ #include <future>
+ #include <memory>
+@@ -26,6 +27,7 @@
+ #include <unistd.h>
+ #endif
+ #include <cstring>
++#include <csignal>
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
+@@ -86,6 +88,12 @@ enum rpc_cmd {
+     RPC_CMD_COMM_FREE,
+     // once per connection after HELLO, only while tracing (8.1)
+     RPC_CMD_TRACE_SYNC,
++    // direct server-to-server tensor transfer, only with servers that set RPC_FEATURE_P2P in HELLO
++    RPC_CMD_PEER_CONNECT,   // client -> server A: open (or reuse) A's link to server B
++    RPC_CMD_PEER_PUSH,      // client -> server A: read a tensor and send it to B under a transfer tag
++    RPC_CMD_PEER_AWAIT,     // client -> server B: wait for the tagged tensor and write it to a tensor
++    RPC_CMD_PEER_HELLO,     // server A -> server B: first command of a peer connection
++    RPC_CMD_PEER_DATA,      // server A -> server B: | tag (8 bytes) | data |
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -118,6 +126,11 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+         case RPC_CMD_TRACE_SYNC:        return "TRACE_SYNC";
++        case RPC_CMD_PEER_CONNECT:      return "PEER_CONNECT";
++        case RPC_CMD_PEER_PUSH:         return "PEER_PUSH";
++        case RPC_CMD_PEER_AWAIT:        return "PEER_AWAIT";
++        case RPC_CMD_PEER_HELLO:        return "PEER_HELLO";
++        case RPC_CMD_PEER_DATA:         return "PEER_DATA";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -139,11 +152,14 @@ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
++// feature bits in rpc_msg_hello_rsp::features (a zeroed padding byte in older servers)
++static constexpr uint8_t RPC_FEATURE_P2P = 0x01;
++
+ struct rpc_msg_hello_rsp {
+     uint8_t major;
+     uint8_t minor;
+     uint8_t patch;
+-    uint8_t padding;
++    uint8_t features;
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
+@@ -283,6 +299,38 @@ struct rpc_msg_comm_free_req {
+     uint32_t device;
+ };
+ 
++static constexpr size_t RPC_PEER_ENDPOINT_MAX = 256;
++
++struct rpc_msg_peer_connect_req {
++    uint64_t self_id;                           // how the receiving server's peer link identifies itself to B
++    uint64_t peer_id;                           // B's id: the key of the link on this server
++    char     endpoint[RPC_PEER_ENDPOINT_MAX];   // B as the client reaches it: host:port or tls://<fp>@host:port
++};
++
++struct rpc_msg_peer_connect_rsp {
++    uint8_t ok;
++};
++
++// PEER_PUSH: peer_id = destination server; PEER_AWAIT: peer_id = source server
++struct rpc_msg_peer_xfer_req {
++    uint64_t   peer_id;
++    uint64_t   tag;
++    rpc_tensor tensor;
++    uint64_t   offset;
++    uint64_t   size;
++};
++
++static constexpr uint64_t RPC_PEER_MAGIC = 0x3170327063707267ULL; // "grpcp2p1"
++
++struct rpc_msg_peer_hello_req {
++    uint64_t magic;
++    uint64_t self_id;
++};
++
++struct rpc_msg_peer_hello_rsp {
++    uint8_t ok;
++};
++
+ #pragma pack(pop)
+ 
+ // RPC data structures
+@@ -516,7 +564,7 @@ static inline void rpc_cpu_relax() {
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server_minor) {
++static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server_minor, uint8_t * server_features) {
+     rpc_msg_hello_req request = {};
+     rpc_msg_hello_rsp response = {};
+ 
+@@ -531,7 +579,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server
+         return false;
+     }
+ 
+-    *server_minor = response.minor;
++    *server_minor    = response.minor;
++    *server_features = response.features;
+     sock->update_caps(response.conn_caps);
+     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
+             __func__, response.major, response.minor, response.patch, sock->transport_name());
+@@ -613,6 +662,12 @@ public:
+ 
+     ~rpc_dispatcher();
+ 
++    // set by start()
++    std::string endpoint;
++    uint8_t     server_features = 0;
++    uint64_t    peer_id         = 0;   // identifies this server in PEER_* commands
++    uint64_t    serial          = 0;   // unique per dispatcher instance in this process
++
+ private:
+     struct rpc_msg {
+         rpc_cmd                       cmd;
+@@ -802,9 +857,13 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+         GGML_ABORT("TLS connection to %s failed\n", endpoint.c_str());
+     }
+     int server_minor = 0;
+-    if (!negotiate_hello(sock, &server_minor)) {
++    if (!negotiate_hello(sock, &server_minor, &server_features)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
++    static std::atomic<uint64_t> next_serial{1};
++    this->endpoint = endpoint;
++    this->peer_id  = fnv_hash((const uint8_t *) endpoint.data(), endpoint.size());
++    this->serial   = next_serial.fetch_add(1);
+     ggml_trace_open(nullptr, "rpc-client");
+     // an 8.0 server passes HELLO but drops the connection on TRACE_SYNC
+     if (ggml_trace_flag && server_minor >= 1) {
+@@ -1461,6 +1520,119 @@ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_eve
+     GGML_UNUSED(event);
+ }
+ 
++// Direct server-to-server copy of a split input (ggml_backend_sched): instead of a GET from server A to
++// this process and a SET from here to server B, queue PEER_PUSH on A's FIFO (after the graph that
++// produces src) and PEER_AWAIT on B's FIFO (before the graph that consumes dst). A sends the bytes to
++// B over a persistent peer connection; B's command loop blocks on the tag until they arrive. Both
++// commands are queued under one lock, so every server sees transfers in the same order and a PUSH
++// is never queued behind an AWAIT that depends on a later transfer. GGML_RPC_P2P=0 disables it.
++static bool rpc_p2p_client_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_RPC_P2P");
++        return !(e && atoi(e) == 0);
++    }();
++    return enabled;
++}
++
++struct rpc_p2p_client_state {
++    std::mutex                                          pairs_mutex;
++    std::map<std::pair<uint64_t, uint64_t>, bool>       pairs;        // (src serial, dst serial) -> link ok
++    std::mutex                                          order_mutex;  // makes a PUSH/AWAIT pair atomic
++    uint64_t                                            next_tag = 0;
++};
++
++static rpc_p2p_client_state & rpc_p2p_client() {
++    static rpc_p2p_client_state * st = [] {
++        auto * s = new rpc_p2p_client_state;
++        s->next_tag = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count() << 8;
++        return s;
++    }();
++    return *st;
++}
++
++// ask src to open its link to dst once per dispatcher pair; any failure keeps the pair on the relay path
++static bool rpc_p2p_ready(rpc_dispatcher * src, rpc_dispatcher * dst) {
++    rpc_p2p_client_state & st = rpc_p2p_client();
++    std::lock_guard<std::mutex> lock(st.pairs_mutex);
++    const auto key = std::make_pair(src->serial, dst->serial);
++    auto it = st.pairs.find(key);
++    if (it != st.pairs.end()) {
++        return it->second;
++    }
++    bool ok = false;
++    if (!(src->server_features & RPC_FEATURE_P2P) || !(dst->server_features & RPC_FEATURE_P2P)) {
++        LOG_INFO("RPC P2P: %s -> %s: a server has no P2P support, copies relay through this process\n",
++                 src->endpoint.c_str(), dst->endpoint.c_str());
++    } else if (dst->endpoint.size() >= RPC_PEER_ENDPOINT_MAX) {
++        LOG_WARN("RPC P2P: endpoint %s is too long, copies relay through this process\n", dst->endpoint.c_str());
++    } else {
++        auto request = std::make_shared<rpc_msg_peer_connect_req>();
++        memset(request.get(), 0, sizeof(*request));
++        request->self_id = src->peer_id;
++        request->peer_id = dst->peer_id;
++        snprintf(request->endpoint, sizeof(request->endpoint), "%s", dst->endpoint.c_str());
++        rpc_msg_peer_connect_rsp response = {};
++        src->send(RPC_CMD_PEER_CONNECT, request, sizeof(*request), &response, sizeof(response));
++        ok = response.ok != 0;
++        if (ok) {
++            LOG_INFO("RPC P2P: %s -> %s: direct transfers\n", src->endpoint.c_str(), dst->endpoint.c_str());
++        } else {
++            LOG_WARN("RPC P2P: %s could not open a peer link to %s (see its log), copies relay through this process\n",
++                     src->endpoint.c_str(), dst->endpoint.c_str());
++        }
++    }
++    st.pairs[key] = ok;
++    return ok;
++}
++
++static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
++    if (!rpc_p2p_client_enabled() || !ggml_backend_is_rpc(backend_src) || !ggml_backend_is_rpc(backend_dst)) {
++        return false;
++    }
++    if (!src->buffer || !dst->buffer || !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
++        return false;
++    }
++    ggml_backend_rpc_context * sctx = (ggml_backend_rpc_context *) backend_src->context;
++    ggml_backend_rpc_context * dctx = (ggml_backend_rpc_context *) backend_dst->context;
++    const auto * sbuf = (const ggml_backend_rpc_buffer_context *) src->buffer->context;
++    const auto * dbuf = (const ggml_backend_rpc_buffer_context *) dst->buffer->context;
++    if (sbuf->dispatcher != sctx->dispatcher || dbuf->dispatcher != dctx->dispatcher || sctx->dispatcher == dctx->dispatcher) {
++        return false;
++    }
++    const size_t size = ggml_nbytes(src);
++    if (size == 0 || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(dst) != size) {
++        return false;
++    }
++    rpc_dispatcher * a = sctx->dispatcher.get();
++    rpc_dispatcher * b = dctx->dispatcher.get();
++    if (!rpc_p2p_ready(a, b)) {
++        return false;
++    }
++
++    auto push  = std::make_shared<rpc_msg_peer_xfer_req>();
++    auto await = std::make_shared<rpc_msg_peer_xfer_req>();
++    push->peer_id  = b->peer_id;
++    push->tensor   = serialize_tensor(src);
++    push->offset   = 0;
++    push->size     = size;
++    await->peer_id = a->peer_id;
++    await->tensor  = serialize_tensor(dst);
++    await->offset  = 0;
++    await->size    = size;
++    LOG_DBG2("[%s] %s (%s) -> %s (%s), %zu bytes\n", __func__, src->name, a->endpoint.c_str(), dst->name, b->endpoint.c_str(), size);
++
++    rpc_p2p_client_state & st = rpc_p2p_client();
++    std::lock_guard<std::mutex> lock(st.order_mutex);
++    const uint64_t tag = ++st.next_tag;
++    push->tag  = tag;
++    await->tag = tag;
++    if (ggml_trace_flag) { ggml_trace_set_subject(src->name, tag); }
++    sctx->last = a->send_async(RPC_CMD_PEER_PUSH, push, sizeof(*push));
++    if (ggml_trace_flag) { ggml_trace_set_subject(dst->name, tag); }
++    dctx->last = b->send_async(RPC_CMD_PEER_AWAIT, await, sizeof(*await));
++    return true;
++}
++
+ static void ggml_backend_rpc_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+@@ -1480,7 +1652,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
+     /* .set_tensor_2d_async     = */ ggml_backend_rpc_set_tensor_2d_async,
+     /* .get_tensor_2d_async     = */ ggml_backend_rpc_get_tensor_2d_async,
+-    /* .cpy_tensor_async        = */ NULL,
++    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
+     /* .synchronize             = */ ggml_backend_rpc_synchronize,
+     /* .graph_plan_create       = */ NULL,
+     /* .graph_plan_free         = */ NULL,
+@@ -1584,6 +1756,370 @@ static bool rpc_repack_is_view(ggml_backend_buffer_t buffer) {
+     return buffer != nullptr && buffer->iface.get_base == rpc_repack_view_get_base;
+ }
+ 
++// Server side of the direct server-to-server (P2P) tensor transfer.
++//
++// Outbound (this server is the source A): PEER_CONNECT opens a persistent link to B, authenticated
++// like a client connection (mutual TLS with this server's certificate, B's fingerprint pinned; on
++// plaintext servers only to 127.0.0.0/8). PEER_PUSH reads the tensor in command order and hands the
++// bytes to the link's sender thread, so A computes the next graph while they go out.
++// Inbound (this server is the destination B): the accept loop routes a connection whose first
++// command is PEER_HELLO to its own receiver thread, which files each PEER_DATA under (source, tag).
++// PEER_AWAIT, in command order, waits for that entry and writes it like SET_TENSOR. It fails (and
++// the client connection is dropped, so the client sees an error) when the source's link closes,
++// the client hangs up, or after GGML_RPC_P2P_TIMEOUT seconds (default 120).
++static bool rpc_p2p_server_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_RPC_P2P");
++        return !(e && atoi(e) == 0);
++    }();
++    return enabled;
++}
++
++static int rpc_p2p_timeout_s() {
++    static const int t = [] {
++        const char * e = getenv("GGML_RPC_P2P_TIMEOUT");
++        const int v = e ? atoi(e) : 0;
++        return v > 0 ? v : 120;
++    }();
++    return t;
++}
++
++static constexpr size_t   RPC_P2P_MAX_MSG      = 4ull << 30;   // one transfer
++static constexpr size_t   RPC_P2P_MAX_INBOX    = 4ull << 30;   // received, not yet awaited
++static constexpr size_t   RPC_P2P_MAX_BACKLOG  = 512ull << 20; // pushed, not yet sent, per link
++static constexpr int64_t  RPC_P2P_STALE_US     = 600ll * 1000 * 1000;
++// PEER_DATA is filed with room for the SET_TENSOR header in front: | rpc_tensor | cache_flag | offset |
++static constexpr size_t   RPC_P2P_SET_HEADER   = sizeof(rpc_tensor) + 1 + sizeof(uint64_t);
++
++static bool rpc_host_is_loopback(const std::string & host) {
++    return host == "localhost" || host.rfind("127.", 0) == 0;
++}
++
++struct rpc_peer_link {
++    struct item {
++        uint64_t             tag;
++        std::vector<uint8_t> data;
++    };
++
++    std::string             endpoint;
++    socket_ptr              sock;
++    std::thread             thread;
++    std::mutex              mutex;
++    std::condition_variable cvar;
++    std::deque<item>        queue;
++    size_t                  backlog = 0;
++    bool                    failed  = false;
++    bool                    stop    = false;
++
++    bool is_failed() {
++        std::lock_guard<std::mutex> lock(mutex);
++        return failed;
++    }
++
++    bool enqueue(uint64_t tag, std::vector<uint8_t> && data) {
++        std::unique_lock<std::mutex> lock(mutex);
++        const size_t n = data.size();
++        cvar.wait(lock, [&] { return failed || backlog == 0 || backlog + n <= RPC_P2P_MAX_BACKLOG; });
++        if (failed) {
++            return false;
++        }
++        backlog += n;
++        queue.push_back({tag, std::move(data)});
++        cvar.notify_all();
++        return true;
++    }
++
++    void run() {
++        while (true) {
++            item it;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                cvar.wait(lock, [&] { return stop || !queue.empty(); });
++                if (stop) {
++                    return;
++                }
++                it = std::move(queue.front());
++                queue.pop_front();
++            }
++            const int64_t t0   = ggml_trace_flag ? ggml_trace_time_us() : 0;
++            const uint8_t cmd  = RPC_CMD_PEER_DATA;
++            const uint64_t size = sizeof(it.tag) + it.data.size();
++            const bool ok = sock->send_data(&cmd, sizeof(cmd)) && sock->send_data(&size, sizeof(size)) &&
++                            sock->send_data(&it.tag, sizeof(it.tag)) && sock->send_data(it.data.data(), it.data.size()) &&
++                            sock->flush();
++            if (ggml_trace_flag) {
++                ggml_trace_eventf("rpc.peer", "PEER_SEND", t0, ggml_trace_time_us(),
++                                  "\"peer\":\"%s\",\"tag\":%llu,\"bytes\":%zu,\"ok\":%d", endpoint.c_str(),
++                                  (unsigned long long) it.tag, (size_t) (size + RPC_CMD_HEADER_BYTES), ok ? 1 : 0);
++            }
++            std::lock_guard<std::mutex> lock(mutex);
++            backlog -= it.data.size();
++            if (!ok) {
++                LOG_ERROR("RPC P2P: sending to peer %s failed, dropping the link\n", endpoint.c_str());
++                failed = true;
++                queue.clear();
++                backlog = 0;
++                cvar.notify_all();
++                return;
++            }
++            cvar.notify_all();
++        }
++    }
++
++    ~rpc_peer_link() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stop = true;
++            cvar.notify_all();
++        }
++        if (sock) {
++            sock->shutdown_rw(); // a send blocked on a stalled peer must not hold up the join
++        }
++        if (thread.joinable()) {
++            thread.join();
++        }
++    }
++};
++
++struct rpc_p2p_hub {
++    struct entry {
++        std::vector<uint8_t> data;   // RPC_P2P_SET_HEADER bytes of room, then the payload
++        int64_t              t_us;
++    };
++
++    std::mutex                                     mutex;
++    std::condition_variable                        cvar;
++    std::map<std::pair<uint64_t, uint64_t>, entry> inbox;   // (source id, tag)
++    size_t                                         inbox_bytes = 0;
++    std::unordered_map<uint64_t, int>              live;    // source id -> open peer connections
++    std::unordered_set<uint64_t>                   seen;    // source ids that ever connected
++
++    std::mutex                                                   links_mutex;
++    std::unordered_map<uint64_t, std::shared_ptr<rpc_peer_link>> links;  // destination id -> link
++
++    void peer_up(uint64_t src) {
++        std::lock_guard<std::mutex> lock(mutex);
++        live[src]++;
++        seen.insert(src);
++    }
++
++    void peer_down(uint64_t src) {
++        std::lock_guard<std::mutex> lock(mutex);
++        live[src]--;
++        cvar.notify_all();
++    }
++
++    bool deposit(uint64_t src, uint64_t tag, std::vector<uint8_t> && data) {
++        std::lock_guard<std::mutex> lock(mutex);
++        const int64_t now = ggml_time_us();
++        for (auto it = inbox.begin(); it != inbox.end();) {
++            if (now - it->second.t_us > RPC_P2P_STALE_US) {
++                inbox_bytes -= it->second.data.size();
++                it = inbox.erase(it);
++            } else {
++                ++it;
++            }
++        }
++        const auto key = std::make_pair(src, tag);
++        if (inbox.count(key) != 0) {
++            LOG_ERROR("RPC P2P: duplicate transfer tag %" PRIu64 " from peer %016" PRIx64 "\n", tag, src);
++            return false;
++        }
++        if (inbox_bytes + data.size() > RPC_P2P_MAX_INBOX) {
++            LOG_ERROR("RPC P2P: %zu bytes received and not awaited, refusing more\n", inbox_bytes);
++            return false;
++        }
++        inbox_bytes += data.size();
++        inbox[key] = entry{std::move(data), now};
++        cvar.notify_all();
++        return true;
++    }
++
++    bool take(uint64_t src, uint64_t tag, std::vector<uint8_t> & out, const socket_ptr & client) {
++        std::unique_lock<std::mutex> lock(mutex);
++        const auto key      = std::make_pair(src, tag);
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rpc_p2p_timeout_s());
++        while (true) {
++            auto it = inbox.find(key);
++            if (it != inbox.end()) {
++                out = std::move(it->second.data);
++                inbox_bytes -= out.size();
++                inbox.erase(it);
++                return true;
++            }
++            if (seen.count(src) != 0 && live[src] <= 0) {
++                LOG_ERROR("RPC P2P: peer %016" PRIx64 " disconnected before transfer %" PRIu64 " arrived\n", src, tag);
++                return false;
++            }
++            if (client && client->remote_hung_up()) {
++                LOG_ERROR("RPC P2P: client hung up while waiting for transfer %" PRIu64 "\n", tag);
++                return false;
++            }
++            if (std::chrono::steady_clock::now() >= deadline) {
++                LOG_ERROR("RPC P2P: transfer %" PRIu64 " from peer %016" PRIx64 " did not arrive within %d s\n",
++                          tag, src, rpc_p2p_timeout_s());
++                return false;
++            }
++            cvar.wait_for(lock, std::chrono::milliseconds(100));
++        }
++    }
++
++    void clear_inbox() {
++        std::lock_guard<std::mutex> lock(mutex);
++        inbox.clear();
++        inbox_bytes = 0;
++    }
++
++    // links belong to the client session that opened them: closing them when it ends tells every
++    // destination that this source is gone, so an AWAIT there fails now instead of at the timeout
++    // (a failure anywhere in the pipeline reaches the client through whichever server it waits on)
++    void close_links() {
++        std::unordered_map<uint64_t, std::shared_ptr<rpc_peer_link>> old;
++        {
++            std::lock_guard<std::mutex> lock(links_mutex);
++            old.swap(links);
++        }
++        old.clear();
++    }
++
++    std::shared_ptr<rpc_peer_link> find_link(uint64_t dst) {
++        std::lock_guard<std::mutex> lock(links_mutex);
++        auto it = links.find(dst);
++        return it == links.end() ? nullptr : it->second;
++    }
++};
++
++static rpc_p2p_hub & rpc_p2p() {
++    static rpc_p2p_hub * hub = new rpc_p2p_hub; // never destroyed: detached receiver threads use it until exit
++    return *hub;
++}
++
++// PEER_CONNECT on the source server: reuse a healthy link to the same endpoint (several llama contexts
++// of one client share it), otherwise open a new one
++static bool rpc_p2p_connect(const rpc_msg_peer_connect_req & request, rpc_msg_peer_connect_rsp & response) {
++    response.ok = 0;
++    if (!rpc_p2p_server_enabled()) {
++        LOG_WARN("RPC P2P: PEER_CONNECT refused (GGML_RPC_P2P=0)\n");
++        return true;
++    }
++    const std::string endpoint(request.endpoint, strnlen(request.endpoint, sizeof(request.endpoint)));
++    std::string host;
++    int         port = 0;
++    std::string fingerprint;
++    if (!parse_endpoint(endpoint, host, port, &fingerprint)) {
++        LOG_ERROR("RPC P2P: cannot parse peer endpoint '%s'\n", endpoint.c_str());
++        return true;
++    }
++    const bool tls = is_tls_endpoint(endpoint);
++    if (!tls && (rpc_tls_server_enabled() || !rpc_host_is_loopback(host))) {
++        LOG_ERROR("RPC P2P: refusing a plaintext peer link to %s (plaintext is for 127.0.0.1 tests on plaintext servers only)\n",
++                  endpoint.c_str());
++        return true;
++    }
++    rpc_p2p_hub & hub = rpc_p2p();
++    {
++        // a link whose peer restarted has seen the FIN/RST even though this side never reads from it
++        auto link = hub.find_link(request.peer_id);
++        if (link && link->endpoint == endpoint && !link->is_failed() && !link->sock->remote_hung_up()) {
++            response.ok = 1;
++            return true;
++        }
++    }
++    socket_ptr sock = socket_t::connect(host.c_str(), port);
++    if (sock == nullptr) {
++        LOG_ERROR("RPC P2P: cannot connect to peer %s\n", endpoint.c_str());
++        return true;
++    }
++    if (tls && !sock->tls_connect_peer(fingerprint)) {
++        LOG_ERROR("RPC P2P: TLS with peer %s failed\n", endpoint.c_str());
++        return true;
++    }
++    rpc_msg_peer_hello_req hello = { RPC_PEER_MAGIC, request.self_id };
++    rpc_msg_peer_hello_rsp hello_rsp = {};
++    sock->set_recv_timeout(10);
++    if (!send_rpc_cmd(sock, RPC_CMD_PEER_HELLO, &hello, sizeof(hello), &hello_rsp, sizeof(hello_rsp)) || !hello_rsp.ok) {
++        LOG_ERROR("RPC P2P: peer %s refused the link\n", endpoint.c_str());
++        return true;
++    }
++    sock->set_recv_timeout(0);
++    auto link      = std::make_shared<rpc_peer_link>();
++    link->endpoint = endpoint;
++    link->sock     = sock;
++    link->thread   = std::thread([l = link.get()] { l->run(); });
++    std::shared_ptr<rpc_peer_link> old;
++    {
++        std::lock_guard<std::mutex> lock(hub.links_mutex);
++        old = hub.links[request.peer_id];
++        hub.links[request.peer_id] = link;
++    }
++    old.reset(); // stops and joins the old sender
++    LOG_INFO("RPC P2P: link to peer %s (%s) open\n", endpoint.c_str(), sock->transport_name());
++    response.ok = 1;
++    return true;
++}
++
++// a connection whose first command was PEER_HELLO: file every PEER_DATA until it closes
++static void rpc_p2p_serve_peer(socket_ptr sock) {
++    rpc_msg_peer_hello_req hello = {};
++    if (!recv_msg(sock, &hello, sizeof(hello))) {
++        return;
++    }
++    rpc_msg_peer_hello_rsp rsp = {};
++    if (hello.magic != RPC_PEER_MAGIC || !rpc_p2p_server_enabled()) {
++        LOG_WARN("RPC P2P: refused a peer (%s)\n", rpc_p2p_server_enabled() ? "bad hello" : "GGML_RPC_P2P=0");
++        send_msg(sock, &rsp, sizeof(rsp));
++        return;
++    }
++    rpc_p2p_hub & hub = rpc_p2p();
++    const uint64_t src = hello.self_id;
++    hub.peer_up(src);
++    rsp.ok = 1;
++    if (!send_msg(sock, &rsp, sizeof(rsp))) {
++        hub.peer_down(src);
++        return;
++    }
++    sock->set_recv_timeout(0);
++    LOG_INFO("RPC P2P: peer %016" PRIx64 " connected (%s)\n", src, sock->transport_name());
++    while (true) {
++        uint8_t  cmd  = 0;
++        uint64_t size = 0;
++        uint64_t tag  = 0;
++        if (!sock->recv_data(&cmd, 1)) {
++            break;
++        }
++        const int64_t t0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
++        if (cmd != RPC_CMD_PEER_DATA) {
++            LOG_ERROR("RPC P2P: unexpected command %d on a peer connection\n", cmd);
++            break;
++        }
++        if (!sock->recv_data(&size, sizeof(size)) || size < sizeof(tag) || size - sizeof(tag) > RPC_P2P_MAX_MSG ||
++            !sock->recv_data(&tag, sizeof(tag))) {
++            break;
++        }
++        const size_t n = size - sizeof(tag);
++        std::vector<uint8_t> data;
++        try {
++            data.resize(RPC_P2P_SET_HEADER + n);
++        } catch (const std::bad_alloc &) {
++            LOG_ERROR("RPC P2P: cannot allocate %zu bytes\n", n);
++            break;
++        }
++        if (!sock->recv_data(data.data() + RPC_P2P_SET_HEADER, n)) {
++            break;
++        }
++        if (ggml_trace_flag) {
++            ggml_trace_eventf("rpc.peer", "PEER_RECV", t0, ggml_trace_time_us(),
++                              "\"src\":\"%016" PRIx64 "\",\"tag\":%llu,\"bytes\":%zu", src,
++                              (unsigned long long) tag, (size_t) (size + RPC_CMD_HEADER_BYTES));
++        }
++        if (!hub.deposit(src, tag, std::move(data))) {
++            break;
++        }
++    }
++    LOG_INFO("RPC P2P: peer %016" PRIx64 " disconnected\n", src);
++    hub.peer_down(src);
++}
++
+ class rpc_server {
+ public:
+     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+@@ -1621,6 +2157,8 @@ public:
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
++    bool peer_push(const rpc_msg_peer_xfer_req & request);
++    bool peer_await(const rpc_msg_peer_xfer_req & request, const socket_ptr & client);
+ 
+     struct stored_graph {
+         std::vector<uint8_t>   buffer;
+@@ -1691,6 +2229,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
++    response.features = rpc_p2p_server_enabled() ? RPC_FEATURE_P2P : 0;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -3094,6 +3633,44 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
+     return true;
+ }
+ 
++bool rpc_server::peer_push(const rpc_msg_peer_xfer_req & request) {
++    auto link = rpc_p2p().find_link(request.peer_id);
++    if (!link || link->is_failed() || link->sock->remote_hung_up()) {
++        LOG_ERROR("[%s] no open link to peer %016" PRIx64 "\n", __func__, request.peer_id);
++        return false;
++    }
++    rpc_msg_get_tensor_req get = {};
++    get.tensor = request.tensor;
++    get.offset = request.offset;
++    get.size   = request.size;
++    std::vector<uint8_t> data;
++    if (!get_tensor(get, data)) {
++        return false;
++    }
++    if (!link->enqueue(request.tag, std::move(data))) {
++        LOG_ERROR("[%s] link to peer %s failed\n", __func__, link->endpoint.c_str());
++        return false;
++    }
++    return true;
++}
++
++bool rpc_server::peer_await(const rpc_msg_peer_xfer_req & request, const socket_ptr & client) {
++    std::vector<uint8_t> input;
++    if (!rpc_p2p().take(request.peer_id, request.tag, input, client)) {
++        return false;
++    }
++    if (input.size() - RPC_P2P_SET_HEADER != request.size) {
++        LOG_ERROR("[%s] transfer %" PRIu64 " has %zu bytes, expected %" PRIu64 "\n", __func__, request.tag,
++                  input.size() - RPC_P2P_SET_HEADER, request.size);
++        return false;
++    }
++    const uint8_t cache_flag = 0;
++    memcpy(input.data(), &request.tensor, sizeof(rpc_tensor));
++    memcpy(input.data() + sizeof(rpc_tensor), &cache_flag, sizeof(cache_flag));
++    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), &request.offset, sizeof(request.offset));
++    return set_tensor(input);
++}
++
+ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
+     uint32_t dev_id = request.device;
+     if (dev_id >= backends.size()) {
+@@ -3120,16 +3697,19 @@ rpc_server::~rpc_server() {
+     }
+ }
+ 
++// hello_read: the accept loop already consumed the HELLO command byte
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+-                             socket_ptr sock) {
++                             socket_ptr sock, bool hello_read = false) {
+     rpc_server server(backends, cache_dir);
+     uint8_t cmd;
+-    if (!sock->recv_data(&cmd, 1)) {
+-        return;
+-    }
+-    if (cmd != RPC_CMD_HELLO) {
+-        LOG_ERROR("Expected HELLO command, update client\n");
+-        return;
++    if (!hello_read) {
++        if (!sock->recv_data(&cmd, 1)) {
++            return;
++        }
++        if (cmd != RPC_CMD_HELLO) {
++            LOG_ERROR("Expected HELLO command, update client\n");
++            return;
++        }
+     }
+ 
+     // Read input_size and validate protocol version
+@@ -3450,6 +4030,40 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_PEER_CONNECT: {
++                rpc_msg_peer_connect_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_peer_connect_rsp response;
++                if (!rpc_p2p_connect(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_PEER_PUSH: {
++                rpc_msg_peer_xfer_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                if (!rpc_p2p_server_enabled() || !server.peer_push(request)) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_PEER_AWAIT: {
++                rpc_msg_peer_xfer_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                if (!rpc_p2p_server_enabled() || !server.peer_await(request, sock)) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_GET_DEVICE_MEMORY: {
+                 rpc_msg_get_device_memory_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -3558,23 +4172,91 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         LOG_ERROR("Failed to create server socket\n");
+         return;
+     }
+-    while (true) {
+-        auto client_socket = server_socket->accept();
+-        if (client_socket == nullptr) {
+-            LOG_ERROR("Failed to accept client connection\n");
+-            return;
++    if (!rpc_p2p_server_enabled()) {
++        LOG_INFO("  peer transfers : disabled (GGML_RPC_P2P=0)\n");
++        while (true) {
++            auto client_socket = server_socket->accept();
++            if (client_socket == nullptr) {
++                LOG_ERROR("Failed to accept client connection\n");
++                return;
++            }
++            if (tls) {
++                std::string fingerprint;
++                if (!client_socket->tls_accept(fingerprint)) {
++                    LOG_WARN("Refused client connection (TLS)\n");
++                    continue;
++                }
++                if (client_socket->tls_peer_only()) {
++                    LOG_WARN("Refused client connection: %s is allowed as a peer only\n", fingerprint.c_str());
++                    continue;
++                }
++                LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
++            } else {
++                LOG_INFO("Accepted client connection\n");
++            }
++            rpc_serve_client(backends, cache_dir, client_socket);
++            LOG_INFO("Client connection closed\n");
+         }
+-        if (tls) {
+-            std::string fingerprint;
+-            if (!client_socket->tls_accept(fingerprint)) {
+-                LOG_WARN("Refused client connection (TLS)\n");
+-                continue;
++    }
++    // P2P: connections are accepted on their own thread (peer links arrive while a client is being
++    // served) and routed by their first command; clients are still served one at a time, here
++    LOG_INFO("  peer transfers : enabled (%s)\n", tls ? "peers must be in the allowlist" : "plaintext, 127.0.0.1 only");
++#ifndef _WIN32
++    // a peer that goes away must fail the write to it (and the client's request), not kill this server
++    signal(SIGPIPE, SIG_IGN);
++#endif
++    auto clients = std::make_shared<message_queue<socket_ptr>>();
++    std::thread([server_socket, clients, tls] {
++        while (true) {
++            auto conn = server_socket->accept();
++            if (conn == nullptr) {
++                LOG_ERROR("Failed to accept client connection\n");
++                clients->interrupt();
++                return;
+             }
+-            LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
+-        } else {
+-            LOG_INFO("Accepted client connection\n");
++            std::thread([conn, clients, tls] {
++                std::string fingerprint;
++                if (tls && !conn->tls_accept(fingerprint)) {
++                    LOG_WARN("Refused connection (TLS)\n");
++                    return;
++                }
++                uint8_t cmd = 0;
++                conn->set_recv_timeout(10);
++                if (!conn->recv_data(&cmd, 1)) {
++                    return;
++                }
++                conn->set_recv_timeout(0);
++                if (cmd == RPC_CMD_PEER_HELLO) {
++                    if (!tls && !conn->remote_is_loopback()) {
++                        LOG_WARN("Refused plaintext peer connection from a non-loopback address\n");
++                        return;
++                    }
++                    rpc_p2p_serve_peer(conn);
++                    return;
++                }
++                if (cmd != RPC_CMD_HELLO) {
++                    LOG_ERROR("Expected HELLO command, update client\n");
++                    return;
++                }
++                if (conn->tls_peer_only()) {
++                    LOG_WARN("Refused client connection: %s is allowed as a peer only\n", fingerprint.c_str());
++                    return;
++                }
++                if (tls) {
++                    LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
++                } else {
++                    LOG_INFO("Accepted client connection\n");
++                }
++                clients->push(conn);
++            }).detach();
+         }
+-        rpc_serve_client(backends, cache_dir, client_socket);
++    }).detach();
++    socket_ptr client_socket;
++    while (clients->pop(&client_socket)) {
++        rpc_serve_client(backends, cache_dir, client_socket, /*hello_read =*/ true);
++        client_socket = nullptr;
++        rpc_p2p().close_links();
++        rpc_p2p().clear_inbox();
+         LOG_INFO("Client connection closed\n");
+     }
+     rpc_transport_shutdown();
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index f39c94c62..acfd22cfd 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -15,6 +15,7 @@
+ #  include <netinet/in.h>
+ #  include <netinet/tcp.h>
+ #  include <netdb.h>
++#  include <poll.h>
+ #  include <unistd.h>
+ #endif
+ #include <cstdlib>
+@@ -169,6 +170,7 @@ struct socket_t::impl {
+     // one TLS record per message: the small writes of a message are held and leave together at flush()
+     static constexpr size_t TLS_COALESCE_MAX = 64 * 1024;
+     SSL *                ssl = nullptr;
++    bool                 tls_peer_only = false;
+     std::vector<uint8_t> tls_out;
+     bool tls_write(const void * data, size_t size);
+     bool tls_send(const void * data, size_t size);
+@@ -752,6 +754,71 @@ bool socket_t::is_tls() const {
+ #endif // GGML_RPC_TLS
+ }
+ 
++static void set_recv_timeout_fd(sockfd_t fd, int seconds) {
++#ifdef _WIN32
++    DWORD ms = (DWORD) seconds * 1000;
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &ms, sizeof(ms));
++#else
++    struct timeval tv;
++    tv.tv_sec  = seconds;
++    tv.tv_usec = 0;
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++#endif
++}
++
++void socket_t::set_recv_timeout(int seconds) {
++    set_recv_timeout_fd(pimpl->fd, seconds);
++}
++
++bool socket_t::remote_is_loopback() const {
++    struct sockaddr_storage addr;
++    socklen_t len = sizeof(addr);
++    if (getpeername(pimpl->fd, (struct sockaddr *) &addr, &len) != 0) {
++        return false;
++    }
++    if (addr.ss_family == AF_INET) {
++        const uint32_t a = ntohl(((struct sockaddr_in *) &addr)->sin_addr.s_addr);
++        return (a >> 24) == 127;
++    }
++    return false;
++}
++
++bool socket_t::remote_hung_up() const {
++#ifdef _WIN32
++    return false;
++#else
++    struct pollfd p = {};
++    p.fd = pimpl->fd;
++#  ifdef POLLRDHUP
++    p.events = POLLRDHUP;
++    const short hup = POLLRDHUP | POLLHUP | POLLERR;
++#  else
++    p.events = 0;
++    const short hup = POLLHUP | POLLERR;
++#  endif
++    if (poll(&p, 1, 0) <= 0) {
++        return false;
++    }
++    return (p.revents & hup) != 0;
++#endif
++}
++
++void socket_t::shutdown_rw() {
++#ifdef _WIN32
++    ::shutdown(pimpl->fd, SD_BOTH);
++#else
++    ::shutdown(pimpl->fd, SHUT_RDWR);
++#endif
++}
++
++bool socket_t::tls_peer_only() const {
++#ifdef GGML_RPC_TLS
++    return pimpl->tls_peer_only;
++#else
++    return false;
++#endif
++}
++
+ static bool is_valid_fd(sockfd_t sockfd) {
+ #ifdef _WIN32
+     return sockfd != INVALID_SOCKET;
+@@ -975,6 +1042,10 @@ struct tls_server_state {
+     std::mutex  mu;
+     SSL_CTX *   ctx = nullptr;
+     std::string allow_file;
++    // kept for the outbound server-to-server (P2P) connections, which present this server's certificate
++    std::string cert;
++    std::string key;
++    std::string ca;
+ };
+ 
+ static tls_server_state & tls_server() {
+@@ -982,24 +1053,50 @@ static tls_server_state & tls_server() {
+     return st;
+ }
+ 
+-static bool tls_allowed(const std::string & allow_file, const std::string & fp) {
++// allowlist line: "<sha-256 fingerprint> [peer]  # comment". A "peer" entry admits another rpc-server for
++// direct tensor transfers only; it cannot issue HELLO and drive this server as a client.
++static bool tls_allowed(const std::string & allow_file, const std::string & fp, bool & peer_only) {
+     std::ifstream in(allow_file);
+     if (!in) {
+         LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file.c_str());
+         return false;
+     }
++    bool        found     = false;
++    bool        any_full  = false;
+     std::string line;
+     while (std::getline(in, line)) {
+         const size_t hash = line.find('#');
+         if (hash != std::string::npos) {
+             line.resize(hash);
+         }
+-        const std::string entry = tls_normalize_fp(line);
+-        if (!entry.empty() && entry == fp) {
+-            return true;
++        size_t b = line.find_first_not_of(" \t\r");
++        if (b == std::string::npos) {
++            continue;
++        }
++        size_t e = line.find_first_of(" \t\r", b);
++        const std::string fp_tok = line.substr(b, e == std::string::npos ? std::string::npos : e - b);
++        std::string       role;
++        if (e != std::string::npos) {
++            const size_t rb = line.find_first_not_of(" \t\r", e);
++            if (rb != std::string::npos) {
++                const size_t re = line.find_first_of(" \t\r", rb);
++                role = line.substr(rb, re == std::string::npos ? std::string::npos : re - rb);
++            }
++        }
++        const std::string entry = tls_normalize_fp(fp_tok);
++        if (entry.empty() || entry != fp) {
++            continue;
+         }
++        if (role.empty()) {
++            any_full = true;
++        } else if (role != "peer") {
++            LOG_WARN("TLS: ignoring allowlist entry with unknown role '%s'\n", role.c_str());
++            continue;
++        }
++        found = true;
+     }
+-    return false;
++    peer_only = found && !any_full;
++    return found;
+ }
+ 
+ bool socket_t::impl::tls_write(const void * data, size_t size) {
+@@ -1056,43 +1153,72 @@ bool socket_t::impl::tls_recv(void * data, size_t size) {
+     return true;
+ }
+ 
+-bool socket_t::tls_connect(const std::string & server_fingerprint) {
+-    const char * cert = std::getenv("GGML_RPC_TLS_CERT");
+-    const char * key  = std::getenv("GGML_RPC_TLS_KEY");
+-    const char * ca   = std::getenv("GGML_RPC_TLS_CA");
+-    if (!cert || !key || !ca) {
+-        LOG_ERROR("TLS: a tls:// endpoint needs GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA\n");
+-        return false;
+-    }
++static SSL * tls_client_handshake(sockfd_t fd, const std::string & server_fingerprint, const char * cert, const char * key, const char * ca) {
+     const std::string want = tls_normalize_fp(server_fingerprint);
+     if (want.size() != 64) {
+         LOG_ERROR("TLS: the endpoint fingerprint must be a SHA-256 hex digest (64 hex digits)\n");
+-        return false;
++        return nullptr;
+     }
+     SSL_CTX * ctx = tls_ctx_new(false, cert, key, ca);
+     if (!ctx) {
+-        return false;
++        return nullptr;
+     }
+     SSL * ssl = SSL_new(ctx);
+     SSL_CTX_free(ctx); // the SSL keeps its own reference
+-    if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
++    if (!ssl || SSL_set_fd(ssl, (int) fd) != 1) {
+         tls_log_errors("TLS: cannot create session");
+         SSL_free(ssl);
+-        return false;
++        return nullptr;
+     }
+-    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
++    tls_set_timeouts(fd, TLS_HANDSHAKE_TIMEOUT_S);
+     if (SSL_connect(ssl) != 1) {
+         tls_log_errors("TLS: handshake with the server failed");
+         SSL_free(ssl);
+-        return false;
++        return nullptr;
+     }
+     const std::string got = tls_peer_fingerprint(ssl);
+     if (got != want) {
+         LOG_ERROR("TLS: server certificate %s is not the pinned %s\n", got.c_str(), want.c_str());
+         SSL_free(ssl);
++        return nullptr;
++    }
++    tls_set_timeouts(fd, 0);
++    return ssl;
++}
++
++bool socket_t::tls_connect(const std::string & server_fingerprint) {
++    const char * cert = std::getenv("GGML_RPC_TLS_CERT");
++    const char * key  = std::getenv("GGML_RPC_TLS_KEY");
++    const char * ca   = std::getenv("GGML_RPC_TLS_CA");
++    if (!cert || !key || !ca) {
++        LOG_ERROR("TLS: a tls:// endpoint needs GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA\n");
++        return false;
++    }
++    SSL * ssl = tls_client_handshake(pimpl->fd, server_fingerprint, cert, key, ca);
++    if (!ssl) {
++        return false;
++    }
++    pimpl->ssl = ssl;
++    return true;
++}
++
++bool socket_t::tls_connect_peer(const std::string & server_fingerprint) {
++    std::string cert, key, ca;
++    {
++        tls_server_state &          st = tls_server();
++        std::lock_guard<std::mutex> lock(st.mu);
++        if (!st.ctx) {
++            LOG_ERROR("TLS: a peer connection needs this server's own TLS identity (--tls-cert/--tls-key/--tls-ca)\n");
++            return false;
++        }
++        cert = st.cert;
++        key  = st.key;
++        ca   = st.ca;
++    }
++    SSL * ssl = tls_client_handshake(pimpl->fd, server_fingerprint, cert.c_str(), key.c_str(), ca.c_str());
++    if (!ssl) {
+         return false;
+     }
+-    tls_set_timeouts(pimpl->fd, 0);
+     pimpl->ssl = ssl;
+     return true;
+ }
+@@ -1121,13 +1247,15 @@ bool socket_t::tls_accept(std::string & client_fingerprint) {
+         return false;
+     }
+     client_fingerprint = tls_peer_fingerprint(ssl);
+-    if (client_fingerprint.empty() || !tls_allowed(allow_file, client_fingerprint)) {
++    bool peer_only = false;
++    if (client_fingerprint.empty() || !tls_allowed(allow_file, client_fingerprint, peer_only)) {
+         LOG_WARN("TLS: client certificate %s is not in the allowlist\n", client_fingerprint.c_str());
+         SSL_free(ssl);
+         return false;
+     }
+     tls_set_timeouts(pimpl->fd, 0);
+-    pimpl->ssl = ssl;
++    pimpl->ssl           = ssl;
++    pimpl->tls_peer_only = peer_only;
+     return true;
+ }
+ 
+@@ -1156,6 +1284,9 @@ bool rpc_tls_server_configure(const char * cert, const char * key, const char *
+     }
+     st.ctx        = ctx;
+     st.allow_file = allow_file;
++    st.cert       = cert;
++    st.key        = key;
++    st.ca         = ca;
+     return true;
+ }
+ 
+@@ -1176,6 +1307,11 @@ bool socket_t::tls_accept(std::string &) {
+     return false;
+ }
+ 
++bool socket_t::tls_connect_peer(const std::string &) {
++    LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
++    return false;
++}
++
+ bool rpc_tls_supported() {
+     return false;
+ }
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 11da1790f..b7a213ac5 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -34,6 +34,21 @@ struct socket_t {
+     bool tls_connect(const std::string & server_fingerprint);
+     bool tls_accept(std::string & client_fingerprint);
+     bool is_tls() const;
++    // Server to server (P2P tensor transfer): connect with this server's own certificate and key (the ones
++    // given to rpc_tls_server_configure) and pin the peer server's fingerprint.
++    bool tls_connect_peer(const std::string & server_fingerprint);
++    // tls_accept() admitted this certificate only through a "peer" allowlist entry: it may push tensors
++    // to this server but must not drive it as a client
++    bool tls_peer_only() const;
++
++    // bound blocking reads (0 = no limit)
++    void set_recv_timeout(int seconds);
++    // the remote end is on 127.0.0.0/8
++    bool remote_is_loopback() const;
++    // the remote end closed or reset the connection (does not consume data; false where unsupported)
++    bool remote_hung_up() const;
++    // shut both directions down, waking a thread blocked in send/recv on this socket
++    void shutdown_rw();
+ 
+     static socket_ptr create_server(const char * host, int port);
+     static socket_ptr connect(const char * host, int port);
+-- 
+2.43.0
+
