@@ -28,7 +28,7 @@ jobs:
       - name: A/B
         env:
           AB_PY: ${{ runner.temp }}/v/bin/python
-        run: bash "$RUNNER_TEMP/h/ab.sh" "$RUNNER_TEMP/w" d22feecf2233bae41b21829e8fe0314eae1f2c9f 5 ${{ matrix.cpus }} main split2_py_first split2_ruff_first split single_par
+        run: bash "$RUNNER_TEMP/h/ab.sh" "$RUNNER_TEMP/w" d22feecf2233bae41b21829e8fe0314eae1f2c9f 5 ${{ matrix.cpus }} main ruff_only
       - name: Summary
         if: always()
         run: python3 "$RUNNER_TEMP/h/summarize.py" "$RUNNER_TEMP"/w/results-*.tsv | tee -a "$GITHUB_STEP_SUMMARY"

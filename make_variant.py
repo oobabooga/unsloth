@@ -37,6 +37,17 @@ elif variant == "split":
         types: [python]
         exclude: {exclude}
 """
+elif variant == "ruff_only":
+    new = f"""      - id: ruff-format-with-kwargs
+        name: Ruff format
+        entry: ruff format
+        language: python
+        types: [python]
+        exclude: {exclude}
+        additional_dependencies:
+          - ruff==0.6.9
+        require_serial: true
+"""
 elif variant in ("split2_py_first", "split2_ruff_first"):
     py = f"""      - id: kwargs-spacing
         name: Kwarg spacing (python passes)
