@@ -257,6 +257,8 @@ def legs(url, headers, model, include_notools):
     if out[-1]["status"] != 200 or out[-1]["error"]:
         hb["max_tokens"] = 4096
         out.append(run_leg("hermes-max4096", url, headers, hb))
+    # Identical request again: a runtime that reuses the prompt prefix answers much sooner.
+    out.append(run_leg("hermes-repeat", url, headers, hb))
     if include_notools:
         nb = hermes_notools_body()
         nb["model"] = model
