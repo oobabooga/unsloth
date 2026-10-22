@@ -1,0 +1,400 @@
+From 221969f249be34aed590badbf0def2c5a977702b Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 07:59:48 -0700
+Subject: [PATCH] rpc: queue split input uploads without a synchronize,
+ together with the split's graph
+
+ggml_backend_sched synchronized the split backend before every user input and
+uploaded it with a blocking send. On an RPC device that serializes ~40 small
+uploads per decode step, and lets other contexts' commands (a PEER_AWAIT that
+blocks the server's command loop) land between a split's data and its graph.
+
+RPC set_tensor_async already copies the data when it is called and an endpoint
+runs its commands in order, so the scheduler now uploads inputs to such a
+backend with set_tensor_async and no synchronize (capability queried through
+the ggml_backend_set_tensor_async_copies proc address). RPC holds a split's
+uploads and PEER_AWAITs back and queues them in one push with the split's
+graph. A direct transfer's PEER_PUSH is tagged and queued at that moment too,
+under the P2P order lock, so every endpoint still sees PUSHes and AWAITs in one
+global order. Weights keep the blocking path with the hash cache.
+
+GGML_RPC_ASYNC_INPUTS=0 or LLAMA_RPC_ASYNC_INPUTS=0 restores the old behaviour.
+---
+ ggml/src/ggml-backend.cpp      |  24 +++++
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 176 ++++++++++++++++++++++++++++++---
+ 2 files changed, 188 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 66036e31f..d42b1130b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1833,12 +1833,36 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
++// a backend whose set_tensor_async copies the data before returning and that runs its commands in submission order
++// (RPC) can take split inputs without a synchronize before each copy: the order already keeps an upload behind the
++// graphs that still read the previous contents, and the caller may reuse its memory at once
++static bool ggml_backend_sched_async_copies(ggml_backend_t backend) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
++    return reg != NULL && backend->iface.set_tensor_async != NULL &&
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensor_async_copies") != NULL;
++}
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++    if (!ggml_backend_sched_is_host_weight(input) && ggml_backend_sched_async_copies(split_backend)) {
++        if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && split_backend->iface.cpy_tensor_async &&
++            split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++            return;
++        }
++        if (input->buffer && ggml_backend_buffer_is_host(input->buffer)) {
++            if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
++                ggml_backend_synchronize(input_backend); // the source may still be computing it
++            }
++            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++            return;
++        }
++    }
++
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 28e5ae599..4f70c2ca8 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -356,6 +356,7 @@ struct ggml_backend_rpc_buffer_type_context {
+ };
+ 
+ class rpc_dispatcher;
++struct rpc_pending_cmds;
+ struct ggml_backend_rpc_context {
+     std::shared_ptr<rpc_dispatcher> dispatcher;
+     std::string                     endpoint;
+@@ -364,6 +365,9 @@ struct ggml_backend_rpc_context {
+     // the last command this backend queued: the queue is FIFO, so waiting on it covers all of this backend's
+     // work without waiting for other backends (other llama contexts) that share the endpoint's dispatcher
+     std::shared_future<void>        last;
++    // split input uploads and PEER_AWAITs held back until the split's graph: they are queued together with it,
++    // so no other context's command lands between them (see rpc_async_inputs_enabled)
++    std::shared_ptr<rpc_pending_cmds> pending;
+ };
+ 
+ struct ggml_backend_rpc_buffer_context {
+@@ -602,6 +606,18 @@ public:
+         return true;
+     }
+ 
++    bool push_all(const std::vector<T> & values) {
++        std::unique_lock<std::mutex> lock(mutex);
++        if (interrupted) {
++            return false;
++        }
++        for (const T & value : values) {
++            queue.push(value);
++        }
++        cvar.notify_all();
++        return true;
++    }
++
+     bool pop(T* out) {
+         std::unique_lock<std::mutex> lock(mutex);
+         cvar.wait(lock, [this] { return !queue.empty() || interrupted; });
+@@ -654,7 +670,6 @@ public:
+     void synchronize();
+     void busy_spin_acquire();
+     void busy_spin_release();
+-    std::shared_future<void> graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+     void free_buffer(std::shared_ptr<const void> request, size_t size);
+ 
+     void start(const std::string & endpoint);
+@@ -668,7 +683,6 @@ public:
+     uint64_t    peer_id         = 0;   // identifies this server in PEER_* commands
+     uint64_t    serial          = 0;   // unique per dispatcher instance in this process
+ 
+-private:
+     struct rpc_msg {
+         rpc_cmd                       cmd;
+         std::shared_ptr<const void>   input;
+@@ -684,14 +698,22 @@ private:
+         int      n_nodes      = -1;
+         int      dev          = -1;
+         int64_t  serialize_us = 0;
++        int      batch        = 0;  // > 0: position in a batch queued with one push (traced)
+     };
+     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
++    static rpc_msg_ptr make_msg(rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
++
++    // queues msgs back to back under one queue lock and empties the vector; returns the last one's completion
++    std::shared_future<void> push_batch(std::vector<rpc_msg_ptr> & msgs);
++    // queues the graph; with held-back commands, they and the graph go in one push (rpc_pending_cmds)
++    std::shared_future<void> graph_compute(uint32_t device, const ggml_cgraph * cgraph, rpc_pending_cmds * pending = nullptr);
++
++private:
+     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
+     struct rpc_event {
+         rpc_msg_ptr              msg;
+         std::shared_future<void> sf;
+     };
+-    static rpc_msg_ptr make_msg(rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+     void send_traced(rpc_msg & msg);
+ 
+     std::mutex graph_mutex;
+@@ -703,6 +725,44 @@ private:
+     std::thread      thread;
+ };
+ 
++// Split input uploads to an RPC backend (ggml_backend_sched): set_tensor_async copies the data when it is called
++// and the endpoint runs its commands in order, so the scheduler needs no synchronize before each upload (it asks
++// for that through the "ggml_backend_set_tensor_async_copies" proc address). The uploads and PEER_AWAITs of a
++// split are held back and queued in one push with its graph, so another context's command (a PEER_AWAIT that
++// blocks the server's command loop) cannot land between this split's data and its graph. A direct transfer's
++// PEER_PUSH is queued at the same moment, so PUSHes and AWAITs keep one order across endpoints.
++// GGML_RPC_ASYNC_INPUTS=0 or LLAMA_RPC_ASYNC_INPUTS=0 restores blocking, unbatched uploads.
++static bool rpc_async_inputs_enabled() {
++    static const bool enabled = [] {
++        for (const char * name : { "GGML_RPC_ASYNC_INPUTS", "LLAMA_RPC_ASYNC_INPUTS" }) {
++            const char * e = getenv(name);
++            if (e && atoi(e) == 0) {
++                return false;
++            }
++        }
++        return true;
++    }();
++    return enabled;
++}
++
++struct rpc_pending_cmds {
++    std::vector<rpc_dispatcher::rpc_msg_ptr> msgs;  // this backend's held-back commands, in order
++    // direct transfers into this backend: the PEER_AWAIT is in msgs; the PEER_PUSH (on the source endpoint) is
++    // tagged and queued under the p2p order lock right before msgs, so both endpoints see the pair in one order
++    struct xfer {
++        ggml_backend_rpc_context *              src;
++        std::shared_ptr<rpc_msg_peer_xfer_req>  push;
++        std::shared_ptr<rpc_msg_peer_xfer_req>  await;
++        rpc_dispatcher::rpc_msg_ptr             push_msg;
++        rpc_dispatcher::rpc_msg_ptr             await_msg;
++    };
++    std::vector<xfer> xfers;
++};
++
++// tags and queues the PEER_PUSHes of pending->xfers; the caller holds the p2p order lock
++static void rpc_push_xfers(rpc_pending_cmds * pending);
++static std::mutex & rpc_p2p_order_mutex();
++
+ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
+ {
+     dispatcher->work();
+@@ -754,6 +814,17 @@ std::shared_future<void> rpc_dispatcher::send_async(enum rpc_cmd cmd, std::share
+     return done;
+ }
+ 
++std::shared_future<void> rpc_dispatcher::push_batch(std::vector<rpc_msg_ptr> & msgs) {
++    GGML_ASSERT(!msgs.empty());
++    for (size_t i = 0; i < msgs.size(); i++) {
++        msgs[i]->batch = (int) i + 1;
++    }
++    std::shared_future<void> done = msgs.back()->completion.get_future().share();
++    GGML_ASSERT(queue.push_all(msgs));
++    msgs.clear();
++    return done;
++}
++
+ void rpc_dispatcher::send_traced(rpc_msg & msg) {
+     const int64_t t_send0 = ggml_trace_time_us();
+     bool ok = send_rpc_cmd(sock, msg.cmd, msg.input.get(), msg.input_size);
+@@ -779,13 +850,13 @@ void rpc_dispatcher::send_traced(rpc_msg & msg) {
+     } else if (msg.n_nodes >= 0) {
+         ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_send1,
+                           "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,"
+-                          "\"reply\":0,\"ok\":%d,\"n_nodes\":%d,\"dev\":%d,\"serialize_us\":%lld",
++                          "\"reply\":0,\"ok\":%d,\"n_nodes\":%d,\"dev\":%d,\"serialize_us\":%lld,\"batch\":%d",
+                           (long long) t_send0, (long long) t_send1, bytes_out, ok ? 1 : 0,
+-                          msg.n_nodes, msg.dev, (long long) msg.serialize_us);
++                          msg.n_nodes, msg.dev, (long long) msg.serialize_us, msg.batch);
+     } else {
+         ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_send1,
+-                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,\"reply\":0,\"ok\":%d",
+-                          (long long) t_send0, (long long) t_send1, bytes_out, ok ? 1 : 0);
++                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,\"reply\":0,\"ok\":%d,\"batch\":%d",
++                          (long long) t_send0, (long long) t_send1, bytes_out, ok ? 1 : 0, msg.batch);
+     }
+ 
+     RPC_STATUS_ASSERT(ok);
+@@ -1348,15 +1419,27 @@ static const char * ggml_backend_rpc_name(ggml_backend_t backend) {
+     return rpc_ctx->name.c_str();
+ }
+ 
++static rpc_pending_cmds * rpc_pending(ggml_backend_rpc_context * ctx);
++static void rpc_flush_pending(ggml_backend_rpc_context * ctx);
++
+ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    rpc_flush_pending(rpc_ctx);
+     delete rpc_ctx;
+     delete backend;
+ }
+ 
+ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
++    if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    if (rpc_async_inputs_enabled() && tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++        size_t input_size;
++        auto input = serialize_set_tensor(rpc_tensor, 0, offset, data, size, input_size);
++        rpc_pending(ctx)->msgs.push_back(rpc_dispatcher::make_msg(RPC_CMD_SET_TENSOR, input, input_size, nullptr, 0));
++        return;
++    }
++    rpc_flush_pending(ctx);
+     uint8_t cache_flag = 0;
+     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %zu\n", __func__, tensor->name, offset, size);
+     if (rpc_use_hash_cache(tensor, size)) {
+@@ -1382,6 +1465,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
+ 
+ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
++    rpc_flush_pending(ctx);
+     auto request = std::make_shared<rpc_msg_get_tensor_req>();
+     request->tensor = serialize_tensor(tensor);
+     request->offset = offset;
+@@ -1391,6 +1475,7 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
+ 
+ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    rpc_flush_pending(rpc_ctx);
+     // GGML_RPC_SYNC_ALL=1: drain the whole endpoint queue, including other backends' work (A/B only)
+     static const bool sync_all = [] { const char * e = getenv("GGML_RPC_SYNC_ALL"); return e && atoi(e) != 0; }();
+     if (sync_all) {
+@@ -1460,7 +1545,7 @@ void rpc_dispatcher::free_buffer(std::shared_ptr<const void> request, size_t siz
+     send(RPC_CMD_FREE_BUFFER, request, size);
+ }
+ 
+-std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
++std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph, rpc_pending_cmds * pending) {
+     std::lock_guard<std::mutex> lock(graph_mutex);
+     GGML_ASSERT(cgraph->n_nodes > 0);
+     auto & device_graph_uids = graph_uids[device];
+@@ -1477,9 +1562,18 @@ std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const gg
+             msg->dev          = (int) device;
+             msg->serialize_us = msg->t_enq - t_ser0;
+         }
+-        std::shared_future<void> done = msg->completion.get_future().share();
+-        GGML_ASSERT(queue.push(msg));
+-        return done;
++        if (pending == nullptr || pending->msgs.empty()) {
++            std::shared_future<void> done = msg->completion.get_future().share();
++            GGML_ASSERT(queue.push(msg));
++            return done;
++        }
++        pending->msgs.push_back(msg);
++        std::unique_lock<std::mutex> order;
++        if (!pending->xfers.empty()) {
++            order = std::unique_lock<std::mutex>(rpc_p2p_order_mutex());
++            rpc_push_xfers(pending);
++        }
++        return push_batch(pending->msgs);
+     };
+     if (reuse) {
+         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+@@ -1505,12 +1599,13 @@ std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const gg
+ 
+ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+-    rpc_ctx->last = rpc_ctx->dispatcher->graph_compute(rpc_ctx->device, cgraph);
++    rpc_ctx->last = rpc_ctx->dispatcher->graph_compute(rpc_ctx->device, cgraph, rpc_ctx->pending.get());
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    rpc_flush_pending(rpc_ctx);
+     rpc_ctx->dispatcher->event_record(event);
+ }
+ 
+@@ -1550,6 +1645,45 @@ static rpc_p2p_client_state & rpc_p2p_client() {
+     return *st;
+ }
+ 
++static std::mutex & rpc_p2p_order_mutex() {
++    return rpc_p2p_client().order_mutex;
++}
++
++static rpc_pending_cmds * rpc_pending(ggml_backend_rpc_context * ctx) {
++    if (!ctx->pending) {
++        ctx->pending = std::make_shared<rpc_pending_cmds>();
++    }
++    return ctx->pending.get();
++}
++
++static void rpc_push_xfers(rpc_pending_cmds * pending) {
++    rpc_p2p_client_state & st = rpc_p2p_client();
++    for (auto & x : pending->xfers) {
++        const uint64_t tag = ++st.next_tag;
++        x.push->tag       = tag;
++        x.await->tag      = tag;
++        x.push_msg->uid   = tag;
++        x.await_msg->uid  = tag;
++        std::vector<rpc_dispatcher::rpc_msg_ptr> push = { x.push_msg };
++        x.src->last = x.src->dispatcher->push_batch(push);
++    }
++    pending->xfers.clear();
++}
++
++// queues what this backend held back, ahead of a command that is not its graph (sync, read, event, ...)
++static void rpc_flush_pending(ggml_backend_rpc_context * ctx) {
++    rpc_pending_cmds * pending = ctx->pending.get();
++    if (pending == nullptr || pending->msgs.empty()) {
++        return;
++    }
++    std::unique_lock<std::mutex> order;
++    if (!pending->xfers.empty()) {
++        order = std::unique_lock<std::mutex>(rpc_p2p_order_mutex());
++        rpc_push_xfers(pending);
++    }
++    ctx->last = ctx->dispatcher->push_batch(pending->msgs);
++}
++
+ // ask src to open its link to dst once per dispatcher pair; any failure keeps the pair on the relay path
+ static bool rpc_p2p_ready(rpc_dispatcher * src, rpc_dispatcher * dst) {
+     rpc_p2p_client_state & st = rpc_p2p_client();
+@@ -1621,6 +1755,20 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
+     await->size    = size;
+     LOG_DBG2("[%s] %s (%s) -> %s (%s), %zu bytes\n", __func__, src->name, a->endpoint.c_str(), dst->name, b->endpoint.c_str(), size);
+ 
++    rpc_flush_pending(sctx);  // the PUSH reads what src's queued work produced
++    if (rpc_async_inputs_enabled()) {
++        // the pair is tagged and queued with dst's graph (rpc_push_xfers): the PUSH lands on src's queue after
++        // the graph that produced src, since that graph was queued in an earlier split
++        rpc_pending_cmds * pending = rpc_pending(dctx);
++        rpc_pending_cmds::xfer x = { sctx, push, await, nullptr, nullptr };
++        if (ggml_trace_flag) { ggml_trace_set_subject(src->name, 0); }
++        x.push_msg  = rpc_dispatcher::make_msg(RPC_CMD_PEER_PUSH, push, sizeof(*push), nullptr, 0);
++        if (ggml_trace_flag) { ggml_trace_set_subject(dst->name, 0); }
++        x.await_msg = rpc_dispatcher::make_msg(RPC_CMD_PEER_AWAIT, await, sizeof(*await), nullptr, 0);
++        pending->msgs.push_back(x.await_msg);
++        pending->xfers.push_back(std::move(x));
++        return true;
++    }
+     rpc_p2p_client_state & st = rpc_p2p_client();
+     std::lock_guard<std::mutex> lock(st.order_mutex);
+     const uint64_t tag = ++st.next_tag;
+@@ -4545,6 +4693,10 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+         return (void *)ggml_backend_rpc_server_set_tls;
+     }
+ #endif // GGML_RPC_TLS
++    if (std::strcmp(name, "ggml_backend_set_tensor_async_copies") == 0) {
++        // set_tensor_async copies the data before it returns, and commands run in submission order
++        return rpc_async_inputs_enabled() ? (void *)rpc_async_inputs_enabled : NULL;
++    }
+     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_rpc_comm_init;
+     }
+-- 
+2.43.0
+

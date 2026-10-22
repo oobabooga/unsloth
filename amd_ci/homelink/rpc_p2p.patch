@@ -1,7 +1,7 @@
 From b9a391705079e7aabd2ca519718d90fd4e58ac91 Mon Sep 17 00:00:00 2001
 From: danielhanchen <danielhanchen@gmail.com>
 Date: Thu, 22 Oct 2026 01:19:54 -0700
-Subject: [PATCH 1/2] rpc: direct server-to-server copies of split inputs
+Subject: [PATCH 1/3] rpc: direct server-to-server copies of split inputs
 
 With pipeline parallelism over several rpc-servers every activation that
 crosses from server A to server B was relayed by the client: a GET_TENSOR
@@ -1254,7 +1254,7 @@ index 11da1790f..b7a213ac5 100644
 From 3c2d11ef832b4926bfe58df63b1a12ae4b3e5fea Mon Sep 17 00:00:00 2001
 From: danielhanchen <danielhanchen@gmail.com>
 Date: Thu, 22 Oct 2026 05:50:33 -0700
-Subject: [PATCH 2/2] rpc: P2P takes HELLO feature bit 1, bit 0 is the tracer's
+Subject: [PATCH 2/3] rpc: P2P takes HELLO feature bit 1, bit 0 is the tracer's
 
 ---
  ggml/src/ggml-rpc/ggml-rpc.cpp | 2 +-
@@ -1273,6 +1273,450 @@ index 0e3e06c42..28e5ae599 100644
  
  struct rpc_msg_hello_rsp {
      uint8_t major;
+-- 
+2.43.0
+
+
+From 84303f95fba3ca6c3fe31f23f954c55b1eb4ab7d Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 07:54:33 -0700
+Subject: [PATCH 3/3] rpc: bound the P2P accept and peer receive paths
+
+With P2P on, every accepted connection got its own detached thread before
+TLS authentication, the read timeout was cleared after the first command
+byte (so a PEER_HELLO that never sends its body held a thread forever),
+and a PEER_DATA receiver allocated up to 4 GiB before the shared inbox
+budget was checked, so concurrent incomplete messages bypassed it.
+
+- at most GGML_RPC_P2P_MAX_CONN (default 64) connections are being
+  authenticated or held as peer links at once; beyond it new connections
+  are closed (logged once per saturation), and a failed thread creation
+  closes that connection instead of terminating the server
+- the TLS handshake, the first command and the whole PEER_HELLO share one
+  absolute 10 s deadline, enforced by a watchdog thread that shuts down
+  the socket (a per-recv timeout alone lets a byte-at-a-time sender stay)
+- a PEER_DATA reserves its inbox budget before its buffer is allocated
+  and releases it on failure; once started it must arrive whole within
+  GGML_RPC_P2P_TIMEOUT seconds
+
+Client connections and GGML_RPC_P2P=0 are unchanged.
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 302 +++++++++++++++++++++++++++------
+ 1 file changed, 249 insertions(+), 53 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 28e5ae599..b34b4af35 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -32,6 +32,7 @@
+ #include <filesystem>
+ #include <algorithm>
+ #include <atomic>
++#include <system_error>
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -1767,6 +1768,10 @@ static bool rpc_repack_is_view(ggml_backend_buffer_t buffer) {
+ // PEER_AWAIT, in command order, waits for that entry and writes it like SET_TENSOR. It fails (and
+ // the client connection is dropped, so the client sees an error) when the source's link closes,
+ // the client hangs up, or after GGML_RPC_P2P_TIMEOUT seconds (default 120).
++// Bounds on the inbound side: at most GGML_RPC_P2P_MAX_CONN (default 64) connections are being
++// authenticated or held as peer links at once, the TLS handshake plus the first command (and the whole
++// PEER_HELLO) must finish within RPC_P2P_HANDSHAKE_S, a PEER_DATA claims its inbox budget before its
++// buffer is allocated, and once started it must arrive whole within GGML_RPC_P2P_TIMEOUT seconds.
+ static bool rpc_p2p_server_enabled() {
+     static const bool enabled = [] {
+         const char * e = getenv("GGML_RPC_P2P");
+@@ -1784,8 +1789,20 @@ static int rpc_p2p_timeout_s() {
+     return t;
+ }
+ 
++// connections being authenticated / routed plus open peer receivers; beyond it new connections are closed
++static int rpc_p2p_max_conn() {
++    static const int n = [] {
++        const char * e = getenv("GGML_RPC_P2P_MAX_CONN");
++        const int v = e ? atoi(e) : 0;
++        return v > 0 ? v : 64;
++    }();
++    return n;
++}
++
++// TLS handshake + first command (+ the whole PEER_HELLO) must complete within this
++static constexpr int      RPC_P2P_HANDSHAKE_S  = 10;
+ static constexpr size_t   RPC_P2P_MAX_MSG      = 4ull << 30;   // one transfer
+-static constexpr size_t   RPC_P2P_MAX_INBOX    = 4ull << 30;   // received, not yet awaited
++static constexpr size_t   RPC_P2P_MAX_INBOX    = 4ull << 30;   // received or being received, not yet awaited
+ static constexpr size_t   RPC_P2P_MAX_BACKLOG  = 512ull << 20; // pushed, not yet sent, per link
+ static constexpr int64_t  RPC_P2P_STALE_US     = 600ll * 1000 * 1000;
+ // PEER_DATA is filed with room for the SET_TENSOR header in front: | rpc_tensor | cache_flag | offset |
+@@ -1795,6 +1812,107 @@ static bool rpc_host_is_loopback(const std::string & host) {
+     return host == "localhost" || host.rfind("127.", 0) == 0;
+ }
+ 
++// Absolute deadlines for reads on accepted connections. SO_RCVTIMEO bounds each recv() call only, so a
++// sender trickling one byte at a time could hold a handshake or a half-sent PEER_DATA (and its memory)
++// open indefinitely; this thread shuts down a socket whose deadline passes, failing the blocked read.
++struct rpc_deadline_watchdog {
++    using clock = std::chrono::steady_clock;
++
++    std::mutex                                                     mutex;
++    std::condition_variable                                        cvar;
++    std::map<uint64_t, std::pair<clock::time_point, socket_ptr>>  armed;
++    uint64_t                                                       next_id = 1;
++    bool                                                           started = false;
++
++    // 0: could not arm (no watchdog thread), the caller must not proceed
++    uint64_t arm(const socket_ptr & sock, int seconds) {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (!started) {
++            try {
++                std::thread([this] { run(); }).detach();
++            } catch (const std::system_error & e) {
++                LOG_ERROR("RPC: cannot start the deadline thread: %s\n", e.what());
++                return 0;
++            }
++            started = true;
++        }
++        const uint64_t id = next_id++;
++        armed.emplace(id, std::make_pair(clock::now() + std::chrono::seconds(seconds), sock));
++        cvar.notify_all();
++        return id;
++    }
++
++    // false: the deadline already fired (the socket is shut down)
++    bool disarm(uint64_t id) {
++        socket_ptr sock;
++        std::lock_guard<std::mutex> lock(mutex);
++        auto it = armed.find(id);
++        if (it == armed.end()) {
++            return false;
++        }
++        sock = std::move(it->second.second); // released after the lock (declared first)
++        armed.erase(it);
++        return true;
++    }
++
++    void run() {
++        std::unique_lock<std::mutex> lock(mutex);
++        while (true) {
++            const auto now  = clock::now();
++            auto       next = clock::time_point::max();
++            std::vector<socket_ptr> expired;
++            for (auto it = armed.begin(); it != armed.end();) {
++                if (it->second.first <= now) {
++                    it->second.second->shutdown_rw();
++                    expired.push_back(std::move(it->second.second));
++                    it = armed.erase(it);
++                } else {
++                    next = std::min(next, it->second.first);
++                    ++it;
++                }
++            }
++            if (!expired.empty()) {
++                lock.unlock();
++                expired.clear();
++                lock.lock();
++                continue;
++            }
++            if (next == clock::time_point::max()) {
++                cvar.wait(lock);
++            } else {
++                cvar.wait_until(lock, next);
++            }
++        }
++    }
++};
++
++static rpc_deadline_watchdog & rpc_deadlines() {
++    static rpc_deadline_watchdog * wd = new rpc_deadline_watchdog; // never destroyed: its thread is detached
++    return *wd;
++}
++
++// scoped deadline on one socket
++struct rpc_deadline {
++    uint64_t id = 0;
++
++    rpc_deadline(const socket_ptr & sock, int seconds) : id(rpc_deadlines().arm(sock, seconds)) {}
++    rpc_deadline(const rpc_deadline &) = delete;
++    rpc_deadline & operator=(const rpc_deadline &) = delete;
++    ~rpc_deadline() { disarm(); }
++
++    bool armed() const { return id != 0; }
++
++    // true when the work finished in time; false when the deadline fired (or was never armed)
++    bool disarm() {
++        if (id == 0) {
++            return false;
++        }
++        const bool ok = rpc_deadlines().disarm(id);
++        id = 0;
++        return ok;
++    }
++};
++
+ struct rpc_peer_link {
+     struct item {
+         uint64_t             tag;
+@@ -1891,6 +2009,7 @@ struct rpc_p2p_hub {
+     std::condition_variable                        cvar;
+     std::map<std::pair<uint64_t, uint64_t>, entry> inbox;   // (source id, tag)
+     size_t                                         inbox_bytes = 0;
++    size_t                                         reserved    = 0;  // PEER_DATA being received
+     std::unordered_map<uint64_t, int>              live;    // source id -> open peer connections
+     std::unordered_set<uint64_t>                   seen;    // source ids that ever connected
+ 
+@@ -1909,9 +2028,7 @@ struct rpc_p2p_hub {
+         cvar.notify_all();
+     }
+ 
+-    bool deposit(uint64_t src, uint64_t tag, std::vector<uint8_t> && data) {
+-        std::lock_guard<std::mutex> lock(mutex);
+-        const int64_t now = ggml_time_us();
++    void purge_stale_locked(int64_t now) {
+         for (auto it = inbox.begin(); it != inbox.end();) {
+             if (now - it->second.t_us > RPC_P2P_STALE_US) {
+                 inbox_bytes -= it->second.data.size();
+@@ -1920,15 +2037,38 @@ struct rpc_p2p_hub {
+                 ++it;
+             }
+         }
++    }
++
++    // claim inbox budget for a PEER_DATA before allocating it, so messages still being received count
++    // against the same limit as the ones waiting for their AWAIT
++    bool reserve(size_t n) {
++        std::lock_guard<std::mutex> lock(mutex);
++        purge_stale_locked(ggml_time_us());
++        if (n > RPC_P2P_MAX_INBOX || inbox_bytes + reserved > RPC_P2P_MAX_INBOX - n) {
++            LOG_ERROR("RPC P2P: %zu bytes received or in flight and not awaited, refusing %zu more\n",
++                      inbox_bytes + reserved, n);
++            return false;
++        }
++        reserved += n;
++        return true;
++    }
++
++    void release(size_t n) {
++        std::lock_guard<std::mutex> lock(mutex);
++        reserved -= n;
++    }
++
++    // data.size() bytes were reserved: they move to the inbox, or are released on failure
++    bool deposit(uint64_t src, uint64_t tag, std::vector<uint8_t> && data) {
++        std::lock_guard<std::mutex> lock(mutex);
++        reserved -= data.size();
++        const int64_t now = ggml_time_us();
++        purge_stale_locked(now);
+         const auto key = std::make_pair(src, tag);
+         if (inbox.count(key) != 0) {
+             LOG_ERROR("RPC P2P: duplicate transfer tag %" PRIu64 " from peer %016" PRIx64 "\n", tag, src);
+             return false;
+         }
+-        if (inbox_bytes + data.size() > RPC_P2P_MAX_INBOX) {
+-            LOG_ERROR("RPC P2P: %zu bytes received and not awaited, refusing more\n", inbox_bytes);
+-            return false;
+-        }
+         inbox_bytes += data.size();
+         inbox[key] = entry{std::move(data), now};
+         cvar.notify_all();
+@@ -1967,7 +2107,7 @@ struct rpc_p2p_hub {
+     void clear_inbox() {
+         std::lock_guard<std::mutex> lock(mutex);
+         inbox.clear();
+-        inbox_bytes = 0;
++        inbox_bytes = 0; // reserved stays: receivers still own what they are reading
+     }
+ 
+     // links belong to the client session that opened them: closing them when it ends tells every
+@@ -2058,8 +2198,9 @@ static bool rpc_p2p_connect(const rpc_msg_peer_connect_req & request, rpc_msg_pe
+     return true;
+ }
+ 
+-// a connection whose first command was PEER_HELLO: file every PEER_DATA until it closes
+-static void rpc_p2p_serve_peer(socket_ptr sock) {
++// a connection whose first command was PEER_HELLO: file every PEER_DATA until it closes. The caller's
++// handshake deadline covers the HELLO body and the reply; only then is the link allowed to sit idle.
++static void rpc_p2p_serve_peer(socket_ptr sock, rpc_deadline & handshake) {
+     rpc_msg_peer_hello_req hello = {};
+     if (!recv_msg(sock, &hello, sizeof(hello))) {
+         return;
+@@ -2074,7 +2215,7 @@ static void rpc_p2p_serve_peer(socket_ptr sock) {
+     const uint64_t src = hello.self_id;
+     hub.peer_up(src);
+     rsp.ok = 1;
+-    if (!send_msg(sock, &rsp, sizeof(rsp))) {
++    if (!send_msg(sock, &rsp, sizeof(rsp)) || !handshake.disarm()) {
+         hub.peer_down(src);
+         return;
+     }
+@@ -2092,19 +2233,37 @@ static void rpc_p2p_serve_peer(socket_ptr sock) {
+             LOG_ERROR("RPC P2P: unexpected command %d on a peer connection\n", cmd);
+             break;
+         }
++        // a started message must arrive whole within GGML_RPC_P2P_TIMEOUT: it holds inbox budget
++        rpc_deadline msg_deadline(sock, rpc_p2p_timeout_s());
++        if (!msg_deadline.armed()) {
++            break;
++        }
+         if (!sock->recv_data(&size, sizeof(size)) || size < sizeof(tag) || size - sizeof(tag) > RPC_P2P_MAX_MSG ||
+             !sock->recv_data(&tag, sizeof(tag))) {
+             break;
+         }
+-        const size_t n = size - sizeof(tag);
++        const size_t n     = size - sizeof(tag);
++        const size_t total = RPC_P2P_SET_HEADER + n;
++        if (!hub.reserve(total)) {
++            break;
++        }
+         std::vector<uint8_t> data;
+         try {
+-            data.resize(RPC_P2P_SET_HEADER + n);
++            data.resize(total);
+         } catch (const std::bad_alloc &) {
+             LOG_ERROR("RPC P2P: cannot allocate %zu bytes\n", n);
++            hub.release(total);
++            break;
++        }
++        const bool got = sock->recv_data(data.data() + RPC_P2P_SET_HEADER, n);
++        if (!msg_deadline.disarm()) {
++            LOG_ERROR("RPC P2P: transfer %" PRIu64 " from peer %016" PRIx64 " (%zu bytes) did not arrive within %d s\n",
++                      tag, src, n, rpc_p2p_timeout_s());
++            hub.release(total);
+             break;
+         }
+-        if (!sock->recv_data(data.data() + RPC_P2P_SET_HEADER, n)) {
++        if (!got) {
++            hub.release(total);
+             break;
+         }
+         if (ggml_trace_flag) {
+@@ -4206,51 +4365,88 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+     signal(SIGPIPE, SIG_IGN);
+ #endif
+     auto clients = std::make_shared<message_queue<socket_ptr>>();
+-    std::thread([server_socket, clients, tls] {
+-        while (true) {
+-            auto conn = server_socket->accept();
+-            if (conn == nullptr) {
+-                LOG_ERROR("Failed to accept client connection\n");
+-                clients->interrupt();
++    // every accepted connection gets a thread for its handshake (a peer link keeps it while open):
++    // at most GGML_RPC_P2P_MAX_CONN at a time, and each handshake must finish within RPC_P2P_HANDSHAKE_S
++    auto active = std::make_shared<std::atomic<int>>(0);
++    auto handle = [clients, tls, active](socket_ptr conn) {
++        struct slot_release {
++            std::atomic<int> & n;
++            ~slot_release() { n.fetch_sub(1); }
++        } slot{*active};
++        rpc_deadline handshake(conn, RPC_P2P_HANDSHAKE_S);
++        if (!handshake.armed()) {
++            return;
++        }
++        std::string fingerprint;
++        if (tls && !conn->tls_accept(fingerprint)) {
++            LOG_WARN("Refused connection (TLS)\n");
++            return;
++        }
++        uint8_t cmd = 0;
++        conn->set_recv_timeout(RPC_P2P_HANDSHAKE_S);
++        if (!conn->recv_data(&cmd, 1)) {
++            return;
++        }
++        if (cmd == RPC_CMD_PEER_HELLO) {
++            if (!tls && !conn->remote_is_loopback()) {
++                LOG_WARN("Refused plaintext peer connection from a non-loopback address\n");
+                 return;
+             }
+-            std::thread([conn, clients, tls] {
+-                std::string fingerprint;
+-                if (tls && !conn->tls_accept(fingerprint)) {
+-                    LOG_WARN("Refused connection (TLS)\n");
+-                    return;
+-                }
+-                uint8_t cmd = 0;
+-                conn->set_recv_timeout(10);
+-                if (!conn->recv_data(&cmd, 1)) {
++            rpc_p2p_serve_peer(conn, handshake);
++            return;
++        }
++        if (!handshake.disarm()) {
++            return;
++        }
++        conn->set_recv_timeout(0);
++        if (cmd != RPC_CMD_HELLO) {
++            LOG_ERROR("Expected HELLO command, update client\n");
++            return;
++        }
++        if (conn->tls_peer_only()) {
++            LOG_WARN("Refused client connection: %s is allowed as a peer only\n", fingerprint.c_str());
++            return;
++        }
++        if (tls) {
++            LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
++        } else {
++            LOG_INFO("Accepted client connection\n");
++        }
++        clients->push(conn);
++    };
++    try {
++        std::thread([server_socket, clients, active, handle] {
++            const int max_conn = rpc_p2p_max_conn();
++            bool      warned   = false;
++            while (true) {
++                auto conn = server_socket->accept();
++                if (conn == nullptr) {
++                    LOG_ERROR("Failed to accept client connection\n");
++                    clients->interrupt();
+                     return;
+                 }
+-                conn->set_recv_timeout(0);
+-                if (cmd == RPC_CMD_PEER_HELLO) {
+-                    if (!tls && !conn->remote_is_loopback()) {
+-                        LOG_WARN("Refused plaintext peer connection from a non-loopback address\n");
+-                        return;
++                if (active->load() >= max_conn) {
++                    if (!warned) {
++                        LOG_WARN("RPC: %d connections in handshake or peer links open, closing new ones "
++                                 "(GGML_RPC_P2P_MAX_CONN)\n", max_conn);
++                        warned = true;
+                     }
+-                    rpc_p2p_serve_peer(conn);
+-                    return;
++                    continue; // conn closes here
+                 }
+-                if (cmd != RPC_CMD_HELLO) {
+-                    LOG_ERROR("Expected HELLO command, update client\n");
+-                    return;
+-                }
+-                if (conn->tls_peer_only()) {
+-                    LOG_WARN("Refused client connection: %s is allowed as a peer only\n", fingerprint.c_str());
+-                    return;
++                warned = false;
++                active->fetch_add(1);
++                try {
++                    std::thread(handle, conn).detach();
++                } catch (const std::system_error & e) {
++                    active->fetch_sub(1);
++                    LOG_ERROR("RPC: cannot start a connection thread (%s), closing the connection\n", e.what());
+                 }
+-                if (tls) {
+-                    LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
+-                } else {
+-                    LOG_INFO("Accepted client connection\n");
+-                }
+-                clients->push(conn);
+-            }).detach();
+-        }
+-    }).detach();
++            }
++        }).detach();
++    } catch (const std::system_error & e) {
++        LOG_ERROR("RPC: cannot start the accept thread: %s\n", e.what());
++        return;
++    }
+     socket_ptr client_socket;
+     while (clients->pop(&client_socket)) {
+         rpc_serve_client(backends, cache_dir, client_socket, /*hello_read =*/ true);
 -- 
 2.43.0
 
