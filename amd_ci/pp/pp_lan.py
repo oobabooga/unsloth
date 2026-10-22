@@ -585,6 +585,16 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag8:
+            # RAM prompt cache on vs off (-cram 0), inbox on: a slot reuse saves the old prompt's KV with
+            # llama_state_seq_get_data, which pulls the remote layers' KV across the LAN on every launch
+            plan = [("x1", 1, 1, B), ("x1_c0", 1, 1, B), ("bs_c1m19", 2, 1, B)]
+            for g in (2, 3, 4):
+                plan += [("bs_c0m19", 2, g, g * B), ("bs_c1m19", 2, g, g * B)]
+            plan.append(("bs_c0m13", 3, 1, B))
+            for g in (3, 4):
+                plan += [("bs_c1m13", 3, g, g * B), ("bs_c0m13", 3, g, g * B)]
+            plan.append(("bs_c0m13", 3, 5, 5 * B))
         if a.diag7:
             # launch inbox (groups_launch_inbox.patch) on vs off, best splits, interleaved so drift hits both arms
             plan = [("x1", 1, 1, B), ("bs_i1m19", 2, 1, B)]
@@ -640,13 +650,15 @@ class Master:
                     restart_workers(want)
                     repacked = want
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
-                if kind.startswith("bs_i"):
+                if kind.startswith("bs_i") or kind.startswith("bs_c"):
                     ml = int(kind[6:])
+                if kind.startswith("bs_c") and kind[4] == "0":
+                    args += ["--cache-ram", "0"]
                 args, p = split(s, g, False, True, ml)
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith("bs_m") or kind.startswith("bs_i"):
+                if kind.startswith("bs_m") or kind.startswith("bs_i") or kind.startswith("bs_c"):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
@@ -665,7 +677,7 @@ class Master:
                 lp.write_json(str(self.out / "master_result.json"), R)
                 continue
             if kind.startswith("x1"):
-                res = self.measure(f"{kind}_{p}_{rnd_i}", local(p), p)
+                res = self.measure(f"{kind}_{p}_{rnd_i}", local(p) + (["--cache-ram", "0"] if kind == "x1_c0" else []), p)
             elif kind.startswith("logits"):
                 args, slots = logits(kind != "logits_local", g, kind == "logits_bs")
                 res = self.measure(f"{kind}_g{g}_c{p}_{rnd_i}", args, p, ctls[:2], tls_env)
@@ -787,6 +799,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag8", action = "store_true", help = "RAM prompt cache on vs off with the launch inbox (use with --waves 8)")
     m.add_argument("--diag7", action = "store_true", help = "launch inbox on vs off at the best splits (use with --waves 8)")
     m.add_argument("--diag6", action = "store_true", help = "steady-state rerun of the best splits (use with --waves 8)")
     m.add_argument("--diag5", action = "store_true", help = "stage balance: layers on the master x groups")
