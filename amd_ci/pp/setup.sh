@@ -59,6 +59,11 @@ if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/bs_lazy_readback.p
 # worker-to-worker copies, GGML_RPC_P2P=0 restores the relay); the two replace the same copy path
 TAIL="${PP_PATCH_TAIL:-rpc_p2p}"
 if [ "$PR" = 191 ] && [ -n "$TAIL" ]; then git -C "$L" apply "$HERE/../homelink/$TAIL.patch" || { echo "FATAL: $TAIL patch does not apply"; exit 1; }; fi
+# PP_PATCH_EXTRA (space-separated) applies after the tail: rpc_async_inputs queues a split's input uploads to RPC
+# without a synchronize, together with its graph (GGML_RPC_ASYNC_INPUTS=0 / LLAMA_RPC_ASYNC_INPUTS=0 restore the old path)
+for X in ${PP_PATCH_EXTRA-rpc_async_inputs}; do
+  if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/$X.patch" || { echo "FATAL: $X patch does not apply"; exit 1; }; fi
+done
 FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
 command -v ccache >/dev/null && FLAGS="$FLAGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 if echo '#include <openssl/ssl.h>' | ${CC:-cc} -E -x c - >/dev/null 2>&1; then
