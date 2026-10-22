@@ -585,6 +585,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag11:
+            # group sweep: deeper pipelines are latency bound with stages 40-50% busy (diag10), so put more groups
+            # in flight; --cache-ram 0 + lazy readback (bs_l1)
+            plan = [("x1", 1, 1, B)]
+            for s_, gs in ((2, (5, 6)), (3, (6, 8)), (4, (6, 8)), (5, (8, 10))):
+                plan += [("bs_l1", s_, g, g * B) for g in gs]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag10:
             # bs_k1 = RAM prompt cache on (llama-server default), bs_l0 / bs_l1 = --cache-ram 0 (as Studio serves) with
             # lazy backend-sampling readback (bs_lazy_readback.patch) off / on; then N-box scaling with both fixes.
@@ -830,6 +837,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag11", action = "store_true", help = "G sweep up to ~2S at 2-5 stages, --cache-ram 0 + lazy readback (use with --waves 8)")
     m.add_argument("--diag10", action = "store_true", help = "lazy backend-sampling readback off vs on, then 4-5 stages (use with --waves 8)")
     m.add_argument("--diag9", action = "store_true", help = "2..N+1 stages x G in (1, S, S+1), --cache-ram 0, even split (use with --waves 8)")
     m.add_argument("--diag8", action = "store_true", help = "RAM prompt cache on vs off with the launch inbox (use with --waves 8)")
