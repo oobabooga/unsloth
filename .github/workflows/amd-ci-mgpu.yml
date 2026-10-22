@@ -18,7 +18,7 @@ permissions:
 env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # base = origin/main when the branch was cut; head = base + amd_ci/patches/head.patch (empty = base itself)
-  BASE_SHA: "2749eeedaa9920d9ffb6973903b13eeebc00ca3c"
+  BASE_SHA: "b2ba86a514714e0829313e95d08ef3a1b80ace39"
 
 jobs:
 
@@ -101,22 +101,37 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
+      - name: Differential (GPU selection tests WITHOUT the spoof, to tell ROCm-host failures from spoof ones)
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/nospoof" \
+            --python "$AMD_CI_PY" -- --python "$AMD_CI_PY" --timeout 1200 --tests \
+              tests/test_gpu_selection.py tests/test_gpu_selection_sandbox.py tests/test_gpu_order_preserved.py \
+              tests/test_video_fast_pin.py tests/test_skipif_version_strings.py
+          cat "$AMD_CI_WORK/out/nospoof/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/nospoof"
+
       - name: Present extra HIP devices
         run: |
           set -euo pipefail
           "$AMD_CI_PY" "$GITHUB_WORKSPACE/amd_ci/lib/device_multiplier.py" \
             --build-into "$AMD_CI_WORK/shim" --extra 1 --github-env
 
-      - name: Differential (multi-GPU test files, head's copies, on base vs head code)
+      - name: Differential (multi-GPU test files, each state's own copies; the fix is in a test file)
         run: |
           set +e
           export HF_HOME="$AMD_CI_WORK/hf"
           "$AMD_CI_PY" amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/head_tests_probe.py \
-            --criteria amd_ci/criteria/head_tests_differential.py \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression.py \
             --out-dir "$AMD_CI_WORK/out/tests" \
-            --python "$AMD_CI_PY" -- --python "$AMD_CI_PY" --timeout 2400 --tests \
+            --python "$AMD_CI_PY" -- --python "$AMD_CI_PY" --timeout 1200 --tests \
               tests/test_diffusion_multigpu.py tests/test_diffusion_multigpu_cuda.py \
               tests/test_diffusion_multigpu_wiring.py tests/test_diffusion_cfg_parallel_tier.py \
               tests/test_diffusion_zimage_cfg_split.py tests/test_diffusion_layer_split.py \
@@ -127,7 +142,7 @@ jobs:
               tests/test_diffusion_measured_placement.py tests/test_diffusion_measured_placement_dense.py \
               tests/test_gpu_residency_coexistence.py tests/test_gpu_order_preserved.py \
               tests/test_offload_planner.py tests/test_video_fast_pin.py \
-              tests/test_system_poll_no_cuda_context.py
+              tests/test_system_poll_no_cuda_context.py tests/test_skipif_version_strings.py
           cat "$AMD_CI_WORK/out/tests/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/tests"
 

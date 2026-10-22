@@ -1,0 +1,63 @@
+diff --git a/studio/backend/tests/test_skipif_version_strings.py b/studio/backend/tests/test_skipif_version_strings.py
+new file mode 100644
+index 0000000000..eb82bb5e39
+--- /dev/null
++++ b/studio/backend/tests/test_skipif_version_strings.py
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""A skipif / xfail condition must not end in a bare ``torch.version.hip`` / ``torch.version.cuda``.
++
++Those are strings when set, and pytest evaluates a string condition as Python source: on a ROCm host
++``"7.13.99004"`` is a SyntaxError, so the test errors at setup instead of skipping (seen on a two-device ROCm run).
++Wrap them in ``bool()`` or compare with ``is not None``."""
++
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++_TESTS = Path(__file__).resolve().parent
++_VERSION_STRINGS = {"torch.version.hip", "torch.version.cuda"}
++
++
++def _string_operands(condition: ast.expr) -> list[str]:
++    values = condition.values if isinstance(condition, ast.BoolOp) else [condition]
++    return [ast.unparse(v) for v in values if ast.unparse(v) in _VERSION_STRINGS]
++
++
++def test_no_skip_condition_can_evaluate_to_a_version_string():
++    offenders = []
++    for path in sorted(_TESTS.glob("*.py")):
++        try:
++            tree = ast.parse(path.read_text(encoding = "utf-8"))
++        except SyntaxError:
++            continue
++        for node in ast.walk(tree):
++            if (
++                isinstance(node, ast.Call)
++                and isinstance(node.func, ast.Attribute)
++                and node.func.attr in ("skipif", "xfail")
++                and node.args
++            ):
++                for operand in _string_operands(node.args[0]):
++                    offenders.append(f"{path.name}:{node.lineno}: {operand}")
++    assert not offenders, offenders
+diff --git a/studio/backend/tests/test_video_fast_pin.py b/studio/backend/tests/test_video_fast_pin.py
+index e359d7db47..b8ccd0a384 100644
+--- a/studio/backend/tests/test_video_fast_pin.py
++++ b/studio/backend/tests/test_video_fast_pin.py
+@@ -165,8 +165,10 @@ print("DEV0_CONTEXT", primary_active(0))
+ 
+ 
+ @pytest.mark.skipif(
+-    not torch.cuda.is_available() or torch.cuda.device_count() < 2 or torch.version.hip,
+-    reason = "needs two CUDA devices",
++    # bool(): a bare torch.version.hip is a string on ROCm, which pytest evaluates as a Python expression ("7.13.99004"
++    # is a SyntaxError), so a two-card ROCm host errored here instead of skipping. The probe reads CUDA driver contexts.
++    not torch.cuda.is_available() or torch.cuda.device_count() < 2 or bool(torch.version.hip),
++    reason = "needs two NVIDIA CUDA devices (reads CUDA driver primary contexts)",
+ )
+ def test_releasing_a_buffer_on_another_thread_syncs_its_own_card():
+     # A buffer registered for cuda:1 and freed on a thread still on device 0 must wait on cuda:1, never open a

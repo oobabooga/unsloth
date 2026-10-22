@@ -231,6 +231,7 @@ def cell_cfg(name: str, family: str, compiled: bool) -> dict:
     pipe, kw = BUILD[family]()
     pipe.set_progress_bar_config(disable = True)
     pipe.to("cuda:0")
+    pipe.transformer.eval()
     if zs is not None and family == "zimage":
         rec["zimage_ref_decline"] = zs.install_zimage_cfg_split(pipe, offload_policy = "none")
     if compiled:
@@ -248,6 +249,7 @@ def cell_cfg(name: str, family: str, compiled: bool) -> dict:
     pipe, kw = BUILD[family]()
     pipe.set_progress_bar_config(disable = True)
     pipe.to("cuda:0")
+    pipe.transformer.eval()
     if zs is not None and family == "zimage":
         rec["zimage_decline"] = zs.install_zimage_cfg_split(pipe, offload_policy = "none")
     selection = mg.make_selection(0, [0, 1])
@@ -293,7 +295,7 @@ class _Target:
     is_cuda_torch_device = True
 
 
-def _plan(pipe, memory_kind: str = "discrete"):
+def _plan(pipe, memory_kind: str = "discrete_vram"):
     import torch
 
     from core.inference import diffusion_memory as dm
@@ -378,7 +380,7 @@ def cell_split(name: str, family: str) -> dict:
         if split is not None:
             rec["cards"] = list(split.cards)
             rec["ranges"] = [[r.denoiser, r.start, r.stop, r.card] for r in split.ranges]
-            mg.apply_split_plan(pipe, refined)
+            rec["placed"] = bool(lsp.apply_layer_split_plan(pipe, refined, placement = "cuda:0"))
             rec["devices_after_place"] = _devices_of(pipe.transformer)
             if family == "wan":
                 with torch.no_grad():
@@ -387,6 +389,9 @@ def cell_split(name: str, family: str) -> dict:
                 rec["hash"] = _hash(_call(pipe, kw, "a photo of a red fox", 2, family, None))
             rec["bit_identical"] = rec["hash"] == ref
             rec["split_status"] = lsp.layer_split_status(pipe)
+            from core.inference import diffusion_layer_split as ls
+
+            rec["split_stats"] = ls.layer_split_stats(pipe.transformer)
     return rec
 
 
@@ -415,7 +420,7 @@ def cell_component(name: str, family: str) -> dict:
         rec["secondary_ordinal"] = getattr(refined, "secondary_ordinal", None)
         rec["secondary_components"] = list(getattr(refined, "secondary_components", None) or ())
         if getattr(refined, "secondary_ordinal", None) is not None:
-            mg.apply_split_plan(pipe, refined)
+            rec["placed"] = bool(mg.apply_split_plan(pipe, refined, placement = "cuda:0"))
             rec["placement"] = (mg.placement_status(pipe) or {}).get("placement")
             rec["hash"] = _hash(_call(pipe, kw, "a photo of a red fox", 2, family, None))
             rec["bit_identical"] = rec["hash"] == ref
