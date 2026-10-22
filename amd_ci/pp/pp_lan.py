@@ -529,7 +529,17 @@ class Master:
         def local(slots):
             return ["-t", str(a.threads), "-np", str(slots), "-c", ctx(slots), "-ngl", "0"]
 
-        def split(s, g, head_local = True, bs = False, master_layers = None):
+        def ts_weights(n_remote, n_workers, head_discount):
+            # -ts as layer counts; the last worker also runs the output projection + sampling (~5 layers of decode
+            # work on Qwen3-4B, profile pp_s5), so it can give head_discount layers to the other workers
+            if n_workers < 2 or not head_discount:
+                return ",".join(["1"] * n_workers)
+            even = n_remote / n_workers
+            last = max(1.0, even - head_discount)
+            rest = (n_remote - last) / (n_workers - 1)
+            return ",".join([f"{rest:.3f}"] * (n_workers - 1) + [f"{last:.3f}"])
+
+        def split(s, g, head_local = True, bs = False, master_layers = None, head_discount = 0):
             # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
             # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
             # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
@@ -540,7 +550,7 @@ class Master:
             args = ["-t", str(a.threads), "-np", str(p), "-c", ctx(B), "--rpc", ",".join(eps),
                     "--device", ",".join(f"RPC{j}" for j in range(s - 1)),
                     "-ngl", str(a.n_layer - k + (1 if head_local else 0)),
-                    "-sm", "layer", "-ts", ",".join(["1"] * (s - 1))] + (HEAD_LOCAL if head_local else [])
+                    "-sm", "layer", "-ts", ts_weights(a.n_layer - k + (1 if head_local else 0), s - 1, head_discount)] + (HEAD_LOCAL if head_local else [])
             if bs:  # sample on the device holding the head: only token ids cross back
                 args += ["--backend-sampling"]
             if g > 1:
@@ -677,16 +687,20 @@ class Master:
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
                 if kind.startswith("bs_i") or kind.startswith("bs_c"):
                     ml = int(kind[6:]) if kind[6:] else None
+                hd = 0
                 if kind.startswith(("bs_l", "bs_k")):
                     ml = None
-                args, p = split(s, g, False, True, ml)
+                if kind.startswith("bs_h"):
+                    hd_s, ml_s = kind[4:].split("m")
+                    hd, ml = int(hd_s), (int(ml_s) or None)
+                args, p = split(s, g, False, True, ml, hd)
                 # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
-                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith("bs_l"):
+                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h")):
                     args += ["--cache-ram", "0"]
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k")):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
