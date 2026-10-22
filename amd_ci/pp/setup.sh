@@ -55,7 +55,10 @@ if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/groups_launch_inbo
 if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/bs_lazy_readback.patch" || { echo "FATAL: lazy readback patch does not apply"; exit 1; }; fi
 # prefill ubatches pipeline across a CPU master stage and RPC stages (async cross-endpoint copies)
 # (GGML_RPC_ASYNC_COPY=0 / LLAMA_RPC_PIPELINE_PARALLEL=0 restore the old behaviour)
-if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/rpc_pipeline_parallel.patch" || { echo "FATAL: pipeline parallel patch does not apply"; exit 1; }; fi
+# PP_PATCH_TAIL picks the last patch: rpc_pipeline_parallel (async cross-endpoint copies) or rpc_p2p (direct
+# worker-to-worker copies, GGML_RPC_P2P=0 restores the relay); the two replace the same copy path
+TAIL="${PP_PATCH_TAIL:-rpc_p2p}"
+if [ "$PR" = 191 ] && [ -n "$TAIL" ]; then git -C "$L" apply "$HERE/../homelink/$TAIL.patch" || { echo "FATAL: $TAIL patch does not apply"; exit 1; }; fi
 FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
 command -v ccache >/dev/null && FLAGS="$FLAGS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 if echo '#include <openssl/ssl.h>' | ${CC:-cc} -E -x c - >/dev/null 2>&1; then
