@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -32,6 +34,19 @@ def is_network_url(repo: str) -> bool:
     return repo.startswith(("https://", "http://", "ssh://", "git://", "git@"))
 
 
+def _wipe(path: Path) -> None:
+    """rmtree that also removes read-only files: Windows git packs are read-only, and a silent
+    partial delete left the next attempt cloning into a non-empty directory (2026-10-22)."""
+
+    def _writable(func, target, _exc):
+        for each in (os.path.dirname(target), target):
+            os.chmod(each, os.stat(each).st_mode | stat.S_IWRITE | stat.S_IEXEC * os.path.isdir(each))
+        func(target)
+
+    if path.exists():
+        shutil.rmtree(path, onerror = _writable)
+
+
 def clone(repo: str, dest: Path, attempts: int = 3) -> Path:
     if dest.exists():
         return dest
@@ -44,7 +59,7 @@ def clone(repo: str, dest: Path, attempts: int = 3) -> Path:
         p = subprocess.run(cmd, capture_output = True, text = True)
         if p.returncode == 0:
             return dest
-        shutil.rmtree(dest, ignore_errors = True)
+        _wipe(dest)
         if attempt == attempts:
             raise SystemExit(f"command failed after {attempts} attempts: git clone {repo}\n{p.stderr.strip()}")
         print(f"git clone attempt {attempt} failed, retrying: {p.stderr.strip()[-300:]}", flush = True)
