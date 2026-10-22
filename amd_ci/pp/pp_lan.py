@@ -585,6 +585,13 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag9:
+            # N-box scaling with the full fix chain, as Studio's planner serves (--cache-ram 0), even layer split
+            plan = [("x1", 1, 1, B), ("x1_c0", 1, 1, B)]
+            for s_ in sorted({int(x) for x in a.stages.split(",")} if a.stages else range(2, a.workers + 2)):
+                if 2 <= s_ <= a.workers + 1:
+                    for g in (1, s_, s_ + 1):
+                        plan.append(("bs_c0", s_, g, g * B))
         if a.diag8:
             # RAM prompt cache on vs off (-cram 0), inbox on: a slot reuse saves the old prompt's KV with
             # llama_state_seq_get_data, which pulls the remote layers' KV across the LAN on every launch
@@ -651,7 +658,7 @@ class Master:
                     repacked = want
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
                 if kind.startswith("bs_i") or kind.startswith("bs_c"):
-                    ml = int(kind[6:])
+                    ml = int(kind[6:]) if kind[6:] else None
                 if kind.startswith("bs_c") and kind[4] == "0":
                     args += ["--cache-ram", "0"]
                 args, p = split(s, g, False, True, ml)
@@ -799,6 +806,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag9", action = "store_true", help = "2..N+1 stages x G in (1, S, S+1), --cache-ram 0, even split (use with --waves 8)")
     m.add_argument("--diag8", action = "store_true", help = "RAM prompt cache on vs off with the launch inbox (use with --waves 8)")
     m.add_argument("--diag7", action = "store_true", help = "launch inbox on vs off at the best splits (use with --waves 8)")
     m.add_argument("--diag6", action = "store_true", help = "steady-state rerun of the best splits (use with --waves 8)")
