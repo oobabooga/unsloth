@@ -20,8 +20,8 @@ permissions:
 env:
   HIP_VISIBLE_DEVICES: ""
   ROCR_VISIBLE_DEVICES: ""
-  PP_MODEL_REPO: unsloth/Qwen3-4B-GGUF
-  PP_MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
+  PP_MODEL_REPO: unsloth/Qwen3-30B-A3B-GGUF
+  PP_MODEL_FILE: Qwen3-30B-A3B-Q4_K_M.gguf
   # diagnostic run: #191 (tracer, on #187) + TLS, traces from the master and every rpc-server
   PP_LLAMA_PR: "191"
   PP_TRACE: "1"
@@ -136,7 +136,7 @@ jobs:
           echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
           python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" master --bin "$AMD_CI_WORK/llama/build-tls/bin" \
             --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --min-workers 2 --peer-allow --diag19 --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
-            --n-layer 36 --slots-per-group 16 --n-predict 64 --waves 8 --rounds 1 --wait-s 2700 2>&1 | tee "$D/master.log"
+            --n-layer 48 --slots-per-group 16 --n-predict 64 --waves 8 --rounds 1 --wait-s 2700 2>&1 | tee "$D/master.log"
           echo "master rc=${PIPESTATUS[0]}"
           test -s "$D/master_result.json"
 
