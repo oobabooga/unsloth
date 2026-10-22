@@ -1,0 +1,494 @@
+From 76b337bed60889477a45333f4cf426e5b83f8f3d Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 19:26:39 -0700
+Subject: [PATCH 1/2] llama: read backend sampling logits/probs/candidates rows
+ lazily
+
+With backend sampling every decode copied the logits, probs and candidates
+rows of every output back to the host, even when the token was already
+sampled on the backend and nobody reads them. On an RPC device each row is
+a GET_TENSOR round trip on the endpoint's FIFO.
+
+Keep the sampled token ids eager, remember the tensor of the other rows and
+read a row on the first llama_get_sampled_{logits,probs,candidates}_ith
+access. Pending rows are read before the compute buffer is reused (next
+ubatch, graph reserve) and dropped when the next decode starts.
+llama_sampler_sample checks the backend sampled token before touching the
+rows. LLAMA_BACKEND_SAMPLING_LAZY_READBACK=0 restores the eager copies.
+---
+ src/llama-context.cpp | 124 ++++++++++++++++++++++++++++++++++++++----
+ src/llama-context.h   |  25 +++++++++
+ src/llama-sampler.cpp |  10 ++--
+ 3 files changed, 145 insertions(+), 14 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0a814e89f..dbe76c47c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -375,6 +375,11 @@ llama_context::llama_context(
+         }
+     }
+ 
++    {
++        const char * LLAMA_BACKEND_SAMPLING_LAZY_READBACK = getenv("LLAMA_BACKEND_SAMPLING_LAZY_READBACK");
++        sampling.lazy_readback = LLAMA_BACKEND_SAMPLING_LAZY_READBACK ? (atoi(LLAMA_BACKEND_SAMPLING_LAZY_READBACK) != 0) : true;
++    }
++
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+ 
+@@ -1170,6 +1175,58 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
+     return embd_layer_inp[lid].data;
+ }
+ 
++void llama_context::sampling_lazy_read(std::vector<sampling_info::lazy_row> & lazy, int64_t row, void * dst) {
++    if (sampling.n_lazy_pending == 0 || row < 0 || (size_t) row >= lazy.size()) {
++        return;
++    }
++
++    auto & entry = lazy[row];
++    if (entry.tensor == nullptr) {
++        return;
++    }
++
++    // the public getters synchronize first, so the compute that produced the row has finished
++    ggml_backend_tensor_get(entry.tensor, dst, 0, entry.nbytes);
++
++    entry = {};
++    GGML_ASSERT(sampling.n_lazy_pending > 0);
++    --sampling.n_lazy_pending;
++}
++
++void llama_context::sampling_lazy_flush() {
++    if (sampling.n_lazy_pending == 0) {
++        return;
++    }
++
++    // the async copies and the compute must be done before the rows are read
++    ggml_backend_sched_synchronize(sched.get());
++
++    const size_t stride = model.vocab.n_tokens();
++
++    for (size_t row = 0; row < sampling.logits_lazy.size(); ++row) {
++        sampling_lazy_read(sampling.logits_lazy,     row, sampling.logits.data     + row*stride);
++        sampling_lazy_read(sampling.probs_lazy,      row, sampling.probs.data      + row*stride);
++        sampling_lazy_read(sampling.candidates_lazy, row, sampling.candidates.data + row*stride);
++    }
++
++    GGML_ASSERT(sampling.n_lazy_pending == 0);
++}
++
++void llama_context::sampling_lazy_drop() {
++    if (sampling.n_lazy_pending == 0) {
++        return;
++    }
++
++    // a row that was never read reports no data rather than stale host memory
++    for (size_t row = 0; row < sampling.logits_lazy.size(); ++row) {
++        if (sampling.logits_lazy[row].tensor)     { sampling.logits_count[row]     = 0; sampling.logits_lazy[row]     = {}; }
++        if (sampling.probs_lazy[row].tensor)      { sampling.probs_count[row]      = 0; sampling.probs_lazy[row]      = {}; }
++        if (sampling.candidates_lazy[row].tensor) { sampling.candidates_count[row] = 0; sampling.candidates_lazy[row] = {}; }
++    }
++
++    sampling.n_lazy_pending = 0;
++}
++
+ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
+     output_reorder();
+ 
+@@ -1199,7 +1256,9 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
+         if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
+             return nullptr;
+         }
+-        return sampling.probs.data + row*model.vocab.n_tokens();
++        float * dst = sampling.probs.data + row*model.vocab.n_tokens();
++        sampling_lazy_read(sampling.probs_lazy, row, dst);
++        return dst;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: invalid backend sampled probs id %d, reason: %s\n", __func__, idx, err.what());
+         return nullptr;
+@@ -1218,7 +1277,9 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
+         if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
+             return nullptr;
+         }
+-        return sampling.logits.data + row*model.vocab.n_tokens();
++        float * dst = sampling.logits.data + row*model.vocab.n_tokens();
++        sampling_lazy_read(sampling.logits_lazy, row, dst);
++        return dst;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: invalid backend sampled logits id %d, reason: %s\n", __func__, idx, err.what());
+         return nullptr;
+@@ -1233,7 +1294,9 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
+         if (sampling.candidates.has_data() &&
+             (size_t) row < sampling.candidates_count.size() &&
+             sampling.candidates_count[row] > 0) {
+-            return sampling.candidates.data + row*model.vocab.n_tokens();
++            llama_token * dst = sampling.candidates.data + row*model.vocab.n_tokens();
++            sampling_lazy_read(sampling.candidates_lazy, row, dst);
++            return dst;
+         }
+     } catch (const std::exception & err) {
+         // fallback to full vocab list
+@@ -1524,6 +1587,9 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // the compute buffer is about to be reused: read the lazy rows of an earlier ubatch first
++    sampling_lazy_flush();
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -1792,7 +1858,9 @@ static void copy_tensor_async_rows(
+     size_t stride,
+     uint32_t row_offset,
+     ggml_backend_sched_t sched,
+-    std::vector<uint32_t> * counts = nullptr) {
++    std::vector<uint32_t> * counts = nullptr,
++    std::vector<llama_sampling_lazy_row> * lazy = nullptr,
++    uint32_t * n_lazy_pending = nullptr) {
+     if (!dst.has_data()) {
+         return;
+     }
+@@ -1809,9 +1877,16 @@ static void copy_tensor_async_rows(
+         GGML_ASSERT(n_elements <= stride);
+         GGML_ASSERT((size_t) row * stride + n_elements <= dst.size);
+ 
+-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+-        T * row_ptr = dst.data + (size_t) row * stride;
+-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
++        if (lazy) {
++            // read on first access, see llama_context::sampling_info::lazy_row
++            GGML_ASSERT(row < lazy->size());
++            (*lazy)[row] = { tensor, ggml_nbytes(tensor) };
++            ++*n_lazy_pending;
++        } else {
++            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
++            T * row_ptr = dst.data + (size_t) row * stride;
++            ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
++        }
+ 
+         if (counts) {
+             GGML_ASSERT(row < counts->size());
+@@ -1930,6 +2005,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     }
+     n_queued_tokens += n_tokens_all;
+ 
++    // the rows of the previous decode are no longer addressable: forget the ones never read
++    sampling_lazy_drop();
++
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+ 
+@@ -2176,9 +2254,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+             // async copy the sampling data from the backend to the host
+             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++            // the logits / probs / candidates rows are only needed when the caller asks for them
++            // (CPU samplers continue the chain, n_probs, ...), so with lazy readback they stay on the backend
++            const bool lazy = sampling.lazy_readback;
++            uint32_t * n_pending = &sampling.n_lazy_pending;
++            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count,
++                    lazy ? &sampling.logits_lazy     : nullptr, n_pending);
++            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count,
++                    lazy ? &sampling.probs_lazy      : nullptr, n_pending);
++            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count,
++                    lazy ? &sampling.candidates_lazy : nullptr, n_pending);
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -2386,6 +2471,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
+ 
+         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
++
++        sampling.logits_lazy    .assign(n_outputs_max, {});
++        sampling.probs_lazy     .assign(n_outputs_max, {});
++        sampling.candidates_lazy.assign(n_outputs_max, {});
++        sampling.n_lazy_pending = 0;
+     } else {
+         sampling.logits     = {nullptr, 0};
+         sampling.probs      = {nullptr, 0};
+@@ -2395,6 +2485,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         sampling.logits_count.clear();
+         sampling.probs_count.clear();
+         sampling.candidates_count.clear();
++
++        sampling.logits_lazy.clear();
++        sampling.probs_lazy.clear();
++        sampling.candidates_lazy.clear();
++        sampling.n_lazy_pending = 0;
+     }
+ 
+     // set all ids as invalid (negative)
+@@ -2476,6 +2571,13 @@ void llama_context::output_reorder() {
+             assert(sampling.probs_count.size() > 0);
+             assert(sampling.candidates_count.size() > 0);
+ 
++            if (sampling.n_lazy_pending > 0) {
++                // a pending row is read into the row it is swapped to
++                std::swap(sampling.logits_lazy[i0],     sampling.logits_lazy[i1]);
++                std::swap(sampling.probs_lazy[i0],      sampling.probs_lazy[i1]);
++                std::swap(sampling.candidates_lazy[i0], sampling.candidates_lazy[i1]);
++            }
++
+             for (uint64_t k = 0; k < n_vocab; ++k) {
+                 std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
+             }
+@@ -2649,6 +2751,8 @@ ggml_cgraph * llama_context::graph_reserve(
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+     }
+ 
++    sampling_lazy_flush();
++
+     ggml_backend_sched_reset(sched.get());
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 277aff71d..46f69f9ba 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -42,6 +42,12 @@ struct llama_memory_buffer {
+ 
+ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+ 
++// a backend sampling output row not read back yet (see llama_context::sampling_info)
++struct llama_sampling_lazy_row {
++    ggml_tensor * tensor = nullptr;
++    size_t        nbytes = 0;
++};
++
+ struct llama_context {
+     // init scheduler and compute buffers, reserve worst-case graphs
+     llama_context(
+@@ -339,10 +345,29 @@ private:
+         std::vector<uint32_t> probs_count;
+         std::vector<uint32_t> candidates_count;
+ 
++        // lazy readback: the logits / probs / candidates rows stay on the backend after decode and are
++        // read on the first getter access (the sampled token ids are always copied eagerly). a row's
++        // tensor lives in the compute buffer, so pending rows are read before that buffer is reused
++        // and dropped when the next decode starts. LLAMA_BACKEND_SAMPLING_LAZY_READBACK=0 copies eagerly.
++        using lazy_row = llama_sampling_lazy_row;
++
++        bool lazy_readback = true;
++
++        std::vector<lazy_row> logits_lazy;
++        std::vector<lazy_row> probs_lazy;
++        std::vector<lazy_row> candidates_lazy;
++
++        uint32_t n_lazy_pending = 0;
++
+         // optimization
+         std::vector<llama_token> token_ids_full_vocab;
+     };
+ 
++    // read (flush) or forget (drop) the pending lazy sampling rows
++    void sampling_lazy_flush();
++    void sampling_lazy_drop();
++    void sampling_lazy_read(std::vector<sampling_info::lazy_row> & lazy, int64_t row, void * dst);
++
+     sampling_info sampling;
+ 
+     // sequence embeddings output (map of [n_embd] vectors)
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 521c5718e..c76b1980a 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -893,18 +893,20 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
+ }
+ 
+ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
+-    const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
+-    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+-    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+-    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
++    const llama_token sampled_token = llama_get_sampled_token_ith(ctx, idx);
+ 
+     // If a backend sampler has already sampled a token, return it.
++    // (checked first: the backend logits / probs / candidates rows are then not needed)
+     if (sampled_token != LLAMA_TOKEN_NULL) {
+         LLAMA_LOG_DEBUG("%s: Backend sampler selected token for idx %d. Skipping CPU samplers\n", __func__, idx);
+         llama_sampler_accept(smpl, sampled_token);
+         return sampled_token;
+     }
+ 
++    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
++    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
++    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
++
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+ 
+-- 
+2.43.0
+
+
+From c094fb6e15ffd4047bd186682f21ad2507484bd5 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 19:26:39 -0700
+Subject: [PATCH 2/2] common: build cur_p lazily when the token was sampled on
+ the backend
+
+common_sampler_sample read the backend logits/probs/candidates rows into
+cur_p before checking whether a backend sampler already picked the token.
+Check the token first and build cur_p only when
+common_sampler_get_candidates() asks for it (n_probs, speculative
+decoding). LLAMA_BACKEND_SAMPLING_LAZY_READBACK=0 keeps the eager build.
+---
+ common/sampling.cpp | 66 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 564fa9c4d..7055b208e 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -11,6 +11,7 @@
+ #include <cctype>
+ #include <climits>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <random>
+ #include <unordered_map>
+@@ -109,6 +110,14 @@ struct ring_buffer {
+     std::vector<T> data;
+ };
+ 
++static bool common_backend_sampling_lazy_readback() {
++    static const bool lazy = [] {
++        const char * env = getenv("LLAMA_BACKEND_SAMPLING_LAZY_READBACK");
++        return env ? atoi(env) != 0 : true;
++    }();
++    return lazy;
++}
++
+ struct common_sampler {
+     common_params_sampling params;
+ 
+@@ -125,13 +134,46 @@ struct common_sampler {
+     // for rejection sampling; independent of the draft, or the target distribution is not preserved
+     std::mt19937 rng;
+ 
++    // lazy cur_p: when a backend sampler picked the token, cur_p is built from the backend rows only when
++    // common_sampler_get_candidates() asks for it (before the next decode of cur_p_ctx), so the rows are
++    // not read back every step. LLAMA_BACKEND_SAMPLING_LAZY_READBACK=0 builds it eagerly.
++    struct llama_context * cur_p_ctx = nullptr;
++    int                    cur_p_idx = -1;
++    llama_token            cur_p_id  = LLAMA_TOKEN_NULL;
++
+     void reset() {
+         prev.clear();
+ 
+         llama_sampler_reset(chain);
+     }
+ 
++    void set_logits_lazy(struct llama_context * ctx, int idx, llama_token id) {
++        cur_p_ctx = ctx;
++        cur_p_idx = idx;
++        cur_p_id  = id;
++
++        cur.clear();
++        cur_p = { cur.data(), 0, -1, false };
++    }
++
++    void materialize_cur_p() {
++        if (cur_p_ctx == nullptr) {
++            return;
++        }
++
++        set_logits(cur_p_ctx, cur_p_idx);
++
++        for (size_t i = 0; i < cur_p.size; ++i) {
++            if (cur_p.data[i].id == cur_p_id) {
++                cur_p.selected = i;
++                break;
++            }
++        }
++    }
++
+     void set_logits(struct llama_context * ctx, int idx) {
++        cur_p_ctx = nullptr;
++
+         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+@@ -441,6 +483,9 @@ struct common_sampler * common_sampler_init(
+         /* .cur_p   = */ {},
+         // mix it, the chain and the draft are seeded from this one too
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
++        /* .cur_p_ctx = */ nullptr,
++        /* .cur_p_idx = */ -1,
++        /* .cur_p_id  = */ LLAMA_TOKEN_NULL,
+     };
+ 
+     return result;
+@@ -525,6 +570,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
++        /* .cur_p_ctx = */ gsmpl->cur_p_ctx,
++        /* .cur_p_idx = */ gsmpl->cur_p_idx,
++        /* .cur_p_id  = */ gsmpl->cur_p_id,
+     };
+ }
+ 
+@@ -546,6 +594,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->cur_p      = src->cur_p;
+     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+     dst->rng        = src->rng;
++    dst->cur_p_ctx  = src->cur_p_ctx;
++    dst->cur_p_idx  = src->cur_p_idx;
++    dst->cur_p_id   = src->cur_p_id;
+     dst->t_total_us = src->t_total_us;
+ }
+ 
+@@ -616,8 +667,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
+-
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+     {
+@@ -629,6 +678,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+ 
++            if (common_backend_sampling_lazy_readback()) {
++                // cur_p (the backend logits / probs / candidates rows) is only read if a caller asks for it
++                gsmpl->set_logits_lazy(ctx, idx, id);
++
++                return id;
++            }
++
++            gsmpl->set_logits(ctx, idx);
++
+             for (size_t i = 0; i < cur_p.size; ++i) {
+                 if (cur_p.data[i].id == id) {
+                     cur_p.selected = i;
+@@ -640,6 +698,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         }
+     }
+ 
++    gsmpl->set_logits(ctx, idx);
++
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+ 
+@@ -865,6 +925,8 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
+     const auto tm = gsmpl->tm();
+ 
++    gsmpl->materialize_cur_p();
++
+     auto * res = &gsmpl->cur_p;
+ 
+     if (do_sort && !res->sorted) {
+-- 
+2.43.0
+

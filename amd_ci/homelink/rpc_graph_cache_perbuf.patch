@@ -1,0 +1,323 @@
+From 31c06a4477b72f3a0ad256deb6544eed52fea445 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 17:53:37 -0700
+Subject: [PATCH] rpc: on FREE_BUFFER drop only the cached graphs that
+ reference the freed buffer
+
+Every FREE_BUFFER cleared every cached graph on the endpoint, on both sides. With
+--backend-sampling each request start/end re-reserves the context's scheduler, which
+frees and reallocates its compute buffer, so the cached graphs of every other context
+(pipeline group) on that endpoint were thrown away and re-sent in full on their next
+launch, although they never touched that buffer.
+
+Client and server now remember, per cached uid, the remote buffer handles named by the
+graph's serialized tensors (computed from the same bytes on both sides) and on
+FREE_BUFFER erase only the uids whose graph names the freed buffer, so both caches keep
+the same uids and keep reaching GRAPH_CACHE_MAX at the same message.
+
+The mode is negotiated per connection: the client sends RPC_CMD_GRAPH_CACHE_MODE right
+after HELLO, only to servers reporting protocol 8.1.1 or newer (patch bumped to 1), and
+uses per-buffer invalidation only when the server accepts. Older peers on either side and
+GGML_RPC_GRAPH_CACHE_PERBUF=0 on either side keep clear-all. GRAPH_CACHE_MAX can be
+lowered at build time with -DGGML_RPC_GRAPH_CACHE_MAX=N to exercise the eviction path.
+---
+ ggml/include/ggml-rpc.h        |   2 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 140 +++++++++++++++++++++++++++++----
+ 2 files changed, 126 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 2c0850d8e..81b00e3a0 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,7 +8,7 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    1
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    1
+ 
+ #ifdef  __cplusplus
+ static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 2c96ffb7c..609330dd4 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -86,6 +86,8 @@ enum rpc_cmd {
+     RPC_CMD_COMM_FREE,
+     // once per connection after HELLO, only while tracing (8.1)
+     RPC_CMD_TRACE_SYNC,
++    // once per connection after HELLO, servers >= 8.1.1 only (see rpc_graph_cache_mode)
++    RPC_CMD_GRAPH_CACHE_MODE,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -118,6 +120,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+         case RPC_CMD_TRACE_SYNC:        return "TRACE_SYNC";
++        case RPC_CMD_GRAPH_CACHE_MODE:  return "GRAPH_CACHE_MODE";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -128,7 +131,53 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+ 
+ // Maximum number of graphs cached per device; client and server must use the same value
+ // so that both sides clear their caches at the same point in the message stream
+-const size_t GRAPH_CACHE_MAX = 1024;
++#ifndef GGML_RPC_GRAPH_CACHE_MAX
++#define GGML_RPC_GRAPH_CACHE_MAX 1024
++#endif
++const size_t GRAPH_CACHE_MAX = GGML_RPC_GRAPH_CACHE_MAX;
++
++// Graph cache invalidation on FREE_BUFFER. Clear-all is the default protocol; per-buffer (drop only the
++// graphs whose tensors reference the freed buffer) is used on a connection only when both sides opt in
++// via RPC_CMD_GRAPH_CACHE_MODE, so the two caches always drop the same uids. GGML_RPC_GRAPH_CACHE_PERBUF=0
++// on either side keeps clear-all.
++enum rpc_graph_cache_mode : uint8_t {
++    RPC_GRAPH_CACHE_CLEAR_ALL = 0,
++    RPC_GRAPH_CACHE_PER_BUFFER = 1,
++};
++
++static bool rpc_graph_cache_perbuf_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_RPC_GRAPH_CACHE_PERBUF");
++        return env == nullptr || atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// sorted, unique remote buffer handles referenced by the tensors of a serialized graph; computed from the
++// same bytes on both sides, so client and server agree on which graphs a FREE_BUFFER invalidates
++static std::vector<uint64_t> rpc_graph_buffers(const rpc_tensor * tensors, uint32_t n_tensors) {
++    std::vector<uint64_t> bufs;
++    for (uint32_t i = 0; i < n_tensors; i++) {
++        if (tensors[i].buffer != 0) {
++            bufs.push_back(tensors[i].buffer);
++        }
++    }
++    std::sort(bufs.begin(), bufs.end());
++    bufs.erase(std::unique(bufs.begin(), bufs.end()), bufs.end());
++    return bufs;
++}
++
++static bool rpc_graph_uses_buffer(const std::vector<uint64_t> & bufs, uint64_t buffer) {
++    return std::binary_search(bufs.begin(), bufs.end(), buffer);
++}
++
++struct rpc_msg_graph_cache_mode_req {
++    uint8_t mode;
++};
++
++struct rpc_msg_graph_cache_mode_rsp {
++    uint8_t mode;
++};
+ 
+ struct rpc_msg_trace_sync_rsp {
+     int64_t t2;
+@@ -516,7 +565,7 @@ static inline void rpc_cpu_relax() {
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server_minor) {
++static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server_minor, int * server_patch) {
+     rpc_msg_hello_req request = {};
+     rpc_msg_hello_rsp response = {};
+ 
+@@ -532,6 +581,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server
+     }
+ 
+     *server_minor = response.minor;
++    *server_patch = response.patch;
+     sock->update_caps(response.conn_caps);
+     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
+             __func__, response.major, response.minor, response.patch, sock->transport_name());
+@@ -606,7 +656,7 @@ public:
+     void busy_spin_acquire();
+     void busy_spin_release();
+     std::shared_future<void> graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+-    void free_buffer(std::shared_ptr<const void> request, size_t size);
++    void free_buffer(uint64_t remote_ptr, std::shared_ptr<const void> request, size_t size);
+ 
+     void start(const std::string & endpoint);
+     void work();
+@@ -640,7 +690,9 @@ private:
+     void send_traced(rpc_msg & msg);
+ 
+     std::mutex graph_mutex;
+-    std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
++    // cached uids per device, with the remote buffers each graph references (per-buffer mode only)
++    std::unordered_map<uint32_t, std::unordered_map<uint64_t, std::vector<uint64_t>>> graph_uids;
++    bool             graph_cache_perbuf = false;
+     rpc_msg_queue    queue;
+     socket_ptr       sock;
+     std::atomic_uint busy_spin_users = 0;
+@@ -802,7 +854,8 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+         GGML_ABORT("TLS connection to %s failed\n", endpoint.c_str());
+     }
+     int server_minor = 0;
+-    if (!negotiate_hello(sock, &server_minor)) {
++    int server_patch = 0;
++    if (!negotiate_hello(sock, &server_minor, &server_patch)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
+     ggml_trace_open(nullptr, "rpc-client");
+@@ -810,7 +863,16 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+     if (ggml_trace_flag && server_minor >= 1) {
+         rpc_trace_sync(sock, endpoint);
+     }
+-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
++    // older servers drop the connection on an unknown command, so only ask 8.1.1+
++    if (rpc_graph_cache_perbuf_enabled() && (server_minor > 1 || (server_minor == 1 && server_patch >= 1))) {
++        rpc_msg_graph_cache_mode_req request = { RPC_GRAPH_CACHE_PER_BUFFER };
++        rpc_msg_graph_cache_mode_rsp response = {};
++        if (!send_rpc_cmd(sock, RPC_CMD_GRAPH_CACHE_MODE, &request, sizeof(request), &response, sizeof(response))) {
++            GGML_ABORT("RPC graph cache mode negotiation failed for %s\n", endpoint.c_str());
++        }
++        graph_cache_perbuf = response.mode == RPC_GRAPH_CACHE_PER_BUFFER;
++    }
++    LOG_DBG("[%s] connected to %s, graph cache: %s\n", __func__, endpoint.c_str(), graph_cache_perbuf ? "per-buffer" : "clear-all");
+     running = true;
+     thread = std::thread(rpc_dispatcher_trampoline, this);
+ }
+@@ -887,7 +949,7 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     auto request = std::make_shared<rpc_msg_free_buffer_req>();
+     request->remote_ptr = ctx->remote_ptr;
+     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
+-    ctx->dispatcher->free_buffer(request, sizeof(*request));
++    ctx->dispatcher->free_buffer(request->remote_ptr, request, sizeof(*request));
+     delete ctx;
+ }
+ 
+@@ -1393,11 +1455,19 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
+     return output;
+ }
+ 
+-// the server drops every cached graph when it frees a buffer (their nodes may point into it), so forget
+-// them here too, under graph_mutex so no graph_compute can pick RECOMPUTE between the two
+-void rpc_dispatcher::free_buffer(std::shared_ptr<const void> request, size_t size) {
++// the server drops the cached graphs whose nodes may point into a buffer it frees (all of them in clear-all
++// mode), so forget the same uids here, under graph_mutex so no graph_compute can pick RECOMPUTE between the two
++void rpc_dispatcher::free_buffer(uint64_t remote_ptr, std::shared_ptr<const void> request, size_t size) {
+     std::lock_guard<std::mutex> lock(graph_mutex);
+-    graph_uids.clear();
++    if (graph_cache_perbuf) {
++        for (auto & dev_uids : graph_uids) {
++            for (auto it = dev_uids.second.begin(); it != dev_uids.second.end(); ) {
++                it = rpc_graph_uses_buffer(it->second, remote_ptr) ? dev_uids.second.erase(it) : std::next(it);
++            }
++        }
++    } else {
++        graph_uids.clear();
++    }
+     send(RPC_CMD_FREE_BUFFER, request, size);
+ }
+ 
+@@ -1428,16 +1498,24 @@ std::shared_future<void> rpc_dispatcher::graph_compute(uint32_t device, const gg
+         request->uid    = cgraph->uid;
+         return push_graph(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+     } else {
++        size_t input_size = 0;
++        uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
+         if (cgraph->uid != 0) {
+             if (device_graph_uids.size() >= GRAPH_CACHE_MAX) {
+                 LOG_DBG("[%s] clearing graph cache for device %u (%zu entries)\n",
+                         __func__, device, device_graph_uids.size());
+                 device_graph_uids.clear();
+             }
+-            device_graph_uids.insert(cgraph->uid);
++            std::vector<uint64_t> bufs;
++            if (graph_cache_perbuf) {
++                // | device (4) | uid (8) | n_nodes (4) | nodes (n_nodes * 8) | n_tensors (4) | tensors |
++                const uint8_t * p = input + 2*sizeof(uint32_t) + sizeof(uint64_t) + cgraph->n_nodes*sizeof(uint64_t);
++                uint32_t n_tensors;
++                memcpy(&n_tensors, p, sizeof(n_tensors));
++                bufs = rpc_graph_buffers((const rpc_tensor *)(p + sizeof(n_tensors)), n_tensors);
++            }
++            device_graph_uids[cgraph->uid] = std::move(bufs);
+         }
+-        size_t input_size = 0;
+-        uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
+         LOG_DBG2("[%s] serialized graph: %zu bytes\n", __func__, input_size);
+         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+         return push_graph(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+@@ -1626,7 +1704,9 @@ public:
+         std::vector<uint8_t>   buffer;
+         ggml_cgraph          * graph;
+         uint64_t               repack_gen = 0;
++        std::vector<uint64_t>  bufs;    // remote buffers referenced, per-buffer mode only
+     };
++    uint8_t graph_cache_mode(uint8_t requested);
+ 
+ private:
+     // repack state (see rpc_repack_view_ctx)
+@@ -1684,6 +1764,7 @@ private:
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // computed graphs cached per backend, keyed by uid
+     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
++    bool graph_cache_perbuf = false;
+     std::vector<comm_state> comm_states;
+ };
+ 
+@@ -1805,8 +1886,15 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     // Erase rather than null them: the client forgets its uids on FREE_BUFFER too, and both sides clear at
+     // GRAPH_CACHE_MAX entries, so dead entries kept here would make this side clear while the client still
+     // expects its newer graphs to be cached.
++    // In per-buffer mode both sides drop exactly the graphs whose serialized tensors name this buffer.
+     for (auto & sgs : stored_graphs) {
+-        sgs.clear();
++        if (!graph_cache_perbuf) {
++            sgs.clear();
++            continue;
++        }
++        for (auto it = sgs.begin(); it != sgs.end(); ) {
++            it = rpc_graph_uses_buffer(it->second.bufs, request.remote_ptr) ? sgs.erase(it) : std::next(it);
++        }
+     }
+     repack_drop_buffer(buffer);
+     ggml_backend_buffer_free(buffer);
+@@ -2396,6 +2484,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     }
+     stored_graph sg_tmp;
+     stored_graph & sg = uid != 0 ? stored_graphs[device][uid] : sg_tmp;
++    sg.bufs.clear();
++    if (uid != 0 && graph_cache_perbuf) {
++        sg.bufs = rpc_graph_buffers(tensors, n_tensors);
++    }
+ 
+     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
+     if (sg.buffer.size() < buf_size) {
+@@ -2853,6 +2945,12 @@ bool rpc_server::repack_prepare_graph(uint32_t device, ggml_cgraph * graph, bool
+     return true;
+ }
+ 
++uint8_t rpc_server::graph_cache_mode(uint8_t requested) {
++    graph_cache_perbuf = requested == RPC_GRAPH_CACHE_PER_BUFFER && rpc_graph_cache_perbuf_enabled();
++    LOG_DBG("[%s] graph cache: %s\n", __func__, graph_cache_perbuf ? "per-buffer" : "clear-all");
++    return graph_cache_perbuf ? RPC_GRAPH_CACHE_PER_BUFFER : RPC_GRAPH_CACHE_CLEAR_ALL;
++}
++
+ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     uint32_t device = request.device;
+     if (device >= backends.size()) {
+@@ -3199,6 +3297,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_GRAPH_CACHE_MODE: {
++                rpc_msg_graph_cache_mode_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_graph_cache_mode_rsp response = {};
++                response.mode = server.graph_cache_mode(request.mode);
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_DEVICE_COUNT: {
+                 if (!recv_msg(sock, nullptr, 0)) {
+                     return;
+-- 
+2.43.0
+

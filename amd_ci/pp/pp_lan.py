@@ -586,14 +586,15 @@ class Master:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
         if a.diag10:
-            # lazy backend-sampling readback (bs_lazy_readback.patch) off vs on, --cache-ram 0, even split, then
-            # N-box scaling with it on; stages beyond the workers that showed up are dropped
+            # bs_k1 = RAM prompt cache on (llama-server default), bs_l0 / bs_l1 = --cache-ram 0 (as Studio serves) with
+            # lazy backend-sampling readback (bs_lazy_readback.patch) off / on; then N-box scaling with both fixes.
+            # Stages beyond the workers that showed up are dropped.
             plan = [("x1", 1, 1, B), ("x1_c0", 1, 1, B)]
             for s_, g in ((2, 3), (3, 4)):
-                plan += [("bs_l0", s_, g, g * B), ("bs_l1", s_, g, g * B)]
+                plan += [("bs_k1", s_, g, g * B), ("bs_l0", s_, g, g * B), ("bs_l1", s_, g, g * B)]
             plan += [("bs_l1", 2, 1, B), ("bs_l1", 2, 4, 4 * B), ("bs_l1", 3, 5, 5 * B)]
             for s_ in (4, 5):
-                plan += [("bs_l0", s_, s_, s_ * B), ("bs_l1", s_, s_, s_ * B), ("bs_l1", s_, s_ + 1, (s_ + 1) * B)]
+                plan += [("bs_k1", s_, s_, s_ * B), ("bs_l1", s_, s_, s_ * B), ("bs_l1", s_, s_ + 1, (s_ + 1) * B)]
             plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag9:
             # N-box scaling with the full fix chain, as Studio's planner serves (--cache-ram 0), even layer split
@@ -669,20 +670,21 @@ class Master:
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
                 if kind.startswith("bs_i") or kind.startswith("bs_c"):
                     ml = int(kind[6:]) if kind[6:] else None
-                if kind.startswith("bs_l"):
+                if kind.startswith(("bs_l", "bs_k")):
                     ml = None
+                args, p = split(s, g, False, True, ml)
+                # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
                 if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith("bs_l"):
                     args += ["--cache-ram", "0"]
-                args, p = split(s, g, False, True, ml)
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l")):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
                     env["LLAMA_GROUP_LAUNCH_INBOX"] = kind[4]
-                if kind.startswith("bs_l"):
+                if kind.startswith(("bs_l", "bs_k")):
                     env["LLAMA_BACKEND_SAMPLING_LAZY_READBACK"] = kind[4]
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
@@ -691,8 +693,16 @@ class Master:
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "1" if kind == "bs_serial" else "0"
                 if kind == "bs_tsplit":
                     args[args.index("-t") + 1] = str(max(1, a.threads // g))
-                res = self.measure(f"{kind}_s{s}_g{g}_{rnd_i}", args, p, ctls[:s - 1], env)
+                tag = f"{kind}_s{s}_g{g}_{rnd_i}"
+                res = self.measure(tag, args, p, ctls[:s - 1], env)
                 res.update({"kind": kind, "stages": s, "groups": g, "slots": p})
+                # engagement: the RAM prompt cache must be silent when --cache-ram 0 was passed
+                try:
+                    slog = (self.out / f"server_{tag}.log").read_text(errors = "replace")
+                    res["prompt_cache_lines"] = slog.count("prompt cache")
+                    res["cache_ram_0"] = "--cache-ram" in args
+                except OSError:
+                    pass
                 R["cases"].append(res)
                 print("CASE", json.dumps({k: v for k, v in res.items() if k != "log"}, default = str)[:700], flush = True)
                 lp.write_json(str(self.out / "master_result.json"), R)
