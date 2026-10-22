@@ -24,6 +24,8 @@ python3 -m pip install -q --upgrade pip >/dev/null 2>&1
 python3 -m pip install -q cryptography psutil huggingface_hub || { echo "FATAL: pip"; exit 1; }
 
 PR="${PP_LLAMA_PR:-187}"
+# the homelink patch chain is built on #191 at 8fa30d2c5; later #191 commits (HELLO feature bits) need a rebased chain
+[ "$PR" = 191 ] && PP_LLAMA_SHA="${PP_LLAMA_SHA:-8fa30d2c5}"
 echo "== llama.cpp pull/$PR/head + TLS, CPU + RPC"
 L="$W/llama"
 # GitHub resets long blob-less clones now and then (run 39712628478 lost 2 of 4 workers): retry from scratch
@@ -31,7 +33,7 @@ ok=0
 for try in 1 2 3; do
   rm -rf "${L:?}"
   if git clone -q --filter=blob:none https://github.com/unslothai/llama.cpp "$L" &&
-     git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q FETCH_HEAD; then ok=1; break; fi
+     git -C "$L" fetch -q origin "pull/$PR/head" && git -C "$L" checkout -q "${PP_LLAMA_SHA:-FETCH_HEAD}"; then ok=1; break; fi
   echo "llama clone/fetch attempt $try failed"; sleep $((try * 20))
 done
 [ "$ok" = 1 ] || { echo "FATAL: llama clone/fetch $PR"; exit 1; }
