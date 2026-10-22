@@ -585,6 +585,14 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag7:
+            # launch inbox (groups_launch_inbox.patch) on vs off, best splits, interleaved so drift hits both arms
+            plan = [("x1", 1, 1, B), ("bs_i1m19", 2, 1, B)]
+            for g in (2, 3):
+                plan += [("bs_i0m19", 2, g, g * B), ("bs_i1m19", 2, g, g * B)]
+            plan.append(("bs_i1m13", 3, 1, B))
+            for g in (3, 4):
+                plan += [("bs_i0m13", 3, g, g * B), ("bs_i1m13", 3, g, g * B)]
         if a.diag6:
             # steady state: run with --waves 8 so the prefill burst and the drain tail are a small part of the window
             plan = [("x1", 1, 1, B)]
@@ -632,13 +640,17 @@ class Master:
                     restart_workers(want)
                     repacked = want
                 ml = int(kind[4:]) if kind.startswith("bs_m") and kind[4:].isdigit() else None
+                if kind.startswith("bs_i"):
+                    ml = int(kind[6:])
                 args, p = split(s, g, False, True, ml)
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith("bs_m"):
+                if kind.startswith("bs_m") or kind.startswith("bs_i"):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
+                if kind.startswith("bs_i"):
+                    env["LLAMA_GROUP_LAUNCH_INBOX"] = kind[4]
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -775,6 +787,7 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--diag7", action = "store_true", help = "launch inbox on vs off at the best splits (use with --waves 8)")
     m.add_argument("--diag6", action = "store_true", help = "steady-state rerun of the best splits (use with --waves 8)")
     m.add_argument("--diag5", action = "store_true", help = "stage balance: layers on the master x groups")
     m.add_argument("--diag4", action = "store_true", help = "per-backend RPC synchronize x serial group submit")

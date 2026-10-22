@@ -1,0 +1,507 @@
+From ad6e9e50f554300e5eed04ee64efe5d0630dc582 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 17:27:50 -0700
+Subject: [PATCH] server: pipeline groups launch through a per-group inbox
+ instead of pausing the group
+
+With --pipeline-groups > 1 every task built an engine_guard: it took every group's lock,
+raised n_pause_req on all of them and, for a completion, waited for the target group's
+decode to end, after which that group parked at the top of update_slots until the task
+thread was done. Under continuous traffic a launch arrives for almost every finished
+request, so the groups kept pausing for up to a whole iteration.
+
+Completion, infill, embedding, rerank and decision tasks now only pick their slot(s) on
+the task thread (under every group's lock, without pausing anyone or waiting out a
+decode), mark them reserved and queue (slot, children, task) in the group's inbox. The
+group thread drains its inbox at the top of update_slots, where it already holds its lock
+and is not decoding, and runs the prompt cache update, the launch and, with
+--cache-idle-slots, the idle slot save of its own slots. A reserved slot is not free for
+slot selection, get_free_slots, slot save/restore/erase or idle purging, and counts as
+processing in /slots and /metrics.
+
+Cancel removes a task still in an inbox and frees its slots (popping a deferred task),
+and hands a running one to its group, which releases the slot at its next iteration. A
+launch error is sent from the group thread (the result queue is locked). Launches left in
+an inbox at shutdown get an error. The shared prompt cache is now behind
+mtx_prompt_cache since group threads update it concurrently.
+
+n_groups == 1 is unchanged, and so are slot save/restore/erase, control, metrics, slots
+and lora tasks, which keep the guard. LLAMA_GROUP_LAUNCH_INBOX=0 restores the old launch
+and cancel path for A/B.
+---
+ tools/server/server-context.cpp | 279 ++++++++++++++++++++++++++++++--
+ 1 file changed, 264 insertions(+), 15 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 62e8a6b23..ca44a86a8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -255,6 +255,10 @@ struct server_slot {
+ 
+     int id_group = 0;
+ 
++    // picked for a task that waits in its group's launch inbox: not processing yet, but taken
++    // (pipeline groups only; written under the group's mtx)
++    bool reserved = false;
++
+     int seq_id = 0;
+ 
+     llama_context * ctx_tgt = nullptr;
+@@ -512,6 +516,11 @@ struct server_slot {
+         return state != SLOT_STATE_IDLE;
+     }
+ 
++    // free to be handed a new task: neither processing nor reserved by a pending launch
++    bool is_free() const {
++        return !is_processing() && !reserved;
++    }
++
+     bool can_speculate() const {
+         return !!spec;
+     }
+@@ -748,7 +757,7 @@ struct server_slot {
+             {"id",            id},
+             {"n_ctx",         n_ctx},
+             {"speculative",   can_speculate()},
+-            {"is_processing", is_processing()},
++            {"is_processing", !is_free()},
+         };
+ 
+         const auto & ptask = task ? task : task_prev;
+@@ -1009,6 +1018,17 @@ struct server_group {
+     std::condition_variable cv;
+     bool busy        = false; // a decode is in flight, no one may touch ctx
+     int  n_pause_req = 0;     // someone wants this group stopped, do not start a new iteration
++
++    // launches and cancels handed over by the task thread, run by this group's thread at the top of
++    // update_slots, so a launch never stops this group or another one (also guarded by mtx)
++    struct pending_launch {
++        server_slot * slot;
++        std::vector<server_slot *> children;
++        server_task task;
++        bool need_cache_update;
++    };
++    std::vector<pending_launch> inbox;
++    std::vector<int>            inbox_cancel; // ids of tasks already running on a slot of this group
+ };
+ 
+ //
+@@ -1083,6 +1103,9 @@ private:
+ 
+     std::atomic<bool> groups_stop { false };
+ 
++    // LLAMA_GROUP_LAUNCH_INBOX=0 makes launches and cancels stop the target group again (A/B only)
++    bool group_launch_inbox = true;
++
+     std::mutex mtx_metrics;
+     std::mutex mtx_prompt_cache;
+ 
+@@ -1960,7 +1983,7 @@ private:
+         std::vector<std::unique_lock<std::mutex>> lks;
+ 
+         explicit engine_guard(server_context_impl * srv_) {
+-            if (srv_->n_groups <= 1) {
++            if (srv_ == nullptr || srv_->n_groups <= 1) {
+                 return;
+             }
+ 
+@@ -2057,6 +2080,9 @@ private:
+                 if (groups_stop.load(std::memory_order_relaxed)) {
+                     return true;
+                 }
++                if (!grp.inbox.empty() || !grp.inbox_cancel.empty()) {
++                    return true;
++                }
+                 for (auto * slot : grp.slots) {
+                     if (slot->is_processing()) {
+                         return true;
+@@ -2074,12 +2100,17 @@ private:
+ 
+         groups_stop.store(false);
+ 
++        {
++            const char * e = getenv("LLAMA_GROUP_LAUNCH_INBOX");
++            group_launch_inbox = !e || atoi(e) != 0;
++        }
++
+         for (auto & grp : groups) {
+             server_group * g = grp.get();
+             g->thread = std::thread([this, g]() { group_loop(*g); });
+         }
+ 
+-        SRV_INF("started %d pipeline group decode threads\n", n_groups);
++        SRV_INF("started %d pipeline group decode threads (launch inbox %s)\n", n_groups, group_launch_inbox ? "on" : "off");
+     }
+ 
+     void stop_groups() {
+@@ -2098,6 +2129,19 @@ private:
+                 grp->thread.join();
+             }
+         }
++
++        // launches the threads never picked up: answer them so no client waits forever
++        for (auto & grp : groups) {
++            for (auto & item : grp->inbox) {
++                item.slot->reserved = false;
++                for (auto * child : item.children) {
++                    child->reserved = false;
++                }
++                send_error(item.task, "server is shutting down", ERROR_TYPE_UNAVAILABLE);
++            }
++            grp->inbox.clear();
++            grp->inbox_cancel.clear();
++        }
+     }
+ 
+     server_slot * get_slot_by_id(int id_slot) {
+@@ -2137,7 +2181,7 @@ private:
+             ret = get_slot_by_id(task.id_slot);
+             if (ret) {
+                 // a busy slot is returned untouched, the caller defers the task
+-                if (ret->is_processing()) {
++                if (!ret->is_free()) {
+                     return ret;
+                 }
+ 
+@@ -2152,7 +2196,7 @@ private:
+             std::vector<int> n_busy(groups.size(), 0);
+             std::vector<int> n_free(groups.size(), 0);
+             for (const server_slot & slot : slots) {
+-                (slot.is_processing() ? n_busy : n_free)[slot.id_group]++;
++                (slot.is_free() ? n_free : n_busy)[slot.id_group]++;
+             }
+             int n_min = -1;
+             for (size_t g = 0; g < groups.size(); ++g) {
+@@ -2179,7 +2223,7 @@ private:
+                 }
+ 
+                 // skip the slot if it is not available
+-                if (slot.is_processing()) {
++                if (!slot.is_free()) {
+                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                     continue;
+                 }
+@@ -2227,7 +2271,7 @@ private:
+ 
+             for (server_slot & slot : slots) {
+                 // skip the slot if it is not available
+-                if (slot.is_processing() || !group_ok[slot.id_group]) {
++                if (!slot.is_free() || !group_ok[slot.id_group]) {
+                     continue;
+                 }
+ 
+@@ -2265,6 +2309,9 @@ private:
+ 
+         const int64_t t_start = ggml_time_us();
+ 
++        // with the launch inbox, group threads update the shared cache concurrently
++        std::lock_guard<std::mutex> lk_cache(mtx_prompt_cache);
++
+         slot.prompt_save(*prompt_cache);
+ 
+         if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+@@ -2291,7 +2338,7 @@ private:
+         for (auto * slot_ptr : grp.slots) {
+             auto & slot = *slot_ptr;
+ 
+-            if (slot.is_processing()) {
++            if (!slot.is_free()) {
+                 continue;
+             }
+ 
+@@ -2951,7 +2998,7 @@ private:
+             if (slot.id_group != id_group) {
+                 continue;
+             }
+-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
++            if (slot.is_free() && slot.id != exclude_id_slot) {
+                 free_slots.push_back(&slot);
+             }
+             if (free_slots.size() >= n_slots_needed) {
+@@ -3202,6 +3249,185 @@ private:
+         return n_read;
+     }
+ 
++    // every group's lock in group order (same order as engine_guard), without pausing any group or
++    // waiting out a decode: only slot state is read or written, never a context
++    std::vector<std::unique_lock<std::mutex>> lock_all_groups() {
++        std::vector<std::unique_lock<std::mutex>> lks;
++        lks.reserve(groups.size());
++        for (auto & grp : groups) {
++            lks.emplace_back(grp->mtx);
++        }
++        return lks;
++    }
++
++    // pipeline groups: pick and reserve the slot(s) here, the group's own thread launches them
++    void launch_via_inbox(server_task && task) {
++        if (task.cli) {
++            if (!tokenize_cli_input(task)) {
++                return;
++            }
++        }
++
++        server_group * grp = nullptr;
++        {
++            auto lks = lock_all_groups();
++
++            const int id_task = task.id;
++
++            bool need_cache_update = false;
++            server_slot * slot = get_available_slot(task, need_cache_update);
++
++            if (slot == nullptr || !slot->is_free()) {
++                SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
++                queue_tasks.defer(std::move(task));
++                return;
++            }
++
++            std::vector<server_slot *> child_slots;
++            if (task.is_parent()) {
++                const size_t n_child_tasks = task.child_tasks.size();
++                // the children take their KV from the parent, so they must fit its group
++                if ((int) n_child_tasks + 1 > n_seq_per_group) {
++                    send_error(task, string_format(
++                        "n_cmpl must not exceed the number of slots per pipeline group (%d)", n_seq_per_group),
++                        ERROR_TYPE_INVALID_REQUEST);
++                    return;
++                }
++                child_slots = get_free_slots(n_child_tasks, slot->id, slot->id_group);
++                if (child_slots.size() < n_child_tasks) {
++                    SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
++                    queue_tasks.defer(std::move(task));
++                    return;
++                }
++            }
++
++            slot->reserved = true;
++            for (auto * child : child_slots) {
++                child->reserved = true;
++            }
++
++            grp = groups[slot->id_group].get();
++            grp->inbox.push_back({ slot, std::move(child_slots), std::move(task), need_cache_update });
++        }
++
++        grp->cv.notify_all();
++    }
++
++    // pipeline groups: a task still in an inbox is dropped here, a running one is released by its group
++    void cancel_via_inbox(int id_target) {
++        server_group * grp_notify = nullptr;
++        {
++            auto lks = lock_all_groups();
++
++            for (auto & grp : groups) {
++                for (auto it = grp->inbox.begin(); it != grp->inbox.end(); ++it) {
++                    if (it->task.id != id_target) {
++                        continue;
++                    }
++                    std::vector<server_slot *> freed = it->children;
++                    freed.push_back(it->slot);
++                    grp->inbox.erase(it);
++                    for (auto * slot : freed) {
++                        slot->reserved = false;
++                        queue_tasks.pop_deferred_task(slot->id);
++                    }
++                    return;
++                }
++            }
++
++            for (auto & slot : slots) {
++                if (slot.task && slot.task->id == id_target) {
++                    grp_notify = groups[slot.id_group].get();
++                    grp_notify->inbox_cancel.push_back(id_target);
++                    break;
++                }
++            }
++        }
++
++        if (grp_notify) {
++            grp_notify->cv.notify_all();
++        }
++    }
++
++    // caller holds grp.mtx and grp is not decoding; runs on the group's own thread
++    void drain_inbox(server_group & grp) {
++        for (const int id_target : grp.inbox_cancel) {
++            for (auto * slot : grp.slots) {
++                if (slot->task && slot->task->id == id_target) {
++                    slot->release();
++                    break;
++                }
++            }
++        }
++        grp.inbox_cancel.clear();
++
++        if (grp.inbox.empty()) {
++            return;
++        }
++
++        server_trace_scope span("launch", grp.id, (int) grp.inbox.size());
++
++        auto items = std::move(grp.inbox);
++        grp.inbox.clear();
++
++        bool launched = false;
++        for (auto & item : items) {
++            item.slot->reserved = false;
++            for (auto * child : item.children) {
++                child->reserved = false;
++            }
++
++            if (item.need_cache_update) {
++                update_prompt_cache(*item.slot, item.task);
++            }
++
++            const int id_task = item.task.id;
++
++            bool ok;
++            if (item.task.is_parent()) {
++                ok = launch_slots_with_parent_task(*item.slot, item.children, std::move(item.task));
++            } else {
++                ok = launch_slot_with_task(*item.slot, std::move(item.task));
++            }
++
++            if (!ok) {
++                // the error was sent; the slots stay free, so let a deferred task have them
++                SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
++                item.children.push_back(item.slot);
++                for (auto * slot : item.children) {
++                    if (!slot->is_processing()) {
++                        queue_tasks.pop_deferred_task(slot->id);
++                    }
++                }
++                continue;
++            }
++
++            launched = true;
++        }
++
++        if (launched && params_base.cache_idle_slots) {
++            // only this group's slots: another group's context is not ours to read, and clearing
++            // its slots frees no room in this one
++            std::lock_guard<std::mutex> lk_cache(mtx_prompt_cache);
++
++            for (auto * slot : grp.slots) {
++                if (slot->is_free()) {
++                    SLT_TRC(*slot, "%s", "saving idle slot to prompt cache\n");
++
++                    if (slot->prompt_save(*prompt_cache)) {
++                        SLT_DBG(*slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
++                        prompt_cache->update();
++                    }
++
++                    if (params_base.kv_unified) {
++                        // [TAG_IDLE_SLOT_CLEAR]
++                        slot->prompt_clear();
++                    }
++                }
++            }
++        }
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -3210,6 +3436,23 @@ private:
+             return false;
+         }
+ 
++        if (n_groups > 1 && group_launch_inbox) {
++            switch (task.type) {
++                case SERVER_TASK_TYPE_COMPLETION:
++                case SERVER_TASK_TYPE_INFILL:
++                case SERVER_TASK_TYPE_EMBEDDING:
++                case SERVER_TASK_TYPE_RERANK:
++                case SERVER_TASK_TYPE_DECISION:
++                    launch_via_inbox(std::move(task));
++                    return true;
++                case SERVER_TASK_TYPE_CANCEL:
++                    cancel_via_inbox(task.id_target);
++                    return true;
++                default:
++                    break;
++            }
++        }
++
+         engine_guard guard(this);
+ 
+         switch (task.type) {
+@@ -3243,7 +3486,7 @@ private:
+                         break;
+                     }
+ 
+-                    if (slot->is_processing()) {
++                    if (!slot->is_free()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                         queue_tasks.defer(std::move(task));
+@@ -3285,6 +3528,8 @@ private:
+                     if (params_base.cache_idle_slots) {
+                         guard.wait_for_all();
+ 
++                        std::lock_guard<std::mutex> lk_cache(mtx_prompt_cache);
++
+                         for (auto & slot : slots) {
+                             if (!slot.is_processing()) {
+                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+@@ -3357,7 +3602,7 @@ private:
+                     int n_processing_slots = 0;
+ 
+                     for (server_slot & slot : slots) {
+-                        if (slot.is_processing()) {
++                        if (!slot.is_free()) {
+                             n_processing_slots++;
+                         }
+                     }
+@@ -3381,7 +3626,7 @@ private:
+                     int n_idle_slots = 0;
+ 
+                     for (server_slot & slot : slots) {
+-                        if (!slot.is_processing()) {
++                        if (slot.is_free()) {
+                             n_idle_slots++;
+                         }
+ 
+@@ -3404,7 +3649,7 @@ private:
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
+-                    if (slot->is_processing()) {
++                    if (!slot->is_free()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                         queue_tasks.defer(std::move(task));
+@@ -3462,7 +3707,7 @@ private:
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
+-                    if (slot->is_processing()) {
++                    if (!slot->is_free()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                         queue_tasks.defer(std::move(task));
+@@ -3532,7 +3777,7 @@ private:
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
+-                    if (slot->is_processing()) {
++                    if (!slot->is_free()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                         queue_tasks.defer(std::move(task));
+@@ -3674,6 +3919,10 @@ private:
+             if (groups_stop.load(std::memory_order_relaxed)) {
+                 return false;
+             }
++
++            if (!grp.inbox.empty() || !grp.inbox_cancel.empty()) {
++                drain_inbox(grp);
++            }
+         }
+ 
+ #ifdef DEBUG_TIMINGS
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From df4cdf7823985401cb0e85008c10e777ad2ef4f0 Mon Sep 17 00:00:00 2001
+From: danielhanchen <danielhanchen@gmail.com>
+Date: Wed, 21 Oct 2026 17:10:37 -0700
+Subject: [PATCH] rpc: erase cached graphs on FREE_BUFFER so the server's cache
+ count matches the client's
+
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index b376436cc..2c96ffb7c 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1802,10 +1802,11 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     // Discard all cached graphs to avoid use-after-free in graph_recompute,
+     // since their nodes may hold pointers to the buffer being freed. The client
+     // will have to re-serialize its graphs from now on.
++    // Erase rather than null them: the client forgets its uids on FREE_BUFFER too, and both sides clear at
++    // GRAPH_CACHE_MAX entries, so dead entries kept here would make this side clear while the client still
++    // expects its newer graphs to be cached.
+     for (auto & sgs : stored_graphs) {
+-        for (auto & sg : sgs) {
+-            sg.second.graph = nullptr;
+-        }
++        sgs.clear();
+     }
+     repack_drop_buffer(buffer);
+     ggml_backend_buffer_free(buffer);
+-- 
+2.43.0
+
