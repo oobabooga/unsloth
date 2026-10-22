@@ -513,9 +513,14 @@ class Master:
         ca = CA(self.out / "tls")
         cert, key, master_fp = ca.client()
         endpoints, starts = [], []
+        # sign every worker's CSR first: with --peer-allow each worker also admits the other workers' certificates
+        # for direct worker-to-worker activation copies only ("<fp> peer" lines, rpc_p2p.patch; an older server
+        # does not admit such a line, which fails safe)
+        certs = [ca.sign_csr(c("csr")["csr"]) for c in ctls]
+        fps = [cert_fp(pem) for pem in certs]
         for i, (c, (host, port)) in enumerate(zip(ctls, addrs)):
-            csr = c("csr")["csr"]
-            starts.append(dict(cert = ca.sign_csr(csr), ca = ca.pem, allow = [master_fp], host = host, port = port,
+            allow = [master_fp] + ([f"{fp} peer" for j, fp in enumerate(fps) if j != i] if a.peer_allow else [])
+            starts.append(dict(cert = certs[i], ca = ca.pem, allow = allow, host = host, port = port,
                                threads = a.threads, cache = True))
             r = c("start_rpc", **starts[-1])
             if not self.step(f"worker {i + 1} serves TLS RPC on {host}:{port}", r.get("ok"), r.get("tail", "")):
@@ -595,6 +600,17 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag12:
+            # bs_v{p}{q}: direct worker-to-worker copies (rpc_p2p.patch, GGML_RPC_P2P) x prefill pipeline parallel over
+            # RPC (rpc_pipeline_parallel.patch, LLAMA_RPC_PIPELINE_PARALLEL + GGML_RPC_ASYNC_COPY); bs_w{h} = both on
+            # + the last worker hands h layers to the others. All with --cache-ram 0 + lazy readback, G=6.
+            plan = [("x1", 1, 1, B)]
+            g = 6
+            plan += [("bs_v00", 2, g, g * B), ("bs_v11", 2, g, g * B)]
+            for s_ in (3, 5):
+                plan += [(k, s_, g, g * B) for k in ("bs_v00", "bs_v10", "bs_v01", "bs_v11", "bs_w3")]
+            plan += [("bs_v00", 4, g, g * B), ("bs_v11", 4, g, g * B)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag11:
             # group sweep: deeper pipelines are latency bound with stages 40-50% busy (diag10), so put more groups
             # in flight; --cache-ram 0 + lazy readback (bs_l1)
@@ -693,20 +709,27 @@ class Master:
                 if kind.startswith("bs_h"):
                     hd_s, ml_s = kind[4:].split("m")
                     hd, ml = int(hd_s), (int(ml_s) or None)
+                if kind.startswith(("bs_v", "bs_w")):
+                    ml = None
+                    hd = int(kind[4:]) if kind.startswith("bs_w") else 0
                 args, p = split(s, g, False, True, ml, hd)
                 # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
-                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h")):
+                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w")):
                     args += ["--cache-ram", "0"]
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h")):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h", "bs_v", "bs_w")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
                     env["LLAMA_GROUP_LAUNCH_INBOX"] = kind[4]
                 if kind.startswith(("bs_l", "bs_k")):
                     env["LLAMA_BACKEND_SAMPLING_LAZY_READBACK"] = kind[4]
+                if kind.startswith("bs_v"):
+                    env["GGML_RPC_P2P"] = kind[4]
+                    env["LLAMA_RPC_PIPELINE_PARALLEL"] = kind[5]
+                    env["GGML_RPC_ASYNC_COPY"] = kind[5]
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -851,6 +874,8 @@ def main():
     m.add_argument("--stages", default = "", help = "comma list of stage counts (default 2, min(4, w + 1), w + 1)")
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
+    m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag12", action = "store_true", help = "worker-to-worker copies x prefill pipeline parallel x stage weights (use with --peer-allow)")
     m.add_argument("--diag11", action = "store_true", help = "G sweep up to ~2S at 2-5 stages, --cache-ram 0 + lazy readback (use with --waves 8)")
     m.add_argument("--diag10", action = "store_true", help = "lazy backend-sampling readback off vs on, then 4-5 stages (use with --waves 8)")
     m.add_argument("--diag9", action = "store_true", help = "2..N+1 stages x G in (1, S, S+1), --cache-ram 0, even split (use with --waves 8)")
