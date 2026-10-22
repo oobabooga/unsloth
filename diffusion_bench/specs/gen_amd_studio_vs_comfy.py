@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Generate specs/amd_studio_vs_comfy.json: Unsloth Studio vs ComfyUI on gfx1151, per family, same prompt / seed /
+steps / size at ComfyUI's template operating point (outputs/comfy_defaults_audit.md; templates read from
+comfyui_workflow_templates_json at the pinned ComfyUI commit).
+
+Arms per family (tag = <fam>_<arm>):
+  s_def     Studio, its defaults (attention auto -> diffusers native -> torch SDPA; AOTriton on ROCm)
+  s_flash   Studio with attention_backend="flash" (DAO-AILab flash-attention, Triton AMD backend). On main the
+            ROCm gate drops the request (falls back to native); on the patched head it engages.
+  c_def     ComfyUI, README ROCm install (download.pytorch.org/whl/rocm7.2 torch), default flags
+  c_rock    ComfyUI, AMD gfx1151 torch (repo.amd.com/rocm/whl/gfx1151, the build Studio installs), default flags
+  c_flash   c_rock + --use-flash-attention (same DAO-AILab Triton AMD build) + --enable-dynamic-vram
+  c_kitchen c_rock + --use-ck-attention (Comfy Kitchen INT8 attention, quantized) + --enable-dynamic-vram
+
+Every ComfyUI file is public (token=False); each family's Studio repo is public too (FLUX.1-schnell via the
+unsloth mirror, since black-forest-labs/FLUX.1-schnell is gated).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+W = "$AMD_CI_WORK"
+COMFY_DIR = f"{W}/ComfyUI"
+PY = {"def": f"{W}/comfy_venv_default/bin/python", "rock": f"{W}/comfy_venv_rock/bin/python"}
+SDXL_NEG = ("color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, "
+            "text, logo, signature\n")
+
+MODELS = {
+    "zimage_turbo": {"repo": "Tongyi-MAI/Z-Image-Turbo", "download": {"ignore": ["*.png", "*.jpg", "*.webp", "assets/*"]}},
+    "comfy_zimage": {"repo": "Comfy-Org/z_image_turbo", "download": {"allow": [
+        "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+        "split_files/text_encoders/qwen_3_4b.safetensors", "split_files/vae/ae.safetensors"]}},
+    "flux2_klein_4b": {"repo": "black-forest-labs/FLUX.2-klein-4B", "download": {"ignore": ["*.png", "*.jpg"]}},
+    "comfy_klein": {"repo": "Comfy-Org/vae-text-encorder-for-flux-klein-4b",  # canonical id of Comfy-Org/flux2-klein-4B (renamed; the runner mirror 404s on the redirect)
+                     "download": {"allow": [
+        "split_files/diffusion_models/flux-2-klein-4b.safetensors",
+        "split_files/text_encoders/qwen_3_4b.safetensors", "split_files/vae/flux2-vae.safetensors"]}},
+    # One download serves both sides: diffusers folders for Studio, the single-file checkpoint for ComfyUI.
+    "sdxl_base": {"repo": "stabilityai/stable-diffusion-xl-base-1.0", "download": {"ignore": [
+        "*.bin", "*.onnx", "*.onnx_data", "*.msgpack", "*.ckpt", "*openvino*", "sd_xl_base_1.0_0.9vae.safetensors",
+        "*.png", "*.jpg"]}},
+    "flux1_schnell": {"repo": "unsloth/FLUX.1-schnell", "download": {"ignore": ["*.png", "*.jpg"]}},
+    "comfy_flux_te": {"repo": "comfyanonymous/flux_text_encoders",
+                      "download": {"allow": ["clip_l.safetensors", "t5xxl_fp16.safetensors"]}},
+    "qwen_image_21": {"repo": "Qwen/Qwen-Image-2.1", "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+                      "download": {"ignore": ["*.png", "*.jpg"]}},
+    "comfy_q21": {"repo": "Comfy-Org/Qwen-Image-2.1", "download": {"allow": [
+        "diffusion_models/qwen_image_2.1_bf16.safetensors", "text_encoders/qwen3vl_8b_bf16.safetensors",
+        "vae/qwen_image_2.1_vae_bf16.safetensors"]}},
+    "wan22_5b": {"repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+                 "download": {"ignore": ["*.png", "*.jpg", "*.gif", "*.mp4", "assets/*", "examples/*"]}},
+    "comfy_wan": {"repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "download": {"allow": [
+        "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+        "split_files/text_encoders/umt5_xxl_fp16.safetensors", "split_files/vae/wan2.2_vae.safetensors"]}},
+    "h3_gguf": {"repo": "unsloth/MiniMax-H3-GGUF", "download": {"allow": [
+        "minimax_h3_fl2va_pruned-Q8_0.gguf", "qwen3vl_32b_minimax_h3-Q4_K_M.gguf", "vae/*"]}},
+    "comfy_h3": {"repo": "Comfy-Org/MiniMax-H3", "download": {"allow": [
+        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "vae/minimax_h3_video_vae_int8_convrot.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"]}},
+}
+
+
+def m(alias: str, rel: str) -> str:
+    return f"$DBENCH_MODEL_{alias.upper()}/{rel}"
+
+
+# family key -> operating point (ComfyUI template) and the two sides' inputs
+FAMILIES = {
+    "zimg": {"studio_model": "@zimage_turbo", "studio_family": "z-image", "comfy_family": "z-image",
+             "fetch": "@comfy_zimage", "width": 1024, "height": 1024, "steps": 8, "short_steps": 3, "n": 2,
+             # No CFG on either side. diffusers' Z-Image guidance is pos + g * (pos - neg), so CFG is on for any
+             # g > 0; ComfyUI's cfg 1 is the no-CFG point. Before v4 the Studio cells inherited g = 1.0 (CFG on, a
+             # batch of two per step) while ComfyUI ran cfg 1.
+             "guidance": 0.0, "comfy_cfg": 1.0,
+             "template": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+             "files": {"dit": m("comfy_zimage", "split_files/diffusion_models/z_image_turbo_bf16.safetensors"),
+                       "te": m("comfy_zimage", "split_files/text_encoders/qwen_3_4b.safetensors"),
+                       "vae": m("comfy_zimage", "split_files/vae/ae.safetensors")}},
+    "klein": {"studio_model": "@flux2_klein_4b", "studio_family": "flux.2-klein", "comfy_family": "flux.2-klein",
+              "fetch": "@comfy_klein", "width": 1024, "height": 1024, "steps": 4, "short_steps": 2, "n": 2,
+              "template": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+              "files": {"dit": m("comfy_klein", "split_files/diffusion_models/flux-2-klein-4b.safetensors"),
+                        "te": m("comfy_klein", "split_files/text_encoders/qwen_3_4b.safetensors"),
+                        "vae": m("comfy_klein", "split_files/vae/flux2-vae.safetensors")}},
+    "sdxl": {"studio_model": "@sdxl_base", "studio_family": "sdxl", "comfy_family": "sdxl", "fetch": None,
+             "width": 1024, "height": 1024, "steps": 25, "short_steps": 5, "n": 2, "guidance": 7.0,
+             "negative_prompt": SDXL_NEG,
+             "template": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+             "files": {"checkpoint": m("sdxl_base", "sd_xl_base_1.0.safetensors")}},
+    "flux1": {"studio_model": "@flux1_schnell", "studio_family": "flux.1", "comfy_family": "flux.1",
+              "fetch": "@comfy_flux_te", "width": 1024, "height": 1024, "steps": 4, "short_steps": 2, "n": 2,
+              "template": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split "
+                          "files here so both sides run the same weights)",
+              "files": {"dit": m("flux1_schnell", "flux1-schnell.safetensors"),
+                        "te": [m("comfy_flux_te", "clip_l.safetensors"), m("comfy_flux_te", "t5xxl_fp16.safetensors")],
+                        "vae": m("flux1_schnell", "ae.safetensors")}},
+    "q21": {"studio_model": "@qwen_image_21", "studio_family": "qwen-image-2.1", "comfy_family": "qwen-image-2.1",
+            "fetch": "@comfy_q21", "width": 1024, "height": 1024, "steps": 25, "short_steps": 5, "n": 1,
+            "guidance": 1.0, "template": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+            "files": {"dit": m("comfy_q21", "diffusion_models/qwen_image_2.1_bf16.safetensors"),
+                      "te": m("comfy_q21", "text_encoders/qwen3vl_8b_bf16.safetensors"),
+                      "vae": m("comfy_q21", "vae/qwen_image_2.1_vae_bf16.safetensors")}},
+    "wan": {"studio_model": "@wan22_5b", "studio_family": "wan2.2-ti2v-5b", "comfy_family": "wan2.2-5b",
+            "fetch": "@comfy_wan", "kind": "video", "prompts": "video_3", "width": 1280, "height": 704, "frames": 21,
+            "fps": 24, "steps": 20, "short_steps": 4, "n": 1, "guidance": 5.0,
+            "template": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in "
+                        "the template; 21 here: a short clip)",
+            "files": {"dit": m("comfy_wan", "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"),
+                      "te": m("comfy_wan", "split_files/text_encoders/umt5_xxl_fp16.safetensors"),
+                      "vae": m("comfy_wan", "split_files/vae/wan2.2_vae.safetensors")}},
+    "h3": {"studio_family": "minimax-h3", "comfy_family": "minimax-h3",
+           "fetch": "@comfy_h3", "kind": "video", "prompts": "video_3", "width": 832, "height": 480, "frames": 39,
+           "fps": 24, "steps": 20, "short_steps": 4, "n": 1,
+           "template": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+           # Studio resolves H3's components from the GGUF repo id itself (unsloth/minimax-h3-gguf -> Comfy-Org/
+           # MiniMax-H3); base_repo only takes unsloth/* or official repos, so pass the repo id, not a local dir.
+           "studio_model": "unsloth/MiniMax-H3-GGUF",
+           "studio_options": {"model_kind": "gguf", "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+                              "local_files_only": False},
+           "files": {"dit": m("comfy_h3", "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+                     "te": m("comfy_h3", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+                     "vae": m("comfy_h3", "vae/minimax_h3_video_vae_int8_convrot.safetensors"),
+                     "audio_vae": m("comfy_h3", "vae/minimax_h3_audio_vae_fp32.safetensors")}},
+}
+
+
+def common(f: dict) -> dict:
+    c = {k: f[k] for k in ("width", "height", "steps", "short_steps", "n") if k in f}
+    for k in ("kind", "prompts", "frames", "fps", "guidance", "negative_prompt"):
+        if k in f:
+            c[k] = f[k]
+    c["note"] = f["template"]
+    return c
+
+
+def cells() -> list:
+    out = []
+    for fam, f in FAMILIES.items():
+        sopts = {"family_override": f["studio_family"], "model_kind": "pipeline", **(f.get("studio_options") or {})}
+        base = common(f)
+        # Studio's server sets TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 at the top of studio/backend/main.py (and
+        # unsloth/__init__.py does too); the in-process backend imports neither, so set it here as the product does.
+        # Without it torch's SDPA on gfx1151 refuses flash / efficient and runs math (run 37130594778, job 1).
+        senv = {"DBENCH_ATTN_PROFILE": "1", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"}
+        out.append({"tag": f"{fam}_s_def", "backend": "studio", "model": f["studio_model"], "ref": f"{fam}_s_def",
+                    **base, "options": sopts, "env": dict(senv)})
+        out.append({"tag": f"{fam}_s_flash", "backend": "studio", "model": f["studio_model"], "ref": f"{fam}_s_def",
+                    **base, "options": {**sopts, "attention_backend": "flash"},
+                    "env": {**senv, "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}})
+        # Follow-up levers (run 37136344284): the speed tier ROCm never leaves when the UI sends "auto" (eager runs
+        # the fused norm / arch patches without compile), and for video the decode path (VAE tiling Studio always
+        # enables, MIOpen convs ComfyUI disables on AMD). Harness-only switches, see backends/studio_inproc.py.
+        if fam in ("zimg", "klein", "flux1"):
+            out.append({"tag": f"{fam}_s_eager", "backend": "studio", "model": f["studio_model"], "ref": f"{fam}_s_def",
+                        **base, "options": {**sopts, "speed_mode": "eager"},
+                        "env": {**senv, "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"}})
+        if fam == "klein":
+            # The AOTriton opt-in left to Studio itself (no harness env): main runs SDPA math here, the head with
+            # the inference-package opt-in gets AOTriton (studio/amd-diffusion-aotriton-optin).
+            out.append({"tag": "klein_s_noflag", "backend": "studio", "model": f["studio_model"], "ref": "klein_s_def",
+                        **base, "options": sopts, "env": {"DBENCH_ATTN_PROFILE": "1"}})
+        if fam == "zimg":
+            out.append({"tag": "zimg_s_defx", "backend": "studio", "model": f["studio_model"], "ref": "zimg_s_defx",
+                        **base, "options": sopts, "env": {**senv, "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"},
+                        "note": "zimg_s_def with the unified-memory refusal bypassed, so the speed is measurable"})
+        if fam == "h3":
+            # v5: the native (sd.cpp) H3 load resident on a ROCm APU vs streamed (kill switch). One warm clip per
+            # cell, no long/short pair: a streamed clip took 1873 s here. Group first, so the in-cell download
+            # (Studio loads by repo id) lands in that cell's load time only.
+            h3c = {k: v for k, v in base.items() if k not in ("short_steps",)}
+            h3c.update(n = 1, short_n = 0, short_steps = 0)
+            out.append({"tag": "h3_s_group", "backend": "studio", "model": f["studio_model"], "ref": "h3_s_group",
+                        **h3c, "options": sopts, "env": {"UNSLOTH_H3_APU_RESIDENT": "0"}})
+            out.append({"tag": "h3_s_res", "backend": "studio", "model": f["studio_model"], "ref": "h3_s_group",
+                        **h3c, "options": sopts, "env": {}})
+        if fam == "zimg":
+            # v4: unset speed (what the UI's "auto" sends) vs an explicit off; head = the ROCm eager-tier branch.
+            ox = {**senv, "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"}
+            out.append({"tag": "zimg_s_unset", "backend": "studio", "model": f["studio_model"], "ref": "zimg_s_off",
+                        **base, "options": sopts, "env": dict(ox)})
+            out.append({"tag": "zimg_s_off", "backend": "studio", "model": f["studio_model"], "ref": "zimg_s_off",
+                        **base, "options": {**sopts, "speed_mode": "off"}, "env": dict(ox)})
+        if fam == "wan":
+            # v4: Studio's default video decode vs the fp32 decode pinned by the kill switch (a no-op on main);
+            # head = the ROCm bf16 VAE decode branch. LPIPS(wan_s_vae vs wan_s_vaefp32) bounds the decode change.
+            out.append({"tag": "wan_s_vae", "backend": "studio", "model": f["studio_model"], "ref": "wan_s_vaefp32",
+                        **base, "options": sopts, "env": dict(senv)})
+            out.append({"tag": "wan_s_vaefp32", "backend": "studio", "model": f["studio_model"],
+                        "ref": "wan_s_vaefp32", **base, "options": sopts,
+                        "env": {**senv, "UNSLOTH_VIDEO_VAE_BF16_DECODE": "0"}})
+        if fam == "wan":
+            for tag, env in (("wan_s_notile", {"DBENCH_VAE_TILING": "0"}),
+                             ("wan_s_nocudnn", {"DBENCH_CUDNN_ENABLED": "0"}),
+                             ("wan_s_nocudnn_notile", {"DBENCH_CUDNN_ENABLED": "0", "DBENCH_VAE_TILING": "0"})):
+                out.append({"tag": tag, "backend": "studio", "model": f["studio_model"], "ref": "wan_s_def", **base,
+                            "options": sopts, "env": {**senv, **env}})
+        arms = {"c_def": ("def", None, {}), "c_rock": ("rock", None, {}),
+                "c_flash": ("rock", "--use-flash-attention --enable-dynamic-vram",
+                            {"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}),
+                "c_kitchen": ("rock", "--use-ck-attention --enable-dynamic-vram", {})}
+        for arm, (venv, flags, env) in arms.items():
+            opts = {"family": f["comfy_family"], "files": f["files"]}
+            if "comfy_cfg" in f:
+                opts["cfg"] = f["comfy_cfg"]
+            if flags:
+                opts["comfy_args"] = flags
+            cell = {"tag": f"{fam}_{arm}", "backend": "comfyui", "venv": None, "ref": f"{fam}_c_rock", **base,
+                    "options": opts,
+                    "env": {"DIFFUSION_BENCH_COMFY_PYTHON": PY[venv], "DIFFUSION_BENCH_COMFY_DIR": COMFY_DIR, **env}}
+            if f.get("fetch"):
+                cell["model"] = f["fetch"]  # never read by the comfyui backend; makes the probe fetch the files
+            elif fam == "sdxl":
+                cell["model"] = "@sdxl_base"
+            out.append(cell)
+    return out + v6_cells(out)
+
+
+# v6 knobs filled in once the parallel investigations name them (None = cell not generated).
+# K1: comfy-kitchen's HIP backend off (comfy_kitchen/backends/hip/__init__.py, exact "1", 0.2.25+; ComfyUI then
+# falls through to kitchen's eager torch path, since it disables kitchen's cuda / triton backends on ROCm).
+KITCHEN_HIP_OFF_ENV: dict = {"COMFY_KITCHEN_DISABLE_HIP": "1"}
+# Studio fused RoPE / AdaLN (studio/amd-diffusion-fused-rope): auto = on for ROCm, so on that head s_def is the
+# fused arm and these switches give the unfused (and RoPE-only) arms.
+STUDIO_NOFUSED_ENV: dict = {"UNSLOTH_DIFFUSION_FUSED_ROPE": "0", "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"}
+STUDIO_ROPEONLY_ENV: dict = {"UNSLOTH_DIFFUSION_FUSED_ROPE": "1", "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"}
+# T1: torch 2.11.0+rocm7.2 (what studio/amd-strix-pytorch-rocm72 installs: Studio caps ROCm torch < 2.12);
+# T1b: torch 2.14.1+rocm7.2 (what ComfyUI's README venv resolved on the runner). Same index, download.pytorch.org.
+PT72_PY = f"{W}/studio_pt72/bin/python"
+PT72N_PY = f"{W}/studio_pt72n/bin/python"
+
+
+def v6_cells(prior: list) -> list:
+    """v6 (study outputs/comfy_amd_study/analysis.json): V2 / M1-M3 Wan decode levers, F1 / K1 / D1 / G1 image levers,
+    V1 2048^2 decodes, T1 Studio on the pytorch.org rocm7.2 torch, E1 eager tier. Reference arms get two *_repeat
+    copies (A/A: the criteria gate their LPIPS vs the original at the noise floor)."""
+    by = {c["tag"]: c for c in prior}
+    out: list = []
+
+    def derive(src: str, tag: str, ref: Optional[str] = None, env: Optional[dict] = None, opts: Optional[dict] = None,
+               **kw) -> None:
+        c = json.loads(json.dumps(by[src]))
+        c["tag"] = tag
+        c["ref"] = ref or c.get("ref")
+        if env:
+            c["env"] = {**c.get("env", {}), **env}
+        if opts:
+            c["options"] = {**c.get("options", {}), **opts}
+        c.update(kw)
+        if c.get("kind") == "video":
+            c.update(n = 1, short_n = 0)  # one warm clip; s/step from the backend's own step timing
+        out.append(c)
+        by[tag] = c
+
+    def repeats(tag: str) -> None:
+        for i in (2, 3):
+            derive(tag, f"{tag}_{i}_repeat", ref = tag)
+
+    # Wan decode: weights cast (default on the branch) vs autocast vs fp32, MIOpen whole-process / VAE-only, tiling.
+    for t in ("wan_s_vae", "wan_s_vaefp32"):
+        by[t].update(n = 1, short_n = 0)
+    derive("wan_s_vae", "wan_s_vaeac", ref = "wan_s_vae", env = {"UNSLOTH_VIDEO_VAE_BF16_DECODE": "autocast"})
+    repeats("wan_s_vae")
+    derive("wan_s_vae", "wan_s_vae_nocudnn", ref = "wan_s_vae", env = {"DBENCH_CUDNN_ENABLED": "0"})
+    derive("wan_s_vae", "wan_s_vae_miopenvae", ref = "wan_s_vae", env = {"UNSLOTH_ROCM_VAE_MIOPEN": "0"})
+    derive("wan_s_vae", "wan_s_vae_notile", ref = "wan_s_vae", env = {"DBENCH_VAE_TILING": "0"})
+    derive("wan_s_vae", "wan_s_vae_nocudnn_notile", ref = "wan_s_vae",
+           env = {"DBENCH_CUDNN_ENABLED": "0", "DBENCH_VAE_TILING": "0"})
+    # ComfyUI side (same gfx1151 torch): MIOpen back on (M3), Kitchen HIP off (K1), dynamic VRAM alone (D1).
+    for fam in ("wan", "klein", "flux1", "q21", "sdxl"):
+        if fam in ("wan", "klein", "flux1"):
+            repeats(f"{fam}_c_rock")
+        if fam in ("wan", "sdxl"):
+            derive(f"{fam}_c_rock", f"{fam}_c_miopen", env = {"COMFYUI_ENABLE_MIOPEN": "1"})
+        if fam in ("wan", "klein", "flux1", "q21") and KITCHEN_HIP_OFF_ENV:
+            derive(f"{fam}_c_rock", f"{fam}_c_nockhip", env = dict(KITCHEN_HIP_OFF_ENV))
+        if fam in ("wan", "klein", "flux1"):
+            derive(f"{fam}_c_rock", f"{fam}_c_dyn", opts = {"comfy_args": "--enable-dynamic-vram"})
+    # F1: explicit flash vs default with A/A on both; G1 TunableOp; fused rope / AdaLN arm.
+    for fam in ("klein", "flux1"):
+        repeats(f"{fam}_s_def")
+        repeats(f"{fam}_s_flash")
+        derive(f"{fam}_s_def", f"{fam}_s_tunable", env = {"PYTORCH_TUNABLEOP_ENABLED": "1"})
+        derive(f"{fam}_s_def", f"{fam}_s_nofused", ref = f"{fam}_s_def", env = dict(STUDIO_NOFUSED_ENV))
+        derive(f"{fam}_s_def", f"{fam}_s_ropeonly", ref = f"{fam}_s_def", env = dict(STUDIO_ROPEONLY_ENV))
+    # V1: 2048^2 decode on both sides.
+    for fam in ("sdxl", "flux1"):
+        derive(f"{fam}_s_def", f"{fam}_s_2048", ref = f"{fam}_s_2048", width = 2048, height = 2048, n = 1)
+        derive(f"{fam}_c_rock", f"{fam}_c_rock_2048", ref = f"{fam}_c_rock_2048", width = 2048, height = 2048, n = 1)
+    # T1: the same Studio source in a venv on download.pytorch.org rocm7.2 torch (what ComfyUI's README installs).
+    for fam in ("klein", "flux1", "sdxl", "q21", "wan"):
+        derive(f"{fam}_s_def", f"{fam}_s_pt72", ref = f"{fam}_s_def", venv = PT72_PY)
+    repeats("klein_s_pt72")
+    for fam in ("klein", "flux1", "wan"):
+        derive(f"{fam}_s_def", f"{fam}_s_pt72n", ref = f"{fam}_s_def", venv = PT72N_PY)
+    # E1: the ROCm eager tier for an unset speed (head = studio/amd-diffusion-rocm-eager-tier).
+    for fam in ("klein", "flux1"):
+        derive(f"{fam}_s_def", f"{fam}_s_unset", ref = f"{fam}_s_off")
+        derive(f"{fam}_s_def", f"{fam}_s_off", ref = f"{fam}_s_off", opts = {"speed_mode": "off"})
+    for t in ("wan_s_def",):
+        by[t].update(n = 1, short_n = 0)
+    return out
+
+
+def main() -> None:
+    spec = {
+        "name": "amd_studio_vs_comfy",
+        "description": __doc__,
+        "models": MODELS,
+        "defaults": {"backend": "studio", "kind": "image", "prompts": "image_24", "n": 2, "warmup": 1, "short_n": 1,
+                     "options": {"local_files_only": True}},
+        "gate": {"max_util": 15, "min_free_mib": 0, "timeout_s": 600},
+        "cells": cells(),
+    }
+    out = Path(__file__).with_name("amd_studio_vs_comfy.json")
+    out.write_text(json.dumps(spec, indent = 1) + "\n", encoding = "utf-8")
+    print(f"wrote {out} ({len(spec['cells'])} cells)")
+
+
+if __name__ == "__main__":
+    main()
