@@ -1,0 +1,184 @@
+From ad0f5ea1fab94bfe5c349cae0cf3dfbfdafe3060 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 16:36:33 -0700
+Subject: [PATCH 1/2] server: n_probs reads the raw logits for a row that was
+ not sampled on the backend
+
+With --backend-sampling, a request with n_probs (and no post_sampling_probs)
+is sampled on the CPU, so its sequence has no backend sampler. When it shares
+a batch with sequences that do have one, the context allocates the backend
+sampling buffers, and llama_get_sampled_logits_count_ith() returns 0 for the
+CPU sampled row because no sampled logits were copied for it.
+get_token_probabilities() used that count for the raw logits it reads with
+llama_get_logits_ith(), so it returned an empty list: every token of the
+request got prob 1.0 (logprob 0) and no top probabilities. Alone (or with
+only other n_probs requests) the buffers are not allocated, the count falls
+back to n_vocab and the probabilities are correct.
+
+Use the backend sampled logits, candidates and count only when the row has
+backend sampled logits, as common_sampler's set_logits() does, and the raw
+logits over the full vocab otherwise.
+---
+ tools/server/server-common.cpp | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 98c72dec1..fb65961c7 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1586,10 +1586,20 @@ json format_response_rerank(
+ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
+     std::vector<llama_token_data> cur;
+ 
+-    const auto * logits = llama_get_logits_ith(ctx, idx);
+-    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
+-
+-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
++    // a row sampled on the backend carries its own (possibly filtered) logits and candidate ids;
++    // any other row uses the raw logits over the full vocab, even when other sequences of the
++    // same batch are sampled on the backend (their sampled logits count is 0 for this row)
++    const float * logits = llama_get_sampled_logits_ith(ctx, idx);
++    const llama_token * sampled_ids = nullptr;
++
++    int n_logits = 0;
++    if (logits) {
++        sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
++        n_logits    = llama_get_sampled_logits_count_ith(ctx, idx);
++    } else {
++        logits   = llama_get_logits_ith(ctx, idx);
++        n_logits = logits ? llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))) : 0;
++    }
+ 
+     cur.resize(n_logits);
+     if (sampled_ids) {
+-- 
+2.43.0
+
+
+From 851ea5052806006f4618d6cdd8788e17d0ba8e8d Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 22 Oct 2026 16:43:38 -0700
+Subject: [PATCH 2/2] llama: keep backend sampling chain tensors and partial
+ gathers as outputs when the sampled ids are gathered
+
+The sampled token gather (LLAMA_BS_BATCH_READBACK) appends GGML_OP_CONCAT
+nodes whose inputs depend on which output rows of the ubatch are active.
+ggml-alloc reuses the previous allocation plan for any graph with the same
+node and leaf count, so a plan made for one set of active rows was applied
+to another. A tensor that was free at the end of the first graph (the
+probs/logits/candidates of a chain without an output row, a partial
+gather) could be live in the second and get overwritten by a gather: with
+concurrent post_sampling_probs requests next to plain ones, about 1 in 100
+probs rows held the request's own sampled token id read as a float
+(prob 1.5e-40 instead of 1.0). With the gather off, or with a fresh
+allocation plan for every graph, the rows were correct.
+
+With the gather on, also mark the tensors of the inactive chains and the
+partial gathers as outputs, so the allocation of every graph with the same
+sampler set no longer depends on the active rows. LLAMA_BS_BATCH_READBACK=0
+is unchanged.
+---
+ src/llama-graph.cpp | 22 ++++++++++++++++++++++
+ src/llama-graph.h   |  4 ++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c2d41f363..5df0b7c84 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1392,6 +1392,7 @@ void llm_graph_result::reset() {
+     t_sampled_logits.clear();
+     t_candidates.clear();
+     t_sampled_runs.clear();
++    t_sampled_keep.clear();
+ 
+     params = {};
+ 
+@@ -1448,6 +1449,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+     for (const auto & run : t_sampled_runs) {
+         ggml_set_output(run.tensor);
+     }
++    for (auto * tensor : t_sampled_keep) {
++        ggml_set_output(tensor);
++    }
+     for (auto * tensor : t_sampled_probs) {
+         if (tensor != nullptr) {
+             ggml_set_output(tensor);
+@@ -4106,6 +4110,13 @@ void llm_graph_context::build_sampling() const {
+ 
+     static const std::vector<uint32_t> no_rows;
+ 
++    // the gather below makes the end of the graph depend on which rows are active, while ggml-alloc reuses the
++    // previous allocation plan for any graph with the same node count. a tensor freed in one graph (a chain
++    // without an output row, a partial gather) and live in the next can then be overwritten by a gather (seen:
++    // a dist probs row holding sampled token ids). keeping every chain's tensors and every partial gather as
++    // outputs makes the allocation independent of the active rows
++    const bool keep_inactive = cparams.sampling_batch_readback;
++
+     // every sampler builds n_outputs_max_per_seq chains, like the reserve, so the graph keeps its topology
+     // whatever rows the ubatch outputs: a chain without a row works on the first row and is not selected
+     for (const auto & [seq_id, sampler] : samplers) {
+@@ -4133,6 +4144,8 @@ void llm_graph_context::build_sampling() const {
+             if (data.sampled != nullptr) {
+                 if (active) {
+                     res->t_sampled[row] = data.sampled;
++                } else if (keep_inactive) {
++                    res->t_sampled_keep.push_back(data.sampled);
+                 }
+                 outs[1] = data.sampled;
+                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+@@ -4141,6 +4154,8 @@ void llm_graph_context::build_sampling() const {
+             if (data.probs != nullptr) {
+                 if (active) {
+                     res->t_sampled_probs[row] = data.probs;
++                } else if (keep_inactive) {
++                    res->t_sampled_keep.push_back(data.probs);
+                 }
+                 outs[1] = data.probs;
+                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+@@ -4149,6 +4164,8 @@ void llm_graph_context::build_sampling() const {
+             if (data.logits != nullptr) {
+                 if (active) {
+                     res->t_sampled_logits[row] = data.logits;
++                } else if (keep_inactive) {
++                    res->t_sampled_keep.push_back(data.logits);
+                 }
+                 outs[1] = data.logits;
+                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+@@ -4157,6 +4174,8 @@ void llm_graph_context::build_sampling() const {
+             if (data.candidates != nullptr) {
+                 if (active) {
+                     res->t_candidates[row] = data.candidates;
++                } else if (keep_inactive) {
++                    res->t_sampled_keep.push_back(data.candidates);
+                 }
+                 outs[1] = data.candidates;
+                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+@@ -4186,6 +4205,9 @@ void llm_graph_context::build_sampling() const {
+             if (end - row > 1) {
+                 ggml_tensor * cur = ggml_reshape_1d(ctx0, res->t_sampled[row], 1);
+                 for (uint32_t r = row + 1; r < end; ++r) {
++                    if (r > row + 1) {
++                        res->t_sampled_keep.push_back(cur);
++                    }
+                     cur = ggml_concat(ctx0, cur, ggml_reshape_1d(ctx0, res->t_sampled[r], 1), 0);
+                 }
+                 ggml_format_name(cur, "sampled_tokens_%u_%u", row, end - row);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 99fef8260..51bce5f61 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -978,6 +978,10 @@ public:
+     };
+     std::vector<sampled_run> t_sampled_runs;
+ 
++    // with the gather above: the tensors of the chains without an output row and the partial gathers, kept
++    // as outputs so the allocation does not depend on the active rows, see llm_graph_context::build_sampling
++    std::vector<ggml_tensor *> t_sampled_keep;
++
+     std::vector<llm_graph_input_ptr> inputs;
+     std::vector<llm_graph_fused_node> fused_nodes;
+ 
+-- 
+2.43.0
+
