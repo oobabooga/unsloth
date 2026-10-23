@@ -323,7 +323,7 @@ test("the budget closes while Run settles it, instead of racing the load", () =>
     .replace(/\/\/[^\n]*/g, "")
     .replace(/\s+/g, " ");
   // Looping the settle only shrinks the race window; locking the control closes it. The lock is
-  // taken before the settings save is awaited, so no drag lands while Run waits on it.
+  // taken before the settings save is awaited, so no drag changes it while Run waits on the save.
   assert.match(
     body,
     /setVramBudgetLocked\(true\); await persistConfig\([^)]*\); const stagedBudget = settleVramBudgetSave\(\);/,

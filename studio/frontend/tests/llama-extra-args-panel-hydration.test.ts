@@ -72,7 +72,7 @@ const ADAPTER = readFileSync(
 );
 
 test("a background auto-load sends the saved list, sanitized", () => {
-  // The startup load can run before the first read of the saved settings lands.
+  // The startup load can run before the first read of the saved settings has answered.
   assert.match(
     ADAPTER,
     /await ensureSavedModelConfigs\(\);\s*const \{ config \} = resolveInitialConfig\(/,

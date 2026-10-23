@@ -89,7 +89,7 @@ test("an unticked Load forgets only a Remember that was on", () => {
 test("a refused save is reported with the server's reason", () => {
   const persist = persistBody();
   assert.match(persist, REPORTS_THE_SERVER_REASON);
-  // Only a write that landed may let a later read of the saved settings replace the draft.
+  // Only a write the server accepted may let a later read of the saved settings replace the draft.
   assert.ok(
     persist.indexOf("clearModelConfigDraftEdited(draftKey)") >
       persist.indexOf("return null;"),

@@ -2833,7 +2833,7 @@ def test_the_sidebar_settings_editor_reseeds_when_the_live_config_lands():
         in page
     )
     assert "markModelConfigDraftEdited(draftKey)" in page
-    # Only once the write landed, and not over an edit typed while it was out.
+    # Only once the server accepted the write, and not over an edit typed while it was out.
     assert (
         "if (readModelConfigDraft(draftKey) === draftAtSave) { "
         "clearModelConfigDraftEdited(draftKey); }" in page

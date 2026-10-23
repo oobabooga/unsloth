@@ -2955,7 +2955,7 @@ export function ModelConfigPage({
   ]);
 
   // Re-read the saved settings each time an editor opens: a save from another tab, origin or the
-  // CLI lands on the server, and an untouched draft takes it. A stored list of launch flags becomes
+  // CLI is written to the server, and an untouched draft takes it. A stored list of launch flags becomes
   // an explicit one /load validates strictly, so flags this build refuses are dropped first.
   // biome-ignore lint/correctness/useExhaustiveDependencies: the model is the identity
   useEffect(() => {
@@ -3049,7 +3049,7 @@ export function ModelConfigPage({
   };
   const update = (patch: Partial<PerModelConfig>) => {
     handleSharedConfigEdit();
-    // Every control lands here and nothing else does, so only a user's edit keeps a re-read of the
+    // Every control calls this and nothing else does, so only a user's edit keeps a re-read of the
     // saved settings off the draft.
     markModelConfigDraftEdited(draftKey);
     setConfig((current) => ({
