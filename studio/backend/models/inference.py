@@ -119,6 +119,13 @@ class LoadRequest(BaseModel):
         False,
         description = "Start a fresh runtime even when the active settings already match",
     )
+    use_saved_settings: bool = Field(
+        True,
+        description = "Fill every field this request leaves out from the launch settings saved "
+        "for this model in Studio (Run settings / model load settings), the same row the API "
+        "auto-switch applies. A field the request sets always wins. The Studio UI sends false: "
+        "it has already resolved its own settings into the request.",
+    )
     alongside: bool = Field(
         False,
         description = "Keep the loaded model and serve this one next to it",
@@ -2093,6 +2100,11 @@ class LoadResponse(_InferenceRuntimeFields):
     """Response after loading a model"""
 
     status: str = Field(..., description = "Load status")
+    saved_settings_applied: list[str] = Field(
+        default_factory = list,
+        description = "LoadRequest fields this load took from the model's saved launch settings "
+        "because the request left them out (see use_saved_settings). Empty when none applied.",
+    )
     model: str = Field(..., description = "Model identifier")
     display_name: str = Field(..., description = "Display name of the model")
     is_lora: bool = Field(False, description = "Whether model is a LoRA adapter")

@@ -965,12 +965,11 @@ class HttpChatBackend:
         llama_extra_args: Optional[List[str]] = None,
     ) -> None:
         typer.echo(f"Loading {model} on the Unsloth server", err = True)
-        payload = {
-            "model_path": model,
-            "hf_token": hf_token,
-            "max_seq_length": max_seq_length,
-            "tensor_parallel": tensor_parallel,
-        }
+        # tensor_parallel=False must be sent to turn off a split inherited from the resident load.
+        # A context of 0 is left out so the server fills in the length saved for this model.
+        payload = {"model_path": model, "hf_token": hf_token, "tensor_parallel": tensor_parallel}
+        if max_seq_length:
+            payload["max_seq_length"] = max_seq_length
         if load_in_4bit is not None:
             payload["load_in_4bit"] = load_in_4bit
         if llama_extra_args:

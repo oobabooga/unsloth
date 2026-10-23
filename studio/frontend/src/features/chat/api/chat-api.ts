@@ -432,6 +432,8 @@ export async function loadModel(
             hf_token: preparedToken.token,
             native_path_lease: payload.nativePathLease ?? null,
             nativePathLease: undefined,
+            // The picker already resolved this model's saved settings into the payload.
+            use_saved_settings: false,
           }),
           signal: options?.signal,
         });

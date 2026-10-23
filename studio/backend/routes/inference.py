@@ -11735,7 +11735,6 @@ async def _maybe_auto_switch_model(
         get_openai_auto_switch_enabled,
         get_model_override,
         idle_unload_is_configured,
-        model_override_load_kwargs,
     )
     from core.inference.local_model_resolver import (
         local_gguf_companion_roots,
@@ -12314,15 +12313,16 @@ async def _maybe_auto_switch_model(
                         # cached repo has no path entry and resolves on the second try; an
                         # early build keyed a loose .gguf by its filename label, so
                         # "<path>:LABEL" is read too, after the bare path used today.
-                        from utils.openai_auto_switch_settings import (
-                            resolve_override_for_load,
-                            stored_gpu_index_kind,
-                        )
-
                         # The candidate order above, kept in one place so the panel
                         # showing a user what a load will apply reads the same row.
-                        _override_key, override = resolve_override_for_load(
-                            target_id, override_id, variant
+                        from utils.openai_auto_switch_settings import saved_load_settings
+
+                        _override_key, override, saved_kwargs = await saved_load_settings(
+                            target_id,
+                            override_id,
+                            variant,
+                            is_gguf = target_is_gguf,
+                            gpu_ids_resolve = _override_gpu_ids_still_resolve,
                         )
                         if require_speech and resolved is not None and speech_budget is not None:
                             target_context = await asyncio.to_thread(
@@ -12353,26 +12353,11 @@ async def _maybe_auto_switch_model(
                                     ),
                                 )
                         load_kwargs = {"model_path": target_id, "gguf_variant": variant}
-                        load_kwargs.update(
-                            model_override_load_kwargs(override, is_gguf = target_is_gguf)
-                        )
+                        load_kwargs.update(saved_kwargs)
                         if caller_hf_token:
                             load_kwargs["hf_token"] = caller_hf_token
                         if beside:
                             load_kwargs["alongside"] = True
-                        saved_gpu_ids = load_kwargs.get("gpu_ids")
-                        if saved_gpu_ids and not await _override_gpu_ids_still_resolve(
-                            saved_gpu_ids, stored_gpu_index_kind(override)
-                        ):
-                            # Stale pin (GPU removed, another host, or a backend change
-                            # renumbering these ids): drop it rather than 400 the load.
-                            load_kwargs.pop("gpu_ids", None)
-                            load_kwargs.pop("tensor_split", None)
-                            logger.warning(
-                                "Dropping saved gpu_ids %s for %s: not available here.",
-                                saved_gpu_ids,
-                                override_id,
-                            )
                         # Reuse the load impl so its dedup, tensor fallback, and threading
                         # apply. Call the impl directly: we already hold the lifecycle gate
                         # the /load route would otherwise take, so the route would deadlock.
@@ -16484,6 +16469,47 @@ async def _validate_reasoning_budget_preflight(
         raise HTTPException(status_code = 400, detail = str(exc)) from exc
 
 
+async def _apply_saved_load_settings(request: LoadRequest) -> "tuple[LoadRequest, list[str]]":
+    """``request`` with every field it left out filled from the model's saved launch settings.
+
+    A field the caller set always wins. The UI opts out because it resolves its own settings.
+    """
+    if not request.use_saved_settings or not request.model_path:
+        return request, []
+    from utils.openai_auto_switch_settings import saved_load_settings
+
+    alias = request._override_alias_id
+    is_gguf = bool(request.gguf_variant)
+    if not is_gguf:
+        from core.inference.local_model_resolver import local_target_is_gguf
+        is_gguf = await asyncio.to_thread(
+            local_target_is_gguf, request.model_path, alias or request.model_path
+        )
+    try:
+        _key, _row, saved = await saved_load_settings(
+            request.model_path,
+            alias,
+            request.gguf_variant,
+            is_gguf = is_gguf,
+            gpu_ids_resolve = _override_gpu_ids_still_resolve,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a load never fails on reading a preference
+        logger.warning("Could not read saved launch settings for %s: %s", request.model_path, exc)
+        return request, []
+    missing = {name: value for name, value in saved.items() if name not in request.model_fields_set}
+    if not missing:
+        return request, []
+    merged = LoadRequest(**{**request.model_dump(exclude_unset = True), **missing})
+    # Private attributes are not fields; carry them over by hand.
+    for attr in getattr(LoadRequest, "__private_attributes__", {}):
+        setattr(merged, attr, getattr(request, attr))
+    applied = sorted(missing)
+    logger.info(
+        "Applied saved launch settings to load of %s: %s", request.model_path, ", ".join(applied)
+    )
+    return merged, applied
+
+
 async def _override_gpu_ids_still_resolve(
     gpu_ids: List[int], stored_index_kind: str = "physical"
 ) -> bool:
@@ -18928,11 +18954,20 @@ async def load_model(
     back to default.yaml for missing values.
 
     GGUF models load via llama-server (llama.cpp) instead of Unsloth.
+
+    Fields left out take the model's saved launch settings unless ``use_saved_settings`` is false.
     """
-    return await _tunnel_safe_json(
-        load_model_gated(request, fastapi_request, current_subject, user_initiated = True),
-        label = "Model load",
-    )
+    request, applied = await _apply_saved_load_settings(request)
+
+    async def _load_and_report():
+        result = await load_model_gated(
+            request, fastapi_request, current_subject, user_initiated = True
+        )
+        if applied and isinstance(result, LoadResponse):
+            result.saved_settings_applied = applied
+        return result
+
+    return await _tunnel_safe_json(_load_and_report(), label = "Model load")
 
 
 def _repo_is_in_the_hub_cache(model_ref) -> Optional[bool]:

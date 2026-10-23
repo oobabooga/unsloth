@@ -558,13 +558,11 @@ def test_run_rejects_invalid_gpu_memory_mode(monkeypatch):
 @pytest.mark.parametrize(
     "mode,expected",
     [
-        ("auto", {"model_path": "owner/model-GGUF", "max_seq_length": 0, "load_in_4bit": True}),
+        ("auto", {"model_path": "owner/model-GGUF"}),
         (
             "manual",
             {
                 "model_path": "owner/model-GGUF",
-                "max_seq_length": 0,
-                "load_in_4bit": True,
                 "gpu_memory_mode": "manual",
                 "gpu_layers": -1,
             },
@@ -1035,3 +1033,34 @@ def test_in_venv_path_passes_api_only_to_run_server(
     assert (
         captured.get("emit_tauri_port") is False
     ), f"run_server got emit_tauri_port={captured.get('emit_tauri_port')!r}, expected False"
+
+
+@pytest.mark.parametrize(
+    "max_seq_length,load_in_4bit,expected",
+    [
+        (0, True, {"model_path": "m"}),
+        (32768, True, {"model_path": "m", "max_seq_length": 32768}),
+        (0, False, {"model_path": "m", "load_in_4bit": False}),
+    ],
+)
+def test_load_model_http_payload_sends_only_what_differs_from_the_default(
+    monkeypatch, max_seq_length, load_in_4bit, expected
+):
+    """A default left out lets the server fill it from the settings saved for the model."""
+    studio_mod = _load_run_command()
+    captured = {}
+
+    def urlopen(request, timeout):
+        captured["request"] = request
+        return BytesIO(b'{"model": "m"}')
+
+    monkeypatch.setattr(studio_mod, "_direct_urlopen", urlopen)
+    studio_mod._load_model_via_http(
+        port = 8888,
+        api_key = "sk-test",
+        model = "m",
+        gguf_variant = None,
+        max_seq_length = max_seq_length,
+        load_in_4bit = load_in_4bit,
+    )
+    assert json.loads(captured["request"].data) == expected

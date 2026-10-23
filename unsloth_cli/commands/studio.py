@@ -1737,11 +1737,12 @@ def _load_model_via_http(
 
     from unsloth_cli._inference import raise_for_deferred_error, require_completed_padded_body
 
-    payload: dict = {
-        "model_path": model,
-        "max_seq_length": max_seq_length,
-        "load_in_4bit": load_in_4bit,
-    }
+    payload: dict = {"model_path": model}
+    # Defaults are left out so the server fills them from the settings saved for this model.
+    if max_seq_length:
+        payload["max_seq_length"] = max_seq_length
+    if not load_in_4bit:
+        payload["load_in_4bit"] = False
     if gguf_variant:
         payload["gguf_variant"] = gguf_variant
     if gpu_memory_mode == "manual":
@@ -1852,6 +1853,14 @@ def _engine_install_notice(engine: str, row: dict) -> Optional[str]:
         "may ask you to restart before the installation can finish. Nothing changes unless you "
         "answer yes."
     )
+
+
+def _format_saved_settings_line(load_result: dict) -> Optional[str]:
+    applied = load_result.get("saved_settings_applied")
+    if not isinstance(applied, list) or not applied:
+        return None
+    names = ", ".join(str(name) for name in applied if isinstance(name, str))
+    return f"  Saved settings: {names} (from this model's settings in Studio)" if names else None
 
 
 def _format_context_length_line(load_result: dict) -> Optional[str]:
@@ -2428,7 +2437,8 @@ def run(
         "--max-seq-length",
         "--context-length",
         rich_help_panel = _RUN_PANEL_MODEL,
-        help = "Runtime context length in tokens (0 = model default for GGUF; 2048 for hub models)",
+        help = "Runtime context length in tokens (0 = the length saved for this model in Studio, "
+        "else the model default for GGUF and 2048 for hub models)",
     ),
     gpu_memory_mode: Literal["auto", "manual"] = typer.Option(
         "auto",
@@ -3104,6 +3114,7 @@ def run(
     loaded_model = result.get("model", model)
     display_variant = f" ({gguf_variant})" if gguf_variant else ""
     context_length_line = _format_context_length_line(result)
+    saved_settings_line = _format_saved_settings_line(result)
 
     display_host = _display_host_for_bind(run_mod, host)
     base_host = _openable_host_for_bind(run_mod, host)
@@ -3146,6 +3157,8 @@ def run(
         typer.echo(f"  Model loaded: {loaded_model}{display_variant}")
         if context_length_line:
             typer.echo(context_length_line)
+        if saved_settings_line:
+            typer.echo(saved_settings_line)
         typer.echo(f"  API Key:      {api_key}")
         typer.echo("")
         # An NPU model serves /v1/chat/completions only: no Anthropic or streaming Responses example.
@@ -3186,6 +3199,8 @@ def run(
             _emit_run_cloudflare_notice(run_mod, host, display_host, actual_port, secure)
         if context_length_line:
             typer.echo(context_length_line.strip())
+        if saved_settings_line:
+            typer.echo(saved_settings_line.strip())
         typer.echo(f"API Key: {api_key}")
         typer.secho(_tool_notice, fg = _tool_notice_fg, bold = True)
 

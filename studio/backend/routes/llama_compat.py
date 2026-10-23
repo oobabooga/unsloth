@@ -484,11 +484,6 @@ async def _resolve_load_target(model_id: str):
     from core.inference.local_model_resolver import local_target_is_gguf
     from core.inference.openai_auto_download import split_model_ref
     from models.inference import LoadRequest
-    from utils.openai_auto_switch_settings import (
-        model_override_load_kwargs,
-        resolve_override_for_load,
-        stored_gpu_index_kind,
-    )
 
     public_id, _, pinned = await _catalog_row(model_id)
     resolved = await _resolve_local(public_id)
@@ -500,16 +495,17 @@ async def _resolve_load_target(model_id: str):
         return LoadRequest(model_path = public_id), public_id
     model_path, variant, loader_id = resolved[:3]
     alias = loader_id or split_model_ref(public_id)[0]
-    _, override = resolve_override_for_load(model_path, alias, variant)
     # Not from the variant: a single-file GGUF or an Ollama tag resolves with no quant to pin.
     is_gguf = await asyncio.to_thread(local_target_is_gguf, model_path, alias)
-    kwargs = model_override_load_kwargs(override, is_gguf = is_gguf)
-    # A stale pin (GPU removed or renumbered) is dropped, as auto-switch does, rather than 400 the load.
-    if kwargs.get("gpu_ids") and not await _inference()._override_gpu_ids_still_resolve(
-        kwargs["gpu_ids"], stored_gpu_index_kind(override)
-    ):
-        kwargs.pop("gpu_ids", None)
-        kwargs.pop("tensor_split", None)
+    from utils.openai_auto_switch_settings import saved_load_settings
+
+    _, _, kwargs = await saved_load_settings(
+        model_path,
+        alias,
+        variant,
+        is_gguf = is_gguf,
+        gpu_ids_resolve = lambda ids, kind: _inference()._override_gpu_ids_still_resolve(ids, kind),
+    )
     request = LoadRequest(model_path = model_path, gguf_variant = variant, **kwargs)
     request._override_alias_id = alias
     request._advertised_id = alias

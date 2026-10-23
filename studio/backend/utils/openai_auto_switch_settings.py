@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from picker.schemas import MAX_CHAT_TEMPLATE_BYTES
 from utils.reasoning_budget import validate_reasoning_budget_message
@@ -913,6 +913,40 @@ def override_lookup_candidates(
         if key and key not in seen:
             seen.append(key)
     return seen
+
+
+async def saved_load_settings(
+    load_id: str,
+    alias_id: Optional[str],
+    variant: Optional[str],
+    *,
+    is_gguf: bool,
+    gpu_ids_resolve: Optional[Callable[[list[int], str], Awaitable[bool]]] = None,
+) -> tuple[Optional[str], dict, dict[str, Any]]:
+    """``(stored key, saved row, LoadRequest kwargs)`` for the launch settings saved for a model.
+
+    Every load path reads the row here so a model loads with the same settings whoever asks.
+    The caller supplies ``gpu_ids_resolve`` because the GPU check lives with the hardware code.
+    """
+    key, override = resolve_override_for_load(load_id, alias_id, variant)
+    kwargs = model_override_load_kwargs(override, is_gguf = is_gguf)
+    saved_gpu_ids = kwargs.get("gpu_ids")
+    if (
+        saved_gpu_ids
+        and gpu_ids_resolve is not None
+        and not await gpu_ids_resolve(saved_gpu_ids, stored_gpu_index_kind(override))
+    ):
+        # Stale pin (GPU removed, another host, or a backend change renumbering these ids).
+        kwargs.pop("gpu_ids", None)
+        kwargs.pop("tensor_split", None)
+        from loggers import get_logger
+
+        get_logger(__name__).warning(
+            "Dropping saved gpu_ids %s for %s: not available here.",
+            saved_gpu_ids,
+            alias_id or load_id,
+        )
+    return key, override, kwargs
 
 
 def resolve_override_for_load(
