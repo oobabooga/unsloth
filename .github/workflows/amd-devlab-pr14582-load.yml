@@ -1,0 +1,66 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-pr14582-load]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 50
+    steps:
+      - name: Hardware
+        shell: powershell
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-Table -AutoSize
+          python --version
+          exit 0
+
+      - name: Load progress probe (Studio's Windows Vulkan llama.cpp, b11798)
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $W = Join-Path $env:RUNNER_TEMP 'pr14582'
+          New-Item -ItemType Directory -Force -Path $W | Out-Null
+          Set-Location $W
+          $raw = "https://raw.githubusercontent.com/oobabooga/unsloth/$env:GITHUB_SHA/devlab"
+          foreach ($f in 'probe.py', 'pr_progress.py', 'main_progress.py') {
+            curl.exe -sSfL -o $f "$raw/$f"
+            if ($LASTEXITCODE -ne 0) { throw "download $f failed" }
+          }
+          python -m venv venv
+          .\venv\Scripts\python.exe -m pip install -q psutil==7.2.2
+          if ($LASTEXITCODE -ne 0) { throw "pip failed" }
+          curl.exe -sSfL -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b11798/llama-b11798-bin-win-vulkan-x64.zip
+          if ($LASTEXITCODE -ne 0) { throw "llama.cpp download failed" }
+          Expand-Archive llama.zip -DestinationPath llama
+          $server = (Get-ChildItem -Recurse llama -Filter llama-server.exe | Select-Object -First 1).FullName
+          cmd /c "`"$server`" --list-devices 2>&1"
+          $t = Get-Date
+          curl.exe -sSfL -o model.gguf https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf
+          if ($LASTEXITCODE -ne 0) { throw "model download failed" }
+          "model downloaded in {0:N0} s, {1} bytes" -f ((Get-Date) - $t).TotalSeconds, (Get-Item model.gguf).Length
+          # Best effort cold loads: RAMMap empties the standby list (file cache) before each load.
+          curl.exe -sSfL -o RAMMap.zip https://download.sysinternals.com/files/RAMMap.zip
+          Expand-Archive RAMMap.zip -DestinationPath rammap
+          $flush = "$W\rammap\RAMMap64.exe -accepteula -Et"
+          .\venv\Scripts\python.exe probe.py --server $server --model model.gguf --out results.json --flush $flush `
+            --run "vulkan-auto=-ngl 99" `
+            --run "vulkan-none=-ngl 99 --load-mode none" `
+            --run "vulkan-dio=-ngl 99 --load-mode dio" `
+            --run "cpu-auto=-ngl 0" `
+            --run "cpu-none=-ngl 0 --load-mode none"
+          "--- warm (no flush) ---"
+          .\venv\Scripts\python.exe probe.py --server $server --model model.gguf --out results-warm.json `
+            --run "warm-vulkan-auto=-ngl 99" `
+            --run "warm-vulkan-none=-ngl 99 --load-mode none"
+          "--- results.json ---"
+          Get-Content results.json
+          "--- results-warm.json ---"
+          Get-Content results-warm.json
+          "--- server logs ---"
+          Select-String -Path server-*.log -Pattern 'using device|load_mode|model buffer size|offloaded' | ForEach-Object { $_.ToString() }
+          exit 0
