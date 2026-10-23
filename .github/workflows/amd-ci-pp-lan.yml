@@ -30,7 +30,7 @@ jobs:
   worker:
     name: "worker ${{ matrix.index }} (Linux)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 170
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +73,7 @@ jobs:
           if-no-files-found: error
 
       - name: Serve the master until it is done
-        timeout-minutes: 120
+        timeout-minutes: 170
         run: |
           set -uo pipefail
           D="$AMD_CI_WORK/out/worker"; PID=$(cat "$D/control.pid")
@@ -108,7 +108,7 @@ jobs:
   master:
     name: "master (Linux)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 170
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -125,7 +125,7 @@ jobs:
           grep -q SETUP_OK "$AMD_CI_WORK/out/setup.log"
 
       - name: Pipeline-parallel sweep (master side)
-        timeout-minutes: 120
+        timeout-minutes: 170
         env:
           GH_API_TOKEN: ${{ github.token }}
         run: |
@@ -135,8 +135,8 @@ jobs:
           D="$AMD_CI_WORK/out/master"; mkdir -p "$D"
           echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
           python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" master --bin "$AMD_CI_WORK/llama/build-tls/bin" \
-            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --min-workers 2 --peer-allow --diag21 --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
-            --n-layer 48 --slots-per-group 16 --n-predict 64 --waves 8 --rounds 1 --wait-s 2700 2>&1 | tee "$D/master.log"
+            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --min-workers 4 --peer-allow --diag21 --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
+            --n-layer 48 --slots-per-group 16 --n-predict 64 --waves 8 --rounds 1 --wait-s 5400 2>&1 | tee "$D/master.log"
           echo "master rc=${PIPESTATUS[0]}"
           test -s "$D/master_result.json"
 
