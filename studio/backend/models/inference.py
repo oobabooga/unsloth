@@ -2233,6 +2233,13 @@ class LlamaFlagCatalogResponse(BaseModel):
 class InferenceStatusResponse(_InferenceRuntimeFields):
     """Current inference backend status"""
 
+    chat_capabilities: Optional[dict] = Field(
+        None,
+        description = "Which OpenAI chat controls the loaded engine honors: {engine, supported, "
+        "unsupported: {control: reason}}. A control listed as unsupported is refused by name "
+        "with a 400, never silently ignored. Null when no chat model is loaded.",
+    )
+
     resident_mib: Optional[int] = Field(
         None,
         description = "Best-effort memory the resident model holds, in MiB; null when unknown.",

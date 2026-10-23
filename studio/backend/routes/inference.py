@@ -19655,22 +19655,30 @@ async def _managed_engine_request(request):
     return request.model_copy(update = {"gpu_ids": gpu_ids})
 
 
-def _managed_engine_unsupported_controls(payload, model_info = None) -> bool:
-    """A spelled-out ``{"type": "text"}`` response_format is the default, not structured output."""
-    reasoning = (model_info or {}).get("reasoning_flags") is not None
-    return bool(
-        payload.use_adapter is not None
-        or _response_format_constrains_decoding(payload)
-        or payload.continue_final_message
-        or (
-            not reasoning
-            and (
-                payload.enable_thinking
-                or payload.preserve_thinking
-                or payload.reasoning_effort not in (None, "none")
-            )
-        )
+def _managed_engine_capabilities(model_info = None):
+    """The capability-table row for a managed vLLM / SGLang load."""
+    from core.inference.chat_capabilities import capabilities_for
+
+    info = model_info or {}
+    return capabilities_for(
+        info.get("engine") or "vllm",
+        reasoning_controls = info.get("reasoning_flags") is not None,
     )
+
+
+def _managed_engine_unsupported_control(payload, model_info = None):
+    """``(param, reason)`` for the first control a managed engine cannot honor, or None. A
+    spelled-out ``{"type": "text"}`` response_format is the default, not structured output."""
+    from core.inference.chat_capabilities import first_unsupported
+    return first_unsupported(
+        payload,
+        _managed_engine_capabilities(model_info),
+        constrains_decoding = _response_format_constrains_decoding,
+    )
+
+
+def _managed_engine_unsupported_controls(payload, model_info = None) -> bool:
+    return _managed_engine_unsupported_control(payload, model_info) is not None
 
 
 def _reject_unsupported_managed_kind(request, config) -> None:
@@ -23829,6 +23837,7 @@ async def get_status(current_subject: str, model: Optional[str] = None):
     if isinstance(response, InferenceStatusResponse):
         from utils.multi_model_settings import get_multi_model_mode
 
+        response.chat_capabilities = _status_chat_capabilities(response)
         response.multi_model_mode = await asyncio.to_thread(get_multi_model_mode)
         active = response.active_model
         response.serving = [active] if active else []
@@ -23846,6 +23855,32 @@ async def get_status(current_subject: str, model: Optional[str] = None):
                         response.serving.append(e["id"])
                         response.serving_checkpoints.append(checkpoint)
     return response
+
+
+def _status_chat_capabilities(response) -> Optional[dict]:
+    """The capability-table row for the loaded chat model, or None when nothing is loaded."""
+    if not response.active_model:
+        return None
+    from core.inference.chat_capabilities import capabilities_for
+
+    try:
+        if response.is_gguf:
+            return capabilities_for("gguf").describe()
+        if response.is_npu:
+            return capabilities_for("npu").describe()
+        if response.is_mlx:
+            return capabilities_for("mlx").describe()
+        if response.engine in ("vllm", "sglang"):
+            backend = _peek_inference_backend()
+            info = (
+                backend.models.get(backend.active_model_name, {})
+                if backend is not None and getattr(backend, "active_model_name", None)
+                else {}
+            )
+            return _managed_engine_capabilities({**info, "engine": response.engine}).describe()
+        return capabilities_for("transformers").describe()
+    except Exception:  # noqa: BLE001 -- an optional decoration on a status read
+        return None
 
 
 def _llama_resident_mib() -> Optional[int]:
@@ -31928,22 +31963,15 @@ def _refuse_npu_chat_request(payload, *, supports_vision: bool, supports_tools: 
     """Reject a chat request FastFlowLM cannot serve; also run before a switch to an NPU model."""
     if _wants_multiple_choices(payload):
         _raise_unsupported_n("NPU chat completions")
-    if _response_format_constrains_decoding(payload):
-        _raise_unsupported_openai_parameter(
-            "response_format", "FastFlowLM on the NPU has no guided decoding for response_format."
-        )
-    if getattr(payload, "seed", None) is not None:
-        _raise_unsupported_openai_parameter(
-            "seed", "FastFlowLM on the NPU does not take a sampling seed."
-        )
-    if getattr(payload, "frequency_penalty", 0.0):
-        _raise_unsupported_openai_parameter(
-            "frequency_penalty", "FastFlowLM on the NPU does not take a frequency penalty."
-        )
-    if getattr(payload, "logit_bias", None):
-        _raise_unsupported_openai_parameter(
-            "logit_bias", "FastFlowLM on the NPU does not take a logit bias."
-        )
+    from core.inference.chat_capabilities import capabilities_for, refuse_unsupported
+
+    # The capability table's NPU row: response_format, seed, frequency_penalty, logit_bias.
+    refuse_unsupported(
+        payload,
+        capabilities_for("npu"),
+        _raise_unsupported_openai_parameter,
+        constrains_decoding = _response_format_constrains_decoding,
+    )
     if payload.logprobs or payload.top_logprobs is not None:
         _raise_unsupported_openai_parameter(
             "logprobs", "FastFlowLM on the NPU does not report log probabilities."
@@ -33359,10 +33387,10 @@ async def produce_openai_chat_completions(
             or not _tools_outrank_response_format(payload, payload.tools)
         ):
             if not model_info.get("is_mlx"):
+                from core.inference.chat_capabilities import capabilities_for
                 _raise_unsupported_openai_parameter(
                     "response_format",
-                    "response_format needs a grammar engine, and the transformers backend "
-                    "has none; load an MLX or GGUF model to use it.",
+                    capabilities_for("transformers").unsupported["response_format"],
                 )
             if payload.tool_choice not in (None, "auto", "none"):
                 _raise_unsupported_openai_parameter(
@@ -36020,10 +36048,16 @@ async def produce_openai_chat_completions(
         else None
     )
     if _sf_model_info.get("engine") in ("vllm", "sglang"):
-        if _managed_engine_unsupported_controls(payload, _sf_model_info):
+        _unsupported = _managed_engine_unsupported_control(payload, _sf_model_info)
+        if _unsupported is not None:
+            # Named, like every other refusal: the one sentence this used to send covered four
+            # controls and said which of them the request had used for none.
+            _control, _reason = _unsupported
             raise _reject(
                 400,
-                "This engine integration does not support adapters, structured output, continuation or reasoning controls.",
+                openai_error_body(
+                    _reason, status = 400, code = "unsupported_parameter", param = _control
+                ),
             )
         from routes.managed_engine_chat import managed_tool_chat
 

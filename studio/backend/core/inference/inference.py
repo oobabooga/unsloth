@@ -54,7 +54,11 @@ from core.inference.chat_template_helpers import (
     tts_prompt_with_voice,
     tts_voice_options,
 )
-from core.inference.presence_penalty import _make_presence_penalty_processor
+from core.inference.presence_penalty import (
+    _make_presence_penalty_processor,
+    make_sampling_processors,
+    seeded_generation,
+)
 from core.inference.generation_timing import (
     GenerationTimer,
     build_generation_timings,
@@ -1658,6 +1662,9 @@ class InferenceBackend:
         presence_penalty: float = 0.0,
         tool_protocol_active: Optional[bool] = None,
         stop: Optional[list] = None,
+        seed: Optional[int] = None,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[dict] = None,
     ) -> Generator[str, None, None]:
         """Generate response for text or vision models (lock held by background thread).
 
@@ -1687,6 +1694,9 @@ class InferenceBackend:
             tool_protocol_active = tool_protocol_active,
             presence_penalty = presence_penalty,
             stop = stop,
+            seed = seed,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
         )
 
     def _generate_chat_response_inner(
@@ -1712,6 +1722,9 @@ class InferenceBackend:
         presence_penalty: float = 0.0,
         tool_protocol_active: Optional[bool] = None,
         stop: Optional[list] = None,
+        seed: Optional[int] = None,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[dict] = None,
     ) -> Generator[str, None, None]:
         """Inner generation logic.
 
@@ -1785,6 +1798,9 @@ class InferenceBackend:
                     preserve_thinking = preserve_thinking,
                     tool_protocol_active = tool_protocol_active,
                     stop = stop,
+                    seed = seed,
+                    frequency_penalty = frequency_penalty,
+                    logit_bias = logit_bias,
                 )
                 return
             else:
@@ -1941,6 +1957,9 @@ class InferenceBackend:
             else tool_protocol_active,
             add_special_tokens = add_special_tokens,
             stop = stop,
+            seed = seed,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
         )
 
     def _generate_deepseek_ocr_response(
@@ -2037,6 +2056,9 @@ class InferenceBackend:
         preserve_thinking: Optional[bool] = None,
         tool_protocol_active: Optional[bool] = None,
         stop: Optional[list] = None,
+        seed: Optional[int] = None,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[dict] = None,
     ) -> Generator[str, None, None]:
         """Handle vision model generation with true token-by-token streaming."""
         # Reset so a failed or uncountable run cannot surface stale stats.
@@ -2272,9 +2294,11 @@ class InferenceBackend:
                 top_k = top_k,
                 min_p = min_p,
             )
-            # Presence penalty (GGUF parity) for VLM chat.
+            # Presence / frequency penalty and logit bias (GGUF and MLX parity) for VLM chat.
             _pp = (
-                _make_presence_penalty_processor(presence_penalty, prompt_len)
+                make_sampling_processors(
+                    presence_penalty, prompt_len, frequency_penalty, logit_bias
+                )
                 if _vision_input_ids is not None
                 else None
             )
@@ -2316,7 +2340,9 @@ class InferenceBackend:
                         timer.start()
                         # See generate_stream: only the returned sequences carry
                         # an exact generated-token count.
-                        gen_outputs["sequences"] = model.generate(**generation_kwargs)
+                        # A request seed is honored per call and the RNG put back afterwards (MLX parity).
+                        with seeded_generation(seed):
+                            gen_outputs["sequences"] = model.generate(**generation_kwargs)
                     except Exception as e:
                         err["msg"] = str(e)
                         stop_streamer.abort()
@@ -2805,6 +2831,9 @@ class InferenceBackend:
         preserve_tool_tokens: bool = False,
         add_special_tokens: bool = True,
         stop: Optional[list] = None,
+        seed: Optional[int] = None,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[dict] = None,
     ) -> Generator[str, None, None]:
         """Generate a streaming text response (text models only).
 
@@ -2899,8 +2928,11 @@ class InferenceBackend:
                 else tokenizer.pad_token_id,
             )
             active_stop_token_ids = self._generation_stop_token_ids(model, generation_kwargs)
-            # Presence penalty (GGUF parity); prompt_len excludes prompt tokens.
-            _pp = _make_presence_penalty_processor(presence_penalty, prompt_len)
+            # Presence / frequency penalty and logit bias (GGUF and MLX parity); prompt_len
+            # excludes prompt tokens.
+            _pp = make_sampling_processors(
+                presence_penalty, prompt_len, frequency_penalty, logit_bias
+            )
             timer = GenerationTimer()
             generation_kwargs["logits_processor"] = with_prefill_boundary_processor(_pp, timer)
             stop_streamer = _StopSequenceStreamer(streamer, stop)
@@ -2919,7 +2951,9 @@ class InferenceBackend:
                         timer.start()
                         # Only the returned sequences carry an exact token count;
                         # the streamer sees decoded text.
-                        gen_outputs["sequences"] = model.generate(**generation_kwargs)
+                        # A request seed is honored per call and the RNG put back afterwards (MLX parity).
+                        with seeded_generation(seed):
+                            gen_outputs["sequences"] = model.generate(**generation_kwargs)
                     except Exception as e:
                         err["msg"] = str(e)
                         stop_streamer.abort()
