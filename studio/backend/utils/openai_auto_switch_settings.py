@@ -943,15 +943,23 @@ async def saved_load_settings(
     *,
     is_gguf: bool,
     gpu_ids_resolve: Optional[Callable[[list[int], str], Awaitable[bool]]] = None,
+    explicit: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Optional[str], dict, dict[str, Any]]:
     """``(stored key, saved row, LoadRequest kwargs)`` for the launch settings saved for a model.
 
     Every load path reads the row here so a model loads with the same settings whoever asks. The
     returned row includes the standing choices it leaves unset, as the load does. The caller
-    supplies ``gpu_ids_resolve`` because the GPU check lives with the hardware code.
+    supplies ``gpu_ids_resolve`` because the GPU check lives with the hardware code. ``explicit``
+    holds the GPU memory fields the request set, so a context derived from them follows the request.
     """
     key, override = resolve_override_for_load(load_id, alias_id, variant)
     override = {**standing_load_choices(is_gguf = is_gguf), **override}
+    if explicit and "gpu_memory_mode" in explicit:
+        override["gpu_memory_mode"] = explicit["gpu_memory_mode"]
+    if explicit and "gpu_layers" in explicit:
+        # The request spells Auto layers -1; a saved row leaves the field out.
+        layers = explicit["gpu_layers"]
+        override["gpu_layers"] = None if layers is None or layers < 0 else layers
     kwargs = model_override_load_kwargs(override, is_gguf = is_gguf)
     saved_gpu_ids = kwargs.get("gpu_ids")
     if (

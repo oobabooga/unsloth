@@ -16495,6 +16495,7 @@ async def _apply_saved_load_settings(request: LoadRequest) -> "tuple[LoadRequest
             request.gguf_variant,
             is_gguf = is_gguf,
             gpu_ids_resolve = _override_gpu_ids_still_resolve,
+            explicit = request.model_dump(include = request.model_fields_set),
         )
     except Exception as exc:  # noqa: BLE001 -- a load never fails on reading a preference
         logger.warning("Could not read saved launch settings for %s: %s", request.model_path, exc)

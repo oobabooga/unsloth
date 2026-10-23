@@ -179,6 +179,20 @@ def test_the_saved_row_and_the_request_outrank_the_standing_choices(monkeypatch,
     assert request.gpu_memory_mode == "auto"
 
 
+def test_an_explicit_gpu_memory_mode_decides_the_derived_context(monkeypatch, gguf_target):
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, gpuMemoryMode = "manual")
+    _put("org/m-GGUF", max_seq_length = 8192, **DEFAULTS)
+    request, applied = _apply(LoadRequest(model_path = "org/m-GGUF", gpu_memory_mode = "auto"))
+    assert request.max_seq_length == 8192
+    request, applied = _apply(LoadRequest(model_path = "org/unsaved-GGUF", gpu_memory_mode = "auto"))
+    assert "max_seq_length" not in applied
+    request, _ = _apply(
+        LoadRequest(model_path = "org/m-GGUF", gpu_memory_mode = "manual", gpu_layers = -1)
+    )
+    assert request.max_seq_length == 0
+
+
 def test_standing_auto_leaves_the_loader_default(monkeypatch, gguf_target):
     _mock_override_store(monkeypatch)
     _standing(monkeypatch, speculativeType = "auto", gpuMemoryMode = "auto")
