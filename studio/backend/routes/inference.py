@@ -19681,22 +19681,20 @@ async def _managed_engine_request(request):
     return request.model_copy(update = {"gpu_ids": gpu_ids})
 
 
-def _managed_engine_unsupported_controls(payload, model_info = None) -> bool:
-    """A spelled-out ``{"type": "text"}`` response_format is the default, not structured output."""
-    reasoning = (model_info or {}).get("reasoning_flags") is not None
-    return bool(
-        payload.use_adapter is not None
-        or _response_format_constrains_decoding(payload)
-        or payload.continue_final_message
-        or (
-            not reasoning
-            and (
-                payload.enable_thinking
-                or payload.preserve_thinking
-                or payload.reasoning_effort not in (None, "none")
-            )
-        )
-    )
+def _managed_engine_unsupported_controls(payload, model_info = None) -> Optional[str]:
+    """The first request parameter a managed vLLM / SGLang load cannot honor, or None. A
+    spelled-out ``{"type": "text"}`` response_format is the default, not structured output."""
+    if payload.use_adapter is not None:
+        return "use_adapter"
+    if _response_format_constrains_decoding(payload):
+        return "response_format"
+    if payload.continue_final_message:
+        return "continue_final_message"
+    if (model_info or {}).get("reasoning_flags") is None:
+        for name in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
+            if getattr(payload, name) not in (None, False, "none"):
+                return name
+    return None
 
 
 def _reject_unsupported_managed_kind(request, config) -> None:
@@ -33436,6 +33434,11 @@ async def produce_openai_chat_completions(
             _explicit_studio_tool_loop_requested(payload)
             or not _tools_outrank_response_format(payload, payload.tools)
         ):
+            if model_info.get("engine") in ("vllm", "sglang"):
+                _raise_unsupported_openai_parameter(
+                    "response_format",
+                    f"response_format is not supported for {model_info['engine']} models.",
+                )
             if not model_info.get("is_mlx"):
                 _raise_unsupported_openai_parameter(
                     "response_format",
@@ -36106,10 +36109,16 @@ async def produce_openai_chat_completions(
         else None
     )
     if _sf_model_info.get("engine") in ("vllm", "sglang"):
-        if _managed_engine_unsupported_controls(payload, _sf_model_info):
+        _unsupported = _managed_engine_unsupported_controls(payload, _sf_model_info)
+        if _unsupported:
             raise _reject(
                 400,
-                "This engine integration does not support adapters, structured output, continuation or reasoning controls.",
+                openai_error_body(
+                    f"{_unsupported} is not supported for {_sf_model_info['engine']} models.",
+                    status = 400,
+                    code = "unsupported_parameter",
+                    param = _unsupported,
+                ),
             )
         from routes.managed_engine_chat import managed_tool_chat
 

@@ -2271,10 +2271,14 @@ def test_a_spelled_out_text_response_format_is_not_structured_output():
 
     assert not route._managed_engine_unsupported_controls(payload())
     assert not route._managed_engine_unsupported_controls(payload(response_format = {"type": "text"}))
-    assert route._managed_engine_unsupported_controls(
-        payload(response_format = {"type": "json_object"})
+    assert (
+        route._managed_engine_unsupported_controls(payload(response_format = {"type": "json_object"}))
+        == "response_format"
     )
-    assert route._managed_engine_unsupported_controls(payload(reasoning_effort = "high"))
+    assert (
+        route._managed_engine_unsupported_controls(payload(reasoning_effort = "high"))
+        == "reasoning_effort"
+    )
 
 
 def test_an_audio_model_that_also_reads_images_is_refused_as_audio():
