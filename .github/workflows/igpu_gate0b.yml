@@ -94,6 +94,9 @@ jobs:
 
   windows:
     name: "Gate 0 on Windows 11 (Radeon 8060S, exclusive)"
+    # After Linux: a Windows job queued for a runner holds the shared GPU group and starves the Linux one.
+    needs: linux
+    if: always()
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     timeout-minutes: 120
     concurrency:
