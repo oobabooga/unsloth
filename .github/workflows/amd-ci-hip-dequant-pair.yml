@@ -1,0 +1,116 @@
+name: "AMD CI: FP8 gfx11 byte dequant + MXFP4 exact rounding (branch amd-ci-hip-dequant-pair)"
+
+# Generated from amd_ci/templates/workflow.yml, two branch-only changes measured in ONE exclusive
+# GPU job (one queue wait instead of two):
+#   fp8   unsloth      base = BASE_SHA_FP8 (main),  head = base + patches/fp8_head.patch
+#   zoo   unsloth-zoo  base = BASE_SHA_ZOO (main),  head = base + patches/zoo_head.patch
+# Each runs its own differential (base and head in the same job, same host) into its own out dir.
+
+on:
+  push:
+    branches: [amd-ci-hip-dequant-pair]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "0"
+  MERGED: "0"
+  UPSTREAM_FP8: "https://github.com/unslothai/unsloth"
+  UPSTREAM_ZOO: "https://github.com/unslothai/unsloth-zoo"
+  BASE_SHA_FP8: "4b9c85f985c8242ccac7ff24092baffb3644b5b5"
+  BASE_SHA_ZOO: "33a18424576c42443ce7c7eb431c73439ec21cef"
+
+jobs:
+
+  gpu:
+    name: "HIP dequant pair GPU measurement (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    # Shared constant: serialises every GPU measurement across all branches. Never rename.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "hippair-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states_patch.py --repo "$UPSTREAM_FP8" --base "$BASE_SHA_FP8" \
+            --patch patches/fp8_head.patch \
+            --root "$AMD_CI_WORK/fp8" --out "$AMD_CI_WORK/out/fp8/states.json"
+          python3 amd_ci/lib/states_patch.py --repo "$UPSTREAM_ZOO" --base "$BASE_SHA_ZOO" \
+            --patch patches/zoo_head.patch \
+            --root "$AMD_CI_WORK/zoo" --out "$AMD_CI_WORK/out/zoo/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Studio venv from the unsloth base tree; each probe puts its state's checkout first on
+          # PYTHONPATH, so the installed unsloth / unsloth_zoo are shadowed per state.
+          cd "$AMD_CI_WORK/fp8/states/base"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Differential (FP8, unsloth)
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/fp8/states.json" \
+            --probe amd_ci/probes/fp8_hip_dequant_probe.py \
+            --criteria amd_ci/criteria/fp8_hip_bytes_dequant.py \
+            --out-dir "$AMD_CI_WORK/out/fp8/gpu" \
+            --python "$AMD_CI_PY" -- --subdir . --tests tests/test_fp8_pre_sm89_byte_dequant.py tests/test_fp8_pre_sm89_dequant_fallback.py
+          cat "$AMD_CI_WORK/out/fp8/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/fp8/gpu"
+
+      - name: Differential (MXFP4, unsloth-zoo)
+        if: always()
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/zoo/states.json" \
+            --probe amd_ci/probes/hip_rne_kernels_probe.py \
+            --criteria amd_ci/criteria/hip_rne_zoo.py \
+            --out-dir "$AMD_CI_WORK/out/zoo/gpu" \
+            --python "$AMD_CI_PY" -- --kind zoo --subdir . --tests tests/test_mxfp4_exact_round.py tests/test_mxfp4_packed_experts.py tests/test_mxfp4_dequant_device_guard.py tests/test_mxfp4_legacy_dequant_precision.py
+          cat "$AMD_CI_WORK/out/zoo/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/zoo/gpu"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hippair-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
