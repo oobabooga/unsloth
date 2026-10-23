@@ -5326,8 +5326,10 @@ class VideoBackend:
 
         with _tree_reader(binary, cancel_event, VIDEO_CANCELLED_MSG):
             if not binary or engine.version() is None:
+                why = getattr(engine, "last_failure", None) if binary else None
                 raise RuntimeError(
                     "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
+                    + (f" {why}." if why else "")
                 )
             # EVERY binary, not just a managed one.
             # EVERY binary, not just a managed one. The managed-only test was written when the ensure sat right here, so

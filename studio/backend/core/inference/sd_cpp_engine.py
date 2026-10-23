@@ -767,6 +767,8 @@ class SdCppEngine:
     def __init__(self, binary: Optional[str] = None) -> None:
         self.binary = binary or find_sd_cpp_binary()
         self._version: Optional[str] = None
+        # Why the last version() returned None, for the load error that follows it.
+        self.last_failure: Optional[str] = None
 
     def is_available(self) -> bool:
         return bool(self.binary) and Path(self.binary).is_file()
@@ -776,6 +778,7 @@ class SdCppEngine:
         OR present-but-unrunnable (missing libs / bad permissions), so callers fail a load early
         instead of a "ready" state that crashes on first generation."""
         if not self.is_available():
+            self.last_failure = f"no stable-diffusion.cpp binary at {self.binary or '(none)'}"
             return None
         if self._version is not None:
             return self._version
@@ -790,10 +793,18 @@ class SdCppEngine:
                 check = False,
                 env = runtime_env(self.binary),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.last_failure = f"{self.binary} --version could not run: {exc}"
+            logger.warning("sd.cpp: %s", self.last_failure)
             return None
         if res.returncode != 0:
+            tail = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()[-500:]
+            self.last_failure = f"{self.binary} --version exited with status {res.returncode}" + (
+                f": {tail}" if tail else ""
+            )
+            logger.warning("sd.cpp: %s", self.last_failure)
             return None
+        self.last_failure = None
         text = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
         self._version = text.splitlines()[0] if text else ""
         return self._version
