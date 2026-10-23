@@ -1,0 +1,78 @@
+name: Triage changes CI
+
+on:
+  push:
+    branches: [triage-ci-runner]
+
+permissions: {}
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+        branch: [base, effcfg, mem-capacity, model-identity, chat-caps, expect-gaps]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Clone
+        run: |
+          git clone -q --depth 1 --branch triage-ci-${{ matrix.branch }} https://github.com/oobabooga/unsloth src
+          git clone -q --depth 1 --branch triage-ci-runner https://github.com/oobabooga/unsloth runner
+          git -C src log -1 --format='%h %s'
+      - name: Install backend test dependencies (CPU only)
+        working-directory: src
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -r studio/backend/requirements/studio.txt
+          pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio pytest-xdist pytest-timeout httpx soundfile
+          pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+            'torch>=2.4,<2.11'
+          pip install -q 'transformers>=4.51,<=5.17.0'
+          pip install -q "$(grep -m1 -E '^peft==' studio/backend/requirements/extras-no-deps.txt)"
+          pip install -q typer rich
+      - name: Tests
+        run: bash runner/run_lists.sh ${{ matrix.branch }} "$PWD/src" "$PWD/out" | tee summary.txt
+      - name: Summary
+        run: cat summary.txt
+
+  amd-strix-halo:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; free -h
+          rocminfo 2>/dev/null | grep -E 'Marketing Name:|gfx' | head -6 || true
+          cat /opt/rocm/.info/version 2>/dev/null || true
+      - name: Probe base and branches
+        run: |
+          set -x
+          WORK_ROOT="$RUNNER_TEMP/unsloth-work"
+          mkdir -p "$WORK_ROOT"/{tmp,cache}
+          export TMPDIR="$WORK_ROOT/tmp" PIP_CACHE_DIR="$WORK_ROOT/cache/pip"
+          python3 -m venv "$WORK_ROOT/venv"; . "$WORK_ROOT/venv/bin/activate"
+          pip install -q --upgrade pip
+          AMD=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
+          pip install -q "$AMD/torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl" \
+                         "$AMD/triton-3.6.0%2Brocm7.2.1.gitba5c1517-cp312-cp312-linux_x86_64.whl"
+          pip install -q 'numpy<3' structlog rich httpx psutil pyyaml jinja2 'transformers>=4.51,<=5.17.0' huggingface_hub
+          for B in base mem-capacity chat-caps; do
+            git clone -q --depth 1 --branch triage-ci-$B https://github.com/oobabooga/unsloth "$WORK_ROOT/src-$B"
+          done
+          git clone -q --depth 1 --branch triage-ci-runner https://github.com/oobabooga/unsloth "$WORK_ROOT/runner"
+          for B in base mem-capacity chat-caps; do
+            (cd "$WORK_ROOT/src-$B/studio/backend" && PYTHONPATH=. python "$WORK_ROOT/runner/amd_probe.py" "$WORK_ROOT/probe-$B.json" "$B" > "$WORK_ROOT/probe-$B.log" 2>&1) || true
+            echo "===== $B"; cat "$WORK_ROOT/probe-$B.json" || tail -40 "$WORK_ROOT/probe-$B.log"
+          done
