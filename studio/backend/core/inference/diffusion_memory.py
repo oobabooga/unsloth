@@ -1172,6 +1172,11 @@ def _cuda_memory(backend: str) -> tuple[Optional[int], Optional[int], str]:
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if bool(getattr(props, "integrated", False) or getattr(props, "is_integrated", False)):
                 kind = "unified_memory"  # e.g. Jetson / integrated SoC
+            elif _torch_is_rocm(torch):
+                # HIP before 6.2 leaves the integrated flag unset on APUs such as gfx1151.
+                from utils.rocm_apu import classify_rocm_unified_memory
+                if classify_rocm_unified_memory(props)[1]:
+                    kind = "unified_memory"
         except Exception:
             pass
         free_mib, total_mib = int(free // (1024 * 1024)), int(total // (1024 * 1024))

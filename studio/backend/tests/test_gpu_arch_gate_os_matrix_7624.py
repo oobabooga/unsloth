@@ -78,6 +78,10 @@ class _Props:
             setattr(self, spec["arch_attr"], spec["arch"])
 
 
+# gfx1036 is the Raphael iGPU, so the probe takes the iGPU host reserve even with the flag unset.
+_GFX1036_FREE = 12176 - _IGPU_HOST_RESERVE_MIB
+
+
 def _gfx103x_pair():
     """The two-card gfx1030 + gfx1036 rig most of this matrix probes."""
     return [_device("gfx1030", free_mib = 12049), _device("gfx1036", free_mib = 12176)]
@@ -214,6 +218,10 @@ def probe_env(tmp_path, monkeypatch):
     )
     for var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(var, raising = False)
+    # The gfx1036 iGPU's free figure is capped by host RAM: pinned so no host decides it.
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 60000)
+    )
     return fake_binary
 
 
@@ -402,7 +410,7 @@ class TestAmdCoverageCases:
         _install_torch(monkeypatch, _gfx103x_pair(), vendor = "amd")
         assert LlamaCppBackend._get_gpu_free_memory(for_llama_server = True) == [
             (0, 12049),
-            (1, 12176),
+            (1, _GFX1036_FREE),
         ]
 
     @pytest.mark.parametrize("os_key", ["windows", "linux", "wsl"])
@@ -412,7 +420,7 @@ class TestAmdCoverageCases:
         _install_torch(monkeypatch, _gfx103x_pair(), vendor = "amd")
         assert LlamaCppBackend._get_gpu_free_memory(for_llama_server = True) == [
             (0, 12049),
-            (1, 12176),
+            (1, _GFX1036_FREE),
         ]
 
     @pytest.mark.parametrize("os_key", ["windows", "linux", "wsl"])
@@ -426,7 +434,7 @@ class TestAmdCoverageCases:
         _binary_with_marker(tmp_path, {"mapped_targets": GFX120X})
         _install_torch(monkeypatch, _gfx103x_pair(), vendor = "amd")
         assert LlamaCppBackend._get_gpu_free_memory(for_llama_server = True) == []
-        assert LlamaCppBackend._get_gpu_free_memory() == [(0, 12049), (1, 12176)]
+        assert LlamaCppBackend._get_gpu_free_memory() == [(0, 12049), (1, _GFX1036_FREE)]
 
     def test_amd_sdk_wheel_is_gated_on_every_os(self, tmp_path, monkeypatch, probe_env):
         """AMD SDK / Radeon wheels leave ``version.hip`` unset and only encode

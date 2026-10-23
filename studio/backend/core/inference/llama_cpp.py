@@ -12591,7 +12591,7 @@ class LlamaCppBackend:
                 return False
             if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
                 return False
-            from core.training.worker import _rocm_classify_unified_memory
+            from utils.rocm_apu import classify_rocm_unified_memory as _rocm_classify_unified_memory
 
             count = torch.cuda.device_count()
             if count <= 0:
@@ -12624,7 +12624,7 @@ class LlamaCppBackend:
                 return set()
             if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
                 return set()
-            from core.training.worker import _rocm_classify_unified_memory
+            from utils.rocm_apu import classify_rocm_unified_memory as _rocm_classify_unified_memory
 
             # Map visible ordinal -> physical id via the active ROCm mask (HIP,
             # then ROCR, then CUDA), mirroring _get_gpu_memory's ROCm branch.
@@ -12663,7 +12663,7 @@ class LlamaCppBackend:
                 return None
             if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
                 return None
-            from core.training.worker import _rocm_classify_unified_memory
+            from utils.rocm_apu import classify_rocm_unified_memory as _rocm_classify_unified_memory
 
             wanted = None if gpu_indices is None else set(gpu_indices)
             physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
@@ -12738,7 +12738,7 @@ class LlamaCppBackend:
                 return arch_by_id
             if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
                 return arch_by_id
-            from core.training.worker import _rocm_classify_unified_memory
+            from utils.rocm_apu import classify_rocm_unified_memory as _rocm_classify_unified_memory
 
             physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
             for ordinal in range(torch.cuda.device_count()):

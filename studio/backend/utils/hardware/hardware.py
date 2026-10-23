@@ -2879,36 +2879,14 @@ def _hip_runtime_version() -> Optional[tuple[int, int]]:
         return None
 
 
-# APU architectures that are unified memory but sit outside the shared classifier's positive set, which names anything else from hipDeviceProp_t::integrated. clr never assigned deviceProps.integrated before rocm-6.2.0 and the legacy R0000 property ABI still does not, while paldevice.cpp inflates globalMemSize_ off settings().apuSystem_ in both cases -- harmless for the cap and the total, wrong for a NUMERATOR. gfx1103 Phoenix / Hawk Point never shipped as a discrete board, so naming it here can only upgrade a part whose props.total_memory really does span host memory.
-# The rest of LLVM's AMDGPUUsage processor table rows typed APU are named here on the same footing (none ever shipped as a
-# discrete board): gfx1153 Krackan Point 2 (Windows-supported), gfx1033 Van Gogh, gfx1035 Rembrandt, gfx1036 Raphael /
-# Granite Ridge iGPU, gfx1013 Cyan Skillfish, gfx90c / gfx902 / gfx909 Renoir / Raven, gfx801 / gfx810 Carrizo / Stoney.
-_ROCM_UNNAMED_APU_ARCHES = frozenset(
-    {
-        "gfx801",
-        "gfx810",
-        "gfx902",
-        "gfx909",
-        "gfx90c",
-        "gfx1013",
-        "gfx1033",
-        "gfx1035",
-        "gfx1036",
-        "gfx1103",
-        "gfx1153",
-    }
-)
+# Kept under this name for callers; the set and the classifier live in utils.rocm_apu.
+from utils.rocm_apu import _UNNAMED_APU_ARCHES as _ROCM_UNNAMED_APU_ARCHES  # noqa: E402
 
 
 def _rocm_props_unified_status(props: Any) -> Optional[bool]:
     try:
-        from core.training.worker import _rocm_classify_unified_memory
-
-        classification = _rocm_classify_unified_memory(props)
-        arch = str(classification[0] or "")
-        return bool(classification[1]) or (
-            arch.split(":")[0].strip().lower() in _ROCM_UNNAMED_APU_ARCHES
-        )
+        from utils.rocm_apu import classify_rocm_unified_memory
+        return bool(classify_rocm_unified_memory(props)[1])
     except Exception as e:
         logger.debug("ROCm unified-memory classification failed: %s", e)
         return None

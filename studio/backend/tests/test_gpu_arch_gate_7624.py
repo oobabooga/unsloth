@@ -274,6 +274,16 @@ def rocm_probe_env(tmp_path, monkeypatch):
     )
     for var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(var, raising = False)
+    # An iGPU's free figure is capped by host RAM: pinned so no host decides it.
+    monkeypatch.setattr(
+        LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 60000)
+    )
+
+
+# gfx1036 is the Raphael iGPU, so the probe takes the iGPU host reserve even with the flag unset.
+from core.inference.llama_cpp import _IGPU_HOST_RESERVE_MIB  # noqa: E402
+
+_GFX1036_FREE = 12176 - _IGPU_HOST_RESERVE_MIB
 
 
 class TestGpuArchGate:
@@ -293,7 +303,7 @@ class TestGpuArchGate:
         )
         assert LlamaCppBackend._get_gpu_free_memory(for_llama_server = True) == [
             (0, 12049),
-            (1, 12176),
+            (1, _GFX1036_FREE),
         ]
 
     def test_unknown_device_arch_fails_open(self, tmp_path, monkeypatch, rocm_probe_env):
@@ -354,8 +364,9 @@ class TestTorchCallersStayUnfiltered:
         monkeypatch.setitem(
             sys.modules, "torch", _fake_torch(["gfx1101", "gfx1036"], [12049, 12176])
         )
-        assert LlamaCppBackend._get_gpu_free_memory() == [(0, 12049), (1, 12176)]
-        assert LlamaCppBackend._get_gpu_memory() == [(0, 12049, 32768), (1, 12176, 32768)]
+        assert LlamaCppBackend._get_gpu_free_memory() == [(0, 12049), (1, _GFX1036_FREE)]
+        # A shared pool publishes no total: it is system RAM of unknown scope.
+        assert LlamaCppBackend._get_gpu_memory() == [(0, 12049, 32768), (1, _GFX1036_FREE, 0)]
 
     def test_rag_auto_still_picks_sentence_transformers(
         self, tmp_path, monkeypatch, rocm_probe_env
