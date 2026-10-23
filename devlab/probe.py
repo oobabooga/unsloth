@@ -82,7 +82,7 @@ def one(name: str, extra: str) -> dict:
             "t": round(t, 3),
             "pr": p["fraction"] if p else None,
             "main": m["fraction"] if m else None,
-            "read": pr_progress.LlamaCppBackend._read_io_bytes(proc.pid),
+            "read": pr_progress.LlamaCppBackend._read_load_bytes(proc.pid),
             "rss": pr_progress.LlamaCppBackend._read_rss_bytes(proc.pid),
             "total": p["bytes_total"] if p else None,
         })
