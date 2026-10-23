@@ -1,0 +1,160 @@
+name: "AMD CI: iGPU Gate 0 GEMM bench (Vulkan vs CPU)"
+
+on:
+  push:
+    branches: [amd-ci-igpu-gate0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: "b11829"
+
+jobs:
+
+  linux:
+    name: "Gate 0 on Linux (Radeon 8060S, exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "igpu-gate0-linux"
+
+      - name: Host facts
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out"
+          { uname -a; lscpu | head -20; free -g; ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>&1; \
+            (command -v vulkaninfo && vulkaninfo --summary) 2>&1 | head -60; } | tee "$AMD_CI_WORK/out/host.txt"
+          true
+
+      - name: CPU torch venv and llama.cpp Vulkan libs
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          python3 -m venv "$AMD_CI_WORK/venv"
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q --upgrade pip
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          "$AMD_CI_WORK/venv/bin/python" -m pip install -q numpy
+          cd "$AMD_CI_WORK"
+          curl -sSL -o llama.tgz "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-ubuntu-vulkan-x64.tar.gz"
+          mkdir -p llama && tar -xzf llama.tgz -C llama
+          SO=$(find "$AMD_CI_WORK/llama" -name 'libggml-vulkan.so' | head -1 || true)
+          [ -n "$SO" ] || { echo "FATAL: no libggml-vulkan.so"; exit 1; }
+          LIB=$(dirname "$SO")
+          echo "GGML_LIB=$LIB" >> "$GITHUB_ENV"
+          ls "$LIB"
+
+      - name: Gate 0 bench (Vulkan iGPU vs CPU torch fp32 / bf16 vs ggml CPU)
+        timeout-minutes: 45
+        run: |
+          set +e
+          "$AMD_CI_WORK/venv/bin/python" -u scripts/gate0_gemm_bench.py --lib-dir "$GGML_LIB" \
+            --out "$AMD_CI_WORK/out/gate0_linux.json" --tokens 512,1024,2048 --reps 7 --ggml-cpu 2>&1 | tee "$AMD_CI_WORK/out/gate0_linux.log"
+          rc=${PIPESTATUS[0]}
+          grep -E "DEVICE|SUMMARY" "$AMD_CI_WORK/out/gate0_linux.log" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: ROCm torch reference (native upper bound)
+        timeout-minutes: 40
+        continue-on-error: true
+        run: |
+          set +e
+          python3 -m venv "$AMD_CI_WORK/venv_rocm"
+          "$AMD_CI_WORK/venv_rocm/bin/python" -m pip install -q --upgrade pip
+          "$AMD_CI_WORK/venv_rocm/bin/python" -m pip install -q torch --index-url https://download.pytorch.org/whl/rocm6.4
+          "$AMD_CI_WORK/venv_rocm/bin/python" -u scripts/rocm_ref.py "$AMD_CI_WORK/out/rocm_ref_linux.json" 2>&1 | tail -30
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: igpu-gate0-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  windows:
+    name: "Gate 0 on Windows 11 (Radeon 8060S, exclusive)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "igpu-gate0-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: CPU torch venv and llama.cpp Vulkan libs
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path "$env:AMD_CI_WORK\out" | Out-Null
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
+          & $py -m pip install -q --upgrade pip
+          & $py -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "BENCH_PY=$py"
+          $zip = "$env:AMD_CI_WORK\llama.zip"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/ggml-org/llama.cpp/releases/download/$env:LLAMA_TAG/llama-$env:LLAMA_TAG-bin-win-vulkan-x64.zip" -OutFile $zip
+          Expand-Archive -Force -Path $zip -DestinationPath "$env:AMD_CI_WORK\llama"
+          $dll = Get-ChildItem -Recurse -Path "$env:AMD_CI_WORK\llama" -Filter "ggml-vulkan.dll" | Select-Object -First 1
+          if ($null -eq $dll) { Write-Host "FATAL: no ggml-vulkan.dll"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "GGML_LIB=$($dll.DirectoryName)"
+          Get-ChildItem $dll.DirectoryName | Select-Object -First 40 Name
+
+      - name: Gate 0 bench (Vulkan iGPU vs CPU torch fp32 / bf16 vs ggml CPU)
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "machine=$env:COMPUTERNAME"
+          & $env:BENCH_PY -u "$env:GITHUB_WORKSPACE\scripts\gate0_gemm_bench.py" --lib-dir "$env:GGML_LIB" `
+            --out "$env:AMD_CI_WORK\out\gate0_windows.json" --tokens 512,1024,2048 --reps 7 --ggml-cpu *>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\gate0_windows.log"
+          $rc = $LASTEXITCODE
+          Select-String -Path "$env:AMD_CI_WORK\out\gate0_windows.log" -Pattern "DEVICE|SUMMARY" |
+            ForEach-Object { $_.Line } | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: igpu-gate0-windows
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
