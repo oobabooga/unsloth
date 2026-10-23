@@ -600,6 +600,14 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag20:
+            # MoE S=5 (diag19 on Qwen3-30B-A3B: 70-80%, master 0.36-0.58 and workers 0.56-0.69 busy, so the pipeline
+            # is under-filled): 2 / 4 layers off the master x G 8 / 10 / 12, each case twice in mirrored order
+            sweep = [("bs_q4", 8), ("bs_q2", 10), ("bs_q4", 10), ("bs_q2", 12), ("bs_q4", 12), ("bs_q2", 8)]
+            plan = [("x1", 1, 1, B)]
+            plan += [(k, 5, g, g * B) for k, g in sweep]
+            plan += [(k, 5, g, g * B) for k, g in reversed(sweep)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag19:
             # confirmation of the best setting per stage count from diag16-18 (levers 1 + 3, half master threads),
             # each case twice in different positions; plus 6 layers off the master at S=5
@@ -944,6 +952,7 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag20", action = "store_true", help = "MoE S=5: layers off the master x pipeline groups (use with --peer-allow)")
     m.add_argument("--diag19", action = "store_true", help = "confirm the best setting per stage count twice (use with --peer-allow)")
     m.add_argument("--diag18", action = "store_true", help = "levers 1 + 3 on, 0 / 2 / 4 layers moved off the master, S=3-5 G=8 (use with --peer-allow)")
     m.add_argument("--diag17", action = "store_true", help = "batched backend-sampling readback off / on over lever 1, 2-5 stages (use with --peer-allow)")
