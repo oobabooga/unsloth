@@ -47,7 +47,6 @@ const hubTarget: ModelPickTarget = {
   displayName: "Model",
   ggufVariant: "Q4_K_M",
   isGguf: true,
-  apiLoadable: true,
   meta: { source: "hub", isLora: false },
 };
 
@@ -105,10 +104,9 @@ function load<T>(file: string, stubs: Record<string, unknown> = {}) {
       },
     },
     "react/jsx-runtime": stubJsxRuntime(),
-    "../model-config/model-config-draft": {
-      modelConfigDraftKey,
-      isExtraArgsHydratedForDraft: () => false,
-    },
+    "../model-config/model-config-draft": { modelConfigDraftKey },
+    // Not read yet, unless a test says otherwise.
+    "../model-config/saved-model-configs": { readSavedModelConfigs: () => null },
     "../model-config/per-model-config": perModel,
     "./extra-args": sharedArgs,
     "./fields": fields,
@@ -532,6 +530,24 @@ test("closing an editor before its sharing UI loads cancels the import, while ef
   assert.match(notices[0].description, /editor closed before the settings/);
 });
 
+test("a link imports only once the saved settings have been read", () => {
+  const hydrated = (saved: unknown, isDiffusion: boolean) => {
+    const { module } = load<typeof Controls>("config-controls.tsx", {
+      "../model-config/saved-model-configs": {
+        readSavedModelConfigs: () => saved,
+      },
+    });
+    const tree = elements(
+      module.SharedRunConfigControls({ ...controlProps, isDiffusion }),
+    );
+    return find(tree, "lazy")?.props.hydrated;
+  };
+  // A link's fields merge over the saved ones, so merging before the read would drop them.
+  assert.equal(hydrated(null, false), false);
+  assert.equal(hydrated({}, false), true);
+  assert.equal(hydrated(null, true), true);
+});
+
 test("edit cancellation includes contained controls and excludes portaled dialog controls", (t) => {
   class NodeFake extends EventTarget {
     child?: NodeFake;
@@ -757,10 +773,10 @@ test("Load and Save refuse while a shared GGUF variant is unresolved", () => {
     "features/model-picker/components/model-config-page.tsx",
   ).replace(/\s+/g, " ");
   for (const handler of ["handleRun", "handleSave"]) {
-    const body = page.slice(page.indexOf(`const ${handler} = () => {`));
+    const body = page.slice(page.indexOf(`const ${handler} = async () => {`));
     assert.match(
       body.slice(0, 80),
-      /^const \w+ = \(\) => \{ if \(sharedVariantUnresolved\) \{ return; \}/,
+      /^const \w+ = async \(\) => \{ if \(sharedVariantUnresolved \|\|/,
     );
     const button = page.slice(0, page.indexOf(`onClick={${handler}}`));
     assert.match(

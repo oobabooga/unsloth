@@ -45,8 +45,8 @@ import {
 } from "@/features/model-picker";
 import { isMlxId } from "@/features/model-picker/components/model-selector/recommended-fit";
 import { loadManagedLlamaFlags } from "@/features/model-picker/api/llama-flags";
-import { fetchLoadExtraArgs } from "@/features/model-picker/api/model-overrides";
 import { sanitizeStoredExtraArgs } from "@/features/model-picker/model-config/llama-extra-args";
+import { ensureSavedModelConfigs } from "@/features/model-picker/model-config/saved-model-configs";
 import { usePlatformStore } from "@/config/env";
 import { resolveSpeculativeType } from "@/lib/speculative-modes";
 
@@ -3652,6 +3652,8 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     const failureLabel = candidate.ggufVariant
       ? `${candidate.id} (${candidate.ggufVariant})`
       : candidate.id;
+    // The startup load can run before the saved settings have been read.
+    await ensureSavedModelConfigs();
     const { config } = resolveInitialConfig(
       candidate.id,
       candidate.ggufVariant,
@@ -3712,46 +3714,31 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         })
       ).isDiffusion;
     }
-    // The stored override can live only on the server while this config is local, and nothing is
-    // resident at startup for /load's omission path to inherit from. Sanitized like every
-    // hydration, so it becomes an EXPLICIT list /load validates strictly.
+    // Nothing is resident at startup for /load's omission path to inherit from, so the saved list
+    // goes out as an EXPLICIT one /load validates strictly: a flag added to the managed set since
+    // it was saved would be answered with a 400.
     let resolvedExtraArgs = config.llamaExtraArgs;
-    if (candidate.kind === "gguf" && !isDiffusion) {
+    if (
+      candidate.kind === "gguf" &&
+      !isDiffusion &&
+      resolvedExtraArgs != null &&
+      resolvedExtraArgs.length > 0
+    ) {
       try {
         const managed = await loadManagedLlamaFlags();
-        const clean = (tokens: readonly string[]) =>
-          sanitizeStoredExtraArgs(tokens, managed?.managed ?? new Set<string>(), {
+        const cleaned = sanitizeStoredExtraArgs(
+          resolvedExtraArgs,
+          managed?.managed ?? new Set<string>(),
+          {
             maxBytes: managed?.maxBytes,
             windowsCommandBudget: managed?.windowsCommandBudget,
-          });
-        if (resolvedExtraArgs === undefined) {
-          const stored = await fetchLoadExtraArgs(
-            modelPath,
-            // Both the advertised repo id and the path this load resolves to: cached inventory can hand
-            // back a different loadId.
-            candidate.id,
-            candidate.ggufVariant ?? null,
-          );
-          if (stored.tokens.length > 0) {
-            const cleaned = clean(stored.tokens);
-            if (cleaned.length > 0) {
-              resolvedExtraArgs = cleaned;
-            }
-          } else if (stored.explicit) {
-            // An EMPTY list is a cleared box, not an absent one: omitting the field lets /load carry over
-            // the arguments that were cleared.
-            resolvedExtraArgs = [];
-          }
-        } else if (resolvedExtraArgs !== null && resolvedExtraArgs.length > 0) {
-          // Same for the local copy: a flag added to the managed set since it was written would be sent
-          // explicitly and answered with a 400.
-          const cleaned = clean(resolvedExtraArgs);
-          if (cleaned.length !== resolvedExtraArgs.length) {
-            resolvedExtraArgs = cleaned.length > 0 ? cleaned : [];
-          }
+          },
+        );
+        if (cleaned.length !== resolvedExtraArgs.length) {
+          resolvedExtraArgs = cleaned;
         }
       } catch {
-        // An overrides outage must not stop a startup load.
+        // A flags outage must not stop a startup load.
       }
     }
     const effectiveTensorParallel = isDiffusion ? false : config.tensorParallel;

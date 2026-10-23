@@ -18,7 +18,7 @@ import {
   normalizeGgufVariantIdentity,
   residentModelIdMatches,
 } from "../../model-picker/model-config/model-identity";
-import { resolveOnlyRememberedGgufVariant } from "../../model-picker/model-config/per-model-config";
+import { resolveOnlyRememberedGgufVariant } from "../../model-picker/model-config/saved-model-configs";
 import { isExternalModelId } from "../external-providers";
 
 export type ChatModelSwitchTarget = {

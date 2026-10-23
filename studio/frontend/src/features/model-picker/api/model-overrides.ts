@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// Server-side mirror of the per-model config. per-model-config.ts lives in browser
-// localStorage, so an API auto-switch load came up with none of the user's settings.
-// routes/inference.py reads this map and rebuilds the picker's LoadRequest.
+// The server's map of saved per-model load settings, and the translation between one of its rows
+// and the picker's config shape. Every load path reads the map (routes/inference.py,
+// llama_compat.py, the CLI); saved-model-configs.ts is the browser's copy of it.
 
-import { normalizeTensorSplit, reconcileTensorSplit } from "@/hooks/gpu-tensor-split";
-import { authFetch } from "@/features/auth";
+import { normalizeTensorSplit } from "@/hooks/gpu-tensor-split";
 import type { GpuIndexKind } from "@/hooks/gpu-selection";
 import { readFastApiError } from "@/lib/format-fastapi-error";
+import { splitQuantSuffix } from "../model-config/model-identity";
 import {
-  normalizeGgufVariantIdentity,
-  normalizeModelIdentity,
-  splitQuantSuffix,
-} from "../model-config/model-identity";
-import {
-  DEFAULT_PER_MODEL_CONFIG,
   normalizeMlxKvQuant,
   type PerModelConfig,
-  deletePerModelConfigsForOverrideKeys,
   normalizePerModelConfig,
 } from "../model-config/per-model-config";
 
 const OVERRIDES_URL = "/api/settings/openai-auto-switch/overrides";
+
+async function request(init?: RequestInit): Promise<Response> {
+  // Imported on first use, so the readers of saved settings stay importable without the auth module.
+  const { authFetch } = await import("@/features/auth");
+  return authFetch(OVERRIDES_URL, init);
+}
 
 /** One model's stored launch config, as the backend persists it. */
 export interface ApiModelOverride {
@@ -151,21 +150,6 @@ export function foldOverrideKey(key: string): string {
   return id.startsWith("/") ? `${id}${quant}` : `${id.toLowerCase()}${quant}`;
 }
 
-/** The stored arguments, keeping "the row carried an empty list" apart from "no row carried
- *  the field". That is what the settings page's tombstone is for: clearing the box saves an
- *  explicit [], which stops the lookup before a legacy bare-repository row. Collapsing the
- *  two left llamaExtraArgs undefined and /load carried the cleared arguments over. */
-export type ResolvedExtraArgs = {
-  tokens: string[];
-  explicit: boolean;
-};
-
-/** The field as one entry stores it, empty list and absent field kept apart. */
-function resolvedFrom(entry: ApiModelOverride): ResolvedExtraArgs {
-  const tokens = entry.llama_extra_args;
-  return { tokens: tokens ?? [], explicit: Array.isArray(tokens) };
-}
-
 function presentOverride(
   value: ApiModelOverride | undefined | null,
 ): ApiModelOverride | null {
@@ -209,16 +193,8 @@ export function resolveStoredOverride(
   return null;
 }
 
-export function resolveStoredExtraArgs(
-  overrides: ApiModelOverrides,
-  keys: readonly string[],
-): ResolvedExtraArgs {
-  const resolved = resolveStoredOverride(overrides, keys);
-  return resolved ? resolvedFrom(resolved) : { tokens: [], explicit: false };
-}
-
 export async function fetchModelOverrides(): Promise<ApiModelOverrides> {
-  const res = await authFetch(OVERRIDES_URL);
+  const res = await request();
   if (!res.ok) {
     throw new Error(
       await readFastApiError(res, "Failed to load saved model settings"),
@@ -228,193 +204,54 @@ export async function fetchModelOverrides(): Promise<ApiModelOverrides> {
   return body.overrides ?? {};
 }
 
-/** The pass-through arguments the LOAD of this model would apply. Asked of the server rather
- *  than derived here, because the resolution is Python's: casefold is not toLowerCase, and
- *  an ambiguous fold deliberately matches nothing. A client can only approximate that, and
- *  the approximation shows as a cold load launching without arguments an API load applies.
- *  Falls back to resolving locally when the backend predates the parameter. */
-export async function fetchLoadModelOverride(
-  loadId: string,
-  aliasId: string,
-  ggufVariant?: string | null,
-  fallbackKeys: readonly string[] = [],
-): Promise<ApiModelOverride | null> {
-  const query = new URLSearchParams({ model_id: loadId, alias_id: aliasId });
-  if (ggufVariant) {
-    query.set("gguf_variant", ggufVariant);
-  }
-  // After queued writes: a read racing Forget re-saved the old row.
-  await Promise.all(
-    [loadId, aliasId].map((id) =>
-      writesByKey
-        .get(
-          modelOverrideKey(
-            normalizeModelIdentity(id),
-            normalizeGgufVariantIdentity(ggufVariant),
-          ),
-        )
-        ?.catch(() => {}),
-    ),
-  );
-  const res = await authFetch(`${OVERRIDES_URL}?${query.toString()}`);
-  if (!res.ok) {
-    throw new Error(
-      await readFastApiError(res, "Failed to load saved model settings"),
-    );
-  }
-  const body = (await res.json()) as {
-    overrides?: ApiModelOverrides;
-    resolved?: ApiModelOverride | null;
-    // biome-ignore lint/style/useNamingConvention: API schema
-    resolved_key?: string | null;
-  };
-  if (body.resolved !== undefined) {
-    return presentOverride(body.resolved);
-  }
-  // A backend that predates the resolved field answers with the whole map and needs to be told
-  // which keys to look under. Derived here when it was not: the panel passes its own richer
-  // list, while the auto-load and compare callers have only these two identities, and
-  // defaulting to none made them read an empty map against an older server.
-  const derived =
-    fallbackKeys.length > 0
-      ? fallbackKeys
-      : [
-          modelOverrideKey(loadId, ggufVariant),
-          modelOverrideKey(aliasId, ggufVariant),
-          loadId,
-          aliasId,
-        ].filter((key, index, all) => all.indexOf(key) === index);
-  return resolveStoredOverride(body.overrides ?? {}, derived);
-}
-
-export async function fetchLoadExtraArgs(
-  loadId: string,
-  aliasId: string,
-  ggufVariant?: string | null,
-  fallbackKeys: readonly string[] = [],
-): Promise<ResolvedExtraArgs> {
-  const resolved = await fetchLoadModelOverride(
-    loadId,
-    aliasId,
-    ggufVariant,
-    fallbackKeys,
-  );
-  // An explicit empty list is a cleared box, not an absence, and must be sent as one: omitting
-  // the field lets /load carry the resident model's arguments over.
-  return resolvedFrom(resolved ?? {});
-}
-
-/** The row as a settings panel applies it. llama-server arguments reach a GGUF load alone, and
- *  hydrating them into another model's config would count a list it cannot show as a change. */
-export function panelOverrideRow(
-  override: ApiModelOverride | null,
-  isGguf: boolean,
-): ApiModelOverride | null {
-  if (!override || isGguf) {
-    return override;
-  }
-  return presentOverride(
-    Object.fromEntries(
-      Object.entries(override).filter(([key]) => key !== "llama_extra_args"),
-    ),
-  );
-}
-
-/** Translate one server-resolved override into the picker's config shape. The row is
- *  authoritative for the fields it CARRIES and only those: an absent field is not evidence
- *  the user chose the default, since a failed PUT, a refused value and an old row all leave
- *  the same gap. `localConfig` fills it, or opening the panel would delete settings typed
- *  here. The cost is that clearing ONE field on another origin does not travel until this
- *  one saves again, which the schema cannot express anyway. */
-export function fromApiOverride(
-  override: ApiModelOverride,
-  localConfig?: PerModelConfig,
-): PerModelConfig {
-  const local = localConfig ?? DEFAULT_PER_MODEL_CONFIG;
-  // Three states, so the winning source is chosen once and restored below: the row's list when
-  // it has one, else whatever this browser held.
-  const extraArgs = Array.isArray(override.llama_extra_args)
-    ? override.llama_extra_args
-    : local.llamaExtraArgs;
-  // A row without ids says nothing about placement, so the local pin keeps its namespace.
-  const serverGpuIds = override.gpu_ids?.length ? override.gpu_ids : null;
-  const tensorSplit = "tensor_split" in override
-    ? normalizeTensorSplit(override.tensor_split, serverGpuIds)
-    : serverGpuIds
-      ? (override.gpu_index_kind ?? "physical") === (local.selectedGpuIndexKind ?? "physical")
-        ? reconcileTensorSplit(local.tensorSplit, local.selectedGpuIds, serverGpuIds)
-        : null
-      : local.tensorSplit;
-
-  // The pin is ONE setting in one of two fields, and an edit clears the other
-  // (contextPinPatch). Filling them from different sources mints a record that loads at
-  // two lengths, since the picker reads customContextLength first and the API's
-  // auto-switch max_seq_length first. So a row stating either field owns both.
-  const serverStatesPin =
-    override.custom_context_length != null || override.max_seq_length != null;
-  const serverStatesKvQuant =
-    "mlx_kv_quant" in override || "mlx_kv_bits" in override;
+/** One stored row in the picker's config shape. A field the row does not carry is at its default:
+ *  a save sends every field this UI shows, so the row is the whole saved config. */
+export function fromApiOverride(override: ApiModelOverride): PerModelConfig {
+  const gpuIds = override.gpu_ids?.length ? override.gpu_ids : null;
   const normalized = normalizePerModelConfig({
-    ...DEFAULT_PER_MODEL_CONFIG,
-    engine: override.engine ?? "auto",
-    engineParallelism: override.engine_parallelism ?? local.engineParallelism ?? "tensor",
-    enginePrecision:
-      override.engine_precision ?? local.enginePrecision ?? "auto",
-    engineKvCacheDtype:
-      override.engine_kv_cache_dtype ?? local.engineKvCacheDtype ?? "auto",
-    engineSeed: override.engine_seed ?? local.engineSeed ?? null,
-    engineGpuMemoryUtilization:
-      override.engine_gpu_memory_utilization ??
-      local.engineGpuMemoryUtilization ??
-      null,
-    customContextLength: serverStatesPin
-      ? (override.custom_context_length ?? null)
-      : local.customContextLength,
-    maxSeqLength: serverStatesPin
-      ? (override.max_seq_length ?? null)
-      : local.maxSeqLength,
-    kvCacheDtype: override.kv_cache_dtype ?? local.kvCacheDtype,
-    mlxKvQuant: serverStatesKvQuant
-      ? normalizeMlxKvQuant(override.mlx_kv_quant, override.mlx_kv_bits)
-      : (local.mlxKvQuant ?? null),
-    speculativeType: override.speculative_type ?? local.speculativeType,
-    specDraftNMax: override.spec_draft_n_max ?? local.specDraftNMax,
-    specDraftModel: override.spec_draft_model ?? local.specDraftModel,
-    specDraftCacheDtype:
-      override.spec_draft_cache_type ?? local.specDraftCacheDtype,
-    nParallel: override.n_parallel ?? local.nParallel,
-    reasoningBudget: override.reasoning_budget ?? local.reasoningBudget,
-    reasoningBudgetMessage:
-      override.reasoning_budget_message ?? local.reasoningBudgetMessage,
-    nBatch: override.n_batch ?? local.nBatch,
-    nUbatch: override.n_ubatch ?? local.nUbatch,
-    loadMode: override.load_mode ?? local.loadMode,
-    ctxCheckpoints: override.ctx_checkpoints ?? local.ctxCheckpoints,
-    cacheRam: override.cache_ram ?? local.cacheRam,
-    // Both are stored only when true, so an absent one is a gap like any other.
-    tensorParallel: override.tensor_parallel ?? local.tensorParallel,
-    disableVision: override.disable_vision ?? local.disableVision,
-    mlxInt8Prefill: override.mlx_int8_prefill ?? local.mlxInt8Prefill,
-    mlxPleOffload: override.mlx_ple_offload ?? local.mlxPleOffload,
-    mlxExpertOffload: override.mlx_expert_offload ?? local.mlxExpertOffload,
-    loadIn4bit: override.load_in_4bit ?? local.loadIn4bit,
-    chatTemplateOverride:
-      override.chat_template_override ?? local.chatTemplateOverride,
-    llamaExtraArgs: extraArgs,
-    gpuMemoryMode: override.gpu_memory_mode ?? local.gpuMemoryMode,
-    gpuLayers: override.gpu_layers ?? local.gpuLayers,
-    nCpuMoe: override.n_cpu_moe ?? local.nCpuMoe,
-    selectedGpuIds: serverGpuIds ?? local.selectedGpuIds ?? null,
-    tensorSplit,
-    // reconcileGpuSelection drops the pin if this host numbers its devices the other way.
-    selectedGpuIndexKind: serverGpuIds
-      ? (override.gpu_index_kind ?? "physical")
-      : (local.selectedGpuIndexKind ?? null),
+    engine: override.engine,
+    engineParallelism: override.engine_parallelism,
+    enginePrecision: override.engine_precision,
+    engineKvCacheDtype: override.engine_kv_cache_dtype,
+    engineSeed: override.engine_seed,
+    engineGpuMemoryUtilization: override.engine_gpu_memory_utilization,
+    loadIn4bit: override.load_in_4bit,
+    customContextLength: override.custom_context_length,
+    maxSeqLength: override.max_seq_length,
+    kvCacheDtype: override.kv_cache_dtype,
+    mlxKvQuant: normalizeMlxKvQuant(override.mlx_kv_quant, override.mlx_kv_bits),
+    mlxInt8Prefill: override.mlx_int8_prefill,
+    mlxPleOffload: override.mlx_ple_offload,
+    mlxExpertOffload: override.mlx_expert_offload,
+    speculativeType: override.speculative_type,
+    specDraftNMax: override.spec_draft_n_max,
+    specDraftCacheDtype: override.spec_draft_cache_type,
+    specDraftModel: override.spec_draft_model,
+    nParallel: override.n_parallel,
+    reasoningBudget: override.reasoning_budget,
+    reasoningBudgetMessage: override.reasoning_budget_message,
+    nBatch: override.n_batch,
+    nUbatch: override.n_ubatch,
+    loadMode: override.load_mode,
+    ctxCheckpoints: override.ctx_checkpoints,
+    cacheRam: override.cache_ram,
+    tensorParallel: override.tensor_parallel,
+    disableVision: override.disable_vision,
+    chatTemplateOverride: override.chat_template_override,
+    llamaExtraArgs: override.llama_extra_args,
+    gpuMemoryMode: override.gpu_memory_mode,
+    gpuLayers: override.gpu_layers,
+    nCpuMoe: override.n_cpu_moe,
+    selectedGpuIds: gpuIds,
+    // The pin keeps its index space; reconcileGpuSelection drops it on a host that numbers
+    // devices the other way.
+    selectedGpuIndexKind: gpuIds ? (override.gpu_index_kind ?? "physical") : null,
+    tensorSplit: normalizeTensorSplit(override.tensor_split, gpuIds),
   });
-  // normalizePerModelConfig collapses an empty list to null. The server uses [] as a tombstone
-  // that stops fallback to a broader override, so hydration must retain that third state.
-  if (Array.isArray(extraArgs)) {
-    normalized.llamaExtraArgs = [...extraArgs];
+  // normalizePerModelConfig collapses an empty list to null. The row's [] is a cleared box that
+  // stops a bare-repository row from answering, so it is sent as one.
+  if (Array.isArray(override.llama_extra_args)) {
+    normalized.llamaExtraArgs = [...override.llama_extra_args];
   }
   return normalized;
 }
@@ -542,65 +379,24 @@ export function toApiOverride(config: PerModelConfig | null): ApiModelOverride {
   return payload;
 }
 
-// One in-flight write per model, so writes commit in issue order: otherwise the older
-// response can land last and resurrect the entry the newer one replaced. Models overlap.
-const writesByKey = new Map<string, Promise<ModelOverrideWriteResult>>();
-
-export interface ModelOverrideWriteResult {
-  overrides: ApiModelOverrides;
-  /** Empty for a save, and from a backend that predates the field. */
-  removedKeys: string[];
-}
-
 export interface PutModelOverrideOptions {
-  /** Fill in only what is missing: every value already on the server stays. The backfill reads
-   *  the map once then writes each model in turn, so another tab's save would be overwritten
-   *  by this browser's older copy. Field level, so a legacy entry gains browser-only fields. */
+  /** Fill in only what is missing: every value already on the server stays. For the one-time
+   *  import of what older builds kept in this browser, whose copy may be the older one. */
   fillAbsentFields?: boolean;
-  /** Clear the fields this UI mirrors but leave the server's own launch flags alone. Evicting a
-   *  local entry for the storage budget is not a forget, so it must not take
-   *  `llama_extra_args` the page can neither show nor restore. */
-  keepLaunchFlags?: boolean;
   /** Remove a legacy passthrough value only after this control was explicitly reset. */
   resetReasoningBudget?: boolean;
   resetReasoningBudgetMessage?: boolean;
 }
 
+/** Saves one model's settings, or forgets them for a null config, and returns the map after the
+ *  write. Throws with the server's reason when the write is refused. `modelId` may be a stored key. */
 export async function putModelOverride(
   modelId: string,
   ggufVariant: string | null | undefined,
   config: PerModelConfig | null,
   options?: PutModelOverrideOptions,
-): Promise<ModelOverrideWriteResult> {
-  // Keyed by the folded identity: the backend resolves a legacy casing and the
-  // normalized one to one row, so raw strings would open two queues and race again.
-  const key = modelOverrideKey(
-    normalizeModelIdentity(modelId),
-    normalizeGgufVariantIdentity(ggufVariant),
-  );
-  // Chain on the settled tail: a failed write must not cancel the next one.
-  const previous = writesByKey.get(key) ?? Promise.resolve();
-  const write = previous
-    .catch(() => {})
-    .then(() => sendModelOverride(modelId, ggufVariant, config, options));
-  writesByKey.set(key, write);
-  try {
-    return await write;
-  } finally {
-    // Only the last writer clears the slot, so a queue still building keeps order.
-    if (writesByKey.get(key) === write) {
-      writesByKey.delete(key);
-    }
-  }
-}
-
-async function sendModelOverride(
-  modelId: string,
-  ggufVariant: string | null | undefined,
-  config: PerModelConfig | null,
-  options?: PutModelOverrideOptions,
-): Promise<ModelOverrideWriteResult> {
-  const res = await authFetch(OVERRIDES_URL, {
+): Promise<ApiModelOverrides> {
+  const res = await request({
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -625,10 +421,10 @@ async function sendModelOverride(
         : {}),
       // Say which operation this is: an all-default save carries no fields, shape-identical to a
       // forget, and guessing wrong wipes flags the UI cannot show or restore.
-      remove: config === null && !options?.keepLaunchFlags,
+      remove: config === null,
       // The backend preserves the flags when omitted, which a save that never opened the box relies
       // on; a forget means all of it, so that path sends an explicit [].
-      ...(config === null && !options?.keepLaunchFlags
+      ...(config === null
         ? // biome-ignore lint/style/useNamingConvention: API schema
           { llama_extra_args: [] }
         : {}),
@@ -650,50 +446,8 @@ async function sendModelOverride(
     }),
   });
   if (!res.ok) {
-    throw new Error(
-      await readFastApiError(res, "Failed to save model settings for the API"),
-    );
+    throw new Error(await readFastApiError(res, "Failed to save model settings"));
   }
-  const body = (await res.json()) as {
-    overrides?: ApiModelOverrides;
-    // biome-ignore lint/style/useNamingConvention: API schema
-    removed_keys?: unknown;
-  };
-  return {
-    overrides: body.overrides ?? {},
-    removedKeys: Array.isArray(body.removed_keys)
-      ? body.removed_keys.filter(
-          (key): key is string => typeof key === "string",
-        )
-      : [],
-  };
-}
-
-/**
- * Mirror a per-model config save to the backend without blocking the UI. Best-effort: the
- * localStorage write already happened, so a failed sync must not fail the save. Logged, not
- * toasted: an API load falls back to defaults until the next save.
- *
- * A forget also drops the local records for every spelling the server reports clearing.
- */
-export function syncModelOverride(
-  modelId: string,
-  ggufVariant: string | null | undefined,
-  config: PerModelConfig | null,
-  options?: PutModelOverrideOptions,
-): void {
-  void putModelOverride(modelId, ggufVariant, config, options)
-    .then(({ removedKeys }) => {
-      if (!deletePerModelConfigsForOverrideKeys(removedKeys)) {
-        console.warn(
-          "Forgot model settings on the server, but this browser kept its own copy.",
-        );
-      }
-    })
-    .catch((error: unknown) => {
-      console.warn(
-        "Failed to mirror model settings to the server; an API load of this model will use defaults.",
-        error,
-      );
-    });
+  const body = (await res.json()) as { overrides?: ApiModelOverrides };
+  return body.overrides ?? {};
 }

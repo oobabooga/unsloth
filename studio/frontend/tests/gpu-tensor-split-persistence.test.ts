@@ -3,23 +3,17 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  installLocalStorageFake,
-  registerStoreStubResolver,
-} from "./helpers/kit.ts";
+import { registerStoreStubResolver } from "./helpers/kit.ts";
 
 registerStoreStubResolver();
-const { store } = installLocalStorageFake();
-const {
-  DEFAULT_PER_MODEL_CONFIG,
-  normalizePerModelConfig,
-  resolveInitialConfig,
-  savePerModelConfig,
-} = await import(
+const { DEFAULT_PER_MODEL_CONFIG, normalizePerModelConfig } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
 );
 const { fromApiOverride, toApiOverride } = await import(
   "../src/features/model-picker/api/model-overrides.ts"
+);
+const { resolveInitialConfig, setSavedModelConfigsForTests } = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
 );
 
 const MODEL = "unsloth/split-GGUF";
@@ -34,8 +28,9 @@ const configured = () => ({
 });
 
 test("saving and reopening keeps the split in GPU order", () => {
-  store.clear();
-  assert.equal(savePerModelConfig(MODEL, VARIANT, configured()), true);
+  setSavedModelConfigsForTests({
+    [`${MODEL}:${VARIANT}`]: toApiOverride(configured()),
+  });
   const restored = resolveInitialConfig(MODEL, VARIANT);
   assert.equal(restored.remembered, true);
   assert.deepEqual(restored.config.selectedGpuIds, [1, 2, 0]);
@@ -43,22 +38,7 @@ test("saving and reopening keeps the split in GPU order", () => {
   assert.equal(restored.config.gpuLayers, 66);
 });
 
-test("a stored split is protected from clients that do not understand it", () => {
-  store.clear();
-  savePerModelConfig(MODEL, VARIANT, configured());
-  const [entry] = Object.values(
-    JSON.parse(store.get("unsloth_model_configs")!),
-  ) as { version: number }[];
-  assert.ok(entry.version > 9);
-  store.clear();
-  savePerModelConfig(MODEL, VARIANT, { ...configured(), tensorSplit: null });
-  const [withoutSplit] = Object.values(
-    JSON.parse(store.get("unsloth_model_configs")!),
-  ) as { version: number }[];
-  assert.equal(withoutSplit.version, 1);
-});
-
-test("the API mirror preserves the ratio and GPU order", () => {
+test("the saved row carries the ratio in GPU order", () => {
   const payload = toApiOverride(configured());
   assert.deepEqual(payload.gpu_ids, [1, 2, 0]);
   assert.deepEqual(
@@ -68,33 +48,25 @@ test("the API mirror preserves the ratio and GPU order", () => {
   assert.deepEqual(fromApiOverride(payload).tensorSplit, [30, 20, 16]);
 });
 
-test("hydration never attaches a local ratio to another server GPU order", () => {
-  const local = configured();
-  const restored = fromApiOverride({ gpu_ids: [0, 1, 2] }, local);
-  assert.deepEqual(restored.selectedGpuIds, [0, 1, 2]);
-  assert.equal(restored.tensorSplit ?? null, null);
-  assert.deepEqual(fromApiOverride({}, local).tensorSplit, local.tensorSplit);
+test("a row's ratio is read only with the GPU order it was saved with", () => {
+  const unsplit = fromApiOverride({ gpu_ids: [0, 1, 2] });
+  assert.deepEqual(unsplit.selectedGpuIds, [0, 1, 2]);
+  assert.equal(unsplit.tensorSplit, null);
   assert.equal(
-    fromApiOverride({ gpu_ids: [1, 2, 0], tensor_split: null }, local)
-      .tensorSplit,
+    fromApiOverride({ gpu_ids: [1, 2, 0], tensor_split: null }).tensorSplit,
     null,
   );
+  // A ratio for another number of GPUs describes some other pick.
   assert.equal(
-    fromApiOverride({ gpu_ids: [1, 2, 0], gpu_index_kind: "vulkan" }, local)
+    fromApiOverride({ gpu_ids: [1, 2], tensor_split: [30, 20, 16] })
       .tensorSplit,
     null,
   );
 });
 
-test("a server ratio cannot attach to unrelated local GPU IDs", () => {
-  assert.equal(
-    fromApiOverride({ tensor_split: [3, 2, 1] }, configured()).tensorSplit,
-    null,
-  );
-  assert.equal(
-    fromApiOverride({ tensor_split: null }, configured()).tensorSplit,
-    null,
-  );
+test("a ratio without its GPU IDs is not a split", () => {
+  assert.equal(fromApiOverride({ tensor_split: [3, 2, 1] }).tensorSplit, null);
+  assert.equal(fromApiOverride({ tensor_split: null }).tensorSplit, null);
 });
 
 test("default and malformed ratios are not persisted", () => {
@@ -129,28 +101,20 @@ test("default and malformed ratios are not persisted", () => {
   }
 });
 
-test("zero shares and fractional ratios survive storage", () => {
-  store.clear();
+test("zero shares and fractional ratios survive the saved row", () => {
   const value = { ...configured(), tensorSplit: [0, 2.5, 1] };
-  savePerModelConfig(MODEL, VARIANT, value);
   assert.deepEqual(
-    resolveInitialConfig(MODEL, VARIANT).config.tensorSplit,
+    fromApiOverride(toApiOverride(value)).tensorSplit,
     value.tensorSplit,
   );
 });
 
-test("clearing the ratio removes it from the next saved config", () => {
-  store.clear();
-  savePerModelConfig(MODEL, VARIANT, configured());
-  savePerModelConfig(MODEL, VARIANT, { ...configured(), tensorSplit: null });
-  assert.equal(
-    resolveInitialConfig(MODEL, VARIANT).config.tensorSplit ?? null,
-    null,
-  );
-  assert.equal(
-    toApiOverride({ ...configured(), tensorSplit: null }).tensor_split,
-    null,
-  );
+test("clearing the ratio sends an explicit clear", () => {
+  // An omitted split leaves the saved one in place on the server; null clears it.
+  const cleared = toApiOverride({ ...configured(), tensorSplit: null });
+  assert.equal("tensor_split" in cleared, true);
+  assert.equal(cleared.tensor_split, null);
+  assert.equal(fromApiOverride(cleared).tensorSplit ?? null, null);
 });
 
 test("a removed GPU, changed order, or backend namespace discards the saved split", async () => {

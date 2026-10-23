@@ -343,44 +343,45 @@ with sync_playwright() as p:
             info(f"WARN: screenshot {name} failed: {_shoot_err}")
 
     def read_configs() -> dict:
-        """Parsed unsloth_model_configs map, or {}; unreadable storage must not look like an empty one."""
-        raw = robust_evaluate(page, "() => localStorage.getItem('unsloth_model_configs')")
-        if not raw:
+        """The account's saved settings map from the server, or {}; a failed read must not look
+        like an empty one."""
+        resp = evaluate_fetch(
+            page,
+            f"{BASE}/api/settings/openai-auto-switch/overrides",
+            headers = {"Authorization": f"Bearer {token}"},
+        )
+        body = resp.get("body")
+        if (
+            resp.get("error") is not None
+            or not isinstance(body, dict)
+            or not isinstance(body.get("overrides"), dict)
+        ):
+            fail(
+                f"saved settings unreadable: status={resp.get('status')} "
+                f"error={resp.get('error')} body={str(body)[:200]!r}"
+            )
             return {}
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            fail(f"unsloth_model_configs is unreadable ({exc}); raw={str(raw)[:200]!r}")
-            return {}
-        if not isinstance(data, dict):
-            fail(f"unsloth_model_configs is not an object: {type(data).__name__}")
-            return {}
-        return data
+        return body["overrides"]
 
     def config_entries(cfg: dict) -> list[dict]:
-        """The per-model entries (dict values) of the stored map, schema-tolerant."""
+        """The rows (dict values) of the saved settings map."""
         return [v for v in cfg.values() if isinstance(v, dict)]
 
     def entries_for_model(cfg: dict) -> list[dict]:
-        """Only entries keyed to this model and quant; all entries only if no key has the versioned
-        shape."""
-        want = (_normalize_model_identity(GGUF_REPO), GGUF_VARIANT.strip().lower())
-        recognised = [k for k in cfg if re.match(r"^v\d+:\[", str(k))]
-        if not recognised:
-            return config_entries(cfg)
+        """Only the rows saved for this model and quant, matched as the server folds a key."""
+        want_model = _normalize_model_identity(GGUF_REPO)
+        want_quant = GGUF_VARIANT.strip().lower()
         matched = []
-        for key in recognised:
-            # Parse the key: a substring match on the repo also matches its other quants.
-            try:
-                parts = json.loads(str(key).split(":", 1)[1])
-            except Exception:
-                continue
-            if not isinstance(parts, list) or not parts:
-                continue
-            raw = (list(parts) + [""])[:2]
-            got = (_normalize_model_identity(str(raw[0])), str(raw[1]).strip().lower())
-            if got == want and isinstance(cfg[key], dict):
-                matched.append(cfg[key])
+        for key, row in cfg.items():
+            # Split on the quant: a substring match on the repo also matches its other quants.
+            model, sep, quant = str(key).rpartition(":")
+            if (
+                sep
+                and _normalize_model_identity(model) == want_model
+                and quant.strip().lower() == want_quant
+                and isinstance(row, dict)
+            ):
+                matched.append(row)
         # An empty result is a real answer; returning everything let another model satisfy the checks.
         return matched
 
@@ -780,12 +781,12 @@ with sync_playwright() as p:
 
                 cfg = read_configs()
                 entries = entries_for_model(cfg)
-                got_ls = any(e.get("customContextLength") == DISTINCT_CTX for e in entries)
-                if got_ls:
-                    info(f"OK persist(localStorage): customContextLength={DISTINCT_CTX} stored")
+                got_saved = any(e.get("custom_context_length") == DISTINCT_CTX for e in entries)
+                if got_saved:
+                    info(f"OK persist(server): custom_context_length={DISTINCT_CTX} saved")
                 else:
                     fail(
-                        "context not stored in unsloth_model_configs "
+                        "context not in the saved settings for this model "
                         f"(entries={json.dumps(entries)[:400]})"
                     )
 
@@ -823,15 +824,15 @@ with sync_playwright() as p:
             if _as_int(val) == DISTINCT_CTX or time.monotonic() >= deadline:
                 break
             page.wait_for_timeout(250)
-        # With the model loaded the field is seeded from the runtime, so re-read the stored entry.
+        # With the model loaded the field is seeded from the runtime, so re-read the saved row.
         stored = [
             e
             for e in entries_for_model(read_configs())
-            if e.get("customContextLength") == DISTINCT_CTX
+            if e.get("custom_context_length") == DISTINCT_CTX
         ]
         if not stored:
             fail(
-                "the remembered per-model entry lost customContextLength across reload "
+                "the saved row lost custom_context_length across reload "
                 f"(entries={json.dumps(entries_for_model(read_configs()))[:400]})"
             )
         elif _as_int(val) == DISTINCT_CTX:
@@ -863,12 +864,12 @@ with sync_playwright() as p:
             click_and_wait_for_commit(btn, "reset commit")
         cfg = read_configs()
         pinned = any(
-            _as_int(e.get("customContextLength")) == DISTINCT_CTX for e in entries_for_model(cfg)
+            _as_int(e.get("custom_context_length")) == DISTINCT_CTX for e in entries_for_model(cfg)
         )
         if pinned:
-            fail("Reset left the distinctive context pinned in unsloth_model_configs")
+            fail("Reset left the distinctive context pinned in the saved settings")
         else:
-            info("OK reset: distinctive context cleared from unsloth_model_configs")
+            info("OK reset: distinctive context cleared from the saved settings")
         shoot("08-after-reset")
 
     # Re-typing the shown value must not pin an override (HARD); Auto shows while nothing is pinned.
@@ -912,16 +913,16 @@ with sync_playwright() as p:
             click_and_wait_for_commit(btn, "re-typed context Load")
         cfg = read_configs()
         entries = entries_for_model(cfg)
-        pinned = [e for e in entries if _as_int(e.get("customContextLength")) == native_default]
+        pinned = [e for e in entries if _as_int(e.get("custom_context_length")) == native_default]
 
         # Not every stored context is a phantom pin: model-config-page.tsx pins the active context on purpose
         # for a manual GPU-layer placement (pinFixedLayerContext), which includes every CPU-only runner.
         expected_pin = [
             e
             for e in pinned
-            if e.get("gpuMemoryMode") == "manual"
-            and isinstance(e.get("gpuLayers"), int)
-            and e.get("gpuLayers") >= 0
+            if e.get("gpu_memory_mode") == "manual"
+            and isinstance(e.get("gpu_layers"), int)
+            and e.get("gpu_layers") >= 0
         ]
         if pinned and len(expected_pin) == len(pinned):
             info(
@@ -931,8 +932,8 @@ with sync_playwright() as p:
         elif pinned:
             fail(
                 "re-typing the shown context pinned it as an override "
-                f"(customContextLength={native_default}) with no fixed-layer placement to "
-                f"justify it; entries={[{k: e.get(k) for k in ('gpuMemoryMode', 'gpuLayers', 'customContextLength')} for e in pinned]}"
+                f"(custom_context_length={native_default}) with no fixed-layer placement to "
+                f"justify it; entries={[{k: e.get(k) for k in ('gpu_memory_mode', 'gpu_layers', 'custom_context_length')} for e in pinned]}"
             )
         else:
             info("OK re-type-shown: shown context not stored as an override")
@@ -977,10 +978,10 @@ with sync_playwright() as p:
                 click_and_wait_for_commit(btn, "advanced settings Load")
             cfg = read_configs()
             has_adv = any(
-                e.get("tensorParallel") or e.get("kvCacheDtype") for e in entries_for_model(cfg)
+                e.get("tensor_parallel") or e.get("kv_cache_dtype") for e in entries_for_model(cfg)
             )
             if toggled and has_adv:
-                info("OK advanced: tensorParallel/kvCacheDtype persisted")
+                info("OK advanced: tensor_parallel/kv_cache_dtype saved")
             else:
                 runtime_warn(
                     f"advanced persistence not observed (toggled={toggled}, "
@@ -992,14 +993,13 @@ with sync_playwright() as p:
     except Exception as e:
         runtime_warn(f"advanced-persist check errored: {e}")
 
-    # 5. Legacy unsloth_load_settings migrates once and stays idempotent (soft_fail gates in CI).
-    step("legacy unsloth_load_settings migrates once and stays idempotent", LOAD_STEP_BUDGET_S)
+    # 5. Settings an older build kept in this browser are imported once (soft_fail gates in CI).
+    step("browser-kept legacy settings import into the saved settings", LOAD_STEP_BUDGET_S)
 
     _seed_marks = [0]
 
-    def seed_legacy_for_next_document(seed: dict, *, wipe_migrated: bool) -> None:
-        """Seed via an init script on the next document; seeding the live page races its server
-        write-back."""
+    def seed_legacy_for_next_document(seed: dict) -> None:
+        """Seed via an init script on the next document, so the import at start-up reads it."""
         _seed_marks[0] += 1
         mark = f"__ui_modelcfg_seed_{_seed_marks[0]}"
         page.add_init_script(
@@ -1009,19 +1009,15 @@ with sync_playwright() as p:
             "    if (sessionStorage.getItem(MARK)) { return; }\n"
             "    sessionStorage.setItem(MARK, '1');\n"
             f"    localStorage.setItem('unsloth_load_settings', {json.dumps(json.dumps(seed))});\n"
-            + (
-                "    localStorage.removeItem('unsloth_model_configs');\n"
-                "    localStorage.removeItem('unsloth_model_configs_migrated');\n"
-                if wipe_migrated
-                else ""
-            )
-            + "  } catch (e) {}\n"
+            "    localStorage.removeItem('unsloth_model_configs');\n"
+            "    localStorage.removeItem('unsloth_model_configs_migrated');\n"
+            "  } catch (e) {}\n"
             "})();"
         )
 
     def clear_server_overrides_for_model() -> None:
-        """Also delete the server override rows: opening the panel writes them back over the
-        migrated value."""
+        """Delete the rows the earlier steps saved: the import only fills what a row lacks, so a
+        surviving row would keep its own values over the imported ones."""
         # Normalise model and quant separately: normalizeModelIdentity keeps a POSIX path's case.
         want_model = _normalize_model_identity(GGUF_REPO)
         want_quant = GGUF_VARIANT.strip().lower()
@@ -1067,13 +1063,12 @@ with sync_playwright() as p:
         if stale is None:
             runtime_warn(
                 "could not read the server override inventory, so the rows left by the earlier "
-                "steps were not cleared; the migration check below may be measuring server "
+                "steps were not cleared; the import check below may be measuring server "
                 "precedence instead"
             )
             return
         remove_rows(stale)
-        # syncModelOverride is fire-and-forget, so a late PUT can recreate the row; sample the whole
-        # window and remove it again each time.
+        # A save still in flight can recreate the row, so sample a short window and remove it again.
         left: list[str] | None = []
         for _ in range(4):
             page.wait_for_timeout(250)
@@ -1087,29 +1082,25 @@ with sync_playwright() as p:
         if left is None:
             runtime_warn(
                 "could not re-read the server override inventory after clearing it, so whether "
-                "the rows stayed removed is unknown; the migration check below may be measuring "
+                "the rows stayed removed is unknown; the import check below may be measuring "
                 "server precedence instead"
             )
         elif left:
             runtime_warn(
                 f"server override rows for the model under test survived removal: {left}; "
-                "the migration check below may be measuring server precedence instead"
+                "the import check below may be measuring server precedence instead"
             )
         elif stale:
             info(f"cleared {len(stale)} server override row(s) left by the earlier steps")
 
-    def wait_for_migration_settled(timeout_ms: int = 15_000) -> str | None:
-        """Wait for the migrated flag, which the import sets last on every path, rather than sleeping."""
+    def wait_for_import_settled(timeout_ms: int = 15_000) -> bool:
+        """The import removes the browser's copy once the server holds it, rather than sleeping."""
         deadline = time.monotonic() + timeout_ms / 1000
-        flag = None
         while time.monotonic() < deadline:
-            flag = robust_evaluate(
-                page, "() => localStorage.getItem('unsloth_model_configs_migrated')"
-            )
-            if flag is not None:
-                return flag
+            if robust_evaluate(page, "() => localStorage.getItem('unsloth_load_settings')") is None:
+                return True
             page.wait_for_timeout(100)
-        return flag
+        return False
 
     try:
         clear_server_overrides_for_model()
@@ -1119,92 +1110,58 @@ with sync_playwright() as p:
                 "contextLength": DISTINCT_CTX,
                 "kvCacheDtype": "q8_0",
                 "tensorParallel": True,
-                # Fingerprint: only this seed sets disableVision (toApiOverride sends it only when true).
+                # Fingerprint: only this seed sets disable_vision on the row.
                 "disableVision": True,
             }
         }
-        seed_legacy_for_next_document(legacy, wipe_migrated = True)
+        seed_legacy_for_next_document(legacy)
         page.reload()
         composer = page.locator('textarea[aria-label="Message input"]')
         composer.wait_for(state = "visible", timeout = 60_000)
-        # Opening the picker config makes the store read, which migrates.
-        popover = open_picker()
-        open_config(popover, MODEL_HINT)
-        flag_first = wait_for_migration_settled()
-        cfg_first = read_configs()
-        model_entries = entries_for_model(cfg_first)
-        migrated_ctx = any(e.get("customContextLength") == DISTINCT_CTX for e in model_entries)
-        # Separate "ran and lost the context" from "skipped because something else wrote the key".
-        migrated_any = any(e.get("disableVision") is True for e in model_entries)
-        # Require the fingerprint too: a surviving server override row also carries DISTINCT_CTX.
-        if migrated_ctx and migrated_any:
-            info(f"OK migration: legacy context {DISTINCT_CTX} preserved after migrating")
-        elif migrated_ctx:
+        settled = wait_for_import_settled()
+        model_entries = entries_for_model(read_configs())
+        imported_ctx = any(e.get("custom_context_length") == DISTINCT_CTX for e in model_entries)
+        # Separate "ran and lost the context" from "a row from another source carries it".
+        imported_any = any(e.get("disable_vision") is True for e in model_entries)
+        if imported_ctx and imported_any:
+            info(f"OK import: legacy context {DISTINCT_CTX} saved on the server")
+        elif imported_ctx:
             soft_fail(
-                f"legacy context {DISTINCT_CTX} is present but NOTHING ELSE from the seed is: "
-                f"disableVision is the fingerprint that only this seed sets, so the context was "
-                f"put here by something other than the legacy import -- a surviving server "
-                f"override row hydrating over the map is what produces this "
-                f"(entries={json.dumps(model_entries)[:400]})"
+                f"legacy context {DISTINCT_CTX} is saved but NOTHING ELSE from the seed is: "
+                f"disable_vision is the fingerprint only this seed sets, so a row that survived "
+                f"the clear-up carries the context (entries={json.dumps(model_entries)[:400]})"
             )
-        elif migrated_any:
+        elif imported_any:
             soft_fail(
-                f"legacy context {DISTINCT_CTX} was DROPPED by the migration: other fields "
-                f"of the same legacy entry did land, so migrateLegacyLoadSettingsOnce ran "
-                f"and lost the context (entries={json.dumps(model_entries)[:400]})"
+                f"legacy context {DISTINCT_CTX} was DROPPED by the import: other fields of the "
+                f"same legacy entry did land (entries={json.dumps(model_entries)[:400]})"
             )
         else:
             soft_fail(
-                f"legacy entry never migrated at all: nothing from the seed reached "
-                f"unsloth_model_configs, so the key was already occupied when "
-                f"migrateLegacyLoadSettingsOnce ran (cfg={json.dumps(cfg_first)[:400]})"
+                "legacy entry never imported: nothing from the seed reached the saved settings "
+                f"(entries={json.dumps(model_entries)[:400]})"
             )
-        if flag_first != "1":
-            soft_fail(f"migration flag not set after migrating (got {flag_first!r})")
-        shoot("09-after-migration")
-        close_picker()
+        if not settled:
+            soft_fail("the browser kept its legacy copy after the import")
+        shoot("09-after-import")
 
-        # Idempotency: a second reload with a different legacy entry must not re-run the migration.
-        if migrated_ctx:
-            probe_key = "unsloth/__idem_probe__::Q4_K_M"
-            # Seed at document start so no racing write lands in the map compared key-for-key.
-            seed_legacy_for_next_document(
-                {probe_key: {"contextLength": DISTINCT_CTX + 2048, "tensorParallel": True}},
-                wipe_migrated = False,
-            )
+        # Another browser copy only fills gaps: what the server already holds is the newer value.
+        if imported_ctx:
+            seed_legacy_for_next_document({legacy_key: {"contextLength": DISTINCT_CTX + 2048}})
             page.reload()
             composer.wait_for(state = "visible", timeout = 60_000)
-            popover = open_picker()
-            open_config(popover, MODEL_HINT)
-            # The flag is already "1", so wait for readMap, which would re-run the import if it were ignored.
-            wait_for_migration_settled()
-            cfg_second = read_configs()
-            keys_first = set(cfg_first.keys())
-            keys_second = set(cfg_second.keys())
-            new_keys = keys_second - keys_first
-            still_has_ctx = any(
-                e.get("customContextLength") == DISTINCT_CTX for e in entries_for_model(cfg_second)
-            )
-            if new_keys:
-                soft_fail(
-                    "legacy migration re-ran on a second reload (persistent flag "
-                    f"ignored): new keys {sorted(new_keys)}"
-                )
-            elif keys_second != keys_first:
-                soft_fail(
-                    "legacy migration dropped entries on a second reload: "
-                    f"{sorted(keys_first)} -> {sorted(keys_second)}"
-                )
-            elif not still_has_ctx:
-                soft_fail("legacy migration clobbered the migrated context on a second reload")
+            wait_for_import_settled()
+            entries_second = entries_for_model(read_configs())
+            if any(e.get("custom_context_length") == DISTINCT_CTX for e in entries_second):
+                info("OK import fills only: a second legacy copy left the saved context alone")
             else:
-                info(
-                    "OK migration idempotent: second reload did not re-migrate, duplicate, or clobber"
+                soft_fail(
+                    "a second legacy copy overwrote the saved context "
+                    f"(entries={json.dumps(entries_second)[:400]})"
                 )
-            shoot("10-after-second-reload")
-            close_picker()
+            shoot("10-after-second-import")
     except Exception as e:
-        soft_fail(f"migration idempotency check errored: {e}")
+        soft_fail(f"legacy import check errored: {e}")
 
     # ─────────────────────────────────────────────────────
     # 6. Hub Run keeps its run settings on a page loaded at /hub (HARD).

@@ -7,7 +7,6 @@ import type {
   ModelSelectorChangeMeta,
 } from "../components/model-selector/types";
 import {
-  apiAutoSwitchMayLoad,
   cachedRepoConfigId,
   ggufVariantsMatch,
   isOllamaModelId,
@@ -15,7 +14,6 @@ import {
   modelDisplayName,
   residentModelIdMatches,
 } from "./model-identity";
-import { adoptLegacyConfigKey } from "./per-model-config";
 
 export interface ModelConfigHandoffRequest {
   requestId: string;
@@ -76,7 +74,6 @@ export function modelConfigTarget(
     displayName: meta.ggufVariant ? `${name} · ${meta.ggufVariant}` : name,
     ggufVariant: meta.ggufVariant ?? null,
     isGguf,
-    apiLoadable: apiAutoSwitchMayLoad([id, loadId], meta.isLora),
     ...(separateLoadId ? { configId: id } : {}),
     meta,
   };
@@ -120,7 +117,6 @@ export function residentModelConfigTarget({
     displayName: ggufVariant ? `${leaf} · ${ggufVariant}` : leaf,
     ggufVariant: settingsGgufVariant,
     isGguf,
-    apiLoadable: apiAutoSwitchMayLoad([modelId], isLora),
     ...(repoId ? { configId: repoId } : {}),
     meta: {
       source: "local",
@@ -213,17 +209,6 @@ export const useModelConfigHandoffStore = create<ModelConfigHandoffState>(
 export function requestModelConfigHandoff(
   request: ModelConfigHandoffRequest,
 ): void {
-  if (
-    request.meta.source === "hub" &&
-    request.meta.loadId?.trim() &&
-    request.meta.loadId !== request.id
-  ) {
-    adoptLegacyConfigKey(
-      request.id,
-      request.meta.loadId,
-      request.meta.ggufVariant,
-    );
-  }
   useModelConfigHandoffStore.getState().submit(request);
 }
 

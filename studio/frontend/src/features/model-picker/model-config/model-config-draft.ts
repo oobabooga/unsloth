@@ -42,11 +42,8 @@ const drafts = new Map<string, ModelConfigDraftSnapshot>();
 const listeners = new Set<() => void>();
 // Editors showing each draft: it must outlive one and not the last.
 const hostCounts = new Map<string, number>();
-// Drafts whose stored override row is folded in. Keyed by the DRAFT, never by the candidate
-// keys: the two hosts build differently SHAPED lists, so no normalizing makes them equal.
-const extraArgsHydratedDrafts = new Set<string>();
-// Drafts the USER changed, which the config alone cannot tell: a read may neither replace an
-// edited draft nor re-run over one, since the peer's edit is already in its configAtStart.
+// Drafts the USER changed, which the config alone cannot tell: a re-read of the saved settings
+// must not replace an edited draft.
 const editedDrafts = new Set<string>();
 // What is TYPED into the Extra Arguments box; the config holds argv tokens. Shared, or a second
 // editor re-quotes a half-typed line into balanced text and judges it loadable.
@@ -88,11 +85,6 @@ export function readModelConfigDraft(
 
 /** Registers one editor and returns its release; the draft and its mark live while any holds. */
 export function retainModelConfigDraft(key: string): () => void {
-  // A fresh editor re-reads the row: the sidebar host never unmounts while a model is resident,
-  // so a permanent mark hid settings another origin saved. Never over an edit.
-  if (!editedDrafts.has(key)) {
-    extraArgsHydratedDrafts.delete(key);
-  }
   hostCounts.set(key, (hostCounts.get(key) ?? 0) + 1);
   let released = false;
   return () => {
@@ -106,7 +98,6 @@ export function retainModelConfigDraft(key: string): () => void {
       return;
     }
     hostCounts.delete(key);
-    extraArgsHydratedDrafts.delete(key);
     editedDrafts.delete(key);
     extraArgsEditByDraftKey.delete(key);
     if (drafts.delete(key)) {
@@ -145,7 +136,7 @@ export function primeModelConfigDraft(
     };
     drafts.set(key, next);
     editedDrafts.delete(key);
-    // Re-seeded from the resident process, as external as a hydration.
+    // Re-seeded from the resident process, as external as a re-read of the saved settings.
     extraArgsEditByDraftKey.delete(key);
     notify();
     return next;
@@ -225,14 +216,6 @@ export function setModelConfigDraftSavedRemember(
   }
   drafts.set(key, { ...existing, savedRemember });
   notify();
-}
-
-export function isExtraArgsHydratedForDraft(key: string): boolean {
-  return extraArgsHydratedDrafts.has(key);
-}
-
-export function markExtraArgsHydratedForDraft(key: string): void {
-  extraArgsHydratedDrafts.add(key);
 }
 
 export function markModelConfigDraftEdited(key: string): void {

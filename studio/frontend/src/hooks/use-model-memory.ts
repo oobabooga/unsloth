@@ -23,16 +23,12 @@ import {
   readPersistedSpeculativeType,
   useChatRuntimeStore,
 } from "@/features/chat/stores/chat-runtime-store";
+import type { PerModelConfig } from "@/features/model-picker/model-config/per-model-config";
 import {
-  normalizeGgufVariantIdentity,
-  normalizeModelIdentity,
-} from "@/features/hub/lib/model-identity";
-import {
-  PER_MODEL_CONFIG_STORAGE_KEY,
-  PER_MODEL_CONFIG_UPDATED_EVENT,
-  type PerModelConfig,
-  listPerModelConfigs,
-} from "@/features/model-picker/model-config/per-model-config";
+  readSavedModelConfigs,
+  resolveInitialConfig,
+  subscribeSavedModelConfigs,
+} from "@/features/model-picker/model-config/saved-model-configs";
 import {
   loadVramBudgetSettings,
   subscribeVramBudgetSettings,
@@ -155,32 +151,27 @@ const MISS: Estimate = {
 };
 
 /**
- * Re-read saved settings whenever any of them are written.
+ * Re-read saved settings whenever any of them change.
  *
- * Two sources, because a model with no override follows the standing preference: the per-model
- * configs, which announce themselves, and the standing GPU-memory mode and speculative type, which
- * live in localStorage and raise no same-tab event. The runtime store changes in lockstep with
- * those writes in-session, so it stands in as their notification.
+ * Two sources, because a model with no override follows the standing preference: the saved
+ * per-model settings, and the standing GPU-memory mode and speculative type, which live in
+ * localStorage and raise no same-tab event. The runtime store changes in lockstep with those
+ * writes in-session, so it stands in as their notification.
  */
 function subscribeToConfigChanges(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
-  const onConfigWrite = () => {
-    configsDirty = true;
-    onChange();
-  };
-  window.addEventListener(PER_MODEL_CONFIG_UPDATED_EVENT, onConfigWrite);
-  // The custom event above is same-tab only, by construction: the native storage event fires in
-  // every OTHER document sharing the origin and never in the one that made the write. So settings
-  // edited in a second Studio tab arrive here as a storage event and nowhere else.
+  const unsubscribeSaved = subscribeSavedModelConfigs(onChange);
+  // The native storage event fires in every OTHER document sharing the origin, so a standing
+  // preference changed in a second Studio tab arrives here and nowhere else.
   const onStorage = (event: Event) => {
     const key = (event as StorageEvent).key;
     // A null key means the whole store was cleared, which counts.
-    if (key == null || watchedStorageKeys().includes(key)) onConfigWrite();
+    if (key == null || watchedStorageKeys().includes(key)) onChange();
   };
   window.addEventListener("storage", onStorage);
   const unsubscribeStore = useChatRuntimeStore.subscribe(onChange);
   return () => {
-    window.removeEventListener(PER_MODEL_CONFIG_UPDATED_EVENT, onConfigWrite);
+    unsubscribeSaved();
     window.removeEventListener("storage", onStorage);
     unsubscribeStore();
   };
@@ -194,7 +185,6 @@ function subscribeToConfigChanges(onChange: () => void): () => void {
  * module scope then reads a `const` in its temporal dead zone and throws at import time.
  */
 const watchedStorageKeys = () => [
-  PER_MODEL_CONFIG_STORAGE_KEY,
   CHAT_GPU_MEMORY_MODE_KEY,
   CHAT_SPECULATIVE_TYPE_KEY,
 ];
@@ -206,12 +196,8 @@ const subscribeNothing = () => () => {};
 const readZeroEpoch = () => 0;
 
 let configEpoch = 0;
-let lastConfigSignature = "";
+let lastSavedConfigs: unknown = null;
 let lastPrefSignature = "";
-// Serialising every saved config is the expensive half, and only a config write can change it. The
-// store ticks on every streamed token, so doing that work per tick would put an O(all configs)
-// stringify in the render path.
-let configsDirty = true;
 
 /**
  * A value that changes whenever any saved config does, so the estimate can be re-keyed. The
@@ -234,33 +220,19 @@ function readConfigEpoch(): number {
     lastPrefSignature = prefSignature;
     configEpoch += 1;
   }
-  if (configsDirty) {
-    configsDirty = false;
-    const signature = JSON.stringify(listPerModelConfigs());
-    if (signature !== lastConfigSignature) {
-      lastConfigSignature = signature;
-      configEpoch += 1;
-    }
+  // A new object on every change, so the store ticking per streamed token costs one comparison.
+  const saved = readSavedModelConfigs();
+  if (saved !== lastSavedConfigs) {
+    lastSavedConfigs = saved;
+    configEpoch += 1;
   }
   return configEpoch;
 }
 
-/**
- * The user's saved settings for this exact variant, if any.
- *
- * Variant-exact only, matching `resolveInitialConfig`: the load path looks up (modelId,
- * ggufVariant) and drops to defaults when there is no hit, so falling back to a model-level entry
- * would size the bar from settings the variant will never load with. Keys are stored normalized,
- * which lower-cases hub repo ids, so comparing raw strings would miss every mixed-case repo.
- */
+/** The user's saved settings for this variant, if any, found as the load path finds them. */
 function configFor(source: ModelMemorySource): PerModelConfig | undefined {
-  const wantId = normalizeModelIdentity(source.repoId);
-  const wantVariant = normalizeGgufVariantIdentity(source.quant);
-  return listPerModelConfigs().find(
-    (e) =>
-      normalizeModelIdentity(e.modelId) === wantId &&
-      normalizeGgufVariantIdentity(e.ggufVariant) === wantVariant,
-  )?.config;
+  const saved = resolveInitialConfig(source.repoId, source.quant || null);
+  return saved.remembered ? saved.config : undefined;
 }
 
 /** A context the user pinned, or undefined to let the model use its own. */
@@ -468,9 +440,9 @@ export function useModelMemory(
       cacheKey,
       trustBudget: budgetIsMeaningful(config) && budgetIsDedicatedVram,
     };
-    // `epoch` is a real dependency the linter cannot see: `configFor` reads
-    // localStorage, and epoch is what changes when that storage does. Folding it
-    // into the cache key instead would evict every row's answer on any save.
+    // `epoch` is a real dependency the linter cannot see: `configFor` reads the
+    // saved settings, and epoch is what changes when they do. Folding it into the
+    // cache key instead would evict every row's answer on any save.
     // biome-ignore lint/correctness/useExhaustiveDependencies: see above
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, repoId, loadId, quant, sizeBytes, epoch, budgetIsDedicatedVram]);

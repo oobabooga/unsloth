@@ -170,7 +170,6 @@ import {
   loadedContextFields,
 } from "@/features/model-picker";
 import { loadManagedLlamaFlags } from "@/features/model-picker/api/llama-flags";
-import { fetchLoadExtraArgs } from "@/features/model-picker/api/model-overrides";
 import { sanitizeStoredExtraArgs } from "@/features/model-picker/model-config/llama-extra-args";
 import { usePlatformStore } from "@/config/env";
 import {
@@ -1701,52 +1700,32 @@ export function SharedComposer({
           resolvedIsDiffusion = staged.isDiffusion;
           diffusionUnknown = staged.diffusionUnknown;
         }
-        // Pass-through arguments can live only in the server's override map while this config comes from
-        // local storage, and /load's omission path inherits them from a RESIDENT instance, which a cold
-        // compare pane does not have, so the experiment would run a different command.
+        // The saved list becomes an EXPLICIT /load argument, validated strictly rather than going
+        // through the carry-over paths that drop a newly denied flag quietly, so a pane on an install
+        // upgraded across a denylist change would otherwise answer 400 on a comparison that ran the
+        // day before. Not for the diffusion runner, which appends none of them.
+        const savedArgs = ownConfig.llamaExtraArgs;
         if (
           targetIsGguf &&
-          // Not for the diffusion runner, which appends none of them.
-          resolvedIsDiffusion !== true
+          resolvedIsDiffusion !== true &&
+          savedArgs != null &&
+          savedArgs.length > 0
         ) {
           try {
-            // Sanitised for the same reason the panel sanitises what it hydrates: either list becomes an
-            // EXPLICIT /load argument, validated strictly rather than going through the carry-over paths
-            // that drop a newly denied flag quietly, so a pane on an install upgraded across a denylist
-            // change would otherwise answer 400 on a comparison that ran the day before.
             const managed = await loadManagedLlamaFlags();
-            const clean = (tokens: readonly string[]) =>
-              sanitizeStoredExtraArgs(
-                tokens,
-                managed?.managed ?? new Set<string>(),
-                {
-                  maxBytes: managed?.maxBytes,
-                  windowsCommandBudget: managed?.windowsCommandBudget,
-                },
-              );
-            const local = ownConfig.llamaExtraArgs;
-            if (local === undefined) {
-              const resolvedArgs = await fetchLoadExtraArgs(
-                sel.id,
-                sel.id,
-                sel.ggufVariant ?? null,
-              );
-              const cleaned = clean(resolvedArgs.tokens);
-              if (cleaned.length > 0) {
-                ownConfig.llamaExtraArgs = cleaned;
-              } else if (resolvedArgs.explicit) {
-                // An explicit empty row is a cleared box, and this pane has to send it as one: left undefined the
-                // field is omitted and /load carries the resident model's arguments into the comparison.
-                ownConfig.llamaExtraArgs = [];
-              }
-            } else if (local !== null && local.length > 0) {
-              const cleaned = clean(local);
-              if (cleaned.length !== local.length) {
-                ownConfig.llamaExtraArgs = cleaned.length > 0 ? cleaned : [];
-              }
+            const cleaned = sanitizeStoredExtraArgs(
+              savedArgs,
+              managed?.managed ?? new Set<string>(),
+              {
+                maxBytes: managed?.maxBytes,
+                windowsCommandBudget: managed?.windowsCommandBudget,
+              },
+            );
+            if (cleaned.length !== savedArgs.length) {
+              ownConfig.llamaExtraArgs = cleaned;
             }
           } catch {
-            // The load still works; a real overrides outage surfaces there.
+            // The load still works; a real outage surfaces there.
           }
         }
         // Mirror single-view resolveLoadMaxSeqLength: a pane with no explicit context hands sizing to

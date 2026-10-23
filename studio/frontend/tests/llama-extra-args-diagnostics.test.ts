@@ -520,40 +520,52 @@ test("the row stores argv tokens, not the typed string", () => {
   assert.match(body, /const \{ tokens \} = parseExtraArgs\(next\)/);
 });
 
+/** The panel's re-read of the saved settings, whitespace collapsed. */
+function reReadEffect(): string {
+  const start = pageSource.indexOf(
+    "const draftAtStart = readModelConfigDraft(draftKey);",
+  );
+  const end = pageSource.indexOf("}, [draftKey, target.id, target.isGguf]);", start);
+  assert.ok(start >= 0 && end > start, "missing the re-read effect");
+  return pageSource.slice(start, end).replace(/\s+/g, " ");
+}
+
 test("the box is filled from the stored flags, not left looking empty", () => {
   const panel = pageSource.slice(
     pageSource.indexOf("export function ModelConfigPage("),
   );
   const body = panel.replace(/\s+/g, " ");
-  // The overrides API can set these without the UI, so the box must fetch what is actually set.
+  // The overrides API can set these without the UI, so the box shows what the load applies: the
+  // row read under the load path, with the settings identity as its alias.
   assert.match(
-    body,
-    /fetchLoadModelOverride\(loadId, configId, target\.ggufVariant, keys\)/,
+    pageSource.replace(/\s+/g, " "),
+    /savedConfigFor\( target\.id, configId === target\.id \? null : configId, target\.ggufVariant, \)/,
   );
-  // Through the resolver: the backend folds identities and falls back from repo:QUANT to repo.
-  // Candidate keys still travel for backends predating the resolving parameter.
-  assert.match(body, /modelOverrideKey\(loadId, target\.ggufVariant\)/);
-  assert.match(body, /sanitizeStoredExtraArgs\( resolvedArgs\.tokens,/);
+  assert.match(body, /const saved = savedTargetConfig\(target, configId\);/);
   // Into the config, not only the textarea: the load sends what the config holds.
-  assert.match(body, /llamaExtraArgs: stored/);
-  // Mark only once a response is in hand, or StrictMode's replayed effect skips the second fetch.
-  const marked = body.indexOf("markExtraArgsHydratedForDraft(draftKey)");
+  const effect = reReadEffect();
+  assert.match(
+    effect,
+    /llamaExtraArgs: sanitizeStoredExtraArgs\( tokens, managed\?\.managed \?\? new Set<string>\(\),/,
+  );
   assert.ok(
-    marked > body.indexOf("if (cancelled) { return; }"),
-    "mark after the response",
+    effect.indexOf("sanitizeStoredExtraArgs(") <
+      effect.indexOf("replaceModelConfigDraft("),
+    "the sanitized list is what replaces the draft",
   );
 });
 
-test("hydration is not gated behind the advanced disclosure", () => {
-  // The row only renders while Advanced is open, so the fetch lives in the always-mounted parent.
+test("the read is not gated behind the advanced disclosure", () => {
+  // The row only renders while Advanced is open, so the read lives in the always-mounted parent.
   const row = pageSource.slice(pageSource.indexOf("function ExtraArgsRow("));
   const rowBody = row.slice(0, row.indexOf("\n}\n"));
-  assert.doesNotMatch(rowBody, /fetchLoadExtraArgs/);
+  assert.doesNotMatch(rowBody, /refreshSavedModelConfigs/);
   const advanced = pageSource.slice(
     pageSource.indexOf("function GgufAdvancedSettings("),
     pageSource.indexOf("export function ModelConfigPage("),
   );
-  assert.doesNotMatch(advanced, /fetchLoadExtraArgs/);
+  assert.doesNotMatch(advanced, /refreshSavedModelConfigs/);
+  assert.match(reReadEffect(), /refreshSavedModelConfigs\(\),/);
 });
 
 test("the row does not withdraw its objection when it unmounts", () => {
@@ -565,9 +577,10 @@ test("the row does not withdraw its objection when it unmounts", () => {
     effect.slice(0, effect.indexOf("const commit")),
     /return \(\) => onLoadableChange/,
   );
+  // Only a different model retires it.
   assert.match(
     pageSource.replace(/\s+/g, " "),
-    /setExtraArgsLoadable\(true\); setExtraArgsHydrating\(!isDiffusion\); \}, \[configId, target\.ggufVariant, target\.isGguf, isDiffusion\]\)/,
+    /useEffect\(\(\) => \{ setExtraArgsLoadable\(true\); \}, \[configId, target\.ggufVariant, target\.isGguf, isDiffusion\]\)/,
   );
 });
 
@@ -626,27 +639,35 @@ test("load waits for the stored arguments to be read", () => {
   );
   const body = panel.replace(/\s+/g, " ");
   // /load cannot inherit from a process that is not running.
-  assert.match(body, /extraArgsHydrating \|\|/);
-  assert.match(body, /\.finally\(\(\) => \{ .*setExtraArgsHydrating\(false\)/);
-  assert.match(body, /setTimeout\(\(\) => setExtraArgsHydrating\(false\), \d+\)/);
-  // The short deadline is on the catalogue, not the gate; the gate waits on the denylist.
-  assert.match(body, /loadManagedLlamaFlags\(\)/);
-  assert.doesNotMatch(body, /loadLlamaFlagCatalog\(\)[^;]*Promise\.all/);
+  assert.match(body, /savedSettingsLoading \|\|/);
+  const effect = reReadEffect();
+  assert.match(
+    effect,
+    /\.finally\(\(\) => \{ if \(!cancelled\) \{ clearTimeout\(release\); setSavedSettingsLoading\(false\);/,
+  );
+  // A request that never settles releases the gate.
+  assert.match(body, /setTimeout\(\(\) => setSavedSettingsLoading\(false\), \d+\)/);
+  // The gate waits on the denylist, not on the catalogue's --help probe.
+  assert.match(effect, /loadManagedLlamaFlags\(\)/);
+  assert.doesNotMatch(effect, /loadLlamaFlagCatalog/);
 });
 
-test("Load waits for the server row on every model but diffusion", () => {
+test("Load waits for the saved settings on every model", () => {
   const panel = pageSource.slice(
     pageSource.indexOf("export function ModelConfigPage("),
   );
   const body = panel.replace(/\s+/g, " ");
-  // Diffusion models run through the shim, which appends no llama-server flags.
+  // Every model's settings now come from the server, diffusion included.
   assert.match(
     body,
-    /if \(resolvedIsDiffusion\) \{ [^}]*setExtraArgsHydrating\(false\); return; \}/,
+    /const \[savedSettingsLoading, setSavedSettingsLoading\] = useState\(true\);/,
   );
-  assert.match(body, /useState\( \(\) => !isDiffusion, \)/);
-  assert.match(body, /setExtraArgsHydrating\(!isDiffusion\);/);
-  assert.doesNotMatch(body, /setExtraArgsHydrating\(true\)/);
+  const effect = reReadEffect();
+  assert.doesNotMatch(effect, /if \(resolvedIsDiffusion\)/);
+  assert.match(
+    body,
+    /useEffect\(\(\) => \{ let cancelled = false; setSavedSettingsLoading\(true\);/,
+  );
 });
 
 test("a diffusion classification retires the argument objection", () => {
@@ -660,14 +681,16 @@ test("a diffusion classification retires the argument objection", () => {
   );
 });
 
-test("hydration asks under the keys the load path uses", () => {
-  const panel = pageSource.slice(
-    pageSource.indexOf("export function ModelConfigPage("),
+test("the panel reads under the identities the load path uses", () => {
+  const saved = pageSource.slice(
+    pageSource.indexOf("function savedTargetConfig("),
+    pageSource.indexOf("function useSavedTargetConfig("),
   );
-  const body = panel.replace(/\s+/g, " ");
-  // The auto-switch loader reads the path-qualified key first for snapshot-path GGUFs.
-  assert.match(body, /modelOverrideKey\(loadId, target\.ggufVariant\), modelOverrideKey\(configId, target\.ggufVariant\), loadId,/);
-  assert.match(body, /fileVariant \? \[`\$\{loadId\}:\$\{fileVariant\}`\] : \[\]/);
+  // The auto-switch loader reads the load path first and the settings identity as its alias.
+  assert.match(
+    saved.replace(/\s+/g, " "),
+    /savedConfigFor\( target\.id, configId === target\.id \? null : configId, target\.ggufVariant, \)/,
+  );
 });
 
 test("a rollback restores the previous model with its arguments", () => {
@@ -683,24 +706,23 @@ test("a rollback restores the previous model with its arguments", () => {
   assert.match(runtime, /: loadLlamaExtraArgs !== undefined/);
 });
 
-test("a hydrated list is judged even when the row cannot be", () => {
-  const panel = pageSource.slice(
-    pageSource.indexOf("export function ModelConfigPage("),
+test("a re-read list is judged even when the row cannot be", () => {
+  // The verdict on the previous list goes with it, and the check that runs while Advanced is
+  // collapsed judges the list that replaced it.
+  const effect = reReadEffect();
+  assert.ok(
+    effect.indexOf("replaceModelConfigDraft(") <
+      effect.indexOf("setExtraArgsLoadable(true);"),
   );
-  const body = panel.replace(/\s+/g, " ");
-  // With Advanced collapsed the row never mounts, so the adopted list must be judged here.
-  assert.match(
-    body,
-    /const hydratedArgs = serverConfig\?\.llamaExtraArgs \?\? stored;/,
-  );
-  assert.match(
-    body,
-    /const hydratedIsLoadable = !target\.isGguf \|\| hydratedArgs\.length === 0 \? true : extraArgsAreLoadable\( diagnoseExtraArgs\( formatExtraArgs\(hydratedArgs\)/,
-  );
-  assert.match(
-    body,
-    /if \(configRef\.current\.llamaExtraArgs !== undefined\) \{ .*return; \} setExtraArgsLoadable\(hydratedIsLoadable\)/,
-  );
+  const hidden = pageSource
+    .slice(
+      pageSource.indexOf(
+        "if (showAdvanced || !target.isGguf || resolvedIsDiffusion) {",
+      ),
+      pageSource.indexOf("hiddenCatalogEpoch,\n  ]);"),
+    )
+    .replace(/\s+/g, " ");
+  assert.match(hidden, /\}, \[ showAdvanced, configState\.llamaExtraArgs,/);
 });
 
 test("the runtime preflight is sized with the arguments the load sends", () => {

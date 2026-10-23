@@ -48,10 +48,8 @@ import {
   ggufVariantsMatch,
   modelDisplayName,
 } from "../model-config/model-identity";
-import {
-  type PerModelConfig,
-  resolveInitialConfig,
-} from "../model-config/per-model-config";
+import type { PerModelConfig } from "../model-config/per-model-config";
+import { resolveInitialConfig } from "../model-config/saved-model-configs";
 import { ModelConfigPage } from "./model-config-page";
 import {
   type ExternalConnectionRef,

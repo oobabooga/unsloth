@@ -96,8 +96,8 @@ export function invalidateLlamaFlagCatalog(): void {
   inFlightCatalog = null;
   // The managed answer too. Its denylist is Unsloth's own, but it carries defaultParallelSlots,
   // which is the EFFECTIVE count: a build without --kv-unified serves one slot however many
-  // are configured. A tab that had already fetched it went on sizing the hydration check's
-  // batch floor from the previous backend.
+  // are configured. A tab that had already fetched it went on sizing batch floors from
+  // the previous backend.
   cachedManaged = null;
   inFlightManaged = null;
   for (const listener of catalogListeners) {

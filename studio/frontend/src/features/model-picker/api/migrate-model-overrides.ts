@@ -1,152 +1,187 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// One-time backfill of per-model settings into the server override map. Settings used to live
-// only in this browser, so on upgrade an API load still used app defaults.
+// One-time import of the per-model settings older builds kept in this browser. The server's map is
+// the only copy now, so each record is sent there, filling only the fields the server row lacks
+// (a value already there is the newer one), and leaves this browser once the server has it.
 
+import { sanitizeStoredExtraArgs } from "../model-config/llama-extra-args";
 import {
   cachedRepoConfigId,
-  isNativeFileLabel,
-  isOllamaLinkPath,
-  normalizeGgufVariantIdentity,
-  normalizeModelIdentity,
-  splitQuantSuffix,
+  ggufVariantFromStorageKey,
+  modelIdFromStorageKey,
+  modelStorageKey,
 } from "../model-config/model-identity";
 import {
-  adoptCachedRepoConfig,
+  type PerModelConfig,
   isDefaultConfig,
-  listPerModelConfigs,
+  normalizePerModelConfig,
+  storedSpeculativeAuto,
 } from "../model-config/per-model-config";
-import type { ApiModelOverride } from "./model-overrides";
-import {
-  fetchModelOverrides,
-  modelOverrideKey,
-  putModelOverride,
-  toApiOverride,
-} from "./model-overrides";
+import { loadManagedLlamaFlags } from "./llama-flags";
+import { putModelOverride } from "./model-overrides";
 
-// Bumped whenever the filter below admits more, so a completed pass reruns: v2 for Ollama tags,
-// v3 for non-GGUF weights.
-const DONE_FLAG = "unsloth_model_overrides_backfilled_v3";
+const CONFIGS_KEY = "unsloth_model_configs";
+// The store before that one, and the flag saying it was already merged into it.
+const LEGACY_KEY = "unsloth_load_settings";
+const LEGACY_MERGED_FLAG = "unsloth_model_configs_migrated";
+// Left by the builds that copied these records to the server field by field.
+const BACKFILL_FLAG = "unsloth_model_overrides_backfilled_v3";
+const LEGACY_FIELDS = [
+  "kvCacheDtype",
+  "speculativeType",
+  "specDraftNMax",
+  "tensorParallel",
+  "disableVision",
+  "gpuMemoryMode",
+  "gpuLayers",
+  "nCpuMoe",
+  "selectedGpuIds",
+] as const;
 
-function alreadyRan(): boolean {
+type BrowserRecord = {
+  modelId: string;
+  ggufVariant: string | null;
+  config: PerModelConfig;
+};
+
+function readObject(key: string): Record<string, unknown> {
   try {
-    return window.localStorage.getItem(DONE_FLAG) === "1";
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? "null");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch {
-    // Storage denied: treat as done rather than re-running on every mount.
-    return true;
+    return {};
   }
 }
 
-function markRan(): void {
-  try {
-    window.localStorage.setItem(DONE_FLAG, "1");
-  } catch {
-    // Nothing to do; the backfill is idempotent anyway.
+function legacyRecordConfig(raw: Record<string, unknown>): PerModelConfig {
+  const fields: Record<string, unknown> = {
+    customContextLength: raw.contextLength,
+  };
+  for (const name of LEGACY_FIELDS) {
+    fields[name] = raw[name];
+  }
+  // Written before any MLX control, so its Auto is GGUF's.
+  return storedSpeculativeAuto(normalizePerModelConfig(fields), false);
+}
+
+/** The store before unsloth_model_configs, keyed `modelId::variant`; the newer store wins a model
+ *  both hold. */
+function addLegacyRecords(records: Map<string, BrowserRecord>): void {
+  for (const [key, raw] of Object.entries(readObject(LEGACY_KEY))) {
+    const separator = key.lastIndexOf("::");
+    const modelId = separator >= 0 ? key.slice(0, separator) : key;
+    const ggufVariant =
+      separator >= 0 ? key.slice(separator + 2) || null : null;
+    const storageKey = modelStorageKey(modelId, ggufVariant);
+    if (modelId && raw && typeof raw === "object" && !records.has(storageKey)) {
+      records.set(storageKey, {
+        modelId,
+        ggufVariant,
+        config: legacyRecordConfig(raw as Record<string, unknown>),
+      });
+    }
   }
 }
 
-/** A server key under the same identity this browser stores. `app_settings` has no schema
- *  version, so an old install holds keys the backend resolves to this model while an exact
- *  lookup calls them missing and overwrites them. The split folds repo ids while preserving
- *  POSIX path identity. */
-function normalizedOverrideKey(key: string): string {
-  const split = splitQuantSuffix(key);
-  if (!split) {
-    return modelOverrideKey(normalizeModelIdentity(key));
+function browserRecords(): BrowserRecord[] {
+  const records = new Map<string, BrowserRecord>();
+  for (const [key, raw] of Object.entries(readObject(CONFIGS_KEY))) {
+    const modelId = modelIdFromStorageKey(key);
+    if (modelId) {
+      const ggufVariant = ggufVariantFromStorageKey(key) || null;
+      records.set(modelStorageKey(modelId, ggufVariant), {
+        modelId,
+        ggufVariant,
+        config: normalizePerModelConfig(raw),
+      });
+    }
   }
-  return modelOverrideKey(
-    normalizeModelIdentity(split[0]),
-    normalizeGgufVariantIdentity(split[1]),
+  if (!localStorage.getItem(LEGACY_MERGED_FLAG)) {
+    addLegacyRecords(records);
+  }
+  return [...records.values()].filter(
+    (record) => !isDefaultConfig(record.config),
   );
 }
 
-/** The fields *config* would contribute that the stored entry does not hold. A malformed entry
- *  (nothing constrains what an older install wrote) counts as holding nothing. */
-function absentFields(
-  stored: ApiModelOverride,
-  config: Parameters<typeof toApiOverride>[0],
-): string[] {
-  const fields = Object.keys(toApiOverride(config));
-  if (typeof stored !== "object" || stored === null) {
-    return fields;
+/** A stored list becomes an explicit one the route validates strictly, so a flag denied since it
+ *  was saved would refuse the whole record. */
+async function withoutRefusedFlags(
+  records: BrowserRecord[],
+): Promise<BrowserRecord[]> {
+  if (
+    !records.some((record) => (record.config.llamaExtraArgs?.length ?? 0) > 0)
+  ) {
+    return records;
   }
-  return fields.filter((field) => !(field in stored));
+  const managed = await loadManagedLlamaFlags().catch(() => null);
+  return records.map((record) => {
+    const tokens = record.config.llamaExtraArgs;
+    if (!tokens || tokens.length === 0) {
+      return record;
+    }
+    const kept = sanitizeStoredExtraArgs(
+      tokens,
+      managed?.managed ?? new Set(),
+      {
+        maxBytes: managed?.maxBytes,
+        windowsCommandBudget: managed?.windowsCommandBudget,
+      },
+    );
+    return {
+      ...record,
+      config: {
+        ...record.config,
+        llamaExtraArgs: kept.length > 0 ? kept : null,
+      },
+    };
+  });
 }
 
-/** Push local settings the server does not hold. Never deletes and never overwrites: a value
- *  already there is the newer authority. Field by field, not entry by entry, since a legacy
- *  entry holds only llama_extra_args and max_seq_length. */
-export async function backfillModelOverrides(): Promise<void> {
-  if (alreadyRan()) {
-    return;
-  }
-  // Uploaded under the path, a record an older build saved for a cached repo would outrank the repo's.
-  for (const entry of listPerModelConfigs()) {
-    adoptCachedRepoConfig(entry.modelId, entry.ggufVariant);
-  }
-  const local = listPerModelConfigs().filter(
-    // Auto-switch resolves GGUF and non-GGUF weights alike. A link sits in a dir the resolver
-    // skips, a bare file name is a label it never keys, and a snapshot path still here is a record
-    // adoption declined.
-    (entry) =>
-      !isOllamaLinkPath(entry.modelId) &&
-      !isNativeFileLabel(entry.modelId) &&
-      cachedRepoConfigId(entry.modelId, entry.ggufVariant) === null &&
-      !isDefaultConfig(entry.config),
-  );
-  if (local.length === 0) {
-    markRan();
-    return;
-  }
-
-  let existing: Awaited<ReturnType<typeof fetchModelOverrides>>;
+/** Sends this browser's records to the server and removes them here. Never rejects: a record the
+ *  server did not take stays in this browser for the next start. */
+export async function importBrowserModelConfigs(): Promise<void> {
+  let records: BrowserRecord[];
   try {
-    existing = await fetchModelOverrides();
+    records = await withoutRefusedFlags(browserRecords());
   } catch {
-    // Offline or not authenticated yet: leave the flag unset so the next start retries.
+    // Storage denied: there is nothing this browser can hand over.
     return;
   }
-
-  const known = new Map<string, ApiModelOverride>();
-  for (const [storedKey, storedEntry] of Object.entries(existing)) {
-    known.set(normalizedOverrideKey(storedKey), storedEntry);
-  }
-
-  let failed = false;
-  for (const entry of local) {
-    // Folded here too: the older `id::variant` keys hold the casing that was typed.
-    const key = normalizedOverrideKey(
-      modelOverrideKey(entry.modelId, entry.ggufVariant),
-    );
-    // Re-read rather than trusting the pre-fetch snapshot: this write commits last.
-    const current = listPerModelConfigs().find(
-      (candidate) =>
-        normalizedOverrideKey(
-          modelOverrideKey(candidate.modelId, candidate.ggufVariant),
-        ) === key,
-    );
-    if (!current || isDefaultConfig(current.config)) {
-      continue;
-    }
-    const stored = known.get(key);
-    // Nothing this browser could add, so skip the round trip entirely.
-    if (stored && absentFields(stored, current.config).length === 0) {
-      continue;
-    }
+  const kept: Record<string, PerModelConfig> = {};
+  // A cached repo is saved under its repo id, since a snapshot-path row would outrank it on every
+  // load. A record kept under the path goes last, so one already under the repo id fills first.
+  const repoIdOf = (record: BrowserRecord) =>
+    cachedRepoConfigId(record.modelId, record.ggufVariant);
+  records.sort(
+    (a, b) => Number(repoIdOf(a) !== null) - Number(repoIdOf(b) !== null),
+  );
+  for (const record of records) {
+    const repoId = repoIdOf(record);
     try {
-      // Fills the gaps only. `known` predates this loop, so another tab's save is invisible here.
       await putModelOverride(
-        current.modelId,
-        current.ggufVariant,
-        current.config,
+        repoId ?? record.modelId,
+        repoId ? null : record.ggufVariant,
+        record.config,
         { fillAbsentFields: true },
       );
     } catch {
-      failed = true;
+      kept[modelStorageKey(record.modelId, record.ggufVariant)] = record.config;
     }
   }
-  if (!failed) {
-    markRan();
+  try {
+    if (Object.keys(kept).length > 0) {
+      localStorage.setItem(CONFIGS_KEY, JSON.stringify(kept));
+    } else {
+      localStorage.removeItem(CONFIGS_KEY);
+    }
+    for (const key of [LEGACY_KEY, LEGACY_MERGED_FLAG, BACKFILL_FLAG]) {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // The records are on the server; a copy left here is only sent again.
   }
 }

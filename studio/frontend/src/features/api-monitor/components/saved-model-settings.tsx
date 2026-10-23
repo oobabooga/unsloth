@@ -7,23 +7,22 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+import type { ApiModelOverride } from "@/features/model-picker/api/model-overrides";
 import {
-  type ApiModelOverride,
-  type ApiModelOverrides,
-  fetchModelOverrides,
-  putModelOverride,
-} from "@/features/model-picker/api/model-overrides";
-import { deletePerModelConfigsForOverrideKeys } from "@/features/model-picker/model-config/per-model-config";
+  forgetModelConfig,
+  readSavedModelConfigs,
+  refreshSavedModelConfigs,
+  subscribeSavedModelConfigs,
+} from "@/features/model-picker/model-config/saved-model-configs";
 import { Trash2 } from "lucide-react";
 import {
   type ReactElement,
   useCallback,
   useEffect,
-  useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { toast } from "sonner";
-import { forgetModelOverride } from "../forget-model-override";
 import { useSingleLine } from "../use-single-line";
 
 function plural(count: number, noun: string): string {
@@ -129,68 +128,48 @@ function describeOverride(override: ApiModelOverride): string[] {
 }
 
 export function SavedModelSettingsPanel(): ReactElement {
-  const [overrides, setOverrides] = useState<ApiModelOverrides | null>(null);
+  // The same copy the picker reads, so a forget here clears it there too.
+  const overrides = useSyncExternalStore(
+    subscribeSavedModelConfigs,
+    readSavedModelConfigs,
+    readSavedModelConfigs,
+  );
   const [error, setError] = useState<string | null>(null);
   const [errorRef, errorSingle] = useSingleLine<HTMLDivElement>();
   const [emptyRef, emptySingle] = useSingleLine<HTMLParagraphElement>();
   const [forgetting, setForgetting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
-  // Each forget refetches, and a row disables only its own button, so two of them
-  // overlap. The reads answer in whatever order the network gives, and the older one
-  // saw the row the newer forget removed: last issued has to win, or a row the server
-  // no longer holds is painted back and stays until the panel remounts.
-  const loadSeq = useRef(0);
-
-  const load = useCallback(async () => {
-    const seq = ++loadSeq.current;
-    try {
-      const next = await fetchModelOverrides();
-      if (seq !== loadSeq.current) {
-        return;
-      }
-      setOverrides(next);
-      setError(null);
-    } catch (err: unknown) {
-      if (seq !== loadSeq.current) {
-        return;
-      }
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not load saved model settings",
-      );
-    }
-  }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    refreshSavedModelConfigs().then(
+      () => setError(null),
+      (err: unknown) =>
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Could not load saved model settings",
+        ),
+    );
+  }, []);
 
-  const forget = useCallback(
-    async (overrideKey: string) => {
-      setForgetting((prev) => new Set(prev).add(overrideKey));
-      try {
-        await forgetModelOverride(overrideKey, {
-          listedKeys: Object.keys(overrides ?? {}),
-          removeRemote: (modelId, ggufVariant) =>
-            putModelOverride(modelId, ggufVariant, null),
-          removeLocal: deletePerModelConfigsForOverrideKeys,
-          reload: load,
-          onError: (message) => {
-            toast.error(message);
-          },
-        });
-      } finally {
-        setForgetting((prev) => {
-          const next = new Set(prev);
-          next.delete(overrideKey);
-          return next;
-        });
-      }
-    },
-    [load, overrides],
-  );
+  const forget = useCallback(async (overrideKey: string) => {
+    setForgetting((prev) => new Set(prev).add(overrideKey));
+    try {
+      // The stored key itself: the server clears every spelling of that model.
+      await forgetModelConfig(overrideKey);
+    } catch (err: unknown) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to forget these settings",
+      );
+    } finally {
+      setForgetting((prev) => {
+        const next = new Set(prev);
+        next.delete(overrideKey);
+        return next;
+      });
+    }
+  }, []);
 
   const entries = Object.entries(overrides ?? {});
 

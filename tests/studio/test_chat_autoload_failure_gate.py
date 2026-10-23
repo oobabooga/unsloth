@@ -122,21 +122,14 @@ export type Scenario = {
   config?: Record<string, unknown>;
 };
 
-// The stored-arguments hydration the auto-load runs before it calls /load. Neutral
-// here on purpose: these scenarios are about the failure gate, not about which flags
-// a model launches with, and a stub that invented some would change the /load payload
-// every scenario asserts on. fetchLoadExtraArgs answers "nothing stored", which is
-// what a fresh install has, and the sanitizer is identity so a scenario that does set
-// llamaExtraArgs still sends exactly what it set.
+// The saved-settings read and the stored-arguments sanitizing the auto-load runs before it
+// calls /load. Neutral here on purpose: these scenarios are about the failure gate, not
+// about which flags a model launches with. The saved settings come from resolveInitialConfig
+// below, and the sanitizer is identity so a scenario that does set llamaExtraArgs still
+// sends exactly what it set.
+export async function ensureSavedModelConfigs(): Promise<void> {}
 export async function loadManagedLlamaFlags(): Promise<any> {
   return null;
-}
-export async function fetchLoadExtraArgs(
-  _loadId: string,
-  _aliasId?: string | null,
-  _variant?: string | null,
-): Promise<{ tokens: string[]; explicit: boolean }> {
-  return { tokens: [], explicit: false };
 }
 export function sanitizeStoredExtraArgs(
   tokens: readonly string[],

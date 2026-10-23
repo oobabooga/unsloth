@@ -9,22 +9,18 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
-  installLocalStorageFake,
-  registerBundlerResolver,
-} from "./helpers/kit.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-installLocalStorageFake();
 
-const {
-  DEFAULT_PER_MODEL_CONFIG,
-  deletePerModelConfig,
-  perModelConfigStorageChanged,
-  resolveInitialConfig,
-  savePerModelConfig,
-} = await import(
+const { fromApiOverride, toApiOverride } = await import(
+  "../src/features/model-picker/api/model-overrides.ts"
+);
+const { DEFAULT_PER_MODEL_CONFIG } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
+);
+const { savedConfigFor, setSavedModelConfigsForTests } = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
 );
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -37,12 +33,27 @@ const PANEL = readFileSync(
   "utf8",
 );
 
-test("a list typed while hydration was in flight is not sanitized", () => {
-  // Only legacy stored data is sanitized; text typed during the fetch is live input.
-  assert.match(PANEL, /const localAtStart = configAtStart\.llamaExtraArgs;/);
+/** The re-read effect, from where it captures the draft to where its dependencies close. */
+function reReadEffect(): string {
+  const start = PANEL.indexOf(
+    "const draftAtStart = readModelConfigDraft(draftKey);",
+  );
+  const end = PANEL.indexOf("}, [draftKey, target.id, target.isGguf]);", start);
+  assert.ok(start >= 0 && end > start, "missing the re-read effect");
+  return PANEL.slice(start, end);
+}
+
+test("a list typed while the re-read was in flight is not sanitized", () => {
+  // Only the saved list is sanitized; a draft edited or replaced during the read is live input.
+  const effect = reReadEffect();
+  assert.ok(
+    effect.indexOf("Promise.all([") <
+      effect.indexOf("sanitizeStoredExtraArgs("),
+    "the draft is captured before the read and sanitized only after it",
+  );
   assert.match(
-    PANEL,
-    /local !== null && local\.length > 0 && local === localAtStart|local != null && local\.length > 0 && local === localAtStart/,
+    effect,
+    /cancelled \|\|\s*isModelConfigDraftEdited\(draftKey\) \|\|\s*readModelConfigDraft\(draftKey\) !== draftAtStart/,
   );
 });
 
@@ -60,15 +71,24 @@ const ADAPTER = readFileSync(
   "utf8",
 );
 
-test("a background auto-load hydrates a server-only override", () => {
-  // Local storage misses overrides written via the API or another browser.
+test("a background auto-load sends the saved list, sanitized", () => {
+  // The startup load can run before the first read of the saved settings lands.
+  assert.match(
+    ADAPTER,
+    /await ensureSavedModelConfigs\(\);\s*const \{ config \} = resolveInitialConfig\(/,
+  );
+  // Read under the id the row was saved by, not the load path cached inventory can hand back.
+  assert.match(
+    ADAPTER,
+    /resolveInitialConfig\(\s*candidate\.id,\s*candidate\.ggufVariant,\s*\)/,
+  );
   assert.match(ADAPTER, /let resolvedExtraArgs = config\.llamaExtraArgs;/);
-  assert.match(ADAPTER, /const stored = await fetchLoadExtraArgs\(/);
-  assert.match(ADAPTER, /sanitizeStoredExtraArgs\(tokens, managed\?\.managed/);
-  // Older builds may have stored a flag that is managed now, which /load would 400.
-  assert.match(ADAPTER, /const cleaned = clean\(resolvedExtraArgs\);/);
-  // Cached inventory can return a different loadId than the one the row was written under.
-  assert.match(ADAPTER, /candidate\.id,\n\s*candidate\.ggufVariant \?\? null,/);
+  // A flag managed since the list was saved would be answered with a 400.
+  assert.match(
+    ADAPTER,
+    /sanitizeStoredExtraArgs\(\s*resolvedExtraArgs,\s*managed\?\.managed/,
+  );
+  assert.doesNotMatch(ADAPTER, /fetchLoadExtraArgs/);
   assert.equal(
     ADAPTER.match(/llama_extra_args: resolvedExtraArgs \?\? \[\]/g)?.length,
     2,
@@ -86,10 +106,11 @@ const COMPOSER = readFileSync(
   "utf8",
 );
 
-test("a compare pane sanitizes the local list as well as the fetched one", () => {
-  // An older build's config may name a now-managed flag, which /load rejects with 400.
-  assert.match(COMPOSER, /const local = ownConfig\.llamaExtraArgs;/);
-  assert.match(COMPOSER, /const cleaned = clean\(local\);/);
+test("a compare pane sanitizes its saved list", () => {
+  // A list saved before a flag became managed would be rejected by /load with a 400.
+  assert.match(COMPOSER, /const savedArgs = ownConfig\.llamaExtraArgs;/);
+  assert.match(COMPOSER, /sanitizeStoredExtraArgs\(\s*savedArgs,/);
+  assert.doesNotMatch(COMPOSER, /fetchLoadExtraArgs/);
 });
 
 test("the hidden revalidation can only tighten the verdict", () => {
@@ -112,141 +133,39 @@ test("the hidden validation re-runs when the binary changes", () => {
   assert.match(PANEL, /hiddenCatalogEpoch,\n\s*\]\);/);
 });
 
-const OVERRIDES = readFileSync(
-  path.join(HERE, "..", "src/features/model-picker/api/model-overrides.ts"),
-  "utf8",
-);
-
-test("the legacy overrides fallback searches the caller's own identities", () => {
-  // Older backends return the whole map, so an empty default key list found nothing.
-  assert.match(OVERRIDES, /fallbackKeys\.length > 0\s*\n?\s*\? fallbackKeys/);
-  assert.match(OVERRIDES, /modelOverrideKey\(loadId, ggufVariant\)/);
-  assert.match(OVERRIDES, /modelOverrideKey\(aliasId, ggufVariant\)/);
-});
-
-test("the hidden hydration check knows the slot floor", () => {
+test("the hidden check knows the slot floor", () => {
   // The backend deterministically refuses a batch below the floor.
   assert.match(
     PANEL,
-    /serverConfig\?\.nParallel \?\? configRef\.current\.nParallel/,
+    /batchFloor: effectiveBatchFloor\(configState\.nParallel, catalog\)/,
   );
 });
 
-test("the panel adopts a shared server config without overwriting a live edit", () => {
-  assert.match(PANEL, /fetchLoadModelOverride\(/);
+test("the panel takes the saved settings without overwriting a live edit", () => {
+  const effect = reReadEffect();
+  assert.match(effect, /refreshSavedModelConfigs\(\),/);
+  // An edited draft, or one replaced while the read was out, keeps what it holds.
   assert.match(
-    PANEL,
-    /const serverConfig = resolvedRow\s*\n?\s*\? fromApiOverride\(resolvedRow, \{/,
+    effect,
+    /isModelConfigDraftEdited\(draftKey\) \|\|\s*readModelConfigDraft\(draftKey\) !== draftAtStart/,
   );
-  // Fields the row lacks keep the local value; the list travels sanitized.
+  // Remember follows whether the server holds a row for the model.
   assert.match(
-    PANEL,
-    /\.\.\.configAtStart,\s*\n?\s*llamaExtraArgs: sanitizedLocal,/,
+    effect,
+    /replaceModelConfigDraft\(\s*draftKey,\s*reconcileConfigGpuSelection\(config, resolvedIsDiffusion, gpuDevices\),\s*\{ remember: resolved\.remembered, savedRemember: resolved\.remembered \},\s*\);/,
   );
-  assert.match(PANEL, /let sanitizedLocal = localAtStart;/);
-  assert.match(
-    PANEL,
-    /sanitizedLocal = cleaned\.length > 0 \? cleaned : null;/,
-  );
-  assert.match(
-    PANEL,
-    /savePerModelConfig\(\s*configId,\s*target\.ggufVariant,\s*storedSpeculativeAuto\(rememberedConfig, !target\.isGguf\),/,
-  );
-  // By value: the primed draft is a different object from the first render's fallback.
-  assert.match(
-    PANEL,
-    /perModelConfigsEqual\(configRef\.current, configAtStart\)/,
-  );
-  assert.match(PANEL, /rememberRef\.current === rememberAtStart/);
-  assert.match(
-    PANEL,
-    /replaceModelConfigDraft\(draftKey, serverConfig, \{\s*\n?\s*remember: true,\s*\n?\s*savedRemember: true,\s*\n?\s*\}\);/,
-  );
+  assert.doesNotMatch(PANEL, /fetchLoadModelOverride|savePerModelConfig/);
 });
 
 test("the panel strips llama-server arguments from a non-GGUF row", () => {
-  // API auto-switch applies the row to MLX and safetensors loads too.
-  assert.match(PANEL, /target\.isGguf \? loadManagedLlamaFlags\(\) : null,/);
-  assert.match(PANEL, /\(row\) => panelOverrideRow\(row, target\.isGguf\)/);
+  // API auto-switch applies the row to MLX and safetensors loads too, which send no such flags.
   assert.match(
     PANEL,
-    /const local = target\.isGguf\s*\?\s*configRef\.current\.llamaExtraArgs\s*:\s*undefined;/,
+    /return target\.isGguf\s*\?\s*saved\s*:\s*\{ \.\.\.saved, config: \{ \.\.\.saved\.config, llamaExtraArgs: undefined \} \};/,
   );
-});
-
-test("hydration detects a newer save or forget", () => {
-  const modelId = "unsloth/Hydration-Race-GGUF";
-  const variant = "Q4_K_M";
-  assert.ok(
-    savePerModelConfig(modelId, variant, {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 2048,
-    }),
-  );
-  const atStart = resolveInitialConfig(modelId, variant);
-
-  assert.ok(
-    savePerModelConfig(modelId, variant, {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 4096,
-    }),
-  );
-  assert.equal(
-    perModelConfigStorageChanged(
-      atStart,
-      resolveInitialConfig(modelId, variant),
-    ),
-    true,
-  );
-
-  assert.ok(deletePerModelConfig(modelId, variant));
-  assert.equal(
-    perModelConfigStorageChanged(
-      atStart,
-      resolveInitialConfig(modelId, variant),
-    ),
-    true,
-  );
-  assert.equal(
-    perModelConfigStorageChanged(atStart, {
-      config: { ...atStart.config },
-      remembered: atStart.remembered,
-    }),
-    false,
-  );
-});
-
-test("the hydration write-back rejects a stale server response", () => {
-  const requestStart = PANEL.indexOf("Promise.all([");
-  const storageSnapshot = PANEL.indexOf(
-    "const storedAtStart = resolveInitialConfig(configId, target.ggufVariant);",
-  );
-  const responseStart = PANEL.indexOf(
-    ".then(([resolvedOverride, managed]) => {",
-    requestStart,
-  );
-  const adoptionStart = PANEL.indexOf(
-    "if (\n          resolvedRow &&",
-    responseStart,
-  );
-  const writeBackEnd = PANEL.indexOf(
-    "setSavedRemember(hydrationSaved);",
-    adoptionStart,
-  );
-  assert.ok(
-    requestStart >= 0 &&
-      storageSnapshot >= 0 &&
-      storageSnapshot < requestStart &&
-      responseStart > requestStart &&
-      adoptionStart > responseStart &&
-      writeBackEnd > adoptionStart,
-    "the storage snapshot must precede the request and guard its write-back",
-  );
-
-  const writeBack = PANEL.slice(adoptionStart, writeBackEnd);
   assert.match(
-    writeBack,
-    /const storedConfig = resolveInitialConfig\(\s*configId,\s*target\.ggufVariant,\s*\);\s*if \(perModelConfigStorageChanged\(storedAtStart, storedConfig\)\) \{\s*return;\s*\}[\s\S]*const rememberedConfig = fromApiOverride\(\s*resolvedRow,\s*storedConfig\.config,\s*\);[\s\S]*savePerModelConfig\(\s*configId,\s*target\.ggufVariant,\s*storedSpeculativeAuto\(rememberedConfig, !target\.isGguf\),/,
+    PANEL,
+    /target\.isGguf \? loadManagedLlamaFlags\(\)\.catch\(\(\) => null\) : null,/,
   );
 });
 
@@ -255,8 +174,8 @@ test("a build that serves one slot does not raise the floor", () => {
   assert.match(PANEL, /if \(limits\?\.parallelSlotsClamped\) \{\n\s*return 2;/);
   assert.equal(
     PANEL.match(/effectiveBatchFloor\(/g)?.length,
-    4,
-    "one definition and three call sites",
+    3,
+    "one definition and two call sites",
   );
 });
 
@@ -278,13 +197,36 @@ test("a compare pane records what it launched with", () => {
   );
 });
 
-test("a stored empty list hydrates as a clear, not as nothing stored", () => {
+test("a stored empty list reads as a clear, not as nothing stored", () => {
   // Explicit [] is a tombstone; treating it as absent lets /load carry cleared flags over.
-  assert.match(OVERRIDES, /explicit: Array\.isArray\(tokens\)/);
-  assert.match(OVERRIDES, /\{ tokens: \[\], explicit: false \}/);
-  assert.match(PANEL, /resolvedArgs\.explicit && local === undefined/);
-  assert.match(ADAPTER, /\} else if \(stored\.explicit\) \{/);
-  assert.match(COMPOSER, /\} else if \(resolvedArgs\.explicit\) \{/);
+  const cleared = toApiOverride({
+    ...DEFAULT_PER_MODEL_CONFIG,
+    llamaExtraArgs: null,
+  });
+  assert.deepEqual(fromApiOverride(cleared).llamaExtraArgs, []);
+  assert.equal(
+    fromApiOverride(
+      toApiOverride({ ...DEFAULT_PER_MODEL_CONFIG, nParallel: 2 }),
+    ).llamaExtraArgs,
+    undefined,
+    "a row without the field leaves the launch flags to the load",
+  );
+  setSavedModelConfigsForTests({
+    "org/model-GGUF:Q4_K_M": cleared,
+    "org/model-GGUF": toApiOverride({
+      ...DEFAULT_PER_MODEL_CONFIG,
+      llamaExtraArgs: ["--no-warmup"],
+    }),
+  });
+  try {
+    // The quant's own tombstone stops the lookup before the bare repository row.
+    assert.deepEqual(
+      savedConfigFor("org/model-GGUF", null, "Q4_K_M").config.llamaExtraArgs,
+      [],
+    );
+  } finally {
+    setSavedModelConfigsForTests(null);
+  }
 });
 
 const CHAT_PAGE = readFileSync(

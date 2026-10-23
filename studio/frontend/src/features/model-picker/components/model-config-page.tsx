@@ -126,13 +126,6 @@ import {
 import { useMemoryEstimate } from "../hooks/use-memory-estimate";
 import { useInt8PrefillAvailable } from "../hooks/use-int8-prefill-available";
 import {
-  fetchLoadModelOverride,
-  fromApiOverride,
-  modelOverrideKey,
-  panelOverrideRow,
-  syncModelOverride,
-} from "../api/model-overrides";
-import {
   diagnoseExtraArgs,
   extraArgsAreLoadable,
   formatExtraArgs,
@@ -147,10 +140,8 @@ import { perModelConfigsEqual } from "../model-config/apply-per-model-config";
 import {
   clearExtraArgsEditForDraft,
   clearModelConfigDraftEdited,
-  isExtraArgsHydratedForDraft,
   isModelConfigDraftEdited,
   markModelConfigDraftEdited,
-  markExtraArgsHydratedForDraft,
   modelConfigDraftKey,
   patchModelConfigDraft,
   primeModelConfigDraft,
@@ -165,7 +156,15 @@ import {
   subscribeModelConfigDraft,
 } from "../model-config/model-config-draft";
 import { loadedConfigSignature } from "../model-config/config-signature";
-import { ggufQuantLabel } from "../model-config/model-identity";
+import {
+  type ResolvedPerModelConfig,
+  forgetModelConfig,
+  readSavedModelConfigs,
+  refreshSavedModelConfigs,
+  saveModelConfig,
+  savedConfigFor,
+  subscribeSavedModelConfigs,
+} from "../model-config/saved-model-configs";
 import {
   CACHE_RAM_LLAMA_DEFAULT,
   CACHE_RAM_MAX,
@@ -195,8 +194,8 @@ import {
   type PerModelConfig,
   SEPARATE_DRAFT_MODEL_SPEC_TYPES,
   SPECULATIVE_TYPES,
-  deletePerModelConfig,
   floorMaxSeqLength,
+  isChatTemplateWithinLimit,
   isDefaultConfig,
   isReasoningBudgetMessageValid,
   contextPinPatch,
@@ -204,13 +203,9 @@ import {
   savedContextPin,
   normalizeMaxSeqLength,
   normalizePerModelConfig,
-  PER_MODEL_CONFIG_UPDATED_EVENT,
-  perModelConfigStorageChanged,
   pinSpeculativeMode,
   readAdvancedSettingsOpen,
-  resolveInitialConfig,
   saveAdvancedSettingsOpen,
-  savePerModelConfig,
   storedSpeculativeAuto,
   subscribeAdvancedSettingsOpen,
   VRAM_BUDGET_PERCENT_STEP,
@@ -1360,24 +1355,33 @@ function AdvancedSettingsToggle({
   );
 }
 
-function useStoredPerModelConfig(
+/** The settings a load of this target applies, as last read from the server. llama-server
+ *  arguments reach a GGUF load alone, so another model's panel never shows or compares them. */
+function savedTargetConfig(
+  target: Pick<ModelPickTarget, "id" | "ggufVariant" | "isGguf">,
   configId: string,
-  ggufVariant: string | null | undefined,
-) {
-  const [version, setVersion] = useState(0);
-  useEffect(() => {
-    const bump = () => setVersion((v) => v + 1);
-    window.addEventListener(PER_MODEL_CONFIG_UPDATED_EVENT, bump);
-    window.addEventListener("storage", bump);
-    return () => {
-      window.removeEventListener(PER_MODEL_CONFIG_UPDATED_EVENT, bump);
-      window.removeEventListener("storage", bump);
-    };
-  }, []);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: version is the storage write signal
+): ResolvedPerModelConfig {
+  const saved = savedConfigFor(
+    target.id,
+    configId === target.id ? null : configId,
+    target.ggufVariant,
+  );
+  return target.isGguf
+    ? saved
+    : { ...saved, config: { ...saved.config, llamaExtraArgs: undefined } };
+}
+
+function useSavedTargetConfig(target: ModelPickTarget, configId: string) {
+  const saved = useSyncExternalStore(
+    subscribeSavedModelConfigs,
+    readSavedModelConfigs,
+    readSavedModelConfigs,
+  );
+  const { id, ggufVariant, isGguf } = target;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: saved is the change signal for the read
   return useMemo(
-    () => resolveInitialConfig(configId, ggufVariant),
-    [configId, ggufVariant, version],
+    () => savedTargetConfig({ id, ggufVariant, isGguf }, configId),
+    [saved, id, ggufVariant, isGguf, configId],
   );
 }
 
@@ -2376,7 +2380,7 @@ function ExtraArgsRow({
   );
   const external = formatExtraArgs(config.llamaExtraArgs);
   // Comparing against what the edit published, not the config, is what stops a re-quote per
-  // keystroke. Reset and hydration drop the edit outright.
+  // keystroke. Reset and a re-read of the saved settings drop the edit outright.
   const text = edit && edit.source === external ? edit.text : external;
 
   // Re-read on invalidation, not only on mount: updating llama.cpp from the banner replaces the
@@ -2602,20 +2606,23 @@ export function ModelConfigPage({
   const configId = target.configId ?? target.id;
   const targetIsNpu = isNpuModelId(target.id);
   const gpuDevices = useGpuDevices();
-  const resolveInitial = () => {
-    const resolved = resolveInitialConfig(configId, target.ggufVariant);
+  const storedRecord = useSavedTargetConfig(target, configId);
+  // The resident model shows what it runs, with the saved launch flags when its own are not
+  // reported. Any other model shows its saved settings, else what the host selected for it.
+  const resolveInitial = (): ResolvedPerModelConfig => {
+    const saved = savedTargetConfig(target, configId);
     if (loadedConfig) {
-      return { config: loadedConfig, remembered: resolved.remembered };
-    }
-    if (initialConfig) {
       return {
-        config: initialConfig,
-        remembered:
-          resolved.remembered &&
-          perModelConfigsEqual(initialConfig, resolved.config),
+        config:
+          loadedConfig.llamaExtraArgs === undefined
+            ? { ...loadedConfig, llamaExtraArgs: saved.config.llamaExtraArgs }
+            : loadedConfig,
+        remembered: saved.remembered,
       };
     }
-    return resolved;
+    return saved.remembered || !initialConfig
+      ? saved
+      : { config: initialConfig, remembered: false };
   };
   const draftKey = modelConfigDraftKey(configId, target.ggufVariant);
   const liveSignature = loadedConfigSignature(loadedConfig);
@@ -2642,9 +2649,10 @@ export function ModelConfigPage({
     subscribeModelConfigDraft,
     () => readModelConfigDraft(draftKey),
   );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: storedRecord is what resolveInitial reads
   const initialFallback = useMemo(
     () => resolveInitial(),
-    [configId, target.ggufVariant, loadedConfig, initialConfig],
+    [configId, target.ggufVariant, loadedConfig, initialConfig, storedRecord],
   );
   const configState =
     draftSnapshot?.config ??
@@ -2666,12 +2674,6 @@ export function ModelConfigPage({
   // This editor's row keeps its refusal after unmounting, so a peer that fixed the text lifts it.
   const sharedExtraArgsCleared =
     sharedExtraArgsCurrent && sharedExtraArgsEdit.loadable === true;
-  // The live config, for the async reads below: an effect that closed over it would hold
-  // whatever it was when the request started.
-  const configRef = useRef(configState);
-  configRef.current = configState;
-  const rememberRef = useRef(remember);
-  rememberRef.current = remember;
   const setConfig = useCallback(
     (action: SetStateAction<PerModelConfig>) => {
       // A plain value REPLACES, as the useState setter this stands in for does. Merging left
@@ -2704,17 +2706,16 @@ export function ModelConfigPage({
   // refuse. Held by the panel rather than the row, since the row unmounts whenever Advanced
   // settings collapse while its tokens stay in the config.
   const [extraArgsLoadable, setExtraArgsLoadable] = useState(true);
-  // True until the server-row read below settles: a load started before it lands sends none of the
-  // row's settings, and with Remember unchecked it forgets the row it never read.
-  const [extraArgsHydrating, setExtraArgsHydrating] = useState(
-    () => !isDiffusion,
-  );
+  // True until the re-read below settles, so neither Load nor Save acts on an older copy of the
+  // saved settings.
+  const [savedSettingsLoading, setSavedSettingsLoading] = useState(true);
+  // A save or forget in flight, whose answer the footer actions wait for.
+  const [saving, setSaving] = useState(false);
   // The row does not withdraw its own objection when it unmounts, or collapsing Advanced settings
   // would re-enable Load for arguments the backend refuses. Only a different model retires it.
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the model, not on the setter
   useEffect(() => {
     setExtraArgsLoadable(true);
-    setExtraArgsHydrating(!isDiffusion);
   }, [configId, target.ggufVariant, target.isGguf, isDiffusion]);
 
   // Compare against what the backend was asked for, not what it applied: staging a new value
@@ -2953,269 +2954,68 @@ export function ModelConfigPage({
     hiddenCatalogEpoch,
   ]);
 
-  // The server copy is shared by Desktop, LAN, and tunnel origins, so hydrate the whole
-  // remembered config here; localStorage is only the immediate seed. This also runs while
-  // Advanced is closed, since the row reaches every load whether or not it is shown.
+  // Re-read the saved settings each time an editor opens: a save from another tab, origin or the
+  // CLI lands on the server, and an untouched draft takes it. A stored list of launch flags becomes
+  // an explicit one /load validates strictly, so flags this build refuses are dropped first.
   // biome-ignore lint/correctness/useExhaustiveDependencies: the model is the identity
   useEffect(() => {
-    if (resolvedIsDiffusion) {
-      // A diffusion model runs through the shim, which appends no llama-server flags, so it keeps
-      // Load free of this read.
-      setExtraArgsHydrating(false);
-      return;
-    }
-    // The order the auto-switch loader tries, and for the same reason: the settings UI keys a local
-    // row by the path it loads from while configId is a derived alias, so reading the alias
-    // first let an older entry stay the one API loads apply.
-    const loadId = target.id;
-    const fileVariant =
-      !target.ggufVariant && loadId.toLowerCase().endsWith(".gguf")
-        ? ggufQuantLabel(loadId.replace(/\\/g, "/").split("/").pop() ?? loadId)
-        : null;
-    const keys = [
-      modelOverrideKey(loadId, target.ggufVariant),
-      modelOverrideKey(configId, target.ggufVariant),
-      loadId,
-      ...(fileVariant ? [`${loadId}:${fileVariant}`] : []),
-      configId,
-    ].filter((key, index, all) => all.indexOf(key) === index);
-    // The draft alone, never a string built from `keys`: the hosts derive different candidate
-    // lists. Retaining an unedited draft clears it, so a fresh editor still sees a newer row.
-    if (isExtraArgsHydratedForDraft(draftKey)) {
-      setExtraArgsHydrating(false);
-      return;
-    }
     let cancelled = false;
-    // What the config held BEFORE the request went out. Anything else at the end of it was typed
-    // while the request was in flight, and sanitizing that would rewrite live input.
-    const configAtStart = configRef.current;
-    const storedAtStart = resolveInitialConfig(configId, target.ggufVariant);
-    const rememberAtStart = rememberRef.current;
-    const localAtStart = configAtStart.llamaExtraArgs;
-    // The denylist, not the catalogue: sanitizing a stored list needs only the flags Unsloth
-    // refuses, and that route answers without running `llama-server --help`. A last-resort
-    // release, so a request that never settles cannot disable Load for good.
-    const release = setTimeout(() => setExtraArgsHydrating(false), 15000);
+    setSavedSettingsLoading(true);
+    const draftAtStart = readModelConfigDraft(draftKey);
+    // A request that never settles must not keep Load disabled.
+    const release = setTimeout(() => setSavedSettingsLoading(false), 15000);
     Promise.all([
-      // Resolved by the backend, which owns the rules; the local resolver stays as the fallback for
-      // a backend that predates the parameter.
-      fetchLoadModelOverride(loadId, configId, target.ggufVariant, keys).then(
-        (row) => panelOverrideRow(row, target.isGguf),
-      ),
-      target.isGguf ? loadManagedLlamaFlags() : null,
+      refreshSavedModelConfigs(),
+      target.isGguf ? loadManagedLlamaFlags().catch(() => null) : null,
     ])
-      .then(([resolvedOverride, managed]) => {
-        // Marked here rather than before the request: StrictMode replays the effect, so a key marked
-        // up front would leave the first fetch cancelled and the box never filled in development.
-        if (cancelled) {
+      .then(([, managed]) => {
+        if (
+          cancelled ||
+          isModelConfigDraftEdited(draftKey) ||
+          readModelConfigDraft(draftKey) !== draftAtStart
+        ) {
           return;
         }
-        markExtraArgsHydratedForDraft(draftKey);
-        const resolvedArgs = {
-          tokens: resolvedOverride?.llama_extra_args ?? [],
-          explicit: Array.isArray(resolvedOverride?.llama_extra_args),
-        };
-        // Through the resolver, not a literal lookup: the backend folds identities and reads whole
-        // entries in its own order. Sanitised before it becomes a request, since hydrating turns a
-        // stored list into an EXPLICIT one that /load validates strictly, so an install upgraded
-        // across a denylist change would otherwise stop loading a model that worked yesterday.
-        const stored = sanitizeStoredExtraArgs(
-          resolvedArgs.tokens,
-          managed?.managed ?? new Set<string>(),
-          // The host's bounds, not the constants: a Windows server takes 24 KiB and holds a
-          // quoted-command budget as well, so trimming to 32 KiB here sends a list /load 400s on.
-          {
-            maxBytes: managed?.maxBytes,
-            windowsCommandBudget: managed?.windowsCommandBudget,
-          },
-        );
-        // A list this build refuses can equally have come from local storage, saved by a build that
-        // still allowed it, and nothing else would catch it while Advanced stays collapsed.
-        const local = target.isGguf
-          ? configRef.current.llamaExtraArgs
-          : undefined;
-        // Kept for the merge below as well as for the box: a row that carries no arguments leaves the
-        // local list standing, and handing back a refused list would re-enable Load.
-        let sanitizedLocal = localAtStart;
-        if (local != null && local.length > 0 && local === localAtStart) {
-          const cleaned = sanitizeStoredExtraArgs(
-            local,
-            managed?.managed ?? new Set<string>(),
-            {
-              maxBytes: managed?.maxBytes,
-              windowsCommandBudget: managed?.windowsCommandBudget,
-            },
-          );
-          if (cleaned.length !== local.length) {
-            sanitizedLocal = cleaned.length > 0 ? cleaned : null;
-            setConfig((current) =>
-              current.llamaExtraArgs === local
-                ? { ...current, llamaExtraArgs: sanitizedLocal }
-                : current,
-            );
-          }
-        }
-        // The row as it should be read: its own fields, with the arguments it carries sanitized against
-        // what this build refuses.
-        const resolvedRow = resolvedOverride
-          ? {
-              ...resolvedOverride,
-              ...(resolvedArgs.explicit ? { llama_extra_args: stored } : {}),
-            }
-          : null;
-        const serverConfig = resolvedRow
-          ? fromApiOverride(resolvedRow, {
-              ...configAtStart,
-              llamaExtraArgs: sanitizedLocal,
-            })
-          : null;
-        // What hydration would leave in the config: the row's list when it carries one, this browser's
-        // when it does not. Judged as a whole, or a local flag the expanded row already refused is
-        // declared loadable by a verdict read off the empty server list.
-        const hydratedArgs = serverConfig?.llamaExtraArgs ?? stored;
-        const hydratedIsLoadable =
-          !target.isGguf || hydratedArgs.length === 0
-            ? true
-            : extraArgsAreLoadable(
-                diagnoseExtraArgs(
-                  formatExtraArgs(hydratedArgs),
+        const resolved = resolveInitial();
+        const tokens = resolved.config.llamaExtraArgs;
+        const config =
+          tokens && tokens.length > 0
+            ? {
+                ...resolved.config,
+                llamaExtraArgs: sanitizeStoredExtraArgs(
+                  tokens,
+                  managed?.managed ?? new Set<string>(),
                   {
-                    flags: {},
-                    managed: managed?.managed ?? new Set<string>(),
-                    switches: new Set<string>(),
-                    maxBytes: managed?.maxBytes ?? 0,
-                    windowsCommandBudget: managed?.windowsCommandBudget ?? 0,
-                    defaultParallelSlots: managed?.defaultParallelSlots ?? 0,
-                    parallelSlotsClamped:
-                      managed?.parallelSlotsClamped ?? false,
-                    probeOk: false,
-                  },
-                  {
-                    batchFloor: effectiveBatchFloor(
-                      serverConfig?.nParallel ?? configRef.current.nParallel,
-                      managed,
-                    ),
+                    maxBytes: managed?.maxBytes,
+                    windowsCommandBudget: managed?.windowsCommandBudget,
                   },
                 ),
-              );
-
-        // The shared row outranks the local seed for every field it carries, so LAN and Desktop cannot
-        // show different remembered values; fromApiOverride keeps the rest of this browser's config,
-        // since an absent field is as much a gap in the mirror as a chosen default. Never over an
-        // edit made while the request was in flight.
-        // The edited check is load-bearing: an edit the OTHER editor made before this read
-        // started is already in configAtStart, so the comparison below reads as untouched.
-        // By value: the primed draft is a new object, so identity refused every row on a fresh editor.
-        if (
-          resolvedRow &&
-          serverConfig &&
-          !isModelConfigDraftEdited(draftKey) &&
-          perModelConfigsEqual(configRef.current, configAtStart) &&
-          rememberRef.current === rememberAtStart
-        ) {
-          const storedConfig = resolveInitialConfig(
-            configId,
-            target.ggufVariant,
-          );
-          if (perModelConfigStorageChanged(storedAtStart, storedConfig)) {
-            return;
-          }
-          setExtraArgsLoadable(hydratedIsLoadable);
-          replaceModelConfigDraft(draftKey, serverConfig, {
-            remember: true,
-            savedRemember: true,
-          });
-          if (hasNonDefaultAdvanced(serverConfig)) {
-            setAutoOpenAdvanced(true);
-          }
-          // Unconditionally, because savePerModelConfig says "no settings" by DELETING the entry: a merge
-          // that comes out default is a clear that has to travel. Skipping it stranded the old flag
-          // for model-selector's quick select; writing when no record exists is already a no-op.
-          const rememberedConfig = fromApiOverride(
-            resolvedRow,
-            storedConfig.config,
-          );
-          // Same budget as any other write, so the same clean-up: eviction is silent and still reports
-          // success, and a dropped model would keep applying its server row to API loads. Not a
-          // Forget: only the mirrored fields go.
-          const hydrationEvicted: {
-            modelId: string;
-            ggufVariant: string | null;
-          }[] = [];
-          // Checked for the same reason the Save path checks it: the write can fail outright and say so
-          // in the return rather than throwing. Marked saved regardless, the panel would claim the
-          // settings are remembered while quick select and background loads, which read
-          // resolveInitialConfig and never open this panel, still saw the stale record or none.
-          const hydrationSaved = savePerModelConfig(
-            configId,
-            target.ggufVariant,
-            storedSpeculativeAuto(rememberedConfig, !target.isGguf),
-            hydrationEvicted,
-          );
-          setSavedRemember(hydrationSaved);
-          for (const dropped of hydrationEvicted) {
-            syncModelOverride(dropped.modelId, dropped.ggufVariant, null, {
-              keepLaunchFlags: true,
-            });
-          }
-          return;
-        }
-        if (stored.length === 0) {
-          // An EXPLICIT empty row is a decision, not an absence: the settings page writes one when the
-          // box is cleared for a quant whose bare-repository row still carries arguments. Left
-          // undefined the panel omits the field on Load, and /load carries the resident model's
-          // arguments over. Only when nothing was typed here meanwhile.
-          const local = configRef.current.llamaExtraArgs;
-          if (resolvedArgs.explicit && local === undefined) {
-            setExtraArgsLoadable(true);
-            setConfig((current) =>
-              current.llamaExtraArgs === undefined
-                ? { ...current, llamaExtraArgs: [] }
-                : current,
-            );
-          }
-          return;
-        }
-        // Read from a ref rather than inside the updater below: an updater must stay free of side
-        // effects (StrictMode calls it twice), and this decides one.
-        if (configRef.current.llamaExtraArgs !== undefined) {
-          // Typed into while this was in flight: the row is judging that text and its verdict is the
-          // live one, so this answer about the stored list must not overwrite either.
-          return;
-        }
-        setExtraArgsLoadable(hydratedIsLoadable);
-        setConfig((current) =>
-          // Guarded again, because the ref is only as fresh as the last render.
-          current.llamaExtraArgs === undefined
-            ? { ...current, llamaExtraArgs: stored }
-            : current,
+              }
+            : resolved.config;
+        replaceModelConfigDraft(
+          draftKey,
+          reconcileConfigGpuSelection(config, resolvedIsDiffusion, gpuDevices),
+          { remember: resolved.remembered, savedRemember: resolved.remembered },
         );
-        // The frozen snapshot above was taken before this answer arrived, so without this a model whose
-        // arguments live only on the server opens looking like every default. A preference wins.
-        setAutoOpenAdvanced(true);
+        setExtraArgsLoadable(true);
+        if (hasNonDefaultAdvanced(config)) {
+          setAutoOpenAdvanced(true);
+        }
       })
       .catch(() => {
-        // Nothing to say: the panel is still usable, and the load would report a real problem with the
-        // overrides service far more clearly.
+        // The panel keeps the last copy read; the status line says when there is none.
       })
       .finally(() => {
-        // Including the failure: an overrides service that is down must not leave Load disabled for good.
         if (!cancelled) {
-          setExtraArgsHydrating(false);
+          clearTimeout(release);
+          setSavedSettingsLoading(false);
         }
       });
     return () => {
       cancelled = true;
       clearTimeout(release);
     };
-  }, [
-    configId,
-    target.id,
-    target.ggufVariant,
-    target.isGguf,
-    resolvedIsDiffusion,
-    draftKey,
-  ]);
+  }, [draftKey, target.id, target.isGguf]);
   const config = reconcileConfigGpuSelection(
     configState,
     resolvedIsDiffusion,
@@ -3249,8 +3049,8 @@ export function ModelConfigPage({
   };
   const update = (patch: Partial<PerModelConfig>) => {
     handleSharedConfigEdit();
-    // Every control lands here and nothing else does: the hydration effect's own sanitising
-    // writes go through setConfig, and marking those would have the read refuse its result.
+    // Every control lands here and nothing else does, so only a user's edit keeps a re-read of the
+    // saved settings off the draft.
     markModelConfigDraftEdited(draftKey);
     setConfig((current) => ({
       ...reconcileConfigGpuSelection(current, resolvedIsDiffusion, gpuDevices),
@@ -3653,7 +3453,6 @@ export function ModelConfigPage({
     });
 
   const rememberChanged = remember !== savedRemember;
-  const storedRecord = useStoredPerModelConfig(configId, target.ggufVariant);
   const matchesStored =
     storedRecord.remembered &&
     perModelConfigsEqual(
@@ -3661,7 +3460,9 @@ export function ModelConfigPage({
       storedRecord.config,
     );
   // Never mounted on demand: the click that saves would move Load.
-  const saveStatus = savedRemember
+  const saveStatus = !savedSettingsLoading && readSavedModelConfigs() === null
+    ? "Saved settings could not be read"
+    : savedRemember
     ? remember
       ? matchesStored
         ? "Saved for this model"
@@ -3760,57 +3561,51 @@ export function ModelConfigPage({
     return { effectiveConfig, effectiveRuntimeConfig, effectiveMaxSeqLengthValue };
   };
 
-  const persistConfig = (next: PerModelConfig) => {
-    // Judge what storage keeps: savePerModelConfig normalizes first, so the raw object over-reports.
+  // Saves or forgets as Remember says. A refused write is reported with the server's reason and
+  // answers null; the draft stays edited, so nothing replaces what is on screen.
+  const persistConfig = async (
+    next: PerModelConfig,
+    failure: string,
+  ): Promise<{ defaultConfig: boolean } | null> => {
+    // Refused here, since normalizing would otherwise drop it from the saved row unseen.
+    if (
+      remember &&
+      next.chatTemplateOverride != null &&
+      !isChatTemplateWithinLimit(next.chatTemplateOverride)
+    ) {
+      toast.error(failure, { description: "The chat template exceeds the size limit." });
+      return null;
+    }
     const normalized = normalizePerModelConfig(storedSpeculativeAuto(next, targetIsMlx));
-    const evicted: { modelId: string; ggufVariant: string | null }[] = [];
     // Only a Remember that was on can be forgotten: an unticked seeded/failed-read box deleted unseen rows.
     const forgets = !remember && savedRemember;
-    const saved = remember
-      ? savePerModelConfig(configId, target.ggufVariant, normalized, evicted)
-      : forgets
-        ? deletePerModelConfig(configId, target.ggufVariant)
-        : true;
-    // Mirror to the server so an API load gets these settings, not app defaults. Best-effort, and
-    // skipped when the localStorage write failed or the two would permanently disagree. Gated on
-    // auto-switch reach, not GGUF-ness: the resolver skips a materialized Ollama link, and a
-    // native-path lease is the same.
-    // A forget also drops the local records for every other spelling the server reports clearing.
-    if (
-      saved &&
-      (remember || forgets) &&
-      (target.apiLoadable ?? target.isGguf) &&
-      !nativePathToken
-    ) {
-      syncModelOverride(
-        configId,
-        target.ggufVariant,
-        remember ? normalized : null,
-        remember
-          ? {
-              resetReasoningBudget:
-                baseline.reasoningBudget !== -1 &&
-                normalized.reasoningBudget === -1,
-              resetReasoningBudgetMessage:
-                baseline.reasoningBudgetMessage !== "" &&
-                normalized.reasoningBudgetMessage === "",
-            }
-          : undefined,
-      );
+    const draftAtSave = readModelConfigDraft(draftKey);
+    setSaving(true);
+    try {
+      if (remember) {
+        await saveModelConfig(configId, target.ggufVariant, normalized, {
+          resetReasoningBudget:
+            baseline.reasoningBudget !== -1 && normalized.reasoningBudget === -1,
+          resetReasoningBudgetMessage:
+            baseline.reasoningBudgetMessage !== "" &&
+            normalized.reasoningBudgetMessage === "",
+        });
+      } else if (forgets) {
+        await forgetModelConfig(configId, target.ggufVariant);
+      }
+    } catch (error: unknown) {
+      toast.error(failure, {
+        description: error instanceof Error ? error.message : undefined,
+      });
+      return null;
+    } finally {
+      setSaving(false);
     }
-    // Only once the write landed: a blocked or full localStorage leaves the values on screen,
-    // and clearing anyway let the next read replace them with the older stored row.
-    if (saved) {
+    // Not over an edit typed while the request was out.
+    if (readModelConfigDraft(draftKey) === draftAtSave) {
       clearModelConfigDraftEdited(draftKey);
     }
-    // Saving can push the local map over budget and drop other models, whose server entries would
-    // keep applying with nothing able to forget them. Not a Forget: only mirrored fields go.
-    for (const dropped of evicted) {
-      syncModelOverride(dropped.modelId, dropped.ggufVariant, null, {
-        keepLaunchFlags: true,
-      });
-    }
-    return { saved, defaultConfig: isDefaultConfig(normalized) };
+    return { defaultConfig: isDefaultConfig(normalized) };
   };
 
   const finishPersist = (defaultConfig: boolean) => {
@@ -3826,14 +3621,16 @@ export function ModelConfigPage({
     );
   };
 
-  const handleSave = () => {
-    if (sharedVariantUnresolved) {
+  const handleSave = async () => {
+    if (sharedVariantUnresolved || saving) {
       return;
     }
     const { effectiveRuntimeConfig } = commitDraft();
-    const { saved, defaultConfig } = persistConfig(effectiveRuntimeConfig);
-    if (!saved) {
-      toast.error("Couldn't save settings for this model.");
+    const persisted = await persistConfig(
+      effectiveRuntimeConfig,
+      "Couldn't save settings for this model.",
+    );
+    if (!persisted) {
       return;
     }
     // The page stays mounted, so show a context pinFixedLayerContext stored (else it reads "Auto").
@@ -3848,14 +3645,11 @@ export function ModelConfigPage({
         customContextLength: effectiveRuntimeConfig.customContextLength,
       }));
     }
-    finishPersist(defaultConfig);
+    finishPersist(persisted.defaultConfig);
   };
 
-  const handleRun = () => {
-    if (sharedVariantUnresolved) {
-      return;
-    }
-    if (budgetSettling) {
+  const handleRun = async () => {
+    if (sharedVariantUnresolved || budgetSettling || saving) {
       return;
     }
     const { effectiveConfig, effectiveRuntimeConfig, effectiveMaxSeqLengthValue } =
@@ -3867,17 +3661,15 @@ export function ModelConfigPage({
         followGlobal: true,
       }) &&
       rememberChanged;
-    const { saved, defaultConfig } = persistConfig(effectiveRuntimeConfig);
     if (effectivePersistenceOnly) {
-      if (!saved) {
-        toast.error("Couldn't save settings for this model.");
-        return;
+      const persisted = await persistConfig(
+        effectiveRuntimeConfig,
+        "Couldn't save settings for this model.",
+      );
+      if (persisted) {
+        finishPersist(persisted.defaultConfig);
       }
-      finishPersist(defaultConfig);
       return;
-    }
-    if (!saved) {
-      toast.error("Couldn't save these settings, loading with them anyway.");
     }
     const effectiveLoadConfig =
       target.isGguf || pinsContextLength
@@ -3891,6 +3683,12 @@ export function ModelConfigPage({
     // the moment this click owns the fraction, or a drag landing in between is the
     // very race the lock exists to remove.
     setVramBudgetLocked(true);
+    // The load request carries every setting itself, so a refused save is reported and the
+    // load goes ahead.
+    await persistConfig(
+      effectiveRuntimeConfig,
+      "Couldn't save these settings, loading with them anyway.",
+    );
     const stagedBudget = settleVramBudgetSave();
     if (stagedBudget) {
       // The click is answered by a network round trip now, so the button stays live for as long as
@@ -4191,7 +3989,8 @@ export function ModelConfigPage({
               budgetSettling ||
               (!extraArgsLoadable && !sharedExtraArgsCleared) ||
               sharedExtraArgsRefused ||
-              extraArgsHydrating ||
+              savedSettingsLoading ||
+              saving ||
               (isActiveModel &&
                 atBaseline &&
                 !rememberChanged &&
@@ -4215,10 +4014,11 @@ export function ModelConfigPage({
                 sharedVariantUnresolved ||
                 stagedMetadataPending ||
                 budgetSettling ||
+                saving ||
                 (remember &&
                   ((!extraArgsLoadable && !sharedExtraArgsCleared) ||
                     sharedExtraArgsRefused ||
-                    extraArgsHydrating))
+                    savedSettingsLoading))
               }
               onClick={handleSave}
             >
@@ -4253,7 +4053,7 @@ export function ModelConfigPage({
               className={FOOTER_BUTTON_CLASS}
               target={target}
               config={config}
-              ready={!extraArgsHydrating}
+              ready={!savedSettingsLoading}
               canImport={variant !== "sidebar"}
               isDiffusion={resolvedIsDiffusion}
               disabled={

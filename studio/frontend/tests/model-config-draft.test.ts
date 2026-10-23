@@ -7,10 +7,8 @@ import test from "node:test";
 import {
   clearExtraArgsEditForDraft,
   clearModelConfigDraftEdited,
-  isExtraArgsHydratedForDraft,
   isModelConfigDraftEdited,
   markModelConfigDraftEdited,
-  markExtraArgsHydratedForDraft,
   readExtraArgsEditForDraft,
   setExtraArgsEditForDraft,
   setExtraArgsEditLoadableForDraft,
@@ -124,12 +122,12 @@ test("the draft outlives one host but not the last one", () => {
   const dropdown = retainModelConfigDraft(key);
   primeModelConfigDraft(key, { config: SEED, remembered: true }, "none");
   patchModelConfigDraft(key, { nParallel: 6 });
-  markExtraArgsHydratedForDraft(key);
+  markModelConfigDraftEdited(key);
   dropdown();
   assert.equal(readModelConfigDraft(key)?.config.nParallel, 6);
   sidebar();
   assert.equal(readModelConfigDraft(key), undefined);
-  assert.equal(isExtraArgsHydratedForDraft(key), false);
+  assert.equal(isModelConfigDraftEdited(key), false);
 });
 
 test("a release that fires twice does not drop another host's draft", () => {
@@ -195,29 +193,22 @@ test("a verdict without an edit is dropped rather than inventing one", () => {
   release();
 });
 
-test("a fresh editor re-reads the stored row, but not over an unsaved edit", () => {
+test("a second editor sees an unsaved edit, so its read of the saved settings leaves it", () => {
   const key = modelConfigDraftKey("unsloth/Refresh-GGUF", VARIANT);
+  // The sidebar never unmounts while a model is resident; the picker opens beside it.
   const sidebar = retainModelConfigDraft(key);
   primeModelConfigDraft(key, { config: SEED, remembered: false }, "none");
-  markExtraArgsHydratedForDraft(key);
-
-  // The sidebar never unmounts while a model is resident, so retirement is needed.
-  const picker = retainModelConfigDraft(key);
-  assert.equal(isExtraArgsHydratedForDraft(key), false);
-  markExtraArgsHydratedForDraft(key);
-  picker();
-
   markModelConfigDraftEdited(key);
-  const pickerAgain = retainModelConfigDraft(key);
-  assert.equal(isExtraArgsHydratedForDraft(key), true);
-  pickerAgain();
+  const picker = retainModelConfigDraft(key);
+  assert.equal(isModelConfigDraftEdited(key), true);
+  picker();
+  assert.equal(isModelConfigDraftEdited(key), true);
 
   clearModelConfigDraftEdited(key);
-  const pickerOnceMore = retainModelConfigDraft(key);
-  assert.equal(isExtraArgsHydratedForDraft(key), false);
-  pickerOnceMore();
-  sidebar();
+  const pickerAgain = retainModelConfigDraft(key);
   assert.equal(isModelConfigDraftEdited(key), false);
+  pickerAgain();
+  sidebar();
 });
 
 test("re-seeding or replacing a draft retires the edited mark", () => {

@@ -4,7 +4,6 @@
 // Barrel import (lint rule); the model-picker cycle is fine because the call
 // happens at runtime, not module eval.
 import {
-  adoptCachedRepoConfig,
   loadedContextFields,
   resolveResidentInitialConfig,
   savedContextPin,
@@ -184,8 +183,6 @@ export function applyActiveModelStatusToStore(
     loadedEngineParallelism: status.engine_parallelism ?? "tensor",
     loadedEngineLaunch: engineLaunchFieldsFrom(status),
   });
-  // Before the settings panel can open on it, which reads only the repo id.
-  adoptCachedRepoConfig(checkpointId, status.gguf_variant ?? null);
 
   const store = useChatRuntimeStore.getState();
   const residentEngine = residentEngineParams(status);

@@ -4,23 +4,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  installLocalStorageFake,
-  registerBundlerResolver,
-} from "./helpers/kit.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-const { store } = installLocalStorageFake();
 
 const {
   DEFAULT_PER_MODEL_CONFIG,
   isDefaultConfig,
   isReasoningBudgetMessageValid,
   normalizePerModelConfig,
-  resolveInitialConfig,
-  savePerModelConfig,
 } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
+);
+const { fromApiOverride, toApiOverride } = await import(
+  "../src/features/model-picker/api/model-overrides.ts"
 );
 
 test("reasoning budget fields normalize to the backend defaults", () => {
@@ -62,48 +59,26 @@ test("reasoning budget messages use the subprocess byte boundary", () => {
   );
 });
 
-test("reasoning budget and message round-trip through per-model storage", () => {
-  store.clear();
-  const config = {
+test("reasoning budget and message round-trip through the saved row", () => {
+  const row = toApiOverride({
     ...DEFAULT_PER_MODEL_CONFIG,
     reasoningBudget: 2048,
     reasoningBudgetMessage: "Reasoning budget exhausted",
-  };
-  assert.equal(savePerModelConfig("unsloth/Test-GGUF", "Q4_K_M", config), true);
+  });
+  assert.equal(row.reasoning_budget, 2048);
+  assert.equal(row.reasoning_budget_message, "Reasoning budget exhausted");
 
-  const resolved = resolveInitialConfig("unsloth/Test-GGUF", "Q4_K_M");
-  assert.equal(resolved.remembered, true);
-  assert.equal(resolved.config.reasoningBudget, 2048);
-  assert.equal(
-    resolved.config.reasoningBudgetMessage,
-    "Reasoning budget exhausted",
-  );
+  const read = fromApiOverride(row);
+  assert.equal(read.reasoningBudget, 2048);
+  assert.equal(read.reasoningBudgetMessage, "Reasoning budget exhausted");
 });
 
-test("a record only claims v6 when it carries a reasoning setting", () => {
-  // toStoredConfig stamps the oldest version that understands every field present.
-  const storedVersion = () =>
-    (
-      Object.values(
-        JSON.parse(store.get("unsloth_model_configs") ?? "{}"),
-      ) as { version: number }[]
-    )[0]?.version;
-  store.clear();
-  assert.equal(
-    savePerModelConfig("unsloth/Test-GGUF", "Q4_K_M", {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      nBatch: 512,
-    }),
-    true,
-  );
-  assert.equal(storedVersion(), 2);
-  store.clear();
-  assert.equal(
-    savePerModelConfig("unsloth/Test-GGUF", "Q4_K_M", {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      reasoningBudget: 2048,
-    }),
-    true,
-  );
-  assert.equal(storedVersion(), 6);
+test("an unlimited budget and an empty message stay off the saved row", () => {
+  const row = toApiOverride(DEFAULT_PER_MODEL_CONFIG);
+  assert.equal("reasoning_budget" in row, false);
+  assert.equal("reasoning_budget_message" in row, false);
+
+  const read = fromApiOverride(row);
+  assert.equal(read.reasoningBudget, -1);
+  assert.equal(read.reasoningBudgetMessage, "");
 });

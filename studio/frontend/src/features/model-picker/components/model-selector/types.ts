@@ -102,9 +102,6 @@ export interface ModelPickTarget {
   displayName: string;
   ggufVariant?: string | null;
   isGguf: boolean;
-  /** Whether an OpenAI-compatible request may load this model; see apiAutoSwitchMayLoad.
-   *  Defaults to isGguf when unknown. */
-  apiLoadable?: boolean;
   /** Identity the saved settings are keyed by, when that is not what loads: a repo cached outside
    *  the active HF cache loads by snapshot path while its settings key on the repo id. Probes
    *  that must open the model keep using `id`. */

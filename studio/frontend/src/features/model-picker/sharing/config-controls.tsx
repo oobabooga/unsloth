@@ -6,10 +6,8 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/lib/toast";
 import { type ComponentProps, Suspense, lazy, useLayoutEffect } from "react";
 import type { ModelPickTarget } from "../components/model-selector/types";
-import {
-  isExtraArgsHydratedForDraft,
-  modelConfigDraftKey,
-} from "../model-config/model-config-draft";
+import { modelConfigDraftKey } from "../model-config/model-config-draft";
+import { readSavedModelConfigs } from "../model-config/saved-model-configs";
 import { runConfigInbox } from "./inbox";
 import { isRunConfigVariantUnresolved } from "./target";
 
@@ -111,7 +109,7 @@ export function SharedRunConfigControls({
         <SharedRunConfigActions
           {...props}
           draftKey={key}
-          hydrated={isDiffusion || isExtraArgsHydratedForDraft(key)}
+          hydrated={isDiffusion || readSavedModelConfigs() !== null}
         />
       </Suspense>
     </LazyImportBoundary>

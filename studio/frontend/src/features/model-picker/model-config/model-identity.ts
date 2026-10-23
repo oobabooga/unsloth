@@ -4,7 +4,6 @@
 // eslint-disable-next-line no-restricted-imports -- Avoid the hub barrel's React and download-manager exports.
 import {
   isHfCacheSnapshotPath,
-  isOllamaLinkPath,
   isStandaloneGgufPath,
   normalizeGgufVariantIdentity,
   normalizeModelIdentity,
@@ -53,16 +52,6 @@ function parseVersionedModelStorageKey(
   } catch {
     return null;
   }
-}
-
-/** False when an OpenAI API auto-switch can never load this model, so its remembered settings stay
- *  off the server. local_model_resolver serves GGUF and non-GGUF weights alike but never a bare LoRA
- *  adapter or a materialized Ollama link; a row for anything else it refuses is inert. */
-export function apiAutoSwitchMayLoad(
-  ids: readonly string[],
-  isLora: boolean,
-): boolean {
-  return !isLora && !ids.some(isOllamaLinkPath);
 }
 
 /** The repo id a cached repo's settings are keyed by when it loads from its snapshot directory with

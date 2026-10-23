@@ -38,7 +38,7 @@ import {
   ManagedEngineOfferDialog,
   SharedRunConfigLinkHandler,
 } from "@/features/model-picker";
-import { backfillModelOverrides } from "@/features/model-picker/api/migrate-model-overrides";
+import { loadSavedModelConfigs } from "@/features/model-picker/model-config/saved-model-configs";
 import { hydratePins } from "@/lib/pins-mirror";
 import { usePersonalizationSync } from "@/features/profile";
 import { RemoteCodeConsentDialog } from "@/features/security";
@@ -474,13 +474,13 @@ function RootLayout() {
       : DEFAULT_DOCUMENT_TITLE;
   }, [documentTitle]);
 
-  // Settings predating the server override map live only here, so an API load would use
-  // app defaults. Backfill once, after auth; pins are restored from the account's server copy.
+  // After auth: read the account's saved model settings, importing what an older build kept in
+  // this browser first, and restore pins from the account's server copy.
   useEffect(() => {
     if (isAuthFlowRoute) {
       return;
     }
-    void backfillModelOverrides();
+    void loadSavedModelConfigs();
     void hydratePins();
   }, [isAuthFlowRoute]);
 

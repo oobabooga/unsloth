@@ -14,54 +14,25 @@ import {
   publicModelId,
   residentModelIdMatches,
 } from "../src/features/hub/lib/model-identity.ts";
-import {
-  installLocalStorageFake,
-  registerBundlerResolver,
-} from "./helpers/kit.ts";
+import type { ApiModelOverride } from "../src/features/model-picker/api/model-overrides.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-const { store, storage } = installLocalStorageFake();
 
-const REPO_KEY = 'v2:["unsloth/repo-gguf","q4_k_m"]';
-
-// The legacy import runs once on the first read, so it must be staged before the import.
-store.set(
-  "unsloth_model_configs",
-  JSON.stringify({ [REPO_KEY]: { version: 1, maxSeqLength: 32768 } }),
+const { resolveInitialConfig, setSavedModelConfigsForTests } = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
 );
-store.set(
-  "unsloth_load_settings",
-  JSON.stringify({ "Unsloth/Repo-GGUF::Q4_K_M": { contextLength: 8192 } }),
-);
-
-const { listPerModelConfigs, resolveInitialConfig, savePerModelConfig } =
-  await import("../src/features/model-picker/model-config/per-model-config.ts");
 const { modelStorageKey, splitQuantSuffix } = await import(
   "../src/features/model-picker/model-config/model-identity.ts"
 );
 
-function config(maxSeqLength: number, kvCacheDtype: string | null = null) {
+function row(maxSeqLength: number, kvCacheDtype?: string): ApiModelOverride {
   return {
-    customContextLength: null,
-    maxSeqLength,
-    kvCacheDtype,
-    speculativeType: null,
-    specDraftNMax: null,
-    nParallel: null,
-    reasoningBudget: -1,
-    reasoningBudgetMessage: "",
-    nBatch: null,
-    nUbatch: null,
-    tensorParallel: false,
-    disableVision: false,
-    chatTemplateOverride: null,
+    // biome-ignore lint/style/useNamingConvention: API schema
+    max_seq_length: maxSeqLength,
+    // biome-ignore lint/style/useNamingConvention: API schema
+    ...(kvCacheDtype ? { kv_cache_dtype: kvCacheDtype } : {}),
   };
-}
-
-function storedKeys(): string[] {
-  return Object.keys(
-    JSON.parse(storage.getItem("unsloth_model_configs") ?? "{}"),
-  );
 }
 
 test("publicModelId mirrors what /status reports for a path-loaded model", () => {
@@ -206,39 +177,27 @@ test("Ollama link paths are recognised the way the resolver excludes them", () =
   assert.equal(isOllamaModelId("ollama-manifest:%2Fh%2Fllama3"), true);
 });
 
-// The backfill matches on the folded identity, unambiguous only because storage holds one record per model.
-test("importing the legacy load settings never doubles up a model", () => {
-  assert.deepEqual(listPerModelConfigs().length, 1);
-  assert.deepEqual(storedKeys(), [REPO_KEY]);
-  assert.equal(
-    resolveInitialConfig("unsloth/repo-gguf", "q4_k_m").config
-      .customContextLength,
-    null,
-  );
+test("two spellings of one model id read one saved row", () => {
+  setSavedModelConfigsForTests({
+    "Unsloth/Repo-GGUF:Q4_K_M": row(32768, "q8_0"),
+  });
+  for (const [id, variant] of [
+    ["Unsloth/Repo-GGUF", "Q4_K_M"],
+    ["unsloth/repo-gguf", "q4_k_m"],
+  ]) {
+    const read = resolveInitialConfig(id, variant);
+    assert.equal(read.remembered, true, `${id}:${variant}`);
+    assert.equal(read.config.maxSeqLength, 32768);
+    assert.equal(read.config.kvCacheDtype, "q8_0");
+  }
 });
 
-test("two spellings of one model id keep a single stored record", () => {
-  store.clear();
-  savePerModelConfig("Unsloth/Repo-GGUF", "Q4_K_M", config(4096));
-  savePerModelConfig("unsloth/repo-gguf", "q4_k_m", config(32768, "q8_0"));
-
-  assert.deepEqual(storedKeys(), [REPO_KEY]);
-  const listed = listPerModelConfigs();
-  assert.equal(listed.length, 1);
-  assert.equal(listed[0]?.config.maxSeqLength, 32768);
+test("two spellings of one Windows path read one saved row", () => {
+  setSavedModelConfigsForTests({ "C:\\Models\\Foo.gguf": row(32768) });
   assert.equal(
-    resolveInitialConfig("Unsloth/Repo-GGUF", "Q4_K_M").config.maxSeqLength,
+    resolveInitialConfig("c:/models/foo.gguf", null).config.maxSeqLength,
     32768,
   );
-});
-
-test("two spellings of one Windows path keep a single stored record", () => {
-  store.clear();
-  savePerModelConfig("C:\\Models\\Foo.gguf", null, config(4096));
-  savePerModelConfig("c:/models/foo.gguf", null, config(32768, "q8_0"));
-
-  assert.deepEqual(storedKeys(), ['v2:["c:/models/foo.gguf",""]']);
-  assert.equal(listPerModelConfigs().length, 1);
 });
 
 test("a Windows drive root stays distinct from a drive-relative identity", () => {
@@ -246,24 +205,26 @@ test("a Windows drive root stays distinct from a drive-relative identity", () =>
   assert.equal(normalizeModelIdentity("C:"), "c:");
 });
 
-test("a POSIX path is case sensitive, so its two spellings stay separate", () => {
-  store.clear();
-  savePerModelConfig("/models/Foo.gguf", null, config(4096));
-  savePerModelConfig("/models/foo.gguf", null, config(32768, "q8_0"));
-
-  assert.equal(storedKeys().length, 2);
+test("a POSIX path is case sensitive, so its two spellings read their own rows", () => {
+  setSavedModelConfigsForTests({
+    "/models/Foo.gguf": row(4096),
+    "/models/foo.gguf": row(32768, "q8_0"),
+  });
   assert.equal(
     resolveInitialConfig("/models/Foo.gguf", null).config.maxSeqLength,
     4096,
   );
+  assert.equal(
+    resolveInitialConfig("/models/foo.gguf", null).config.maxSeqLength,
+    32768,
+  );
 });
 
 test("symlink alias paths keep independent remembered settings", () => {
-  store.clear();
-  savePerModelConfig("/models/alias-a", "Q4_K_M", config(4096));
-  savePerModelConfig("/models/alias-b", "Q4_K_M", config(32768, "q8_0"));
-
-  assert.equal(storedKeys().length, 2);
+  setSavedModelConfigsForTests({
+    "/models/alias-a:Q4_K_M": row(4096),
+    "/models/alias-b:Q4_K_M": row(32768, "q8_0"),
+  });
   assert.equal(
     resolveInitialConfig("/models/alias-a", "Q4_K_M").config.maxSeqLength,
     4096,

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// The pin moved fields without a schema bump, so an old client's config page misreads new
-// records (its auto-load and compare pane still honour them).
+// A context pin lives in one of two fields: MLX keeps it in customContextLength and transformers in
+// maxSeqLength, and a row saved before the move still holds an MLX pin in maxSeqLength. Every reader
+// has to honour both, on either backend.
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { PerModelConfig } from "../src/features/model-picker/model-config/per-model-config.ts";
+import type { ApiModelOverride } from "../src/features/model-picker/api/model-overrides.ts";
 
 import {
   installLocalStorageFake,
@@ -15,7 +16,7 @@ import {
 } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-const { store } = installLocalStorageFake();
+installLocalStorageFake();
 
 const {
   CONTEXT_LENGTH_MIN,
@@ -26,72 +27,50 @@ const {
   isDefaultConfig,
   normalizeMaxSeqLength,
   normalizePerModelConfig,
-  resolveInitialConfig,
-  savePerModelConfig,
   savedContextPin,
 } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
+);
+const { toApiOverride } = await import(
+  "../src/features/model-picker/api/model-overrides.ts"
+);
+const { resolveInitialConfig, setSavedModelConfigsForTests } = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
 );
 const { resolveLoadMaxSeqLength } = await import(
   "../src/features/chat/presets/preset-policy.ts"
 );
 
-const STORAGE_KEY = "unsloth_model_configs";
 const MODEL = "mlx-community/Qwen3-8B-4bit";
-const NATIVE = 262144;
 
-
-function storageKeyForModel(): string {
-  store.clear();
-  assert.ok(
-    savePerModelConfig(MODEL, null, {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 4096,
-    }),
-  );
-  const map = JSON.parse(store.get(STORAGE_KEY) ?? "{}") as Record<
-    string,
-    unknown
-  >;
-  const keys = Object.keys(map);
-  assert.equal(
-    keys.length,
-    1,
-    `expected one stored key, got ${JSON.stringify(keys)}`,
-  );
-  return keys[0];
-}
-
-const MODEL_KEY = storageKeyForModel();
-
-function stage(raw: Record<string, unknown>) {
-  store.clear();
-  // The legacy migration runs on the first read and would merge an unrelated blob in.
-  store.set("unsloth_model_configs_migrated", "1");
-  store.set(STORAGE_KEY, JSON.stringify({ [MODEL_KEY]: raw }));
+/** The model's saved row as the server returns it, read the way every load path reads it. */
+function stage(row: ApiModelOverride) {
+  setSavedModelConfigsForTests({ [MODEL]: row });
   return resolveInitialConfig(MODEL, null);
 }
 
-function stampedVersion(patch: Record<string, unknown>): number {
-  store.clear();
-  assert.ok(
-    savePerModelConfig(MODEL, null, { ...DEFAULT_PER_MODEL_CONFIG, ...patch }),
-  );
-  const map = JSON.parse(store.get(STORAGE_KEY) ?? "{}") as Record<
-    string,
-    { version: number }
-  >;
-  return map[MODEL_KEY].version;
-}
+type Pin = { customContextLength?: number; maxSeqLength?: number };
 
+function rowOf(pin: Pin): ApiModelOverride {
+  return {
+    ...(pin.customContextLength === undefined
+      ? {}
+      : // biome-ignore lint/style/useNamingConvention: API schema
+        { custom_context_length: pin.customContextLength }),
+    ...(pin.maxSeqLength === undefined
+      ? {}
+      : // biome-ignore lint/style/useNamingConvention: API schema
+        { max_seq_length: pin.maxSeqLength }),
+  };
+}
 
 type Row = {
   name: string;
-  raw: Record<string, unknown>;
+  pin: Pin;
   normalizedPin: number | null;
   rawPin: number | null;
   isDefault: boolean;
-  readable: boolean;
+  remembered: boolean;
   mlxRequest: number;
   transformersRequest: number;
   note?: string;
@@ -99,105 +78,82 @@ type Row = {
 
 const ROWS: Row[] = [
   {
-    name: "old record: pin only in maxSeqLength",
-    raw: { version: 1, maxSeqLength: 8192 },
+    name: "old row: pin only in max_seq_length",
+    pin: { maxSeqLength: 8192 },
     normalizedPin: 8192,
     rawPin: 8192,
     isDefault: false,
-    readable: true,
+    remembered: true,
     mlxRequest: 8192,
     transformersRequest: 8192,
     note: "backwards compatibility: the pre-move field still pins, on either backend.",
   },
   {
-    name: "new record: pin only in customContextLength",
-    raw: { version: 1, customContextLength: 32768 },
+    name: "new row: pin only in custom_context_length",
+    pin: { customContextLength: 32768 },
     normalizedPin: 32768,
     rawPin: 32768,
     isDefault: false,
-    readable: true,
+    remembered: true,
     mlxRequest: 32768,
     transformersRequest: 32768,
   },
   {
     name: "both fields set",
-    raw: { version: 1, customContextLength: 32768, maxSeqLength: 8192 },
+    pin: { customContextLength: 32768, maxSeqLength: 8192 },
     normalizedPin: 32768,
     rawPin: 32768,
     isDefault: false,
-    readable: true,
+    remembered: true,
     mlxRequest: 32768,
     transformersRequest: 32768,
     note:
       "customContextLength wins in both the pin reader and the load resolver, so the " +
-      "two agree. No edit can author this state -- contextPinPatch clears the other " +
-      "field -- but a hand-edited or merged store can hold it.",
+      "two agree. No edit can author this state, since contextPinPatch clears the other " +
+      "field, but a legacy row can hold it.",
   },
   {
     name: "neither field set",
-    raw: { version: 1 },
+    pin: {},
     normalizedPin: null,
     rawPin: null,
     isDefault: true,
-    readable: true,
+    // An empty row is no row: nothing is saved for the model.
+    remembered: false,
     // MLX sizes its own window (0 asks for nothing); transformers gets the app default.
     mlxRequest: 0,
     transformersRequest: DEFAULT_MAX_SEQ_LENGTH,
   },
   {
     name: "zero in both fields",
-    raw: { version: 1, customContextLength: 0, maxSeqLength: 0 },
+    pin: { customContextLength: 0, maxSeqLength: 0 },
     normalizedPin: null,
-    // `??` keeps 0, so an unnormalized record yields a falsy 0 pin.
+    // `??` keeps 0, so an unnormalized value yields a falsy 0 pin.
     rawPin: 0,
     isDefault: true,
-    readable: true,
+    remembered: true,
     mlxRequest: 0,
     transformersRequest: DEFAULT_MAX_SEQ_LENGTH,
   },
   {
     name: "negative in both fields",
-    raw: { version: 1, customContextLength: -1, maxSeqLength: -4096 },
+    pin: { customContextLength: -1, maxSeqLength: -4096 },
     normalizedPin: null,
     rawPin: -1,
     isDefault: true,
-    readable: true,
+    remembered: true,
     mlxRequest: 0,
     transformersRequest: DEFAULT_MAX_SEQ_LENGTH,
   },
   {
     name: "non-integer in both fields",
-    raw: { version: 1, customContextLength: 8192.7, maxSeqLength: 8192.7 },
+    pin: { customContextLength: 8192.7, maxSeqLength: 8192.7 },
     normalizedPin: 8192,
     rawPin: 8192.7,
     isDefault: false,
-    readable: true,
+    remembered: true,
     mlxRequest: 8192,
     transformersRequest: 8192,
-  },
-  {
-    name: "version 4 (below the current schema version)",
-    raw: { version: 4, customContextLength: 32768 },
-    normalizedPin: 32768,
-    rawPin: 32768,
-    isDefault: false,
-    readable: true,
-    mlxRequest: 32768,
-    transformersRequest: 32768,
-    note:
-      "Not a future record: STORAGE_SCHEMA_VERSION is 9, so v4 is a v4-client record " +
-      "and reads normally.",
-  },
-  {
-    name: "version 13 (genuinely future)",
-    raw: { version: 13, customContextLength: 32768 },
-    normalizedPin: null,
-    rawPin: 32768,
-    isDefault: true,
-    // Above STORAGE_SCHEMA_VERSION: loadPerModelConfig refuses it.
-    readable: false,
-    mlxRequest: 0,
-    transformersRequest: DEFAULT_MAX_SEQ_LENGTH,
   },
 ];
 
@@ -221,20 +177,18 @@ function loadRequest(
 }
 
 for (const row of ROWS) {
-  test(`record matrix — ${row.name}`, () => {
-    const { config, remembered } = stage(row.raw);
-    assert.equal(remembered, row.readable, "remembered");
+  test(`saved row matrix: ${row.name}`, () => {
+    const { config, remembered } = stage(rowOf(row.pin));
+    assert.equal(remembered, row.remembered, "remembered");
     assert.equal(
       savedContextPin(config),
       row.normalizedPin,
-      "savedContextPin(normalized)",
+      "savedContextPin(read)",
     );
     assert.equal(
-      savedContextPin(
-        row.raw as { customContextLength?: number; maxSeqLength?: number },
-      ),
+      savedContextPin(row.pin),
       row.rawPin,
-      "savedContextPin(raw)",
+      "savedContextPin(unnormalized)",
     );
     assert.equal(isDefaultConfig(config), row.isDefault, "isDefaultConfig");
     assert.equal(loadRequest(config, true), row.mlxRequest, "MLX /load n_ctx");
@@ -245,7 +199,6 @@ for (const row of ROWS) {
     );
   });
 }
-
 
 test("contextPinPatch writes the pin in exactly one field and clears the other", () => {
   assert.deepEqual(contextPinPatch(32768, true), {
@@ -282,16 +235,14 @@ test("contextPinPatch bounds without snapping, and never writes a blank", () => 
   assert.equal(MAX_SEQ_LENGTH_MIN, CONTEXT_LENGTH_MIN);
 });
 
-test("a patched pin round-trips through storage on both backends", () => {
+test("a patched pin round-trips through the saved row on both backends", () => {
   for (const isMlx of [true, false]) {
-    store.clear();
     const patched = {
       ...DEFAULT_PER_MODEL_CONFIG,
       ...contextPinPatch(32768, isMlx),
     };
     assert.equal(isDefaultConfig(normalizePerModelConfig(patched)), false);
-    assert.ok(savePerModelConfig(MODEL, null, patched));
-    const { config, remembered } = resolveInitialConfig(MODEL, null);
+    const { config, remembered } = stage(toApiOverride(patched));
     assert.ok(remembered);
     assert.equal(savedContextPin(config), 32768, `isMlx=${isMlx}`);
     assert.equal(loadRequest(config, isMlx), 32768, `isMlx=${isMlx}`);
@@ -303,186 +254,50 @@ test("a patched pin round-trips through storage on both backends", () => {
   }
 });
 
-
-test("both pin shapes are stamped version 1, so neither is distinguishable by version", () => {
-  assert.equal(stampedVersion({ customContextLength: 32768 }), 1);
-  assert.equal(stampedVersion({ maxSeqLength: 32768 }), 1);
-  // The current client's forwards guard is `version > 10`, and v1 invites any client
-  // back to v1 to rewrite the record.
+test("int8 prefill defaults off, and only an enabled one is a setting", () => {
+  assert.equal(normalizePerModelConfig({}).mlxInt8Prefill, false);
   assert.equal(
-    stage({ version: 1, customContextLength: 32768 }).remembered,
-    true,
+    normalizePerModelConfig({ mlxInt8Prefill: "true" }).mlxInt8Prefill,
+    false,
   );
   assert.equal(
-    stage({ version: 6, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 7, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 8, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 9, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 10, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 12, customContextLength: 32768 }).remembered,
-    true,
-  );
-  assert.equal(
-    stage({ version: 13, customContextLength: 32768 }).remembered,
+    isDefaultConfig({ ...DEFAULT_PER_MODEL_CONFIG, mlxInt8Prefill: true }),
     false,
   );
 });
 
-
-test("a stored mlxKvQuant stamps a version older builds refuse", () => {
-  assert.equal(stampedVersion({ mlxKvQuant: "tq-4" }), 7);
-  // An older client folds a kept Auto and an MLX-only mode back to unset, so both lock it out.
-  assert.deepEqual(["auto", "eagle3", "mtp"].map((speculativeType) => stampedVersion({ speculativeType })), [11, 11, 1]);
-  assert.equal(stampedVersion({ mlxKvQuant: "4" }), 7);
-  assert.equal(stampedVersion({ loadMode: "mmap" }), 5);
-  assert.equal(stampedVersion({ mlxKvQuant: "tq-4", loadMode: "mmap" }), 7);
-});
-
-test("int8 prefill defaults off, and only an enabled one stamps v9", () => {
-  assert.equal(normalizePerModelConfig({ version: 8 }).mlxInt8Prefill, false);
-  assert.equal(normalizePerModelConfig({ mlxInt8Prefill: "true" }).mlxInt8Prefill, false);
-  assert.equal(isDefaultConfig({ ...DEFAULT_PER_MODEL_CONFIG, mlxInt8Prefill: true }), false);
-  assert.equal(stampedVersion({ mlxInt8Prefill: false, mlxKvQuant: "4" }), 7);
-  assert.equal(stampedVersion({ mlxInt8Prefill: true }), 9);
-  assert.equal(stage({ mlxInt8Prefill: true }).config.mlxInt8Prefill, true);
-});
-
-test("MLX offload keeps off or a fraction in (0, 1], and only a set one stamps v12", () => {
-  const offload = (value: unknown) => normalizePerModelConfig({ mlxExpertOffload: value }).mlxExpertOffload;
+test("MLX offload keeps off or a fraction in (0, 1], and a set one is a setting", () => {
+  const offload = (value: unknown) =>
+    normalizePerModelConfig({ mlxExpertOffload: value }).mlxExpertOffload;
   assert.deepEqual([0.5, 1, "off"].map(offload), [0.5, 1, "off"]);
-  assert.deepEqual([0, 1.5, -0.2, Number.NaN, "auto", "0.5", true].map(offload), Array(7).fill(null));
-  assert.equal(isDefaultConfig({ ...DEFAULT_PER_MODEL_CONFIG, mlxPleOffload: "off" }), false);
-  assert.equal(stampedVersion({ specDraftModel: "org/drafter", speculativeType: "dflash" }), 11);
-  assert.equal(stampedVersion({ mlxPleOffload: 0.25 }), 12);
-  assert.equal(stampedVersion({ mlxExpertOffload: "off" }), 12);
-  const config = stage({ version: 12, mlxPleOffload: 0.75, mlxExpertOffload: "off" }).config;
-  assert.deepEqual([config.mlxPleOffload, config.mlxExpertOffload], [0.75, "off"]);
+  assert.deepEqual(
+    [0, 1.5, -0.2, Number.NaN, "auto", "0.5", true].map(offload),
+    Array(7).fill(null),
+  );
+  assert.equal(
+    isDefaultConfig({ ...DEFAULT_PER_MODEL_CONFIG, mlxPleOffload: "off" }),
+    false,
+  );
 });
 
-
-/** Old config page, non-GGUF: the number reads maxSeqLength; customContextLength only sets atDefault. */
-function oldClientConfigPage(
-  config: PerModelConfig,
-  native: number,
-): { shownContext: number; loadRequests: number; showsAsDefault: boolean } {
-  const clamp = (value: number, max: number) => Math.min(value, max);
-  const shown =
-    normalizeMaxSeqLength(config.maxSeqLength) ??
-    clamp(DEFAULT_MAX_SEQ_LENGTH, native);
-  const showsAsDefault = isDefaultConfig({
-    ...config,
-    customContextLength: null,
-  });
-  return { shownContext: shown, loadRequests: shown, showsAsDefault };
-}
-
-test("FORWARDS-COMPAT GAP: an old client's config page silently drops a new record's pin", () => {
-  store.clear();
-  const patched = {
+test("the fractional TurboQuant choice survives the saved row", () => {
+  const saved = toApiOverride({
     ...DEFAULT_PER_MODEL_CONFIG,
-    ...contextPinPatch(32768, true),
-  };
-  assert.ok(savePerModelConfig(MODEL, null, patched));
-  const stored = JSON.parse(store.get(STORAGE_KEY) ?? "{}") as Record<
-    string,
-    Record<string, unknown>
-  >;
-  const record = stored[MODEL_KEY];
+    mlxKvQuant: "tq-3.5",
+  });
+  assert.equal(saved.mlx_kv_quant, "tq-3.5");
+  assert.equal(stage(saved).config.mlxKvQuant, "tq-3.5");
+});
 
-  assert.equal(record.customContextLength, 32768);
-  assert.equal(record.maxSeqLength, null);
-  assert.equal(record.version, 1);
-
-  const { config } = resolveInitialConfig(MODEL, null);
-
-  assert.equal(savedContextPin(config), 32768);
-  assert.equal(loadRequest(config, true), 32768);
-
-  const old = oldClientConfigPage(config, NATIVE);
-  assert.equal(old.shownContext, DEFAULT_MAX_SEQ_LENGTH);
-  assert.equal(old.loadRequests, DEFAULT_MAX_SEQ_LENGTH);
-  assert.equal(old.showsAsDefault, true);
-
-  // The stamp is 1 and the old client's guard is `version > 5`, so nothing warns it.
-  assert.ok((record.version as number) <= 5);
-
-  const table = [
-    "| reader                                   | context requested | shows as |",
-    "| ---------------------------------------- | ----------------- | -------- |",
-    `| new code (savedContextPin)               | ${loadRequest(config, true)}             | pinned   |`,
-    `| old client, model-config page (non-GGUF) | ${old.loadRequests}              | default  |`,
-  ].join("\n");
-  assert.ok(table.includes("32768") && table.includes("4096"));
-  console.log(
-    [
-      "",
-      "Record on disk (written by the new code):",
-      `  ${JSON.stringify({
-        version: record.version,
-        customContextLength: record.customContextLength,
-        maxSeqLength: record.maxSeqLength,
-      })}`,
-      "",
-      table,
-      "",
-    ].join("\n"),
+test("a record holding the superseded width normalizes to the single choice", () => {
+  // An older build's record, as the one-time import reads it.
+  assert.equal(normalizePerModelConfig({ mlxKvBits: 8 }).mlxKvQuant, "8");
+  assert.equal(
+    normalizePerModelConfig({ mlxKvQuant: " TQ-4 ", mlxKvBits: 8 }).mlxKvQuant,
+    "tq-4",
   );
-});
-
-test("the gap is the config page's, not resolveLoadMaxSeqLength's", () => {
-  // main's resolveLoadMaxSeqLength reads customContextLength first, so auto-load keeps the pin.
-  store.clear();
-  assert.ok(
-    savePerModelConfig(MODEL, null, {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      ...contextPinPatch(32768, true),
-    }),
+  assert.equal(
+    normalizePerModelConfig({ mlxKvQuant: null, mlxKvBits: 8 }).mlxKvQuant,
+    null,
   );
-  const { config } = resolveInitialConfig(MODEL, null);
-  const oldResolverAnswer =
-    config.customContextLength != null
-      ? config.customContextLength
-      : (normalizeMaxSeqLength(config.maxSeqLength) ?? DEFAULT_MAX_SEQ_LENGTH);
-  assert.equal(oldResolverAnswer, 32768);
-  const oldComparePaneAnswer =
-    config.customContextLength ??
-    normalizeMaxSeqLength(config.maxSeqLength) ??
-    DEFAULT_MAX_SEQ_LENGTH;
-  assert.equal(oldComparePaneAnswer, 32768);
-});
-
-test("BACKWARDS COMPAT: an old record still pins under the new code, on either backend", () => {
-  const { config } = stage({ version: 1, maxSeqLength: 8192 });
-  assert.equal(savedContextPin(config), 8192);
-  assert.equal(loadRequest(config, true), 8192);
-  assert.equal(loadRequest(config, false), 8192);
-  // And it is not reported as default, so it survives savePerModelConfig's delete-if-default.
-  assert.equal(isDefaultConfig(config), false);
-});
-
-test("the fractional TurboQuant choice survives the saved model record", () => {
-  store.clear();
-  savePerModelConfig(MODEL, null, { ...DEFAULT_PER_MODEL_CONFIG, mlxKvQuant: "tq-3.5" });
-  assert.equal(resolveInitialConfig(MODEL, null).config.mlxKvQuant, "tq-3.5");
-});
-
-test("a record holding the superseded width reads back as the single choice", () => {
-  assert.equal(stage({ mlxKvBits: 8 }).config.mlxKvQuant, "8");
-  assert.equal(stage({ mlxKvQuant: " TQ-4 ", mlxKvBits: 8 }).config.mlxKvQuant, "tq-4");
-  assert.equal(stage({ mlxKvQuant: null, mlxKvBits: 8 }).config.mlxKvQuant, null);
 });

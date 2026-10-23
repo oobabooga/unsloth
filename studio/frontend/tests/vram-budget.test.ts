@@ -133,7 +133,7 @@ test("the staged fraction is held outside the component that unmounts", () => {
 
 test("Run waits for a staged budget save before starting the load", () => {
   // If Run stages the load while the PUT is open, the load uses the old fraction.
-  const handlerStart = pageSource.indexOf("const handleRun = () => {");
+  const handlerStart = pageSource.indexOf("const handleRun = async () => {");
   assert.ok(handlerStart >= 0, "handleRun is gone");
   const handler = pageSource.slice(
     handlerStart,
@@ -158,7 +158,7 @@ test("the row adopts published settings instead of only its own read", () => {
 });
 
 test("Run reports a rejected budget flush instead of voiding it", () => {
-  const handlerStart = pageSource.indexOf("const handleRun = () => {");
+  const handlerStart = pageSource.indexOf("const handleRun = async () => {");
   const handler = pageSource.slice(
     handlerStart,
     pageSource.indexOf("\n  };", handlerStart),
@@ -260,10 +260,15 @@ test("the reload notice is refreshed once a load finishes", () => {
 });
 
 test("Run waits out the budget save without starting two loads", () => {
-  const run = pageSource.slice(pageSource.indexOf("const handleRun = () => {"));
+  const run = pageSource.slice(
+    pageSource.indexOf("const handleRun = async () => {"),
+  );
   const body = run.slice(0, run.indexOf("\n  return (")).replace(/\s+/g, " ");
   // A second click during the PUT would settle the chain again and call onRun twice.
-  assert.match(body, /if \(budgetSettling\) \{ return; \}/);
+  assert.match(
+    body,
+    /if \(sharedVariantUnresolved \|\| budgetSettling \|\| saving\) \{ return; \}/,
+  );
   assert.match(body, /setBudgetSettling\(true\);/);
   assert.match(body, /setBudgetSettling\(false\); onRun\(/);
   const disabled = pageSource
@@ -273,7 +278,9 @@ test("Run waits out the budget save without starting two loads", () => {
 });
 
 test("a save that fails during Run is dropped, not left to race the load", () => {
-  const run = pageSource.slice(pageSource.indexOf("const handleRun = () => {"));
+  const run = pageSource.slice(
+    pageSource.indexOf("const handleRun = async () => {"),
+  );
   const rejection = run
     .slice(run.indexOf("void stagedBudget"))
     .replace(/\s+/g, " ");
@@ -308,12 +315,18 @@ test("a post-load read is not answered by one taken before the load finished", (
 });
 
 test("the budget closes while Run settles it, instead of racing the load", () => {
-  const run = pageSource.slice(pageSource.indexOf("const handleRun = () => {"));
-  const body = run.slice(0, run.indexOf("\n  return (")).replace(/\s+/g, " ");
-  // Looping the settle only shrinks the race window; locking the control closes it.
+  const run = pageSource.slice(
+    pageSource.indexOf("const handleRun = async () => {"),
+  );
+  const body = run
+    .slice(0, run.indexOf("\n  return ("))
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ");
+  // Looping the settle only shrinks the race window; locking the control closes it. The lock is
+  // taken before the settings save is awaited, so no drag lands while Run waits on it.
   assert.match(
     body,
-    /setVramBudgetLocked\(true\); const stagedBudget = settleVramBudgetSave\(\);/,
+    /setVramBudgetLocked\(true\); await persistConfig\([^)]*\); const stagedBudget = settleVramBudgetSave\(\);/,
   );
   assert.match(
     body,

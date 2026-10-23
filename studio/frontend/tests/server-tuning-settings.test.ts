@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { readSrc, registerBundlerResolver } from "./helpers/kit.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
 
@@ -99,36 +99,6 @@ test("the four take part in the editor's identity", () => {
   assert.equal(loadedConfigSignature(normalizePerModelConfig({})), base);
 });
 
-test("a record only claims the new schema version when it carries one", () => {
-  // toStoredConfig stamps the oldest version that understands every field present.
-  const source = readSrc("features/model-picker/model-config/per-model-config.ts");
-  assert.match(source, /const STORAGE_SCHEMA_VERSION = 12;\nconst PRE_MLX_OFFLOAD_SCHEMA_VERSION = 11;\nconst PRE_MLX_DRAFTER_SCHEMA_VERSION = 10;/);
-  assert.match(source, /mlxExpertOffload != null\)\s*\{\s*return STORAGE_SCHEMA_VERSION;/);
-  assert.match(source, /specDraftModel != null \|\| mlxMode\)\s*\{\s*return PRE_MLX_OFFLOAD_SCHEMA_VERSION;/);
-  assert.match(source, /tensorSplit != null\)\s*\{\s*return PRE_MLX_DRAFTER_SCHEMA_VERSION;/);
-  assert.match(source, /const PRE_TENSOR_SPLIT_SCHEMA_VERSION = 9;/);
-  assert.match(source, /const PRE_MLX_INT8_PREFILL_SCHEMA_VERSION = 7;/);
-  assert.match(source, /const PRE_MLX_KV_QUANT_SCHEMA_VERSION = 6;/);
-  assert.match(source, /const PRE_REASONING_BUDGET_SCHEMA_VERSION = 5;/);
-  assert.match(source, /const PRE_SERVER_TUNING_SCHEMA_VERSION = 4;/);
-  assert.match(
-    source,
-    /normalized\.mlxInt8Prefill\)\s*\{\s*return PRE_TENSOR_SPLIT_SCHEMA_VERSION;/,
-  );
-  assert.match(
-    source,
-    /mlxKvQuant != null\)\s*\{\s*return PRE_MLX_INT8_PREFILL_SCHEMA_VERSION;/,
-  );
-  assert.match(
-    source,
-    /hasReasoningBudget\)\s*\{\s*return PRE_MLX_KV_QUANT_SCHEMA_VERSION;/,
-  );
-  assert.match(
-    source,
-    /hasServerTuning\)\s*\{\s*return PRE_REASONING_BUDGET_SCHEMA_VERSION;/,
-  );
-});
-
 test("blank knobs are omitted from the load payload", () => {
   // A null counts as set on the backend and strips the flag from extras, so blank is omitted.
   assert.deepEqual(
@@ -198,7 +168,8 @@ test("the load mode is reported as removed, not as winning, under Model Memory",
 });
 
 test("a config whose only change is one of the four is not read as default", () => {
-  // savePerModelConfig deletes entries judged default, so tuning-only saves must count.
+  // A config judged default saves as no settings and the one-time import skips it, so tuning-only
+  // configs must count.
   for (const patch of [
     { loadMode: "mmap" },
     { specDraftCacheDtype: "q8_0", speculativeType: "dspark" },

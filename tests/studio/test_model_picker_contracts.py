@@ -1045,7 +1045,7 @@ def test_reset_persists_null_max_length_and_substitutes_only_for_load():
     assert "target.isGguf || pinsContextLength\n        ? effectiveRuntimeConfig" in src
     assert "const effectiveLoadConfig" in src
     assert "onRun(effectiveLoadConfig, classifiedIsDiffusion)" in src
-    assert "savePerModelConfig(" in src
+    assert "saveModelConfig(" in src
 
 
 def test_initial_load_uses_staged_config_payload():
@@ -1257,8 +1257,9 @@ def test_requested_gpu_pick_survives_fit_narrowing_and_namespace_changes():
     assert "cachedPinnableGpuContext" in gpu_info
     assert 'unavailableVulkan ? "vulkan" : undefined' in gpu_info
     assert "cachedPinnableGpuIndexKind" in gpu_info
-    config = _read("features/model-picker/model-config/per-model-config.ts")
-    assert '"selectedGpuIndexKind"' in config
+    overrides = _read("features/model-picker/api/model-overrides.ts")
+    assert "payload.gpu_index_kind = gpuIndexKind;" in overrides
+    assert 'override.gpu_index_kind ?? "physical"' in overrides
 
 
 def test_staged_gpu_pick_reconciles_with_async_namespace_discovery():
@@ -1415,7 +1416,7 @@ def test_forget_settings_is_not_locked_by_unloadable_extra_args():
     apply to a save only."""
     gate = " ".join(_save_button_gate().split())
     assert "(remember && ((!extraArgsLoadable && !sharedExtraArgsCleared) ||" in gate, gate
-    assert "sharedExtraArgsRefused || extraArgsHydrating))" in gate, gate
+    assert "sharedExtraArgsRefused || savedSettingsLoading))" in gate, gate
 
 
 def test_the_run_settings_footer_does_not_reflow_under_the_pointer():
@@ -1441,7 +1442,7 @@ def test_save_settings_is_not_rendered_when_it_could_do_nothing():
 def test_save_settings_reflects_the_context_it_pinned():
     """Save stays on the page, so a pinned context must show; a forget must not pin one."""
     src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    handler = src.split("const handleSave = () => {", 1)[1].split("const handleRun", 1)[0]
+    handler = src.split("const handleSave = async () => {", 1)[1].split("const handleRun", 1)[0]
     assert (
         "if ( remember && effectiveRuntimeConfig.customContextLength !== config.customContextLength"
         in handler
@@ -1452,24 +1453,6 @@ def test_save_settings_reflects_the_context_it_pinned():
     )
     # update() re-marks the draft edited, and an edited draft refuses newer server settings.
     assert "update(" not in handler
-
-
-def test_legacy_migration_is_idempotent_and_non_destructive():
-    """Migration runs on every read, so it must be idempotent and never overwrite a newer config."""
-    raw = _read("features/model-picker/model-config/per-model-config.ts")
-    src = " ".join(raw.split())
-    # Migration runs on every readMap, so it must be safe to repeat.
-    assert (
-        "function readMap(): StoredMap { migrateLegacyLoadSettingsOnce(); "
-        "return readMapRaw(); }" in src
-    )
-    assert "let legacyMigrationChecked = false;" in src
-    assert "if (legacyMigrationChecked || !canUseStorage()) {" in src
-    assert "legacyMigrationChecked = true;" in src
-    assert 'const LEGACY_MIGRATION_FLAG = "unsloth_model_configs_migrated";' in src
-    assert "if (localStorage.getItem(LEGACY_MIGRATION_FLAG)) {" in src
-    assert src.count('localStorage.setItem(LEGACY_MIGRATION_FLAG, "1");') >= 3
-    assert "if (isDefaultConfig(migrated) || Object.hasOwn(map, key)) {" in src
 
 
 def test_variant_expander_forwards_the_gguf_filename():
@@ -2085,8 +2068,10 @@ def test_a_lost_generate_post_must_prove_it_reached_the_backend():
 def test_parallel_slots_setting_wired_end_to_end():
     """Parallel slots (llama-server --parallel) must flow through every hop, or the server default wins."""
     config = _read("features/model-picker/model-config/per-model-config.ts")
+    overrides = _read("features/model-picker/api/model-overrides.ts")
+    assert "payload.n_parallel = config.nParallel;" in overrides
+    assert "nParallel: override.n_parallel," in overrides
     # null (server default) counts as default, so blank configs are not stored.
-    assert '"nParallel",' in config
     assert "N_PARALLEL_MAX, Math.round(partial.nParallel)" in config
     assert "config.nParallel == null &&" in config
     page = _read("features/model-picker/components/model-config-page.tsx")
@@ -2267,21 +2252,13 @@ def test_hydration_restores_a_remembered_slot_override():
 
 def test_remembered_slots_are_read_through_the_cached_repo_alias():
     """Look up saved slots by the repo alias too, since an auto-switch reports a snapshot path."""
-    config = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    # The raw identifier still wins, so a path-keyed record is never shadowed.
-    assert (
-        "const direct = resolveInitialConfig(modelId, standalone ? null : ggufVariant); "
-        "if (direct.remembered) {" in config
-    )
-    # Older pickers keyed the label, and those records are still on disk.
-    assert (
-        "if (standalone && ggufVariant) { const labelled = "
-        "resolveInitialConfig(modelId, ggufVariant); if (labelled.remembered) { "
-        "return labelled; } }" in config
-    )
-    assert "const alias = publicModelId(modelId);" in config
+    saved = " ".join(_read("features/model-picker/model-config/saved-model-configs.ts").split())
+    # Read in the server's lookup order: the raw identifier first, then its label key, then the alias.
+    assert "const alias = publicModelId(modelId);" in saved
     # Only a namespaced collapse: other paths collapse onto a shareable file stem.
-    assert 'if (alias === modelId || !alias.includes("/")) { return direct; }' in config
+    assert 'alias !== modelId && alias.includes("/") ? alias : null,' in saved
+    # A standalone file's reported quant is its filename label, saved without one.
+    assert "isStandaloneGgufPath(modelId) ? null : ggufVariant," in saved
 
     status = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
     assert "resolveResidentInitialConfig(checkpointId, status.gguf_variant ?? null)" in status
@@ -2329,7 +2306,10 @@ def test_batch_sizes_setting_wired_end_to_end():
     follow the same hops as Parallel Slots; a lost hop silently reverts the model to the
     llama.cpp defaults (2048 / 512)."""
     config = _read("features/model-picker/model-config/per-model-config.ts")
-    assert '"nBatch",' in config and '"nUbatch",' in config
+    overrides = _read("features/model-picker/api/model-overrides.ts")
+    assert "payload.n_batch = config.nBatch;" in overrides
+    assert "payload.n_ubatch = config.nUbatch;" in overrides
+    assert "nBatch: override.n_batch," in overrides and "nUbatch: override.n_ubatch," in overrides
     assert "N_BATCH_MAX, Math.round(partial.nBatch)" in config
     assert "N_BATCH_MAX, Math.round(partial.nUbatch)" in config
     assert "config.nBatch == null &&" in config
@@ -2547,29 +2527,11 @@ def test_adoption_takes_its_own_pin_before_moving_the_checkpoint():
     ), "the pin must be written before the checkpoint is adopted"
 
 
-def test_only_gguf_configs_are_mirrored_to_the_server():
-    """The server override map is read by the OpenAI-compatible auto-switch, and its
-    resolver indexes GGUFs only."""
-    src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert (
-        "if ( saved && (remember || forgets) && (target.apiLoadable ?? target.isGguf) && "
-        "!nativePathToken ) { syncModelOverride(" in src
-    )
-    assert "const saved = remember ? savePerModelConfig(" in src
-
-
-def test_a_native_leased_gguf_is_not_mirrored_to_the_server():
+def test_a_native_leased_gguf_saves_under_a_name_no_api_load_resolves():
     """A dropped or file-picked GGUF loads through a signed native-path lease, and
     /api/inference/status reports model_identifier as null for it, so the checkpoint the
-    browser keys settings by is the bare file name the backend echoes back."""
-    page = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "&& !nativePathToken ) { syncModelOverride(" in page
-    assert (
-        "const nativePathToken = target.meta.nativePathToken ?? "
-        "(isActiveModel ? activeNativePathToken : null);" in page
-    ), "the token this gate reads"
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "!isNativeFileLabel(entry.modelId) &&" in backfill
+    browser keys settings by is the bare file name the backend echoes back. Its saved row is
+    the panel's alone: no load path looks a bare file name up."""
     identity = " ".join(_read("features/hub/lib/model-identity.ts").split())
     assert "export function isNativeFileLabel(" in identity
     assert "const NATIVE_FILE_LABEL_RE = /^[^/\\\\]+\\.gguf$/i;" in identity
@@ -2580,30 +2542,6 @@ def test_a_native_leased_gguf_is_not_mirrored_to_the_server():
     ), "why the checkpoint is only a display name"
     models = _read_backend("routes/models.py")
     assert "display_name = gguf_file.stem," in models, "why the name is never an index key"
-
-
-def test_evicted_local_configs_drop_their_server_overrides():
-    """savePerModelConfig evicts older models when the map exceeds its budget."""
-    src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "const evicted: { modelId: string; ggufVariant: string | null }[] = [];" in src
-    assert (
-        "for (const dropped of evicted) { syncModelOverride(dropped.modelId, "
-        "dropped.ggufVariant, null, { keepLaunchFlags: true, }); }" in src
-    )
-    api = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    assert "keepLaunchFlags?: boolean;" in api
-    # The route re-supplies stored flags and drops an empty row.
-    assert "remove: config === null && !options?.keepLaunchFlags," in api
-    assert (
-        "...(config === null && !options?.keepLaunchFlags ? { llama_extra_args: [] } : {}),"
-        in api.replace("// biome-ignore lint/style/useNamingConvention: API schema ", "")
-    )
-    route = _read_backend("routes/settings.py")
-    assert 'requested_extra_args = stored.get("llama_extra_args")' in route, "the rule this mirrors"
-
-    store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    assert "evicted?: { modelId: string; ggufVariant: string | null }[]" in store
-    assert "modelIdFromStorageKey(" in store and "ggufVariantFromStorageKey(" in store
 
 
 def test_reasoning_resets_reach_the_server_without_making_backfill_destructive():
@@ -2647,12 +2585,12 @@ def test_a_recipe_restores_the_previous_model_at_its_reasoning_budget():
 
 def test_reasoning_settings_hydrate_from_a_server_authored_override():
     """A row written by another browser or an API client carries the pair, and fromApiOverride has
-    to copy it or the panel shows local defaults and the next save writes them back."""
+    to copy it or the panel shows defaults and the next save writes them back."""
     api = _read("features/model-picker/api/model-overrides.ts")
     hydrate = api.split("export function fromApiOverride", 1)[1]
     hydrate = hydrate[: hydrate.index("\n}")]
-    assert "reasoningBudget: override.reasoning_budget ?? local.reasoningBudget" in hydrate
-    assert "override.reasoning_budget_message ?? local.reasoningBudgetMessage" in hydrate
+    assert "reasoningBudget: override.reasoning_budget," in hydrate
+    assert "reasoningBudgetMessage: override.reasoning_budget_message," in hydrate
 
 
 def test_a_recipe_compares_the_requested_reasoning_budget():
@@ -2686,19 +2624,6 @@ def test_validate_sends_reasoning_controls_before_the_runtime_unloads():
     assert "validateReasoningBudgetMessage" in validate_payload
 
 
-def test_backfill_compares_server_keys_by_normalized_identity():
-    """app_settings has no schema version, so an install predating identity normalization
-    holds rows keyed by whatever id was typed, e.g."""
-    src = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "function normalizedOverrideKey(" in src
-    # Folded on both sides: the older `id::variant` local keys are not.
-    assert "known.set(normalizedOverrideKey(storedKey), storedEntry);" in src
-    assert "const stored = known.get(key);" in src
-    # A quant-aware split, so a Windows drive letter is not read as a separator.
-    assert "const split = splitQuantSuffix(key);" in src
-    assert "normalizeModelIdentity(" in src and "normalizeGgufVariantIdentity(" in src
-
-
 def test_monitor_stats_exclude_model_lifecycle_rows():
     """A load, unload or download is recorded as a monitor entry but is not an HTTP call."""
     # computeStats lives in stats.ts so it runs under `node --test`.
@@ -2711,15 +2636,6 @@ def test_monitor_stats_exclude_model_lifecycle_rows():
     assert 'entry.kind != "lifecycle"' in backend, "the rule this mirrors"
 
 
-def test_backfill_includes_a_standalone_gguf_with_no_variant():
-    """A standalone .gguf picked directly has no quant to choose between, so it is stored
-    with a null variant."""
-    src = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    # No GGUF clause: auto-switch resolves non-GGUF weights too.
-    assert "cachedRepoConfigId(entry.modelId, entry.ggufVariant) === null &&" in src
-    assert "entry.ggufVariant != null ||" not in src
-
-
 def test_monitor_overlay_does_not_pull_in_the_lazy_page():
     """The overlay is mounted from __root.tsx, so a static import of the page for two label
     helpers drags the whole 900-line page and its dependency graph into the eagerly
@@ -2730,34 +2646,6 @@ def test_monitor_overlay_does_not_pull_in_the_lazy_page():
     shared = _read("features/api-monitor/lifecycle.ts")
     assert "export function isLifecycleEntry(" in shared
     assert "export function lifecycleLabel(" in shared
-
-
-def test_override_writes_are_ordered_per_model():
-    """Two saves for one model, or a save racing the one-time backfill, started independent
-    requests with no sequencing, so the older response could commit last and resurrect
-    the entry the newer one meant to replace."""
-    src = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    # One in-flight promise per key is the ordering; what it resolves to is not.
-    assert (
-        "const writesByKey = new Map<string, Promise<" in src
-    ), "writes are no longer serialised through one in-flight promise per model"
-    assert (
-        "const key = modelOverrideKey( normalizeModelIdentity(modelId), normalizeGgufVariantIdentity(ggufVariant), );"
-        in src
-    )
-    # Chained on the settled tail, so one failed write cannot cancel the next.
-    assert "previous .catch(() => {}) .then(() => sendModelOverride(" in src
-    assert "writesByKey.set(key, write);" in src
-    # Only the last writer clears the slot, or a queue still building loses order.
-    assert "if (writesByKey.get(key) === write) { writesByKey.delete(key); }" in src
-
-
-def test_backfill_skips_future_schema_local_records():
-    """loadPerModelConfig refuses to apply a record written by a newer Unsloth and eviction
-    refuses to drop one, because this client cannot interpret that schema."""
-    src = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    listing = src[src.index("export function listPerModelConfigs()") :]
-    assert "storedConfigVersion(raw) > STORAGE_SCHEMA_VERSION" in listing[:900]
 
 
 def test_a_failed_detail_fetch_is_retried():
@@ -2776,10 +2664,10 @@ def test_model_config_keeps_storage_and_load_identities_separate():
     config_page = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
     assert "const configId = target.configId ?? target.id;" in config_page
     for call in (
-        "resolveInitialConfig(configId, target.ggufVariant)",
-        "savePerModelConfig( configId, target.ggufVariant,",
-        "deletePerModelConfig(configId, target.ggufVariant)",
-        "syncModelOverride( configId, target.ggufVariant,",
+        # Read as a load reads it: the load path first, then the id the settings are saved by.
+        "savedConfigFor( target.id, configId === target.id ? null : configId, target.ggufVariant, );",
+        "await saveModelConfig(configId, target.ggufVariant, normalized, {",
+        "await forgetModelConfig(configId, target.ggufVariant);",
     ):
         assert call in config_page, call
     assert "useDefaultChatTemplate( target.id," in config_page
@@ -2809,9 +2697,9 @@ def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
     # The suffix must be the scanner's label, or names with ".gguf:" fold two files onto one key.
     assert "tail.toLowerCase() === ggufQuantLabel(filename).toLowerCase()" in identity
 
-    migrate = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "const split = splitQuantSuffix(key);" in migrate
-    assert 'key.lastIndexOf(":")' not in migrate, "the unconditional split is gone"
+    saved = " ".join(_read("features/model-picker/model-config/saved-model-configs.ts").split())
+    assert "const split = splitQuantSuffix(key);" in saved
+    assert 'key.lastIndexOf(":")' not in saved, "the unconditional split is gone"
 
     backend = _read_backend("utils/openai_auto_switch_settings.py")
     assert "def split_quant_suffix(" in backend, "the rule this mirrors"
@@ -2843,39 +2731,25 @@ def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
 
 
 def test_the_settings_page_judges_the_config_storage_actually_keeps():
-    """savePerModelConfig normalizes before deciding, and the runtime hands this page
-    Speculative Decoding "auto", which a GGUF model stores as null."""
+    """persistConfig normalizes before deciding, and the runtime hands this page Speculative
+    Decoding "auto", which a GGUF model stores as null."""
     src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    # Load and Save (#10216) both go through persistConfig.
+    # Load and Save both go through persistConfig.
     assert (
         "const normalized = normalizePerModelConfig(storedSpeculativeAuto(next, targetIsMlx));"
         in src
     )
-    # Server hydration writes the same record, so a GGUF row's stored "auto" folds there too.
-    assert "storedSpeculativeAuto(rememberedConfig, !target.isGguf)" in src
     assert "defaultConfig: isDefaultConfig(normalized)" in src
-    assert "savePerModelConfig(configId, target.ggufVariant, normalized, evicted)" in src
-    assert "remember ? normalized : null," in src
+    assert "await saveModelConfig(configId, target.ggufVariant, normalized, {" in src
     assert "isDefaultConfig(effectiveRuntimeConfig)" not in src
     assert "isDefaultConfig(next)" not in src
 
     store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
     assert "export function normalizePerModelConfig(" in store
-    assert "const normalized = normalize(config);" in store
-    assert "if (isDefaultConfig(normalized)) {" in store, "the rule this mirrors"
 
 
-def test_the_chat_picker_marks_ollama_targets_unloadable_by_the_api():
-    """A settings target opened from the Chat model picker carried no apiLoadable, so the
-    `??"""
-    handoff = " ".join(_read("features/model-picker/model-config/model-config-handoff.ts").split())
-    assert "apiLoadable: apiAutoSwitchMayLoad([id, loadId], meta.isLora)," in handoff
-    assert "apiLoadable: apiAutoSwitchMayLoad([modelId], isLora)," in handoff
-    predicate = " ".join(_read("features/model-picker/model-config/model-identity.ts").split())
-    assert "return !isLora && !ids.some(isOllamaLinkPath);" in predicate
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "!isOllamaLinkPath(entry.modelId) &&" in backfill
-
+def test_ollama_link_directories_match_the_backend_resolver():
+    """The browser and the resolver agree on which directories hold materialized Ollama links."""
     identity = _read("features/hub/lib/model-identity.ts")
     assert 'new Set([".studio_links", "ollama_links"])' in identity
     resolver = _read_backend("core/inference/local_model_resolver.py")
@@ -2883,18 +2757,10 @@ def test_the_chat_picker_marks_ollama_targets_unloadable_by_the_api():
 
 
 def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
-    """The backfill reads the override map once and then writes each model in turn, so a
-    save by another tab during that pass was overwritten by this browser's older
-    localStorage copy."""
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "{ fillAbsentFields: true }," in backfill
-    # Key presence alone is not "done": what the server lacks decides.
-    assert "const stored = known.get(key);" in backfill
-    assert (
-        "if (stored && absentFields(stored, current.config).length === 0) { continue; }" in backfill
-    )
-    assert "const fields = Object.keys(toApiOverride(config));" in backfill
-    assert "return fields.filter((field) => !(field in stored));" in backfill
+    """The one-time import sends this browser's older copy of each model's settings, so it may
+    only fill what the server row lacks: a save from another tab or origin is the newer one."""
+    importer = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
+    assert "{ fillAbsentFields: true }," in importer
 
     api = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
     assert "fillAbsentFields?: boolean;" in api
@@ -2902,7 +2768,8 @@ def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
         "// biome-ignore lint/style/useNamingConvention: API schema ", ""
     )
     # Ordinary saves must stay unconditional, or a settings edit would never land.
-    assert "syncModelOverride" in api and "fill_absent_fields: true" in api
+    saved = " ".join(_read("features/model-picker/model-config/saved-model-configs.ts").split())
+    assert "publish(await putModelOverride(modelId, ggufVariant, config, options))" in saved
 
     # Read from the parse tree, so reflowed set literals are not a change.
     route = "routes/settings.py"
@@ -2960,20 +2827,23 @@ def test_the_sidebar_settings_editor_reseeds_when_the_live_config_lands():
     assert "loadedConfigSignature(loadedConfig)" in page
     # LAYOUT: a live change remounts under the same key, so only a layout cleanup runs first.
     assert "useLayoutEffect(() => retainModelConfigDraft(draftKey), [draftKey])" in page
-    # By the DRAFT, never the candidate keys: hosts build differently shaped lists.
-    assert "isExtraArgsHydratedForDraft(draftKey)" in page
-    # The sidebar stays mounted for the model's residency, so retain must retire it to re-read.
-    assert "!isModelConfigDraftEdited(draftKey) &&" in page
+    # A re-read of the saved settings replaces only a draft nobody touched while it was out.
+    assert (
+        "isModelConfigDraftEdited(draftKey) || readModelConfigDraft(draftKey) !== draftAtStart"
+        in page
+    )
     assert "markModelConfigDraftEdited(draftKey)" in page
-    # Only once the write landed, or the next read replaces values still on screen.
-    assert re.search(r"if \(saved\) \{.*?clearModelConfigDraftEdited\(draftKey\);", page)
+    # Only once the write landed, and not over an edit typed while it was out.
+    assert (
+        "if (readModelConfigDraft(draftKey) === draftAtSave) { "
+        "clearModelConfigDraftEdited(draftKey); }" in page
+    )
     # An unticked Remember is a pending Forget the read's guard would otherwise re-tick.
     assert "markModelConfigDraftEdited(draftKey); setRemember(checked === true);" in page
     assert "(!extraArgsLoadable && !sharedExtraArgsCleared) ||" in page
     # Run reads the draft, not the render closure: the peer's input blurs during this click.
     assert "const liveDraftConfig = readModelConfigDraft(draftKey)?.config;" in page
     assert "const peerChanged = !perModelConfigsEqual(baseConfig, config);" in page
-    assert "markExtraArgsHydratedForDraft(draftKey)" in page
     # DEFAULT_PER_MODEL_CONFIG names no GPU field, so a merge could not clear a manual pick.
     assert 'typeof action === "function" ? action(current) : action' in page
     # Only LOWERED by a row with no catalogue: before the probe every flag reads unknown.
@@ -3052,24 +2922,6 @@ def test_a_gpu_pin_is_mirrored_to_the_server_with_its_index_space():
     assert "payload.gpu_ids = config.selectedGpuIds;" in mirror
     # Omitted at the legacy default, so old rows still read as physical.
     assert 'if (gpuIndexKind !== "physical") { payload.gpu_index_kind = gpuIndexKind; }' in mirror
-
-
-def test_a_cached_repo_moves_legacy_settings_to_the_current_key():
-    """A cached repo's legacy snapshot-path settings move to its current repo-id key."""
-    config = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    assert "export function adoptLegacyConfigKey(" in config
-    # Renamed in one write: saving the copy first can silently evict an unrelated model.
-    assert "savePerModelConfig(modelId, ggufVariant, legacy)" not in config
-    assert (
-        "const alreadySaved = findConfigKeyForModelVariant(map, modelId, ggufVariant) "
-        "!== null;" in config
-    )
-    assert "if (!(alreadySaved || isDefaultConfig(legacy)))" in config
-    assert "map[key] = toStoredConfig(legacy);" in config
-    assert (
-        "delete map[legacyKey]; deleteConfigEntriesForModelVariant(map, legacyModelId, "
-        "ggufVariant);" in config
-    )
 
 
 def test_clearing_the_log_keeps_a_request_that_is_still_running():

@@ -27,14 +27,6 @@ export {
 export { ModelConfigPage } from "./components/model-config-page";
 export { SidebarModelConfig } from "./components/sidebar-model-config";
 export type { ModelPickTarget } from "./components/model-selector/types";
-export {
-  fetchModelOverrides,
-  modelOverrideKey,
-  putModelOverride,
-  syncModelOverride,
-  type ApiModelOverride,
-  type ApiModelOverrides,
-} from "./api/model-overrides";
 export { useActiveModelConfig } from "./hooks/use-active-model-config";
 export { useVllmAvailable, useVllmPlatform } from "./hooks/use-vllm-available";
 export { ManagedEngineOfferDialog } from "./components/managed-engine-offer-dialog";
@@ -75,22 +67,19 @@ export {
   DEFAULT_PER_MODEL_CONFIG,
   normalizeMaxSeqLength,
   type PerModelConfig,
-  PER_MODEL_CONFIG_STORAGE_KEY,
-  PER_MODEL_CONFIG_UPDATED_EVENT,
-  adoptCachedRepoConfig,
-  adoptLegacyConfigKey,
   isServedByLlamaCpp,
   resumesThought,
   contextPinPatch,
-  listPerModelConfigs,
   isServedByMlx,
   residentIsServedByMlx,
   savedContextPin,
   loadedContextFields,
   presetLoadSettingNames,
+} from "./model-config/per-model-config";
+export {
   resolveInitialConfig,
   resolveResidentInitialConfig,
-} from "./model-config/per-model-config";
+} from "./model-config/saved-model-configs";
 export {
   SharedRunConfigLinkHandler,
   receiveSharedRunConfigUrls,

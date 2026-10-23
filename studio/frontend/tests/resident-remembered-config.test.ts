@@ -1,52 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+// The settings for the identifier /api/inference/status reports, read from the server's map in the
+// order a load reads it: the load path before its public id, a quant's row before the bare one.
+
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import {
-  installLocalStorageFake,
-  registerBundlerResolver,
-} from "./helpers/kit.ts";
+import type { PerModelConfig } from "../src/features/model-picker/model-config/per-model-config.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-const { store } = installLocalStorageFake();
 
 const {
   resolveInitialConfig,
   resolveResidentInitialConfig,
-  savePerModelConfig,
+  setSavedModelConfigsForTests,
 } = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
+);
+const { toApiOverride } = await import(
+  "../src/features/model-picker/api/model-overrides.ts"
+);
+const { DEFAULT_PER_MODEL_CONFIG } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
 );
+
+/** A row as a save from Run settings writes it. */
+function row(config: Partial<PerModelConfig>) {
+  return toApiOverride({ ...DEFAULT_PER_MODEL_CONFIG, ...config });
+}
 
 // model_identifier after an API auto-switch is the snapshot path; settings are keyed by repo id.
 const SNAPSHOT_PATH =
   "/home/u/.cache/huggingface/hub/models--unsloth--Repo-GGUF/snapshots/2f1c9ab";
 const REPO_ID = "unsloth/Repo-GGUF";
 
-function config(nParallel: number | null, maxSeqLength: number | null = null) {
-  return {
-    customContextLength: null,
-    maxSeqLength,
-    kvCacheDtype: null,
-    speculativeType: null,
-    specDraftNMax: null,
-    nParallel,
-    reasoningBudget: -1,
-    reasoningBudgetMessage: "",
-    nBatch: null,
-    nUbatch: null,
-    tensorParallel: false,
-    disableVision: false,
-    chatTemplateOverride: null,
-  };
-}
-
 test("the resident model's repo-keyed slots are found through its snapshot path", () => {
-  store.clear();
-  savePerModelConfig(REPO_ID, "Q4_K_M", config(4));
+  setSavedModelConfigsForTests({
+    [`${REPO_ID}:Q4_K_M`]: row({ nParallel: 4 }),
+  });
 
   assert.equal(resolveInitialConfig(SNAPSHOT_PATH, "Q4_K_M").remembered, false);
 
@@ -57,9 +51,10 @@ test("the resident model's repo-keyed slots are found through its snapshot path"
 });
 
 test("a record under the raw identifier still wins over the repo alias", () => {
-  store.clear();
-  savePerModelConfig(SNAPSHOT_PATH, "Q4_K_M", config(2));
-  savePerModelConfig(REPO_ID, "Q4_K_M", config(8));
+  setSavedModelConfigsForTests({
+    [`${SNAPSHOT_PATH}:Q4_K_M`]: row({ nParallel: 2 }),
+    [`${REPO_ID}:Q4_K_M`]: row({ nParallel: 8 }),
+  });
 
   assert.equal(
     resolveResidentInitialConfig(SNAPSHOT_PATH, "Q4_K_M").config.nParallel,
@@ -67,21 +62,11 @@ test("a record under the raw identifier still wins over the repo alias", () => {
   );
 });
 
-test("a cached repo loaded without a quant moves its snapshot-path record to the repo id", () => {
-  store.clear();
+test("a cached repo loaded without a quant reads its repo-id row through the snapshot path", () => {
   const snapshot = "/hf/models--mlx-community--Model-4bit/snapshots/abc";
   const repo = "mlx-community/Model-4bit";
-  savePerModelConfig(snapshot, null, config(2));
+  setSavedModelConfigsForTests({ [repo]: row({ nParallel: 8 }) });
 
-  assert.equal(
-    resolveResidentInitialConfig(snapshot, null).config.nParallel,
-    2,
-  );
-  assert.equal(resolveInitialConfig(repo, null).config.nParallel, 2);
-  assert.equal(resolveInitialConfig(snapshot, null).remembered, false);
-
-  savePerModelConfig(snapshot, null, config(6));
-  savePerModelConfig(repo, null, config(8));
   assert.equal(
     resolveResidentInitialConfig(snapshot, null).config.nParallel,
     8,
@@ -90,8 +75,9 @@ test("a cached repo loaded without a quant moves its snapshot-path record to the
 });
 
 test("the quant still separates two variants of one cached repo", () => {
-  store.clear();
-  savePerModelConfig(REPO_ID, "Q4_K_M", config(4));
+  setSavedModelConfigsForTests({
+    [`${REPO_ID}:Q4_K_M`]: row({ nParallel: 4 }),
+  });
 
   assert.equal(
     resolveResidentInitialConfig(SNAPSHOT_PATH, "Q8_0").remembered,
@@ -105,10 +91,8 @@ for (const modelId of [
   "Qwen3-0.6B-Q4_K_M.gguf",
 ]) {
   test(`a resident standalone GGUF restores the settings saved by the picker: ${modelId}`, () => {
-    store.clear();
-    savePerModelConfig(modelId, null, {
-      ...config(2),
-      customContextLength: 4096,
+    setSavedModelConfigsForTests({
+      [modelId]: row({ nParallel: 2, customContextLength: 4096 }),
     });
 
     const resolved = resolveResidentInitialConfig(modelId, "Q4_K_M");
@@ -123,14 +107,19 @@ for (const modelId of [
   "Qwen3-0.6B-Q4_K_M.gguf",
 ]) {
   test(`a record the picker keyed by the quant label before #7473 is still read: ${modelId}`, () => {
-    store.clear();
-    savePerModelConfig(modelId, "Q4_K_M", config(5));
+    setSavedModelConfigsForTests({
+      [`${modelId}:Q4_K_M`]: row({ nParallel: 5 }),
+    });
 
     const resolved = resolveResidentInitialConfig(modelId, "Q4_K_M");
     assert.equal(resolved.remembered, true);
     assert.equal(resolved.config.nParallel, 5);
 
-    savePerModelConfig(modelId, null, config(6));
+    // The bare path is what the picker saves today, and a load reads it first.
+    setSavedModelConfigsForTests({
+      [`${modelId}:Q4_K_M`]: row({ nParallel: 5 }),
+      [modelId]: row({ nParallel: 6 }),
+    });
     assert.equal(
       resolveResidentInitialConfig(modelId, "Q4_K_M").config.nParallel,
       6,
@@ -143,21 +132,31 @@ for (const modelId of [
   "org/model.gguf",
 ]) {
   test(`a model containing several GGUF variants keeps their settings separate: ${modelId}`, () => {
-    store.clear();
-    savePerModelConfig(modelId, null, config(8));
-    savePerModelConfig(modelId, "Q4_K_M", config(2));
-    savePerModelConfig(modelId, "Q8_0", config(4));
+    setSavedModelConfigsForTests({
+      [modelId]: row({ nParallel: 8 }),
+      [`${modelId}:Q4_K_M`]: row({ nParallel: 2 }),
+      [`${modelId}:Q8_0`]: row({ nParallel: 4 }),
+    });
 
-    assert.equal(resolveResidentInitialConfig(modelId, "Q4_K_M").config.nParallel, 2);
-    assert.equal(resolveResidentInitialConfig(modelId, "Q8_0").config.nParallel, 4);
-    assert.equal(resolveResidentInitialConfig(modelId, "Q6_K").remembered, false);
+    assert.equal(
+      resolveResidentInitialConfig(modelId, "Q4_K_M").config.nParallel,
+      2,
+    );
+    assert.equal(
+      resolveResidentInitialConfig(modelId, "Q8_0").config.nParallel,
+      4,
+    );
+    // A quant with no row of its own loads with the bare row, so it reads that row too.
+    assert.equal(
+      resolveResidentInitialConfig(modelId, "Q6_K").config.nParallel,
+      8,
+    );
   });
 }
 
 test("a stem two models can share is never read as an alias", () => {
-  store.clear();
   // "Repo-Q4_K_M" is the stem both files collapse onto, so adopting it would cross settings.
-  savePerModelConfig("Repo-Q4_K_M", null, config(4));
+  setSavedModelConfigsForTests({ "Repo-Q4_K_M": row({ nParallel: 4 }) });
 
   assert.equal(
     resolveResidentInitialConfig("/srv/models/a/Repo-Q4_K_M.gguf", null)
@@ -172,8 +171,9 @@ test("a stem two models can share is never read as an alias", () => {
 });
 
 test("a repo id resolves exactly as before", () => {
-  store.clear();
-  savePerModelConfig(REPO_ID, "Q4_K_M", config(4));
+  setSavedModelConfigsForTests({
+    [`${REPO_ID}:Q4_K_M`]: row({ nParallel: 4 }),
+  });
 
   assert.equal(
     resolveResidentInitialConfig(REPO_ID, "Q4_K_M").config.nParallel,
@@ -195,10 +195,8 @@ const ensureModelLoaded = composer.slice(
 );
 
 test("compare ensureModelLoaded recovers a repo-keyed pin through a snapshot path", () => {
-  store.clear();
-  savePerModelConfig(REPO_ID, "Q4_K_M", {
-    ...config(null),
-    customContextLength: 8192,
+  setSavedModelConfigsForTests({
+    [`${REPO_ID}:Q4_K_M`]: row({ customContextLength: 8192 }),
   });
   assert.equal(resolveInitialConfig(SNAPSHOT_PATH, "Q4_K_M").remembered, false);
   assert.equal(
@@ -210,8 +208,5 @@ test("compare ensureModelLoaded recovers a repo-keyed pin through a snapshot pat
     ensureModelLoaded,
     /resolveResidentInitialConfig\(\s*sel\.id,\s*sel\.ggufVariant \?\? null,?\s*\)/,
   );
-  assert.doesNotMatch(
-    ensureModelLoaded,
-    /resolveInitialConfig\(\s*sel\.id,/,
-  );
+  assert.doesNotMatch(ensureModelLoaded, /resolveInitialConfig\(\s*sel\.id,/);
 });

@@ -18,7 +18,7 @@ import {
 } from "./helpers/kit.ts";
 
 registerBundlerResolver();
-const { store } = installLocalStorageFake();
+installLocalStorageFake();
 const {
   chatModelIsResident,
   chatModelLoadedTarget,
@@ -35,11 +35,23 @@ const { chatLocalModelOptions } = await import(
   "../src/features/chat/local-model-options.ts"
 );
 const {
-  DEFAULT_PER_MODEL_CONFIG,
   resolveInitialConfig,
   resolveResidentInitialConfig,
-  savePerModelConfig,
-} = await import("../src/features/model-picker/model-config/per-model-config.ts");
+  setSavedModelConfigsForTests,
+} = await import(
+  "../src/features/model-picker/model-config/saved-model-configs.ts"
+);
+const { toApiOverride } = await import(
+  "../src/features/model-picker/api/model-overrides.ts"
+);
+const { DEFAULT_PER_MODEL_CONFIG } = await import(
+  "../src/features/model-picker/model-config/per-model-config.ts"
+);
+
+/** The row a save from Run settings writes for a context pin. */
+function pinnedContext(customContextLength: number) {
+  return toApiOverride({ ...DEFAULT_PER_MODEL_CONFIG, customContextLength });
+}
 const { shouldPersistRunModel } = await import(
   "../src/features/chat/utils/queued-chat-run-settings.ts"
 );
@@ -643,7 +655,7 @@ test("a single .gguf file carries its format out of the local inventory", () => 
 });
 
 test("a saved GGUF variant is carried back exactly", () => {
-  store.clear();
+  setSavedModelConfigsForTests(null);
   const modelId = "/models/Qwen3-4B-GGUF";
   assert.deepEqual(
     chatModelSwitchMeta({ modelId, ggufVariant: "Q6_K" }, [
@@ -672,7 +684,7 @@ test("a saved GGUF variant is carried back exactly", () => {
 });
 
 test("switching back to a hub GGUF loads it instead of staging a download", () => {
-  store.clear();
+  setSavedModelConfigsForTests(null);
   // Hub picks without isDownloaded go through the download manager, which can silently do nothing.
   const selection = switchBackSelection({
     modelId: "unsloth/Qwen3-4B-GGUF",
@@ -752,14 +764,10 @@ test("a history update that leaves the model alone is not re-emitted", () => {
 });
 
 test("a legacy GGUF directory recovers its sole saved variant and context", () => {
-  store.clear();
   const modelId = String.raw`N:\AI Models\Qwen\Qwen3.6-40B-Q6_K`;
-  assert.ok(
-    savePerModelConfig(modelId, "Q6_K", {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 32768,
-    }),
-  );
+  setSavedModelConfigsForTests({
+    [`${modelId}:Q6_K`]: pinnedContext(32768),
+  });
   const [option] = chatLocalModelOptions([
     {
       id: modelId,
@@ -783,16 +791,11 @@ test("a legacy GGUF directory recovers its sole saved variant and context", () =
 });
 
 test("a legacy GGUF directory does not guess between saved variants", () => {
-  store.clear();
   const modelId = "/models/Qwen3-4B-GGUF";
-  for (const variant of ["Q4_K_M", "Q8_0"]) {
-    assert.ok(
-      savePerModelConfig(modelId, variant, {
-        ...DEFAULT_PER_MODEL_CONFIG,
-        customContextLength: 32768,
-      }),
-    );
-  }
+  setSavedModelConfigsForTests({
+    [`${modelId}:Q4_K_M`]: pinnedContext(32768),
+    [`${modelId}:Q8_0`]: pinnedContext(32768),
+  });
   const [option] = chatLocalModelOptions([
     {
       id: modelId,
@@ -809,14 +812,10 @@ test("a legacy GGUF directory does not guess between saved variants", () => {
 });
 
 test("a legacy GGUF directory does not infer a quant from config alone", () => {
-  store.clear();
   const modelId = "/models/Qwen3-4B-GGUF";
-  assert.ok(
-    savePerModelConfig(modelId, "Q6_K", {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 32768,
-    }),
-  );
+  setSavedModelConfigsForTests({
+    [`${modelId}:Q6_K`]: pinnedContext(32768),
+  });
   assert.equal(
     resolveChatModelSwitchTarget({ modelId }).ggufVariant,
     undefined,
@@ -824,14 +823,10 @@ test("a legacy GGUF directory does not infer a quant from config alone", () => {
 });
 
 test("the switch back leaves the remembered config to stageOrLoad", () => {
-  store.clear();
   const modelId = "/models/qwen3-4b-q4.gguf";
-  assert.ok(
-    savePerModelConfig(modelId, null, {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 32768,
-    }),
-  );
+  setSavedModelConfigsForTests({
+    [modelId]: pinnedContext(32768),
+  });
   const selection = switchBackSelection({ modelId }, [
     {
       id: modelId,
@@ -871,16 +866,12 @@ test("the switch back leaves the remembered config to stageOrLoad", () => {
 });
 
 test("switch back recovers a repo-keyed context through a snapshot path", () => {
-  store.clear();
   const snapshotPath =
     "/home/u/.cache/huggingface/hub/models--unsloth--Repo-GGUF/snapshots/2f1c9ab";
   const repoId = "unsloth/Repo-GGUF";
-  assert.ok(
-    savePerModelConfig(repoId, "Q4_K_M", {
-      ...DEFAULT_PER_MODEL_CONFIG,
-      customContextLength: 32768,
-    }),
-  );
+  setSavedModelConfigsForTests({
+    [`${repoId}:Q4_K_M`]: pinnedContext(32768),
+  });
   assert.equal(resolveInitialConfig(snapshotPath, "Q4_K_M").remembered, false);
   assert.equal(
     resolveResidentInitialConfig(snapshotPath, "Q4_K_M").config
