@@ -9846,12 +9846,15 @@ def _target_effective_context_length(
         from utils.openai_auto_switch_settings import (
             resolve_fit_max_seq_length,
             resolve_override_for_load,
+            standing_load_choices,
         )
 
         if override_is_resolved:
             override = resolved_override
         else:
             _key, override = resolve_override_for_load(load_path, override_id, gguf_variant)
+            # As saved_load_settings reads it, so this estimate sizes the load that follows.
+            override = {**standing_load_choices(is_gguf = is_gguf), **override}
         configured = _positive_int_or_none(
             resolve_fit_max_seq_length(override, is_gguf = is_gguf) if override else None
         )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""POST /load fills the fields a caller leaves out from the model's saved launch settings."""
+"""POST /load fills the fields a caller leaves out from the launch settings saved in Studio."""
 
 import asyncio
 import sys
@@ -139,3 +139,88 @@ def test_auto_switch_and_load_read_the_same_settings(monkeypatch, gguf_target):
     request, _ = _apply(LoadRequest(model_path = "org/m-GGUF", gguf_variant = "Q4_K_M"))
     for name, value in auto_switch_kwargs.items():
         assert getattr(request, name) == value
+
+
+def _standing(monkeypatch, **chat_settings):
+    """The Chat UI's standing choices, as /api/chat/settings stores them."""
+    import storage.studio_db as studio_db
+    monkeypatch.setattr(studio_db, "list_chat_settings", lambda: dict(chat_settings))
+
+
+def test_standing_choices_fill_what_the_saved_row_leaves_unset(monkeypatch, gguf_target):
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, speculativeType = "off", gpuMemoryMode = "manual")
+    _put("org/m-GGUF", custom_context_length = 32768, kv_cache_dtype = "q8_0", **DEFAULTS)
+    request, applied = _apply(LoadRequest(model_path = "org/m-GGUF"))
+    assert request.speculative_type == "off"
+    assert request.gpu_memory_mode == "manual"
+    # Manual with Auto layers sends the context pin, as the UI's resolveFitMaxSeqLength does.
+    assert request.max_seq_length == 32768
+    assert {"speculative_type", "gpu_memory_mode", "cache_type_kv"} <= set(applied)
+
+
+def test_standing_choices_apply_to_a_model_with_no_saved_row(monkeypatch, gguf_target):
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, speculativeType = "ngram", gpuMemoryMode = "manual")
+    request, applied = _apply(LoadRequest(model_path = "org/unsaved-GGUF"))
+    assert request.speculative_type == "ngram"
+    assert request.gpu_memory_mode == "manual"
+    # No pin under Manual with Auto layers: --fit sizes the context.
+    assert request.max_seq_length == 0
+    assert set(applied) == {"speculative_type", "gpu_memory_mode", "max_seq_length"}
+
+
+def test_the_saved_row_and_the_request_outrank_the_standing_choices(monkeypatch, gguf_target):
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, speculativeType = "off", gpuMemoryMode = "manual")
+    _put("org/m-GGUF", speculative_type = "mtp", **DEFAULTS)
+    request, _ = _apply(LoadRequest(model_path = "org/m-GGUF", gpu_memory_mode = "auto"))
+    assert request.speculative_type == "mtp"
+    assert request.gpu_memory_mode == "auto"
+
+
+def test_standing_auto_leaves_the_loader_default(monkeypatch, gguf_target):
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, speculativeType = "auto", gpuMemoryMode = "auto")
+    original = LoadRequest(model_path = "org/unsaved-GGUF")
+    request, applied = _apply(original)
+    assert request is original and applied == []
+
+
+def test_a_non_gguf_load_takes_only_a_standing_off(monkeypatch):
+    import core.inference.local_model_resolver as resolver
+
+    monkeypatch.setattr(resolver, "local_target_is_gguf", lambda path, alias = None: False)
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, speculativeType = "ngram", gpuMemoryMode = "manual")
+    original = LoadRequest(model_path = "org/model")
+    request, applied = _apply(original)
+    # ngram reads as auto off a GGUF, and GPU memory mode is GGUF-only.
+    assert request is original and applied == []
+    _standing(monkeypatch, speculativeType = "off")
+    request, applied = _apply(LoadRequest(model_path = "org/model"))
+    assert request.speculative_type == "off" and applied == ["speculative_type"]
+
+
+def test_the_auto_switch_row_carries_the_standing_choices(monkeypatch):
+    """The speech budget estimates the context from this row, so it sizes what the load runs."""
+    _mock_override_store(monkeypatch)
+    _standing(monkeypatch, gpuMemoryMode = "manual")
+    _put("org/m-GGUF", max_seq_length = 65536, **DEFAULTS)
+    _, row, kwargs = asyncio.run(
+        settings.saved_load_settings("org/m-GGUF", None, None, is_gguf = True)
+    )
+    assert row["gpu_memory_mode"] == "manual"
+    assert settings.resolve_fit_max_seq_length(row, is_gguf = True) == kwargs["max_seq_length"] == 0
+
+
+def test_the_speech_estimate_reads_the_row_as_the_load_does(monkeypatch):
+    _mock_override_store(monkeypatch)
+    _put("org/tts-GGUF", max_seq_length = 65536, **DEFAULTS)
+    inference = _inference()
+    monkeypatch.setattr(inference, "_target_native_context_length", lambda *a, **k: 4096)
+    _standing(monkeypatch)
+    assert inference._target_effective_context_length("org/tts-GGUF", True) == 65536
+    # Manual with Auto layers hands sizing to --fit, so the saved length is not the window.
+    _standing(monkeypatch, gpuMemoryMode = "manual")
+    assert inference._target_effective_context_length("org/tts-GGUF", True) == 4096

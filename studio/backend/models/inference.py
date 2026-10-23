@@ -123,8 +123,9 @@ class LoadRequest(BaseModel):
         True,
         description = "Fill every field this request leaves out from the launch settings saved "
         "for this model in Studio (Run settings / model load settings), the same row the API "
-        "auto-switch applies. A field the request sets always wins. The Studio UI sends false: "
-        "it has already resolved its own settings into the request.",
+        "auto-switch applies, then from the standing Speculative Decoding and GPU Memory choices "
+        "for a field the row leaves unset. A field the request sets always wins. The Studio UI "
+        "sends false: it has already resolved its own settings into the request.",
     )
     alongside: bool = Field(
         False,
@@ -2102,7 +2103,7 @@ class LoadResponse(_InferenceRuntimeFields):
     status: str = Field(..., description = "Load status")
     saved_settings_applied: list[str] = Field(
         default_factory = list,
-        description = "LoadRequest fields this load took from the model's saved launch settings "
+        description = "LoadRequest fields this load took from the launch settings saved in Studio "
         "because the request left them out (see use_saved_settings). Empty when none applied.",
     )
     model: str = Field(..., description = "Model identifier")

@@ -58,8 +58,9 @@ def test_context_length_alias_is_registered():
     assert "--context-length" in flags
 
 
-def test_gpu_memory_mode_option_is_registered_with_auto_default():
-    """The GPU placement policy is a first-class model option."""
+def test_gpu_memory_mode_option_is_registered_without_a_default():
+    """The GPU placement policy is a first-class model option. Unset, the server applies the
+    choice saved in Studio, so a typed auto must stay distinguishable from no flag."""
     studio_mod = _load_run_command()
     import inspect
 
@@ -67,7 +68,7 @@ def test_gpu_memory_mode_option_is_registered_with_auto_default():
     opt = sig.parameters["gpu_memory_mode"].default
     flags = set(getattr(opt, "param_decls", None) or [])
     assert flags == {"--gpu-memory-mode"}
-    assert getattr(opt, "default", None) == "auto"
+    assert getattr(opt, "default", "missing") is None
     assert getattr(opt, "rich_help_panel", None) == "Model"
 
 
@@ -470,6 +471,12 @@ def test_reexec_omits_default_gpu_memory_mode(monkeypatch):
     assert "--gpu-memory-mode" not in captured[0]["argv"]
 
 
+def test_reexec_forwards_an_explicit_auto_gpu_memory_mode(monkeypatch):
+    result, captured = _invoke_run(monkeypatch, _BASE + ["--gpu-memory-mode", "auto"])
+    assert len(captured) == 1, result.output
+    assert _value_after(captured[0]["argv"], "--gpu-memory-mode") == "auto"
+
+
 def test_reexec_forwards_engine_parallelism_and_gpus(monkeypatch):
     result, captured = _invoke_run(
         monkeypatch,
@@ -558,7 +565,8 @@ def test_run_rejects_invalid_gpu_memory_mode(monkeypatch):
 @pytest.mark.parametrize(
     "mode,expected",
     [
-        ("auto", {"model_path": "owner/model-GGUF"}),
+        (None, {"model_path": "owner/model-GGUF"}),
+        ("auto", {"model_path": "owner/model-GGUF", "gpu_memory_mode": "auto"}),
         (
             "manual",
             {

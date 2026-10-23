@@ -1719,7 +1719,7 @@ def _load_model_via_http(
     gguf_variant: Optional[str],
     max_seq_length: int,
     load_in_4bit: bool,
-    gpu_memory_mode: Literal["auto", "manual"] = "auto",
+    gpu_memory_mode: Optional[Literal["auto", "manual"]] = None,
     tensor_parallel: bool = False,
     speculative_type: Optional[SpeculativeType] = None,
     spec_draft_n_max: Optional[int] = None,
@@ -1748,6 +1748,8 @@ def _load_model_via_http(
     if gpu_memory_mode == "manual":
         payload["gpu_memory_mode"] = "manual"
         payload["gpu_layers"] = -1
+    elif gpu_memory_mode == "auto":
+        payload["gpu_memory_mode"] = "auto"
     if tensor_parallel:
         payload["tensor_parallel"] = True
     if speculative_type is not None:
@@ -1860,7 +1862,7 @@ def _format_saved_settings_line(load_result: dict) -> Optional[str]:
     if not isinstance(applied, list) or not applied:
         return None
     names = ", ".join(str(name) for name in applied if isinstance(name, str))
-    return f"  Saved settings: {names} (from this model's settings in Studio)" if names else None
+    return f"  Saved settings: {names} (saved in Studio)" if names else None
 
 
 def _format_context_length_line(load_result: dict) -> Optional[str]:
@@ -2440,14 +2442,15 @@ def run(
         help = "Runtime context length in tokens (0 = the length saved for this model in Studio, "
         "else the model default for GGUF and 2048 for hub models)",
     ),
-    gpu_memory_mode: Literal["auto", "manual"] = typer.Option(
-        "auto",
+    gpu_memory_mode: Optional[Literal["auto", "manual"]] = typer.Option(
+        None,
         "--gpu-memory-mode",
         rich_help_panel = _RUN_PANEL_MODEL,
         help = (
             "GPU memory strategy for GGUF models. Auto lets Unsloth select GPUs "
             "and cap context to fit VRAM. Manual with default layers and context "
-            "delegates placement and sizing to llama.cpp --fit."
+            "delegates placement and sizing to llama.cpp --fit. Default: the GPU Memory "
+            "choice saved in Studio, else auto."
         ),
     ),
     speculative_type: Optional[SpeculativeType] = typer.Option(
@@ -2938,7 +2941,7 @@ def run(
             "--host",
             host,
         ]
-        if gpu_memory_mode != "auto":
+        if gpu_memory_mode is not None:
             args.extend(["--gpu-memory-mode", gpu_memory_mode])
         if gguf_variant:
             args.extend(["--gguf-variant", gguf_variant])

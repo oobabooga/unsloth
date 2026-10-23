@@ -336,7 +336,7 @@ def set_openai_auto_switch(
     )
 
 
-# An override is the server-side twin of the UI's per-model config, mirrored on every save so an API load applies the same launch settings the picker would; every field is optional and absent means "app default". Mirrors _valid_cache_types in core/inference/llama_cpp.py. Legacy entries hold just {llama_extra_args, max_seq_length}, and a write replaces the fields it expresses, so the route carries `llama_extra_args` over. Known gap: the picker's global fallbacks for GPU memory mode and speculative decoding live in browser localStorage, so an API load following the global gets the default.
+# An override is a model's saved launch settings, the only copy: Run settings reads and writes it here, and every load path applies it. Every field is optional and absent means "app default". Mirrors _valid_cache_types in core/inference/llama_cpp.py. Legacy entries hold just {llama_extra_args, max_seq_length}, and a write replaces the fields it expresses, so the route carries `llama_extra_args` over.
 VALID_KV_CACHE_DTYPES = frozenset(
     {"f16", "bf16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl", "f32"}
 )
@@ -440,7 +440,7 @@ _ENGINE_DEFAULTS = {"engine_parallelism": "tensor", "engine_precision": "auto"}
 def normalize_model_override(
     payload: dict[str, Any], *, keep_empty_extra_args: bool = False
 ) -> dict[str, Any]:
-    """Validate one per-model launch config, dropping anything unusable. Silently drops rather than raising: an override is a convenience mirror of the UI's config, so one stale field (a KV dtype this llama.cpp build lost, a GPU id from another host) must not block persisting the rest or fail the API load that reads it. ``validate_extra_args`` is the caller's job, since it lives in the llama_server_args allow-list module this one must not import. ``keep_empty_extra_args`` keeps an explicit empty list, the difference between "this model has no launch flags" and "nothing is stored for this model": the same thing everywhere except under a fallback, where a quant whose row is gone reads the bare repository row instead and a cleared box would come back holding whatever that legacy row carries."""
+    """Validate one per-model launch config, dropping anything unusable. Silently drops rather than raising: an override is a saved preference, so one stale field (a KV dtype this llama.cpp build lost, a GPU id from another host) must not block persisting the rest or fail the API load that reads it. ``validate_extra_args`` is the caller's job, since it lives in the llama_server_args allow-list module this one must not import. ``keep_empty_extra_args`` keeps an explicit empty list, the difference between "this model has no launch flags" and "nothing is stored for this model": the same thing everywhere except under a fallback, where a quant whose row is gone reads the bare repository row instead and a cleared box would come back holding whatever that legacy row carries."""
     entry: dict[str, Any] = {}
     # The defaults ("tensor", "auto") are not stored: a default-only row would count as an
     # override, shadow a repository row in auto-switch, and re-tick Remember.
@@ -915,6 +915,27 @@ def override_lookup_candidates(
     return seen
 
 
+def standing_load_choices(*, is_gguf: bool) -> dict[str, Any]:
+    """The Chat UI's standing Speculative Decoding and GPU Memory choices, as override fields.
+
+    The UI loads a model whose saved settings leave either unset with these, so every load path does.
+    """
+    try:
+        from storage.studio_db import list_chat_settings
+        settings = list_chat_settings()
+    except Exception:  # noqa: BLE001 -- a load never fails on reading a preference
+        return {}
+    choices: dict[str, Any] = {}
+    mode = settings.get("speculativeType")
+    # Auto is the loader's own default. Off a GGUF the UI reads ngram as auto: n-gram copying
+    # alone would move an MLX text model onto the vision runtime.
+    if mode == "off" or (mode == "ngram" and is_gguf):
+        choices["speculative_type"] = mode
+    if is_gguf and settings.get("gpuMemoryMode") == "manual":
+        choices["gpu_memory_mode"] = "manual"
+    return choices
+
+
 async def saved_load_settings(
     load_id: str,
     alias_id: Optional[str],
@@ -925,10 +946,12 @@ async def saved_load_settings(
 ) -> tuple[Optional[str], dict, dict[str, Any]]:
     """``(stored key, saved row, LoadRequest kwargs)`` for the launch settings saved for a model.
 
-    Every load path reads the row here so a model loads with the same settings whoever asks.
-    The caller supplies ``gpu_ids_resolve`` because the GPU check lives with the hardware code.
+    Every load path reads the row here so a model loads with the same settings whoever asks. The
+    returned row includes the standing choices it leaves unset, as the load does. The caller
+    supplies ``gpu_ids_resolve`` because the GPU check lives with the hardware code.
     """
     key, override = resolve_override_for_load(load_id, alias_id, variant)
+    override = {**standing_load_choices(is_gguf = is_gguf), **override}
     kwargs = model_override_load_kwargs(override, is_gguf = is_gguf)
     saved_gpu_ids = kwargs.get("gpu_ids")
     if (
