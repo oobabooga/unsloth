@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from loggers import get_logger
+from core.inference.sidecar_log import exit_details, open_child_log, read_tail
 
 from hub.utils.hf_errors import modelscope_missing
 from hub.utils.hf_tokens import normalize_token
@@ -1064,19 +1065,25 @@ class MtmdSttSidecar:
                 key_argv, key_env, key_file = _llama_server_key_launch(api_key)
                 # Right after the binary: --no-mmproj-offload has to stay last.
                 cmd[1:1] = key_argv
-            process = subprocess.Popen(
-                cmd,
-                # nothing reads these, and an undrained pipe blocks llama-server mid-startup once its logs fill the
-                # buffer
-                stdout = subprocess.DEVNULL,
-                stderr = subprocess.DEVNULL,
-                stdin = subprocess.DEVNULL,
-                # bundled libs and pip CUDA runtimes on the loader path, secrets scrubbed, as the chat backend spawns
-                # the same binary
-                env = {**_llama_server_child_env(binary), **key_env},
-                # Die with Unsloth, so a crash never orphans a server on the GPU.
-                **child_popen_kwargs(),
-            )
+            # A file, not a pipe: nothing drains a pipe, and an undrained one blocks llama-server
+            # mid-startup once its logs fill the buffer. Before this the output went to DEVNULL,
+            # so a failed start said only "did not become ready".
+            log_path, log_handle = open_child_log("stt-llama-server", port)
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout = log_handle or subprocess.DEVNULL,
+                    stderr = subprocess.STDOUT if log_handle else subprocess.DEVNULL,
+                    stdin = subprocess.DEVNULL,
+                    # bundled libs and pip CUDA runtimes on the loader path, secrets scrubbed, as the chat backend
+                    # spawns the same binary
+                    env = {**_llama_server_child_env(binary), **key_env},
+                    # Die with Unsloth, so a crash never orphans a server on the GPU.
+                    **child_popen_kwargs(),
+                )
+            finally:
+                if log_handle is not None:
+                    log_handle.close()
             # Published before the wait, so training can preempt a startup that is already allocating; _process is not
             # set for another 180s.
             with self._lock:
@@ -1096,6 +1103,9 @@ class MtmdSttSidecar:
                     with suppress(OSError):
                         key_file.unlink()
             if not ready:
+                # Read before the reap: a server still starting gets killed below, and its
+                # SIGKILL status would then read as the operating system's OOM kill.
+                exited_status = process.poll()
                 # Reap it here: _process was never assigned, so unload() cannot reach a child that ignores SIGTERM and
                 # keeps port and VRAM.
                 _reap(process)
@@ -1105,7 +1115,9 @@ class MtmdSttSidecar:
                     raise SttLoadCancelledError(
                         "Dictation model loading was cancelled so training could start."
                     )
-                raise SttUnavailableError(f"llama-server did not become ready for '{model_id}'.")
+                raise SttUnavailableError(
+                    self._start_failure_message(model_id, exited_status, log_path, binary, api_key)
+                )
             with self._lock:
                 self._process = process
                 self._port = port
@@ -1122,6 +1134,38 @@ class MtmdSttSidecar:
                 self._load_cancel_event = None
                 self._load_owner_cancel_event = None
                 self._starting_process = None
+
+    @staticmethod
+    def _start_failure_message(
+        model_id: str,
+        returncode: Optional[int],
+        log_path: Optional[Path],
+        binary: Optional[str],
+        api_key: Optional[str],
+    ) -> str:
+        """Why the server did not come up, read from its own output.
+
+        It is the same llama-server the chat backend runs, so the chat backend's start-failure
+        classifier applies as is: a missing library, an unknown architecture or an unparsable
+        chat template get the same specific message here as on a chat load.
+        """
+        if returncode is None:
+            return f"llama-server did not become ready for '{model_id}'." + exit_details(
+                None, log_path
+            )
+        try:
+            from core.inference.llama_cpp import LlamaCppBackend
+            output = read_tail(log_path, limit = 20000)
+            reason = LlamaCppBackend._classify_llama_start_failure(
+                output, None, model_id, returncode, binary, log_path, (api_key,), None
+            )
+        except Exception:
+            reason = ""
+        if not reason:
+            return f"llama-server exited before becoming ready for '{model_id}'." + exit_details(
+                returncode, log_path
+            )
+        return f"Could not start the transcription model '{model_id}' (llama-server exited with status {returncode}). {reason}"
 
     @staticmethod
     def _wait_for_server(

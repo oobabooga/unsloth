@@ -1101,13 +1101,15 @@ const downloadedRowShellClassName = (
   cn(
     "group flex items-center transition-colors hover:bg-sidebar-accent has-[:focus-visible]:bg-sidebar-accent has-[[data-state=open]]:bg-sidebar-accent",
     hasMemoryBar ? "rounded-2xl" : "rounded-full",
-    selected && "bg-sidebar-accent",
+    // The selected row keeps its gear on screen: hover-only left the load settings (context
+    // length, KV cache, slots) undiscoverable for users who never hovered it (RD-404).
+    selected && "bg-sidebar-accent [&_.row-actions]:opacity-100",
   );
 
 // One gutter for every row, gear or no gear, so the columns never shift by a button; the
 // buttons show on hover or while their menu is open.
 const ROW_ACTIONS_CLASS =
-  "mr-0.5 flex w-[calc(38px*var(--ui-space-scale,1))] shrink-0 items-center justify-end -space-x-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 has-[[data-state=open]]:opacity-100 [@media(hover:none)]:opacity-100";
+  "row-actions mr-0.5 flex w-[calc(38px*var(--ui-space-scale,1))] shrink-0 items-center justify-end -space-x-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 has-[[data-state=open]]:opacity-100 [@media(hover:none)]:opacity-100";
 
 // Drop line for a pinned-row drag. A border snaps to whole pixels, so every row matches.
 const PINNED_DROP_CUE_BASE =

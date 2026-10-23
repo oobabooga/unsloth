@@ -22943,6 +22943,30 @@ class LlamaCppBackend:
         return str(_resolve_llama_binary(binary, template_only = True))
 
     @staticmethod
+    def _installed_build_label(binary: Optional[str]) -> Optional[str]:
+        """The release tag of the llama.cpp install ``binary`` belongs to, e.g. 'b11798-mix-f8a7950'.
+
+        Read from the prebuilt's install marker only, never by executing the binary: this runs
+        on the failure path of a launch that may have just crashed. None for a source build, a
+        custom path, or any read error, and the caller then simply omits the build.
+        """
+        if not binary:
+            return None
+        try:
+            from utils.llama_cpp_freshness import read_install_marker
+            marker = read_install_marker(binary) or {}
+            tag = marker.get("release_tag") or marker.get("tag")
+        except Exception:
+            return None
+        if not isinstance(tag, str):
+            return None
+        tag = tag.strip()
+        # A marker is a file on disk; keep anything odd out of a user-facing sentence.
+        if not tag or len(tag) > 64 or not re.fullmatch(r"[A-Za-z0-9._+-]+", tag):
+            return None
+        return tag
+
+    @staticmethod
     def _runtime_remedy(binary: Optional[str]) -> str:
         """The repair advice for ``binary``, by provenance.
 
@@ -23393,6 +23417,34 @@ class LlamaCppBackend:
                 f"not set it."
             )
 
+        # The weights loaded, then llama.cpp's Jinja engine rejected the GGUF's embedded chat
+        # template (e.g. "lexer: unknown escape character \x" for a replace("\x00", "")
+        # filter older builds could not lex, RD-784/RD-785). The fallback blamed the file and
+        # memory, both of which were fine.
+        if (
+            "failed to initialize chat template" in lowered
+            or "chat template parsing error" in lowered
+        ):
+            _tpl_error = re.search(r"common_chat_templates_init:\s*error:\s*([^\r\n]+)", scan_tail)
+            _tpl_detail = f" ({_short(_tpl_error.group(1))})" if _tpl_error else ""
+            _build = LlamaCppBackend._installed_build_label(binary)
+            _build_named = f" {_build}" if _build else ""
+            _update = (
+                "Update llama.cpp (Settings > General, or `unsloth studio update`), since a newer build may parse it"
+                if LlamaCppBackend._is_unsloth_managed_binary(binary)
+                else "Update that custom llama.cpp, since a newer build may parse it"
+            )
+            return LlamaCppBackend._with_startup_diagnostics(
+                f"The installed llama.cpp{_build_named} could not parse this model's built-in chat "
+                f"template{_tpl_detail}. The GGUF file loaded and this is not a memory problem. "
+                f"{_update}; or replace the template under Chat Template in this model's load "
+                "settings. --no-jinja alone does not help: current builds still parse the "
+                "embedded template.",
+                output,
+                log_path,
+                secrets,
+            )
+
         # Tensor parallelism (--split-mode tensor) is arch-gated in llama.cpp;
         # unsupported architectures abort the load with this marker. Point the
         # user at the toggle instead of a generic invalid-GGUF/OOM message.
@@ -23526,11 +23578,20 @@ class LlamaCppBackend:
                     "Ollama instead."
                 )
             # Not "cannot be run": unlike the branches above, this includes an arch the
-            # INSTALLED build predates (qwen4exp ran after a llama.cpp update).
+            # INSTALLED build predates (qwen4exp ran after a llama.cpp update). Naming the
+            # build and how to update is the point: users asked in threads whether a new build
+            # was coming because nothing said which one they had (RD-788, #14695).
+            _build = LlamaCppBackend._installed_build_label(binary)
+            _build_named = f" ({_build})" if _build else ""
+            _how = (
+                " (Settings > General, or `unsloth studio update`)"
+                if LlamaCppBackend._is_unsloth_managed_binary(binary)
+                else ""
+            )
             return (
-                f"The installed llama.cpp does not recognise this GGUF's model "
+                f"The installed llama.cpp{_build_named} does not recognise this GGUF's model "
                 f"architecture ('{arch}'). The file is valid. If the model is newer "
-                "than this llama.cpp build, updating llama.cpp may add support for it."
+                f"than this llama.cpp build, updating llama.cpp{_how} may add support for it."
             )
 
         # Other Ollama compat failures that don't name an arch. Only when

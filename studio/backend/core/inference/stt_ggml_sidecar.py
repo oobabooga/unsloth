@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from loggers import get_logger
+from core.inference.sidecar_log import exit_details, open_child_log
 
 from hub.utils.hf_errors import modelscope_missing
 from hub.utils.hf_tokens import normalize_token
@@ -1079,18 +1080,25 @@ class GgmlSttSidecar:
                     raise SttLoadCancelledError(
                         "Unsloth is shutting down; not starting whisper-server."
                     )
-                process = subprocess.Popen(
-                    command,
-                    stdout = subprocess.DEVNULL,
-                    stderr = subprocess.DEVNULL,
-                    stdin = subprocess.DEVNULL,
-                    # Co-located GPU libs on the loader path (WSL system HIP first), secrets scrubbed from the
-                    # downloaded binary's env.
-                    env = _whisper_server_child_env(binary),
-                    # die with Unsloth (Linux PDEATHSIG, Windows job) so a crash never orphans a server holding the
-                    # model
-                    **child_popen_kwargs(),
-                )
+                # Its output goes to a per-launch log, so a server that dies at startup
+                # leaves its reason behind instead of a guess about the model file.
+                log_path, log_handle = open_child_log("whisper-server", port)
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdout = log_handle or subprocess.DEVNULL,
+                        stderr = subprocess.STDOUT if log_handle else subprocess.DEVNULL,
+                        stdin = subprocess.DEVNULL,
+                        # Co-located GPU libs on the loader path (WSL system HIP first), secrets scrubbed from the
+                        # downloaded binary's env.
+                        env = _whisper_server_child_env(binary),
+                        # die with Unsloth (Linux PDEATHSIG, Windows job) so a crash never orphans a server holding the
+                        # model
+                        **child_popen_kwargs(),
+                    )
+                finally:
+                    if log_handle is not None:
+                        log_handle.close()
                 with self._load_state_lock:
                     self._starting_process = process
                 adopt_pid(process.pid)  # terminate_all backstop for graceful exits
@@ -1108,6 +1116,16 @@ class GgmlSttSidecar:
                     )
                 try:
                     self._wait_for_server(process, port, cancel_event, route = route)
+                except SttEngineUnavailableError as exc:
+                    # Read the status before the kill below can replace it with a SIGKILL.
+                    status = process.poll()
+                    if status is None:
+                        process.kill()
+                        process.wait(timeout = 10)
+                    forget_pid(process.pid)
+                    raise SttEngineUnavailableError(
+                        f"{exc}{exit_details(status, log_path)}"
+                    ) from exc
                 except Exception:
                     if process.poll() is None:
                         process.kill()
@@ -1142,9 +1160,10 @@ class GgmlSttSidecar:
                     "GGUF STT model loading was cancelled so training could start."
                 )
             if process.poll() is not None:
+                # The exit status and the server's own last lines say more than any guess:
+                # the old text blamed the model file for every early exit.
                 raise SttEngineUnavailableError(
-                    "The local transcription runtime exited before becoming "
-                    "ready; the model file may be corrupt or unsupported."
+                    "The local transcription runtime (whisper-server) exited before becoming ready."
                 )
             # Require a whisper-server-specific response twice, with the managed child alive around each probe. An
             # arbitrary local process that won the bind race would otherwise be mistaken for the sidecar and receive the

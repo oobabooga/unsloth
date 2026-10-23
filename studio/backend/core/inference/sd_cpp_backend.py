@@ -512,11 +512,34 @@ def _sd_cpp_probe_output(binary: str, *args: str) -> Optional[str]:
             env = runtime_env(binary),
             **windows_hidden_subprocess_kwargs(),
         )
-    except Exception:  # noqa: BLE001 -- cannot exec / timeout: "cannot tell"
+    except Exception as exc:  # noqa: BLE001 -- cannot exec / timeout: "cannot tell"
+        _log_probe_failure(binary, args, f"could not run: {exc}")
         return None
     if proc.returncode != 0:
+        tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-500:]
+        _log_probe_failure(
+            binary, args, f"exited with status {proc.returncode}" + (f": {tail}" if tail else "")
+        )
         return None
     return (proc.stdout or "") + (proc.stderr or "")
+
+
+_LOGGED_PROBE_FAILURES: set = set()
+
+
+def _log_probe_failure(binary: str, args: "tuple[str, ...]", detail: str) -> None:
+    """Log a failed probe once per binary, arguments and outcome.
+
+    The probe is "cannot tell" by design, so its callers stay quiet and fall back; without this
+    the exit status and stderr that explain the fallback were gone before anything saw them
+    (FD-003). Once, since a probe repeats on every load: an older build rejecting a flag is
+    expected and would otherwise fill the log.
+    """
+    key = (binary, args, detail[:120])
+    if key in _LOGGED_PROBE_FAILURES:
+        return
+    _LOGGED_PROBE_FAILURES.add(key)
+    logger.warning("sd.cpp probe %s %s %s", binary, " ".join(args), detail)
 
 
 # The ``--help`` token that marks a build carrying MiniMax-H3 support. Upstream added the mode's own options
