@@ -155,12 +155,48 @@ def test_the_managed_bundle_check_still_answers_like_before():
 
 def test_the_transformers_backend_declares_the_three_controls():
     """The worker forwards a control only when the backend's signature declares it."""
-    # Imports unsloth and peft at module scope, which a CPU-only test environment may lack.
-    inference = pytest.importorskip("core.inference.inference")
-
-    params = inspect.signature(inference.InferenceBackend.generate_chat_response).parameters
+    backend_cls = _inference_backend_class()
+    if backend_cls is None:
+        pytest.skip("core.inference.inference does not import in this environment")
+    params = inspect.signature(backend_cls.generate_chat_response).parameters
     for name in ("seed", "frequency_penalty", "logit_bias"):
         assert name in params
+
+
+def _inference_backend_class():
+    """``InferenceBackend``, with unsloth and trl stubbed only while it imports when the CPU test
+    job lacks them (the _stub_if_missing pattern of test_audio_type_inconclusive.py), so the
+    stubs never outlive this call. None when it cannot be imported at all."""
+    import importlib
+    import types
+    from unittest.mock import MagicMock
+
+    stubbed = []
+    for name, attrs in (
+        ("unsloth", ("FastLanguageModel", "FastVisionModel", "is_bfloat16_supported")),
+        ("unsloth.chat_templates", ("get_chat_template",)),
+        ("trl", ("SFTTrainer", "SFTConfig")),
+    ):
+        if name in sys.modules:
+            continue
+        try:
+            importlib.import_module(name)
+            continue
+        except Exception:  # noqa: BLE001 - unusable here either way, so stub it
+            pass
+        module = types.ModuleType(name)
+        module.__spec__ = None
+        for attr in attrs:
+            setattr(module, attr, MagicMock())
+        sys.modules[name] = module
+        stubbed.append(name)
+    try:
+        return importlib.import_module("core.inference.inference").InferenceBackend
+    except Exception:  # noqa: BLE001 - reported as a skip by the caller
+        return None
+    finally:
+        for name in reversed(stubbed):
+            sys.modules.pop(name, None)
 
 
 def test_frequency_penalty_charges_every_repeat_of_completion_tokens_only():
