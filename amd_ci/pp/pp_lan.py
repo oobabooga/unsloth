@@ -600,6 +600,14 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag21:
+            # sched_pin_l_out (diag20 profile: the master's last-layer tail ran on W1, shipping 8x the activation):
+            # pin off / on at the diag20 best (2 off the master, G=8), then with ~2 layers off the head; mirrored
+            cases = ["bs_p0q2h0", "bs_p1q2h0", "bs_p1q4h0", "bs_p1q4h2", "bs_p1q2h2"]
+            plan = [("x1", 1, 1, B)]
+            plan += [(k, 5, 8, 8 * B) for k in cases]
+            plan += [(k, 5, 8, 8 * B) for k in reversed(cases)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag20:
             # MoE S=5 (diag19 on Qwen3-30B-A3B: 70-80%, master 0.36-0.58 and workers 0.56-0.69 busy, so the pipeline
             # is under-filled): 2 / 4 layers off the master x G 8 / 10 / 12, each case twice in mirrored order
@@ -776,17 +784,23 @@ class Master:
                 if kind.startswith("bs_q"):
                     hd = 0
                     ml = (round(a.n_layer / s) + 1 - int(kind[4:])) if int(kind[4:]) else None
+                if kind.startswith("bs_p"):
+                    # bs_p{pin}q{m}h{hd}: sched_pin_l_out off / on, m layers off the master, hd off the head
+                    pin_s, rest = kind[4:].split("q")
+                    m_s, hd_s = rest.split("h")
+                    hd = int(hd_s)
+                    ml = (round(a.n_layer / s) + 1 - int(m_s)) if int(m_s) else None
                 if kind.startswith("bs_x"):
                     hd = 0
                     ml = (round(a.n_layer / s) + 1 - 3) if kind[5] == "1" else None
                 args, p = split(s, g, False, True, ml, hd)
                 # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
-                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w", "bs_x", "bs_z", "bs_y", "bs_q")):
+                if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w", "bs_x", "bs_z", "bs_y", "bs_q", "bs_p")):
                     args += ["--cache-ram", "0"]
                 env = dict(tls_env)
                 if kind == "bs_passive":
                     env["OMP_WAIT_POLICY"] = "PASSIVE"
-                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h", "bs_v", "bs_w", "bs_x", "bs_z", "bs_y", "bs_q")):
+                if kind.startswith(("bs_m", "bs_i", "bs_c", "bs_l", "bs_k", "bs_h", "bs_v", "bs_w", "bs_x", "bs_z", "bs_y", "bs_q", "bs_p")):
                     env["GGML_RPC_SYNC_ALL"] = "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0"
                 if kind.startswith("bs_i"):
@@ -797,14 +811,16 @@ class Master:
                     env["GGML_RPC_P2P"] = kind[4]
                     env["LLAMA_RPC_PIPELINE_PARALLEL"] = kind[5]
                     env["GGML_RPC_ASYNC_COPY"] = kind[5]
-                if kind.startswith(("bs_z", "bs_y", "bs_q")):
+                if kind.startswith(("bs_z", "bs_y", "bs_q", "bs_p")):
                     env["GGML_RPC_P2P"] = "1"
                     env["GGML_RPC_ASYNC_INPUTS"] = env["LLAMA_RPC_ASYNC_INPUTS"] = kind[4] if kind.startswith("bs_z") else "1"
                     args[args.index("-t") + 1] = str(max(1, a.threads // 2))
                 if kind.startswith("bs_y"):
                     env["LLAMA_BS_BATCH_READBACK"] = kind[4]
-                if kind.startswith("bs_q"):
+                if kind.startswith(("bs_q", "bs_p")):
                     env["LLAMA_BS_BATCH_READBACK"] = "1"
+                if kind.startswith("bs_p"):
+                    env["LLAMA_PIN_LAYER_OUT"] = kind[4]
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -952,6 +968,7 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag21", action = "store_true", help = "sched_pin_l_out off / on at S=5 G=8 (use with --peer-allow)")
     m.add_argument("--diag20", action = "store_true", help = "MoE S=5: layers off the master x pipeline groups (use with --peer-allow)")
     m.add_argument("--diag19", action = "store_true", help = "confirm the best setting per stage count twice (use with --peer-allow)")
     m.add_argument("--diag18", action = "store_true", help = "levers 1 + 3 on, 0 / 2 / 4 layers moved off the master, S=3-5 G=8 (use with --peer-allow)")

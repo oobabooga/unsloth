@@ -1,0 +1,65 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 23162fbe6..3c1952a61 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -366,6 +366,14 @@ llama_context::llama_context(
+     cparams.pipeline_parallel = false;
+     cparams.training = false;
+ 
++    {
++        // pin the output of the last layer on a device to that device, so that a layer split ships one activation
++        // instead of the layer's weightless tail inputs (e.g. the per-expert MoE outputs and the residual)
++        // LLAMA_PIN_LAYER_OUT=0 restores the old behaviour
++        const char * LLAMA_PIN_LAYER_OUT = getenv("LLAMA_PIN_LAYER_OUT");
++        pin_layer_out = LLAMA_PIN_LAYER_OUT ? (atoi(LLAMA_PIN_LAYER_OUT) != 0) : true;
++    }
++
+     {
+         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
+         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
+@@ -3061,6 +3069,31 @@ llm_graph_cb llama_context::graph_get_cb() const {
+                 }
+             }
+         }
++
++        // - the weightless tail of the last layer on a device (residual add, MoE expert sum) is otherwise expanded up
++        //   from the next layer's ops onto the next device, which then receives the tail's inputs instead of l_out
++        // - only at device boundaries, at any batch size, unless the layer's ops may be offloaded off the CPU
++        if (pin_layer_out && il != -1 && strcmp(name, "l_out") == 0) {
++            const auto & dev_layer = model.dev_layer(il);
++            const auto & dev_next  = il + 1 < (int) model.hparams.n_layer_all ? model.dev_layer(il + 1) : model.dev_output();
++            if (dev_layer != dev_next) {
++                bool offload = false;
++                if (cparams.op_offload && ggml_backend_dev_type(dev_layer) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    for (const auto & backend : backends) {
++                        if (ggml_backend_get_device(backend.get()) != dev_layer && ggml_backend_offload_op(backend.get(), cur)) {
++                            offload = true;
++                        }
++                    }
++                }
++                for (const auto & backend : backends) {
++                    if (!offload && ggml_backend_get_device(backend.get()) == dev_layer) {
++                        if (ggml_backend_supports_op(backend.get(), cur)) {
++                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                        }
++                    }
++                }
++            }
++        }
+     };
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index c9defbfb4..80c9ca84b 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -455,6 +455,9 @@ private:
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
++    // env: LLAMA_PIN_LAYER_OUT
++    bool pin_layer_out = true;
++
+     // true after the prism.hadamard coverage check passes on a reserved graph
+     bool hadamard_verified = false;
+ 

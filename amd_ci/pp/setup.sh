@@ -61,7 +61,7 @@ TAIL="${PP_PATCH_TAIL:-rpc_p2p}"
 if [ "$PR" = 191 ] && [ -n "$TAIL" ]; then git -C "$L" apply "$HERE/../homelink/$TAIL.patch" || { echo "FATAL: $TAIL patch does not apply"; exit 1; }; fi
 # PP_PATCH_EXTRA (space-separated) applies after the tail: rpc_async_inputs queues a split's input uploads to RPC
 # without a synchronize, together with its graph (GGML_RPC_ASYNC_INPUTS=0 / LLAMA_RPC_ASYNC_INPUTS=0 restore the old path)
-for X in ${PP_PATCH_EXTRA-rpc_async_inputs bs_batch_readback bs_probs_fix}; do
+for X in ${PP_PATCH_EXTRA-rpc_async_inputs bs_batch_readback bs_probs_fix sched_pin_l_out}; do
   if [ "$PR" = 191 ]; then git -C "$L" apply "$HERE/../homelink/$X.patch" || { echo "FATAL: $X patch does not apply"; exit 1; }; fi
 done
 FLAGS="-DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
