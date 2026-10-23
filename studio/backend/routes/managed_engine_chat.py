@@ -14,6 +14,7 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from core.inference.chat_controls import chat_controls
 from core.inference.engine_transport import engine_messages, engine_request_timeout
 from core.inference.inference_gate import gated_async_client
 from core.inference.http_stream import closing_response_lines
@@ -115,7 +116,7 @@ def _message_fitter(
     from routes import inference as api
 
     if (
-        getattr(engine, "engine", None) != "vllm"
+        not chat_controls(engine.engine)["context_overflow"]
         or api._rolling_context_policy(payload) is None
         or not engine.context
     ):

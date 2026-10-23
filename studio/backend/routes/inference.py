@@ -123,6 +123,8 @@ from core.inference.audio_errors import (
 )
 from core.inference.audio_cpp_outputs import NO_STEMS
 from core.inference import context_refusal
+from core.inference.chat_controls import LABELS as _CHAT_BACKEND_LABELS
+from core.inference.chat_controls import chat_controls, in_process_backend
 from core.inference.context_window import (
     estimate_message_tokens as _estimate_message_tokens,
     estimate_messages_tokens as _estimate_messages_tokens,
@@ -522,12 +524,18 @@ def _continue_final_message(payload, *, thought: bool = False) -> bool:
     return isinstance(reasoning, str) and bool(reasoning.strip())
 
 
+def _gguf_chat_controls(llama_backend) -> dict:
+    return chat_controls(
+        "gguf", resumes_thoughts = bool(getattr(llama_backend, "_resumes_thoughts", True))
+    )
+
+
 def _reject_unresumable_thought(payload, llama_backend, reject) -> None:
     """An older llama-server would treat the thought as finished and answer after it."""
     if (
         _continue_final_message(payload, thought = True)
         and not _continue_final_message(payload)
-        and not getattr(llama_backend, "_resumes_thoughts", True)
+        and not _gguf_chat_controls(llama_backend)["continue_thought"]
     ):
         raise reject(
             400,
@@ -808,6 +816,34 @@ def _raise_unsupported_openai_parameter(param: str, message: str) -> None:
             param = param,
         ),
     )
+
+
+def _no_grammar_engine_detail(label: str) -> str:
+    # Deep Research retries without the format only on "needs a grammar engine".
+    return (
+        f"response_format needs a grammar engine, which Unsloth does not run for {label} models; "
+        "load an MLX or GGUF model to use it."
+    )
+
+
+def _refuse_unsupported_chat_controls(payload, backend: str) -> None:
+    """Refuse, by name, a request control the loaded ``backend`` does not honor."""
+    controls = chat_controls(backend)
+    label = _CHAT_BACKEND_LABELS[backend]
+    for name, asked in (
+        ("response_format", _response_format_needs_grammar(payload)),
+        ("seed", getattr(payload, "seed", None) is not None),
+        ("frequency_penalty", bool(getattr(payload, "frequency_penalty", 0.0))),
+        ("logit_bias", bool(getattr(payload, "logit_bias", None))),
+        ("continue_final_message", bool(getattr(payload, "continue_final_message", None))),
+    ):
+        if asked and not controls[name]:
+            _raise_unsupported_openai_parameter(
+                name,
+                _no_grammar_engine_detail(label)
+                if name == "response_format"
+                else f"{name} is not supported for {label} models.",
+            )
 
 
 def _choice_seed(
@@ -8802,6 +8838,7 @@ def _unsloth_serving_fields(model_info: dict) -> dict:
         "spec_draft_model": model_info.get("spec_draft_model"),
         "spec_drafter_kind": model_info.get("spec_drafter_kind"),
         "spec_fallback_reason": model_info.get("spec_fallback_reason"),
+        "chat_controls": chat_controls(in_process_backend(model_info)) if model_info else None,
     }
 
 
@@ -8822,6 +8859,7 @@ def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
         # Not MLX, so the MLX runtime fields report as absent.
         is_mlx = False,
         is_npu = False,
+        chat_controls = _gguf_chat_controls(llama_backend),
         mlx_kv_quant = None,
         mlx_kv_quant_requested = None,
         mlx_kv_bits = None,
@@ -19694,14 +19732,10 @@ async def _managed_engine_request(request):
 
 
 def _managed_engine_unsupported_controls(payload, model_info = None) -> Optional[str]:
-    """The first request parameter a managed vLLM / SGLang load cannot honor, or None. A
-    spelled-out ``{"type": "text"}`` response_format is the default, not structured output."""
+    """The first request parameter outside the chat controls that a managed vLLM / SGLang load
+    cannot honor, or None."""
     if payload.use_adapter is not None:
         return "use_adapter"
-    if _response_format_constrains_decoding(payload):
-        return "response_format"
-    if payload.continue_final_message:
-        return "continue_final_message"
     if (model_info or {}).get("reasoning_flags") is None:
         for name in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
             if getattr(payload, name) not in (None, False, "none"):
@@ -19762,6 +19796,7 @@ def _npu_load_response(resident, status: str) -> LoadResponse:
         supports_reasoning = model.reasoning,
         reasoning_style = "enable_thinking",
         supports_tools = model.tools,
+        chat_controls = chat_controls("npu"),
     )
 
 
@@ -23984,6 +24019,7 @@ async def _slot_status(current_subject: str):
                 supports_reasoning = _npu_model.reasoning,
                 reasoning_style = "enable_thinking",
                 supports_tools = _npu_model.tools,
+                chat_controls = chat_controls("npu"),
                 llama_cpp_supports_mtp = _supports_mtp,
             )
 
@@ -32015,22 +32051,7 @@ def _refuse_npu_chat_request(payload, *, supports_vision: bool, supports_tools: 
     """Reject a chat request FastFlowLM cannot serve; also run before a switch to an NPU model."""
     if _wants_multiple_choices(payload):
         _raise_unsupported_n("NPU chat completions")
-    if _response_format_constrains_decoding(payload):
-        _raise_unsupported_openai_parameter(
-            "response_format", "FastFlowLM on the NPU has no guided decoding for response_format."
-        )
-    if getattr(payload, "seed", None) is not None:
-        _raise_unsupported_openai_parameter(
-            "seed", "FastFlowLM on the NPU does not take a sampling seed."
-        )
-    if getattr(payload, "frequency_penalty", 0.0):
-        _raise_unsupported_openai_parameter(
-            "frequency_penalty", "FastFlowLM on the NPU does not take a frequency penalty."
-        )
-    if getattr(payload, "logit_bias", None):
-        _raise_unsupported_openai_parameter(
-            "logit_bias", "FastFlowLM on the NPU does not take a logit bias."
-        )
+    _refuse_unsupported_chat_controls(payload, "npu")
     if payload.logprobs or payload.top_logprobs is not None:
         _raise_unsupported_openai_parameter(
             "logprobs", "FastFlowLM on the NPU does not report log probabilities."
@@ -32104,7 +32125,11 @@ async def _npu_chat_completions(payload, request: Request, current_subject: str)
 
     wants_stream = bool(payload.stream)
     relay = _NpuStreamRelay(upstream.public_model, _normalize_stop_sequences(payload.stop))
-    update: dict = {"stream": True}
+    # Admission let a structured format through only beside callable tools, which set it aside.
+    update: dict = {
+        "stream": True,
+        "response_format": _response_format_beside_tools(payload, payload.tools),
+    }
     if _legacy_image_is_distinct(payload):
         # The proxy reads messages only, so splice a top-level image in as GGUF chat does.
         update["messages"] = [
@@ -33381,6 +33406,7 @@ async def produce_openai_chat_completions(
     normalized_stop = _normalize_stop_sequences(payload.stop)
 
     if using_gguf:
+        _refuse_unsupported_chat_controls(payload, "gguf")
         # Advertised repo id after an auto-switch load, else a clean public id,
         # never the absolute .gguf path.
         model_name = _llama_public_model_id(llama_backend, payload.model)
@@ -33449,23 +33475,8 @@ async def produce_openai_chat_completions(
                     "route: a waveform admits no grammar, and transcription and audio-input "
                     "answers are decoded without one. Send the request to a text model.",
                 )
-        # Callable client tools set the format aside (_response_format_beside_tools), so nothing
-        # below applies, unless the request asks for Unsloth's own loop, which keeps the format.
-        if _response_format_constrains_decoding(payload) and (
-            _explicit_studio_tool_loop_requested(payload)
-            or not _tools_outrank_response_format(payload, payload.tools)
-        ):
-            if model_info.get("engine") in ("vllm", "sglang"):
-                _raise_unsupported_openai_parameter(
-                    "response_format",
-                    f"response_format is not supported for {model_info['engine']} models.",
-                )
-            if not model_info.get("is_mlx"):
-                _raise_unsupported_openai_parameter(
-                    "response_format",
-                    "response_format needs a grammar engine, and the transformers backend "
-                    "has none; load an MLX or GGUF model to use it.",
-                )
+        _refuse_unsupported_chat_controls(payload, in_process_backend(model_info))
+        if _response_format_needs_grammar(payload):
             if payload.tool_choice not in (None, "auto", "none"):
                 _raise_unsupported_openai_parameter(
                     "tool_choice",
@@ -36123,11 +36134,12 @@ async def produce_openai_chat_completions(
 
     # Classify capability flags from the loaded template.
     _sf_model_info = backend.models.get(backend.active_model_name, {})
-    # Only MLX and managed vLLM count their own prompt exactly, so only they are fitted first.
+    _sf_controls = chat_controls(in_process_backend(_sf_model_info))
     _sf_fit_overflow = (
-        _rolling_context_policy(payload)
-        if _sf_model_info.get("is_mlx") or _sf_model_info.get("engine") == "vllm"
-        else None
+        _rolling_context_policy(payload) if _sf_controls["context_overflow"] else None
+    )
+    _sf_compact_now = (
+        _sf_controls["compact_context"] and getattr(payload, "compact_context", None) is True
     )
     if _sf_model_info.get("engine") in ("vllm", "sglang"):
         _unsupported = _managed_engine_unsupported_controls(payload, _sf_model_info)
@@ -36135,7 +36147,8 @@ async def produce_openai_chat_completions(
             raise _reject(
                 400,
                 openai_error_body(
-                    f"{_unsupported} is not supported for {_sf_model_info['engine']} models.",
+                    f"{_unsupported} is not supported for "
+                    f"{_CHAT_BACKEND_LABELS[_sf_model_info['engine']]} models.",
                     status = 400,
                     code = "unsupported_parameter",
                     param = _unsupported,
@@ -36354,8 +36367,8 @@ async def produce_openai_chat_completions(
 
     # A continued turn renders no generation prompt, so nothing is prefilled and the
     # resumed text is the visible answer. Only the first turn continues; later tool-loop
-    # turns render a fresh generation prompt and prefill as usual. MLX also resumes a thought.
-    _sf_continue = _continue_final_message(payload, thought = bool(_sf_model_info.get("is_mlx")))
+    # turns render a fresh generation prompt and prefill as usual.
+    _sf_continue = _continue_final_message(payload, thought = _sf_controls["continue_thought"])
     _sf_resumes_thought = _sf_continue and not _continue_final_message(payload)
     _sf_continued_turn = [_sf_continue]
 
@@ -36642,7 +36655,7 @@ async def produce_openai_chat_completions(
                 context_overflow = _sf_fit_overflow,
                 context_policy = _request_context_policy(payload),
                 compaction_headroom_ratio = _request_compaction_headroom_ratio(payload),
-                compact_context = getattr(payload, "compact_context", None) is True,
+                compact_context = _sf_compact_now,
                 **_sf_website_policy_kwargs,
             )
 
@@ -37362,7 +37375,7 @@ async def produce_openai_chat_completions(
                 context_overflow = _sf_fit_overflow,
                 context_policy = _request_context_policy(payload),
                 compaction_headroom_ratio = _request_compaction_headroom_ratio(payload),
-                force_reset = getattr(payload, "compact_context", None) is True,
+                force_reset = _sf_compact_now,
                 max_tokens = effective_max_tokens,
                 thread_id = payload.thread_id,
                 cancel_event = cancel_event,
@@ -44007,11 +44020,8 @@ async def openai_responses(
                 # Off an MLX host a non-GGUF target is transformers, which has no grammar engine.
                 gguf_only = _stream_needs_grammar,
                 gguf_only_reason = (
-                    "response_format needs a grammar engine, and the transformers backend has none; "
-                    "load an MLX or GGUF model to use it."
-                )
-                if _stream_needs_grammar
-                else None,
+                    _no_grammar_engine_detail("transformers") if _stream_needs_grammar else None
+                ),
             )
         monitor_id = None
         if not getattr(request.state, "skip_api_monitor", False):
@@ -49777,6 +49787,15 @@ def _reject_unhonorable_response_format(payload) -> None:
 
 def _tools_outrank_response_format(payload, tools) -> bool:
     return bool(tools) and payload.tool_choice != "none"
+
+
+def _response_format_needs_grammar(payload) -> bool:
+    """A constraining format the request still holds to. Callable client tools set it aside
+    (_response_format_beside_tools) unless the request asks for Unsloth's own loop."""
+    return _response_format_constrains_decoding(payload) and (
+        _explicit_studio_tool_loop_requested(payload)
+        or not _tools_outrank_response_format(payload, payload.tools)
+    )
 
 
 def _response_format_beside_tools(payload, tools):

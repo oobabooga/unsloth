@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Generator, Mapping, Optional, Sequence, Tuple, Union
 from core.inference.audio_device import audio_device_forces_cpu, audio_load_runs_on_cpu
 from core.inference.audio_cpp_failures import AudioCppFailure, AudioCppFailureError, attach_failure
+from core.inference.chat_controls import chat_controls, in_process_backend
 from core.inference.context_refusal import ContextBudgetExceeded
 from core.inference.native_audio import NATIVE_AUDIO_TYPES, is_native_audio_model
 from core.inference.audio_errors import (
@@ -2903,7 +2904,7 @@ class InferenceOrchestrator:
         live_branch: Optional[list] = None,
         force_reset: bool = False,
     ) -> dict:
-        """Fit one MLX or managed-engine prompt into the served window under the policy GGUF uses.
+        """Fit one MLX or vLLM prompt into the served window under the policy GGUF uses.
 
         A ``tool_loop`` turn carrying tools may reset the epoch; a plain turn only when a later
         one can search (``recall_reachable``). ``request_branch`` is the client's transcript and
@@ -2921,7 +2922,7 @@ class InferenceOrchestrator:
         context_length = int(model_info.get("context_length") or 0)
         if (
             context_overflow != "truncate_oldest"
-            or not (model_info.get("is_mlx") or model_info.get("engine") in ("vllm", "sglang"))
+            or not chat_controls(in_process_backend(model_info))["context_overflow"]
             or context_length <= 1
         ):
             return unchanged

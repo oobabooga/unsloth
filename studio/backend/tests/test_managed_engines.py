@@ -2254,27 +2254,23 @@ def test_a_24_gb_card_leaves_the_headroom_measured_on_an_l4(monkeypatch, engine,
 
 
 def test_a_spelled_out_text_response_format_is_not_structured_output():
-    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from models.inference import ChatCompletionRequest
     from routes import inference as route
 
     def payload(**fields):
-        base = dict(
-            use_adapter = None,
-            response_format = None,
-            continue_final_message = False,
-            enable_thinking = None,
-            preserve_thinking = None,
-            reasoning_effort = None,
-            model_extra = {},
+        return ChatCompletionRequest(
+            model = "m", messages = [{"role": "user", "content": "hi"}], **fields
         )
-        return SimpleNamespace(**{**base, **fields})
 
-    assert not route._managed_engine_unsupported_controls(payload())
-    assert not route._managed_engine_unsupported_controls(payload(response_format = {"type": "text"}))
-    assert (
-        route._managed_engine_unsupported_controls(payload(response_format = {"type": "json_object"}))
-        == "response_format"
-    )
+    for engine in ("vllm", "sglang"):
+        route._refuse_unsupported_chat_controls(payload(), engine)
+        route._refuse_unsupported_chat_controls(payload(response_format = {"type": "text"}), engine)
+        with pytest.raises(HTTPException) as caught:
+            route._refuse_unsupported_chat_controls(
+                payload(response_format = {"type": "json_object"}), engine
+            )
+        assert caught.value.detail["error"]["param"] == "response_format"
     assert (
         route._managed_engine_unsupported_controls(payload(reasoning_effort = "high"))
         == "reasoning_effort"

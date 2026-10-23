@@ -166,13 +166,6 @@ def test_reasoning_controls_are_refused_only_without_a_parser():
     assert not _managed_engine_unsupported_controls(
         payload, {"engine": "vllm", "reasoning_flags": {"supports_reasoning": True}}
     )
-    payload = payload.model_copy(update = {"continue_final_message": True})
-    assert (
-        _managed_engine_unsupported_controls(
-            payload, {"engine": "vllm", "reasoning_flags": {"supports_reasoning": True}}
-        )
-        == "continue_final_message"
-    )
 
 
 def test_load_flags_come_from_the_engine_template():

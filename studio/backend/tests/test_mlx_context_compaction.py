@@ -125,6 +125,16 @@ def test_a_prompt_the_fit_must_not_touch_is_returned_unchanged(case):
     assert result["events"] == [] and "boundary_applied" not in result
 
 
+@pytest.mark.parametrize("engine, fitted", [("vllm", True), ("sglang", False), ("auto", False)])
+def test_only_a_backend_declaring_context_overflow_is_fitted(archive_calls, engine, fitted):
+    backend = _backend()
+    backend.models["mlx-test"] = {"engine": engine, "context_length": 1200}
+
+    result = _fit(backend, _thread(), thread_id = "thread-1")
+
+    assert bool(result["events"]) is fitted
+
+
 def test_a_request_resets_only_where_search_can_follow_and_names_only_an_offered_tool(
     archive_calls, monkeypatch
 ):

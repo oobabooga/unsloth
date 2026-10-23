@@ -1177,6 +1177,7 @@ class TestLoadHubDownloadExclusion:
             "parallel_slots",
             "is_mlx",
             "is_npu",
+            "chat_controls",
             "mlx_kv_quant",
             "mlx_kv_quant_requested",
             "mlx_kv_bits",

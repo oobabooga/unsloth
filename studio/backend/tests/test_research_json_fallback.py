@@ -24,8 +24,8 @@ from .test_sf_client_tools_passthrough import _ScriptedBackend, _fixed, _install
 
 
 _NO_GRAMMAR_ENGINE = (
-    "response_format needs a grammar engine, and the transformers backend has none; load an "
-    "MLX or GGUF model to use it."
+    "response_format needs a grammar engine, which Unsloth does not run for transformers "
+    "models; load an MLX or GGUF model to use it."
 )
 _AUDIO_REFUSAL_MESSAGE = (
     "response_format cannot be honored by an audio reply; send the request to a text model "

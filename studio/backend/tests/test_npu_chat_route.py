@@ -531,6 +531,19 @@ def test_tool_choice_none_withholds_the_tools(flm):
     assert "tools" not in recorded[-1]["body"]
 
 
+def test_a_format_beside_callable_tools_is_set_aside_as_on_every_local_backend(flm):
+    recorded = flm(tools = True)
+    status, _ = _call(
+        stream = False,
+        tools = [_TOOL],
+        response_format = {"type": "json_object"},
+        messages = [{"role": "user", "content": "TOOL"}],
+    )
+    assert status == 200
+    assert "response_format" not in recorded[-1]["body"]
+    assert recorded[-1]["body"]["tools"]
+
+
 def test_a_bare_error_line_becomes_an_error(flm):
     flm()
     status, body = _call(stream = False, messages = [{"role": "user", "content": "FAULT"}])

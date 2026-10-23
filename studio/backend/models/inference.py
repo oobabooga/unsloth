@@ -1757,6 +1757,14 @@ class _InferenceRuntimeFields(BaseModel):
         False,
         description = "Whether model supports tool calling (web search, etc.)",
     )
+    chat_controls: Optional[Dict[str, bool]] = Field(
+        None,
+        description = (
+            "Chat request controls the loaded backend honors, by name. A request using one "
+            "marked false is refused, or the control is not applied. Null when no chat model is "
+            "loaded."
+        ),
+    )
     cache_type_kv: Optional[str] = Field(
         None,
         description = (
