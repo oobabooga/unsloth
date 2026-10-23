@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-24.04]
-        branch: [base, effcfg, mem-capacity, model-identity, tf-sampling-controls, managed-engine-param, start-failure-messages, stt-sidecar-logs, image-engine-failure]
+        branch: [base, effcfg, chat-capabilities]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     defaults:
@@ -68,11 +68,11 @@ jobs:
           pip install -q "$AMD/torch-2.10.0%2Brocm7.2.1.lw.gitb07cec22-cp312-cp312-linux_x86_64.whl" \
                          "$AMD/triton-3.6.0%2Brocm7.2.1.gitba5c1517-cp312-cp312-linux_x86_64.whl"
           pip install -q 'numpy<3' structlog rich httpx psutil pyyaml jinja2 'transformers>=4.51,<=5.17.0' huggingface_hub
-          for B in base mem-capacity tf-sampling-controls; do
+          for B in base chat-capabilities; do
             git clone -q --depth 1 --branch triage-ci-$B https://github.com/oobabooga/unsloth "$WORK_ROOT/src-$B"
           done
           git clone -q --depth 1 --branch triage-ci-runner https://github.com/oobabooga/unsloth "$WORK_ROOT/runner"
-          for B in base mem-capacity tf-sampling-controls; do
+          for B in base chat-capabilities; do
             (cd "$WORK_ROOT/src-$B/studio/backend" && PYTHONPATH=. python "$WORK_ROOT/runner/amd_probe.py" "$WORK_ROOT/probe-$B.json" "$B" > "$WORK_ROOT/probe-$B.log" 2>&1) || true
             echo "===== $B"; cat "$WORK_ROOT/probe-$B.json" || tail -40 "$WORK_ROOT/probe-$B.log"
           done

@@ -11,8 +11,9 @@ EX_SF="studio/backend/tests/test_llama_cpp_start_failure_classification.py"
 EX_STT="studio/backend/tests/test_stt_mtmd_sidecar.py studio/backend/tests/test_stt_ggml_request_path.py"
 EX_IMG="studio/backend/tests/test_sd_cpp_backend.py studio/backend/tests/test_sd_cpp_engine.py"
 case "$BR" in
-  base) FILES="$EX_EFFCFG $EX_MEM $EX_MI $EX_TF $EX_MG $EX_SF $EX_STT $EX_IMG";;
-  effcfg) FILES="$EX_EFFCFG studio/backend/tests/test_load_applies_saved_settings.py";;
+  base) FILES="$EX_EFFCFG $EX_TF $EX_MG studio/backend/tests/test_research_json_fallback.py studio/backend/tests/test_mlx_context_compaction.py";;
+  effcfg) FILES="$EX_EFFCFG studio/backend/tests/test_load_applies_saved_settings.py studio/backend/tests/test_model_override_field_parity.py";;
+  chat-capabilities) FILES="$EX_TF $EX_MG studio/backend/tests/test_transformers_sampling_controls.py studio/backend/tests/test_chat_controls.py studio/backend/tests/test_research_json_fallback.py studio/backend/tests/test_mlx_context_compaction.py";;
   mem-capacity) FILES="$EX_MEM studio/backend/tests/test_rocm_apu_one_classifier.py";;
   model-identity) FILES="$EX_MI studio/backend/tests/test_gguf_names_single_owner.py studio/backend/tests/test_openai_auto_switch.py";;
   tf-sampling-controls) FILES="$EX_TF studio/backend/tests/test_transformers_sampling_controls.py";;
