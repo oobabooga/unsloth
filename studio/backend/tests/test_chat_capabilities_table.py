@@ -155,9 +155,10 @@ def test_the_managed_bundle_check_still_answers_like_before():
 
 def test_the_transformers_backend_declares_the_three_controls():
     """The worker forwards a control only when the backend's signature declares it."""
-    from core.inference.inference import InferenceBackend
+    # Imports unsloth and peft at module scope, which a CPU-only test environment may lack.
+    inference = pytest.importorskip("core.inference.inference")
 
-    params = inspect.signature(InferenceBackend.generate_chat_response).parameters
+    params = inspect.signature(inference.InferenceBackend.generate_chat_response).parameters
     for name in ("seed", "frequency_penalty", "logit_bias"):
         assert name in params
 
