@@ -62,25 +62,16 @@ test("a compaction request applies to the thread's next request only", () => {
   assert.equal(takeThreadCompactionRequest("t1"), false);
 });
 
-test("compact now asks a GGUF or MLX model to compact, even with auto-compaction off", () => {
+test("compact now asks a compacting backend to compact, even with auto-compaction off", () => {
   const asked = { context_overflow: "truncate_oldest", compact_context: true };
   for (const autoCompactEnabled of [true, false]) {
     assert.deepEqual(
-      ggufCompactionRequestFields({ isGguf: true, autoCompactEnabled, compactNow: true }),
-      asked,
-    );
-    assert.deepEqual(
-      ggufCompactionRequestFields({
-        isGguf: false,
-        isMlx: true,
-        autoCompactEnabled,
-        compactNow: true,
-      }),
+      ggufCompactionRequestFields({ compacts: true, autoCompactEnabled, compactNow: true }),
       asked,
     );
   }
   assert.deepEqual(
-    ggufCompactionRequestFields({ isGguf: false, autoCompactEnabled: true, compactNow: true }),
+    ggufCompactionRequestFields({ compacts: false, autoCompactEnabled: true, compactNow: true }),
     {},
   );
 });
@@ -177,18 +168,21 @@ test("a marker naming a call the reply no longer shows falls back to the prompt"
   assert.equal(compactionToolCallDividers(messages).size, 0);
 });
 
-test("the composer reads /compact before any send path, and only for GGUF or MLX", async () => {
+test("the composer reads /compact before any send path, and only where the backend declares it", async () => {
   const thread = await readSrc("components/assistant-ui/thread.tsx");
   const submit = thread.slice(thread.indexOf("const handleSubmit = useCallback("));
   const command = submit.indexOf("isCompactCommand(composerText)");
   assert.ok(command > 0);
   assert.ok(command < submit.indexOf("if (disabled || shouldBlockSend())"));
   assert.match(submit, /requestThreadCompaction\(referenceThreadId\)/);
-  assert.match(submit, /resumesThought\(\{/);
+  assert.match(submit, /!localBackendHonors\(runtime, "compact_context"\)/);
   assert.match(submit, /!runtime\.supportsTools \|\|/);
   assert.match(submit, /runtime\.incognito \|\| isThreadIncognito\(referenceThreadId\)/);
   const adapter = await readSrc("features/chat/api/chat-adapter.ts");
-  assert.match(adapter, /takeThreadCompactionRequest\(resolvedThreadId\) &&/);
+  assert.match(
+    adapter,
+    /takeThreadCompactionRequest\(resolvedThreadId\) &&\s+localBackendHonors\(runtime, "compact_context"\)/,
+  );
   assert.match(adapter, /compactNow,\n\s+\}\),/);
   // Only a reset started by this request counts; a replayed manual epoch is not one.
   assert.match(
@@ -297,11 +291,7 @@ function compactMenu(threadId: string) {
   const runtime = {
     modelLoading: false,
     runningByThreadId: {} as Record<string, boolean>,
-    loadedIsGguf: true,
-    loadedIsMlx: false,
     supportsTools: true,
-    activeGgufVariant: "Q4_K_M",
-    activeNativePathToken: null,
     params: { checkpoint: "local-model" },
   };
   const menu = { item: { id: threadId, type: "single" } };
@@ -312,14 +302,9 @@ function compactMenu(threadId: string) {
     menu,
     useChatRuntimeStore: { getState: () => runtime },
     liveThreadBranch: (id: string) => id === threadId ? branch.ids : null,
-    resumesThought: (target: unknown) => {
-      assert.deepEqual(target, {
-        loadedIsGguf: runtime.loadedIsGguf,
-        loadedIsMlx: runtime.loadedIsMlx,
-        activeGgufVariant: runtime.activeGgufVariant,
-        activeNativePathToken: runtime.activeNativePathToken,
-        checkpoint: runtime.params.checkpoint,
-      });
+    localBackendHonors: (state: unknown, control: unknown) => {
+      assert.equal(state, runtime);
+      assert.equal(control, "compact_context");
       return supported;
     },
     requestThreadCompaction,
@@ -360,20 +345,16 @@ test("the compact button does not queue empty, hidden, unsupported or busy chats
   }
 });
 
-test("the compact button requires tool capability for both local backends", () => {
-  for (const mlx of [false, true]) {
-    const menu = compactMenu(`tools-${mlx}`);
-    menu.runtime.loadedIsGguf = !mlx;
-    menu.runtime.loadedIsMlx = mlx;
-    menu.runtime.supportsTools = false;
-    menu.click();
-    assert.equal(takeThreadCompactionRequest(menu.menu.item.id), false);
-    assert.deepEqual(menu.notices, ["chatMenu.compactUnsupported"]);
-    menu.runtime.supportsTools = true;
-    menu.click();
-    assert.equal(takeThreadCompactionRequest(menu.menu.item.id), true);
-    assert.deepEqual(menu.notices, ["chatMenu.compactUnsupported", "chatMenu.compactQueued"]);
-  }
+test("the compact button requires tool capability", () => {
+  const menu = compactMenu("tools");
+  menu.runtime.supportsTools = false;
+  menu.click();
+  assert.equal(takeThreadCompactionRequest(menu.menu.item.id), false);
+  assert.deepEqual(menu.notices, ["chatMenu.compactUnsupported"]);
+  menu.runtime.supportsTools = true;
+  menu.click();
+  assert.equal(takeThreadCompactionRequest(menu.menu.item.id), true);
+  assert.deepEqual(menu.notices, ["chatMenu.compactUnsupported", "chatMenu.compactQueued"]);
 });
 
 test("the compact button waits for its accepted send's preflight to release", () => {

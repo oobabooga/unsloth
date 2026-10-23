@@ -244,18 +244,32 @@ export function isServedByLlamaCpp(x: {
   );
 }
 
-/** Whether the backend can resume a reply stopped mid-thought: llama-server or reported MLX. */
-export function resumesThought(x: {
-  loadedIsGguf?: boolean | null;
-  loadedIsMlx?: boolean | null;
-  activeGgufVariant?: string | null;
-  activeNativePathToken?: string | null;
-  checkpoint?: string | null;
-}): boolean {
-  return (
-    isServedByLlamaCpp(x) ||
-    (!isExternalModelId(x.checkpoint) && x.loadedIsMlx === true)
-  );
+/** The chat request controls a local backend can lack, as load and status responses declare
+ *  them in `chat_controls` (studio/backend/core/inference/chat_controls.py). Only the rows the
+ *  chat UI reads are typed here. */
+export type ChatControls = Partial<
+  Record<
+    | "seed"
+    | "continue_final_message"
+    | "continue_thought"
+    | "context_overflow"
+    | "compact_context",
+    boolean
+  >
+>;
+
+/** Whether the resident local backend honors `control`. An external selection, or a response
+ *  that declared nothing (no model loaded, or a server older than the field), answers `fallback`. */
+export function localBackendHonors(
+  state: {
+    loadedChatControls: ChatControls | null;
+    params: { checkpoint?: string | null };
+  },
+  control: keyof ChatControls,
+  fallback = false,
+): boolean {
+  if (isExternalModelId(state.params.checkpoint)) return fallback;
+  return state.loadedChatControls?.[control] ?? fallback;
 }
 
 /** The store's record of the context window a load left behind.
@@ -275,12 +289,14 @@ export function loadedContextFields(resp: {
   context_unbounded_when_batched?: boolean;
   parallel_slots?: number | null;
   mlx_context_budget?: number | null;
+  chat_controls?: ChatControls | null;
 } | null): {
   loadedContextLength: number | null;
   maxContextLength: number | null;
   nativeContextLength: number | null;
   loadedIsGguf: boolean | null;
   loadedIsMlx: boolean | null;
+  loadedChatControls: ChatControls | null;
   loadedContextEnforced: boolean | null;
   loadedContextUnboundedWhenBatched: boolean;
   loadedParallelSlots: number | null;
@@ -293,6 +309,7 @@ export function loadedContextFields(resp: {
       nativeContextLength: null,
       loadedIsGguf: null,
       loadedIsMlx: null,
+      loadedChatControls: null,
       loadedContextEnforced: null,
       loadedContextUnboundedWhenBatched: false,
       loadedParallelSlots: null,
@@ -309,6 +326,7 @@ export function loadedContextFields(resp: {
       nativeContextLength: null,
       loadedIsGguf: false,
       loadedIsMlx: resp.is_mlx ?? null,
+      loadedChatControls: resp.chat_controls ?? null,
       loadedContextEnforced: null,
       loadedContextUnboundedWhenBatched: false,
       loadedParallelSlots: null,
@@ -323,6 +341,7 @@ export function loadedContextFields(resp: {
     // The backend's own answer, so a checkpoint the worker serves off the MLX path
     // (native audio) is not taken for MLX by the platform alone.
     loadedIsMlx: resp.is_mlx ?? null,
+    loadedChatControls: resp.chat_controls ?? null,
     // llama.cpp allocates what it reports, so GGUF is enforced by construction.
     // Everything else answers for itself, or says nothing.
     loadedContextEnforced: isGguf ? true : (resp.context_length_enforced ?? null),

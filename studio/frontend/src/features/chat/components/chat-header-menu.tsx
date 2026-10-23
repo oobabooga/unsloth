@@ -19,7 +19,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useChatFavoritesStore } from "@/features/library/chats/favorites-store";
-import { resumesThought } from "@/features/model-picker";
+import { localBackendHonors } from "@/features/model-picker";
 import { useShortcutLabel } from "@/features/settings";
 import type { ShortcutId } from "@/features/settings";
 import { useT } from "@/i18n";
@@ -190,13 +190,7 @@ function ChatMenuItems({ menu }: { menu: ActiveChatMenu }) {
       toast.info(t("chatMenu.compactEmpty"));
       return;
     }
-    if (!runtime.supportsTools || !resumesThought({
-      loadedIsGguf: runtime.loadedIsGguf,
-      loadedIsMlx: runtime.loadedIsMlx,
-      activeGgufVariant: runtime.activeGgufVariant,
-      activeNativePathToken: runtime.activeNativePathToken,
-      checkpoint: runtime.params.checkpoint,
-    })) {
+    if (!runtime.supportsTools || !localBackendHonors(runtime, "compact_context")) {
       toast.info(t("chatMenu.compactUnsupported"));
       return;
     }

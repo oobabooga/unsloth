@@ -14,48 +14,23 @@ import { readSrc } from "./helpers/kit.ts";
 test("auto-compact on sends truncate_oldest and no policy of its own", () => {
   // the server applies UNSLOTH_CONTEXT_POLICY because Studio no longer exposes context_policy.
   assert.deepEqual(
-    ggufCompactionRequestFields({ isGguf: true, autoCompactEnabled: true }),
+    ggufCompactionRequestFields({ compacts: true, autoCompactEnabled: true }),
     { context_overflow: "truncate_oldest" },
   );
 });
 
 test("auto-compact off sends an explicit error overflow policy", () => {
   assert.deepEqual(
-    ggufCompactionRequestFields({ isGguf: true, autoCompactEnabled: false }),
+    ggufCompactionRequestFields({ compacts: true, autoCompactEnabled: false }),
     { context_overflow: "error" },
   );
 });
 
-test("external models never opt into GGUF compaction", () => {
+test("a backend that does not compact gets no compaction fields", () => {
   assert.deepEqual(
-    ggufCompactionRequestFields({ isGguf: false, autoCompactEnabled: true }),
+    ggufCompactionRequestFields({ compacts: false, autoCompactEnabled: true }),
     {},
   );
-});
-
-test("a managed vLLM or SGLang model compacts like a local GGUF", () => {
-  assert.deepEqual(
-    ggufCompactionRequestFields({
-      isGguf: false,
-      isManagedEngine: true,
-      autoCompactEnabled: true,
-    }),
-    { context_overflow: "truncate_oldest" },
-  );
-  assert.deepEqual(
-    ggufCompactionRequestFields({
-      isGguf: false,
-      isManagedEngine: true,
-      autoCompactEnabled: false,
-    }),
-    { context_overflow: "error" },
-  );
-  const adapter = readSrc("features/chat/api/chat-adapter.ts");
-  // SGLang has no exact count to fit against, so only the vLLM engine asks.
-  assert.match(adapter, /runtime\.loadedEngine === "vllm"/);
-  // A queued turn keeps the engine it was queued against, like loadedIsGguf / loadedIsMlx.
-  assert.match(readSrc("features/chat/utils/queued-chat-run-settings.ts"), /"loadedEngine",/);
-  assert.match(adapter, /isManagedEngine: isManagedEngineForCompaction/);
 });
 
 test("nothing still offers the removed compaction style", () => {
@@ -80,16 +55,15 @@ test("nothing still offers the removed compaction style", () => {
 
 test("the chat adapter sends compaction fields through the shared helper", () => {
   const adapter = readSrc("features/chat/api/chat-adapter.ts");
-  assert.match(adapter, /ggufCompactionRequestFields\(/);
-  // Via isServedByLlamaCpp, not a catalog row: /api/models/list can replace the loaded row.
-  assert.match(adapter, /isGguf: isGgufForCompaction/);
-  assert.match(adapter, /loadedIsGguf: runtime\.loadedIsGguf/);
-  assert.match(adapter, /isServedByLlamaCpp\(/);
+  // The completion and the token count ask the loaded backend's own declaration.
+  assert.match(adapter, /compacts: localBackendCompacts\(runtime\)/);
+  assert.match(adapter, /compacts: localBackendCompacts\(state\)/);
+  assert.match(adapter, /localBackendHonors\(state, "context_overflow", true\)/);
   // The value must derive from THIS turn's messages only (durable-gate.ts).
   assert.match(adapter, /image_base64: findLatestUserImageBase64\(currentTurnMessages\)/);
 });
 
-test("a queued run keeps its own model's llama.cpp verdict after the picker moves on", async () => {
+test("a queued run keeps its own model's compaction verdict after the picker moves on", async () => {
   const { registerBundlerResolver, installLocalStorageFake } = await import(
     "./helpers/kit.ts"
   );
@@ -98,16 +72,13 @@ test("a queued run keeps its own model's llama.cpp verdict after the picker move
   const { snapshotQueuedChatRunSettings } = await import(
     "../src/features/chat/utils/queued-chat-run-settings.ts"
   );
-  const { isServedByLlamaCpp, loadedContextFields } = await import(
+  const { loadedContextFields, localBackendHonors } = await import(
     "../src/features/model-picker/model-config/per-model-config.ts"
   );
 
-  // An Ollama GGUF has no .gguf suffix and no quant, so loadedIsGguf is the only evidence.
   const resident = {
     params: { checkpoint: "ollama-manifest:%2Fhome%2Fu%2F.ollama%2Fmanifests%2Fq" },
-    activeGgufVariant: null,
-    activeNativePathToken: null,
-    loadedIsGguf: true,
+    loadedChatControls: { context_overflow: true },
     loadedContextLength: 8192,
     autoCompactEnabled: true,
   };
@@ -118,43 +89,28 @@ test("a queued run keeps its own model's llama.cpp verdict after the picker move
   const live = {
     ...resident,
     params: { checkpoint: "external::openai::gpt-5" },
-    activeGgufVariant: null,
-    activeNativePathToken: null,
     ...loadedContextFields(null),
   };
   const runtime = { ...live, ...queued };
 
-  const isGguf = isServedByLlamaCpp({
-    loadedIsGguf: runtime.loadedIsGguf,
-    activeGgufVariant: runtime.activeGgufVariant,
-    activeNativePathToken: runtime.activeNativePathToken,
-    checkpoint: runtime.params.checkpoint,
-  });
-  assert.equal(isGguf, true);
   assert.deepEqual(
     ggufCompactionRequestFields({
-      isGguf,
+      compacts: localBackendHonors(runtime, "context_overflow", true),
       autoCompactEnabled: runtime.autoCompactEnabled,
     }),
     { context_overflow: "truncate_oldest" },
   );
-});
-
-test("MLX chats opt in on the backend's own report and honor disabling auto compaction", () => {
-  const options = { isGguf: false, isMlx: true, autoCompactEnabled: true };
-  assert.deepEqual(ggufCompactionRequestFields(options), {
-    context_overflow: "truncate_oldest",
-  });
+  // A backend that declares it cannot compact gets nothing, even while nothing else is known.
   assert.deepEqual(
-    ggufCompactionRequestFields({ ...options, autoCompactEnabled: false }),
-    { context_overflow: "error" },
-  );
-  // loadedIsMlx is authoritative because isGguf already uses isServedByLlamaCpp.
-  const adapter = readSrc("features/chat/api/chat-adapter.ts");
-  assert.match(adapter, /isMlx: isMlxForCompaction/);
-  assert.match(
-    adapter,
-    /isMlxForCompaction =\s*!isExternalModelId\(params\.checkpoint\) && runtime\.loadedIsMlx === true/,
+    ggufCompactionRequestFields({
+      compacts: localBackendHonors(
+        { ...runtime, loadedChatControls: { context_overflow: false } },
+        "context_overflow",
+        true,
+      ),
+      autoCompactEnabled: true,
+    }),
+    {},
   );
 });
 

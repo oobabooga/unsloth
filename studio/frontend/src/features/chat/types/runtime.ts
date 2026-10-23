@@ -40,25 +40,24 @@ export const MAX_SAMPLING_SEED = 4_294_967_294;
 
 /** An absent flag reads as false, so a row that omits one makes the gate answer wrong. */
 export type SeedGateFlags = Required<
-  Pick<ChatModelSummary, "isGguf" | "isMlx" | "isAudio" | "hasAudioInput">
+  Pick<ChatModelSummary, "isAudio" | "hasAudioInput">
 >;
 
 /** What the store holds, so every place that mints a row has to state those flags. */
 export type ChatModelRow = ChatModelSummary & SeedGateFlags;
 
-/** Whether the loaded model's backend reads a sampling seed. Shared so the panel cannot offer
- *  the field where the request would drop it, and takes the same `models[]` summary the
- *  request body already reads `isGguf` from. */
+/** Whether a sampling seed reaches generation: the backend honors one (`seedHonored`, its
+ *  declared `seed` control) and the reply is text. Shared so the panel cannot offer the field
+ *  where the request would drop it. */
 export function modelReadsSamplingSeed(
   activeModel: SeedGateFlags | null | undefined,
+  seedHonored: boolean,
 ): boolean {
   // An audio-output model answers through generateAudio, whose request carries no seed.
   if (activeModel?.isAudio && !activeModel.hasAudioInput) {
     return false;
   }
-  // llama-server takes a seed, and so does MLX. The transformers backend declares no `seed`
-  // kwarg, so worker.py's `_backend_declares` gate drops it before generation.
-  return activeModel?.isGguf === true || activeModel?.isMlx === true;
+  return seedHonored;
 }
 
 /** The params that survive a reload. `checkpoint` names the model rather than being one of its

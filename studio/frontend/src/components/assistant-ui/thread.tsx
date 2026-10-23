@@ -201,7 +201,7 @@ import {
   attachLibraryChatFiles,
   useLibraryChatHandoffStore,
 } from "@/features/library/chat-handoff-store";
-import { resumesThought } from "@/features/model-picker";
+import { localBackendHonors } from "@/features/model-picker";
 import { cancelResearchRun } from "@/features/chat/api/research-api";
 import {
   ingestResearchUpdate,
@@ -5593,13 +5593,7 @@ const Composer: FC<{
         // The compacted turns stay reachable only through search_conversation, so no tools, no reset.
         if (
           !runtime.supportsTools ||
-          !resumesThought({
-            loadedIsGguf: runtime.loadedIsGguf,
-            loadedIsMlx: runtime.loadedIsMlx,
-            activeGgufVariant: runtime.activeGgufVariant,
-            activeNativePathToken: runtime.activeNativePathToken,
-            checkpoint: runtime.params.checkpoint,
-          })
+          !localBackendHonors(runtime, "compact_context")
         ) {
           toast.info("/compact works with GGUF and MLX models that support tools");
           return;
@@ -7932,13 +7926,11 @@ function useContinuation() {
   const status = useAuiState(({ message }) => message.status);
   const metadata = useAuiState(({ message }) => message.metadata);
   const thoughtResumable = useChatRuntimeStore((s) =>
-    resumesThought({
-      loadedIsGguf: s.loadedIsGguf,
-      loadedIsMlx: s.loadedIsMlx,
-      activeGgufVariant: s.activeGgufVariant,
-      activeNativePathToken: s.activeNativePathToken,
-      checkpoint: s.params.checkpoint,
-    }),
+    localBackendHonors(s, "continue_thought"),
+  );
+  // Offered while nothing is declared: a backend without it refuses the parameter by name.
+  const backendContinues = useChatRuntimeStore((s) =>
+    localBackendHonors(s, "continue_final_message", true),
   );
   const partial = useAuiState(
     ({ message }) => readContinuationSource(message.content).partial,
@@ -8014,6 +8006,7 @@ function useContinuation() {
     !isRunning &&
     !researchRunId &&
     !researchActive &&
+    backendContinues &&
     continuable &&
     modeAllowsContinuation({
       fromAudioInput,

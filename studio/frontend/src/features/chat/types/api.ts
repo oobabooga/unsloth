@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import type { TransformersUpgradeInfo } from "@/features/transformers-upgrade";
-import type { ManagedEngineOffer } from "@/features/model-picker";
+import type { ChatControls, ManagedEngineOffer } from "@/features/model-picker";
 import type { CustomReasoningConfig } from "../custom-reasoning";
 
 export type CpuFallbackReason = "vulkan_startup_crash";
@@ -306,6 +306,7 @@ export interface LoadModelResponse {
   supports_preserve_thinking?: boolean;
   preserve_thinking_default?: boolean;
   supports_tools?: boolean;
+  chat_controls?: ChatControls | null;
   cache_type_kv?: string | null;
   mlx_kv_quant?: string | null;
   mlx_kv_quant_requested?: string | null;
@@ -459,6 +460,7 @@ export interface InferenceStatusResponse {
   supports_preserve_thinking?: boolean;
   preserve_thinking_default?: boolean;
   supports_tools?: boolean;
+  chat_controls?: ChatControls | null;
   chat_template?: string | null;
   context_length?: number | null;
   max_context_length?: number | null;

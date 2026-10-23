@@ -127,30 +127,34 @@ function row(
   overrides: Partial<Parameters<typeof modelReadsSamplingSeed>[0] & object>,
 ) {
   return {
-    isGguf: false,
-    isMlx: false,
     isAudio: false,
     hasAudioInput: false,
     ...overrides,
   };
 }
 
-test("a seed reaches only the backends that read one", () => {
-  assert.ok(modelReadsSamplingSeed(row({ isGguf: true })));
-  assert.ok(modelReadsSamplingSeed(row({ isMlx: true })));
-  assert.ok(!modelReadsSamplingSeed(row({})));
-  assert.ok(!modelReadsSamplingSeed(null));
-  assert.ok(!modelReadsSamplingSeed(undefined));
-  assert.ok(
-    !modelReadsSamplingSeed(
-      row({ isGguf: true, isAudio: true, hasAudioInput: false }),
-    ),
+test("a seed reaches only a backend that declares it, for a text reply", () => {
+  assert.ok(modelReadsSamplingSeed(row({}), true));
+  assert.ok(!modelReadsSamplingSeed(row({}), false));
+  assert.ok(modelReadsSamplingSeed(null, true));
+  assert.ok(!modelReadsSamplingSeed(undefined, false));
+  assert.ok(!modelReadsSamplingSeed(row({ isAudio: true, hasAudioInput: false }), true));
+  assert.ok(modelReadsSamplingSeed(row({ isAudio: true, hasAudioInput: true }), true));
+});
+
+test("the seed follows the loaded backend's declaration", async () => {
+  const { localBackendHonors } = await import(
+    "../src/features/model-picker/model-config/per-model-config.ts"
   );
-  assert.ok(
-    modelReadsSamplingSeed(
-      row({ isGguf: true, isAudio: true, hasAudioInput: true }),
-    ),
-  );
+  const state = (loadedChatControls: object | null, checkpoint = GGUF) => ({
+    loadedChatControls,
+    params: { checkpoint },
+  });
+  assert.ok(localBackendHonors(state({ seed: true }), "seed"));
+  assert.ok(!localBackendHonors(state({ seed: false }), "seed"));
+  // Nothing loaded, or an external pick the local declaration does not describe.
+  assert.ok(!localBackendHonors(state(null), "seed"));
+  assert.ok(!localBackendHonors(state({ seed: true }, "external::openai::gpt-5"), "seed"));
 });
 
 test("the panel offers the seed only where the backend reads it", () => {
@@ -168,18 +172,13 @@ test("the panel offers the seed only where the backend reads it", () => {
   assert.doesNotMatch(sheet, /const isGguf = modelReadsSamplingSeed\(/);
 });
 
-test("the panel and the request body gate on the same argument", () => {
-  const gateArguments = (source: string): string[] =>
-    [...source.matchAll(/modelReadsSamplingSeed\(([^)]*)\)/g)].map((match) =>
-      match[1].replace(/\s+/g, " ").trim(),
-    );
-  assert.deepEqual(
-    gateArguments(readText("../src/features/chat/chat-settings-sheet.tsx")),
-    ["activeModel"],
-  );
-  assert.deepEqual(
-    gateArguments(readText("../src/features/chat/api/chat-adapter.ts")),
-    ["activeModel"],
+test("the panel and the request body read the same declared control", () => {
+  const sheet = readText("../src/features/chat/chat-settings-sheet.tsx");
+  assert.match(sheet, /localBackendHonors\(s, "seed"\)/);
+  assert.match(sheet, /modelReadsSamplingSeed\(activeModel, seedHonored\)/);
+  assert.match(
+    readText("../src/features/chat/api/chat-adapter.ts"),
+    /modelReadsSamplingSeed\(\s*activeModel,\s*localBackendHonors\(runtime, "seed"\),?\s*\)/,
   );
 });
 
@@ -239,8 +238,7 @@ test("the stored seed is range-checked, not just the keystroke", () => {
 
 test("the request drops a seed the loaded model cannot use", () => {
   const adapter = readText("../src/features/chat/api/chat-adapter.ts");
-  assert.match(adapter, /!modelReadsSamplingSeed\(/);
-  assert.match(adapter, /modelReadsSamplingSeed\(activeModel\)/);
+  assert.match(adapter, /params\.seed == null \|\|\s*!modelReadsSamplingSeed\(/);
 });
 
 test("the seed belongs to the chat, not the installation", () => {
@@ -270,7 +268,7 @@ type RequiredKeys<T> = {
 }[keyof T];
 type Assert<T extends true> = T;
 type _EveryFlagTheSeedGateReadsIsRequired = Assert<
-  "isGguf" | "isMlx" | "isAudio" | "hasAudioInput" extends
+  "isAudio" | "hasAudioInput" extends
     RequiredKeys<ChatModelRow>
     ? true
     : false
@@ -285,12 +283,10 @@ test("a models[] row states every flag the seed gate reads", () => {
     name: "m",
     isVision: false,
     isLora: false,
-    isGguf: true,
-    isMlx: false,
     isAudio: false,
     hasAudioInput: false,
   };
-  assert.ok(modelReadsSamplingSeed(row));
+  assert.ok(modelReadsSamplingSeed(row, true));
 });
 
 test("saving a preset takes the seed being typed, not the one before it", () => {

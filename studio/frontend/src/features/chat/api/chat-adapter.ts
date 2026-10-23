@@ -37,10 +37,10 @@ import {
 } from "@/features/hub/inventory/api";
 import { isHiddenModelId } from "@/features/hub/lib/hidden-models";
 import {
-  isServedByLlamaCpp,
-  resumesThought,
+  type ChatControls,
   isServedByMlx,
   loadedContextFields,
+  localBackendHonors,
   resolveInitialConfig,
 } from "@/features/model-picker";
 import { isMlxId } from "@/features/model-picker/components/model-selector/recommended-fit";
@@ -2281,6 +2281,14 @@ export function buildLocalTokenCountReasoning(
   };
 }
 
+/** Whether the local backend fits a prompt to its window. A server that declares nothing still
+ *  gets the compaction fields, since one that cannot compact ignores them. */
+function localBackendCompacts(
+  state: Parameters<typeof localBackendHonors>[0],
+): boolean {
+  return localBackendHonors(state, "context_overflow", true);
+}
+
 /** The tool flags a completion would send, so the count includes the schemas and the action nudge. */
 export async function buildLocalTokenCountExtras(
   threadId: string | undefined,
@@ -2315,14 +2323,7 @@ export async function buildLocalTokenCountExtras(
     ...(threadId ? { thread_id: threadId } : {}),
     max_tokens: state.params.maxTokens,
     ...ggufCompactionRequestFields({
-      isGguf: isServedByLlamaCpp({
-        loadedIsGguf: state.loadedIsGguf,
-        activeGgufVariant: state.activeGgufVariant,
-        activeNativePathToken: state.activeNativePathToken,
-        checkpoint: state.params.checkpoint,
-      }),
-      isMlx: state.loadedIsMlx === true,
-      isManagedEngine: state.loadedEngine === "vllm",
+      compacts: localBackendCompacts(state),
       autoCompactEnabled: state.autoCompactEnabled,
     }),
   };
@@ -2692,6 +2693,7 @@ type QueuedResolvedModelRuntime = {
   loadedContextLength: number | null;
   loadedIsGguf: boolean | null;
   loadedIsMlx: boolean | null;
+  loadedChatControls: ChatControls | null;
   loadedIsMultimodal: boolean;
   modelCapabilities: QueuedModelCapabilities | null;
 };
@@ -2715,6 +2717,7 @@ const VISIBLE_MODEL_RUNTIME_KEYS = [
   "nativeContextLength",
   "loadedIsGguf",
   "loadedIsMlx",
+  "loadedChatControls",
   "modelRequiresTrustRemoteCode",
   "supportsReasoning",
   "reasoningAlwaysOn",
@@ -2858,13 +2861,14 @@ function queuedResolvedModelFromStore(
     loadedContextLength: state.loadedContextLength,
     loadedIsGguf: state.loadedIsGguf,
     loadedIsMlx: state.loadedIsMlx,
+    loadedChatControls: state.loadedChatControls,
     loadedIsMultimodal: state.loadedIsMultimodal,
     modelCapabilities: activeModel
       ? {
           isVision: activeModel.isVision,
           isGguf: activeModel.isGguf,
-          // The queued run mints its own summary for a model with no catalog row, and the sampling seed
-          // is gated on this.
+          // The queued run mints its own summary for a model with no catalog row, and the MLX budget
+          // and audio-clip checks read this.
           isMlx: activeModel.isMlx,
           isAudio: activeModel.isAudio,
           audioType: activeModel.audioType,
@@ -4537,6 +4541,7 @@ async function resolveQueuedEmptyLocalModel(abortSignal: AbortSignal): Promise<{
             loadedContextLength: loadedContextFields(status).loadedContextLength,
             loadedIsGguf: loadedContextFields(status).loadedIsGguf,
             loadedIsMlx: loadedContextFields(status).loadedIsMlx,
+            loadedChatControls: loadedContextFields(status).loadedChatControls,
             loadedIsMultimodal: isMultimodalResponse(status),
             modelCapabilities: {
               isVision: status.is_vision ?? false,
@@ -4769,6 +4774,7 @@ export function createOpenAIStreamAdapter(
                 loadedContextLength: queuedEmptyModelRuntime.loadedContextLength,
                 loadedIsGguf: queuedEmptyModelRuntime.loadedIsGguf,
                 loadedIsMlx: queuedEmptyModelRuntime.loadedIsMlx,
+                loadedChatControls: queuedEmptyModelRuntime.loadedChatControls,
                 models: mergeQueuedModelCapabilities(
                   base.models,
                   queuedEmptyModelRuntime.checkpoint,
@@ -5168,6 +5174,10 @@ export function createOpenAIStreamAdapter(
                 queuedEmptyModelRuntime !== null
                   ? queuedEmptyModelRuntime.loadedIsMlx
                   : liveRuntime.loadedIsMlx,
+              loadedChatControls:
+                queuedEmptyModelRuntime !== null
+                  ? queuedEmptyModelRuntime.loadedChatControls
+                  : liveRuntime.loadedChatControls,
               loadedIsMultimodal:
                 queuedEmptyModelRuntime?.loadedIsMultimodal ??
                 liveRuntime.loadedIsMultimodal,
@@ -5429,14 +5439,7 @@ export function createOpenAIStreamAdapter(
 
       // Carry reasoning only to a backend that can resume it.
       const resumedThought =
-        continuation &&
-        resumesThought({
-          loadedIsGguf: runtime.loadedIsGguf,
-          loadedIsMlx: runtime.loadedIsMlx,
-          activeGgufVariant: runtime.activeGgufVariant,
-          activeNativePathToken: runtime.activeNativePathToken,
-          checkpoint: params.checkpoint,
-        })
+        continuation && localBackendHonors(runtime, "continue_thought")
           ? (continuation.reasoning ?? "")
           : "";
       const hasGeminiReplayContinuation = Boolean(
@@ -5726,26 +5729,10 @@ export function createOpenAIStreamAdapter(
       const activeModel = runtime.models.find(
         (m) => m.id === params.checkpoint,
       );
-      // The same owner the settings panel asks, so the body and the panel cannot disagree
-      // about the model they both describe. A catalog row would: /api/models/list can
-      // replace the row a load minted, and the variant / native path token still classify
-      // a GGUF the backend has not answered for yet.
-      const isGgufForCompaction = isServedByLlamaCpp({
-        loadedIsGguf: runtime.loadedIsGguf,
-        activeGgufVariant: runtime.activeGgufVariant,
-        activeNativePathToken: runtime.activeNativePathToken,
-        checkpoint: params.checkpoint,
-      });
-      // The backend's own report, for the same reason. An external id leaves it describing
-      // the local model still resident.
-      const isMlxForCompaction =
-        !isExternalModelId(params.checkpoint) && runtime.loadedIsMlx === true;
-      const isManagedEngineForCompaction =
-        !isExternalModelId(params.checkpoint) && runtime.loadedEngine === "vllm";
       // Taken once, so a retried request still carries it and the next turn does not.
       const compactNow =
         takeThreadCompactionRequest(resolvedThreadId) &&
-        (isGgufForCompaction || isMlxForCompaction);
+        localBackendHonors(runtime, "compact_context");
       const generationUserMessage = [...survivingMessages]
         .reverse()
         .find((message) => message.role === "user");
@@ -7098,9 +7085,7 @@ export function createOpenAIStreamAdapter(
             // Opt into the trailing usage chunk so the context bar and tok/s populate (backend gates it).
             stream_options: { include_usage: true },
             ...ggufCompactionRequestFields({
-              isGguf: isGgufForCompaction,
-              isMlx: isMlxForCompaction,
-              isManagedEngine: isManagedEngineForCompaction,
+              compacts: localBackendCompacts(runtime),
               autoCompactEnabled: runtime.autoCompactEnabled,
               compactNow,
             }),
@@ -7113,7 +7098,11 @@ export function createOpenAIStreamAdapter(
             presence_penalty: params.presencePenalty,
             // Omitted when unset so the server draws a fresh seed, and when the backend reads none, so a
             // GGUF pin is not sent invisibly after a switch.
-            ...(params.seed == null || !modelReadsSamplingSeed(activeModel)
+            ...(params.seed == null ||
+            !modelReadsSamplingSeed(
+              activeModel,
+              localBackendHonors(runtime, "seed"),
+            )
               ? {}
               : { seed: params.seed }),
             // Turn-scoped, not thread-scoped. These are the CURRENT turn's attachment channel; history media rides

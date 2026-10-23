@@ -96,6 +96,10 @@ test("the newest message still gets the whole continue bar", () => {
     /isContinuableContent\(messageContent, \{[\s\S]{0,160}thought: thoughtResumable,[\s\S]{0,160}replay: geminiReplayTurns\.length > 0/,
     /findLatestUserAudioBase64\(thread\.messages, false\)/,
     /modeAllowsContinuation\(\{/,
+    // Both read the loaded backend's declared controls, the same ones the request is admitted on.
+    /localBackendHonors\(s, "continue_thought"\)/,
+    /localBackendHonors\(s, "continue_final_message", true\)/,
+    /backendContinues &&\s+continuable &&/,
   ]) {
     assert.match(shared, marker);
   }

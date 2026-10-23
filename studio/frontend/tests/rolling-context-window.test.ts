@@ -25,8 +25,7 @@ const adapter = readSrc("features/chat/api/chat-adapter.ts");
 const transport = readSrc("features/chat/api/chat-api.ts");
 
 test("local chat opts into the rolling context policy", () => {
-  assert.match(adapter, /isGgufForCompaction/);
-  assert.match(adapter, /runtime\.loadedIsGguf/);
+  assert.match(adapter, /compacts: localBackendCompacts\(runtime\)/);
   assert.match(adapter, /autoCompactEnabled/);
   assert.match(adapter, /ggufCompactionRequestFields\(/);
   assert.match(adapter, /This conversation was compacted/);

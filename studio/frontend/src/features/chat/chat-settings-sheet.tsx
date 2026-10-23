@@ -46,6 +46,7 @@ import { usePlatformStore } from "@/config/env";
 import {
   NumericValueInput,
   isServedByLlamaCpp,
+  localBackendHonors,
   presetLoadSettingNames,
   snapToStep,
 } from "@/features/model-picker";
@@ -558,10 +559,11 @@ export function ChatSettingsPanel({
   const activeModel = useChatRuntimeStore(
     (s) => s.models.find((m) => m.id === currentCheckpoint) ?? null,
   );
-  // Same call the request body makes, on the same summary, so the panel cannot offer a seed the
-  // body drops. An external selection carries an `external::` id no local entry matches, so
-  // the summary answers that case without a separate guard.
-  const showSeed = modelReadsSamplingSeed(activeModel);
+  // Same call the request body makes, so the panel cannot offer a seed the body drops.
+  const seedHonored = useChatRuntimeStore((s) =>
+    localBackendHonors(s, "seed"),
+  );
+  const showSeed = modelReadsSamplingSeed(activeModel, seedHonored);
   const platformDeviceType = usePlatformStore((s) => s.deviceType);
   // Unified memory, not just Darwin: an Intel Mac spills to system RAM like a PC.
   const isUnifiedMemory = usePlatformStore((s) => s.appleSilicon);

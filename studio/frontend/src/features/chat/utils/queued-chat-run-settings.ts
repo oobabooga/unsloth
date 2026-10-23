@@ -42,6 +42,7 @@ const QUEUED_SETTING_KEYS = [
   // no .gguf suffix, reads as non-GGUF and loses its compaction policy.
   "loadedIsGguf",
   "loadedIsMlx",
+  "loadedChatControls",
   "loadedEngine",
   "autoHealToolCalls",
   "nudgeToolCalls",

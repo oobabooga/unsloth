@@ -18,8 +18,8 @@ const {
   isServedByLlamaCpp,
   isServedByMlx,
   loadedContextFields,
+  localBackendHonors,
   residentIsServedByMlx,
-  resumesThought,
 } = await import(
   "../src/features/model-picker/model-config/per-model-config.ts"
 );
@@ -58,6 +58,7 @@ test("an MLX response carries a window without a native one", () => {
     nativeContextLength: null,
     loadedIsGguf: false,
     loadedIsMlx: true,
+    loadedChatControls: null,
     loadedContextEnforced: null,
     loadedContextUnboundedWhenBatched: false,
     loadedParallelSlots: null,
@@ -69,6 +70,7 @@ test("an MLX response carries a window without a native one", () => {
     nativeContextLength: null,
     loadedIsGguf: false,
     loadedIsMlx: null,
+    loadedChatControls: null,
     loadedContextEnforced: null,
     loadedContextUnboundedWhenBatched: false,
     loadedParallelSlots: null,
@@ -130,13 +132,35 @@ test("a load that reported a non-GGUF backend outranks a stale variant", () => {
   assert.equal(isServedByLlamaCpp({ checkpoint: "external::openai/gpt-4" }), false);
 });
 
-test("a thought resumes on llama-server and on a load MLX reports serving", () => {
-  assert.equal(resumesThought({ loadedIsGguf: true }), true);
-  assert.equal(resumesThought({ loadedIsGguf: false, loadedIsMlx: true }), true);
-  assert.equal(resumesThought({ loadedIsGguf: false, loadedIsMlx: false }), false);
-  assert.equal(resumesThought({ loadedIsMlx: null }), false);
+test("every load response carries the backend's declared chat controls, a window or not", () => {
+  const declared = { seed: true, continue_thought: false };
+  for (const response of [GGUF, MLX, { is_gguf: false, context_length: 2048 }]) {
+    assert.deepEqual(
+      loadedContextFields({ ...response, chat_controls: declared }).loadedChatControls,
+      declared,
+    );
+  }
+  assert.equal(loadedContextFields(GGUF).loadedChatControls, null);
+  assert.equal(loadedContextFields(null).loadedChatControls, null);
+});
+
+test("a control counts only as the resident local backend declares it", () => {
+  const state = (loadedChatControls: object | null, checkpoint = "local-model") => ({
+    loadedChatControls,
+    params: { checkpoint },
+  });
+  assert.equal(localBackendHonors(state({ continue_thought: true }), "continue_thought"), true);
+  assert.equal(localBackendHonors(state({ continue_thought: false }), "continue_thought"), false);
+  // Nothing declared, or an external selection the declaration does not describe.
+  assert.equal(localBackendHonors(state(null), "continue_thought"), false);
+  assert.equal(localBackendHonors(state({}), "continue_thought"), false);
   assert.equal(
-    resumesThought({ loadedIsMlx: true, checkpoint: "external::openai/gpt-4" }),
+    localBackendHonors(state({ continue_thought: true }, "external::openai/gpt-4"), "continue_thought"),
+    false,
+  );
+  assert.equal(localBackendHonors(state(null), "continue_final_message", true), true);
+  assert.equal(
+    localBackendHonors(state({ continue_final_message: false }), "continue_final_message", true),
     false,
   );
 });
@@ -362,30 +386,24 @@ test("a background load cannot leave the visible model reading another model's w
   }
 });
 
-test("a queued run keeps its own model's MLX thought-resume verdict", async () => {
+test("a queued run keeps its own model's thought-resume verdict", async () => {
   const { snapshotQueuedChatRunSettings } = await import(
     "../src/features/chat/utils/queued-chat-run-settings.ts"
   );
   const resident = {
     params: { checkpoint: "mlx-community/Qwen3-0.6B-4bit" },
-    activeGgufVariant: null,
-    activeNativePathToken: null,
-    loadedIsGguf: false,
-    loadedIsMlx: true,
+    loadedChatControls: { continue_thought: true },
   };
   const queued = snapshotQueuedChatRunSettings(
     resident as unknown as Parameters<typeof snapshotQueuedChatRunSettings>[0],
   );
-  const live = { ...resident, ...loadedContextFields(null) };
+  // The picker moved to an external model, which clears the live residency fields.
+  const live = {
+    ...resident,
+    params: { checkpoint: "external::openai::gpt-5" },
+    ...loadedContextFields(null),
+  };
   const runtime = { ...live, ...queued };
-  assert.equal(
-    resumesThought({
-      loadedIsGguf: runtime.loadedIsGguf,
-      loadedIsMlx: runtime.loadedIsMlx,
-      activeGgufVariant: runtime.activeGgufVariant,
-      activeNativePathToken: runtime.activeNativePathToken,
-      checkpoint: runtime.params.checkpoint,
-    }),
-    true,
-  );
+  assert.equal(localBackendHonors(runtime, "continue_thought"), true);
+  assert.equal(localBackendHonors(live, "continue_thought"), false);
 });
