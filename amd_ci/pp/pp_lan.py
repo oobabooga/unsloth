@@ -600,6 +600,16 @@ class Master:
                 for kind in kinds:
                     for g, conc in ((1, 1), (1, B), (3, 3 * B)):
                         plan.append((kind, 2, g, conc))
+        if a.diag22:
+            # Qwen3-4B: sched_pin_l_out off / on at each stage count's best layout (diag19), plus ~2 layers off the head
+            cases = [(2, "bs_p0q0h0", 6), (2, "bs_p1q0h0", 6),
+                     (3, "bs_p0q4h0", 8), (3, "bs_p1q4h0", 8), (3, "bs_p1q4h2", 8),
+                     (4, "bs_p0q2h0", 8), (4, "bs_p1q2h0", 8), (4, "bs_p1q2h2", 8),
+                     (5, "bs_p0q4h0", 8), (5, "bs_p1q4h0", 8), (5, "bs_p1q4h2", 8)]
+            plan = [("x1", 1, 1, B)]
+            plan += [(k, s_, g, g * B) for s_, k, g in cases]
+            plan += [(k, s_, g, g * B) for s_, k, g in reversed(cases)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
         if a.diag21:
             # sched_pin_l_out (diag20 profile: the master's last-layer tail ran on W1, shipping 8x the activation):
             # pin off / on at the diag20 best (2 off the master, G=8), then with ~2 layers off the head; mirrored
@@ -968,6 +978,7 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag22", action = "store_true", help = "Qwen3-4B S=2..5: sched_pin_l_out off / on + head discount (use with --peer-allow)")
     m.add_argument("--diag21", action = "store_true", help = "sched_pin_l_out off / on at S=5 G=8 (use with --peer-allow)")
     m.add_argument("--diag20", action = "store_true", help = "MoE S=5: layers off the master x pipeline groups (use with --peer-allow)")
     m.add_argument("--diag19", action = "store_true", help = "confirm the best setting per stage count twice (use with --peer-allow)")
