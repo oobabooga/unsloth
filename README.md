@@ -163,6 +163,17 @@ Unsloth can be used in three ways: **[Unsloth Desktop](https://unsloth.ai/downlo
 </table>
 
 ### Unsloth Studio (web UI)
+Unsloth Studio and Desktop work on **Windows, Linux, WSL** and **macOS**. What runs depends on the hardware:
+
+| Hardware | Training | Chat / inference |
+|---|---|---|
+| NVIDIA | Yes: RTX 30/40/50, Blackwell, DGX Spark, Station and more | GGUF, safetensors, vLLM |
+| AMD | Yes, on Windows, WSL and Linux ([AMD guide](https://unsloth.ai/docs/basics/amd)) | GGUF, safetensors, vLLM (Linux and WSL) |
+| Intel GPUs (XPU) | Yes | GGUF |
+| Apple Silicon | Yes, through MLX | MLX and GGUF |
+| Intel Mac | No | GGUF |
+| CPU only | No | GGUF chat and Data Recipes |
+| Vulkan | No: Vulkan accelerates GGUF inference only | GGUF on [compatible GPUs, including Intel](https://github.com/unslothai/unsloth/pull/5819) |
 
 #### macOS, Linux, WSL:
 ```bash
