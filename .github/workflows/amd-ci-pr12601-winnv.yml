@@ -134,6 +134,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -m pip install -q --no-deps unsloth_zoo
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # As Studio's setup.ps1 installs it on x64 Windows (the trainer module imports Unsloth).
+          & $py -m pip install -q "triton-windows<3.7"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
