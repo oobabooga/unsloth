@@ -1,0 +1,296 @@
+diff --git a/tests/test_amdchk_gfx1151.py b/tests/test_amdchk_gfx1151.py
+new file mode 100644
+index 000000000..52057c983
+--- /dev/null
++++ b/tests/test_amdchk_gfx1151.py
+@@ -0,0 +1,290 @@
++# gfx1151 runtime checks (AMD CI only): fused small-M FP8, compiled FP8BlockQuantLinear, zoo MXFP4 exact round.
++import json
++import os
++import subprocess
++import sys
++import textwrap
++
++import pytest
++import torch
++
++ZOO_SHA = "e6a96b23d9575c376837a7b7ca64bfc77650492b"
++
++
++def _emit(request, tag, payload):
++    tr = request.config.pluginmanager.getplugin("terminalreporter")
++    line = json.dumps(payload, separators = (",", ":"), default = str)
++    tr.write_line(f"AMDCHK {tag} " + line[:600])
++    work = os.environ.get("AMD_CI_WORK")
++    if work:
++        os.makedirs(os.path.join(work, "out"), exist_ok = True)
++        with open(os.path.join(work, "out", f"amdchk_{tag}.json"), "w", encoding = "utf-8") as fh:
++            fh.write(line)
++
++
++def _arch():
++    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0].lower()
++
++
++def test_00_is_gfx1151(request):
++    assert torch.cuda.is_available() and torch.version.hip is not None
++    import triton
++
++    _emit(request, "env", {"arch": _arch(), "hip": torch.version.hip, "torch": torch.__version__,
++                           "triton": triton.__version__,
++                           "cus": torch.cuda.get_device_properties(0).multi_processor_count})
++    assert _arch() == "gfx1151"
++
++
++def _block_weight(N, K, scale_dtype = torch.float32):
++    W = torch.randn(N, K, device = "cuda") * 0.02
++    s = W.abs().view(N // 128, 128, K // 128, 128).amax((1, 3)) / 448.0
++    q = (W.view(N // 128, 128, K // 128, 128) / s[:, None, :, None]).view(N, K).to(torch.float8_e4m3fn)
++    return q, s.contiguous().to(scale_dtype)
++
++
++class _CountLaunch:
++    def __init__(self, fn):
++        self.fn, self.n = fn, 0
++
++    def __getitem__(self, grid):
++        self.n += 1
++        return self.fn[grid]
++
++    def __getattr__(self, name):
++        return getattr(self.fn, name)
++
++
++def test_10_small_m_fused_engages_and_matches_torch(request, monkeypatch):
++    import unsloth  # noqa: F401
++    import unsloth.kernels.fp8 as f
++
++    monkeypatch.setattr(f, "_FP8_BLOCK_GEMV", False, raising = False)
++    counter = _CountLaunch(f._w8a8_block_fp8_small_m)
++    monkeypatch.setattr(f, "_w8a8_block_fp8_small_m", counter)
++    rows, bad = [], []
++    for dtype in (torch.bfloat16, torch.float16):
++        for N, K in ((4096, 4096), (1024, 4096), (2048, 6144)):
++            for M in (1, 8, 16):
++                torch.manual_seed(0)
++                q, s = _block_weight(N, K)
++                X = torch.randn(1, M, K, device = "cuda", dtype = dtype)
++                before = counter.n
++                with torch.no_grad():
++                    ok = f.can_use_fp8_block_small_m(X, q, s, [128, 128])
++                    out = f.fp8_linear(X, q, s)
++                launched = counter.n - before
++                # torch reference: fp32 dequant of W, unquantized X, fp64 matmul.
++                Wd = (q.float().view(N // 128, 128, K // 128, 128) * s[:, None, :, None]).view(N, K)
++                ref = X.double().view(M, K) @ Wd.double().t()
++                o = out.double().view(M, N)
++                rel = float((o - ref).norm() / ref.norm())
++                # act-quantized fp64 oracle (same operands the kernel sees)
++                xq, xs = f.act_quant(X, 128)
++                x64 = (xq.double().view(M, K // 128, 128) * xs.double().view(M, K // 128, 1)).view(M, K)
++                orc = x64 @ Wd.double().t()
++                rel_orc = float((o - orc).norm() / orc.norm())
++                split_k = f._small_m_config(M, N, K, X.device)[1]
++                rows.append([str(dtype)[6:], N, K, M, split_k, bool(ok), launched, round(rel, 5), f"{rel_orc:.2e}",
++                             bool(torch.isfinite(out).all())])
++                if not ok or launched != 1 or rel > 0.08 or rel_orc > 1e-2 or not torch.isfinite(out).all():
++                    bad.append(rows[-1])
++    _emit(request, "item1", {"cols": "dtype,N,K,M,split_k,can_use,launches,rel_vs_torch,rel_vs_actq_oracle,finite",
++                             "rows": rows, "total_launches": counter.n})
++    assert not bad, bad
++
++
++def test_20_compiled_block_linear_fullgraph(request):
++    import unsloth  # noqa: F401
++    import torch._dynamo
++    from torch._dynamo.utils import counters
++    import unsloth.kernels.fp8 as f
++
++    dev = torch.device("cuda", 0)
++    route = bool(f._rocm_bytes_dequant_arch(dev))
++    calls = {"bytes": 0}
++    orig = f._e4m3fn_bytes_dequant
++
++    def counted(*a, **k):
++        calls["bytes"] += 1
++        return orig(*a, **k)
++
++    rows, bad = [], []
++    try:
++        for dtype in (torch.bfloat16, torch.float16):
++            for N, K in ((512, 256), (768, 256), (512, 200), (384, 328)):
++                torch._dynamo.reset()
++                counters.clear()
++
++                def step(X, W, s):
++                    return f.FP8BlockQuantLinear.apply(X, W, s)
++
++                compiled = torch.compile(step, fullgraph = True)
++                torch.manual_seed(0)
++                W = (torch.randn(N, K, device = dev) * 0.02).to(torch.float8_e4m3fn)
++                s = torch.rand(-(-N // 128), -(-K // 128), device = dev) + 0.5
++                s.block_size = [128, 128]
++                X = torch.randn(64, K, device = dev, dtype = dtype, requires_grad = True)
++                g = torch.randn(64, N, device = dev, dtype = dtype)
++                err = None
++                try:
++                    yc = compiled(X, W, s)
++                    yc.backward(g)
++                    gc, X.grad = X.grad, None
++                except Exception as e:  # fullgraph=True raises on a graph break
++                    err = f"{type(e).__name__}: {str(e)[:300]}"
++                breaks = sum(counters["graph_break"].values())
++                graphs = counters["stats"]["unique_graphs"]
++                b0 = calls["bytes"]
++                f._e4m3fn_bytes_dequant = counted  # eager only: a counter is a side effect under compile
++                try:
++                    ye = step(X, W, s)
++                    ye.backward(g)
++                finally:
++                    f._e4m3fn_bytes_dequant = orig
++                ge = X.grad
++                eager_bytes = calls["bytes"] - b0
++                if err is None:
++                    dy = float((yc.detach().float() - ye.detach().float()).abs().max())
++                    dg = float((gc.float() - ge.float()).abs().max())
++                    exact = bool(torch.equal(yc, ye) and torch.equal(gc, ge))
++                else:
++                    dy = dg = None
++                    exact = False
++                rows.append([str(dtype)[6:], N, K, breaks, graphs, err, dy, dg, exact, eager_bytes])
++                tol_y = 1e-2 * float(ye.detach().float().abs().max())
++                tol_g = 1e-2 * float(ge.float().abs().max())
++                if err or breaks or dy > tol_y or dg > tol_g:
++                    bad.append(rows[-1])
++                # gfx11 bf16 uneven-K: forward + backward both route through the byte decoder.
++                if K % 128 and dtype == torch.bfloat16 and route and eager_bytes != 2:
++                    bad.append(["bytes route not taken"] + rows[-1])
++    finally:
++        f._e4m3fn_bytes_dequant = orig
++    _emit(request, "item2", {"rocm_bytes_dequant_arch": route,
++                             "cols": "dtype,N,K,graph_breaks,unique_graphs,error,max|dy|,max|dgX|,bit_exact,eager_bytes_calls",
++                             "rows": rows})
++    assert route, "gfx11 byte-dequant route not selected on this device"
++    assert not bad, bad
++
++
++_MX_SCRIPT = r'''
++import json, os, sys, statistics
++import torch
++import unsloth_zoo.mxfp4_dequant as mxd
++from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
++
++res = {"zoo_has_exact_round": hasattr(mxd, "_exact_round"), "is_hip": mxd._IS_HIP}
++dev = "cuda"
++
++def every(device):
++    byte = torch.arange(256, device = device, dtype = torch.int32)
++    blocks = byte.view(1, 1, 256).expand(256, 1, 256).reshape(256, 16, 16).to(torch.uint8).reshape(2, 128, 16, 16)
++    scales = torch.arange(256, device = device, dtype = torch.int32).view(256, 1).expand(256, 16)
++    return blocks, scales.reshape(2, 128, 16).to(torch.uint8).contiguous()
++
++def rnd(E, N, G, device, seed = 0):
++    g = torch.Generator(device = "cpu").manual_seed(seed)
++    b = torch.randint(0, 256, (E, N, G, 16), generator = g, dtype = torch.int32).to(torch.uint8)
++    s = torch.randint(110, 135, (E, N, G), generator = g, dtype = torch.int32).to(torch.uint8)
++    return b.to(device), s.to(device)
++
++def deq(b, s, dtype, tr, flag):
++    os.environ["UNSLOTH_MXFP4_EXACT_ROUND"] = flag
++    return mxd._kernel_dequantize(b, s, dtype, tr, None, None, None)
++
++bits = {}
++for name, (b, s) in (("every_nibble_every_scale", every(dev)), ("random_e2_n512_g90", rnd(2, 512, 90, dev))):
++    for dtype in (torch.bfloat16, torch.float16):
++        for tr in (False, True):
++            want = mxfp4_dequantize_torch(b, s, dtype = dtype, transpose = tr).contiguous().view(torch.int16)
++            row = {}
++            for flag in ("1", "0"):
++                got = deq(b, s, dtype, tr, flag).contiguous().view(torch.int16)
++                diff = got != want
++                n = int(diff.sum())
++                info = {"mismatch": n, "of": want.numel()}
++                if n:
++                    wv = want[diff]
++                    info["want_signed_zero"] = int((wv == -32768).sum())
++                    info["sample"] = [[int(a) & 0xFFFF, int(c) & 0xFFFF] for a, c in zip(want[diff][:4].tolist(), got[diff][:4].tolist())]
++                row["exact" if flag == "1" else "plain"] = info
++            bits[f"{name}|{str(dtype)[6:]}|tr={int(tr)}"] = row
++res["bits"] = bits
++
++ver = {}
++for flag in ("1", "0"):
++    os.environ["UNSLOTH_MXFP4_EXACT_ROUND"] = flag
++    mxd._KERNEL_VERIFIED.clear()
++    for dtype in (torch.bfloat16, torch.float16):
++        for tr in (False, True):
++            ver[f"flag={flag}|{str(dtype)[6:]}|tr={int(tr)}"] = bool(mxd._kernel_verified(torch.device(dev), dtype, tr))
++res["kernel_verified"] = ver
++
++# timing: gpt-oss-20b gate_up expert stack slice (E=4, N=5760, K=2880), interleaved arms incl. A/A duplicate.
++E, N, G = 4, 5760, 90
++b, s = rnd(E, N, G, dev, 1)
++X = torch.randn(E, 256, G * 32, device = dev, dtype = torch.bfloat16)
++ev = lambda: torch.cuda.Event(enable_timing = True)
++
++def time_once(fn, iters = 10):
++    fn(); torch.cuda.synchronize()
++    a, z = ev(), ev()
++    a.record()
++    for _ in range(iters):
++        fn()
++    z.record(); torch.cuda.synchronize()
++    return a.elapsed_time(z) / iters
++
++timing = {}
++for dtype in (torch.bfloat16, torch.float16):
++    Xd = X.to(dtype)
++    for tr in (True, False):
++        arms = {"exact": "1", "plain": "0", "exact_AA": "1"}
++        samples = {k: [] for k in arms}
++        msamples = {k: [] for k in arms}
++        out = torch.empty((E, G * 32, N) if tr else (E, N, G * 32), dtype = dtype, device = dev)
++        for r in range(9):
++            order = list(arms) if r % 2 == 0 else list(arms)[::-1]
++            for k in order:
++                flag = arms[k]
++                os.environ["UNSLOTH_MXFP4_EXACT_ROUND"] = flag
++                f1 = lambda: mxd._kernel_dequantize(b, s, dtype, tr, None, None, out)
++                samples[k].append(time_once(f1))
++                if tr:
++                    f2 = lambda: torch.matmul(Xd, mxd._kernel_dequantize(b, s, dtype, tr, None, None, out))
++                    msamples[k].append(time_once(f2, 5))
++        key = f"{str(dtype)[6:]}|tr={int(tr)}"
++        timing[key] = {k: {"dequant_ms_med": round(statistics.median(v), 4), "min": round(min(v), 4), "max": round(max(v), 4)} for k, v in samples.items()}
++        if tr:
++            for k, v in msamples.items():
++                timing[key][k]["deq+matmul_ms_med"] = round(statistics.median(v), 4)
++res["timing"] = timing
++json.dump(res, open(sys.argv[1], "w"))
++'''
++
++
++def test_30_zoo_mxfp4_exact_round(request, tmp_path):
++    zoo = tmp_path / "zoo"
++    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "https://github.com/unslothai/unsloth-zoo", str(zoo)],
++                   check = True, timeout = 600)
++    subprocess.run(["git", "-C", str(zoo), "checkout", "-q", ZOO_SHA], check = True, timeout = 300)
++    script = tmp_path / "mx.py"
++    script.write_text(_MX_SCRIPT, encoding = "utf-8")
++    out = tmp_path / "mx.json"
++    env = dict(os.environ, PYTHONPATH = str(zoo), UNSLOTH_IS_PRESENT = "1",
++               TRITON_CACHE_DIR = str(tmp_path / "tcache"))
++    env.pop("UNSLOTH_MXFP4_EXACT_ROUND", None)
++    p = subprocess.run([sys.executable, str(script), str(out)], cwd = str(tmp_path), env = env,
++                       capture_output = True, text = True, timeout = 2400)
++    if p.returncode != 0:
++        _emit(request, "item3_err", {"rc": p.returncode, "stderr": p.stderr[-1500:]})
++    assert p.returncode == 0
++    res = json.loads(out.read_text(encoding = "utf-8"))
++    _emit(request, "item3_bits", res["bits"])
++    _emit(request, "item3_verified", res["kernel_verified"])
++    _emit(request, "item3_timing", res["timing"])
++    assert res["zoo_has_exact_round"] and res["is_hip"]
++    # The default (exact) path must be bit-identical everywhere; the plain one is informational.
++    bad = {k: v["exact"] for k, v in res["bits"].items() if v["exact"]["mismatch"]}
++    assert not bad, bad
