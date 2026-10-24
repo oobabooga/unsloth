@@ -1,0 +1,92 @@
+diff --git a/tests/test_amdchk_splitk.py b/tests/test_amdchk_splitk.py
+new file mode 100644
+index 000000000..fe11b9acf
+--- /dev/null
++++ b/tests/test_amdchk_splitk.py
+@@ -0,0 +1,86 @@
++# gfx1151: the fused small-M FP8 kernel with SPLIT_K > 1 (natural and forced configs) vs main path and fp64 oracle.
++import json
++import os
++
++import torch
++
++
++def _emit(request, tag, payload):
++    line = json.dumps(payload, separators = (",", ":"), default = str)
++    request.config.pluginmanager.getplugin("terminalreporter").write_line(f"AMDCHK {tag} " + line[:600])
++    work = os.environ.get("AMD_CI_WORK")
++    if work:
++        os.makedirs(os.path.join(work, "out"), exist_ok = True)
++        with open(os.path.join(work, "out", f"amdchk_{tag}.json"), "w", encoding = "utf-8") as fh:
++            fh.write(line)
++
++
++def _block_weight(N, K):
++    W = torch.randn(N, K, device = "cuda") * 0.02
++    s = W.abs().view(N // 128, 128, K // 128, 128).amax((1, 3)) / 448.0
++    q = (W.view(N // 128, 128, K // 128, 128) / s[:, None, :, None]).view(N, K).to(torch.float8_e4m3fn)
++    return q, s.contiguous()
++
++
++class _CountLaunch:
++    def __init__(self, fn):
++        self.fn, self.n, self.splits = fn, 0, []
++
++    def __getitem__(self, grid):
++        self.n += 1
++        self.splits.append(grid[1])
++        return self.fn[grid]
++
++    def __getattr__(self, name):
++        return getattr(self.fn, name)
++
++
++def test_split_k_engages_and_matches(request, monkeypatch):
++    import unsloth  # noqa: F401
++    import unsloth.kernels.fp8 as f
++
++    assert torch.version.hip is not None
++    monkeypatch.setattr(f, "_FP8_BLOCK_GEMV", False, raising = False)
++    counter = _CountLaunch(f._w8a8_block_fp8_small_m)
++    monkeypatch.setattr(f, "_w8a8_block_fp8_small_m", counter)
++    natural = f._small_m_config
++    cases = [(N, K, M, None) for N in (256, 512) for K in (4096, 8192) for M in (1, 8, 16)]
++    cases += [(1024, 4096, M, cfg) for M in (1, 4, 16) for cfg in ((32, 8, 4, 3), (16, 4, 4, 5), (64, 2, 4, 3))]
++    rows, bad = [], []
++    for dtype in (torch.bfloat16, torch.float16):
++        for N, K, M, cfg in cases:
++            torch.manual_seed(0)
++            q, s = _block_weight(N, K)
++            X = torch.randn(1, M, K, device = "cuda", dtype = dtype)
++            monkeypatch.setattr(f, "_small_m_config", natural if cfg is None else (lambda *a, c = cfg: c))
++            n0 = counter.n
++            with torch.no_grad():
++                ok = f.can_use_fp8_block_small_m(X, q, s, [128, 128])
++                new = f.fp8_linear(X, q, s)
++                again = f.fp8_linear(X, q, s)
++                monkeypatch.setattr(f, "_FP8_BLOCK_SMALL_M", False)
++                main = f.fp8_linear(X, q, s)
++                monkeypatch.setattr(f, "_FP8_BLOCK_SMALL_M", True)
++            launches = counter.n - n0
++            split = counter.splits[-1] if launches else None
++            xq, xs = f.act_quant(X, 128)
++            x64 = (xq.double().view(M, K // 128, 128) * xs.double().view(M, K // 128, 1)).view(M, K)
++            w64 = (q.double().view(N // 128, 128, K // 128, 128) * s.double()[:, None, :, None]).view(N, K)
++            orc = x64 @ w64.t()
++            oabs = x64.abs() @ w64.abs().t()
++            n64, m64 = new.double().view(M, N), main.double().view(M, N)
++            mag = torch.maximum(n64.abs(), m64.abs())
++            bound = torch.finfo(dtype).eps * mag + 2 * (K // 128) * torch.finfo(torch.float32).eps * oabs
++            within = bool(((n64 - m64).abs() <= bound + 1e-30).all())
++            err_new = float((n64 - orc).abs().mean())
++            err_main = float((m64 - orc).abs().mean())
++            det = bool(torch.equal(new, again))
++            rows.append([str(dtype)[6:], N, K, M, cfg[1] if cfg else "nat", split, ok, launches, within,
++                         f"{err_new:.3e}", f"{err_main:.3e}", det])
++            if not ok or launches != 2 or not within or err_new > err_main * 1.05 or not det:
++                bad.append(rows[-1])
++    n_split = sum(1 for r in rows if r[5] and r[5] > 1)
++    _emit(request, "splitk", {"cols": "dtype,N,K,M,cfg_split,grid_split,can_use,launches,within_bound,err_new,err_main,deterministic",
++                              "rows": rows, "rows_with_split_gt1": n_split, "sms": f._sm_count(torch.device("cuda", 0))})
++    assert n_split >= 20, n_split
++    assert not bad, bad
