@@ -1,0 +1,41 @@
+name: "Chat load request tests (windows-latest)"
+on:
+  push:
+    branches: ["pr-15139-xplat-ci"]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install pytest
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm ci --no-audit --no-fund
+      - name: Frontend load request tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/chat-load-request-one-builder.test.ts tests/chat-save-conflict-detail.test.ts tests/compare-pane-managed-engine.test.ts tests/context-pin-survives-load.test.ts tests/llama-extra-args-diagnostics.test.ts tests/llama-extra-args-panel-hydration.test.ts tests/load-in-4bit-setting.test.ts tests/load-rollback-after-lost-reply.test.ts tests/load-warning-toast.test.ts tests/managed-engine-offer.test.ts tests/read-aloud-beside-chat.test.ts tests/switch-validate-gpu-ids.test.ts tests/thread-read-sharing.test.ts tests/tool-approval-gone.test.ts
+      - name: Frontend typecheck
+        working-directory: studio/frontend
+        run: npm run typecheck
+      - name: Auto-load and model picker tests
+        run: python -m pytest tests/studio/test_chat_autoload_failure_gate.py tests/studio/test_model_picker_contracts.py -q
