@@ -132,6 +132,8 @@ jobs:
           & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\no-torch-runtime.txt" `
             -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q --no-deps unsloth_zoo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
