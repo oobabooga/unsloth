@@ -1,0 +1,132 @@
+name: "AMD CI: llama.cpp 321 --fit MoE ubatch, ROCm + Vulkan (gfx1151)"
+
+# Hand-adapted from amd_ci/templates/workflow.yml (same shape as the llama.cpp 268 runs): one exclusive GPU job.
+# Base = PR 321's base 5c19a5a7560 (ggml-org), head = PR 321 head ae1a7faafcf. Both built on the same runner for
+# ROCm (gfx1151) and, when the runner has a Vulkan toolchain, for Vulkan. The probe records the n_ubatch the fit chose,
+# the fit trail, buffers, n_ctx and whether one ~8k-token request succeeds without an out-of-memory error.
+
+on:
+  push:
+    branches: [amd-ci-llama321-fit]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "321"
+
+jobs:
+
+  gpu:
+    name: "PR 321 GPU check (shared GPU, correctness only)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr321-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran without a torch venv; the probe rows below name the devices llama.cpp used"
+
+      - name: Fetch models, build base and head (ROCm, Vulkan if available)
+        timeout-minutes: 150
+        run: |
+          set +e
+          W="$AMD_CI_WORK"; OUT="$W/out"; mkdir -p "$W/model"
+          BASE=5c19a5a7560024bb19745b4ae04a75613d4b9aa3
+          HEAD=ae1a7faafcf1b2a78679c88b1d7417e742e75f34
+          MOE="$W/model/gpt-oss-20b-mxfp4.gguf"; DENSE="$W/model/Qwen3-8B-Q4_K_M.gguf"
+          ( curl -fL --retry 8 --retry-delay 10 -s -S -o "$MOE" "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-mxfp4.gguf" > "$OUT/curl_moe.log" 2>&1; echo "rc=$?" >> "$OUT/curl_moe.log"
+            curl -fL --retry 8 --retry-delay 10 -s -S -o "$DENSE" "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf" > "$OUT/curl_dense.log" 2>&1; echo "rc=$?" >> "$OUT/curl_dense.log" ) &
+          CURL_PID=$!
+          {
+            echo "## runner: ${RUNNER_NAME:-?}"; free -m; nproc
+            cat /sys/class/drm/card*/device/mem_info_vram_total /sys/class/drm/card*/device/mem_info_gtt_total 2>/dev/null
+            hipconfig --version; echo
+            command -v glslc; command -v vulkaninfo; vulkaninfo --summary 2>&1 | head -30
+            ls /usr/include/vulkan/vulkan.h 2>&1
+          } > "$OUT/diag.txt" 2>&1; cat "$OUT/diag.txt"
+          export HIPCXX=/opt/rocm/llvm/bin/clang HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm PATH="/opt/rocm/bin:$PATH"
+
+          SRC="$W/llama"; mkdir -p "$SRC"
+          git -C "$SRC" init -q
+          git -C "$SRC" remote add up https://github.com/ggml-org/llama.cpp
+          git -C "$SRC" remote add us https://github.com/unslothai/llama.cpp
+          git -C "$SRC" fetch -q --depth 1 up "$BASE" || { echo "FATAL: fetch base"; exit 1; }
+          git -C "$SRC" fetch -q --depth 1 us refs/pull/321/head
+          echo "pull/321/head = $(git -C "$SRC" rev-parse FETCH_HEAD) (want $HEAD)" | tee "$OUT/source.txt"
+          git -C "$SRC" fetch -q --depth 1 us "$HEAD" || { echo "FATAL: fetch head"; exit 1; }
+          VK=0; command -v glslc > /dev/null && [ -e /usr/include/vulkan/vulkan.h ] && VK=1
+          echo "vulkan toolchain: $VK" | tee -a "$OUT/source.txt"
+          for arm in base head; do
+            SHA=$BASE; [ $arm = head ] && SHA=$HEAD
+            T="$W/src_$arm"; git -C "$SRC" worktree add -q --detach "$T" "$SHA" || { echo "FATAL: worktree $arm"; exit 1; }
+            echo "$arm = $(git -C "$T" rev-parse HEAD)" | tee -a "$OUT/source.txt"
+            T0=$(date +%s)
+            cmake -S "$T" -B "$T/build_hip" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 \
+              -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_EXE_LINKER_FLAGS=-no-pie -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DCMAKE_HIP_COMPILER="$HIPCXX" \
+              -DCMAKE_PREFIX_PATH=/opt/rocm > "$OUT/${arm}_hip_configure.log" 2>&1 || { tail -40 "$OUT/${arm}_hip_configure.log"; exit 1; }
+            cmake --build "$T/build_hip" --target llama-server -j "$(nproc)" > "$OUT/${arm}_hip_build.log" 2>&1 || { grep -E "error|FAILED" "$OUT/${arm}_hip_build.log" | head -30; exit 1; }
+            echo "$arm hip build $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt"
+            if [ $VK = 1 ]; then
+              T0=$(date +%s)
+              cmake -S "$T" -B "$T/build_vk" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF \
+                -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF > "$OUT/${arm}_vk_configure.log" 2>&1 \
+                && cmake --build "$T/build_vk" --target llama-server -j "$(nproc)" > "$OUT/${arm}_vk_build.log" 2>&1 \
+                && echo "$arm vulkan build $(( $(date +%s) - T0 )) s" | tee -a "$OUT/source.txt" \
+                || { echo "$arm vulkan build FAILED" | tee -a "$OUT/source.txt"; grep -E "error|FAILED" "$OUT/${arm}_vk_build.log" "$OUT/${arm}_vk_configure.log" 2>/dev/null | head -20; }
+            fi
+          done
+          cat "$T"/README.md "$T"/docs/*.md "$T"/docs/*/*.md "$T"/tools/server/README.md > "$W/corpus.txt" 2>/dev/null
+          wait "$CURL_PID"; cat "$OUT/curl_moe.log" "$OUT/curl_dense.log"; ls -la "$W/model"
+          [ "$(stat -c %s "$MOE")" -gt 10000000000 ] || { echo "FATAL: MoE model size"; exit 1; }
+          {
+            echo "AMD_CI_MOE=$MOE"; echo "AMD_CI_DENSE=$DENSE"; echo "AMD_CI_CORPUS=$W/corpus.txt"
+            echo "AMD_CI_BASE=$W/src_base"; echo "AMD_CI_HEAD=$W/src_head"; echo "HIP_PATH=/opt/rocm"; echo "ROCM_PATH=/opt/rocm"
+          } >> "$GITHUB_ENV"
+
+      - name: Probe ROCm (base vs head)
+        timeout-minutes: 60
+        run: |
+          set +e
+          python3 -u amd_ci/probes/fit_ubatch_probe.py --bin base=$AMD_CI_BASE/build_hip/bin --bin head=$AMD_CI_HEAD/build_hip/bin \
+            --model "$AMD_CI_MOE" --corpus "$AMD_CI_CORPUS" --out "$AMD_CI_WORK/out/hip_moe" \
+            --case "ctx16k=-c 16384 --fit on" --case "ctxauto=--fit on" --case "ctxauto_m512=--fit on -fitt 512"
+          python3 -u amd_ci/probes/fit_ubatch_probe.py --bin base=$AMD_CI_BASE/build_hip/bin --bin head=$AMD_CI_HEAD/build_hip/bin \
+            --model "$AMD_CI_DENSE" --corpus "$AMD_CI_CORPUS" --out "$AMD_CI_WORK/out/hip_dense" --case "ctx16k=-c 16384 --fit on"
+          test -s "$AMD_CI_WORK/out/hip_moe/rows.jsonl"
+
+      - name: Probe Vulkan (base vs head)
+        timeout-minutes: 60
+        run: |
+          set +e
+          if [ ! -x "$AMD_CI_HEAD/build_vk/bin/llama-server" ] || [ ! -x "$AMD_CI_BASE/build_vk/bin/llama-server" ]; then
+            echo "no Vulkan build on this runner" | tee "$AMD_CI_WORK/out/vulkan_skipped.txt"; exit 0
+          fi
+          python3 -u amd_ci/probes/fit_ubatch_probe.py --bin base=$AMD_CI_BASE/build_vk/bin --bin head=$AMD_CI_HEAD/build_vk/bin \
+            --model "$AMD_CI_MOE" --corpus "$AMD_CI_CORPUS" --out "$AMD_CI_WORK/out/vk_moe" \
+            --case "ctx16k=-c 16384 --fit on" --case "ctxauto_m512=--fit on -fitt 512"
+
+      - name: Free disk
+        if: always()
+        run: |
+          rm -rf "${AMD_CI_WORK:?}/model" "${AMD_CI_WORK:?}/llama" "${AMD_CI_WORK:?}/src_base" "${AMD_CI_WORK:?}/src_head"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr321-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
