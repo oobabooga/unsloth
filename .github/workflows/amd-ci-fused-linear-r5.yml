@@ -40,7 +40,7 @@ env:
   UNSLOTH_SHA: "afbd9f0a26a1b67321a92c0fba7183951e36ae93"
   # Expected zoo states (informational: states.py resolves them live from the PR; the probes record the real SHAs).
   EXPECT_ZOO_BASE: "5a1207c80543aadade24ce93e5bc2af7e524fa3e"
-  EXPECT_ZOO_HEAD: "57777dda51a83e2326df06320a7fdd5b5b7f0f8c"
+  EXPECT_ZOO_HEAD: "bc326b6a95bb15eff05fd315eefc55e23f7cd559"
 
 jobs:
 
