@@ -23,7 +23,7 @@ name: "AMD CI: zoo PR 1866 fused linear r8"
 
 on:
   push:
-    branches: [amd-ci-fused-linear-r8]
+    branches: [amd-ci-fused-linear-r5]
   workflow_dispatch:
 
 permissions:
@@ -37,10 +37,10 @@ env:
   # unsloth is pinned to ONE commit for every zoo state (PR unslothai/unsloth#14185 head); only unsloth-zoo varies.
   UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
   UNSLOTH_PR: "14185"
-  UNSLOTH_SHA: "c1d3aa98ed33ac3c50947b1b60c765bb6be72c5f"
+  UNSLOTH_SHA: "afbd9f0a26a1b67321a92c0fba7183951e36ae93"
   # Expected zoo states (informational: states.py resolves them live from the PR; the probes record the real SHAs).
-  EXPECT_ZOO_BASE: "cda2b273b53384a9a1765f2c037d5dc78a8370de"
-  EXPECT_ZOO_HEAD: "e69996fde0fd35da319e5474cbcbfa87c48bcbd5"
+  EXPECT_ZOO_BASE: "5a1207c80543aadade24ce93e5bc2af7e524fa3e"
+  EXPECT_ZOO_HEAD: "57777dda51a83e2326df06320a7fdd5b5b7f0f8c"
 
 jobs:
 
