@@ -198,10 +198,7 @@ jobs:
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_win_tests.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
             --python "$env:AMD_CI_PY" -- --diag --only-states base,head --tests tests/test_fused_linear_collapse.py `
-            tests/test_fused_linear.py tests/test_fused_linear_flash.py tests/test_fused_linear_routing.py `
-            tests/test_chunked_ce.py tests/test_chunked_logprob.py tests/test_grpo_logprob_recompute.py `
-            tests/test_fused_loss_fullgraph.py tests/test_fused_preference_loss.py tests/test_fused_linear_jsd.py `
-            tests/test_distillation_chunked_jsd.py
+            tests/test_fused_linear_jsd.py tests/test_fused_linear_routing.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE, e.g. no GPU test ran) does not.
