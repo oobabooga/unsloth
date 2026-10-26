@@ -1,0 +1,192 @@
+name: "AMD CI: zoo #2080 / #2079 / #2035 + unsloth #15244 fused losses r6"
+
+# Derived from amd_ci/templates/workflow.yml via the r5 (zoo #1866) workflow: one GPU job, serialised on the
+# shared group, the Studio venv built once from ONE pinned unsloth commit; every zoo differential puts its
+# state's zoo checkout first on PYTHONPATH, the unsloth differential runs in its state's unsloth checkout.
+
+on:
+  push:
+    branches: [amd-ci-fused-linear-r6]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "2080"
+  UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
+  MERGED: "1"
+  # unsloth main after #15244 (8fec28219); the venv's unsloth for every zoo state.
+  UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
+  UNSLOTH_SHA: "8fec28219290c45e74fae616818707a829a296e4"
+  # zoo main after #2080: the venv's zoo (used by the unsloth #15244 differential; zoo states override it).
+  ZOO_MAIN_SHA: "1def1905bd9a86a4281a70a3d22b31c78acfac86"
+
+jobs:
+
+  gpu:
+    name: "fused losses r6 GPU check (shared GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    # --shared-gpu: no concurrency group, so a co-tenant may share the card.
+    # Correctness only; capability.py reports `exclusive_gpu` as a gap.
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "fl-r6-gpu"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr 2080 --merged \
+            --root "$AMD_CI_WORK/s2080" --out "$AMD_CI_WORK/out/states_2080.json"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr 2079 --merged \
+            --root "$AMD_CI_WORK/s2079" --out "$AMD_CI_WORK/out/states_2079.json"
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr 2035 --merged \
+            --root "$AMD_CI_WORK/s2035" --out "$AMD_CI_WORK/out/states_2035.json"
+          python3 amd_ci/lib/states.py --repo "$UNSLOTH_REPO" --pr 15244 --merged \
+            --root "$AMD_CI_WORK/s15244" --out "$AMD_CI_WORK/out/states_15244.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          for f in 2080 2079 2035 15244; do
+            python3 -c 'import json, sys; print(sys.argv[2], json.load(open(sys.argv[1], encoding="utf-8"))["commits"])' "$AMD_CI_WORK/out/states_$f.json" "$f"
+          done
+          U="$AMD_CI_WORK/unsloth"
+          git clone -q --filter=blob:none "$UNSLOTH_REPO" "$U"
+          git -C "$U" checkout -q --detach "$UNSLOTH_SHA"
+          echo "unsloth at $(git -C "$U" rev-parse HEAD)"
+          cd "$U"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          export UNSLOTH_ZOO_REF="$ZOO_MAIN_SHA"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          set +e
+          "$V/bin/python" -m pip install -q pytest pytest-timeout
+          rc=$?
+          set -e
+          [ "$rc" -eq 0 ] || uv pip install --python "$V/bin/python" -q pytest pytest-timeout
+          "$V/bin/python" -c "import torch, triton, trl, transformers, unsloth_zoo; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda?', torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName, 'triton', triton.__version__, 'trl', trl.__version__, 'transformers', transformers.__version__, 'zoo', unsloth_zoo.__file__)"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: HIP libdevice and collapse facts (zoo #2080 base and head, observation only)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          for st in base head; do
+            P=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["paths"][sys.argv[2]])' "$AMD_CI_WORK/out/states_2080.json" "$st")
+            PYTHONPATH="$P" UNSLOTH_IS_PRESENT=1 "$AMD_CI_PY" amd_ci/probes/hip_libdevice_facts.py --out "$AMD_CI_WORK/out/libdevice_$st.json"
+            echo "== $st ($P)"; cat "$AMD_CI_WORK/out/libdevice_$st.json"
+          done
+
+      - name: Differential (zoo #2080 GPU unit tests)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_2080.json" \
+            --probe amd_ci/probes/zoo_pytest_probe.py \
+            --criteria amd_ci/criteria/zoo_gpu_tests.py \
+            --out-dir "$AMD_CI_WORK/out/t2080" \
+            --python "$AMD_CI_PY" -- --tests tests/test_fused_linear_collapse.py tests/test_fused_linear.py \
+            tests/test_fused_linear_flash.py tests/test_fused_linear_routing.py tests/test_chunked_ce.py \
+            tests/test_chunked_logprob.py tests/test_grpo_logprob_recompute.py tests/test_fused_loss_fullgraph.py \
+            tests/test_fused_preference_loss.py tests/test_fused_linear_jsd.py tests/test_distillation_chunked_jsd.py \
+            --only-states base,head
+          cat "$AMD_CI_WORK/out/t2080/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/t2080"
+
+      - name: Differential (zoo #2080 tiny SFT + DPO)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_2080.json" \
+            --probe amd_ci/probes/zoo_train_probe.py \
+            --criteria amd_ci/criteria/zoo_train_parity.py \
+            --out-dir "$AMD_CI_WORK/out/train2080" \
+            --python "$AMD_CI_PY" -- --jobs sft,dpo --max-steps 10 --repeats 2 --only-states base,head
+          cat "$AMD_CI_WORK/out/train2080/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/train2080"
+
+      - name: Differential (zoo #2079 fused JSD)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_2079.json" \
+            --probe amd_ci/probes/zoo_pytest_probe.py \
+            --criteria amd_ci/criteria/zoo_gpu_tests.py \
+            --out-dir "$AMD_CI_WORK/out/t2079" \
+            --python "$AMD_CI_PY" -- --tests tests/test_fused_linear_jsd.py tests/test_distillation_chunked_jsd.py \
+            tests/test_fused_linear.py --only-states base,head
+          cat "$AMD_CI_WORK/out/t2079/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/t2079"
+
+      - name: Differential (zoo #2035 fp32 head once)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_2035.json" \
+            --probe amd_ci/probes/zoo_pytest_probe.py \
+            --criteria amd_ci/criteria/zoo_gpu_tests.py \
+            --out-dir "$AMD_CI_WORK/out/t2035" \
+            --python "$AMD_CI_PY" -- --tests tests/test_grpo_fp32_head_once.py tests/test_grpo_packed_grad_oom_recovery.py \
+            tests/test_grpo_packed_verify_raw_logits.py tests/test_grpo_prefix_grouper_raw_logits.py \
+            tests/test_grpo_logprob_recompute.py tests/test_fused_linear.py --only-states base,head
+          cat "$AMD_CI_WORK/out/t2035/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/t2035"
+
+      - name: Differential (unsloth #15244 trainer routes, venv zoo = zoo main)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states_15244.json" \
+            --probe amd_ci/probes/pytest_probe.py \
+            --criteria amd_ci/criteria/pytest_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/t15244" \
+            --python "$AMD_CI_PY" -- --subdir . --timeout 3000 --tests tests/test_ppo_fused_logprobs.py \
+            tests/test_rloo_fused_logprobs.py tests/python/test_fused_linear_bco.py \
+            tests/python/test_fused_linear_online_dpo.py tests/python/test_fused_linear_xpo_nash_md.py \
+            tests/python/test_gkd_fused_linear_jsd.py tests/python/test_gkd_chunked_jsd.py \
+            tests/python/test_fused_linear_trl_routes.py tests/python/test_preference_chunked_logprobs.py \
+            tests/test_dpo_chunked_logprobs.py
+          cat "$AMD_CI_WORK/out/t15244/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/t15244"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fl-r6-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
