@@ -82,6 +82,8 @@ def main():
             rec["inductor"] = {"error": _err(e), "tb": traceback.format_exc()[-3000:]}
         save()
         try:
+            import os
+            os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
             import unsloth_zoo.fused_losses.fused_linear as fl
 
             before = dict(fl.CALLS)
