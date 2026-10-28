@@ -1,0 +1,471 @@
+diff --git a/tests/test_vendor_fla_rocm_fp32.py b/tests/test_vendor_fla_rocm_fp32.py
+new file mode 100644
+index 00000000..560e53d2
+--- /dev/null
++++ b/tests/test_vendor_fla_rocm_fp32.py
+@@ -0,0 +1,228 @@
++# Unsloth Zoo - Utilities for Unsloth
++# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++"""ROCm gfx11: float32 gated delta leaves fla's kernels for transformers' torch reference.
++
++On a Radeon 8060S (gfx1151, Triton 3.6 / ROCm 7.13) fla's float32 chunk kernels fault
++(chunk_gated_delta_rule_fwd_kernel_h_blockdim64: illegal memory access) or hang
++(prepare_wy_repr_bwd_kernel); bfloat16 / float16 are correct. These tests run on CPU:
++the arch gate, the routing (float32 only, never on CUDA), and the torch path's numerics
++against an fp64 recurrence, forward and backward.
++"""
++
++import os
++import sys
++import types
++
++import pytest
++
++os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
++os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
++
++torch = pytest.importorskip("torch")
++try:
++    from unsloth_zoo.temporary_patches import fla_vendor
++except ImportError as _e:
++    pytest.skip(f"unsloth_zoo unavailable: {_e}", allow_module_level = True)
++
++
++def _fake_torch(hip, archs, available = True):
++    def props(i):
++        return types.SimpleNamespace(gcnArchName = archs[i])
++
++    return types.SimpleNamespace(
++        version = types.SimpleNamespace(hip = "7.13.99004" if hip else None),
++        cuda = types.SimpleNamespace(
++            is_available = lambda: available,
++            device_count = lambda: len(archs),
++            get_device_properties = props,
++        ),
++    )
++
++
++def test_gfx11_is_detected_on_rocm_only():
++    detect = fla_vendor._rocm_has_fp32_faulting_gpu
++    for arch in ("gfx1151", "gfx1151:xnack-", "gfx1100", "gfx1103", "gfx1150"):
++        assert detect(_fake_torch(True, [arch])) is True, arch
++    assert detect(_fake_torch(True, ["gfx942", "gfx1151"])) is True
++    for arch in ("gfx1030", "gfx1201", "gfx942", "gfx90a", "gfx1010", ""):
++        assert detect(_fake_torch(True, [arch])) is False, arch
++    # CUDA builds, no accelerator, no devices, or a torch that raises: never.
++    assert detect(_fake_torch(False, ["gfx1151"])) is False
++    assert detect(_fake_torch(True, ["gfx1151"], available = False)) is False
++    assert detect(_fake_torch(True, [])) is False
++    assert detect(types.SimpleNamespace(version = None)) is False
++
++
++def _recurrent_fp64(q, k, v, g, beta, scale, h0 = None):
++    """Gated delta rule, one token at a time in fp64. q/k (B,T,H,K), v (B,T,HV,V), g/beta (B,T,HV)."""
++    q, k, v, g, beta = (x.double() for x in (q, k, v, g, beta))
++    groups = v.shape[2] // q.shape[2]
++    q = q.repeat_interleave(groups, 2)
++    k = k.repeat_interleave(groups, 2)
++    q = q * torch.rsqrt((q * q).sum(-1, keepdim = True) + 1e-6)
++    k = k * torch.rsqrt((k * k).sum(-1, keepdim = True) + 1e-6)
++    B, T, H, K = q.shape
++    S = torch.zeros(B, H, K, v.shape[-1], dtype = torch.float64) if h0 is None else h0.double()
++    out = []
++    for t in range(T):
++        S = S * g[:, t].exp()[..., None, None]
++        u = beta[:, t][..., None] * (v[:, t] - torch.einsum("bhk,bhkv->bhv", k[:, t], S))
++        S = S + k[:, t][..., :, None] * u[..., None, :]
++        out.append(scale * torch.einsum("bhk,bhkv->bhv", q[:, t], S))
++    return torch.stack(out, 1), S
++
++
++def _inputs(B, T, H, HV, K, V, seed = 0, dtype = torch.float32):
++    gen = torch.Generator().manual_seed(seed)
++    q, k = torch.randn(B, T, H, K, generator = gen), torch.randn(B, T, H, K, generator = gen)
++    v = torch.randn(B, T, HV, V, generator = gen)
++    g = torch.nn.functional.logsigmoid(torch.randn(B, T, HV, generator = gen)) * 0.5
++    beta = torch.rand(B, T, HV, generator = gen)
++    return [x.to(dtype).requires_grad_() for x in (q, k, v, g, beta)]
++
++
++@pytest.mark.parametrize("T", [6, 64, 70])
++def test_torch_path_matches_fp64_forward_and_backward(T):
++    """Grouped value heads (HV = 2H), a non-default scale, an initial state and the final state."""
++    pytest.importorskip("transformers.models.qwen3_next.modeling_qwen3_next")
++    B, H, HV, K, V = 2, 2, 4, 16, 8
++    leaves = _inputs(B, T, H, HV, K, V)
++    h0 = torch.randn(B, HV, K, V, generator = torch.Generator().manual_seed(3)) * 0.1
++    scale = 0.3
++    o, ht = fla_vendor._rocm_fp32_chunk_gated_delta_rule(
++        *leaves, scale = scale, initial_state = h0, output_final_state = True, use_qk_l2norm_in_kernel = True,
++    )
++    ref_leaves = [x.detach().double().requires_grad_() for x in leaves]
++    o_ref, ht_ref = _recurrent_fp64(*ref_leaves, scale, h0)
++    assert o.dtype == torch.float32 and o.shape == (B, T, HV, V)
++    torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
++    torch.testing.assert_close(ht.double(), ht_ref, atol = 2e-5, rtol = 1e-4)
++    do = torch.randn(o.shape, generator = torch.Generator().manual_seed(5))
++    (o * do).sum().backward()
++    (o_ref * do.double()).sum().backward()
++    for mine, ref in zip(leaves, ref_leaves):
++        torch.testing.assert_close(mine.grad.double(), ref.grad, atol = 5e-5, rtol = 1e-3)
++
++
++def test_torch_path_varlen_and_state_v_first():
++    """cu_seqlens: each packed sequence restarts from its own state; V-first state layout."""
++    pytest.importorskip("transformers.models.qwen3_next.modeling_qwen3_next")
++    H, K, V = 2, 16, 8
++    lengths = [5, 0, 67, 3]
++    cu = torch.tensor([0, 5, 5, 72, 75])
++    q, k, v, g, beta = _inputs(1, sum(lengths), H, H, K, V, seed = 1)
++    h0 = torch.randn(len(lengths), H, K, V, generator = torch.Generator().manual_seed(4)) * 0.1
++    o, ht = fla_vendor._rocm_fp32_chunk_gated_delta_rule(
++        q, k, v, g, beta, initial_state = h0.transpose(-1, -2), output_final_state = True,
++        use_qk_l2norm_in_kernel = True, state_v_first = True, cu_seqlens = cu,
++    )
++    assert o.shape == v.shape and ht.shape == (len(lengths), H, V, K)
++    bounds = cu.tolist()
++    for i, (s, e) in enumerate(zip(bounds[:-1], bounds[1:])):
++        if e == s:  # an empty sequence keeps its initial state
++            torch.testing.assert_close(ht[i].transpose(-1, -2), h0[i])
++            continue
++        o_ref, ht_ref = _recurrent_fp64(
++            *(x.detach()[:, s:e] for x in (q, k, v, g, beta)), K ** -0.5, h0[i : i + 1]
++        )
++        torch.testing.assert_close(o[:, s:e].double(), o_ref, atol = 2e-5, rtol = 1e-4)
++        torch.testing.assert_close(ht[i : i + 1].transpose(-1, -2).double(), ht_ref, atol = 2e-5, rtol = 1e-4)
++
++
++def _install_fake_fla(monkeypatch):
++    """A live fla with the three names the installer touches, plus a modeling module bound to it."""
++    calls = []
++
++    def chunk_gated_delta_rule(q, k, v, g, beta, scale = None, initial_state = None,
++                               output_final_state = False, use_qk_l2norm_in_kernel = False, **kwargs):
++        calls.append(("fla", q.dtype))
++        return "fla"
++
++    def chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state, output_final_state, **kwargs):
++        calls.append(("fwd", q.dtype))
++        return "fwd"
++
++    def chunk_gated_delta_rule_bwd(q, k, v, g, beta, A, scale, initial_state, do, dht, **kwargs):
++        calls.append(("bwd", q.dtype))
++        return "bwd"
++
++    package = types.ModuleType("fla.ops.gated_delta_rule")
++    chunk = types.ModuleType("fla.ops.gated_delta_rule.chunk")
++    package.chunk_gated_delta_rule = chunk.chunk_gated_delta_rule = chunk_gated_delta_rule
++    chunk.chunk_gated_delta_rule_fwd = chunk_gated_delta_rule_fwd
++    chunk.chunk_gated_delta_rule_bwd = chunk_gated_delta_rule_bwd
++    modeling = types.ModuleType("transformers.models.qwen3_5.modeling_qwen3_5")
++    modeling.chunk_gated_delta_rule = chunk_gated_delta_rule
++    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", package)
++    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule.chunk", chunk)
++    monkeypatch.setitem(sys.modules, "transformers.models.qwen3_5.modeling_qwen3_5", modeling)
++    return package, chunk, modeling, calls
++
++
++def test_cuda_and_other_archs_leave_fla_untouched(monkeypatch):
++    package, chunk, modeling, _ = _install_fake_fla(monkeypatch)
++    before = (package.chunk_gated_delta_rule, chunk.chunk_gated_delta_rule_fwd, chunk.chunk_gated_delta_rule_bwd)
++    for fake in (_fake_torch(False, ["gfx1151"]), _fake_torch(True, ["gfx942"]), _fake_torch(True, ["gfx1201"])):
++        assert fla_vendor._install_rocm_fp32_torch_path(fake) is False
++    after = (package.chunk_gated_delta_rule, chunk.chunk_gated_delta_rule_fwd, chunk.chunk_gated_delta_rule_bwd)
++    assert all(a is b for a, b in zip(before, after))
++    assert modeling.chunk_gated_delta_rule is before[0]
++
++
++def test_gfx11_routes_only_float32_to_torch(monkeypatch):
++    package, chunk, modeling, calls = _install_fake_fla(monkeypatch)
++    original = package.chunk_gated_delta_rule
++    assert fla_vendor._install_rocm_fp32_torch_path(_fake_torch(True, ["gfx1151"])) is True
++    wrapped = package.chunk_gated_delta_rule
++    assert wrapped is not original
++    assert chunk.chunk_gated_delta_rule is wrapped and modeling.chunk_gated_delta_rule is wrapped
++    # Idempotent: a second pass does not wrap again.
++    assert fla_vendor._install_rocm_fp32_torch_path(_fake_torch(True, ["gfx1151"])) is True
++    assert package.chunk_gated_delta_rule is wrapped
++
++    # CPU tensors stand in for a gfx11 device: the per-call check is the only thing faked.
++    monkeypatch.setattr(
++        fla_vendor, "_rocm_fp32_on_faulting_gpu",
++        lambda *ts: any(isinstance(t, torch.Tensor) and t.dtype == torch.float32 for t in ts),
++    )
++    seen = []
++    monkeypatch.setattr(fla_vendor, "_rocm_fp32_chunk_gated_delta_rule", lambda *a, **k: seen.append(k) or "torch")
++    for dtype in (torch.bfloat16, torch.float16):
++        q, k, v, g, beta = _inputs(1, 4, 2, 2, 8, 8, dtype = dtype)
++        assert wrapped(q, k, v, g = g.float(), beta = beta, use_qk_l2norm_in_kernel = True) == "fla"
++    q, k, v, g, beta = _inputs(1, 4, 2, 2, 8, 8)
++    assert wrapped(q, k, v, g = g, beta = beta, initial_state = None, output_final_state = True,
++                   use_qk_l2norm_in_kernel = True, cu_seqlens = None) == "torch"
++    assert [c for c in calls if c[0] == "fla"] == [("fla", torch.bfloat16), ("fla", torch.float16)]
++    assert seen[0]["output_final_state"] is True and seen[0]["use_qk_l2norm_in_kernel"] is True
++
++    # Internals refuse float32 before any launch; other dtypes pass through.
++    with pytest.raises(RuntimeError, match = "float32"):
++        chunk.chunk_gated_delta_rule_fwd(q = q, k = k, v = v, g = g, beta = beta, scale = 1.0,
++                                         initial_state = None, output_final_state = False)
++    with pytest.raises(RuntimeError, match = "float32"):
++        chunk.chunk_gated_delta_rule_bwd(q, k, v, g, beta, None, 1.0, None, v, None)
++    qb, kb, vb = (x.detach().bfloat16() for x in (q, k, v))
++    assert chunk.chunk_gated_delta_rule_fwd(q = qb, k = kb, v = vb, g = g, beta = beta, scale = 1.0,
++                                            initial_state = None, output_final_state = False) == "fwd"
++
++
++def test_per_call_check_is_false_off_rocm(monkeypatch):
++    """A CUDA build answers False before reading any device: NVIDIA routing never changes."""
++    monkeypatch.setattr(torch.version, "hip", None, raising = False)
++    x = torch.zeros(2, dtype = torch.float32)
++    assert fla_vendor._rocm_fp32_on_faulting_gpu(x, x, x) is False
+diff --git a/unsloth_zoo/temporary_patches/fla_vendor.py b/unsloth_zoo/temporary_patches/fla_vendor.py
+index bf02a44a..f4d01deb 100644
+--- a/unsloth_zoo/temporary_patches/fla_vendor.py
++++ b/unsloth_zoo/temporary_patches/fla_vendor.py
+@@ -22,6 +22,8 @@ an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VE
+ ``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
+ on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
+ ``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
++On ROCm gfx11 float32 chunk_gated_delta_rule calls take transformers' pure-torch reference
++(fla's float32 chunk kernels fault there); bfloat16 / float16 and CUDA are untouched.
+ Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
+ """
+ 
+@@ -1239,6 +1241,212 @@ def _install_gdn_backend():
+     return True
+ 
+ 
++# ROCm gfx11 (RDNA3 / RDNA3.5): fla's chunked gated-delta kernels built for float32 inputs
++# fault on gfx1151 (Radeon 8060S, Triton 3.6 / ROCm 7.13): chunk_gated_delta_rule_fwd_kernel_h_blockdim64
++# hits an illegal memory access and prepare_wy_repr_bwd_kernel hangs, with every config that fits
++# in 64 KB of LDS. The same kernels in bfloat16 / float16 run and match an fp64 reference, so only
++# float32 calls leave fla: they take transformers' pure-torch chunked reference. Never on CUDA.
++_ROCM_FP32_TORCH_PATH_GFX = "gfx11"
++_ROCM_FP32_MARK = "_unsloth_rocm_fp32_torch_path"
++_rocm_fp32_state = {"arch": {}, "reference": None, "calls": 0, "logged": False}
++
++
++def _hip_gfx_arch(torch_mod, index):
++    """gcnArchName of HIP device ``index`` without feature flags ("gfx1151"), or "" if unknown."""
++    try:
++        props = torch_mod.cuda.get_device_properties(index)
++        return str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
++    except Exception:
++        return ""
++
++
++def _rocm_has_fp32_faulting_gpu(torch_mod=None):
++    """ROCm and some visible GPU is gfx11; CUDA, CPU or unreadable -> False."""
++    try:
++        if torch_mod is None:
++            import torch as torch_mod
++        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
++            return False
++        if not torch_mod.cuda.is_available():
++            return False
++        return any(
++            _hip_gfx_arch(torch_mod, i).startswith(_ROCM_FP32_TORCH_PATH_GFX)
++            for i in range(int(torch_mod.cuda.device_count()))
++        )
++    except Exception:
++        return False
++
++
++def _rocm_fp32_on_faulting_gpu(*tensors):
++    """Any float32 tensor among ``tensors`` sits on a ROCm gfx11 device."""
++    import torch
++    if getattr(torch.version, "hip", None) is None:
++        return False
++    for t in tensors:
++        if not isinstance(t, torch.Tensor) or t.dtype != torch.float32 or t.device.type != "cuda":
++            continue
++        index = t.device.index if t.device.index is not None else torch.cuda.current_device()
++        arch = _rocm_fp32_state["arch"].get(index)
++        if arch is None:
++            arch = _rocm_fp32_state["arch"][index] = _hip_gfx_arch(torch, index)
++        if arch.startswith(_ROCM_FP32_TORCH_PATH_GFX):
++            return True
++    return False
++
++
++def _torch_reference_chunk_gated_delta_rule():
++    """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (the kernel-hub fallback), unwrapped."""
++    if _rocm_fp32_state["reference"] is not None:
++        return _rocm_fp32_state["reference"]
++    for pkg in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
++        try:
++            mod = importlib.import_module(f"transformers.models.{pkg}.modeling_{pkg}")
++        except Exception:
++            continue
++        fn = getattr(mod, "torch_chunk_gated_delta_rule", None)
++        if fn is not None:
++            _rocm_fp32_state["reference"] = inspect.unwrap(fn)
++            return _rocm_fp32_state["reference"]
++    raise RuntimeError("Unsloth: transformers has no torch_chunk_gated_delta_rule to run float32 gated delta on ROCm gfx11.")
++
++
++def _rocm_fp32_chunk_gated_delta_rule(
++    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
++    use_qk_l2norm_in_kernel = False, use_beta_sigmoid_in_kernel = False, allow_neg_eigval = False,
++    state_v_first = False, cu_seqlens = None, cu_seqlens_cpu = None, cp_context = None, **kwargs,
++):
++    """fla's ``chunk_gated_delta_rule`` contract computed by transformers' torch reference."""
++    import torch
++    if cp_context is not None or kwargs.get("use_gate_in_kernel") or kwargs.get("head_first"):
++        raise RuntimeError(
++            "Unsloth: float32 gated delta on ROCm gfx11 runs in pure torch, which does not support "
++            "context parallel, use_gate_in_kernel or head_first. Use bfloat16 or float16."
++        )
++    reference = _torch_reference_chunk_gated_delta_rule()
++    if use_beta_sigmoid_in_kernel:
++        beta = beta.float().sigmoid() * (2.0 if allow_neg_eigval else 1.0)
++    groups = v.shape[2] // q.shape[2]
++    if groups > 1:
++        q = q.repeat_interleave(groups, dim = 2)
++        k = k.repeat_interleave(groups, dim = 2)
++    if use_qk_l2norm_in_kernel:
++        q = _fp32_l2norm(q)
++        k = _fp32_l2norm(k)
++    head_dim = q.shape[-1]
++    if scale is None:
++        scale = head_dim ** -0.5
++    # The reference multiplies q by head_dim ** -0.5 itself.
++    q = q * (scale * head_dim ** 0.5)
++    if initial_state is not None and state_v_first:
++        initial_state = initial_state.transpose(-1, -2)
++
++    def run(qs, ks, vs, gs, bs, h0):
++        return reference(
++            qs, ks, vs, gs, bs, initial_state = h0, output_final_state = output_final_state,
++            use_qk_l2norm_in_kernel = False,
++        )
++
++    if cu_seqlens is None:
++        o, final_state = run(q, k, v, g, beta, initial_state)
++    else:
++        bounds = (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens).tolist()
++        outs, states = [], []
++        for i, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
++            h0 = initial_state[i : i + 1] if initial_state is not None else None
++            if end <= start:
++                states.append(h0.float() if h0 is not None else q.new_zeros(
++                    1, v.shape[2], head_dim, v.shape[-1], dtype = torch.float32))
++                continue
++            o_i, h_i = run(*(t[:, start:end] for t in (q, k, v, g, beta)), h0)
++            outs.append(o_i)
++            states.append(h_i)
++        o = torch.cat(outs, dim = 1) if outs else v.new_zeros(v.shape)
++        final_state = torch.cat(states, dim = 0) if output_final_state else None
++    if final_state is not None and state_v_first:
++        final_state = final_state.transpose(-1, -2).contiguous()
++    return o, final_state
++
++
++def _make_rocm_fp32_chunk_gated_delta_rule(original):
++    """float32 on a ROCm gfx11 GPU -> torch reference; everything else -> ``original``, untouched."""
++    signature = inspect.signature(original)
++
++    @functools.wraps(original)
++    def chunk_gated_delta_rule(*args, **kwargs):
++        try:
++            a = signature.bind(*args, **kwargs).arguments
++        except TypeError:
++            return original(*args, **kwargs)
++        if not _rocm_fp32_on_faulting_gpu(a.get("q"), a.get("k"), a.get("v")):
++            return original(*args, **kwargs)
++        _rocm_fp32_state["calls"] += 1
++        if not _rocm_fp32_state["logged"]:
++            _rocm_fp32_state["logged"] = True
++            logger.info(
++                "Unsloth: float32 gated-delta (linear attention) runs in pure torch on this AMD GPU: "
++                "fla's float32 kernels fault on gfx11. bfloat16 / float16 keep the fast kernels."
++            )
++        extra = dict(a.pop("kwargs", {}))
++        return _rocm_fp32_chunk_gated_delta_rule(**a, **extra)
++
++    setattr(chunk_gated_delta_rule, _ROCM_FP32_MARK, "torch")
++    return chunk_gated_delta_rule
++
++
++def _make_rocm_fp32_guard(original, what):
++    """Refuse float32 on ROCm gfx11 before any kernel launches: a direct caller of fla's internals
++    (unsloth's opaque gated-delta op self-checks through them) gets an exception, not a dead GPU."""
++
++    @functools.wraps(original)
++    def guarded(*args, **kwargs):
++        tensors = list(args[:3]) + [kwargs.get(name) for name in ("q", "k", "v")]
++        if _rocm_fp32_on_faulting_gpu(*tensors):
++            raise RuntimeError(
++                f"Unsloth: fla {what} does not run float32 on ROCm gfx11 (its kernels fault); "
++                f"call fla.ops.gated_delta_rule.chunk_gated_delta_rule, which uses pure torch for float32."
++            )
++        return original(*args, **kwargs)
++
++    setattr(guarded, _ROCM_FP32_MARK, "guard")
++    return guarded
++
++
++def _install_rocm_fp32_torch_path(torch_mod=None):
++    """ROCm with a gfx11 GPU: route the live fla's float32 chunk_gated_delta_rule calls to the
++    torch reference and guard its float32 internals. Anything else: nothing is touched. Idempotent."""
++    if not _rocm_has_fp32_faulting_gpu(torch_mod):
++        return False
++    package = sys.modules.get("fla.ops.gated_delta_rule")
++    chunk_mod = sys.modules.get("fla.ops.gated_delta_rule.chunk")
++    original = getattr(package, "chunk_gated_delta_rule", None) if package is not None else None
++    if original is None:
++        return False
++    if getattr(original, _ROCM_FP32_MARK, None) is not None:
++        return True
++    try:
++        import torch
++        wrapped = torch.compiler.disable(_make_rocm_fp32_chunk_gated_delta_rule(original))
++    except Exception:
++        wrapped = _make_rocm_fp32_chunk_gated_delta_rule(original)
++    setattr(wrapped, _ROCM_FP32_MARK, "torch")
++    package.chunk_gated_delta_rule = wrapped
++    if chunk_mod is not None:
++        if getattr(chunk_mod, "chunk_gated_delta_rule", None) is original:
++            chunk_mod.chunk_gated_delta_rule = wrapped
++        for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
++            fn = getattr(chunk_mod, name, None)
++            if fn is not None and getattr(fn, _ROCM_FP32_MARK, None) is None:
++                setattr(chunk_mod, name, _make_rocm_fp32_guard(fn, name))
++    # Modeling modules (and unsloth's compiled copies) that bound the original at import.
++    for modname in _l2norm_modules(_GATED_DELTA_MODELING):
++        mod = sys.modules.get(modname)
++        if mod is not None and getattr(mod, "chunk_gated_delta_rule", None) is original:
++            setattr(mod, "chunk_gated_delta_rule", wrapped)
++    if UNSLOTH_ENABLE_LOGGING:
++        logger.info("Unsloth: float32 gated-delta calls on ROCm gfx11 take the pure-torch path.")
++    return True
++
++
+ _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
+ 
+ 
+@@ -1344,6 +1552,10 @@ def patch_vendor_fla(phase=None):
+             except Exception as e:
+                 if UNSLOTH_ENABLE_LOGGING:
+                     logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
++            try:
++                _install_rocm_fp32_torch_path()
++            except Exception as e:
++                logger.warning(f"Unsloth: could not route float32 gated delta to pure torch on ROCm gfx11: {e}")
+             try:
+                 _install_gdn_backend()
+             except Exception as e:
