@@ -33,7 +33,9 @@ HERE = Path(__file__).resolve().parent
 PIN_SIM = HERE / "pin2222" / "pin_sim.py"
 TORCH = "2.14.1+rocm7.14"
 ROCM_INDEX = "https://download.pytorch.org/whl/rocm7.14"
-DEPS = ["transformers==5.21.0", "accelerate", "peft", "psutil", "filelock", "packaging", "numpy"]
+# The set a CPU venv imports every arm with (checked locally on f1833f5, e96d1da14, 1752aebeb, 874fc8dc6).
+DEPS = ["transformers==5.21.0", "accelerate==1.15.0", "peft==0.21.2", "psutil", "filelock", "packaging", "numpy",
+        "requests", "pyyaml", "safetensors", "tokenizers", "huggingface-hub", "tqdm", "regex"]
 CAP_MIB = {"1": 10, "1b": 10, "2": 10, "3": 11}
 CONF = {"1": "pinned_max_cached_size_mb:4", "1b": "pinned_max_cached_size_mb:4",
         "2": "pinned_max_round_threshold_mb:1", "3": "pinned_max_round_threshold_mb:1"}
@@ -175,7 +177,8 @@ def main() -> int:
             dest = work / "arms" / name
             if not (dest / "unsloth_zoo").is_dir():
                 dest.mkdir(parents = True, exist_ok = True)
-                ar = subprocess.run(["git", "-C", args.checkout, "archive", sha, "unsloth_zoo"], capture_output = True)
+                # Whole tree: unsloth_zoo imports the sibling top-level package unsloth_zoo_downloads.
+                ar = subprocess.run(["git", "-C", args.checkout, "archive", sha], capture_output = True)
                 if ar.returncode:
                     obs.setdefault("arm_errors", {})[name] = ar.stderr.decode(errors = "replace")[-800:]
                     continue
