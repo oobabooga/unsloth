@@ -1,4 +1,4 @@
-name: "AMD CI: validate PR 2169"
+name: "AMD CI: validate PR 2166"
 
 # Generated from amd_ci/templates/workflow.yml. Edit the PROBE and CRITERIA env
 # values, and the tests/args, rather than the plumbing.
@@ -30,20 +30,25 @@ permissions:
   contents: read
 
 env:
-  PR: "2169"
+  PR: "2166"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
   # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
   PATCH_BASE: "9a453b0df7d340cbd11858477289dff6d1a62a06"
   PATCH_FILE: "amd_ci/patches/fl_hip_fp16_v3.patch"
+  # unsloth pinned to one commit (main); the zoo repo has no install.sh. The venv's zoo = base (main);
+  # each arm puts its state's checkout first on PYTHONPATH.
+  UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
+  UNSLOTH_SHA: "bb7ac2bfc5ee490352d8145687a6c94e52beabf9"
+  EXPECT_ZOO_BASE: "9a453b0df7d340cbd11858477289dff6d1a62a06"
 
 jobs:
 
   gpu:
-    name: "PR 2169 GPU measurement (exclusive)"
+    name: "PR 2166 GPU measurement (exclusive)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 120
+    timeout-minutes: 200
     # A shared constant, deliberately: it serialises every GPU measurement across
     # all branches. That is stricter than co-tenancy strictly requires now that the
     # pool is many machines, but nothing in the label set can pin or exclude a
@@ -61,7 +66,7 @@ jobs:
 
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "pr2169-gpu"
+          source amd_ci/lib/preamble.sh "pr2166-gpu"
 
       - name: Hardware gate
         run: |
@@ -84,7 +89,14 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          cd "$AMD_CI_WORK/states/head"
+          python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["commits"])' "$AMD_CI_WORK/out/states.json"
+          # The Studio venv comes from ONE pinned unsloth checkout (the zoo repo has no install.sh).
+          U="$AMD_CI_WORK/unsloth"
+          git clone -q --filter=blob:none "$UNSLOTH_REPO" "$U"
+          git -C "$U" fetch -q origin "$UNSLOTH_SHA" || true
+          git -C "$U" checkout -q --detach "$UNSLOTH_SHA"
+          echo "unsloth at $(git -C "$U" rev-parse HEAD)"
+          cd "$U"
           export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
           echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
           # The runners' uv index (/etc/uv/uv.toml) is a PyPI mirror that lags new releases, so a
@@ -92,6 +104,8 @@ jobs:
           # extra index; give uv the same. A global UV_EXCLUDE_NEWER is NOT a substitute: it drops
           # the ROCm torch index, whose wheels carry no upload time.
           export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          # The venv's own unsloth-zoo is the base; the probe puts each arm's zoo checkout first on PYTHONPATH.
+          export UNSLOTH_ZOO_REF="$EXPECT_ZOO_BASE"
           set +e
           bash install.sh --local 2>&1 | tail -15
           rc=${PIPESTATUS[0]}
@@ -103,8 +117,9 @@ jobs:
           done
           [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
           echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -c "import torch, transformers, trl; print('torch', torch.__version__, 'hip', torch.version.hip, torch.cuda.get_device_properties(0).gcnArchName, 'transformers', transformers.__version__, 'trl', trl.__version__)"
+          "$V/bin/python" -c "import bitsandbytes as b; print('bitsandbytes', b.__version__)" || echo "bitsandbytes import failed"
           # Now with torch present, the gate is meaningful. It EXITS 1 on a miss.
-          # Absolute path: this step cd'd into the head worktree, which has no amd_ci/.
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
@@ -124,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr2169-gpu
+          name: pr2166-gpu
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
