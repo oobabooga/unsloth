@@ -23,6 +23,7 @@ CELLS = {
     "sft4": ["--mode", "sft", "--quant", "4", "--head-dim", "64"],
     "packed": ["--mode", "packed", "--quant", "16", "--head-dim", "256"],
     "packed_r2": ["--mode", "packed", "--quant", "16", "--head-dim", "256"],
+    "moe_control": ["--mode", "moe_control"],
     "infer": ["--mode", "infer", "--head-dim", "64"],
 }
 TESTS = [
@@ -33,7 +34,10 @@ TESTS = [
     "tests/test_sdpa_cudnn_length_bucket_masked.py", "tests/test_multi_lora_experts.py",
     "tests/test_gc_skip_auto_dist_cells.py", "tests/python/test_fused_linear_trl_routes.py",
     "tests/utils/test_packing.py", "tests/test_padding_free_eval.py",
+    "tests/test_multi_lora.py", "tests/test_multi_lora_absent_nan_a_dx.py",
 ]
+# Files whose tests each run in their own process (a HIP illegal access aborts the whole process).
+PER_TEST = ("tests/test_multi_lora_experts.py",)
 CLEAR = ("UNSLOTH_BLOCK_CUDAGRAPHS", "UNSLOTH_BLOCK_COMPILE", "UNSLOTH_PACKED_VARLEN_OVER_FLEX", "UNSLOTH_TORCH_VARLEN",
          "UNSLOTH_FP8_ROWWISE_DIRECT", "UNSLOTH_FP8_DEQUANT_MAX_ROWS", "UNSLOTH_COMPILE_DISABLE", "UNSLOTH_FORCE_FLOAT32",
          "UNSLOTH_HF_PACKED_VARLEN", "UNSLOTH_FLASH_ATTENTION_IMPL", "UNSLOTH_FLEX_ATTENTION_FOR_LARGE_HEAD_DIM")
@@ -48,11 +52,11 @@ def _env(checkout: str, extra: dict) -> dict:
     return env
 
 
-def _pytest_one(checkout, test, out_dir, state, python, timeout):
-    tag = test.replace("/", "_").removesuffix(".py")
+def _pytest_one(checkout, test, out_dir, state, python, timeout, extra_env = None):
+    tag = test.replace("/", "_").replace(".py", "").replace("::", "__").replace("[", "_").replace("]", "")
     junit = out_dir / f"junit_{state}_{tag}.xml"
-    cmd = [python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", f"--junitxml={junit}", test]
-    extra = {"UNSLOTH_COMPILE_LOCATION": str(out_dir / f"compiled_{state}_pytest")}
+    cmd = [python, "-m", "pytest", "-q", "-rfEs", "--tb=short", "-p", "no:cacheprovider", f"--junitxml={junit}", test]
+    extra = {"UNSLOTH_COMPILE_LOCATION": str(out_dir / f"compiled_{state}_pytest"), **(extra_env or {})}
     try:
         p = subprocess.run(cmd, cwd = checkout, env = _env(checkout, extra), capture_output = True,
                            text = True, timeout = timeout)
@@ -95,8 +99,18 @@ def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: i
         obs["note"] = "no selected tests exist at this state"
         return obs
     passed, failed, errors, skipped, msgs = [], [], [], {}, {}
+    units = []
     for t in present:
-        r = _pytest_one(checkout, t, out_dir, state, python, timeout)
+        if t in PER_TEST:
+            c = subprocess.run([python, "-m", "pytest", "-q", "--collect-only", "-p", "no:cacheprovider", t], cwd = checkout,
+                               env = _env(checkout, {}), capture_output = True, text = True, timeout = 600)
+            ids = [ln.strip() for ln in (c.stdout or "").splitlines() if ln.startswith(t + "::")]
+            obs.setdefault("per_test_collected", {})[t] = ids
+            units += [(i, {"AMD_SERIALIZE_KERNEL": "3"}) for i in ids] or [(t, {})]
+        else:
+            units.append((t, {}))
+    for t, env_extra in units:
+        r = _pytest_one(checkout, t, out_dir, state, python, timeout, env_extra)
         obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "no_junit", "stderr_tail", "stdout_tail", "junit_error")
                            if r.get(k) is not None}
         obs["files"][t]["n"] = len(r["passed"]) + len(r["failed"]) + len(r["errors"]) + len(r["skipped"])
@@ -112,7 +126,7 @@ def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: i
 def run_cell(checkout: str, name: str, out_dir: Path, state: str, python: str) -> dict:
     out, log = out_dir / f"cell_{state}_{name}.json", out_dir / f"cell_{state}_{name}.log"
     argv = list(CELLS[name])
-    if name != "decisions":
+    if name not in ("decisions", "moe_control"):
         hd = argv[argv.index("--head-dim") + 1]
         argv += ["--model-dir", str(out_dir / f"tiny_mistral_hd{hd}")]  # shared by base and head: same bytes
     extra = {"UNSLOTH_COMPILE_LOCATION": str(out_dir / f"compiled_{state}_{name}")}

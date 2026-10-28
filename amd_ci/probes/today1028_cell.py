@@ -329,9 +329,51 @@ def mode_infer(res, args):
     res["n_new"] = len(res["generated_ids"])
 
 
+def mode_moe_control(res, args):
+    """Control for tests/test_multi_lora_experts.py: the same tiny Qwen3.5 MoE (fp32, GPU) WITHOUT multi-LoRA.
+    Steps run in order and each is recorded; a HIP illegal access aborts the process, so the JSON is
+    rewritten after every step (the last recorded step tells where it died)."""
+    import torch
+    import unsloth  # noqa: F401
+    import transformers
+    import peft
+    import copy
+    versions(res)
+    res["steps"] = {}
+
+    def step(name, fn):
+        res["current_step"] = name
+        args.out.write_text(json.dumps(res, indent = 2, default = str), encoding = "utf-8")
+        try:
+            fn()
+            torch.cuda.synchronize()
+            res["steps"][name] = "ok"
+        except Exception as e:  # noqa: BLE001
+            res["steps"][name] = f"ERR {type(e).__name__}: {str(e)[:400]}"
+        args.out.write_text(json.dumps(res, indent = 2, default = str), encoding = "utf-8")
+
+    from huggingface_hub import snapshot_download
+    cls = getattr(transformers, "Qwen3_5MoeForConditionalGeneration", None)
+    if cls is None:
+        res["steps"]["load"] = "no Qwen3_5Moe class"
+        return
+    path = snapshot_download("trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6")
+    holder = {}
+    step("load", lambda: holder.__setitem__("m", cls.from_pretrained(path, torch_dtype = torch.float32).eval().to("cuda")))
+    ids = torch.randint(0, 100, (3, 6), generator = torch.Generator().manual_seed(1)).to("cuda")
+    step("base_forward", lambda: holder["m"](input_ids = ids, use_cache = False).logits)
+    cfg = peft.LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"],
+                          target_parameters = ["mlp.experts.down_proj", "mlp.experts.gate_up_proj"], lora_dropout = 0.0)
+    step("peft_wrap", lambda: holder.__setitem__("p", peft.get_peft_model(copy.deepcopy(holder["m"]), cfg)))
+    step("peft_forward", lambda: holder["p"](input_ids = ids, use_cache = False).logits)
+    step("peft_forward_backward", lambda: holder["p"](input_ids = ids, use_cache = False).logits.pow(2).mean().backward())
+    res["current_step"] = None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required = True, choices = ("decisions", "sft", "packed", "infer"))
+    ap.add_argument("--mode", required = True, choices = ("decisions", "sft", "packed", "infer", "moe_control"))
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--model-dir", type = Path)
     ap.add_argument("--head-dim", type = int, default = 64)
@@ -345,6 +387,8 @@ def main() -> int:
         if args.mode == "decisions":
             versions(res)
             mode_decisions(res, args)
+        elif args.mode == "moe_control":
+            mode_moe_control(res, args)
         elif args.mode == "infer":
             mode_infer(res, args)
         else:

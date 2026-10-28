@@ -68,6 +68,10 @@ def gates(obs):
 
 def head_is_worse(base, head):
     problems, notes = [], []
+    for name, o in (("base", base), ("head", head)):
+        mc = _cell(o, "moe_control")
+        notes.append(f"moe_control (tiny Qwen3.5 MoE fp32 on GPU, no multi-LoRA) at {name}: rc {mc.get('rc')} steps "
+                     f"{mc.get('steps')} died in {mc.get('current_step')!r}")
     for k in ("decisions",) + TRAIN + ("infer",):
         bc, hc = _cell(base, k), _cell(head, k)
         if _done(bc) and not _done(hc):
