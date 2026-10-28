@@ -59,6 +59,10 @@ def main() -> int:
     base_env.setdefault("HF_HOME", str(Path(os.environ.get("AMD_CI_WORK", str(work))) / "hf"))
     base_env.update(UNSLOTH_DISABLE_AUTO_UPDATES = "1", PYTHONUTF8 = "1", UNSLOTH_IS_PRESENT = "1")
     base_env.pop("UNSLOTH_GPT_OSS_EAGER_INFERENCE", None)
+    # GitHub sets CI=true, and torch then turns its custom-op aliasing DEPRECATION WARNING into an error
+    # (functorch config error_on_custom_op_aliasing defaults to bool($CI)); users' processes do not have CI set, so
+    # the arms run without it and the warnings are counted instead (alias_warnings per arm).
+    obs["ci_env_unset"] = base_env.pop("CI", None)
 
     def pick_check(model, no4):
         d = work / ("pick_" + model.replace("/", "_"))
@@ -124,7 +128,8 @@ def main() -> int:
                 "utf-8", "replace"))
         (d / "log.txt").write_text(text, encoding = "utf-8")
         rec = {"state": st, "rc": rc, "s": round(time.time() - t, 1), "env": extra,
-               "tail": text[-2500:], "dynamic_cache_fallback": "dynamic cache instead" in text}
+               "tail": text[-2500:], "dynamic_cache_fallback": "dynamic cache instead" in text,
+               "alias_warnings": text.count("will become an error in a future version of PyTorch")}
         for f in ("result.json", "gen.json"):
             if (d / f).is_file():
                 rec[f.split(".")[0]] = json.loads((d / f).read_text(encoding = "utf-8"))

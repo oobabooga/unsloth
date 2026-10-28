@@ -136,7 +136,7 @@ def table(obs: dict) -> str:
         lines.append(f"| {st} | {[round(x, 4) for x in r.get('losses') or []]} | {r.get('step_s')} | "
                      f"{r.get('peak_alloc_gb')} | {r.get('lora_b_after_min')} |")
     lines.append("")
-    lines.append("Arms: " + ", ".join(f"{n} rc={a.get('rc')} {a.get('s')}s dyn_fallback={a.get('dynamic_cache_fallback')}"
+    lines.append("Arms: " + ", ".join(f"{n} rc={a.get('rc')} {a.get('s')}s dyn_fallback={a.get('dynamic_cache_fallback')} alias_warn={a.get('alias_warnings')}"
                                       for n, a in arms.items()))
     return "\n".join(lines)
 
