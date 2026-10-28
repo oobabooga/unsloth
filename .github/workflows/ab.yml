@@ -42,6 +42,7 @@ jobs:
           "W=$W" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           foreach ($d in @("main", "fix")) {
             git init -q "$W\$d"
+            git -C "$W\$d" config core.autocrlf false
             git -C "$W\$d" fetch -q --depth 1 https://github.com/unslothai/unsloth $env:SRC_SHA
             git -C "$W\$d" checkout -q FETCH_HEAD
           }

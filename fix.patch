@@ -1,17 +1,15 @@
 diff --git a/studio/backend/core/inference/sd_cpp_backend.py b/studio/backend/core/inference/sd_cpp_backend.py
-index 235c087768..96e9ce2f35 100644
+index 235c087768..0b9aff6b40 100644
 --- a/studio/backend/core/inference/sd_cpp_backend.py
 +++ b/studio/backend/core/inference/sd_cpp_backend.py
-@@ -1338,9 +1338,9 @@ def accelerator_fallback_reason(accelerator: Optional[str]) -> str:
-     if os.name == "nt":
+@@ -1339,8 +1339,8 @@ def accelerator_fallback_reason(accelerator: Optional[str]) -> str:
          # The loader cannot be asked ahead of time on Windows; a missing DLL is exit 0xC0000135 with no output.
          return (
--            "the ROCm build needs the AMD HIP SDK 7.x runtime DLLs (amdhip64_7.dll, hipblas.dll, rocblas.dll) on "
+             "the ROCm build needs the AMD HIP SDK 7.x runtime DLLs (amdhip64_7.dll, hipblas.dll, rocblas.dll) on "
 -            "PATH; without them Windows stops it before it prints anything (exit 0xC0000135), or the card's gfx "
 -            "target is missing from the prebuilt"
-+            "the ROCm build needs the AMD HIP SDK 7.x runtime DLLs (hipblas.dll, rocblas.dll), found on PATH or "
-+            "under HIP_PATH; without them Windows stops it before it prints anything (exit 0xC0000135), or the "
-+            "card's gfx target is missing from the prebuilt"
++            "PATH or under HIP_PATH; without them Windows stops it before it prints anything (exit 0xC0000135), or "
++            "the card's gfx target is missing from the prebuilt"
          )
      missing = rocm_runtime_missing_sonames()
      if missing is None:
@@ -64,16 +62,18 @@ index 235c087768..96e9ce2f35 100644
          chosen = klass = "vulkan"
      seen: set[str] = set()
 diff --git a/studio/backend/core/inference/sd_cpp_engine.py b/studio/backend/core/inference/sd_cpp_engine.py
-index aae49a59b3..d28361667c 100644
+index aae49a59b3..353a71a028 100644
 --- a/studio/backend/core/inference/sd_cpp_engine.py
 +++ b/studio/backend/core/inference/sd_cpp_engine.py
-@@ -300,10 +300,20 @@ def runtime_env(binary: str, base_env: Optional[dict[str, str]] = None) -> dict[
+@@ -300,10 +300,22 @@ def runtime_env(binary: str, base_env: Optional[dict[str, str]] = None) -> dict[
      if _needs_host_cuda_runtime(bindir):
          dirs.extend(d for d in host_cuda_runtime_dirs() if d not in dirs)
      existing = env.get(var, "")
 -    env[var] = os.pathsep.join(dirs) + (os.pathsep + existing if existing else "")
 +    # After the caller's PATH, so an SDK the user put on PATH still wins.
-+    env[var] = os.pathsep.join([*dirs, *([existing] if existing else []), *host_hip_sdk_dirs(bindir)])
++    env[var] = os.pathsep.join(
++        [*dirs, *([existing] if existing else []), *host_hip_sdk_dirs(bindir)]
++    )
      return env
  
  
@@ -200,10 +200,10 @@ index 392d138c47..8e8f71a7f0 100644
 +    assert windows_path_only.windows_hip_runtime_missing_dlls() == ["hipblas.dll"]
 +    assert windows_path_only.preferred_accelerator("rocm") == "vulkan"
 diff --git a/studio/install_sd_cpp_prebuilt.py b/studio/install_sd_cpp_prebuilt.py
-index 7cb4a71459..04848b899a 100644
+index 7cb4a71459..6bccd5e451 100644
 --- a/studio/install_sd_cpp_prebuilt.py
 +++ b/studio/install_sd_cpp_prebuilt.py
-@@ -725,6 +725,47 @@ def loader_refusal(returncode: Optional[int], output: str = "") -> Optional[str]
+@@ -725,6 +725,48 @@ def loader_refusal(returncode: Optional[int], output: str = "") -> Optional[str]
      return None
  
  
@@ -228,9 +228,10 @@ index 7cb4a71459..04848b899a 100644
 +        pass
 +    dirs: list[str] = []
 +    for root in roots:
-+        if not root or not root.strip().strip('"'):
++        root = (root or "").strip().strip('"')
++        if not root:
 +            continue
-+        bindir = os.path.join(root.strip().strip('"'), "bin")
++        bindir = os.path.join(root, "bin")
 +        # amdhip64_7.dll marks a 7.x SDK: a 6.x hipblas.dll binds the other HIP runtime.
 +        if bindir not in dirs and all(
 +            os.path.isfile(os.path.join(bindir, dll)) for dll in ("hipblas.dll", "amdhip64_7.dll")
@@ -251,17 +252,21 @@ index 7cb4a71459..04848b899a 100644
  def _probe_env(binary: Path) -> dict:
      env = dict(os.environ)
      if sys.platform == "win32":
-@@ -734,7 +775,8 @@ def _probe_env(binary: Path) -> dict:
+@@ -734,7 +776,12 @@ def _probe_env(binary: Path) -> dict:
      else:
          var = "LD_LIBRARY_PATH"
      existing = env.get(var, "")
 -    env[var] = str(binary.parent) + (os.pathsep + existing if existing else "")
-+    parts = [str(binary.parent), *([existing] if existing else []), *hip_sdk_dirs_for_bundle(binary.parent)]
++    parts = [
++        str(binary.parent),
++        *([existing] if existing else []),
++        *hip_sdk_dirs_for_bundle(binary.parent),
++    ]
 +    env[var] = os.pathsep.join(parts)
      return env
  
  
-@@ -837,7 +879,8 @@ def _verify_bundle_starts(
+@@ -837,7 +884,8 @@ def _verify_bundle_starts(
          hint = ""
          if sys.platform == "win32" and accelerator_class(accelerator) == "rocm":
              hint = (
