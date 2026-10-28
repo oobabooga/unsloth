@@ -22,7 +22,7 @@ TITLE = "unsloth main 2026-10-28 (25fd237aad -> 987731ec56) on gfx1151 ROCm: LoR
 MODE = "regression"
 NEEDS = ["rocm", "gpu", "nvidia", "windows", "multi_gpu"]
 RTOL = 2e-2
-TRAIN = ("sft16", "sft4", "packed")
+TRAIN = ("sft16", "sft4", "packed", "packed_r2")
 
 
 def _cell(o, k):
@@ -167,6 +167,20 @@ def head_is_worse(base, head):
                 f"(head cudnn_free_index {hs.get('cudnn_free_index')})")
         (notes if same else problems).append(line)
 
+    # packed A/A (same state twice): noise floor for the packed head-vs-base loss comparison
+    for name, o in (("base", base), ("head", head)):
+        a, b2 = _cell(o, "packed"), _cell(o, "packed_r2")
+        if _done(a) and _done(b2):
+            d = max((abs(x - y) for x, y in zip(a.get("losses") or [], b2.get("losses") or [])), default = None)
+            notes.append(f"packed A/A at {name}: max |dloss| {d}")
+    # pytest: whole-file native crashes first
+    bcr = set(((base or {}).get("pytest") or {}).get("crashed_files") or [])
+    hcr = set(((head or {}).get("pytest") or {}).get("crashed_files") or [])
+    if hcr - bcr:
+        problems.append(f"test files whose pytest process crashed at head, not at base: {sorted(hcr - bcr)} "
+                        f"{[((head.get('pytest') or {}).get('files') or {}).get(t, {}).get('stderr_tail', '')[-600:] for t in sorted(hcr - bcr)]}")
+    if hcr & bcr:
+        notes.append(f"test files crashing at both states (pre-existing): {sorted(hcr & bcr)}")
     # pytest by id
     bp_, hp_ = (base or {}).get("pytest") or {}, (head or {}).get("pytest") or {}
     bpass = set(bp_.get("passed") or [])

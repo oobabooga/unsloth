@@ -22,6 +22,7 @@ CELLS = {
     "sft16": ["--mode", "sft", "--quant", "16", "--head-dim", "64"],
     "sft4": ["--mode", "sft", "--quant", "4", "--head-dim", "64"],
     "packed": ["--mode", "packed", "--quant", "16", "--head-dim", "256"],
+    "packed_r2": ["--mode", "packed", "--quant", "16", "--head-dim", "256"],
     "infer": ["--mode", "infer", "--head-dim", "64"],
 }
 TESTS = [
@@ -47,43 +48,62 @@ def _env(checkout: str, extra: dict) -> dict:
     return env
 
 
-def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: int) -> dict:
-    present = [t for t in TESTS if (Path(checkout) / t).exists()]
-    obs: dict = {"selected": present, "absent_at_this_state": [t for t in TESTS if t not in present]}
-    if not present:
-        obs["note"] = "no selected tests exist at this state"
-        return obs
-    junit = out_dir / f"junit_{state}.xml"
-    cmd = [python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--continue-on-collection-errors",
-           f"--junitxml={junit}", *present]
-    obs["cmd"] = " ".join(cmd)
+def _pytest_one(checkout, test, out_dir, state, python, timeout):
+    tag = test.replace("/", "_").removesuffix(".py")
+    junit = out_dir / f"junit_{state}_{tag}.xml"
+    cmd = [python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", f"--junitxml={junit}", test]
     extra = {"UNSLOTH_COMPILE_LOCATION": str(out_dir / f"compiled_{state}_pytest")}
     try:
         p = subprocess.run(cmd, cwd = checkout, env = _env(checkout, extra), capture_output = True,
                            text = True, timeout = timeout)
         rc, out, err = p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired as exc:
-        rc = -1
+        rc = "timeout"
         out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         err = "TimeoutExpired"
-    (out_dir / f"pytest_{state}.log").write_text(out + "\n--- stderr ---\n" + err, encoding = "utf-8")
-    obs.update(rc = rc, tail = out[-5000:], stderr_tail = err[-2000:])
-    passed, failed, errors, skipped, msgs = [], [], [], {}, {}
+    (out_dir / f"pytest_{state}_{tag}.log").write_text(out + "\n--- stderr ---\n" + err, encoding = "utf-8")
+    rec = {"rc": rc, "passed": [], "failed": [], "errors": [], "skipped": {}, "fail_msgs": {}}
     if junit.is_file():
         try:
             for tc in ET.parse(junit).getroot().iter("testcase"):
                 tid = f"{tc.get('classname')}::{tc.get('name')}"
                 kinds = {c.tag: c for c in tc}
                 if "failure" in kinds or "error" in kinds:
-                    (failed if "failure" in kinds else errors).append(tid)
+                    (rec["failed"] if "failure" in kinds else rec["errors"]).append(tid)
                     k = kinds.get("failure", kinds.get("error"))
-                    msgs[tid] = ((k.get("message") or "") + "\n" + (k.text or "")[-1200:])[:1600]
+                    rec["fail_msgs"][tid] = ((k.get("message") or "") + "\n" + (k.text or "")[-1200:])[:1600]
                 elif "skipped" in kinds:
-                    skipped[tid] = (kinds["skipped"].get("message") or "")[:200]
+                    rec["skipped"][tid] = (kinds["skipped"].get("message") or "")[:200]
                 else:
-                    passed.append(tid)
+                    rec["passed"].append(tid)
         except Exception as e:  # noqa: BLE001
-            obs["junit_error"] = repr(e)
+            rec["junit_error"] = repr(e)
+    else:
+        rec["no_junit"] = True
+    if not (isinstance(rc, int) and rc in (0, 1, 5)):
+        rec["crashed"] = True
+        rec["stderr_tail"] = err[-3000:]
+        rec["stdout_tail"] = out[-1500:]
+    return rec
+
+
+def run_pytest(checkout: str, out_dir: Path, state: str, python: str, timeout: int) -> dict:
+    """One pytest process per file, so a native abort costs only its own file and is named."""
+    present = [t for t in TESTS if (Path(checkout) / t).exists()]
+    obs: dict = {"selected": present, "absent_at_this_state": [t for t in TESTS if t not in present], "files": {}}
+    if not present:
+        obs["note"] = "no selected tests exist at this state"
+        return obs
+    passed, failed, errors, skipped, msgs = [], [], [], {}, {}
+    for t in present:
+        r = _pytest_one(checkout, t, out_dir, state, python, timeout)
+        obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "no_junit", "stderr_tail", "stdout_tail", "junit_error")
+                           if r.get(k) is not None}
+        obs["files"][t]["n"] = len(r["passed"]) + len(r["failed"]) + len(r["errors"]) + len(r["skipped"])
+        passed += r["passed"]; failed += r["failed"]; errors += r["errors"]
+        skipped.update(r["skipped"]); msgs.update(r["fail_msgs"])
+    obs["rc"] = 0 if all(not f.get("crashed") for f in obs["files"].values()) else "crash"
+    obs["crashed_files"] = sorted(t for t, f in obs["files"].items() if f.get("crashed"))
     obs.update(passed = sorted(passed), failed = sorted(failed), errors = sorted(errors), skipped = skipped,
                fail_msgs = msgs, n_passed = len(passed), n_failed = len(failed) + len(errors), n_skipped = len(skipped))
     return obs
@@ -123,7 +143,7 @@ def main() -> int:
     ap.add_argument("--checkout", required = True)
     ap.add_argument("--out", required = True, type = Path)
     ap.add_argument("--python", default = sys.executable)
-    ap.add_argument("--timeout", type = int, default = 2700)
+    ap.add_argument("--timeout", type = int, default = 900)
     args = ap.parse_args()
     args.out = args.out.resolve()
     out_dir = args.out.parent
