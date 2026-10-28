@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k15_bench.py: llama.cpp k15 (9d5b0f0e5a8) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
+"""k15_bench.py: llama.cpp k15 (1b1b9369adf) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
 
 Derived from the k10s k6p_bench.py (ci_k6_amd 737e0eb). Every measurement is a fresh process; arm order rotates per rep.
 env: K6P_DIR work root (bins/<arm dir>, models/, out/), ARMS "name:dir[:VAR=VAL;...]", K6P_DEV device (ROCm0).
@@ -260,7 +260,7 @@ def memstats(s):
             "mtp_ctx_fail_n": len(g(r"failed to create MTP context")),
             "spec_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:draft acceptance rate|n_draft|speculative|draft-mtp|MTP)[^\n]*") if "CMD" not in l][:8],
             "graph_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:CUDA graph|cuda_graph|cudaGraph|hipGraph)[^\n]*")][:6],
-            # k15 r2 (9d5b0f0e5a8): single-graph host misses / mailbox (c98b2f662f2, 5f9e82fd578: CUDA only, HIP has no mapped mailbox),
+            # k15 r2 (1b1b9369adf): single-graph host misses / mailbox (c98b2f662f2, 5f9e82fd578: CUDA only, HIP has no mapped mailbox),
             # PLE read-in (ab9df2b3658 / d9aaecc4448 / 1595d7a813d: Linux only), replay-commit fallback (1811f0c7468)
             "single_on_n": len(g(r"single-graph host misses on")),
             "single_nomb_n": len(g(r"no mapped mailbox|has no mapped mailboxes")),

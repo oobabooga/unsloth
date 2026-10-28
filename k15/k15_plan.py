@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """k15_plan.py: the k15 AMD matrix on one gfx1151 host (Linux or Windows), one k15_bench.py call per step, one log per step.
 
-Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (9d5b0f0e5a8), k10 = ff5a2337 + k10.patch (a162dce854, the last
+Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (1b1b9369adf), k10 = ff5a2337 + k10.patch (a162dce854, the last
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.
@@ -44,7 +44,7 @@ ARMS = [
     # spilled tier, --moe-cache-mib 0 (the GDN warm-up crash path); k10 at the same flags = reference only
     "n_d:k15:%s;K6P_MOE=0" % PIN, "n_d2:k15:%s;K6P_MOE=0" % PIN, "n_ip0:k15:%s;K6P_MOE=0;GGML_CUDA_GDN_STATE_IN_PLACE=0" % PIN,
     "n_dbg:k15:%s;K6P_MOE=0;GGML_CUDA_GDN_STATE_IN_PLACE_DEBUG=1" % PIN, "n_k10:k10:%s;K6P_MOE=0" % PIN,
-    # r2 (9d5b0f0e5a8): mailbox handshake fast path / one-region host experts kill switches at the m_ pins (default = m_d / m_d2), and
+    # r2 (1b1b9369adf): mailbox handshake fast path / one-region host experts kill switches at the m_ pins (default = m_d / m_d2), and
     # LLAMA_MOE_SINGLE=1 forced: HIP has no mapped mailbox (ggml_backend_moe_mailbox_alloc is CUDA only), so the split path must stay
     "m_mbf0:k15:%s;%s;GGML_MOE_MAILBOX_FAST=0" % (PIN, C1), "m_sf0:k15:%s;%s;LLAMA_MOE_SINGLE_FUSED=0" % (PIN, C1),
     "m_s1:k15:%s;%s;LLAMA_MOE_SINGLE=1" % (PIN, C1),

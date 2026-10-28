@@ -264,7 +264,7 @@ def item45(rows, os_):
              [("m_d", "m_d2"), ("m_a0", "m_a02")])
 
 
-# ---------------------------------------------------------------- r2 (9d5b0f0e5a8) additions
+# ---------------------------------------------------------------- r2 (1b1b9369adf) additions
 def item_r2(rows, os_):
     st = lambda r: (r or {}).get("stats") or {}
     # mailbox handshake fast path (c98b2f662f2) + one-region host experts (5f9e82fd578): kill switches vs default at the m_ pins
@@ -417,7 +417,7 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
 item9(load("k15-linux-cpu"))
 
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: 9d5b0f0e5a8 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: 1b1b9369adf (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))
