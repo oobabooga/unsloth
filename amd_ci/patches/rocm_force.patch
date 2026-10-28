@@ -1,0 +1,40 @@
+diff --git a/tests/test_gpt_oss_decode_fused.py b/tests/test_gpt_oss_decode_fused.py
+index c40b09a9..5bf100e9 100644
+--- a/tests/test_gpt_oss_decode_fused.py
++++ b/tests/test_gpt_oss_decode_fused.py
+@@ -123,7 +123,8 @@ def _run(tmp_path, script, *args, env_extra = None):
+ def kernels(tmp_path_factory):
+     tmp = tmp_path_factory.mktemp("gpt_oss_decode_fused")
+     if torch.cuda.is_available():
+-        return _run(tmp, _SCRIPT, "cuda")
++        # Forced on: ROCm takes the kernels only with UNSLOTH_GPT_OSS_FUSED_DECODE=1.
++        return _run(tmp, _SCRIPT, "cuda", env_extra = {"UNSLOTH_GPT_OSS_FUSED_DECODE": "1"})
+     return _run(tmp, _SCRIPT, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
+ 
+ 
+diff --git a/unsloth_zoo/gpt_oss_decode_fused.py b/unsloth_zoo/gpt_oss_decode_fused.py
+index be144337..6c53d180 100644
+--- a/unsloth_zoo/gpt_oss_decode_fused.py
++++ b/unsloth_zoo/gpt_oss_decode_fused.py
+@@ -23,7 +23,7 @@ Same math and rounding points as the eager code (the residual sum is rounded to
+ before the norm, the sink scale is rounded to the output dtype before the multiply). The sink
+ epilogue is bit-identical on CUDA; the norm differs only in the order of its fp32 sum. Inference only: callers check
+ fused_decode_ok() (NVIDIA CUDA tensors, Triton present, no autograd, not tracing).
+-Kill switch: UNSLOTH_GPT_OSS_FUSED_DECODE=0, read at import.
++Kill switch: UNSLOTH_GPT_OSS_FUSED_DECODE=0 (=1 forces it on ROCm too), read at import.
+ """
+ 
+ __all__ = [
+@@ -56,8 +56,10 @@ if HAS_TRITON and not _INTERPRET:
+     except Exception:
+         _libdevice = None
+ 
+-# NVIDIA only for now: the libdevice exp / rsqrt and rounding were verified on sm75 / sm80 / sm120, not on ROCm.
+-_ENABLED = HAS_TRITON and torch.version.hip is None and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
++# UNSLOTH_GPT_OSS_FUSED_DECODE: "0" off, "1" on everywhere, unset = on for NVIDIA only (the libdevice exp / rsqrt and
++# rounding were verified on sm75 / sm80 / sm120; ROCm takes them only when forced).
++_FUSED_ENV = os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "")
++_ENABLED = HAS_TRITON and _FUSED_ENV != "0" and (torch.version.hip is None or _FUSED_ENV == "1")
+ # Engagement counters (tests and benchmarks read them).
+ FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0}
+ _MAX_COLS = 32768
