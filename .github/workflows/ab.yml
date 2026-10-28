@@ -1,0 +1,124 @@
+name: RD-825 Windows ROCm sd.cpp with the HIP SDK off PATH (A/B)
+
+on:
+  push:
+    branches: [amd-devlab-rd825-hip]
+
+permissions:
+  contents: read
+
+env:
+  SRC_SHA: 6cdce47fecbeb931d0e4b3730585cc0160a6d8d3
+
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: h
+
+      - name: Hardware and HIP state of the host
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion,DriverDate
+          Get-ChildItem "$env:SystemRoot\System32" -Filter 'amdhip64*.dll' | Format-Table Name,Length
+          "hipblas.dll in System32: " + (Test-Path "$env:SystemRoot\System32\hipblas.dll")
+          "C:\Program Files\AMD\ROCm exists: " + (Test-Path 'C:\Program Files\AMD\ROCm')
+          "HIP_PATH=$env:HIP_PATH ROCM_PATH=$env:ROCM_PATH"
+          where.exe hipblas.dll 2>&1
+          python --version
+          exit 0
+
+      - name: Sources (main at SRC_SHA, and main + fix)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "rd825"
+          New-Item -ItemType Directory -Force -Path $W, "$W\out", "$W\models" | Out-Null
+          "W=$W" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($d in @("main", "fix")) {
+            git init -q "$W\$d"
+            git -C "$W\$d" fetch -q --depth 1 https://github.com/unslothai/unsloth $env:SRC_SHA
+            git -C "$W\$d" checkout -q FETCH_HEAD
+          }
+          git -C "$W\fix" apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\h\fix.patch"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::patch failed"; exit 1 }
+          git -C "$W\main" log --oneline -1
+          git -C "$W\fix" diff --stat
+          python -m venv "$W\venv"
+          & "$W\venv\Scripts\python.exe" -m pip install -q httpx structlog pydantic huggingface_hub pytest python-msi 2>&1 | Select-Object -Last 2
+          exit 0
+
+      - name: Branch unit tests on Windows
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Push-Location "$env:W\fix\studio\backend"
+          & "$env:W\venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider tests/test_sd_cpp_install_verify.py 2>&1 | Select-Object -Last 8
+          Pop-Location
+          exit 0
+
+      - name: HIP SDK 7.2 files where its MSI puts them (no installer run, no driver change)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $exe = "$env:W\hipsdk.exe"
+          Invoke-WebRequest -Uri 'https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe' -OutFile $exe -Headers @{ Referer = 'https://www.amd.com/' } -UserAgent 'Mozilla/5.0'
+          Invoke-WebRequest -Uri 'https://www.7-zip.org/a/7zr.exe' -OutFile "$env:W\7zr.exe"
+          (Get-Item $exe).Length
+          & "$env:W\venv\Scripts\python.exe" "$env:GITHUB_WORKSPACE\h\prep_sdk.py" $exe "$env:W\7zr.exe" "$env:W\sdkwork" "$env:W\sdk\AMD\ROCm\7.2"
+          Remove-Item $exe
+          Invoke-WebRequest -Uri 'https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf' -OutFile "$env:W\models\sd_turbo-q8_0.gguf"
+          (Get-Item "$env:W\models\sd_turbo-q8_0.gguf").Length
+
+      - name: A/B scenarios
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $py = "$env:W\venv\Scripts\python.exe"
+          $ab = "$env:GITHUB_WORKSPACE\h\ab.py"
+          $sdk = "$env:W\sdk\AMD\ROCm\7.2\"
+          $env:RD825_MODEL = "$env:W\models\sd_turbo-q8_0.gguf"
+          $origPath = $env:PATH
+          function Run-Case($label, $src, $hip, $force, $runs, $pathPrefix) {
+            Write-Host "================ $label ================"
+            $env:UNSLOTH_STUDIO_HOME = "$env:W\home-$label\studio"
+            if ($hip) { $env:HIP_PATH = $hip; $env:HIP_PATH_72 = $hip } else { Remove-Item Env:HIP_PATH -ErrorAction SilentlyContinue; Remove-Item Env:HIP_PATH_72 -ErrorAction SilentlyContinue }
+            if ($force) { $env:UNSLOTH_SD_CPP_WINDOWS_ROCM = $force } else { Remove-Item Env:UNSLOTH_SD_CPP_WINDOWS_ROCM -ErrorAction SilentlyContinue }
+            $env:PATH = if ($pathPrefix) { "$pathPrefix;$origPath" } else { $origPath }
+            $env:RD825_RUNS = "$runs"
+            & $py $ab $label "$env:W\$src" "$env:W\out\$label.json" 2>&1 | Out-String -Width 400 | Write-Host
+            $env:PATH = $origPath
+          }
+          # SDK installed as AMD's MSI leaves it: HIP_PATH set, bin dir not on PATH.
+          Run-Case "A-main-sdk" "main" $sdk $null 2 $null
+          Run-Case "B-fix-sdk" "fix" $sdk $null 2 $null
+          # The user follows the existing log hint and forces the ROCm build.
+          Run-Case "A-main-sdk-forced" "main" $sdk "1" 1 $null
+          # Control: the manual PATH edit AMD's docs describe, on main.
+          Run-Case "C-main-sdk-on-path" "main" $sdk $null 1 ($sdk + "bin")
+          # No SDK at all: unchanged Vulkan fallback.
+          Run-Case "B-fix-nosdk" "fix" $null $null 0 $null
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & "$env:W\venv\Scripts\python.exe" -c "import json,glob,os; [print(os.path.basename(p), json.dumps({k: v for k, v in json.load(open(p)).items() if k in ('preferred_accelerator(rocm)', 'hip_dlls_missing', 'install_record', 'rocm_failure_recorded', 'sd_cli')}), [(g['exit'], g['seconds'], g['png_bytes']) for g in json.load(open(p))['generations']]) for p in sorted(glob.glob(os.path.join(os.environ['W'], 'out', '*.json')))]"
+          exit 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: rd825-ab
+          path: ${{ env.W }}/out
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          Remove-Item -LiteralPath $env:W -Recurse -Force -ErrorAction SilentlyContinue
+          exit 0
