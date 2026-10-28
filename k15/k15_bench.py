@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k15_bench.py: llama.cpp k15 (95b695923af) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
+"""k15_bench.py: llama.cpp k15 (9d5b0f0e5a8) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
 
 Derived from the k10s k6p_bench.py (ci_k6_amd 737e0eb). Every measurement is a fresh process; arm order rotates per rep.
 env: K6P_DIR work root (bins/<arm dir>, models/, out/), ARMS "name:dir[:VAR=VAL;...]", K6P_DEV device (ROCm0).
@@ -41,6 +41,8 @@ a = ap.parse_args()
 
 MODELS = {
     "q35": ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", 532517120, False),
+    # k15 r2: the smallest arch with a lazy-marked PLE table (gemma4 per_layer_tok_embd, TENSOR_READ_LAZY); --lazy-mode on makes it lazy
+    "g4e2b": ("unsloth/gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf", "0314792d7f1f7e229411f620751375812bb9faf2", 3106738272, False),
     "q3m": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "Qwen3.6-35B-A3B-UD-Q3_K_M.gguf", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d", 17104402720, True),
 }
 SHARDS = {}
@@ -258,6 +260,17 @@ def memstats(s):
             "mtp_ctx_fail_n": len(g(r"failed to create MTP context")),
             "spec_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:draft acceptance rate|n_draft|speculative|draft-mtp|MTP)[^\n]*") if "CMD" not in l][:8],
             "graph_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:CUDA graph|cuda_graph|cudaGraph|hipGraph)[^\n]*")][:6],
+            # k15 r2 (9d5b0f0e5a8): single-graph host misses / mailbox (c98b2f662f2, 5f9e82fd578: CUDA only, HIP has no mapped mailbox),
+            # PLE read-in (ab9df2b3658 / d9aaecc4448 / 1595d7a813d: Linux only), replay-commit fallback (1811f0c7468)
+            "single_on_n": len(g(r"single-graph host misses on")),
+            "single_nomb_n": len(g(r"no mapped mailbox|has no mapped mailboxes")),
+            "ple_resident_n": len(g(r"PLE table '[^']*' \([^)]*\) made resident")),
+            "ple_lazy_n": len(g(r"PLE table '[^']*' \([^)]*\) left lazy")),
+            "ple_res_lines": [l.strip()[-260:] for l in g(r"[^\n]*PLE table '[^\n]*")][:3],
+            "rs_fallback_commits": max([int(x) for x in g(r"(\d+) commits in the reserved fallback buffer")] or [0]),
+            "rs_fallback_warn_n": len(g(r"runs in the reserved fallback buffer")),
+            "rs_commits": max([int(x) for x in g(r"recurrent replay commits: (\d+)")] or [0]),
+            "rs_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:replay commit|reserved fallback)[^\n]*")][:4],
             "load_mode_lines": [l.strip()[-200:] for l in g(r"[^\n]*(?:load mode|lazy mode|lazy_mode)[^\n]*")][:4]}
 
 

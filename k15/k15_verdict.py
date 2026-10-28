@@ -264,9 +264,64 @@ def item45(rows, os_):
              [("m_d", "m_d2"), ("m_a0", "m_a02")])
 
 
+# ---------------------------------------------------------------- r2 (9d5b0f0e5a8) additions
+def item_r2(rows, os_):
+    st = lambda r: (r or {}).get("stats") or {}
+    # mailbox handshake fast path (c98b2f662f2) + one-region host experts (5f9e82fd578): kill switches vs default at the m_ pins
+    A = same_set(rows, "q3m", ["m_d", "m_d2", "m_mbf0", "m_sf0", "m_s1"], "r2 mailbox fast / one-region host experts (switches)", os_,
+                 [("m_d", "m_d2")])
+    if A:
+        on = {a: st(A[a]).get("single_on_n", 0) for a in A}
+        nomb = st(A["m_s1"]).get("single_nomb_n", 0)
+        add("r2 mailbox path reach on HIP", os_, "PASS" if not died(A["m_s1"]) else "FAIL",
+            "single-graph host misses on: %s (0 = the path is off, as the code says for a backend without mapped mailboxes); forced "
+            "LLAMA_MOE_SINGLE=1: 'no mapped mailbox' lines %d, %s" % (on, nomb, "ran on the split path" if not died(A["m_s1"]) else "ABORTED"))
+    # replay-commit fallback (1811f0c7468), 4 GB-like budget + MTP
+    R = {a: one(rows, a, "q3m") for a in ("r4_d", "r4_d2", "r4_ff", "r4_fb0")}
+    if any(R[a] is None for a in ("r4_d", "r4_d2", "r4_ff")):
+        add("r2 replay commit fallback, 4 GB budget", os_, "INCONCLUSIVE", "missing %s" % [a for a in R if R[a] is None])
+    else:
+        k = {a: text_key(R[a]) for a in R}
+        why = "md5 %s; replay commits %s; fallback commits %s; reserve off + forced: %s" % (
+            {a: (v and "/".join(x[:8] for x in v if x)) for a, v in k.items()}, {a: st(R[a]).get("rs_commits") for a in R if R[a]},
+            {a: st(R[a]).get("rs_fallback_commits") for a in R if R[a]}, "aborted" if died(R["r4_fb0"]) else "ran" if R["r4_fb0"] else "missing")
+        if any(died(R[a]) for a in ("r4_d", "r4_d2", "r4_ff")):
+            add("r2 replay commit fallback, 4 GB budget", os_, "FAIL", "an arm aborted: %s; %s" % ([a for a in ("r4_d", "r4_d2", "r4_ff") if died(R[a])], why))
+        elif k["r4_d"] != k["r4_d2"]:
+            add("r2 replay commit fallback, 4 GB budget", os_, "VOID", "A/A pair differs; " + why)
+        elif st(R["r4_ff"]).get("rs_fallback_commits", 0) == 0:
+            add("r2 replay commit fallback, 4 GB budget", os_, "VOID", "LLAMA_RS_REPLAY_FALLBACK_FORCE=1 put no commit in the fallback buffer; " + why)
+        elif k["r4_ff"] != k["r4_d"]:
+            add("r2 replay commit fallback, 4 GB budget", os_, "FAIL", "the fallback buffer changes the text; " + why)
+        else:
+            add("r2 replay commit fallback, 4 GB budget", os_, "PASS", "no abort, fallback path = default text; " + why)
+    # PLE read-in: Linux makes the lazy table resident, Windows leaves it lazy (the read-in is Linux only); same text as LLAMA_PLE_RESIDENT=0
+    P = {a: one(rows, a, "g4e2b") for a in ("ple_d", "ple_0", "ple_d2")}
+    if any(v is None for v in P.values()):
+        add("r2 PLE read-in", os_, "INCONCLUSIVE", "missing %s" % [a for a in P if P[a] is None])
+        return
+    k = {a: text_key(P[a]) for a in P}
+    d = st(P["ple_d"])
+    why = "default: made resident %d, left lazy %d (%s); md5 %s" % (d.get("ple_resident_n", 0), d.get("ple_lazy_n", 0), d.get("ple_res_lines", [])[:1],
+                                                               {a: (v and "/".join(x[:8] for x in v if x)) for a, v in k.items()})
+    if any(died(P[a]) for a in P):
+        add("r2 PLE read-in", os_, "FAIL", "an arm aborted; " + why)
+    elif k["ple_d"] != k["ple_d2"]:
+        add("r2 PLE read-in", os_, "VOID", "A/A pair differs; " + why)
+    elif os_ == "linux" and d.get("ple_resident_n", 0) == 0:
+        add("r2 PLE read-in", os_, "VOID", "the table was not made resident on Linux (the read-in never ran); " + why)
+    elif os_ == "windows" and (d.get("ple_resident_n", 0) > 0 or d.get("ple_lazy_n", 0) == 0):
+        add("r2 PLE read-in", os_, "FAIL" if d.get("ple_resident_n", 0) else "VOID",
+            ("made resident on Windows" if d.get("ple_resident_n", 0) else "no PLE decision line (the table was not lazy)") + "; " + why)
+    elif k["ple_d"] != k["ple_0"]:
+        add("r2 PLE read-in", os_, "FAIL", "text differs from LLAMA_PLE_RESIDENT=0; " + why)
+    else:
+        add("r2 PLE read-in", os_, "PASS", ("resident on Linux" if os_ == "linux" else "off on Windows") + ", same text as off; " + why)
+
+
 # ---------------------------------------------------------------- 10. draft guard
 def item10(rows, os_):
-    dflt = [r for r in rows if r.get("kind") == "server" and r.get("model") == "q3m" and str(r.get("arm", "")).startswith(("k15", "m_", "n_"))
+    dflt = [r for r in rows if r.get("kind") == "server" and r.get("model") == "q3m" and str(r.get("arm", "")).startswith(("k15", "m_", "n_", "r4_"))
             and not (r.get("arm_env") or {}).get("LLAMA_DRAFT_MIN_FREE_MIB") and r.get("ok")]
     f = one(rows, "dg_force", "q3m")
     if not dflt or f is None:
@@ -356,12 +411,13 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
     item2(rows, os_)
     item3(rows, os_)
     item45(rows, os_)
+    item_r2(rows, os_)
     item10(rows, os_)
     item11(rows, os_)
 item9(load("k15-linux-cpu"))
 
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: 95b695923af (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: 9d5b0f0e5a8 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))

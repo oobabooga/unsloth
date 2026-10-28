@@ -1,7 +1,7 @@
-name: "AMD CI k15: llama.cpp k15 95b695923af vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
+name: "AMD CI k15: llama.cpp k15 9d5b0f0e5a8 vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
 
 # Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
-# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce854..95b695923af).
+# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..9d5b0f0e5a8).
 # Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
 # b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
@@ -125,7 +125,7 @@ jobs:
     needs: [hosted-build, cpu-linux]
     if: ${{ always() }}
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,dguard,bench,tbofull,tbopad,stock
+      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,ple,dguard,bench,tbofull,tbopad,stock
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     concurrency:
@@ -185,7 +185,7 @@ jobs:
     name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,dguard,bench,tbofull
+      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,ple,dguard,bench,tbofull
     timeout-minutes: 360
     concurrency:
       group: amd-ci-gfx1151-gpu
