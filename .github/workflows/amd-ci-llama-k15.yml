@@ -1,0 +1,260 @@
+name: "AMD CI k15: llama.cpp k15 95b695923af vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
+
+# Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
+# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce854..95b695923af).
+# Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
+# b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
+# Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
+
+on:
+  push:
+    branches: [amd-ci-llama-k15]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # nothing is written into the checkout on the self-hosted boxes (no __pycache__ beside amd_ci/lib or k15/)
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+
+  linux-control:
+    name: "k15 linux control (selector diagnosis for the Windows leg)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the Windows GPU job stays queued (not pending on the GPU group), the Windows selector matched"
+          echo "no runner. If BOTH stay queued, the pool is busy."
+
+  hosted-build:
+    name: "Linux build ${{ matrix.n }} (hosted ubuntu-22.04, release recipe; HIP gfx1151 + CPU ctest, or CPU-only MMID tests)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [k15, k10, up, k15cpu]
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
+      - name: Build
+        run: |
+          bash k15/hosted_linux_build.sh ${{ matrix.n }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bin_${{ matrix.n }}
+          path: ${{ runner.temp }}/art
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: info_${{ matrix.n }}
+          path: ${{ runner.temp }}/info
+          retention-days: 7
+          if-no-files-found: warn
+
+  cpu-linux:
+    name: "k15 CPU multi-column MUL_MAT_ID on the gfx1151 host CPU (Zen 5), HIP masked"
+    needs: [hosted-build]
+    if: ${{ always() }}
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k15-linux-cpu"
+      - name: Host gate
+        run: |
+          set +e
+          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host_cpu.json" > /dev/null
+          rc=$?
+          grep -m1 "model name" /proc/cpuinfo
+          if [ $rc -ne 0 ]; then echo "GATE FAILED: gate.py rc=$rc"; exit 1; fi
+          if ! grep -q -w avx512f /proc/cpuinfo; then echo "GATE FAILED: no avx512f (not the Zen 5 host)"; exit 1; fi
+          echo "gate ok"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_k15cpu
+          path: ${{ env.AMD_CI_WORK }}/art/bin_k15cpu
+      - name: test-mmid-multi + CPU MUL_MAT_ID, GGML_CPU_MMID_MULTI_K 1 / 0, avx512 + avx2
+        timeout-minutes: 75
+        run: |
+          set +e
+          bash k15/linux_cpu.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
+      - name: Stop leftover test processes
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -u "$(id -u)" -x test-mmid-multi; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
+          echo "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k15-linux-cpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  gpu-linux:
+    name: "k15 vs k10, Linux ROCm gfx1151 (exclusive)"
+    # after cpu-linux: this run's own CPU job never shares a Linux box with the measurement
+    needs: [hosted-build, cpu-linux]
+    if: ${{ always() }}
+    env:
+      K15_STEPS: ops,gst,mmid,eager,gdn,race,dguard,bench,tbofull,tbopad,stock
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k15-linux-gpu"
+      - name: Hardware gate
+        run: |
+          set +e
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json" > /dev/null
+          ls -la /dev/kfd /dev/dri 2>&1 | head -5
+          R=$(command -v rocminfo || echo /opt/rocm/bin/rocminfo)
+          "$R" 2>&1 | grep -m3 -E "Marketing Name|gfx1151" | tee "$AMD_CI_WORK/out/rocminfo.txt"
+          if [ ! -e /dev/kfd ] || ! grep -q gfx1151 "$AMD_CI_WORK/out/rocminfo.txt"; then echo "GATE FAILED: no gfx1151 via KFD"; exit 1; fi
+          echo "gate ok"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_k15
+          path: ${{ env.AMD_CI_WORK }}/art/bin_k15
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin_k10
+          path: ${{ env.AMD_CI_WORK }}/art/bin_k10
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: bin_up
+          path: ${{ env.AMD_CI_WORK }}/art/bin_up
+      - name: Cells
+        timeout-minutes: 345
+        run: |
+          set +e
+          bash k15/linux_gpu.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x test-backend-op; pgrep -u "$(id -u)" -x test-graph-src-); do kill -9 "$p"; done
+          echo "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k15-linux-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  gpu-windows:
+    name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    env:
+      K15_STEPS: ops,gst,mmid,eager,gdn,race,dguard,bench,tbofull
+    timeout-minutes: 360
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "k15-windows"
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
+          & "C:\Program Files\Python312\python.exe" "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\windows\host.json"
+          if ($LASTEXITCODE -ne 0) { Write-Host "GATE FAILED"; exit 1 }
+      - name: Build k10 / k15 with the release's TheRock, cells
+        timeout-minutes: 350
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\k15\win_gpu.ps1"
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\bench\rows.jsonl")) { exit 1 }
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Process -Name llama-server, test-backend-ops, test-graph-src-type -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k15-windows-gpu
+          path: ${{ env.AMD_CI_WORK }}\out
+          retention-days: 7
+          if-no-files-found: warn
+
+  verdict:
+    name: "k15 verdict (judges the artifacts; red on FAIL / VOID / INCONCLUSIVE)"
+    needs: [hosted-build, cpu-linux, gpu-linux, gpu-windows]
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: k15-*
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: info_*
+          path: ${{ runner.temp }}/in
+      - name: Judge
+        run: |
+          set +e
+          python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
+          rc=$?
+          cat "$RUNNER_TEMP/verdict/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdict
+          path: ${{ runner.temp }}/verdict
+          retention-days: 7
+          if-no-files-found: warn
