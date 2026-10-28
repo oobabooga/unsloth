@@ -264,7 +264,7 @@ def item45(rows, os_):
              [("m_d", "m_d2"), ("m_a0", "m_a02")])
 
 
-# ---------------------------------------------------------------- r2 (1b1b9369adf) additions
+# ---------------------------------------------------------------- r2 (c5429be4abd) additions
 def item_r2(rows, os_):
     st = lambda r: (r or {}).get("stats") or {}
     # mailbox handshake fast path (c98b2f662f2) + one-region host experts (5f9e82fd578): kill switches vs default at the m_ pins
@@ -295,6 +295,28 @@ def item_r2(rows, os_):
             add("r2 replay commit fallback, 4 GB budget", os_, "FAIL", "the fallback buffer changes the text; " + why)
         else:
             add("r2 replay commit fallback, 4 GB budget", os_, "PASS", "no abort, fallback path = default text; " + why)
+    # release-split (deb1079e81c + a4b47119d1a + c5429be4abd), 4 GB budget + MTP, chat / 2k / 8k: no abort, the release counted
+    Q = {a: one(rows, a, "q3m") for a in ("rsp_on", "rsp_on2", "rsp_off")}
+    if any(v is None for v in Q.values()):
+        add("r4 release-split, 4 GB budget", os_, "INCONCLUSIVE", "missing %s" % [a for a in Q if Q[a] is None])
+    else:
+        key8 = lambda r: text_key(r) and text_key(r) + ((r.get("p8k") or {}).get("md5"),)
+        k = {a: key8(Q[a]) for a in Q}
+        cnt = {a: {c: st(Q[a]).get(c, 0) for c in ("relsplit_n", "bank_release_n", "pool_trim_n", "free_after_release_n")} for a in Q}
+        why = "release counts (capped in the log) %s; md5 chat/2k/8k %s; lines %s" % (
+            cnt, {a: (v and "/".join(str(x)[:8] for x in v if x)) for a, v in k.items()}, st(Q["rsp_on"]).get("release_lines", [])[:2])
+        if any(died(Q[a]) for a in Q) or any(not (Q[a].get("p8k") or {}).get("md5") for a in Q):
+            add("r4 release-split, 4 GB budget", os_, "FAIL", "an arm aborted or the 8k cell did not answer: %s; %s" % (
+                [a for a in Q if died(Q[a]) or not (Q[a].get("p8k") or {}).get("md5")], why))
+        elif cnt["rsp_on"]["relsplit_n"] == 0 and cnt["rsp_on2"]["relsplit_n"] == 0:
+            add("r4 release-split, 4 GB budget", os_, "VOID", "no release-split decision in either default launch (the path did not run at "
+                "this budget; banks released by the fixed share: %s); " % cnt["rsp_on"]["bank_release_n"] + why)
+        elif cnt["rsp_off"]["relsplit_n"] > 0:
+            add("r4 release-split, 4 GB budget", os_, "FAIL", "LLAMA_MOE_LM_RELEASE_SPLIT=0 still took the release-split path; " + why)
+        else:
+            add("r4 release-split, 4 GB budget", os_, "PASS", "no abort on / off; A/A text %s; text on vs off %s (a split graph may "
+                "batch differently: reported, not gated); " % ("same" if k["rsp_on"] == k["rsp_on2"] else "DIFFERS",
+                                                                 "same" if k["rsp_on"] == k["rsp_off"] else "differs") + why)
     # PLE read-in: Linux makes the lazy table resident, Windows leaves it lazy (the read-in is Linux only); same text as LLAMA_PLE_RESIDENT=0
     P = {a: one(rows, a, "g4e2b") for a in ("ple_d", "ple_0", "ple_d2")}
     if any(v is None for v in P.values()):
@@ -321,7 +343,7 @@ def item_r2(rows, os_):
 
 # ---------------------------------------------------------------- 10. draft guard
 def item10(rows, os_):
-    dflt = [r for r in rows if r.get("kind") == "server" and r.get("model") == "q3m" and str(r.get("arm", "")).startswith(("k15", "m_", "n_", "r4_"))
+    dflt = [r for r in rows if r.get("kind") == "server" and r.get("model") == "q3m" and str(r.get("arm", "")).startswith(("k15", "m_", "n_", "r4_", "rsp_"))
             and not (r.get("arm_env") or {}).get("LLAMA_DRAFT_MIN_FREE_MIB") and r.get("ok")]
     f = one(rows, "dg_force", "q3m")
     if not dflt or f is None:
@@ -417,7 +439,7 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
 item9(load("k15-linux-cpu"))
 
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: 1b1b9369adf (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: c5429be4abd (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))

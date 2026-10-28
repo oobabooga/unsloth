@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """k15_plan.py: the k15 AMD matrix on one gfx1151 host (Linux or Windows), one k15_bench.py call per step, one log per step.
 
-Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (1b1b9369adf), k10 = ff5a2337 + k10.patch (a162dce854, the last
+Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (c5429be4abd), k10 = ff5a2337 + k10.patch (a162dce854, the last
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.
-K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, ple, dguard, bench, tbofull, tbopad, stock.
+K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, relsplit, ple, dguard, bench, tbofull, tbopad, stock.
 """
 import json, os, subprocess, sys, time
 
@@ -13,7 +13,7 @@ J = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["K6P_DIR"], "plan_logs")
 os.makedirs(OUT, exist_ok=True)
 WIN = os.name == "nt"
-STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,ple,dguard,bench,tbofull,tbopad,stock").split(","))
+STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,ple,dguard,bench,tbofull,tbopad,stock").split(","))
 
 PIN = "LLAMA_MOE_CPU_MISS=0;LLAMA_MOE_CACHE_FETCH_OVERLAP=0;GGML_CUDA_VERIFY_REASSOC=0"
 C1 = "K6P_MOE=1024"                     # pinned MoE cache for q3m (covers the 2-token MTP window + tail; rule: never auto / 0)
@@ -44,7 +44,7 @@ ARMS = [
     # spilled tier, --moe-cache-mib 0 (the GDN warm-up crash path); k10 at the same flags = reference only
     "n_d:k15:%s;K6P_MOE=0" % PIN, "n_d2:k15:%s;K6P_MOE=0" % PIN, "n_ip0:k15:%s;K6P_MOE=0;GGML_CUDA_GDN_STATE_IN_PLACE=0" % PIN,
     "n_dbg:k15:%s;K6P_MOE=0;GGML_CUDA_GDN_STATE_IN_PLACE_DEBUG=1" % PIN, "n_k10:k10:%s;K6P_MOE=0" % PIN,
-    # r2 (1b1b9369adf): mailbox handshake fast path / one-region host experts kill switches at the m_ pins (default = m_d / m_d2), and
+    # r2 (c5429be4abd): mailbox handshake fast path / one-region host experts kill switches at the m_ pins (default = m_d / m_d2), and
     # LLAMA_MOE_SINGLE=1 forced: HIP has no mapped mailbox (ggml_backend_moe_mailbox_alloc is CUDA only), so the split path must stay
     "m_mbf0:k15:%s;%s;GGML_MOE_MAILBOX_FAST=0" % (PIN, C1), "m_sf0:k15:%s;%s;LLAMA_MOE_SINGLE_FUSED=0" % (PIN, C1),
     "m_s1:k15:%s;%s;LLAMA_MOE_SINGLE=1" % (PIN, C1),
@@ -53,6 +53,9 @@ ARMS = [
     "r4_d:k15:%s" % PIN, "r4_d2:k15:%s" % PIN, "r4_ff:k15:%s;LLAMA_RS_REPLAY_FALLBACK_FORCE=1" % PIN,
     "r4_fb0:k15:%s;LLAMA_RS_REPLAY_FALLBACK_FORCE=1;LLAMA_RS_REPLAY_FALLBACK=0" % PIN,
     # r2: PLE background read-in, gemma-4 E2B with a lazy PLE table: default (Linux: made resident; Windows: left lazy) vs LLAMA_PLE_RESIDENT=0
+    # r4: release-split (deb1079e81c) at a 4 GB budget + MTP, 8k prompt (on unified memory n_ubatch is 2048, so a 2k prompt is one
+    # ubatch and forms no layer-major group): default x2 vs LLAMA_MOE_LM_RELEASE_SPLIT=0
+    "rsp_on:k15:%s" % PIN, "rsp_on2:k15:%s" % PIN, "rsp_off:k15:%s;LLAMA_MOE_LM_RELEASE_SPLIT=0" % PIN,
     "ple_d:k15:K6P_ARGS=--lazy-mode on", "ple_0:k15:K6P_ARGS=--lazy-mode on;LLAMA_PLE_RESIDENT=0", "ple_d2:k15:K6P_ARGS=--lazy-mode on",
     # draft guard: the default k15 MTP launches must keep the draft; a forced floor shows the check runs on HIP (non-vacuity)
     "dg_force:k15:LLAMA_DRAFT_MIN_FREE_MIB=1000000",
@@ -64,14 +67,14 @@ PLAN = []
 DEADLINE = float(os.environ.get("K15_DEADLINE") or "inf")   # epoch seconds: the job's step budget, set by linux_gpu.sh / win_gpu.ps1
 
 
-def step(name, *args, arms=None, extra="", timeout=None):
+def step(name, *args, arms=None, extra="", timeout=None, p8k=0):
     rem = DEADLINE - time.time()
     if rem < 180:
         PLAN.append({"step": name, "rc": "skipped-budget", "s": 0})
         print("STEP %-28s SKIPPED: %.0f s of the job budget left" % (name, rem), flush=True)
         return
     timeout = min(timeout or rem, rem - 60)
-    env = dict(os.environ, ARMS=",".join(ARMS), PYTHONIOENCODING="utf-8", K6P_EXTRA=extra, K6P_P8K="0")
+    env = dict(os.environ, ARMS=",".join(ARMS), PYTHONIOENCODING="utf-8", K6P_EXTRA=extra, K6P_P8K=str(p8k))
     argv = [sys.executable, "-u", os.path.join(J, "k15_bench.py")] + list(args) + (["--arms", arms] if arms else [])
     t = time.time()
     with open(os.path.join(OUT, name + ".log"), "w", encoding="utf-8") as fh:
@@ -150,6 +153,9 @@ if STEPS & {"eager", "race", "gdn", "mailbox"}:
 # r2: replay-commit fallback at a 4 GB-like budget (spill4096: --fit-target = free - 4096 MiB), MTP, shipping cache size
 if "replay" in STEPS:
     step("replay_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="r4_d,r4_d2,r4_ff,r4_fb0", extra=MTP, timeout=3600)
+# r4: release-split on vs off at a 4 GB-like budget, chat / 2k / 8k (7900 tokens) per launch, release counts from the log
+if "relsplit" in STEPS:
+    step("relsplit_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="rsp_on,rsp_on2,rsp_off", extra=MTP, p8k=7900, timeout=3600)
 # r2: PLE read-in on (Linux) / off by construction (Windows), same text as LLAMA_PLE_RESIDENT=0
 if "ple" in STEPS:
     step("ple_g4e2b", "time", "--cell", "g4e2b:full", "--reps", "1", arms="ple_d,ple_0,ple_d2", timeout=1800)

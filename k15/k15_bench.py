@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k15_bench.py: llama.cpp k15 (1b1b9369adf) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
+"""k15_bench.py: llama.cpp k15 (c5429be4abd) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
 
 Derived from the k10s k6p_bench.py (ci_k6_amd 737e0eb). Every measurement is a fresh process; arm order rotates per rep.
 env: K6P_DIR work root (bins/<arm dir>, models/, out/), ARMS "name:dir[:VAR=VAL;...]", K6P_DEV device (ROCm0).
@@ -260,7 +260,7 @@ def memstats(s):
             "mtp_ctx_fail_n": len(g(r"failed to create MTP context")),
             "spec_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:draft acceptance rate|n_draft|speculative|draft-mtp|MTP)[^\n]*") if "CMD" not in l][:8],
             "graph_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:CUDA graph|cuda_graph|cudaGraph|hipGraph)[^\n]*")][:6],
-            # k15 r2 (1b1b9369adf): single-graph host misses / mailbox (c98b2f662f2, 5f9e82fd578: CUDA only, HIP has no mapped mailbox),
+            # k15 r2 (c5429be4abd): single-graph host misses / mailbox (c98b2f662f2, 5f9e82fd578: CUDA only, HIP has no mapped mailbox),
             # PLE read-in (ab9df2b3658 / d9aaecc4448 / 1595d7a813d: Linux only), replay-commit fallback (1811f0c7468)
             "single_on_n": len(g(r"single-graph host misses on")),
             "single_nomb_n": len(g(r"no mapped mailbox|has no mapped mailboxes")),
@@ -271,6 +271,13 @@ def memstats(s):
             "rs_fallback_warn_n": len(g(r"runs in the reserved fallback buffer")),
             "rs_commits": max([int(x) for x in g(r"recurrent replay commits: (\d+)")] or [0]),
             "rs_lines": [l.strip()[-220:] for l in g(r"[^\n]*(?:replay commit|reserved fallback)[^\n]*")][:4],
+            # r4 (c5429be4abd, release-split deb1079e81c + pool trim a4b47119d1a + stream creation c5429be4abd). The log lines are capped
+            # in the code (decision 4, bank release 2 per cache, trim 4, free-after 4), so these are counts up to the caps
+            "relsplit_n": len(g(r"the cache banks are released for it")),
+            "bank_release_n": len(g(r"MoE cache banks released \(")),
+            "pool_trim_n": len(g(r"MiB of CUDA pool memory the released group took given back")),
+            "free_after_release_n": len(g(r"MiB free after the released banks returned")),
+            "release_lines": [l.strip()[-240:] for l in g(r"[^\n]*(?:banks are released for it|MoE cache banks released|pool memory the released group|free after the released banks)[^\n]*")][:6],
             "load_mode_lines": [l.strip()[-200:] for l in g(r"[^\n]*(?:load mode|lazy mode|lazy_mode)[^\n]*")][:4]}
 
 
