@@ -32,7 +32,7 @@ jobs:
           "HIP_PATH=$env:HIP_PATH"
           exit 0
 
-      - name: Sources (main and main + fix)
+      - name: Sources (A = main + first commit, B = main + first commit + review follow-up)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -45,6 +45,8 @@ jobs:
           git -C $A checkout -q FETCH_HEAD
           if ($LASTEXITCODE) { exit 1 }
           Copy-Item -Recurse $A "$env:RUNNER_TEMP\B"
+          git -C $A apply --verbose "$env:GITHUB_WORKSPACE\fix_v1.patch"
+          if ($LASTEXITCODE) { exit 1 }
           git -C "$env:RUNNER_TEMP\B" apply --verbose "$env:GITHUB_WORKSPACE\fix.patch"
           if ($LASTEXITCODE) { exit 1 }
           git -C "$env:RUNNER_TEMP\B" diff --stat
@@ -74,22 +76,13 @@ jobs:
           $server = Get-ChildItem -Recurse "$env:RUNNER_TEMP\pristine" -Filter sd-server.exe | Select-Object -First 1
           & $py -c $probe $server.FullName
 
-      - name: A/B in session 0 (the runner service, no desktop)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
-          & $py "$env:GITHUB_WORKSPACE\run_all.py" $env:RUNNER_TEMP $env:GITHUB_WORKSPACE "$env:RUNNER_TEMP\out-session0" probe_server
-          Get-Content "$env:RUNNER_TEMP\out-session0\run_all.log"
-          exit 0
-
       - name: A/B in the logged-on desktop session (where a user's Studio runs)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
           $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
           $out = "$env:RUNNER_TEMP\out"
-          $scenarios = 'probe_server,probe_output,engine_probes,upgrade_to_vulkan,forced_rocm'
+          $scenarios = 'overlap,probe_server,probe_output,engine_probes,upgrade_to_vulkan,forced_rocm'
           $taskArgs = "`"$env:GITHUB_WORKSPACE\run_all.py`" `"$env:RUNNER_TEMP`" `"$env:GITHUB_WORKSPACE`" `"$out`" $scenarios"
           $action = New-ScheduledTaskAction -Execute $py -Argument $taskArgs
           $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
@@ -110,7 +103,6 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          Get-Content "$env:RUNNER_TEMP\out-session0\results.jsonl"
           Get-Content "$env:RUNNER_TEMP\out\results.jsonl"
 
       - name: Upload results
@@ -120,4 +112,3 @@ jobs:
           name: rd845-ab
           path: |
             ${{ runner.temp }}/out
-            ${{ runner.temp }}/out-session0

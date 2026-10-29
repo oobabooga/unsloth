@@ -139,10 +139,10 @@ index aae49a59b3..b9d0de6a1e 100644
              return None
          if res.returncode != 0:
 diff --git a/studio/backend/utils/subprocess_compat.py b/studio/backend/utils/subprocess_compat.py
-index ea49d315d1..e0d7322726 100644
+index ea49d315d1..e88da928d6 100644
 --- a/studio/backend/utils/subprocess_compat.py
 +++ b/studio/backend/utils/subprocess_compat.py
-@@ -3,8 +3,16 @@
+@@ -3,8 +3,31 @@
  
  """Cross-platform subprocess helpers for the Unsloth Studio backend."""
  
@@ -150,27 +150,49 @@ index ea49d315d1..e0d7322726 100644
  import subprocess
  import sys
 +import threading
++import types
 +from typing import Iterator
 +
-+_SEM_FAILCRITICALERRORS = 0x0001
-+_error_mode_lock = threading.Lock()
-+_error_mode_holders = 0
-+_error_mode_before = 0
++SEM_FAILCRITICALERRORS = 0x0001
++
++
++def _process_error_mode_state() -> types.ModuleType:
++    """One per process, not per module copy: the installer loads this file as
++    backend.utils.subprocess_compat while the backend loads it as utils.subprocess_compat."""
++    name = "_unsloth_windows_error_mode"
++    state = sys.modules.get(name)
++    if state is None:
++        fresh = types.ModuleType(name)
++        fresh.lock = threading.Lock()
++        fresh.held = {}  # holder token -> the flags it needs
++        fresh.before = 0  # the mode before the first holder entered
++        state = sys.modules.setdefault(name, fresh)
++    return state
++
++
++_ERROR_MODE = _process_error_mode_state()
  
  
  def windows_hidden_subprocess_kwargs() -> dict[str, object]:
-@@ -27,3 +35,32 @@ def windows_hidden_subprocess_kwargs() -> dict[str, object]:
+@@ -27,3 +50,39 @@ def windows_hidden_subprocess_kwargs() -> dict[str, object]:
          kwargs["startupinfo"] = startupinfo
  
      return kwargs
 +
 +
++def _apply_held_error_mode(kernel32) -> None:
++    flags = 0
++    for held in _ERROR_MODE.held.values():
++        flags |= held
++    kernel32.SetErrorMode(_ERROR_MODE.before | flags)
++
++
 +@contextlib.contextmanager
-+def windows_loader_error_boxes_suppressed() -> Iterator[None]:
++def windows_loader_error_boxes_suppressed(flags: int = SEM_FAILCRITICALERRORS) -> Iterator[None]:
 +    """Hold around a test-launch: the child inherits SEM_FAILCRITICALERRORS, so a missing DLL
 +    exits 0xC0000135 instead of blocking on a modal box until someone dismisses it. The mode is
-+    process-wide, so concurrent holders share one change and the last one out restores it."""
-+    global _error_mode_holders, _error_mode_before
++    process-wide, so every holder (the installer's too) shares one record: the mode is the one
++    before the first holder plus every current holder's flags, and the last one out restores it."""
 +    if sys.platform != "win32":
 +        yield
 +        return
@@ -180,15 +202,69 @@ index ea49d315d1..e0d7322726 100644
 +    except Exception:  # noqa: BLE001 -- best effort; the launch still runs
 +        yield
 +        return
-+    with _error_mode_lock:
-+        if _error_mode_holders == 0:
-+            mode = kernel32.GetErrorMode() | _SEM_FAILCRITICALERRORS
-+            _error_mode_before = kernel32.SetErrorMode(mode)
-+        _error_mode_holders += 1
++    token = object()
++    with _ERROR_MODE.lock:
++        if not _ERROR_MODE.held:
++            _ERROR_MODE.before = kernel32.GetErrorMode()
++        _ERROR_MODE.held[token] = flags
++        _apply_held_error_mode(kernel32)
 +    try:
 +        yield
 +    finally:
-+        with _error_mode_lock:
-+            _error_mode_holders -= 1
-+            if _error_mode_holders == 0:
-+                kernel32.SetErrorMode(_error_mode_before)
++        with _ERROR_MODE.lock:
++            del _ERROR_MODE.held[token]
++            _apply_held_error_mode(kernel32)
+diff --git a/studio/install_sd_cpp_prebuilt.py b/studio/install_sd_cpp_prebuilt.py
+index 7cb4a71459..839121b185 100644
+--- a/studio/install_sd_cpp_prebuilt.py
++++ b/studio/install_sd_cpp_prebuilt.py
+@@ -24,11 +24,13 @@ from typing import Optional, Sequence
+ 
+ if __package__:
+     from .backend.utils.auth_safe import auth_safe_open
++    from .backend.utils.subprocess_compat import windows_loader_error_boxes_suppressed
+ else:
+     _STUDIO_DIR = os.path.dirname(os.path.abspath(__file__))
+     if _STUDIO_DIR not in sys.path:
+         sys.path.insert(0, _STUDIO_DIR)
+     from backend.utils.auth_safe import auth_safe_open
++    from backend.utils.subprocess_compat import windows_loader_error_boxes_suppressed
+ 
+ # GPU hosts run diffusers, so only CPU/Apple assets are needed.
+ DEFAULT_REPO = "unslothai/stable-diffusion.cpp"
+@@ -739,31 +741,10 @@ def _probe_env(binary: Path) -> dict:
+ 
+ 
+ def _windows_error_mode_suppressed():
+-    """On Windows, suppress the missing-DLL dialog so a refusal returns an exit status."""
+-    import contextlib
+-
+-    @contextlib.contextmanager
+-    def _cm():
+-        if sys.platform != "win32":
+-            yield
+-            return
+-        try:
+-            import ctypes
+-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+-            # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+-            previous = kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+-        except Exception:  # noqa: BLE001 -- best effort; the probe still runs
+-            yield
+-            return
+-        try:
+-            yield
+-        finally:
+-            try:
+-                kernel32.SetErrorMode(previous)
+-            except Exception:  # noqa: BLE001
+-                pass
+-
+-    return _cm()
++    """On Windows, suppress the missing-DLL dialog so a refusal returns an exit status. Shares the
++    backend's process-wide record, since the backend's own probes can run during an install."""
++    # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
++    return windows_loader_error_boxes_suppressed(0x0001 | 0x0002 | 0x8000)
+ 
+ 
+ def probe_binary_starts(binary: Path, *, timeout: float = 30.0) -> Optional[str]:

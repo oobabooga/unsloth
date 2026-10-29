@@ -163,6 +163,27 @@ def run_scenario():
         c = bk.ensure_sd_cpp_binary(accelerator = acc)
         out["ensure_cli_returned"] = c
         out["record_after_cli"] = record_accelerator()
+    elif scenario == "overlap":
+        # The review's sequence with real kernel32: an install probe and a backend probe overlap,
+        # the install leaves first, then a backend probe launches the unrunnable bundle.
+        from utils import subprocess_compat
+
+        install = bk._installer_module()._windows_error_mode_suppressed()
+        probe = subprocess_compat.windows_loader_error_boxes_suppressed()
+        install.__enter__()
+        probe.__enter__()
+        out["mode_both_held"] = hex(k32.GetErrorMode())
+        install.__exit__(None, None, None)
+        out["mode_probe_still_held"] = hex(k32.GetErrorMode())
+        t = time.monotonic()
+        try:
+            rc = subprocess.run([server, "--help"], capture_output = True, timeout = 20).returncode
+            out["launch"] = hex(rc & 0xFFFFFFFF)
+        except subprocess.TimeoutExpired:
+            out["launch"] = "timeout"
+        out["launch_s"] = round(time.monotonic() - t, 2)
+        probe.__exit__(None, None, None)
+        out["mode_after_all_left"] = hex(k32.GetErrorMode())
     else:
         raise SystemExit(f"unknown scenario {scenario}")
     return out
