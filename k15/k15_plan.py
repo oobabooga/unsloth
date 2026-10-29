@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """k15_plan.py: the k15 AMD matrix on one gfx1151 host (Linux or Windows), one k15_bench.py call per step, one log per step.
 
-Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (c5429be4abd), k10 = ff5a2337 + k10.patch (a162dce854, the last
+Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (d24f02733af), k10 = ff5a2337 + k10.patch (a162dce854, the last
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.
-K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, relsplit, ple, dguard, bench, tbofull, tbopad, stock.
+K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, relsplit, b3, ple, dguard, bench, tbofull, tbopad, stock.
 """
 import json, os, subprocess, sys, time
 
@@ -13,7 +13,7 @@ J = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["K6P_DIR"], "plan_logs")
 os.makedirs(OUT, exist_ok=True)
 WIN = os.name == "nt"
-STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,ple,dguard,bench,tbofull,tbopad,stock").split(","))
+STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull,tbopad,stock").split(","))
 
 PIN = "LLAMA_MOE_CPU_MISS=0;LLAMA_MOE_CACHE_FETCH_OVERLAP=0;GGML_CUDA_VERIFY_REASSOC=0"
 C1 = "K6P_MOE=1024"                     # pinned MoE cache for q3m (covers the 2-token MTP window + tail; rule: never auto / 0)
@@ -56,6 +56,10 @@ ARMS = [
     # r4: release-split (deb1079e81c) at a 4 GB budget + MTP, 8k prompt (on unified memory n_ubatch is 2048, so a 2k prompt is one
     # ubatch and forms no layer-major group): default x2 vs LLAMA_MOE_LM_RELEASE_SPLIT=0
     "rsp_on:k15:%s" % PIN, "rsp_on2:k15:%s" % PIN, "rsp_off:k15:%s;LLAMA_MOE_LM_RELEASE_SPLIT=0" % PIN,
+    # r5: the ggml-backend changes since r4 at a 4 GB budget + MTP, chat / 2k / 8k: the lend free check (f3a105b68e3) and the scheduler
+    # table trim + input arena fit (0363724a80a) and the draft release (5cfcadced95), default x2 vs each kill switch
+    "b3_on:k15:%s" % PIN, "b3_on2:k15:%s" % PIN, "b3_lf0:k15:%s;GGML_SCHED_LEND_FREE_CHECK=0" % PIN,
+    "b3_tr0:k15:%s;LLAMA_MOE_LM_SCHED_TRIM=0;LLAMA_MOE_LM_ARENA_FIT=0" % PIN, "b3_dr0:k15:%s;LLAMA_MOE_LM_DRAFT_RELEASE=0" % PIN,
     "ple_d:k15:K6P_ARGS=--lazy-mode on", "ple_0:k15:K6P_ARGS=--lazy-mode on;LLAMA_PLE_RESIDENT=0", "ple_d2:k15:K6P_ARGS=--lazy-mode on",
     # draft guard: the default k15 MTP launches must keep the draft; a forced floor shows the check runs on HIP (non-vacuity)
     "dg_force:k15:LLAMA_DRAFT_MIN_FREE_MIB=1000000",
@@ -156,6 +160,9 @@ if "replay" in STEPS:
 # r4: release-split on vs off at a 4 GB-like budget, chat / 2k / 8k (7900 tokens) per launch, release counts from the log
 if "relsplit" in STEPS:
     step("relsplit_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="rsp_on,rsp_on2,rsp_off", extra=MTP, p8k=7900, timeout=3600)
+# r5: lend free check / scheduler trim at a 4 GB-like budget, chat / 2k / 8k, their log counts
+if "b3" in STEPS:
+    step("b3_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="b3_on,b3_on2,b3_lf0,b3_tr0,b3_dr0", extra=MTP, p8k=7900, timeout=3600)
 # r2: PLE read-in on (Linux) / off by construction (Windows), same text as LLAMA_PLE_RESIDENT=0
 if "ple" in STEPS:
     step("ple_g4e2b", "time", "--cell", "g4e2b:full", "--reps", "1", arms="ple_d,ple_0,ple_d2", timeout=1800)

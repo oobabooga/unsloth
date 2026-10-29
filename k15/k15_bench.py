@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k15_bench.py: llama.cpp k15 (c5429be4abd) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
+"""k15_bench.py: llama.cpp k15 (d24f02733af) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
 
 Derived from the k10s k6p_bench.py (ci_k6_amd 737e0eb). Every measurement is a fresh process; arm order rotates per rep.
 env: K6P_DIR work root (bins/<arm dir>, models/, out/), ARMS "name:dir[:VAR=VAL;...]", K6P_DEV device (ROCm0).
@@ -277,6 +277,8 @@ def memstats(s):
             "bank_release_n": len(g(r"MoE cache banks released \(")),
             "pool_trim_n": len(g(r"MiB of CUDA pool memory the released group took given back")),
             "free_after_release_n": len(g(r"MiB free after the released banks returned")),
+            # r5: the lend free check (f3a105b68e3) lends the graph in one part and frees the own buffer (the scheduler trim 0363724a80a logs nothing)
+            "lend_whole_n": len(g(r"is lent in one part and the own compute buffer")),
             "release_lines": [l.strip()[-240:] for l in g(r"[^\n]*(?:banks are released for it|MoE cache banks released|pool memory the released group|free after the released banks)[^\n]*")][:6],
             "load_mode_lines": [l.strip()[-200:] for l in g(r"[^\n]*(?:load mode|lazy mode|lazy_mode)[^\n]*")][:4]}
 
