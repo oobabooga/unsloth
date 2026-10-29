@@ -139,7 +139,7 @@ index aae49a59b3..b9d0de6a1e 100644
              return None
          if res.returncode != 0:
 diff --git a/studio/backend/utils/subprocess_compat.py b/studio/backend/utils/subprocess_compat.py
-index ea49d315d1..1b5571ed46 100644
+index ea49d315d1..e0d7322726 100644
 --- a/studio/backend/utils/subprocess_compat.py
 +++ b/studio/backend/utils/subprocess_compat.py
 @@ -3,8 +3,16 @@
@@ -159,7 +159,7 @@ index ea49d315d1..1b5571ed46 100644
  
  
  def windows_hidden_subprocess_kwargs() -> dict[str, object]:
-@@ -27,3 +35,33 @@ def windows_hidden_subprocess_kwargs() -> dict[str, object]:
+@@ -27,3 +35,32 @@ def windows_hidden_subprocess_kwargs() -> dict[str, object]:
          kwargs["startupinfo"] = startupinfo
  
      return kwargs
@@ -176,7 +176,6 @@ index ea49d315d1..1b5571ed46 100644
 +        return
 +    try:
 +        import ctypes
-+
 +        kernel32 = ctypes.WinDLL("kernel32")
 +    except Exception:  # noqa: BLE001 -- best effort; the launch still runs
 +        yield

@@ -178,7 +178,10 @@ except Exception as exc:  # noqa: BLE001
     out = {"exception": repr(exc)}
 elapsed = round(time.monotonic() - t0, 2)
 seen = watcher.finish()
+sid = wt.DWORD()
+k32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
 out.update(
+    session_id = sid.value,
     label = label,
     scenario = scenario,
     elapsed_s = elapsed,
