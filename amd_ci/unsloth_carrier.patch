@@ -1,0 +1,251 @@
+diff --git a/amd_ci_zoo_fix.patch b/amd_ci_zoo_fix.patch
+new file mode 100644
+--- /dev/null
++++ b/amd_ci_zoo_fix.patch
+@@ -0,0 +1,246 @@
++diff --git a/tests/test_compile_force_float32_key.py b/tests/test_compile_force_float32_key.py
++new file mode 100644
++index 00000000..59707020
++--- /dev/null
+++++ b/tests/test_compile_force_float32_key.py
++@@ -0,0 +1,122 @@
+++# Unsloth Zoo - Utilities for Unsloth
+++# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+++#
+++# This program is free software: you can redistribute it and/or modify
+++# it under the terms of the GNU Affero General Public License as published
+++# by the Free Software Foundation, either version 3 of the License, or
+++# (at your option) any later version.
+++#
+++# This program is distributed in the hope that it will be useful,
+++# but WITHOUT ANY WARRANTY; without even the implied warranty of
+++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+++# GNU Affero General Public License for more details.
+++#
+++# You should have received a copy of the GNU Affero General Public License
+++# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+++
+++"""The compiled modeling module follows UNSLOTH_FORCE_FLOAT32 within one process.
+++
+++An fp16 Gemma 3 load sets the flag to "1" and generates
+++unsloth_compiled_module_gemma3 with the forced float32 MLP and RMSNorm. A later
+++bf16 load in the same process (flag "0") used to return early on
+++__UNSLOTH_PATCHED__ and keep running that fp16 module. Each scenario mirrors the
+++loader (pre_compile patches, compile, post_compile patches) in its own process.
+++"""
+++
+++import json
+++import os
+++import subprocess
+++import sys
+++from pathlib import Path
+++
+++import pytest
+++
+++ROOT = Path(__file__).resolve().parents[1]
+++
+++SCRIPT = r"""
+++import inspect, json, os, sys
+++import transformers
+++from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+++import unsloth_zoo.compiler as compiler
+++
+++def run_patches(phase):
+++    for patch in TEMPORARY_PATCHES:
+++        try:
+++            if "phase" in inspect.signature(patch).parameters: patch(phase = phase)
+++            else: patch()
+++        except Exception: pass
+++
+++path = os.path.join(os.environ["UNSLOTH_COMPILE_LOCATION"], "unsloth_compiled_module_gemma3.py")
+++passes = []
+++for flag in json.loads(sys.argv[1]):
+++    os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
+++    run_patches("pre_compile")
+++    compiler.unsloth_compile_transformers("gemma3", fast_lora_forwards = False)
+++    run_patches("post_compile")
+++    mlp = transformers.models.gemma3.modeling_gemma3.Gemma3MLP
+++    with open(path, encoding = "utf-8") as f: source = f.read()
+++    passes.append({"source": source, "mlp_module": mlp.__module__, "mlp_id": id(mlp)})
+++print("RESULT " + json.dumps(passes))
+++"""
+++
+++
+++def _run(flags, cache):
+++    env = dict(
+++        os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
+++        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(cache),
+++    )
+++    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+++    for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_FORCE_CUSTOM_DTYPE", "UNSLOTH_COMPILE_OVERWRITE"):
+++        env.pop(key, None)
+++    proc = subprocess.run(
+++        [sys.executable, "-c", SCRIPT, json.dumps(flags)],
+++        capture_output = True, text = True, timeout = 900, env = env,
+++    )
+++    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+++    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+++    return json.loads(lines[-1][len("RESULT "):])
+++
+++
+++def _normalized(source):
+++    # The modeling-module import list order depends on the module's attribute set
+++    # (an unstable argsort), not on the flag; compare it as a set.
+++    out = []
+++    for line in source.splitlines():
+++        prefix = "from transformers.models.gemma3.modeling_gemma3 import ("
+++        if line.startswith(prefix):
+++            line = prefix + ",".join(sorted(x.strip() for x in line[len(prefix):-1].split(","))) + ")"
+++        out.append(line)
+++    return "\n".join(out)
+++
+++
+++def _forced(source):
+++    return "_gemma3_rms_norm_float32" in source
+++
+++
+++@pytest.fixture(scope = "module", autouse = True)
+++def _needs_gemma3():
+++    pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
+++
+++
+++def test_compiled_module_follows_force_float32_in_process(tmp_path):
+++    fresh_bf16 = _run(["0"], tmp_path / "bf16")[0]["source"]
+++    fresh_fp16 = _run(["1"], tmp_path / "fp16")[0]["source"]
+++    assert _forced(fresh_fp16) and not _forced(fresh_bf16)
+++
+++    p = _run(["1", "1", "0", "0", "1"], tmp_path / "mixed")
+++    assert all(x["mlp_module"] == "unsloth_compiled_module_gemma3" for x in p)
+++    # Same flag: the first pass is reused, not regenerated.
+++    assert p[1]["mlp_id"] == p[0]["mlp_id"] and p[1]["source"] == p[0]["source"]
+++    assert p[3]["mlp_id"] == p[2]["mlp_id"] and p[3]["source"] == p[2]["source"]
+++    # Flag flips: regenerated, and equal to a fresh process with that flag.
+++    assert p[2]["mlp_id"] != p[1]["mlp_id"] and p[4]["mlp_id"] != p[3]["mlp_id"]
+++    assert _normalized(p[0]["source"]) == _normalized(fresh_fp16)
+++    assert _normalized(p[2]["source"]) == _normalized(fresh_bf16)
+++    assert _normalized(p[4]["source"]) == _normalized(fresh_fp16)
+++
+++
+++def test_compiled_cache_written_by_fp16_process_is_regenerated_for_bf16(tmp_path):
+++    fresh_bf16 = _run(["0"], tmp_path / "bf16")[0]["source"]
+++    shared = tmp_path / "shared"
+++    assert _forced(_run(["1"], shared)[0]["source"])
+++    assert _normalized(_run(["0"], shared)[0]["source"]) == _normalized(fresh_bf16)
++diff --git a/unsloth_zoo/compiler.py b/unsloth_zoo/compiler.py
++index 27f3b2d2..9ab7fcda 100644
++--- a/unsloth_zoo/compiler.py
+++++ b/unsloth_zoo/compiler.py
++@@ -6199,6 +6199,50 @@ def _patch_torch_dtype_modules(
++     pass
++ 
++ 
+++# model_location -> {(dict name or None, key): original}, recorded before the first replacement.
+++_MODELING_FILE_ORIGINALS = {}
+++# model_location -> _compiled_source_key() of its last pass. Not a module attribute:
+++# dir(modeling_file) feeds an unstable argsort, so one more name reorders the imports.
+++_MODELING_FILE_KEYS = {}
+++
+++
+++def _compiled_source_key():
+++    """Env decisions baked into the generated module source at compile time."""
+++    return (
+++        os.environ.get("UNSLOTH_FORCE_FLOAT32", "0"),
+++        os.environ.get("UNSLOTH_FORCE_CUSTOM_DTYPE", ""),
+++    )
+++
+++
+++def _unpatch_modeling_file(modeling_file):
+++    """Undo a compile pass made under another source key, so the next one regenerates.
+++
+++    The compiled classes replaced the originals in modeling_file, and every source the
+++    compiler reads comes from there, so put the originals back and rerun the
+++    pre_compile temporary patches against them (they ran on the compiled classes).
+++    """
+++    originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
+++    for (container, key), value in originals.items():
+++        try:
+++            if container is None:
+++                setattr(modeling_file, key, value)
+++            else:
+++                getattr(modeling_file, container)[key] = value
+++        except Exception:
+++            pass
+++    vars(modeling_file).pop("__UNSLOTH_PATCHED__", None)
+++    from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+++
+++    for temporary_patch in TEMPORARY_PATCHES:
+++        try:
+++            if "phase" in inspect.signature(temporary_patch).parameters:
+++                temporary_patch(phase="pre_compile")
+++            else:
+++                temporary_patch()
+++        except Exception:
+++            pass
+++
+++
++ @_compile_versions_scope
++ def unsloth_compile_transformers(
++     model_type: str = "llama",
++@@ -6269,6 +6313,13 @@ def unsloth_compile_transformers(
++         return
++     # Later `eval(model_location)` calls need `transformers` bound in globals
++     exec("import transformers", globals())
+++    # A pass compiled under another key (an fp16 load before a bf16 one) is redone.
+++    if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
+++        model_location, _compiled_source_key()
+++    ) != _compiled_source_key():
+++        _unpatch_modeling_file(modeling_file)
+++    if not hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
+++        _MODELING_FILE_ORIGINALS.pop(model_location, None)
++     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
++     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
++     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
++@@ -6413,6 +6464,7 @@ def unsloth_compile_transformers(
++     pass
++ 
++     modeling_file.__UNSLOTH_PATCHED__ = True
+++    _MODELING_FILE_KEYS[model_location] = _compiled_source_key()
++     functions = dir(modeling_file)
++     try:
++         full_source = inspect.getsource(modeling_file)
++@@ -7669,9 +7721,12 @@ def unsloth_compile_transformers(
++         )
++         return
++ 
++-    # Import and replace with new module
+++    # Import and replace with new module. Keep the first originals for _unpatch_modeling_file.
+++    originals = _MODELING_FILE_ORIGINALS.setdefault(model_location, {})
++     replacement_classes = {}
++     for module in all_standalone_classes.keys():
+++        if hasattr(modeling_file, module):
+++            originals.setdefault((None, module), getattr(modeling_file, module))
++         try:
++             # The compiled replacement class must keep the counting convention the rewrite marked.
++             original = getattr(modeling_file, module, None)
++@@ -7706,6 +7761,7 @@ def unsloth_compile_transformers(
++             found = False
++             for replaced_class in replaced_classes:
++                 if replaced_class == value:
+++                    originals.setdefault((check, key), item[key])
++                     try:
++                         exec(
++                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",
++diff --git a/unsloth_zoo/temporary_patches/gemma.py b/unsloth_zoo/temporary_patches/gemma.py
++index 01650df8..f75f1e89 100644
++--- a/unsloth_zoo/temporary_patches/gemma.py
+++++ b/unsloth_zoo/temporary_patches/gemma.py
++@@ -186,12 +186,8 @@ def _publish_boundary_helpers(modeling_module):
++ pass
++ 
++ 
++-# The forced float32 set below (embedding, MLP, projector, causal mask) has no
++-# generic counterpart, so in one process an fp16 load followed by a bf16 load
++-# kept them: the float32 embedding then met bf16 attention ("Expected query,
++-# key, and value to have the same dtype"). patch_function re-stashes on every
++-# pass, which would record our own forward as the original after pre_compile
++-# + post_compile, so these stash once and undo when the flag is "0".
+++# Forced float32 patches with no generic counterpart: stash the original once (a re-stash
+++# would record our own forward) so a later flag "0" load can undo them.
++ def _patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
++     stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
++     return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
