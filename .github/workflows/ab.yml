@@ -26,11 +26,13 @@ jobs:
       - name: Fetch main (A) and apply the fix (B)
         run: |
           git init -q src && cd src
+          git config core.autocrlf false
+          tr -d '\r' < ../ci/fix.patch > ../fix.lf.patch
           git fetch -q --depth 1 https://github.com/unslothai/unsloth "$BASE_SHA"
           git checkout -q FETCH_HEAD
           git log -1 --oneline
           cp -r studio ../A
-          git apply ../ci/fix.patch
+          git apply ../fix.lf.patch
           cp -r studio ../B
           diff -r ../A ../B | head -60 || true
       - name: Venv with the real torch 2.13.0+cu130 Windows wheel
