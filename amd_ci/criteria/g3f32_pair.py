@@ -20,7 +20,7 @@ TITLE = "Gemma 3 float32 pair (unsloth #15879 + unsloth-zoo #2227) on gfx1151 RO
 MODE = "differential"
 NEEDS = ["rocm", "gpu", "nvidia", "exclusive_gpu"]
 MODELS = ("tiny", "270m")
-ALONE = ("c16", "c4", "d16", "d4")
+ALONE = ("c16", "c4", "d16", "d4", "bb")
 _CTX: dict = {}
 
 
@@ -104,9 +104,16 @@ def gates(obs):
     return out
 
 
+def _bf16_defect(c):
+    """The bf16 load (last in the cell) carries the stale float32 embedding, and the dtype mismatch is raised
+    (in training on CPU; on gfx1151 with compile training runs and generate's KV-cache index_copy_ raises)."""
+    loads = c.get("loads") or []
+    return bool(loads) and loads[-1].get("dtype") == "bfloat16" and loads[-1].get("embed_out_dtype") == "torch.float32" \
+        and _dtype_err(c)
+
+
 def base_shows_defect(base):
-    return all(_dtype_err(_c(base, "base", m, "a")) and not _done(_c(base, "base", m, "a")) and
-               _dtype_err(_c(base, "base", m, "b")) and not _done(_c(base, "base", m, "b")) for m in MODELS)
+    return all(_bf16_defect(_c(base, "base", m, "a")) and _bf16_defect(_c(base, "base", m, "b")) for m in MODELS)
 
 
 def head_is_fixed(head):
@@ -117,8 +124,16 @@ def head_is_fixed(head):
     for m in MODELS:
         a, b, d16 = _c(head, "head", m, "a"), _c(head, "head", m, "b"), _c(head, "head", m, "d16")
         parts[f"{m} a,b train + generate"] = all(_done(x) and _finite(x) and _gen_ok(x) for x in (a, b))
-        parts[f"{m} b == fresh bf16"] = _maxdiff(b.get("losses"), d16.get("losses")) is not None and \
-            _maxdiff(b.get("losses"), d16.get("losses")) <= 1e-6
+        bb = _c(head, "head", m, "bb")
+        db, dbb = _maxdiff(b.get("losses"), d16.get("losses")), _maxdiff(b.get("losses"), bb.get("losses"))
+        _CTX[f"{m} b-vs-fresh"], _CTX[f"{m} b-vs-bb"] = db, dbb
+        _CTX[f"{m} a-vs-fresh"] = _maxdiff(a.get("losses"), d16.get("losses"))
+        # b's bf16 model must equal a bf16 model loaded second in a process with no fp16 load before it (bb);
+        # whether an in-process reload equals a fresh process is pre-existing and is reported, not judged.
+        parts[f"{m} b == bf16-after-bf16 (bb) or fresh bf16"] = (db is not None and db == 0.0) or (dbb is not None and dbb == 0.0)
+        parts[f"{m} b bf16 embed dtype bf16"] = (b.get("loads") or [{}])[-1].get("embed_out_dtype") == "torch.bfloat16"
+        parts[f"{m} b bf16 tokens == fresh bf16"] = bool(d16.get("loads")) and \
+            (b.get("loads") or [{}])[-1].get("gen_ids") == d16["loads"][0].get("gen_ids")
         for n in ALONE:
             bc, hc = _c(base, "base", m, n), _c(head, "head", m, n)
             tol = 0.0
@@ -171,5 +186,6 @@ def table(obs):
     rows += ["", f"- A/A (base vs base repeat) max loss diff: {_CTX.get('aa')}"]
     if "head_parts" in _CTX:
         rows.append(f"- head parts: {_CTX['head_parts']}")
+    rows.append("- loss max diffs: " + str({k: v for k, v in _CTX.items() if "-vs-" in k}))
     rows.append("- merge state: not probed (base and head carry the evidence); its head_is_fixed is declared True.")
     return "\n".join(rows)

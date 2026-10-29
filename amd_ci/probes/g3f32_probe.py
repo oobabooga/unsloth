@@ -9,6 +9,7 @@ Arms (the state's unsloth checkout + one zoo worktree, both first on PYTHONPATH)
 Cells (g3f32_cell.py, one process each), per model (tiny random Gemma3, gemma-3-270m-it):
   a    UNSLOTH_FORCE_FLOAT32=1 at import, bf16 load, SFT
   b    env unset, fp16 load then bf16 load in one process, SFT on the bf16 model
+  bb   control for b: bf16 load then bf16 load in one process (in-process reload, no fp16)
   c16 / c4   fp16 load alone (forced path), 16-bit / 4-bit, SFT
   d16 / d4   bf16 load alone, 16-bit / 4-bit, SFT
 Full arms run every cell; single-PR arms run a and b. The base arm repeats c16 / d16 (A/A).
@@ -36,14 +37,16 @@ LOADER = {"tiny": "fast_language_model", "270m": "fast_model"}
 SPECS = {
     "a": {"seq": "bfloat16", "quant": 16, "import_flag": "1"},
     "b": {"seq": "float16,bfloat16", "quant": 16},
+    "bb": {"seq": "bfloat16,bfloat16", "quant": 16},
     "c16": {"seq": "float16", "quant": 16},
     "c4": {"seq": "float16", "quant": 4},
     "d16": {"seq": "bfloat16", "quant": 16},
     "d4": {"seq": "bfloat16", "quant": 4},
 }
-FULL = ("a", "b", "c16", "c4", "d16", "d4")
+FULL = ("a", "b", "bb", "c16", "c4", "d16", "d4")
 SINGLE = ("a", "b")
 REPEAT = ("c16", "d16")
+KEEP_COMPILED = ("a", "b", "bb", "d16", "c16")
 CLEAR = ("UNSLOTH_FORCE_FLOAT32", "TORCHDYNAMO_DISABLE", "UNSLOTH_COMPILE_DISABLE", "PYTEST_ADDOPTS",
          "UNSLOTH_ALLOW_CPU")
 
@@ -110,6 +113,12 @@ def run_cell(arm, model, cell, spec, unsloth_ck, zoo_ck, out_dir, work, python, 
     text = log.read_text(encoding = "utf-8", errors = "replace")
     rec["log_tail"] = text[-1500:]
     rec["log_has_same_dtype"] = "same dtype" in text
+    if cell in KEEP_COMPILED:
+        import shutil
+        dst = out_dir / f"compiled_{tag}"
+        dst.mkdir(exist_ok = True)
+        for f in (cw / "compiled").glob("*gemma3*.py"):
+            shutil.copy2(f, dst / f.name)
     return rec
 
 
