@@ -1,0 +1,101 @@
+name: RD-845 sd.cpp error-mode A/B
+
+on:
+  push:
+    branches: [amd-devlab-ci-rd845]
+
+permissions: {}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    env:
+      MAIN_SHA: 4a87de122efeafed0c6bec79f9e4313a83cbcbf3
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout driver
+        uses: actions/checkout@v4
+
+      - name: Session
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          whoami
+          "process session id: " + [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+          "interactive: " + [Environment]::UserInteractive
+          query session
+          Get-Process explorer -ErrorAction SilentlyContinue | Select-Object Id, SessionId
+          Get-Process csrss | Select-Object Id, SessionId
+          where.exe hipblas.dll
+          "HIP_PATH=$env:HIP_PATH"
+          exit 0
+
+      - name: Sources (main and main + fix)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git config --global core.autocrlf false
+          $A = "$env:RUNNER_TEMP\A"
+          git init -q $A
+          git -C $A remote add origin https://github.com/unslothai/unsloth
+          git -C $A sparse-checkout set --no-cone /studio/backend/ /studio/install_sd_cpp_prebuilt.py
+          git -C $A fetch -q --depth 1 --filter=blob:none origin $env:MAIN_SHA
+          git -C $A checkout -q FETCH_HEAD
+          if ($LASTEXITCODE) { exit 1 }
+          Copy-Item -Recurse $A "$env:RUNNER_TEMP\B"
+          git -C "$env:RUNNER_TEMP\B" apply --verbose "$env:GITHUB_WORKSPACE\fix.patch"
+          if ($LASTEXITCODE) { exit 1 }
+          git -C "$env:RUNNER_TEMP\B" diff --stat
+
+      - name: Python
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m venv "$env:RUNNER_TEMP\venv"
+          & "$env:RUNNER_TEMP\venv\Scripts\python.exe" -m pip install -q httpx structlog pillow
+          exit $LASTEXITCODE
+
+      - name: Seed a ROCm bundle the way v0.1.911-beta installed it (no start check)
+        shell: powershell
+        env:
+          UNSLOTH_SD_CPP_VERIFY_INSTALL: "0"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
+          $code = "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import install_sd_cpp_prebuilt as i; print(i.install(accelerator='rocm', install_dir=Path(sys.argv[2])))"
+          & $py -c $code "$env:RUNNER_TEMP\A\studio" "$env:RUNNER_TEMP\pristine"
+          if ($LASTEXITCODE) { exit 1 }
+          Get-ChildItem "$env:RUNNER_TEMP\pristine" | Select-Object Name, Length
+          Get-Content "$env:RUNNER_TEMP\pristine\.unsloth-sd-cpp-install.json"
+          # Sanity: with boxes suppressed the bundle exits at once with STATUS_DLL_NOT_FOUND here.
+          $probe = "import ctypes, subprocess, sys; ctypes.WinDLL('kernel32').SetErrorMode(1); r = subprocess.run([sys.argv[1], '--help'], capture_output=True); print('suppressed probe rc=%#x' % (r.returncode & 0xffffffff))"
+          $server = Get-ChildItem -Recurse "$env:RUNNER_TEMP\pristine" -Filter sd-server.exe | Select-Object -First 1
+          & $py -c $probe $server.FullName
+
+      - name: A/B scenarios
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
+          $out = "$env:RUNNER_TEMP\out"
+          foreach ($scenario in @('probe_server', 'probe_output', 'engine_probes', 'upgrade_to_vulkan', 'forced_rocm')) {
+            foreach ($label in @('A', 'B')) {
+              $env:UNSLOTH_STUDIO_HOME = "$env:RUNNER_TEMP\home-$label-$scenario"
+              & $py "$env:GITHUB_WORKSPACE\ab_probe.py" "$env:RUNNER_TEMP\$label\studio\backend" $label "$env:RUNNER_TEMP\pristine" $out $scenario
+            }
+          }
+          exit 0
+
+      - name: Summary
+        shell: powershell
+        run: |
+          Get-Content "$env:RUNNER_TEMP\out\results.jsonl"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rd845-ab
+          path: ${{ runner.temp }}/out
