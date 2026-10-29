@@ -139,7 +139,7 @@ index aae49a59b3..b9d0de6a1e 100644
              return None
          if res.returncode != 0:
 diff --git a/studio/backend/utils/subprocess_compat.py b/studio/backend/utils/subprocess_compat.py
-index ea49d315d1..e88da928d6 100644
+index ea49d315d1..87cb1c2e0c 100644
 --- a/studio/backend/utils/subprocess_compat.py
 +++ b/studio/backend/utils/subprocess_compat.py
 @@ -3,8 +3,31 @@
@@ -153,7 +153,7 @@ index ea49d315d1..e88da928d6 100644
 +import types
 +from typing import Iterator
 +
-+SEM_FAILCRITICALERRORS = 0x0001
++_SEM_FAILCRITICALERRORS = 0x0001
 +
 +
 +def _process_error_mode_state() -> types.ModuleType:
@@ -188,7 +188,7 @@ index ea49d315d1..e88da928d6 100644
 +
 +
 +@contextlib.contextmanager
-+def windows_loader_error_boxes_suppressed(flags: int = SEM_FAILCRITICALERRORS) -> Iterator[None]:
++def windows_loader_error_boxes_suppressed(flags: int = _SEM_FAILCRITICALERRORS) -> Iterator[None]:
 +    """Hold around a test-launch: the child inherits SEM_FAILCRITICALERRORS, so a missing DLL
 +    exits 0xC0000135 instead of blocking on a modal box until someone dismisses it. The mode is
 +    process-wide, so every holder (the installer's too) shares one record: the mode is the one

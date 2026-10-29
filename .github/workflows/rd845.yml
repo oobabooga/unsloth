@@ -32,7 +32,7 @@ jobs:
           "HIP_PATH=$env:HIP_PATH"
           exit 0
 
-      - name: Sources (A = main + first commit, B = main + first commit + review follow-up)
+      - name: Sources (A = main, B = main + the final PR diff)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -45,8 +45,6 @@ jobs:
           git -C $A checkout -q FETCH_HEAD
           if ($LASTEXITCODE) { exit 1 }
           Copy-Item -Recurse $A "$env:RUNNER_TEMP\B"
-          git -C $A apply --verbose "$env:GITHUB_WORKSPACE\fix_v1.patch"
-          if ($LASTEXITCODE) { exit 1 }
           git -C "$env:RUNNER_TEMP\B" apply --verbose "$env:GITHUB_WORKSPACE\fix.patch"
           if ($LASTEXITCODE) { exit 1 }
           git -C "$env:RUNNER_TEMP\B" diff --stat

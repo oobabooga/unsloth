@@ -168,6 +168,9 @@ def run_scenario():
         # the install leaves first, then a backend probe launches the unrunnable bundle.
         from utils import subprocess_compat
 
+        if not hasattr(subprocess_compat, "windows_loader_error_boxes_suppressed"):
+            out["overlap"] = "n/a: no backend probe scope on this tree"
+            return out
         install = bk._installer_module()._windows_error_mode_suppressed()
         probe = subprocess_compat.windows_loader_error_boxes_suppressed()
         install.__enter__()
