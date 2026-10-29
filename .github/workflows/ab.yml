@@ -1,0 +1,77 @@
+name: torchao Windows CUDA index A/B
+
+on:
+  push:
+    branches: [torchao-windows-ab-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASE_SHA: 4a87de122efeafed0c6bec79f9e4313a83cbcbf3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Fetch main (A) and apply the fix (B)
+        run: |
+          git init -q src && cd src
+          git fetch -q --depth 1 https://github.com/unslothai/unsloth "$BASE_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
+          cp -r studio ../A
+          git apply ../ci/fix.patch
+          cp -r studio ../B
+          diff -r ../A ../B | head -60 || true
+      - name: Venv with the real torch 2.13.0+cu130 Windows wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          PY="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$PY" -m pip install -q uv
+          export PATH="$RUNNER_TEMP/venv/Scripts:$PATH"
+          uv pip install -q --python "$PY" torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+          "$PY" -c "import sys, platform, torch; print(sys.version); print(platform.platform()); print('torch', torch.__version__, 'cuda build', torch.version.cuda)"
+      - name: A (main) fresh, update, resync
+        run: |
+          export PATH="$RUNNER_TEMP/venv/Scripts:$PATH"
+          PY="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$PY" ci/ab_driver.py A fresh
+          "$PY" ci/ab_driver.py A update
+          "$PY" ci/ab_driver.py A update
+          "$PY" ci/ab_driver.py A resync
+          uv pip uninstall -q --python "$PY" torchao
+      - name: B (fix) fresh, update, resync
+        run: |
+          export PATH="$RUNNER_TEMP/venv/Scripts:$PATH"
+          PY="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$PY" ci/ab_driver.py B fresh
+          "$PY" ci/ab_driver.py B update
+          "$PY" ci/ab_driver.py B update
+          "$PY" ci/ab_driver.py B resync
+      - name: The installed torchao imports and carries no binaries
+        run: |
+          PY="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$PY" - <<'EOF'
+          import importlib.metadata as md, pathlib, torchao
+          import torch
+          print("torchao", md.version("torchao"))
+          try:
+              from torchao.quantization import quantize_, Int8WeightOnlyConfig
+              m = torch.nn.Sequential(torch.nn.Linear(64, 64))
+              quantize_(m, Int8WeightOnlyConfig())
+              print("quantize_ ran on CPU:", type(m[0].weight).__name__)
+          except Exception as e:
+              print("quantize_ check:", type(e).__name__, e)
+          root = pathlib.Path(torchao.__file__).parent
+          print("compiled files:", [p.name for p in root.rglob("*") if p.suffix in (".so", ".pyd", ".dll")])
+          EOF
