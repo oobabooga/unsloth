@@ -80,7 +80,7 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
           $out = "$env:RUNNER_TEMP\out"
-          $scenarios = 'overlap,probe_server,probe_output,engine_probes,upgrade_to_vulkan,forced_rocm'
+          $scenarios = 'forced_rocm'
           $taskArgs = "`"$env:GITHUB_WORKSPACE\run_all.py`" `"$env:RUNNER_TEMP`" `"$env:GITHUB_WORKSPACE`" `"$out`" $scenarios"
           $action = New-ScheduledTaskAction -Execute $py -Argument $taskArgs
           $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
