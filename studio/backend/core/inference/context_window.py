@@ -337,6 +337,187 @@ def prompt_budget(context_length: int, max_tokens: Optional[int]) -> int:
     return context_length - min(requested, max(1, context_length // 4))
 
 
+# Rendering and tokenizing a transcript many windows long can outlast the count's timeout, and a
+# fit whose first count fails sends the transcript unfitted (#15800). So a slice of the newest
+# messages is counted first, this many thresholds by estimate, doubling while it is not yet over:
+# the estimate can be off by more than 1.5x either way.
+_OVER_PROOF_THRESHOLDS = 2
+# estimate_message_tokens' own ratio, so a cut to n * this many characters estimates near n.
+_CHARS_PER_ESTIMATED_TOKEN = 4
+
+
+def _ends(text: str, max_chars: int) -> str:
+    """Both ends of ``text`` with the middle cut out, so a template checking how it starts or
+    ends (a tool-response prefix, say) still sees what it saw."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    return text[:head] + text[len(text) - (max_chars - head) :]
+
+
+def _clipped_arguments(arguments: Any, max_chars: int) -> Any:
+    """Tool-call arguments cut to about ``max_chars`` characters of JSON, still valid: brackets,
+    separators and keys are charged, strings keep their ends, and arrays and objects stop taking
+    items once the budget is spent. Arguments that do not parse become the empty object."""
+    value = arguments
+    if isinstance(arguments, str):
+        try:
+            value = json.loads(arguments)
+        except ValueError:
+            return "{}"
+    left = max_chars
+
+    def _cut(node):
+        nonlocal left
+        if isinstance(node, str):
+            kept = _ends(node, left - 2)
+            left -= len(kept) + 2
+            return kept
+        if isinstance(node, (list, dict)):
+            left -= 2
+            pairs = node.items() if isinstance(node, dict) else enumerate(node)
+            taken = []
+            for key, item in pairs:
+                if left <= 0:
+                    break
+                left -= 1  # separator
+                if isinstance(node, dict):
+                    left -= len(json.dumps(str(key), ensure_ascii = False)) + 1
+                taken.append((key, _cut(item)))
+            return dict(taken) if isinstance(node, dict) else [item for _, item in taken]
+        left -= len(str(node))
+        return node
+
+    cut = _cut(value)
+    if not isinstance(arguments, str):
+        return cut
+    return json.dumps(cut, ensure_ascii = False, separators = (",", ":"))
+
+
+def _clipped_for_count(message: dict, max_chars: int) -> dict:
+    """A copy holding at most about ``max_chars`` of each of its text and its tool-call
+    arguments, rendering a subset of what the original renders, so its count is a lower bound.
+
+    Templates rewrite assistant text: they strip old reasoning between markers that differ per
+    model (Qwen's ``</think>``, Gemma's ``<|channel>``), and a cut that lost either marker would
+    render reasoning the original never sent. So an assistant message's text is kept whole or
+    emptied, never cut. Other roles are rendered as given and keep both ends of a cut."""
+    changed: dict[str, Any] = {}
+    calls = message.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        per_call = max_chars // len(calls)
+        short = [
+            {
+                **call,
+                "function": {
+                    **call["function"],
+                    "arguments": _clipped_arguments(call["function"].get("arguments"), per_call),
+                },
+            }
+            if isinstance(call, dict)
+            and isinstance(call.get("function"), dict)
+            and len(str(call["function"].get("arguments") or "")) > max(2, per_call)
+            else call
+            for call in calls
+        ]
+        if any(new is not old for new, old in zip(short, calls)):
+            changed["tool_calls"] = short
+    content = message.get("content")
+    if message.get("role") == "assistant":
+        reasoning = message.get("reasoning_content")
+        text_chars = len(str(content or "")) + len(str(reasoning or ""))
+        if text_chars > max_chars:
+            changed["content"] = ""
+            if reasoning:
+                changed["reasoning_content"] = ""
+        return {**message, **changed} if changed else message
+    if isinstance(content, str) and len(content) > max_chars:
+        changed["content"] = _ends(content, max_chars)
+    elif isinstance(content, list):
+        # Newest parts first; parts past the budget, images too, are left out.
+        parts, left, cut = [], max_chars, False
+        for part in reversed(content):
+            if left <= 0:
+                cut = True
+                break
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str):
+                if len(text) > left:
+                    cut = True
+                    part = {**part, "text": _ends(text, left)}
+                left -= len(part["text"])
+            parts.append(part)
+        if cut:
+            changed["content"] = parts[::-1] or ""
+    return {**message, **changed} if changed else message
+
+
+def _newest_slice(messages: list[dict], sizes: list[int], budget: int) -> list[dict]:
+    """The leading instructions and the newest messages within ``budget`` estimated tokens, the
+    next older one cut to what is left. Opens on a user message, as templates expect: the rest of
+    the cut message's turn comes along emptied. Text is only ever removed, never added."""
+    start = 0
+    while start < len(messages) and messages[start].get("role") in ("system", "developer"):
+        start += 1
+    head = [
+        _clipped_for_count(message, budget * _CHARS_PER_ESTIMATED_TOKEN)
+        for message in messages[:start]
+    ]
+    used = sum(sizes[:start])
+    taken: list[dict] = []
+    index = len(messages) - 1
+    while index >= start and used + sizes[index] <= budget:
+        taken.append(messages[index])
+        used += sizes[index]
+        index -= 1
+    if index >= start:
+        left = max(0, budget - used) * _CHARS_PER_ESTIMATED_TOKEN
+        taken.append(_clipped_for_count(messages[index], left))
+        index -= 1
+        while index >= start and taken[-1].get("role") != "user":
+            taken.append(_clipped_for_count(messages[index], 0))
+            index -= 1
+    return head + taken[::-1]
+
+
+def bounded_prompt_count(
+    messages: list[dict],
+    count_tokens: Callable[[list[dict]], int],
+    threshold: int,
+    *,
+    estimate_message: Callable[[dict], int] = estimate_message_tokens,
+) -> int:
+    """The exact count, or for a transcript estimated far past ``threshold``, the count of a slice
+    of its newest messages scaled to the whole. Scaled only once that exact count already exceeds
+    ``threshold``, so comparing the result against ``threshold`` stays exact while the value itself
+    is approximate. A slice that cannot be counted falls back to counting the whole."""
+    if threshold > 0:
+        sizes = [estimate_message(message) for message in messages]
+        estimate = sum(sizes)
+        keep = threshold * _OVER_PROOF_THRESHOLDS
+        # Only while the slice is at most half the transcript; past that, count the whole.
+        while keep * 2 <= estimate:
+            newest = _newest_slice(messages, sizes, keep)
+            try:
+                counted = count_tokens(newest)
+            except RuntimeError:
+                # A refused render or a timeout, so the whole decides. Cancellation is not a
+                # RuntimeError and still propagates.
+                break
+            if counted > threshold:
+                kept = sum(estimate_message(message) for message in newest)
+                scaled = max(counted, int(counted * estimate / max(1, kept)))
+                # The estimate alone can overstate a sparse transcript many times over. A whole
+                # this small is cheap to count, and a refusal's diagnosis subtracts from it.
+                if scaled <= threshold * 2 * _OVER_PROOF_THRESHOLDS:
+                    break
+                return scaled
+            keep *= 2
+    return count_tokens(list(messages))
+
+
 _RETRIEVAL_BUDGET_SHARE = 0.5
 
 # Small on purpose: missing the reserve is survivable, so this only rules out the stub-answer end.
@@ -906,7 +1087,10 @@ def fit_rolling_context(
 
     prompt_target = prompt_budget(context_length, max_tokens)
     fitted = list(messages)
-    initial_tokens = count_tokens(fitted)
+    # Against the window, not the target: the rescue below compares this to context_length.
+    initial_tokens = bounded_prompt_count(
+        fitted, count_tokens, context_length, estimate_message = estimate_message
+    )
     current_tokens = initial_tokens
     dropped_total = 0
 
@@ -923,7 +1107,10 @@ def fit_rolling_context(
         if dropped:
             fitted = candidate
             dropped_total = dropped
-            current_tokens = count_tokens(fitted)
+            # A boundary saved long ago can leave most of the transcript in place.
+            current_tokens = bounded_prompt_count(
+                fitted, count_tokens, context_length, estimate_message = estimate_message
+            )
 
     if replay_only:
         return fitted, {
@@ -962,7 +1149,11 @@ def fit_rolling_context(
             break
         fitted = candidate
         dropped_total += dropped
-        current_tokens = count_tokens(fitted)
+        # A protected turn too big to drop can keep this huge. Bounded against the window, so the
+        # comparisons here and the rescue's below stay exact.
+        current_tokens = bounded_prompt_count(
+            fitted, count_tokens, context_length, estimate_message = estimate_message
+        )
 
     if current_tokens > prompt_target:
         # Stay strictly under n_ctx (llama-server refuses at it); one token over loses history and answer.
@@ -1119,7 +1310,7 @@ def fit_oversized_attachments(
     budget = prompt_budget(context_length, max_tokens)
     # The margin sizes a cut; it never decides one, or a file that fits would lose its end.
     target = int(budget * (1 - _ATTACHMENT_FIT_MARGIN))
-    if count_tokens(messages) <= budget:
+    if bounded_prompt_count(messages, count_tokens, budget) <= budget:
         return messages
     latest = max(index for index, message in enumerate(messages) if message.get("role") == "user")
     base = [message for message in messages if message.get("role") == "system"]
