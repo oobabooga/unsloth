@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """k15_plan.py: the k15 AMD matrix on one gfx1151 host (Linux or Windows), one k15_bench.py call per step, one log per step.
 
-Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (1dd95e587fd), k10 = ff5a2337 + k10.patch (a162dce854, the last
+Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (3aeed3f29d0), k10 = ff5a2337 + k10.patch (a162dce854, the last
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.
@@ -60,6 +60,8 @@ ARMS = [
     # table trim + input arena fit (0363724a80a) and the draft release (5cfcadced95), default x2 vs each kill switch
     "b3_on:k15:%s" % PIN, "b3_on2:k15:%s" % PIN, "b3_lf0:k15:%s;GGML_SCHED_LEND_FREE_CHECK=0" % PIN,
     "b3_tr0:k15:%s;LLAMA_MOE_LM_SCHED_TRIM=0;LLAMA_MOE_LM_ARENA_FIT=0" % PIN, "b3_dr0:k15:%s;LLAMA_MOE_LM_DRAFT_RELEASE=0" % PIN,
+    # the prefetch reserve check (0a4c75c3eb6): the MTP context's staging arena checked next to its compute buffers before allocating
+    "b3_rc0:k15:%s;GGML_SCHED_PREFETCH_RESERVE_CHECK=0" % PIN,
     "ple_d:k15:K6P_ARGS=--lazy-mode on", "ple_0:k15:K6P_ARGS=--lazy-mode on;LLAMA_PLE_RESIDENT=0", "ple_d2:k15:K6P_ARGS=--lazy-mode on",
     # draft guard: the default k15 MTP launches must keep the draft; a forced floor shows the check runs on HIP (non-vacuity)
     "dg_force:k15:LLAMA_DRAFT_MIN_FREE_MIB=1000000",
@@ -162,7 +164,7 @@ if "relsplit" in STEPS:
     step("relsplit_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="rsp_on,rsp_on2,rsp_off", extra=MTP, p8k=7900, timeout=3600)
 # r5: lend free check / scheduler trim at a 4 GB-like budget, chat / 2k / 8k, their log counts
 if "b3" in STEPS:
-    step("b3_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="b3_on,b3_on2,b3_lf0,b3_tr0,b3_dr0", extra=MTP, p8k=7900, timeout=3600)
+    step("b3_q3m_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="b3_on,b3_on2,b3_lf0,b3_tr0,b3_dr0,b3_rc0", extra=MTP, p8k=7900, timeout=3600)
 # r2: PLE read-in on (Linux) / off by construction (Windows), same text as LLAMA_PLE_RESIDENT=0
 if "ple" in STEPS:
     step("ple_g4e2b", "time", "--cell", "g4e2b:full", "--reps", "1", arms="ple_d,ple_0,ple_d2", timeout=1800)

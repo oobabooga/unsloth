@@ -319,14 +319,14 @@ def item_r2(rows, os_):
                                                                  "same" if k["rsp_on"] == k["rsp_off"] else "differs") + why)
     # r5: lend free check (f3a105b68e3) + scheduler trim / arena fit (0363724a80a), 4 GB budget + MTP, chat / 2k / 8k: no abort,
     # every arm answers the 8k cell; text on vs kill switches reported (a different lend / arena can batch differently), not gated
-    Q = {a: one(rows, a, "q3m") for a in ("b3_on", "b3_on2", "b3_lf0", "b3_tr0", "b3_dr0")}
+    Q = {a: one(rows, a, "q3m") for a in ("b3_on", "b3_on2", "b3_lf0", "b3_tr0", "b3_dr0", "b3_rc0")}
     if any(v is None for v in Q.values()):
         add("r5 lend free check / sched trim, 4 GB budget", os_, "INCONCLUSIVE", "missing %s" % [a for a in Q if Q[a] is None])
     else:
         key8 = lambda r: text_key(r) and text_key(r) + ((r.get("p8k") or {}).get("md5"),)
         k = {a: key8(Q[a]) for a in Q}
         why = "md5 chat/2k/8k %s; counts %s" % ({a: (v and "/".join(str(x)[:8] for x in v if x)) for a, v in k.items()},
-                                               {a: {c: st(Q[a]).get(c, 0) for c in ("lend_whole_n",)} for a in Q})
+                                               {a: {c: st(Q[a]).get(c, 0) for c in ("lend_whole_n", "pf_notused_n", "oom_n")} for a in Q})
         if any(died(Q[a]) for a in Q) or any(not (Q[a].get("p8k") or {}).get("md5") for a in Q):
             add("r5 lend free check / sched trim, 4 GB budget", os_, "FAIL", "an arm aborted or the 8k cell did not answer: %s; %s" % (
                 [a for a in Q if died(Q[a]) or not (Q[a].get("p8k") or {}).get("md5")], why))
@@ -456,7 +456,7 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
 item9(load("k15-linux-cpu"))
 
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: 1dd95e587fd (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: 3aeed3f29d0 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))
