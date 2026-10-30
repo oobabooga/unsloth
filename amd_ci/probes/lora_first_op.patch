@@ -1,6 +1,21 @@
---- a/unsloth/kernels/utils.py	2026-10-30 02:14:15.993202399 -0700
-+++ b/unsloth/kernels/utils.py	2026-10-30 02:15:25.224106604 -0700
-@@ -1855,6 +1855,22 @@
+--- a/unsloth/kernels/utils.py
++++ b/unsloth/kernels/utils.py
+@@ -1845,6 +1845,14 @@
+     return out
+ 
+ 
++def _lora_first_addmm(X, Wt, XA, Bt, alpha):
++    # alpha * XA @ Bt into a fresh buffer (beta 0 never reads it), then the base GEMM accumulates onto it.
++    out = torch.empty((X.shape[0], Wt.shape[1]), dtype = X.dtype, device = X.device)
++    out.addmm_(XA, Bt, alpha = alpha, beta = 0)
++    out.addmm_(X, Wt)
++    return out
++
++
+ # Traced, x.addmm_ copies x first; this op stays in place. No derivative: grad off only.
+ _HAS_ADDMM_OP = hasattr(torch.library, "custom_op")
+ if _HAS_ADDMM_OP:
+@@ -1855,6 +1863,19 @@
      ) -> None:
          out.addmm_(A, B, alpha = alpha, beta = beta)
  
@@ -11,10 +26,7 @@
 +    def _lora_first_addmm_op(
 +        X: torch.Tensor, Wt: torch.Tensor, XA: torch.Tensor, Bt: torch.Tensor, alpha: float
 +    ) -> torch.Tensor:
-+        out = torch.empty((X.shape[0], Wt.shape[1]), dtype = X.dtype, device = X.device)
-+        out.addmm_(XA, Bt, alpha = alpha, beta = 0)
-+        out.addmm_(X, Wt)
-+        return out
++        return _lora_first_addmm(X, Wt, XA, Bt, alpha)
 +
 +    @_lora_first_addmm_op.register_fake
 +    def _(X, Wt, XA, Bt, alpha):
@@ -23,7 +35,7 @@
  
  def addmm_(
      out,
-@@ -1965,18 +1981,22 @@
+@@ -1965,18 +1986,26 @@
              XA = torch_matmul(X, A.t().to(dtype))
          B = B.t().to(dtype)
          caller_out = out is not None
@@ -37,9 +49,13 @@
 -            # Traced, an in-place accumulate onto a buffer the region saves for backward breaks the block
 -            # compile (the saved tensor aliases a mutated intermediate); Inductor plans the buffer itself.
 -            out = torch.addmm(out, X, W.t())
-+        if _is_compiling() and not caller_out and _HAS_ADDMM_OP and type(s) in (int, float):
++        compiling = _is_compiling()
++        if not caller_out and (not compiling or (_HAS_ADDMM_OP and type(s) in (int, float))):
 +            W = fast_dequantize(W, W_quant, use_global_buffer = use_global_buffer, dtype = dtype)
-+            out = torch.ops.unsloth.lora_first_addmm(X, W.t(), XA, B, s)
++            if compiling:
++                out = torch.ops.unsloth.lora_first_addmm(X, W.t(), XA, B, s)
++            else:
++                out = _lora_first_addmm(X, W.t(), XA, B, s)
          else:
 -            out.addmm_(X, W.t())
 +            if caller_out:
