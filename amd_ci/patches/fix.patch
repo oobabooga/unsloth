@@ -1,0 +1,75 @@
+diff --git a/tests/test_gpt_oss_decode_fused.py b/tests/test_gpt_oss_decode_fused.py
+index 619d8ffb..104edefb 100644
+--- a/tests/test_gpt_oss_decode_fused.py
++++ b/tests/test_gpt_oss_decode_fused.py
+@@ -30,6 +30,16 @@ import torch
+ pytest.importorskip("triton")
+ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
++
++def _skip_without_cpu_inductor():
++    # CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none.
++    try:
++        from torch._inductor.cpp_builder import get_cpp_compiler
++
++        get_cpp_compiler()
++    except Exception as e:  # noqa: BLE001
++        pytest.skip(f"CPU Inductor has no C++ compiler here ({type(e).__name__}: {e})"[:300])
++
+ _SCRIPT = textwrap.dedent('''
+     import json, os, sys
+     import torch
+@@ -251,6 +261,8 @@ def loop_runs(tmp_path_factory):
+     tmp = tmp_path_factory.mktemp("gpt_oss_decode_loop")
+     dev = "cuda" if torch.cuda.is_available() and torch.version.hip is None else "cpu"
+     dtype = "bfloat16" if dev == "cuda" else "float32"
++    if dev == "cpu":
++        _skip_without_cpu_inductor()
+     return {
+         arm: _run(
+             tmp, _LOOP, dev, dtype,
+diff --git a/tests/test_gpt_oss_rope_decode.py b/tests/test_gpt_oss_rope_decode.py
+index ed1b9a2c..169bf671 100644
+--- a/tests/test_gpt_oss_rope_decode.py
++++ b/tests/test_gpt_oss_rope_decode.py
+@@ -30,6 +30,16 @@ pytest.importorskip("triton")
+ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
++def _skip_without_cpu_inductor():
++    # CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none.
++    try:
++        from torch._inductor.cpp_builder import get_cpp_compiler
++
++        get_cpp_compiler()
++    except Exception as e:  # noqa: BLE001
++        pytest.skip(f"CPU Inductor has no C++ compiler here ({type(e).__name__}: {e})"[:300])
++
++
+ def _run(tmp_path, script, *args, env_extra = None):
+     path = tmp_path / "case.py"
+     path.write_text(script)
+@@ -98,6 +108,7 @@ def kernel_results(tmp_path_factory):
+     script = _KERNEL.replace("__REGION__", textwrap.dedent(inspect.getsource(_region)))
+     if torch.cuda.is_available() and torch.version.hip is None:
+         return _run(tmp, script, "cuda")
++    _skip_without_cpu_inductor()
+     return _run(tmp, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
+ 
+ 
+@@ -275,6 +286,7 @@ def test_first_token_cannot_certify_an_eager_region(tmp_path):
+     if torch.cuda.is_available() and torch.version.hip is None:
+         res = _run(tmp_path, script, "cuda")
+     else:
++        _skip_without_cpu_inductor()
+         res = _run(tmp_path, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
+     assert res["position0_agrees"] and res["eager_differs_later"], res  # the premise
+     assert res["eager_region_declined"] and res["compiled_accepted"] and res["compiled_equal"], res
+@@ -326,6 +338,7 @@ _LOOP = textwrap.dedent('''
+ 
+ 
+ def test_decode_loop_calls_rope_decode(tmp_path):
++    _skip_without_cpu_inductor()
+     env = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None}
+     on = _run(tmp_path, _LOOP, "on", env_extra = env)
+     off = _run(tmp_path, _LOOP, "off", env_extra = env)

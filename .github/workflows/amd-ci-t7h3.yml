@@ -15,9 +15,9 @@ permissions:
 env:
   PR: "2256"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
-  PATCH_BASE: "4a74d204548a3d61968ccae84e07f459468aa5ef"
-  PATCH_FILE: "amd_ci/patches/range.patch"
-  ZOO_HEAD_SHA: "b64139475b2cb745e020e9871f0202703203d7a7"
+  PATCH_BASE: "a6d79c47730bcd242afeb34423588d186f41bfee"
+  PATCH_FILE: "amd_ci/patches/fix.patch"
+  ZOO_HEAD_SHA: "a6d79c47730bcd242afeb34423588d186f41bfee"
   UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
   UNSLOTH_SHA: "7af6ba3dde89850f398c7996434c22a49be2a7d7"
   AMD_TORCH_INDEX: "https://repo.amd.com/rocm/whl-multi-arch/"
@@ -100,18 +100,18 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
-      - name: Differential (GPT-OSS flex / kill switch / 4-bit, head)
+      - name: Differential (GPT-OSS flex prefill memory across varied lengths, head)
         timeout-minutes: 75
         run: |
           set +e
           "$AMD_CI_PY" amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/t7h3_gptoss_probe.py \
-            --criteria amd_ci/criteria/t7h3_gptoss.py \
-            --out-dir "$AMD_CI_WORK/out/lin_gptoss" \
-            --python "$AMD_CI_PY" -- --only-states head --wall 3600
-          cat "$AMD_CI_WORK/out/lin_gptoss/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/lin_gptoss"
+            --probe amd_ci/probes/t7h3_flexmem_probe.py \
+            --criteria amd_ci/criteria/t7h3_flexmem.py \
+            --out-dir "$AMD_CI_WORK/out/lin_flexmem" \
+            --python "$AMD_CI_PY" -- --only-states head
+          cat "$AMD_CI_WORK/out/lin_flexmem/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/lin_flexmem"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -206,7 +206,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$v"
           & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
 
-      - name: Differential (decode tests, base vs head, Studio venv)
+      - name: Differential (decode tests, base main vs head no-compiler skip, Studio venv)
         timeout-minutes: 50
         run: |
           $ErrorActionPreference = "Continue"
@@ -228,38 +228,19 @@ jobs:
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_tests"
 
-      - name: Differential (fused-linear tests with Triton + env diag, head, Studio venv)
-        timeout-minutes: 45
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
-            --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_win_tests.py" `
-            --out-dir "$env:AMD_CI_WORK\out\w_fl" `
-            --python "$env:AMD_CI_PY" -- --diag --only-states head --timeout 300 --wall 1800 `
-            --tests tests/test_fused_linear.py::test_ce_matches_fp64_oracle tests/test_fused_linear.py::test_ce_matches_chunked_ce `
-            tests/test_fused_linear.py::test_logprobs_match_fp64_oracle tests/test_fused_linear.py::test_split_statistics_match_oracle `
-            tests/test_fused_linear.py::test_logprobs_bit_identical_with_and_without_grad tests/test_fused_linear.py::test_fullgraph_compile_no_breaks_no_recompile `
-            tests/test_fused_linear.py::test_gpu_accuracy_modes_and_inplace tests/test_fused_linear.py::test_gpu_torch_fallback_matches_triton `
-            tests/test_fused_linear.py::test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm tests/test_fused_linear.py::test_opcheck
-          Get-Content "$env:AMD_CI_WORK\out\w_fl\VERDICT.md" |
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_fl"
-
-      - name: Differential (GPT-OSS flex / kill switch / 4-bit + Triton facts, head)
+      - name: Differential (GPT-OSS flex prefill memory across varied lengths, head)
         timeout-minutes: 75
         run: |
           $ErrorActionPreference = "Continue"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
             --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/t7h3_gptoss_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_gptoss.py" `
-            --out-dir "$env:AMD_CI_WORK\out\w_gptoss" `
-            --python "$env:AMD_CI_PY" -- --only-states head --wall 3600
-          Get-Content "$env:AMD_CI_WORK\out\w_gptoss\VERDICT.md" |
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/t7h3_flexmem_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_flexmem.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_flexmem" `
+            --python "$env:AMD_CI_PY" -- --only-states head
+          Get-Content "$env:AMD_CI_WORK\out\w_flexmem\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_gptoss"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_flexmem"
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-TITLE = "T7h.3: zoo #2255 / #2256 GPT-OSS decode tests on real gfx1151, base 4a74d204 vs head b6413947"
+TITLE = "T7h.3: zoo GPT-OSS decode tests (rope_decode + decode_fused) on real gfx1151, base vs head (SHAs below)"
 MODE = "differential"
 NEEDS = ["rocm", "gpu", "discrete_gpu", "nvidia", "multi_gpu", "mig", "xpu", "mlx"]
 _RAN = (0, 1)
