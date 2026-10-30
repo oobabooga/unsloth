@@ -1,0 +1,114 @@
+name: "AMD CI (Windows): T7h.5g LoRA order microbench (PR 16071)"
+
+on:
+  push:
+    branches: [amd-ci-t7h5g-win]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "16071"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  MERGED: "0"
+
+jobs:
+  windows:
+    name: "T7h.5g on Windows (non-Docker)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "t7h5g-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" --pr "$env:PR" `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Studio install from the head (install.ps1 --local --skip-autostart)
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $u = & $env:AMD_CI_PY -c "import json,sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
+          Add-Content -Path $env:GITHUB_ENV -Value "T7H5G_HEAD=$u"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          Push-Location "$u"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File "$u\install.ps1" --local --skip-autostart *>&1 | Select-Object -Last 30
+          Pop-Location
+          $cands = Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME" -Recurse -Filter python.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\Scripts\\python.exe$" }
+          $v = $null
+          foreach ($c in $cands) {
+            & $c.FullName -c "import torch, unsloth" 2>$null
+            if ($LASTEXITCODE -eq 0) { $v = $c.FullName; break }
+          }
+          if ($null -eq $v) { Write-Host "FATAL: no Studio venv with torch + unsloth"; exit 1 }
+          Write-Host "Studio venv: $v"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$v"
+          & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_torch.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Op microbench (torch only)
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          $o = "$env:AMD_CI_WORK\out\t7h5g"
+          New-Item -ItemType Directory -Force -Path $o | Out-Null
+          Push-Location $o
+          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\t7h5g_mm_bench.py" mm_bench.json *>&1 | Tee-Object -FilePath mm_bench.log
+          Write-Host "bench exit $LASTEXITCODE"
+          Pop-Location
+
+      - name: Step profile, flag 1 vs 0 (ABBA, head checkout)
+        timeout-minutes: 75
+        run: |
+          $ErrorActionPreference = "Continue"
+          $o = "$env:AMD_CI_WORK\out\t7h5g"
+          Push-Location $o
+          $env:PYTHONPATH = "$env:T7H5G_HEAD"
+          $env:UNSLOTH_IS_PRESENT = "1"
+          $env:PYTHONUTF8 = "1"
+          foreach ($pair in @(@("1","1"), @("2","0"), @("3","0"), @("4","1"))) {
+            $r = $pair[0]; $f = $pair[1]
+            $env:UNSLOTH_LORA_FUSED_PASSES = $f
+            $env:UNSLOTH_COMPILE_LOCATION = "$o\cache_$r"
+            Write-Host "run $r flag $f"
+            & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\t7h5g_profile_scenario.py" "prof_r$($r)_f$($f).json" unsloth/Llama-3.2-1B-Instruct *> "prof_r$($r)_f$($f).log"
+            Write-Host "exit $LASTEXITCODE"
+            & $env:AMD_CI_PY -c "import json,sys; d=json.load(open(sys.argv[1], encoding='utf-8')); print('median', d.get('median_timed_ms'), 'err', str(d.get('error'))[:300])" "prof_r$($r)_f$($f).json"
+          }
+          Get-ChildItem -Path $o -Directory -Filter "cache_*" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7h5g-win
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
