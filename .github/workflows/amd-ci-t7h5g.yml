@@ -1,0 +1,95 @@
+name: "AMD CI: T7h.5g LoRA order microbench (PR 16071)"
+
+on:
+  push:
+    branches: [amd-ci-t7h5g-lin]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR: "16071"
+  UPSTREAM: "https://github.com/unslothai/unsloth"
+  MERGED: "0"
+  PATCH_BASE: ""
+  PATCH_FILE: ""
+
+jobs:
+  gpu:
+    name: "T7h.5g GPU microbench + profile (exclusive)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "t7h5g-gpu"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Op microbench (torch only)
+        timeout-minutes: 60
+        run: |
+          set +e
+          mkdir -p "$AMD_CI_WORK/out/t7h5g"
+          cd "$AMD_CI_WORK/out/t7h5g"
+          "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/amd_ci/probes/t7h5g_mm_bench.py" mm_bench.json 2>&1 | tee mm_bench.log
+          echo "bench exit ${PIPESTATUS[0]}"
+
+      - name: Step profile, flag 1 vs 0 (ABBA, head checkout)
+        timeout-minutes: 60
+        run: |
+          set +e
+          cd "$AMD_CI_WORK/out/t7h5g"
+          HEAD="$AMD_CI_WORK/states/head"
+          for pair in "1 1" "2 0" "3 0" "4 1"; do
+            set -- $pair
+            echo "run $1 flag $2"
+            PYTHONPATH="$HEAD" UNSLOTH_IS_PRESENT=1 UNSLOTH_LORA_FUSED_PASSES="$2" \
+              UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/out/t7h5g/cache_$1" \
+              "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/amd_ci/probes/t7h5g_profile_scenario.py" \
+              "prof_r$1_f$2.json" unsloth/Llama-3.2-1B-Instruct > "prof_r$1_f$2.log" 2>&1
+            echo "exit $?"; tail -3 "prof_r$1_f$2.log"
+            "$AMD_CI_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print('median', d.get('median_timed_ms'), 'err', str(d.get('error'))[:300])" "prof_r$1_f$2.json"
+          done
+          rm -rf "$AMD_CI_WORK/out/t7h5g"/cache_*
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7h5g-lin
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
