@@ -49,7 +49,7 @@ def main() -> int:
         if res.is_file():
             run.update(json.loads(res.read_text(encoding = "utf-8")))
         obs["runs"][mode] = run
-    obs["unsloth_zoo_file"] = (obs["runs"].get("default") or {}).get("unsloth_zoo_file")
+    obs["unsloth_zoo_file"] = next((r.get("unsloth_zoo_file") for r in obs["runs"].values() if r.get("unsloth_zoo_file")), None)
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     return 0
 

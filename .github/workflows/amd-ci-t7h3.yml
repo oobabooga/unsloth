@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  T7H3_FLEXMEM_MODES: "gen_flex_only,gen_alternate"
+  T7H3_FLEXMEM_MODES: "gen_flex_only"
   PR: "2256"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   PATCH_BASE: "a6d79c47730bcd242afeb34423588d186f41bfee"
@@ -220,6 +220,21 @@ jobs:
           Get-Content "$env:AMD_CI_WORK\out\w_flexmem\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_flexmem"
+
+      - name: Pin triton-windows 3.8.0.post29 (what install gave on 10-27) and rerun
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m pip install -q "triton-windows==3.8.0.post29"
+          & $env:AMD_CI_PY -c "import triton; print('triton', triton.__version__, triton.runtime.driver.active.get_current_target())"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/t7h3_flexmem_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_flexmem.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_flexmem_tw38" `
+            --python "$env:AMD_CI_PY" -- --only-states head
+          Get-Content "$env:AMD_CI_WORK\out\w_flexmem_tw38\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         if: always()
