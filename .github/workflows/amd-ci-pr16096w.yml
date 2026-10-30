@@ -125,7 +125,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-asyncio pytest-timeout
+          & $py -m pip install -q pytest pytest-asyncio pytest-timeout python-multipart psutil -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
@@ -136,6 +136,8 @@ jobs:
       - name: Differential
         run: |
           $ErrorActionPreference = "Continue"
+          $env:UNSLOTH_IS_PRESENT = "1"
+          $env:UNSLOTH_COMPILE_DISABLE = "1"
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
             --states "$env:AMD_CI_WORK\out\states.json" `
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
