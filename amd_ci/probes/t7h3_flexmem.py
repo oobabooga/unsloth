@@ -69,20 +69,30 @@ try:
     G.patch_GptOssAttention(); G.patch_GptOssModel()
     ids = torch.randint(1, 1024, (1, 4096), device = "cuda")
     plan = [("flex", T) for T in (2048, 4096, 1024, 3072, 2048, 4096, 1536, 4096)]
+    if MODE == "gen_flex_only":
+        plan = [("flex", 2048), ("flex", 4096), ("gen_flex", 512)] * 3
+    if MODE == "gen_alternate":
+        plan = [("eager", 2048), ("eager", 4096), ("gen_eager", 512), ("flex", 2048), ("flex", 4096), ("gen_flex", 512),
+                ("eager", 2048), ("eager", 4096), ("gen_eager", 512), ("flex", 2048), ("flex", 4096), ("gen_flex", 512),
+                ("flex", 4096)]
     if MODE == "alternate":
         plan = [("eager", 2048), ("eager", 4096), ("flex", 2048), ("flex", 4096), ("eager", 2048), ("eager", 4096),
                 ("flex", 2048), ("flex", 4096), ("flex", 4096)]
     import torch._dynamo.utils as DU
 
     for arm, T in plan:
-        os.environ["UNSLOTH_GPT_OSS_EAGER_INFERENCE"] = "1" if arm == "eager" else "0"
+        os.environ["UNSLOTH_GPT_OSS_EAGER_INFERENCE"] = "1" if arm.endswith("eager") else "0"
         n_log = len(rec["log"])
         step = {"arm": arm, "T": T}
         try:
             with torch.no_grad():
                 torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
                 base = torch.cuda.memory_allocated()
-                model(input_ids = ids[:, :T], use_cache = False, logits_to_keep = 1)
+                if arm.startswith("gen_"):
+                    model.generate(ids[:, :T], attention_mask = torch.ones_like(ids[:, :T]), max_new_tokens = 32,
+                                   do_sample = False, pad_token_id = 0)
+                else:
+                    model(input_ids = ids[:, :T], use_cache = False, logits_to_keep = 1)
                 torch.cuda.synchronize()
                 step["peak_mib"] = round((torch.cuda.max_memory_allocated() - base) / 2**20, 1)
         except Exception as e:  # noqa: BLE001

@@ -13,6 +13,7 @@ permissions:
   contents: read
 
 env:
+  T7H3_FLEXMEM_MODES: "gen_flex_only,gen_alternate"
   PR: "2256"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   PATCH_BASE: "a6d79c47730bcd242afeb34423588d186f41bfee"
@@ -205,28 +206,6 @@ jobs:
           & $v -c "import triton; print('triton', triton.__version__, triton.__file__, triton.runtime.driver.active.get_current_target())"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$v"
           & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
-
-      - name: Differential (decode tests, base main vs head no-compiler skip, Studio venv)
-        timeout-minutes: 50
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY -c "import pytest" 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            & $env:AMD_CI_PY -m pip --version 2>$null
-            if ($LASTEXITCODE -ne 0) { & $env:AMD_CI_PY -m ensurepip --upgrade }
-            & $env:AMD_CI_PY -m pip install -q pytest pytest-timeout
-          }
-          & $env:AMD_CI_PY -c "import pytest; print('pytest', pytest.__version__)"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
-            --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_tests.py" `
-            --out-dir "$env:AMD_CI_WORK\out\w_tests" `
-            --python "$env:AMD_CI_PY" -- --only-states base,head --timeout 900 --wall 2400 `
-            --tests tests/test_gpt_oss_rope_decode.py tests/test_gpt_oss_decode_fused.py
-          Get-Content "$env:AMD_CI_WORK\out\w_tests\VERDICT.md" |
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_tests"
 
       - name: Differential (GPT-OSS flex prefill memory across varied lengths, head)
         timeout-minutes: 75

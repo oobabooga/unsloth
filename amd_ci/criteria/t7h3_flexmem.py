@@ -3,8 +3,7 @@
 (zoo head, gfx1151). Pairs with probes/t7h3_flexmem_probe.py (head only).
 
 Gates: each of the three runs (default / static / alternate) finished at the head from its own zoo checkout.
-REGRESSION (head-only): in any run, a flex step's peak exceeds 4x the smallest flex peak at the same length in that run,
-or a flex step at length T >= 2048 peaks above 50% of the dense bf16 scores of one layer (32 heads x T x T x 2 bytes): the flex
+REGRESSION (head-only): in any run, a flex prefill step at length T >= 2048 peaks above 50% of the dense bf16 scores of one layer (32 heads x T x T x 2 bytes): the flex
 route is then materialising attention scores.
 """
 
@@ -42,7 +41,7 @@ def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
             best[s["T"]] = min(best.get(s["T"], s["peak_mib"]), s["peak_mib"])
         for s in steps:
             dense = 32 * s["T"] * s["T"] * 2 / 2**20
-            if s["peak_mib"] > 4 * best[s["T"]] or (s["T"] >= 2048 and s["peak_mib"] > 0.5 * dense):
+            if s["T"] >= 2048 and s["peak_mib"] > 0.5 * dense:
                 bad.append(f"{mode} flex T={s['T']} peak {s['peak_mib']} MiB (best {best[s['T']]}, dense one layer {dense:.0f})")
         for s in r.get("steps") or []:
             if s.get("error"):

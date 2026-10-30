@@ -35,7 +35,7 @@ def main() -> int:
     env.setdefault("UNSLOTH_IS_PRESENT", "1")
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    for mode in ("default", "static", "alternate"):
+    for mode in os.environ.get("T7H3_FLEXMEM_MODES", "default,static,alternate").split(","):
         res = args.out.with_name(f"{args.out.stem}_{mode}.json")
         e = dict(env, UNSLOTH_COMPILE_LOCATION = str(args.out.parent / f"cc_{args.state}_{mode}"))
         try:
