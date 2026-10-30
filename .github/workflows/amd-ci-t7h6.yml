@@ -1,0 +1,279 @@
+name: "AMD CI (Linux + Windows): T7h.6 GPT-OSS flex decode guard for Triton without block pointers + AMD Windows triton-windows pairing"
+
+# base = zoo main 7af6e81e, head = base + the flex decode guard (amd_ci/patches/fix.patch).
+# unsloth = main 4089c57a + the setup.ps1 AMD triton-windows pairing (amd_ci/patches/unsloth.patch), same for both states.
+# Correctness only: no concurrency group (no timing; the GPT-OSS prefill peaks are per-process allocator stats).
+
+on:
+  push:
+    branches: [amd-ci-t7h6]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  T7H3_FLEXMEM_MODES: "gen_flex_only"
+  PR: "t7h6"
+  UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
+  PATCH_BASE: "7af6e81e47ff83640fe6559c78529f99b3d8c4c0"
+  PATCH_FILE: "amd_ci/patches/fix.patch"
+  ZOO_HEAD_SHA: "7af6e81e47ff83640fe6559c78529f99b3d8c4c0"
+  UNSLOTH_REPO: "https://github.com/unslothai/unsloth"
+  UNSLOTH_SHA: "4089c57a82c13fcb96c4b9d71b67e32a75808763"
+  UNSLOTH_PATCH: "amd_ci/patches/unsloth.patch"
+  AMD_TORCH_INDEX: "https://repo.amd.com/rocm/whl-multi-arch/"
+  AMD_TORCH_SPEC: "torch[device-gfx1151]==2.11.0+rocm7.14.0"
+
+jobs:
+
+  linux-control:
+    name: "linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+
+  lin:
+    name: "Linux: GPT-OSS flex / 4-bit with dynamo counters (Studio install.sh --local)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "t7h6-lin"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Resolve states
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/states.py --repo "$UPSTREAM" --pr "$PR" \
+            --patch-base "$PATCH_BASE" --patch "$GITHUB_WORKSPACE/$PATCH_FILE" \
+            --root "$AMD_CI_WORK" --out "$AMD_CI_WORK/out/states.json"
+          cat "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment (Studio install.sh --local) and real gate
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          U="$AMD_CI_WORK/unsloth"
+          git clone -q --filter=blob:none "$UNSLOTH_REPO" "$U"
+          git -C "$U" fetch -q origin "$UNSLOTH_SHA" || true
+          git -C "$U" checkout -q --detach "$UNSLOTH_SHA"
+          git -C "$U" apply "$GITHUB_WORKSPACE/$UNSLOTH_PATCH"
+          echo "unsloth at $(git -C "$U" rev-parse HEAD) + $UNSLOTH_PATCH"
+          cd "$U"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          export UNSLOTH_ZOO_REF="$ZOO_HEAD_SHA"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" -c "import pytest" 2>/dev/null || { "$V/bin/python" -m pip install -q pytest pytest-timeout 2>/dev/null || uv pip install --python "$V/bin/python" pytest pytest-timeout || true; }
+          "$V/bin/python" -c "import pytest; print('pytest', pytest.__version__)" || echo "WARNING: pytest missing in the Studio venv"
+          "$V/bin/python" -c "import torch, transformers; print('torch', torch.__version__, 'hip', torch.version.hip, torch.cuda.get_device_properties(0).gcnArchName, 'transformers', transformers.__version__)"
+          "$V/bin/python" -c "import triton; print('triton', triton.__version__, triton.runtime.driver.active.get_current_target())" || echo "triton import failed"
+          "$V/bin/python" -c "import bitsandbytes as b; print('bitsandbytes', b.__version__)" || echo "bitsandbytes import failed"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Guard flag at the head (expected False on Linux triton)
+        run: |
+          set +e
+          HEADCO=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1], encoding='utf-8')); print(d['paths']['head'])" "$AMD_CI_WORK/out/states.json")
+          PYTHONPATH="$HEADCO" UNSLOTH_IS_PRESENT=1 "$AMD_CI_PY" -c "import triton, torch; from unsloth_zoo.flex_attention import utils as u; print('triton', triton.__version__, 'torch', torch.__version__, 'FLEX_DECODING_UNAVAILABLE', u.FLEX_DECODING_UNAVAILABLE, 'block_ptr_removed', u._triton_block_ptr_removed(), 'template_uses', u._flex_decode_template_uses_block_ptr(), 'zoo', u.__file__)"
+
+      - name: Differential (GPT-OSS flex prefill memory across varied lengths, head)
+        timeout-minutes: 75
+        run: |
+          set +e
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe amd_ci/probes/t7h3_flexmem_probe.py \
+            --criteria amd_ci/criteria/t7h3_flexmem.py \
+            --out-dir "$AMD_CI_WORK/out/lin_flexmem" \
+            --python "$AMD_CI_PY" -- --only-states head
+          cat "$AMD_CI_WORK/out/lin_flexmem/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/lin_flexmem"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7h6-lin
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  w_studio:
+    name: "Windows: Studio install.ps1 --local; decode tests; fused-linear Triton; Triton facts + GPT-OSS flex / 4-bit"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    env:
+      UNSLOTH_IS_PRESENT: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "core.autocrlf"
+      GIT_CONFIG_VALUE_0: "false"
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "t7h6-w_studio"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) {
+            Write-Host "FATAL: no system Python found at any known location."
+            exit 1
+          }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Resolve states
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
+            --repo "$env:UPSTREAM" --pr "$env:PR" `
+            --patch-base "$env:PATCH_BASE" --patch "$env:GITHUB_WORKSPACE\$env:PATCH_FILE" `
+            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Studio install (install.ps1 --local --skip-autostart)
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          $u = "$env:AMD_CI_WORK\unsloth"
+          git clone -q --filter=blob:none "$env:UNSLOTH_REPO" "$u"
+          git -C "$u" checkout -q --detach "$env:UNSLOTH_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C "$u" apply "$env:GITHUB_WORKSPACE\$env:UNSLOTH_PATCH"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: unsloth patch did not apply"; exit 1 }
+          Write-Host "unsloth at $env:UNSLOTH_SHA + $env:UNSLOTH_PATCH"
+          $env:UNSLOTH_STUDIO_HOME = "$env:AMD_CI_WORK\studio"
+          Add-Content -Path $env:GITHUB_ENV -Value "UNSLOTH_STUDIO_HOME=$env:UNSLOTH_STUDIO_HOME"
+          Push-Location "$u"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File "$u\install.ps1" --local --skip-autostart *>&1 | Select-Object -Last 40
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "install.ps1 exit $rc"
+          $cands = Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME" -Recurse -Filter python.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\Scripts\\python.exe$" }
+          $cands | ForEach-Object { Write-Host "venv python: $($_.FullName)" }
+          $v = $null
+          foreach ($c in $cands) {
+            & $c.FullName -c "import torch, unsloth" 2>$null
+            if ($LASTEXITCODE -eq 0) { $v = $c.FullName; break }
+          }
+          if ($null -eq $v) { Write-Host "FATAL: no Studio venv with torch + unsloth"; exit 1 }
+          Write-Host "Studio venv: $v"
+          & $v -m pip list 2>$null | Select-String -Pattern "triton|torch|bitsandbytes|unsloth|transformers"
+          & $v -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available())"
+          & $v -c "import triton; print('triton', triton.__version__, triton.__file__, triton.runtime.driver.active.get_current_target())"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$v"
+          & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
+
+      - name: What the install paired (expect triton-windows 3.8.x) and the guard flag at the head
+        run: |
+          $ErrorActionPreference = "Continue"
+          $headco = & $env:AMD_CI_PY -c "import json,sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['paths']['head'])" "$env:AMD_CI_WORK\out\states.json"
+          Add-Content -Path $env:GITHUB_ENV -Value "HEADCO=$headco"
+          & $env:AMD_CI_PY -m pip list 2>$null | Select-String -Pattern "triton|torch"
+          $env:PYTHONPATH = $headco
+          & $env:AMD_CI_PY -c "import triton, torch; from unsloth_zoo.flex_attention import utils as u; print('triton', triton.__version__, 'torch', torch.__version__, 'FLEX_DECODING_UNAVAILABLE', u.FLEX_DECODING_UNAVAILABLE, 'block_ptr_removed', u._triton_block_ptr_removed(), 'template_uses', u._flex_decode_template_uses_block_ptr(), 'zoo', u.__file__)"
+
+      - name: Head on the paired triton-windows (flat expected)
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/t7h3_flexmem_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_flexmem.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_flexmem_paired" `
+            --python "$env:AMD_CI_PY" -- --only-states head
+          Get-Content "$env:AMD_CI_WORK\out\w_flexmem_paired\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: triton-windows 3.9 (no block pointers), base vs head
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m pip install -q "triton-windows==3.9.0.post30"
+          $env:PYTHONPATH = $env:HEADCO
+          & $env:AMD_CI_PY -c "import triton, torch; from unsloth_zoo.flex_attention import utils as u; print('triton', triton.__version__, 'torch', torch.__version__, 'FLEX_DECODING_UNAVAILABLE', u.FLEX_DECODING_UNAVAILABLE)"
+          Remove-Item Env:PYTHONPATH
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/t7h3_flexmem_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h6_flexmem.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_flexmem_tw39" `
+            --python "$env:AMD_CI_PY" -- --only-states base,head
+          Get-Content "$env:AMD_CI_WORK\out\w_flexmem_tw39\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_flexmem_tw39"
+
+      - name: Head zoo flex tests on triton-windows 3.9
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          Push-Location $env:HEADCO
+          $env:PYTHONPATH = $env:HEADCO
+          & $env:AMD_CI_PY -m pytest -o addopts= -p no:cacheprovider -q -rfEs `
+            tests/test_flex_decoding_block_ptr_guard.py tests/test_gpt_oss_flex_inference.py `
+            tests/test_gpt_oss_flex_decode_static_batch.py tests/test_flex_sink_short_query.py *>&1 |
+            Tee-Object -FilePath "$env:AMD_CI_WORK\out\pytest_head_tw39.log" | Select-Object -Last 30
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7h6-w_studio
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
