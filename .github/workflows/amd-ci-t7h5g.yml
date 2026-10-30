@@ -73,34 +73,36 @@ jobs:
           & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 --out "$env:AMD_CI_WORK\out\host_torch.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Op microbench (torch only)
-        timeout-minutes: 60
+      - name: Patched head (custom op for the traced fused order)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $p = "$env:AMD_CI_WORK\states\patched"
+          Copy-Item -Recurse -Force "$env:T7H5G_HEAD" $p
+          Push-Location $p
+          git apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\amd_ci\probes\lora_first_op.patch"
+          Write-Host "git apply exit $LASTEXITCODE"
+          (Select-String -Path "unsloth\kernels\utils.py" -Pattern "lora_first_addmm").Count
+          Pop-Location
+          Add-Content -Path $env:GITHUB_ENV -Value "T7H5G_PATCHED=$p"
+
+      - name: Step profile, head flag 1 / head flag 0 / patched flag 1 (h1 p1 h0 h0 p1 h1)
+        timeout-minutes: 100
         run: |
           $ErrorActionPreference = "Continue"
           $o = "$env:AMD_CI_WORK\out\t7h5g"
           New-Item -ItemType Directory -Force -Path $o | Out-Null
           Push-Location $o
-          & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\t7h5g_mm_bench.py" mm_bench.json *>&1 | Tee-Object -FilePath mm_bench.log
-          Write-Host "bench exit $LASTEXITCODE"
-          Pop-Location
-
-      - name: Step profile, flag 1 vs 0 (ABBA, head checkout)
-        timeout-minutes: 75
-        run: |
-          $ErrorActionPreference = "Continue"
-          $o = "$env:AMD_CI_WORK\out\t7h5g"
-          Push-Location $o
-          $env:PYTHONPATH = "$env:T7H5G_HEAD"
           $env:UNSLOTH_IS_PRESENT = "1"
           $env:PYTHONUTF8 = "1"
-          foreach ($pair in @(@("1","1"), @("2","0"), @("3","0"), @("4","1"))) {
-            $r = $pair[0]; $f = $pair[1]
+          foreach ($spec in @(@("1","head","1"), @("2","patched","1"), @("3","head","0"), @("4","head","0"), @("5","patched","1"), @("6","head","1"))) {
+            $r = $spec[0]; $st = $spec[1]; $f = $spec[2]
+            if ($st -eq "head") { $env:PYTHONPATH = "$env:T7H5G_HEAD" } else { $env:PYTHONPATH = "$env:T7H5G_PATCHED" }
             $env:UNSLOTH_LORA_FUSED_PASSES = $f
             $env:UNSLOTH_COMPILE_LOCATION = "$o\cache_$r"
-            Write-Host "run $r flag $f"
-            & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\t7h5g_profile_scenario.py" "prof_r$($r)_f$($f).json" unsloth/Llama-3.2-1B-Instruct *> "prof_r$($r)_f$($f).log"
+            Write-Host "run $r $st flag $f"
+            & $env:AMD_CI_PY -u "$env:GITHUB_WORKSPACE\amd_ci\probes\t7h5g_profile_scenario.py" "prof_r$($r)_$($st)_f$($f).json" unsloth/Llama-3.2-1B-Instruct *> "prof_r$($r)_$($st)_f$($f).log"
             Write-Host "exit $LASTEXITCODE"
-            & $env:AMD_CI_PY -c "import json,sys; d=json.load(open(sys.argv[1], encoding='utf-8')); print('median', d.get('median_timed_ms'), 'err', str(d.get('error'))[:300])" "prof_r$($r)_f$($f).json"
+            & $env:AMD_CI_PY -c "import json,sys; d=json.load(open(sys.argv[1], encoding='utf-8')); print('median', d.get('median_timed_ms'), 'file', d.get('unsloth_file'), 'dyn', d.get('dynamo'), 'err', str(d.get('error'))[:300])" "prof_r$($r)_$($st)_f$($f).json"
           }
           Get-ChildItem -Path $o -Directory -Filter "cache_*" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
           Pop-Location
@@ -108,7 +110,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: t7h5g-win
+          name: t7h5g-win-e2e
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
