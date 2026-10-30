@@ -14,7 +14,7 @@ permissions:
 
 env:
   T7H3_FLEXMEM_MODES: "gen_flex_only"
-  PR: "t7h6"
+  PR: "2153"
   UPSTREAM: "https://github.com/unslothai/unsloth-zoo"
   PATCH_BASE: "7af6e81e47ff83640fe6559c78529f99b3d8c4c0"
   PATCH_FILE: "amd_ci/patches/fix.patch"
