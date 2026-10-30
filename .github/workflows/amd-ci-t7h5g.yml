@@ -80,6 +80,7 @@ jobs:
           Copy-Item -Recurse -Force "$env:T7H5G_HEAD" $p
           Push-Location $p
           & $env:AMD_CI_PY -c "import sys; p=sys.argv[1]; b=open(p,'rb').read(); open(p,'wb').write(b.replace(b'\r\n', b'\n'))" "unsloth\kernels\utils.py"
+          & $env:AMD_CI_PY -c "import sys; p=sys.argv[1]; b=open(p,'rb').read(); open(p,'wb').write(b.replace(b'\r\n', b'\n'))" "$env:GITHUB_WORKSPACE\amd_ci\probes\lora_first_op.patch"
           git apply --whitespace=nowarn "$env:GITHUB_WORKSPACE\amd_ci\probes\lora_first_op.patch"
           if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: git apply failed"; exit 1 }
           (Select-String -Path "unsloth\kernels\utils.py" -Pattern "lora_first_addmm").Count
