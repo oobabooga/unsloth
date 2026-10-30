@@ -59,37 +59,36 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
-      - name: Op microbench (torch only)
-        timeout-minutes: 60
+      - name: Patched head (custom op for the traced fused order)
+        run: |
+          set -euo pipefail
+          cp -r "$AMD_CI_WORK/states/head" "$AMD_CI_WORK/states/patched"
+          cd "$AMD_CI_WORK/states/patched"
+          patch -p1 < "$GITHUB_WORKSPACE/amd_ci/probes/lora_first_op.patch" || git apply "$GITHUB_WORKSPACE/amd_ci/probes/lora_first_op.patch"
+          grep -c "lora_first_addmm" unsloth/kernels/utils.py
+
+      - name: Step profile, head flag 1 / head flag 0 / patched flag 1 (h1 p1 h0 h0 p1 h1)
+        timeout-minutes: 90
         run: |
           set +e
           mkdir -p "$AMD_CI_WORK/out/t7h5g"
           cd "$AMD_CI_WORK/out/t7h5g"
-          "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/amd_ci/probes/t7h5g_mm_bench.py" mm_bench.json 2>&1 | tee mm_bench.log
-          echo "bench exit ${PIPESTATUS[0]}"
-
-      - name: Step profile, flag 1 vs 0 (ABBA, head checkout)
-        timeout-minutes: 60
-        run: |
-          set +e
-          cd "$AMD_CI_WORK/out/t7h5g"
-          HEAD="$AMD_CI_WORK/states/head"
-          for pair in "1 1" "2 0" "3 0" "4 1"; do
-            set -- $pair
-            echo "run $1 flag $2"
-            PYTHONPATH="$HEAD" UNSLOTH_IS_PRESENT=1 UNSLOTH_LORA_FUSED_PASSES="$2" \
+          for spec in "1 head 1" "2 patched 1" "3 head 0" "4 head 0" "5 patched 1" "6 head 1"; do
+            set -- $spec
+            echo "run $1 $2 flag $3"
+            PYTHONPATH="$AMD_CI_WORK/states/$2" UNSLOTH_IS_PRESENT=1 UNSLOTH_LORA_FUSED_PASSES="$3" \
               UNSLOTH_COMPILE_LOCATION="$AMD_CI_WORK/out/t7h5g/cache_$1" \
               "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/amd_ci/probes/t7h5g_profile_scenario.py" \
-              "prof_r$1_f$2.json" unsloth/Llama-3.2-1B-Instruct > "prof_r$1_f$2.log" 2>&1
-            echo "exit $?"; tail -3 "prof_r$1_f$2.log"
-            "$AMD_CI_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print('median', d.get('median_timed_ms'), 'err', str(d.get('error'))[:300])" "prof_r$1_f$2.json"
+              "prof_r$1_$2_f$3.json" unsloth/Llama-3.2-1B-Instruct > "prof_r$1_$2_f$3.log" 2>&1
+            echo "exit $?"
+            "$AMD_CI_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print('median', d.get('median_timed_ms'), 'file', d.get('unsloth_file'), 'dyn', d.get('dynamo'), 'err', str(d.get('error'))[:300])" "prof_r$1_$2_f$3.json"
           done
           rm -rf "$AMD_CI_WORK/out/t7h5g"/cache_*
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: t7h5g-lin
+          name: t7h5g-lin-e2e
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn

@@ -95,6 +95,14 @@ try:
     rec["kernels_top"] = [r for r in rows if r["self_dev_us"] > 0][:80]
     rec["aten_top"] = sorted([r for r in rows if r["name"].startswith("aten::")], key = lambda r: -r["dev_total_us"])[:60]
     rec["total_self_dev_us"] = sum(r["self_dev_us"] for r in rows)
+    try:
+        from torch._dynamo.utils import counters
+
+        rec["dynamo"] = {"graph_break": sum(counters["graph_break"].values()),
+                         "unique_graphs": counters["stats"].get("unique_graphs", 0),
+                         "graph_break_reasons": [k[:160] for k in list(counters["graph_break"])[:5]]}
+    except Exception as e:  # noqa: BLE001
+        rec["dynamo"] = {"error": f"{type(e).__name__}: {e}"}
     rec["done"] = True
 except Exception as e:  # noqa: BLE001
     rec["error"] = f"{type(e).__name__}: {e} | {traceback.format_exc()[-2000:]}"
