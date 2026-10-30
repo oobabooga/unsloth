@@ -39,6 +39,7 @@ def main() -> int:
     env.setdefault("UNSLOTH_IS_PRESENT", "1")
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("TORCH_LOGS", "recompiles,graph_breaks")
     env.setdefault("UNSLOTH_COMPILE_LOCATION", str(args.out.parent / f"compiled_cache_{args.state}"))
     try:
         p = subprocess.run([args.python, "-u", str(HERE / "t7h3_gptoss_scenario.py"), str(res)], cwd = str(args.out.parent),

@@ -76,8 +76,8 @@ def head_is_worse(base: dict, head: dict) -> tuple[bool, str]:
         pf = [r.get("prefill_4096_peak_mib") for r in fx if r.get("prefill_4096_peak_mib") is not None]
         if pe and pf:
             notes.append(f"prefill 4k peak MiB eager {pe} vs flex {pf}")
-            if min(pf) >= min(pe):
-                bad.append("flex prefill 4k peak not below eager")
+            if max(pf) >= min(pe):
+                bad.append(f"a flex round's 4k prefill peak is not below eager (flex {pf} vs eager {pe})")
         p2e = [r.get("prefill_2048_peak_mib") for r in eg]
         p2f = [r.get("prefill_2048_peak_mib") for r in fx]
         notes.append(f"prefill 2k peak MiB eager {p2e} vs flex {p2f}")

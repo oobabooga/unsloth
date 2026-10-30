@@ -113,7 +113,15 @@ try:
     model = M.GptOssForCausalLM(c).to("cuda", dtype).eval()
     G.patch_GptOssAttention(); G.patch_GptOssModel()
     ids = torch.randint(1, 1024, (1, 4096), device = "cuda")
-    for arm, flag in (("eager", "1"), ("flex", "0"), ("eager", "1"), ("flex", "0")):
+    try:
+        import torch._dynamo.utils as DU
+
+        def _dyn():
+            return {k: dict(v) for k, v in DU.counters.items() if k in ("stats", "recompiles", "graph_break", "inductor")}
+    except Exception:  # noqa: BLE001
+        def _dyn():
+            return {}
+    for arm, flag in (("eager", "1"), ("flex", "0"), ("eager", "1"), ("flex", "0"), ("flex", "0")):
         os.environ["UNSLOTH_GPT_OSS_EAGER_INFERENCE"] = flag
         COUNT["flex"] = COUNT["eager"] = 0
         r = {}
@@ -125,6 +133,7 @@ try:
                     model(input_ids = ids[:, :T], use_cache = False, logits_to_keep = 1)
                     torch.cuda.synchronize()
                     r[f"prefill_{T}_peak_mib"] = round((torch.cuda.max_memory_allocated() - base) / 2**20, 1)
+                    r[f"prefill_{T}_dynamo"] = _dyn()
                 except Exception as e:  # noqa: BLE001
                     r[f"prefill_{T}_error"] = err(e)
             try:

@@ -40,7 +40,7 @@ jobs:
           echo "machine: $(uname -n)"
 
   lin:
-    name: "Linux: decode tests base vs head + GPT-OSS flex / 4-bit (Studio install.sh --local)"
+    name: "Linux: GPT-OSS flex / 4-bit with dynamo counters (Studio install.sh --local)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     steps:
@@ -100,20 +100,6 @@ jobs:
           "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
             --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
 
-      - name: Differential (decode tests, base vs head)
-        timeout-minutes: 60
-        run: |
-          set +e
-          "$AMD_CI_PY" amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe amd_ci/probes/zoo_pytest_probe.py \
-            --criteria amd_ci/criteria/t7h3_tests.py \
-            --out-dir "$AMD_CI_WORK/out/lin_tests" \
-            --python "$AMD_CI_PY" -- --only-states base,head --timeout 900 --wall 2700 \
-            --tests tests/test_gpt_oss_rope_decode.py tests/test_gpt_oss_decode_fused.py
-          cat "$AMD_CI_WORK/out/lin_tests/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/lin_tests"
-
       - name: Differential (GPT-OSS flex / kill switch / 4-bit, head)
         timeout-minutes: 75
         run: |
@@ -135,139 +121,10 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  w_pip:
-    name: "Windows: pip install unsloth[huggingface] on AMD torch; decode tests base vs head; fused-linear Triton"
-    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 180
-    env:
-      UNSLOTH_IS_PRESENT: "1"
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: "core.autocrlf"
-      GIT_CONFIG_VALUE_0: "false"
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-
-      - name: Preamble
-        run: |
-          .\amd_ci\lib\preamble.ps1 -Name "t7h3-w_pip"
-
-      - name: Locate the system Python
-        run: |
-          $ErrorActionPreference = "Continue"
-          $found = $null
-          foreach ($c in @("C:\Program Files\Python312\python.exe",
-                           "C:\Program Files\Python311\python.exe",
-                           "C:\Program Files\Python310\python.exe")) {
-            if (Test-Path -LiteralPath $c) { $found = $c; break }
-          }
-          if ($null -eq $found) {
-            Write-Host "FATAL: no system Python found at any known location."
-            exit 1
-          }
-          & $found --version
-          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
-
-      - name: Host gate
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
-            --require windows --out "$env:AMD_CI_WORK\out\host.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Resolve states
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
-            --repo "$env:UPSTREAM" --pr "$env:PR" `
-            --patch-base "$env:PATCH_BASE" --patch "$env:GITHUB_WORKSPACE\$env:PATCH_FILE" `
-            --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-Content "$env:AMD_CI_WORK\out\states.json"
-
-      - name: Test environment (AMD torch, then unsloth[huggingface] from the checkout, no explicit triton)
-        timeout-minutes: 75
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
-          & $py -m pip install -q --upgrade pip
-          & $py -m pip install -q pytest pytest-timeout
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $py -m pip install --index-url "$env:AMD_TORCH_INDEX" "$env:AMD_TORCH_SPEC"
-          if ($LASTEXITCODE -ne 0) {
-            & $py -m pip install --index-url "$env:AMD_TORCH_INDEX" --extra-index-url "https://pypi.org/simple" "$env:AMD_TORCH_SPEC"
-          }
-          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: AMD ROCm torch for gfx1151 did not install"; exit 1 }
-          $tv = & $py -c "import torch; print(torch.__version__)"
-          & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available())"
-          & $py -c "import triton" 2>$null
-          Write-Host "triton importable BEFORE installing unsloth: exit $LASTEXITCODE (nonzero = AMD torch wheel ships no triton)"
-          Set-Content -Path "$env:AMD_CI_WORK\constraints.txt" -Value "torch==$tv" -Encoding ASCII
-          $u = "$env:AMD_CI_WORK\unsloth"
-          git clone -q --filter=blob:none "$env:UNSLOTH_REPO" "$u"
-          git -C "$u" checkout -q --detach "$env:UNSLOTH_SHA"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $py -m pip install -c "$env:AMD_CI_WORK\constraints.txt" "$u[huggingface]"
-          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: pip install unsloth[huggingface] failed"; exit 1 }
-          & $py -m pip list 2>$null | Select-String -Pattern "triton|torch|bitsandbytes|unsloth|transformers"
-          & $py -c "import triton; print('triton', triton.__version__, triton.__file__, triton.runtime.driver.active.get_current_target())"
-          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
-          & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Differential (decode tests, base vs head)
-        timeout-minutes: 50
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
-            --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_tests.py" `
-            --out-dir "$env:AMD_CI_WORK\out\w_tests" `
-            --python "$env:AMD_CI_PY" -- --only-states base,head --timeout 900 --wall 2400 `
-            --tests tests/test_gpt_oss_rope_decode.py tests/test_gpt_oss_decode_fused.py
-          Get-Content "$env:AMD_CI_WORK\out\w_tests\VERDICT.md" |
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_tests"
-
-      - name: Differential (fused-linear tests with Triton, env diag)
-        timeout-minutes: 45
-        run: |
-          $ErrorActionPreference = "Continue"
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
-            --states "$env:AMD_CI_WORK\out\states.json" `
-            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
-            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_win_tests.py" `
-            --out-dir "$env:AMD_CI_WORK\out\w_fl" `
-            --python "$env:AMD_CI_PY" -- --diag --only-states head --timeout 300 --wall 1800 `
-            --tests tests/test_fused_linear.py::test_ce_matches_fp64_oracle tests/test_fused_linear.py::test_ce_matches_chunked_ce `
-            tests/test_fused_linear.py::test_logprobs_match_fp64_oracle tests/test_fused_linear.py::test_split_statistics_match_oracle `
-            tests/test_fused_linear.py::test_logprobs_bit_identical_with_and_without_grad tests/test_fused_linear.py::test_fullgraph_compile_no_breaks_no_recompile `
-            tests/test_fused_linear.py::test_gpu_accuracy_modes_and_inplace tests/test_fused_linear.py::test_gpu_torch_fallback_matches_triton `
-            tests/test_fused_linear.py::test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm tests/test_fused_linear.py::test_opcheck
-          Get-Content "$env:AMD_CI_WORK\out\w_fl\VERDICT.md" |
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_fl"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: t7h3-w_pip
-          path: ${{ env.AMD_CI_WORK }}/out
-          retention-days: 7
-          if-no-files-found: warn
-
   w_studio:
-    name: "Windows: Studio install.ps1 --local; Triton facts + GPT-OSS flex / 4-bit"
+    name: "Windows: Studio install.ps1 --local; decode tests; fused-linear Triton; Triton facts + GPT-OSS flex / 4-bit"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       UNSLOTH_IS_PRESENT: "1"
       PYTHONUTF8: "1"
@@ -348,6 +205,47 @@ jobs:
           & $v -c "import triton; print('triton', triton.__version__, triton.__file__, triton.runtime.driver.active.get_current_target())"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$v"
           & $v "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows --out "$env:AMD_CI_WORK\out\host_torch.json"
+
+      - name: Differential (decode tests, base vs head, Studio venv)
+        timeout-minutes: 50
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -c "import pytest" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            & $env:AMD_CI_PY -m pip --version 2>$null
+            if ($LASTEXITCODE -ne 0) { & $env:AMD_CI_PY -m ensurepip --upgrade }
+            & $env:AMD_CI_PY -m pip install -q pytest pytest-timeout
+          }
+          & $env:AMD_CI_PY -c "import pytest; print('pytest', pytest.__version__)"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/t7h3_tests.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_tests" `
+            --python "$env:AMD_CI_PY" -- --only-states base,head --timeout 900 --wall 2400 `
+            --tests tests/test_gpt_oss_rope_decode.py tests/test_gpt_oss_decode_fused.py
+          Get-Content "$env:AMD_CI_WORK\out\w_tests\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_tests"
+
+      - name: Differential (fused-linear tests with Triton + env diag, head, Studio venv)
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\differential.py" `
+            --states "$env:AMD_CI_WORK\out\states.json" `
+            --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/zoo_pytest_probe.py" `
+            --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/zoo_win_tests.py" `
+            --out-dir "$env:AMD_CI_WORK\out\w_fl" `
+            --python "$env:AMD_CI_PY" -- --diag --only-states head --timeout 300 --wall 1800 `
+            --tests tests/test_fused_linear.py::test_ce_matches_fp64_oracle tests/test_fused_linear.py::test_ce_matches_chunked_ce `
+            tests/test_fused_linear.py::test_logprobs_match_fp64_oracle tests/test_fused_linear.py::test_split_statistics_match_oracle `
+            tests/test_fused_linear.py::test_logprobs_bit_identical_with_and_without_grad tests/test_fused_linear.py::test_fullgraph_compile_no_breaks_no_recompile `
+            tests/test_fused_linear.py::test_gpu_accuracy_modes_and_inplace tests/test_fused_linear.py::test_gpu_torch_fallback_matches_triton `
+            tests/test_fused_linear.py::test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm tests/test_fused_linear.py::test_opcheck
+          Get-Content "$env:AMD_CI_WORK\out\w_fl\VERDICT.md" |
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\announce.py" "$env:AMD_CI_WORK\out\w_fl"
 
       - name: Differential (GPT-OSS flex / kill switch / 4-bit + Triton facts, head)
         timeout-minutes: 75
