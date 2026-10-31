@@ -1,7 +1,7 @@
-name: "AMD CI k15: llama.cpp k15 535819a71d5 vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
+name: "AMD CI k15: llama.cpp k15 ac9f056a08d vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
 
 # Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
-# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..535819a71d5).
+# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..ac9f056a08d).
 # Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
 # b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
