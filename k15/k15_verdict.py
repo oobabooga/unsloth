@@ -456,7 +456,7 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
 item9(load("k15-linux-cpu"))
 
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: ac9f056a08d (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: 5d2e25dbaf9 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))
