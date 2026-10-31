@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""Self-test for the AMD CI toolkit.
+
+The toolkit's whole claim is that its verdicts mean something, so the parts that
+could quietly turn a non-result into a pass are the parts that need testing:
+the VOID rule, the added-tests-are-not-a-regression rule, and the lint rules
+that each correspond to a CI run someone already lost.
+
+Run: python amd_ci/selftest.py
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+FAILURES: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    print(f"  {'ok  ' if cond else 'FAIL'} {name}" + (f"  ({detail})" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(f"{name}: {detail}")
+
+
+def _load(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_void_rule() -> None:
+    print("\nThe VOID rule (a green head with no base failure is not a pass)")
+    diff = _load(ROOT / "lib" / "differential.py")
+
+    class Crit:
+        MODE = "differential"
+        base_shows_defect = staticmethod(lambda o: o.get("broken", False))
+        head_is_fixed = staticmethod(lambda o: not o.get("broken", False))
+
+    v, _ = diff._decide(Crit, {"base": {"broken": False}, "head": {"broken": False}}, [])
+    check("base clean + head clean -> VOID, not CONFIRMED", v == "VOID", f"got {v}")
+
+    v, _ = diff._decide(Crit, {"base": {"broken": True}, "head": {"broken": False}}, [])
+    check("base broken + head clean -> CONFIRMED", v == "CONFIRMED", f"got {v}")
+
+    v, _ = diff._decide(Crit, {"base": {"broken": True}, "head": {"broken": True}}, [])
+    check("base broken + head broken -> FIX_INCOMPLETE", v == "FIX_INCOMPLETE", f"got {v}")
+
+    v, _ = diff._decide(Crit, {"base": {"broken": True}, "head": {"broken": False}},
+                        [("a gate", False, "")])
+    check("failed gate outranks everything -> INCONCLUSIVE", v == "INCONCLUSIVE", f"got {v}")
+
+    v, _ = diff._decide(Crit, {"head": {"broken": False}}, [])
+    check("missing base state -> VOID", v == "VOID", f"got {v}")
+
+
+def test_added_tests_are_not_a_regression() -> None:
+    print("\nAdded tests are not a regression (the trap that misread 237 -> 260)")
+    crit = _load(ROOT / "criteria" / "pytest_no_regression.py")
+
+    base = {"failed": [], "n_passed": 237, "n_failed": 0}
+    head = {"failed": ["tests/t_new.py::test_added_and_failing"], "n_passed": 260, "n_failed": 1}
+    worse, why = crit.head_is_worse(base, head)
+    check("a NEW failing test at head is a regression", worse, why)
+
+    base = {"failed": ["tests/t.py::flaky"], "n_passed": 100}
+    head = {"failed": ["tests/t.py::flaky"], "n_passed": 123}
+    worse, why = crit.head_is_worse(base, head)
+    check("same failure at both states is NOT a regression", not worse, why)
+    check("and it is reported as pre-dating the change", "pre-dates" in why, why)
+
+    base = {"failed": ["tests/t.py::broken"], "n_passed": 100}
+    head = {"failed": [], "n_passed": 101}
+    worse, why = crit.head_is_worse(base, head)
+    check("a fix is not a regression", not worse, why)
+    check("and the newly passing test is named", "newly passing" in why, why)
+
+
+def test_probe_skips_tests_absent_at_a_state() -> None:
+    print("\nA test file added by the PR is absent at base, not a failure there")
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td) / "base" / "studio" / "backend" / "tests"
+        base.mkdir(parents = True)
+        (base.parent / "tests" / "t_old.py").write_text("def test_a():\n    assert True\n")
+        out = Path(td) / "obs.json"
+        subprocess.run([sys.executable, str(ROOT / "probes" / "pytest_probe.py"),
+                        "--state", "base", "--checkout", str(Path(td) / "base"),
+                        "--out", str(out), "--tests", "tests/t_old.py", "tests/t_new.py"],
+                       capture_output = True)
+        obs = json.loads(out.read_text())
+        check("absent file is recorded, not run", obs.get("absent_at_this_state") == ["tests/t_new.py"],
+              str(obs.get("absent_at_this_state")))
+        check("present file is still selected", obs.get("selected") == ["tests/t_old.py"],
+              str(obs.get("selected")))
+        check("no spurious failure from the absent file", obs.get("n_failed", 0) == 0,
+              str(obs.get("n_failed")))
+
+
+def test_lint_rules_fire() -> None:
+    print("\nLint rules fire on the shapes that cost real runs")
+    lint = _load(ROOT / "lib" / "lint_workflow.py")
+
+    f = lint.lint_text("x", "set -uo pipefail\nfoo bar\nrc=$?\n")
+    check("E001 errexit swallowing rc", any(c == "E001" for c, _, _ in f))
+    f = lint.lint_text("x", "set +e\nset -uo pipefail\nfoo bar\nrc=$?\n")
+    check("E001 silent once `set +e` present", not any(c == "E001" for c, _, _ in f))
+
+    f = lint.lint_text("x", 'pkill -f "probe_9362.py holder"\n')
+    check("E002 self-matching pkill", any(c == "E002" for c, _, _ in f))
+
+    f = lint.lint_text("x", "set -euo pipefail\nicd=$(ls /a/b*.json 2>/dev/null | head -1)\n")
+    check("E005 pipefail glob despite 2>/dev/null", any(c == "E005" for c, _, _ in f))
+    f = lint.lint_text("x", "set -euo pipefail\nicd=$(ls /a/b*.json 2>/dev/null | head -1 || true)\n")
+    check("E005 silent with `|| true`", not any(c == "E005" for c, _, _ in f))
+
+    f = lint.lint_text("x", "cat <<'PY' > f.txt\n  hello\n  PY\n")
+    check("E003 indented heredoc terminator", any(c == "E003" for c, _, _ in f))
+
+    # The shape that broke every GPU job: the toolkit is only at the checkout
+    # root, so a relative reference dies once the step enters a state worktree.
+    body = 'cd "$AMD_CI_WORK/states/head"\n"$V/bin/python" amd_ci/lib/gate.py --require gpu\n'
+    check("E007 relative toolkit path after cd", any(c == "E007" for c, _, _ in lint.lint_text("x", body)))
+    fixed = 'cd "$AMD_CI_WORK/states/head"\n"$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py"\n'
+    check("E007 silent once absolute", not any(c == "E007" for c, _, _ in lint.lint_text("x", fixed)))
+    back = 'cd "$AMD_CI_WORK/states/head"\ncd "$GITHUB_WORKSPACE"\npython3 amd_ci/lib/gate.py\n'
+    check("E007 silent after cd back", not any(c == "E007" for c, _, _ in lint.lint_text("x", back)))
+    check("E007 silent with no cd", not any(c == "E007" for c, _, _ in
+                                            lint.lint_text("x", "python3 amd_ci/lib/gate.py\n")))
+
+    check("the shipped template is E007-clean",
+          not any(c == "E007" for c, _, _ in
+                  lint.lint_workflow(ROOT / "templates" / "workflow.yml")))
+
+
+def test_scaffold_rejects_subdir_prefixed_tests() -> None:
+    print("\n--tests carrying the probe's own subdir is refused, not run")
+    probe = (ROOT / "probes" / "pytest_probe.py").read_text()
+    m = re.search(r'"--subdir",\s*default\s*=\s*"([^"]+)"', probe)
+    scaffold = _load(ROOT / "scaffold.py")
+    check("scaffold's PYTEST_SUBDIR matches the probe's default",
+          m is not None and m.group(1) == scaffold.PYTEST_SUBDIR,
+          f"probe={m and m.group(1)} scaffold={scaffold.PYTEST_SUBDIR}")
+
+    with tempfile.TemporaryDirectory() as td:
+        base = [sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                "--out", str(Path(td) / "o"), "--no-gpu"]
+        bad = subprocess.run(base + ["--tests", "studio/backend/tests/test_x.py"],
+                             capture_output = True, text = True)
+        check("a repo-root path exits non-zero", bad.returncode != 0, bad.stdout + bad.stderr)
+        check("and the message gives the corrected path",
+              "'tests/test_x.py'" in (bad.stdout + bad.stderr), bad.stdout + bad.stderr)
+        good = subprocess.run(base + ["--tests", "tests/test_x.py"],
+                              capture_output = True, text = True)
+        check("the subdir-relative form is accepted", good.returncode == 0,
+              good.stdout + good.stderr)
+
+
+def test_bounds_are_stated_even_when_there_are_none() -> None:
+    print("\nA report always states its reach, including when nothing is missing")
+    cap = _load(ROOT / "lib" / "capability.py")
+    p = cap.HostProfile()
+    p.capabilities = {"rocm": True, "gpu": True}
+
+    s = cap.untested_section(p, ["rocm", "windows", "multi_gpu"])
+    check("declared gaps are listed", "**windows**" in s and "**multi_gpu**" in s, s)
+    check("a satisfied capability is not listed as a gap", "**rocm**" not in s, s)
+
+    # The under-declaration that made a Windows-only PR look unbounded.
+    s = cap.untested_section(p, ["rocm"])
+    check("a fully-satisfied NEEDS still renders a section", s.strip() != "", repr(s))
+    check("and says it is a claim about the declaration", "DECLARATION" in s, s)
+
+    s = cap.untested_section(p, [])
+    check("an absent NEEDS renders a section too", s.strip() != "", repr(s))
+    check("and calls the reach unknown", "unknown" in s, s)
+
+    # Observed on the runner: with torch absent, every GPU capability reads
+    # False, and the report asserted "this host has no ROCm" about a ROCm box.
+    d = cap.HostProfile()
+    d.capabilities = {"linux": True}
+    d.torch_detection = False
+    s = cap.untested_section(d, ["rocm", "windows"])
+    check("an unmeasurable capability is UNDETERMINED, not absent",
+          "UNDETERMINED" in s.split("- **windows**")[0], s)
+    check("and it says so is not a claim about the hardware",
+          "Not a statement about the hardware" in s, s)
+    check("a genuinely host-derived gap still reads as a gap",
+          "needs a Windows host" in s, s)
+    d.torch_detection = True
+    s = cap.untested_section(d, ["rocm"])
+    check("with detection working, absence is reported as absence",
+          "UNDETERMINED" not in s, s)
+
+
+def test_a_non_result_does_not_leave_the_job_green() -> None:
+    print("\nVOID/INCONCLUSIVE fail the job; a real finding does not")
+    ann = ROOT / "lib" / "announce.py"
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for verdict, want_rc in [("INCONCLUSIVE", 1), ("VOID", 1), ("CONFIRMED", 0),
+                                 ("NO_REGRESSION", 0), ("FIX_INCOMPLETE", 0)]:
+            (d / "verdict.json").write_text(json.dumps({"verdict": verdict, "why": "w"}))
+            r = subprocess.run([sys.executable, str(ann), str(d)], capture_output = True, text = True)
+            check(f"{verdict} -> exit {want_rc}", r.returncode == want_rc,
+                  f"rc={r.returncode} {r.stdout}")
+        (d / "verdict.json").unlink()
+        r = subprocess.run([sys.executable, str(ann), str(d)], capture_output = True, text = True)
+        check("a missing verdict is a failure, not a pass", r.returncode == 1, r.stdout)
+
+
+def test_fixture_failure_is_inconclusive_not_a_pass() -> None:
+    print("\nA fixture that never comes up yields no result, not a green one")
+    diff = _load(ROOT / "lib" / "differential.py")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        dud = out / "dud.py"
+        dud.write_text("import sys\nsys.exit(3)\n")
+        proc, info = diff.start_fixture(dud, [], out, sys.executable, timeout = 6)
+        check("a fixture that exits is not ready", not info.get("ready"), str(info))
+        check("its early exit is recorded", info.get("exited_early") == 3, str(info))
+        diff.stop_fixture(proc)
+
+        ok = out / "ok.py"
+        ok.write_text(
+            "import json,time,sys\n"
+            "print(json.dumps({'status':'READY','allocated_gib':4.0}), flush=True)\n"
+            "time.sleep(30)\n")
+        proc, info = diff.start_fixture(ok, [], out, sys.executable, timeout = 30)
+        check("a ready fixture is detected", info.get("ready") is True, str(info))
+        check("its payload is captured", info.get("allocated_gib") == 4.0, str(info))
+        diff.stop_fixture(proc)
+        check("and it is stopped by PID", proc.poll() is not None, "still running")
+
+
+def test_fixture_metadata_is_not_mistaken_for_a_state() -> None:
+    print("\nFixture metadata is not a state")
+    diff = _load(ROOT / "lib" / "differential.py")
+
+    class Crit:
+        MODE = "differential"
+        base_shows_defect = staticmethod(lambda o: o.get("broken", False))
+        head_is_fixed = staticmethod(lambda o: not o.get("broken", False))
+
+    obs = {"base": {"broken": True}, "head": {"broken": False},
+           "_fixture": {"pid": 1, "ready": True}}
+    v, _ = diff._decide(Crit, obs, [])
+    check("_fixture is skipped when checking extra states", v == "CONFIRMED", f"got {v}")
+
+
+def test_spoofed_devices_cannot_satisfy_multi_gpu() -> None:
+    print("\nA fabricated device never counts as multi-GPU")
+    cap = _load(ROOT / "lib" / "capability.py")
+
+    # The hazard this guards: detect() reads torch.cuda.device_count(), which under
+    # the HIP device multiplier reports 2 on a one-GPU box. If that were allowed to
+    # satisfy multi_gpu, "Not tested here" would lose the multi-GPU line and a wiring
+    # run would read as hardware validation.
+    profile = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 2)
+    profile.spoofed_devices = 1
+    # capabilities_for is the SHIPPED rule. Rebuilding the dict here instead would
+    # test this test's arithmetic and pass while the real rule was broken.
+    profile.capabilities = cap.capabilities_for(profile)
+    section = cap.untested_section(profile, ["multi_gpu"])
+
+    check("a spoofed second device does not satisfy multi_gpu",
+          profile.capabilities["multi_gpu"] is False)
+    check("the verdict says the devices were fabricated",
+          "FABRICATED" in section, section[:120])
+    check("and says what a fabricated device cannot show",
+          "sharding" in section and "collectives" in section, section[:200])
+
+    two_real = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 2)
+    check("two REAL devices still do satisfy multi_gpu (the rule is not just off)",
+          cap.capabilities_for(two_real)["multi_gpu"] is True)
+
+    honest = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 1)
+    honest.capabilities = cap.capabilities_for(honest)
+    check("an unspoofed run says nothing about fabrication",
+          "FABRICATED" not in cap.untested_section(honest, ["multi_gpu"]))
+
+
+def test_linux_gpu_step_hands_the_pytest_probe_its_tests() -> None:
+    print("\nthe Linux GPU Differential step passes --tests to the default pytest probe")
+    import subprocess, tempfile
+    # pytest_probe.py requires --tests. The Linux GPU step spliced only --probe-args, so the
+    # default probe died at argparse inside the job on every run that kept the GPU job.
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "ci"
+        r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                            "--out", str(out), "--branch", "b", "--no-suites",
+                            "--tests", "tests/test_x.py"], capture_output = True, text = True)
+        wf = out / ".github" / "workflows" / "b.yml"
+        text = wf.read_text() if wf.is_file() else ""
+        gpu = text[text.find("name: Differential"):]
+        check("scaffold succeeds", r.returncode == 0, (r.stdout + r.stderr)[-200:])
+        check("the GPU step carries --tests", "-- --tests tests/test_x.py" in gpu, gpu[:400])
+        check("no placeholder is left behind", "__" + "DIFF_ARGS" + "__" not in text
+              and "__" + "PROBE_ARGS" + "__" not in text)
+        check("uv also reads pypi.org in every install step",
+              text.count("UV_EXTRA_INDEX_URL=") == text.count("bash install.sh --local")
+              and text.count("bash install.sh --local") > 0)
+
+
+def test_custom_probe_args_follow_the_separator() -> None:
+    print("\na custom probe's --probe-args reach it after `--` on both templates")
+    import subprocess, tempfile
+    # differential.py takes probe args as a REMAINDER; spliced bare, argparse rejected them
+    # ("unrecognized arguments") and the job ended with no verdict before probing anything.
+    for extra in ([], ["--windows"]):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "ci"
+            r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                                "--out", str(out), "--branch", "b", *extra,
+                                "--probe", "amd_ci/probes/gpu_summary_probe.py",
+                                "--criteria", "amd_ci/criteria/gpu_summary_sees_others.py",
+                                "--probe-args", "--run-chosen --hazard"],
+                               capture_output = True, text = True)
+            wf = out / ".github" / "workflows" / "b.yml"
+            text = wf.read_text(encoding = "utf-8") if wf.is_file() else ""
+            label = "windows" if extra else "linux"
+            check(f"{label}: scaffold succeeds", r.returncode == 0, (r.stdout + r.stderr)[-200:])
+            check(f"{label}: probe args follow `--`", "-- --run-chosen --hazard" in text)
+            check(f"{label}: no bare probe args",
+                  text.count("--run-chosen --hazard") == text.count("-- --run-chosen --hazard"))
+            check(f"{label}: no placeholder is left behind", "__" + "DIFF_ARGS" + "__" not in text)
+
+
+def test_spoof_flag_targets_the_gpu_job() -> None:
+    print("\n--spoof-devices lands in the gpu job, not the suites job")
+    import subprocess, tempfile
+    # The template carries a Differential step in BOTH jobs. Inserting before the
+    # first one puts it in suites, where --no-suites then deletes it: the flag
+    # silently does nothing and the workflow lints clean. Observed once.
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "ci"
+        r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                            "--out", str(out), "--branch", "b", "--no-suites",
+                            "--spoof-devices", "1"], capture_output = True, text = True)
+        wf = out / ".github" / "workflows" / "b.yml"
+        text = wf.read_text() if wf.is_file() else ""
+        check("the step survives --no-suites", "device_multiplier.py" in text,
+              (r.stdout + r.stderr)[-200:])
+        check("it runs before the Differential step",
+              "device_multiplier.py" in text and
+              text.find("Present extra HIP devices") < text.find("name: Differential"))
+
+
+def test_a_pytest_run_that_never_ran_is_not_a_pass() -> None:
+    print("\nA pytest suite that never ran is not no-regression")
+    crit = _load(ROOT / "criteria" / "pytest_no_regression.py")
+
+    # The exact shape seen on the gfx1151 runner: unconditional --timeout with no
+    # pytest-timeout plugin, so pytest exits 4 with empty stdout and the reason on
+    # stderr. The old gate was "rc is not None", which this satisfies.
+    vacuous = {"rc": 4, "n_passed": 0, "n_failed": 0, "n_skipped": 0,
+               "stderr_tail": "error: unrecognized arguments: --timeout"}
+    failed = [n for n, ok, _ in crit.gates({"base": dict(vacuous), "head": dict(vacuous)}) if not ok]
+    check("a usage error is not 'the suite ran'",
+          any("actually ran" in n for n in failed), str(failed))
+
+    # Clean exit, nothing collected: comparing zero to zero always looks clean.
+    empty = {"rc": 0, "n_passed": 0, "n_failed": 0, "n_skipped": 0}
+    failed = [n for n, ok, _ in crit.gates({"base": dict(empty), "head": dict(empty)}) if not ok]
+    check("collecting nothing is not a comparison",
+          any("collected tests" in n for n in failed), str(failed))
+
+    real = {"rc": 0, "n_passed": 47, "n_failed": 0, "n_skipped": 2}
+    failed = [n for n, ok, _ in crit.gates({"base": dict(real), "head": dict(real)}) if not ok]
+    check("a real run still passes", not failed, str(failed))
+
+    # rc=1 is tests failing, which IS a run and must be judged, not discarded.
+    ran = {"rc": 1, "n_passed": 40, "n_failed": 7, "n_skipped": 0}
+    failed = [n for n, ok, _ in crit.gates({"base": dict(ran), "head": dict(ran)}) if not ok]
+    check("failing tests still count as having run", not failed, str(failed))
+
+
+def test_windows_is_reachable_but_docker_on_windows_is_not() -> None:
+    print("\nWindows is a target; Docker on Windows still is not")
+    cap = _load(ROOT / "lib" / "capability.py")
+
+    # The four Windows AMD runners as measured: Windows, no docker CLI. The point
+    # of the split is that ONE gap used to cover both, so a Windows-only change was
+    # reported as unreachable when it is now reachable, while a containerised one
+    # would become reported as reachable when it is not.
+    win = cap.HostProfile(system = "Windows", gpu_count = 0)
+    win.docker_cli = False
+    win.capabilities = cap.capabilities_for(win)
+    check("a Windows runner satisfies `windows`", win.capabilities["windows"] is True)
+    check("but not `windows_docker`", win.capabilities["windows_docker"] is False)
+    check("nor plain `docker`", win.capabilities["docker"] is False)
+
+    s = cap.untested_section(win, ["windows_docker"])
+    check("the docker gap is stated as measured on the runners",
+          "not installed" in s and "windows_docker" in s, s)
+    check("and says non-Docker Windows work IS reachable",
+          "NON-Docker" in s or "non-Docker" in s, s)
+
+    lin = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 1)
+    lin.capabilities = cap.capabilities_for(lin)
+    s = cap.untested_section(lin, ["windows"])
+    check("a Linux job still reports `windows` as a gap for ITSELF",
+          "**windows**" in s, s)
+    check("but no longer claims the POOL has no Windows",
+          "this runner is Linux" not in s, s)
+    check("and names the selector that reaches them",
+          "self-hosted, Windows, strix-halo, devlab-dispatch" in s, s)
+    check("and the shell they need",
+          "shell: powershell" in s, s)
+
+    # A docker-capable Windows host is not something this pool has, but the rule
+    # must be a rule and not a constant, or it stops describing whatever runs next.
+    dock = cap.HostProfile(system = "Windows")
+    dock.docker_cli = True
+    check("the rule is computed, not hardcoded to False",
+          cap.capabilities_for(dock)["windows_docker"] is True)
+
+
+def test_windows_lint_rules_fire() -> None:
+    print("\nThe Windows shell traps are caught before a run is spent")
+    lint = _load(ROOT / "lib" / "lint_workflow.py")
+
+    def codes(shell, body):
+        return [c for c, _, _ in lint.lint_windows("x", body, shell)]
+
+    check("E100 on `shell: pwsh` (no PowerShell 7 on these boxes)",
+          "E100" in codes("pwsh", "Write-Host hi"))
+    check("E100 on `shell: bash` (no bash either)",
+          "E100" in codes("bash", "Write-Host hi"))
+    check("E100 on no shell at all (the Actions default is pwsh)",
+          "E100" in codes(None, "Write-Host hi"))
+    check("E100 silent on `shell: powershell`",
+          "E100" not in codes("powershell", "Write-Host hi"))
+
+    check("E101 on docker in a Windows job",
+          "E101" in codes("powershell", "docker pull rocm/dev"))
+    check("E102 on the Linux preamble in a Windows job",
+          "E102" in codes("powershell", ". amd_ci/lib/preamble.sh j"))
+    check("W103 (a warning, not an error) on branching on RUNNER_OS",
+          "W103" in codes("powershell", 'if ($env:RUNNER_OS -eq "Windows") { }'))
+    check("E104 on a bash-style $RUNNER_TEMP inside PowerShell",
+          "E104" in codes("powershell", 'New-Item -Path "$RUNNER_TEMP\\w"'))
+    check("E104 silent on the PowerShell form",
+          "E104" not in codes("powershell", 'New-Item -Path "$env:RUNNER_TEMP\\w"'))
+    check("W104 on Out-File into GITHUB_ENV (BOM on PowerShell 5.1)",
+          "W104" in codes("powershell",
+                          '"a=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'))
+
+    # A selector with no OS label used to be merely redundant; both OSes answer now.
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "wf.yml"
+        p.write_text("on: {push: {branches: [x]}}\njobs:\n"
+                     "  j:\n    runs-on: [self-hosted, strix-halo, devlab-dispatch]\n"
+                     "    steps:\n      - run: echo hi\n")
+        check("E106 on a strix-halo selector with no OS label",
+              any(c == "E106" for c, _, _ in lint.lint_workflow(p)))
+
+    # A bash rule aimed at a PowerShell block is worse than no rule: it is a
+    # finding that cannot be fixed, and a linter people ignore catches nothing.
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "wf.yml"
+        p.write_text("on: {push: {branches: [x]}}\njobs:\n"
+                     "  j:\n    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]\n"
+                     "    defaults:\n      run:\n        shell: powershell\n"
+                     "    steps:\n      - run: |\n"
+                     '          $rc = 1\n          if ($rc -ne 0) { exit $rc }\n')
+        got = [c for c, _, _ in lint.lint_workflow(p)]
+        check("no bash syntax error is reported for a PowerShell block",
+              "E000" not in got, str(got))
+        check("and the job-level `defaults.run.shell` counts as declaring the shell",
+              "E100" not in got, str(got))
+
+    check("the shipped Windows template lints clean",
+          not lint.lint_workflow(ROOT / "templates" / "workflow_windows.yml"),
+          str(lint.lint_workflow(ROOT / "templates" / "workflow_windows.yml")))
+
+
+def test_a_dead_label_is_an_error_not_a_wait() -> None:
+    print("\nA selector no runner can satisfy is a lint error, not a queue")
+    lint = _load(ROOT / "lib" / "lint_workflow.py")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "wf.yml"
+        p.write_text("on: {push: {branches: [x]}}\njobs:\n"
+                     "  j:\n    runs-on: [self-hosted, Linux, strix-halo, ephemeral]\n"
+                     "    steps:\n      - run: echo hi\n", encoding = "utf-8")
+        check("E107 on a strix-halo selector carrying `ephemeral`",
+              any(c == "E107" for c, _, _ in lint.lint_workflow(p)))
+        p.write_text("on: {push: {branches: [x]}}\njobs:\n"
+                     "  j:\n    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]\n"
+                     "    steps:\n      - run: echo hi\n", encoding = "utf-8")
+        check("E107 silent on `devlab-dispatch`",
+              not any(c == "E107" for c, _, _ in lint.lint_workflow(p)))
+
+
+def test_a_tuple_verdict_is_read_for_its_bool() -> None:
+    print("\nA (bool, reason) criterion result is not truthy just for being a tuple")
+    diff = _load(ROOT / "lib" / "differential.py")
+
+    class Crit:
+        MODE = "differential"
+        base_shows_defect = staticmethod(lambda o: (o.get("broken", False), "base"))
+        head_is_fixed = staticmethod(
+            lambda o: (not o.get("broken", False), "still broken" if o.get("broken") else "clean"))
+
+    v, _ = diff._decide(Crit, {"base": {"broken": True}, "head": {"broken": True}}, [])
+    check("a head that still shows the defect is FIX_INCOMPLETE", v == "FIX_INCOMPLETE", f"got {v}")
+    v, _ = diff._decide(Crit, {"base": {"broken": True}, "head": {"broken": False}}, [])
+    check("a head that clears it is CONFIRMED", v == "CONFIRMED", f"got {v}")
+    v, _ = diff._decide(Crit, {"base": {"broken": False}, "head": {"broken": False}}, [])
+    check("a base without the defect is VOID even as a tuple", v == "VOID", f"got {v}")
+
+
+def test_a_verdict_can_be_redecided_without_the_probes() -> None:
+    print("\nA finished run's observations can be re-decided offline")
+    red = _load(ROOT / "lib" / "redecide.py")
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "observations.json").write_text(json.dumps(
+            {"base": {"broken": True}, "head": {"broken": True}}), encoding = "utf-8")
+        crit = d / "crit.py"
+        crit.write_text(
+            'MODE = "differential"\n'
+            'def base_shows_defect(o): return (o.get("broken", False), "b")\n'
+            'def head_is_fixed(o): return (not o.get("broken", False), "h")\n'
+            'def gates(o): return [("both probed", "base" in o and "head" in o, "ok")]\n',
+            encoding = "utf-8")
+        v, _ = red.redecide(d, crit, "t")
+        check("the re-decided verdict is the corrected one", v == "FIX_INCOMPLETE", f"got {v}")
+        out = (d / "VERDICT_redecided.md").read_text(encoding = "utf-8")
+        check("it is written beside the original, marked as offline",
+              "re-decided offline" in out and "FIX_INCOMPLETE" in out, out)
+        check("the original VERDICT.md is not touched", not (d / "VERDICT.md").exists())
+
+
+def test_windows_arch_comes_from_the_video_controller() -> None:
+    print("\nOn Windows the gfx target is read from the video controller name")
+    cap = _load(ROOT / "lib" / "capability.py")
+    names = ["AMD Radeon(TM) 8060S Graphics", "Microsoft Basic Display Adapter"]
+    check("8060S maps to gfx1151 and the unknown adapter maps to nothing",
+          cap.archs_from_windows_video_controllers(names) == ["gfx1151"],
+          str(cap.archs_from_windows_video_controllers(names)))
+    check("an unknown part is not guessed", cap.archs_from_windows_video_controllers(["RTX 4090"]) == [])
+    if sys.platform != "win32":
+        check("the controller query is a no-op off Windows", cap.windows_video_controllers() == [])
+
+
+def test_toolkit_text_io_names_its_encoding() -> None:
+    print("\nEvery text read and write in the toolkit names its encoding")
+    # cp1252 is the Windows default; a UTF-8 prompt read through it is mojibake.
+    import ast
+    offenders: list[str] = []
+    for path in [*(ROOT / "lib").glob("*.py"), *(ROOT / "probes").glob("*.py"),
+                 *(ROOT / "criteria").glob("*.py"), ROOT / "scaffold.py"]:
+        for node in ast.walk(ast.parse(path.read_text(encoding = "utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name not in ("read_text", "write_text", "open"):
+                continue
+            if isinstance(f, ast.Attribute) and getattr(f.value, "id", "") in ("tarfile", "zipfile"):
+                continue  # archive members are bytes
+            if any(k.arg == "encoding" for k in node.keywords):
+                continue
+            if name == "open":
+                mode = node.args[1] if len(node.args) > 1 else None
+                for k in node.keywords:
+                    if k.arg == "mode":
+                        mode = k.value
+                if isinstance(mode, ast.Constant) and "b" in str(mode.value):
+                    continue  # bytes need no encoding
+            offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    check("no unqualified text I/O under lib/, probes/, criteria/ or scaffold.py",
+          not offenders, ", ".join(offenders))
+
+
+def test_scaffold_windows_emits_the_measured_selector() -> None:
+    print("\n--windows emits the selector and shell that actually match")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "ci"
+        r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                            "--out", str(out), "--branch", "b", "--windows",
+                            "--tests", "tests/test_x.py"], capture_output = True, text = True)
+        check("scaffolding succeeds", r.returncode == 0, r.stdout + r.stderr)
+        wf = out / ".github" / "workflows" / "b.yml"
+        text = wf.read_text() if wf.is_file() else ""
+        check("the Windows selector is emitted",
+              "[self-hosted, Windows, strix-halo, devlab-dispatch]" in text, text[:200])
+        check("with shell: powershell", "shell: powershell" in text, text[:200])
+        check("and the PowerShell preamble, not the bash one",
+              "preamble.ps1" in text and "preamble.sh" not in text)
+        # The text check alone passed in workspaces whose deploy dropped the file itself.
+        check("and that preamble ships on the branch",
+              (out / "amd_ci" / "lib" / "preamble.ps1").is_file())
+        # A stalled Windows job and a busy pool look identical from the run list.
+        check("a linux-control job ships with it", "linux-control:" in text)
+        check("differing only in the OS label",
+              "[self-hosted, Linux, strix-halo, devlab-dispatch]" in text)
+
+        # Silently ignoring a Linux-only flag is how --spoof-devices once did
+        # nothing while the workflow linted clean.
+        bad = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1",
+                              "--out", str(Path(td) / "ci2"), "--windows",
+                              "--spoof-devices", "1"], capture_output = True, text = True)
+        check("--spoof-devices with --windows is refused, not ignored",
+              bad.returncode != 0, bad.stdout + bad.stderr)
+        check("and says why there is no Windows equivalent",
+              "LD_PRELOAD" in (bad.stdout + bad.stderr), bad.stdout + bad.stderr)
+
+
+def test_nvidia_identity_reaches_the_vendor_branches() -> None:
+    print("\nThe NVIDIA identity spoof flips torch and nvidia-smi, and nothing else")
+    ni = _load(ROOT / "lib" / "nvidia_identity.py")
+    with tempfile.TemporaryDirectory() as td:
+        d = ni.build(Path(td) / "nv", name = "NVIDIA GeForce RTX 4090", capability = "8.9",
+                     vram_mib = 24564, cuda = "12.8")
+        env = ni.env_for(d, base = {k: v for k, v in __import__("os").environ.items()
+                                    if k != "AMD_CI_SPOOFED_VENDOR"})
+        check("env_for sets the marker capability.py reads",
+              env.get("AMD_CI_SPOOFED_VENDOR") == "nvidia")
+        check("and prepends the spoof dir to PYTHONPATH and PATH",
+              env["PYTHONPATH"].split(__import__("os").pathsep)[0] == str(d)
+              and env["PATH"].split(__import__("os").pathsep)[0] == str(d))
+
+        # Windows shims, textually: this host may not be Windows.
+        cmd = (d / "nvidia-smi.cmd").read_bytes()
+        check("the .cmd shim forwards every argument to the fake, CRLF endings",
+              b"%~dp0nvidia_smi_fake.py" in cmd and b"%*" in cmd and b"\r\n" in cmd
+              and b"exit /b %ERRORLEVEL%" in cmd, repr(cmd))
+        check("and a .bat twin exists", (d / "nvidia-smi.bat").read_bytes() == cmd)
+
+        if sys.platform != "win32":
+            def smi(*a):
+                return subprocess.run([str(d / "nvidia-smi"), *a], capture_output = True,
+                                      text = True, env = env)
+            r = smi("-L")
+            check("nvidia-smi -L names the spoofed card",
+                  r.returncode == 0 and r.stdout.startswith("GPU 0: NVIDIA GeForce RTX 4090"), r.stdout + r.stderr)
+            r = smi("--query-gpu=name,memory.total,memory.free,compute_cap,driver_version",
+                    "--format=csv,noheader,nounits")
+            f = [x.strip() for x in r.stdout.strip().split(",")]
+            check("csv,noheader,nounits parses as the usual numbers",
+                  r.returncode == 0 and f[0] == "NVIDIA GeForce RTX 4090" and f[1] == "24564"
+                  and int(f[2]) < 24564 and f[3] == "8.9", r.stdout + r.stderr)
+            r = smi("--query-gpu=memory.used", "--format=csv")
+            check("a header and units unless asked otherwise",
+                  r.stdout.splitlines()[:2] == ["memory.used [MiB]", "1 MiB"], r.stdout)
+            r = smi("-q")
+            check("an unspoofed flag fails loudly instead of answering empty",
+                  r.returncode == 2 and "-q" in r.stderr, r.stdout + r.stderr)
+            r = smi("--query-gpu=temperature.gpu", "--format=csv")
+            check("so does an unspoofed field", r.returncode == 2, r.stdout + r.stderr)
+
+        code = ("import json, torch\n"
+                "print(json.dumps({'hip': torch.version.hip, 'cuda': torch.version.cuda,\n"
+                "  'real_hip_stashed': hasattr(torch.version, '_amd_ci_real_hip'),\n"
+                "  'name': torch.cuda.get_device_name(0), 'cap': list(torch.cuda.get_device_capability()),\n"
+                "  'props': [torch.cuda.get_device_properties(0).name, torch.cuda.get_device_properties(0).major],\n"
+                "  'n': torch.cuda.device_count()}))\n")
+        r = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env)
+        if r.returncode != 0 and "No module named 'torch'" in r.stderr:
+            print("  skip torch hook (no torch in this interpreter)")
+        else:
+            o = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else {}
+            check("import torch is patched by the post-import hook",
+                  o.get("hip") is None and o.get("cuda") == "12.8" and o.get("real_hip_stashed"), r.stdout + r.stderr)
+            check("device name, capability and properties read as the NVIDIA card",
+                  o.get("name") == "NVIDIA GeForce RTX 4090" and o.get("cap") == [8, 9]
+                  and o.get("props") == ["NVIDIA GeForce RTX 4090", 8], str(o))
+            plain = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True)
+            n = json.loads(plain.stdout.strip().splitlines()[-1]).get("n") if plain.returncode == 0 else None
+            check("device_count stays real", o.get("n") == n, f"{o.get('n')} vs {n}")
+
+
+def test_spoofed_vendor_cannot_satisfy_nvidia() -> None:
+    print("\nA spoofed NVIDIA identity never counts as NVIDIA hardware")
+    cap = _load(ROOT / "lib" / "capability.py")
+    # What detect() records under the spoof: the STASHED real hip, since torch.version
+    # itself now says CUDA. Even if a caller hands in the fabricated values, the marker
+    # alone must keep nvidia False.
+    for hip, cuda in (("7.2.1", None), (None, "12.8")):
+        prof = cap.HostProfile(system = "Windows", hip = hip, cuda = cuda, gpu_count = 1)
+        prof.spoofed_vendor = "nvidia"
+        prof.capabilities = cap.capabilities_for(prof)
+        section = cap.untested_section(prof, ["nvidia"])
+        check(f"nvidia stays UNMET (hip={hip}, cuda={cuda})", prof.capabilities["nvidia"] is False)
+        check("the verdict names the fabrication and what it cannot show",
+              "FABRICATED" in section and "flash-attn" in section and "- **nvidia**" in section, section[:300])
+    real = cap.HostProfile(system = "Linux", cuda = "12.8", gpu_count = 1)
+    check("a real CUDA host still satisfies nvidia (the rule is not just off)",
+          cap.capabilities_for(real)["nvidia"] is True)
+
+
+def test_spoof_nvidia_lands_before_differential_on_both_templates() -> None:
+    print("\n--spoof-nvidia lands after the gate and before Differential, Linux and Windows")
+    for extra, job in (([], "  gpu:"), (["--windows"], "  windows:")):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "ci"
+            r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--out", str(out),
+                                "--branch", "b", "--spoof-nvidia", "--tests", "tests/test_x.py", *extra],
+                               capture_output = True, text = True)
+            wf = out / ".github" / "workflows" / "b.yml"
+            text = wf.read_text(encoding = "utf-8") if wf.is_file() else ""
+            label = "windows" if extra else "linux"
+            check(f"{label}: scaffolds and lints clean", r.returncode == 0, (r.stdout + r.stderr)[-300:])
+            body = text.partition(job)[2]
+            i = body.find("Present the GPU as NVIDIA")
+            check(f"{label}: the step is in the measuring job, before Differential",
+                  i != -1 and i < body.find("name: Differential"), body[:200])
+            gate = body.find("gate.py")
+            check(f"{label}: and after the gate, which measures the real host", -1 < gate < i)
+            if extra:
+                check("windows: PowerShell syntax, not bash",
+                      "$env:AMD_CI_PY" in body[i:i + 400] and "set -euo" not in body[i:i + 400])
+
+
+
+def test_a_dropped_clone_is_retried_from_scratch() -> None:
+    print("\nA runner network drop during the upstream clone is retried, not the end of the run")
+    states = _load(ROOT / "lib" / "states.py")
+    calls = []
+
+    def fake_run(cmd, capture_output = True, text = True):
+        dest = Path(cmd[-1])
+        calls.append(dest.exists())
+        dest.mkdir(parents = True, exist_ok = True)          # a partial clone left behind
+        ok = len(calls) == 3
+        return subprocess.CompletedProcess(cmd, 0 if ok else 128, "", "" if ok else "fatal: early EOF")
+
+    real_run, real_sleep = states.subprocess.run, states.time.sleep
+    states.subprocess.run, states.time.sleep = fake_run, lambda s: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "repo"
+            got = states.clone("https://example.invalid/r.git", dest)
+            check("the third attempt's clone is returned", got == dest and dest.exists())
+            check("each retry starts from an empty destination", calls == [False, False, False], str(calls))
+            calls.clear()
+            try:
+                states.clone("https://example.invalid/r.git", Path(tmp) / "other", attempts = 2)
+                check("giving up raises", False)
+            except SystemExit as e:
+                check("giving up names the attempts and the git error", "2 attempts" in str(e) and "early EOF" in str(e), str(e))
+    finally:
+        states.subprocess.run, states.time.sleep = real_run, real_sleep
+
+def test_scaffold_targets_another_repo_without_studio() -> None:
+    print("\n--repo points states.py at another repo; --no-studio drops the Studio install")
+    import subprocess, tempfile
+    for extra, label in (([], "linux"), (["--windows"], "windows")):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "ci"
+            flags = ["--no-studio", "--no-suites"] if not extra else []
+            r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "7", "--out", str(out),
+                                "--branch", "b", "--repo", "https://github.com/unslothai/llama.cpp", *extra, *flags,
+                                "--probe", "amd_ci/probes/llama_rocm_kpack_probe.py",
+                                "--criteria", "amd_ci/criteria/rocm_kpack_embed.py"],
+                               capture_output = True, text = True)
+            wf = out / ".github" / "workflows" / "b.yml"
+            text = wf.read_text(encoding = "utf-8") if wf.is_file() else ""
+            check(f"{label}: scaffold succeeds", r.returncode == 0, (r.stdout + r.stderr)[-300:])
+            check(f"{label}: UPSTREAM is the --repo", 'UPSTREAM: "https://github.com/unslothai/llama.cpp"' in text)
+            if not extra:
+                check("linux --no-studio: no install.sh", "install.sh" not in text)
+                check("linux --no-studio: AMD_CI_PY is set before Differential",
+                      0 <= text.find("AMD_CI_PY=") < text.find("- name: Differential"))
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "7", "--out", str(Path(td) / "ci"),
+                            "--windows", "--no-studio"], capture_output = True, text = True)
+        check("--no-studio with --windows is refused", r.returncode != 0)
+
+
+def test_states_follow_the_default_branch() -> None:
+    print("\nstates.py compares against origin's default branch, not a hardcoded main")
+    import subprocess, tempfile
+    states = _load(ROOT / "lib" / "states.py")
+    with tempfile.TemporaryDirectory() as td:
+        up, cl = Path(td) / "up", Path(td) / "cl"
+        g = lambda d, *a: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd = d,
+                                         capture_output = True, text = True, check = True)
+        up.mkdir()
+        g(up, "init", "-q", "-b", "master")
+        (up / "f").write_text("x", encoding = "utf-8")
+        g(up, "add", "f")
+        g(up, "commit", "-q", "-m", "c")
+        g(Path(td), "clone", "-q", str(up), str(cl))
+        check("a master-default clone resolves origin/master", states.default_branch(cl) == "origin/master",
+              states.default_branch(cl))
+
+
+def test_rocm_kpack_criteria_need_a_real_gpu_and_a_real_crash() -> None:
+    print("\nrocm_kpack_embed: VOID without a base crash, INCONCLUSIVE without a ROCm device")
+    import copy
+    diff = _load(ROOT / "lib" / "differential.py")
+    crit = _load(ROOT / "criteria" / "rocm_kpack_embed.py")
+    ok_case = lambda n: {"case": n, "status": 200, "server_alive_after": True, "finite": True, "seconds": 1}
+    names = ["short_1x20tok", "mid_1x73tok", "long_1x500tok", "long_64x500tok"]
+    good = {"cases": [ok_case(n) for n in names], "rocm_devices": 1, "rocm_model_buffer": True, "exit_code": 0}
+    crashed = dict(good, cases = [ok_case(names[0]), {"case": names[1], "status": "EXC", "server_alive_after": False}],
+                   exit_code = -6)
+    cpu = {"cases": [ok_case(n) for n in names], "rocm_devices": 0, "rocm_model_buffer": False, "exit_code": 0}
+    state = lambda gpu, present, cos: {"_probe_rc": 0, "packaging_step_present": present,
+                                       "configs": {"gfx1151": {"gpu": gpu, "cpu": cpu, "gpu_vs_cpu_min_cos": cos}}}
+    obs = {"base": state(crashed, False, None), "head": state(good, True, 0.9999)}
+    v, _ = diff._decide(crit, obs, crit.gates(obs))
+    check("crash at base, clean head = CONFIRMED", v == "CONFIRMED", v)
+    obs2 = {"base": state(good, False, 0.9999), "head": state(good, True, 0.9999)}
+    v, _ = diff._decide(crit, obs2, crit.gates(obs2))
+    check("no crash at base = VOID", v == "VOID", v)
+    obs3 = copy.deepcopy(obs)
+    for st in obs3.values():
+        st["configs"]["gfx1151"]["gpu"]["rocm_devices"] = 0
+    v, _ = diff._decide(crit, obs3, crit.gates(obs3))
+    check("no ROCm device = INCONCLUSIVE", v == "INCONCLUSIVE", v)
+    obs4 = {"base": state(crashed, False, None), "head": state(good, True, 0.98)}
+    v, _ = diff._decide(crit, obs4, crit.gates(obs4))
+    check("head vectors off the CPU's = FIX_INCOMPLETE", v == "FIX_INCOMPLETE", v)
+
+
+def test_shared_gpu_drops_the_group_and_declares_the_gap() -> None:
+    print("\n--shared-gpu: no shared group, the gap is declared, timing is refused")
+    lint = _load(ROOT / "lib" / "lint_workflow.py")
+    cap = _load(ROOT / "lib" / "capability.py")
+    with tempfile.TemporaryDirectory() as td:
+        base = [sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--no-suites"]
+        r = subprocess.run(base + ["--out", str(Path(td) / "s"), "--shared-gpu"],
+                           capture_output = True, text = True)
+        check("--shared-gpu scaffolds and lints clean", r.returncode == 0, r.stdout + r.stderr)
+        wf = next((Path(td) / "s" / ".github" / "workflows").glob("*.yml"))
+        text = wf.read_text(encoding = "utf-8")
+        gpu = text.partition("  gpu:")[2]
+        check("the gpu job has no concurrency group", "concurrency:" not in gpu, gpu[:400])
+        check("and declares AMD_CI_SHARED_GPU=1", 'AMD_CI_SHARED_GPU: "1"' in gpu, gpu[:400])
+        check("and is no longer named exclusive", "(exclusive)" not in gpu and "shared GPU" in gpu)
+        codes = [c for c, _, _ in lint.lint_workflow(wf)]
+        check("W101 stays silent for a declared shared job", "W101" not in codes, str(codes))
+
+        ex = subprocess.run(base + ["--out", str(Path(td) / "e")], capture_output = True, text = True)
+        ex_gpu = next((Path(td) / "e" / ".github" / "workflows").glob("*.yml")).read_text(
+            encoding = "utf-8").partition("  gpu:")[2]
+        check("without the flag the exclusive group is still emitted",
+              ex.returncode == 0 and "group: amd-ci-gfx1151-gpu" in ex_gpu, ex.stdout + ex.stderr)
+
+        for extra, why in ((["--criteria", "amd_ci/criteria/train_perf_no_regression.py"], "timing criteria"),
+                           (["--probe", "amd_ci/probes/train_perf_probe.py"], "timing probe"),
+                           (["--windows"], "--windows"), (["--no-gpu"], "--no-gpu")):
+            bad = subprocess.run(base + ["--out", str(Path(td) / "b"), "--shared-gpu"] + extra,
+                                 capture_output = True, text = True)
+            check(f"--shared-gpu with {why} is refused", bad.returncode != 0, bad.stdout + bad.stderr)
+
+        # A hand-edited shared job that runs a timing probe is an error, not a warning.
+        timed = text.replace("--probe amd_ci/probes/pytest_probe.py",
+                             "--probe amd_ci/probes/train_perf_probe.py")
+        tw = Path(td) / "timed.yml"
+        tw.write_text(timed, encoding = "utf-8")
+        check("E108: a shared job running a timing probe",
+              "E108" in [c for c, _, _ in lint.lint_workflow(tw)])
+        check("E108 silent for the correctness probe", "E108" not in codes, str(codes))
+
+    shared = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 1, shared_gpu = True)
+    shared.capabilities = cap.capabilities_for(shared)
+    section = cap.untested_section(shared, ["rocm"])
+    check("a shared run never satisfies exclusive_gpu", shared.capabilities["exclusive_gpu"] is False)
+    check("and the verdict says the GPU was shared, unasked", "SHARED" in section, section[:200])
+    alone = cap.HostProfile(system = "Linux", hip = "7.2.1", gpu_count = 1)
+    alone.capabilities = cap.capabilities_for(alone)
+    check("an exclusive run satisfies exclusive_gpu", alone.capabilities["exclusive_gpu"] is True)
+    check("and says nothing about sharing", "SHARED" not in cap.untested_section(alone, ["rocm"]))
+
+
+def test_push_queue_never_evicts_its_own_and_requeues_evictions() -> None:
+    print("\npush_queue: one exclusive waiter at a time, shared capped per OS, evictions requeue first")
+    q = _load(ROOT / "push_queue.py")
+    T = lambda i, mode, state = "waiting", os_ = "linux", created = 0.0: {
+        "id": i, "mode": mode, "state": state, "os": os_, "created": created}
+    two = [T("a", "exclusive", created = 1), T("b", "exclusive", created = 2)]
+    check("two exclusive waiters: only the oldest is pushed", q.plan(two) == ["a"], str(q.plan(two)))
+    two[0]["state"] = "pushed"
+    check("nothing more while ours waits in the GPU group", q.plan(two) == [], str(q.plan(two)))
+    two[0]["state"] = "running"
+    check("the next is pushed once the first is running", q.plan(two) == ["b"], str(q.plan(two)))
+
+    shared = [T(f"s{i}", "shared", created = i) for i in range(5)] + [T("w", "shared", os_ = "windows", created = 9)]
+    got = q.plan(shared, max_shared = 3)
+    check("shared jobs are capped per OS", got == ["s0", "s1", "s2", "w"], str(got))
+    mixed = [T("e", "exclusive", state = "pushed", created = 0), T("s", "shared", created = 1)]
+    check("a waiting exclusive job does not block shared ones", q.plan(mixed) == ["s"], str(q.plan(mixed)))
+
+    t = T("x", "exclusive", state = "pushed")
+    q.apply_run(t, {"databaseId": 1, "status": "completed", "conclusion": "cancelled"}, False)
+    check("an eviction before any GPU step requeues the ticket", t["state"] == "waiting", str(t))
+    late = [T("y", "exclusive", created = 0.5), t]
+    check("and it goes to the FRONT of the queue", q.plan(late) == ["x"], str(q.plan(late)))
+    u = T("z", "exclusive", state = "pushed")
+    q.apply_run(u, {"databaseId": 2, "status": "completed", "conclusion": "cancelled"}, True)
+    check("a run cancelled after GPU steps ran is finished, not requeued",
+          u["state"] == "done" and u["conclusion"] == "cancelled", str(u))
+    v = T("v", "shared", state = "pushed")
+    q.apply_run(v, {"databaseId": 3, "status": "completed", "conclusion": "success"}, None)
+    check("a completed run records its conclusion", v["state"] == "done" and v["conclusion"] == "success", str(v))
+
+    with tempfile.TemporaryDirectory() as td:
+        for flag, want in (([], "exclusive"), (["--shared-gpu"], "shared")):
+            out = Path(td) / ("x" + "".join(flag))
+            subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--no-suites",
+                            "--out", str(out)] + flag, capture_output = True, text = True)
+            check(f"workflow_traits reads {want} from a scaffolded branch",
+                  q.workflow_traits(out) == (want, "linux"), str(q.workflow_traits(out)))
+        win = Path(td) / "w"
+        subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--windows", "--out", str(win)],
+                       capture_output = True, text = True)
+        check("and windows from a --windows branch", q.workflow_traits(win)[1] == "windows",
+              str(q.workflow_traits(win)))
+
+
+
+def test_push_queue_judges_the_gpu_job_not_the_run() -> None:
+    print("\npush_queue: the GPU job (not the run) decides running / evicted; a failed push frees its slot")
+    q = _load(ROOT / "push_queue.py")
+    gname = "PR 12601 GPU measurement (exclusive)"
+    T = lambda i, state = "pushed", created = 0.0: {
+        "id": i, "mode": "exclusive", "state": state, "os": "linux", "created": created,
+        "gpu_jobs": [gname], "branch": i, "dir": "/nonexistent/" + i}
+    J = lambda name, status, conclusion = None, steps = 0: {
+        "name": name, "status": status, "conclusion": conclusion,
+        "steps": [{"conclusion": "success"}] * steps}
+    suites = "PR 12601 suites, base vs head"
+    # The default branch has a suites job outside the group, so the RUN is in_progress while the GPU
+    # job still waits in amd-ci-gfx1151-gpu (seen live: run 39561093148, suites ran 9 steps, GPU 0).
+    a, b = T("a", created = 1), T("b", "waiting", created = 2)
+    q.apply_run(a, {"databaseId": 1, "status": "in_progress"}, None,
+                [J(suites, "in_progress", steps = 3), J(gname, "queued")])
+    check("suites running, GPU job still queued: the ticket stays pushed", a["state"] == "pushed", str(a))
+    check("so our next exclusive branch is NOT pushed to evict it", q.plan([a, b]) == [], str(q.plan([a, b])))
+    q.apply_run(a, {"databaseId": 1, "status": "in_progress"}, None,
+                [J(suites, "in_progress", steps = 5), J(gname, "completed", "cancelled")])
+    check("GPU job cancelled before a step, suites still running: requeued at once",
+          a["state"] == "waiting" and a["priority"] == -1 and a["attempts"] == 1, str(a))
+    c = T("c")
+    q.apply_run(c, {"databaseId": 2, "status": "completed", "conclusion": "cancelled"}, None,
+                [J(suites, "completed", "failure", steps = 9), J(gname, "completed", "cancelled")])
+    check("the same eviction seen after the run finished is requeued too (was final: state was running)",
+          c["state"] == "waiting", str(c))
+    d = T("d")
+    q.apply_run(d, {"databaseId": 3, "status": "in_progress"}, None,
+                [J(suites, "in_progress", steps = 2), J(gname, "in_progress", steps = 1)])
+    check("the GPU job started: running, and the next exclusive may go",
+          d["state"] == "running" and q.plan([d, T("e", "waiting", created = 5)]) == ["e"], str(d))
+    q.apply_run(d, {"databaseId": 3, "status": "completed", "conclusion": "success"}, None,
+                [J(suites, "completed", "success", steps = 9), J(gname, "completed", "success", steps = 7)])
+    check("and a finished run records its conclusion", d["state"] == "done" and d["conclusion"] == "success", str(d))
+    f = T("f")
+    q.apply_run(f, {"databaseId": 4, "status": "completed", "conclusion": "cancelled"}, None,
+                [J(gname, "completed", "cancelled", steps = 4)])
+    check("a GPU job cancelled after its steps ran is final", f["state"] == "done", str(f))
+
+    # A failed push gives its slot to the next waiter in the same pass; three failures end it.
+    g, h = T("g", "waiting", created = 1), T("h", "waiting", created = 2)
+    pushed = []
+
+    def fake_push(t):
+        pushed.append(t["id"])
+        if t["id"] == "g":
+            t["push_failures"] = t.get("push_failures", 0) + 1
+            if t["push_failures"] >= q.MAX_PUSH_FAILURES:
+                t["state"] = "done"
+            return False
+        t["state"] = "pushed"
+        return True
+    q.dispatch([g, h], push_fn = fake_push)
+    check("the oldest exclusive's push fails: the next one is pushed in the same pass",
+          pushed == ["g", "h"] and h["state"] == "pushed", str(pushed))
+    with tempfile.TemporaryDirectory() as td:
+        gone = {"id": "x", "mode": "exclusive", "state": "waiting", "os": "linux", "created": 0,
+                "branch": "x", "dir": str(Path(td) / "deleted")}
+        check("a ticket whose dir is gone ends as push_failed, not waiting forever",
+              q.push(gone) is False and gone["state"] == "done" and gone["conclusion"] == "push_failed", str(gone))
+
+        for flag, want in (([], ["PR 1 GPU measurement (exclusive)"]), (["--shared-gpu"], [])):
+            out = Path(td) / ("b" + "".join(flag))
+            subprocess.run([sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--out", str(out)] + flag,
+                           capture_output = True, text = True)
+            check(f"group_jobs names the GPU-group job{'s' if want else ' (none)'} of a "
+                  f"{'--shared-gpu' if flag else 'default'} branch", q.group_jobs(out) == want, str(q.group_jobs(out)))
+
+        os.environ["AMD_CI_QUEUE_DIR"] = str(Path(td) / "q")
+        try:
+            with q.tick_lock() as first, q.tick_lock() as second:
+                check("one tick at a time, and a second ticker skips instead of waiting", first and not second,
+                      f"{first} {second}")
+            fake = Path(td) / "bin"
+            fake.mkdir()
+            (fake / "gh").write_text("#!/bin/sh\nsleep 30\n")
+            (fake / "gh").chmod(0o755)
+            path, q.GH_TIMEOUT_S = os.environ["PATH"], 1
+            os.environ["PATH"] = f"{fake}:{path}"
+            try:
+                t0 = time.time()
+                got = q._gh_json(["run", "list"])
+                check("a hung gh times out instead of stalling the queue", got is None and time.time() - t0 < 10,
+                      f"{got} {time.time() - t0:.1f}s")
+            finally:
+                os.environ["PATH"] = path
+        finally:
+            os.environ.pop("AMD_CI_QUEUE_DIR", None)
+
+
+def test_patch_mode_renders_applies_and_refuses() -> None:
+    print("\npatch mode: base = SHA, head = SHA + diff; unsafe or non-applying input refused loudly")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        g = lambda d, *a: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd = d,
+                                         capture_output = True, text = True, check = True).stdout.strip()
+        up = td / "up"
+        up.mkdir()
+        g(up, "init", "-q", "-b", "main")
+        (up / "f").write_text("a\n", encoding = "utf-8")
+        g(up, "add", "f")
+        g(up, "commit", "-q", "-m", "c")
+        sha = g(up, "rev-parse", "HEAD")
+        good, bad = td / "fix.diff", td / "bad.diff"
+        good.write_text("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n", encoding = "utf-8")
+        bad.write_text("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-zzz\n+b\n", encoding = "utf-8")
+        st = [sys.executable, str(ROOT / "lib" / "states.py"), "--repo", str(up), "--pr", "0", "--patch-base", sha]
+        r = subprocess.run(st + ["--patch", str(good), "--root", str(td / "w1"), "--out", str(td / "s1.json")],
+                           capture_output = True, text = True)
+        doc = json.loads((td / "s1.json").read_text(encoding = "utf-8")) if r.returncode == 0 else {}
+        c = doc.get("commits") or {}
+        check("states: base is the SHA, head is a distinct commit carrying the diff",
+              c.get("base") == sha and c.get("head") not in (None, sha)
+              and (td / "w1" / "states" / "head" / "f").read_text(encoding = "utf-8") == "b\n"
+              and (td / "w1" / "states" / "base" / "f").read_text(encoding = "utf-8") == "a\n"
+              and len((doc.get("patch") or {}).get("sha256", "")) == 64, r.stdout + r.stderr)
+        r = subprocess.run(st + ["--patch", str(bad), "--root", str(td / "w2"), "--out", str(td / "s2.json")],
+                           capture_output = True, text = True)
+        check("states: a patch that does not apply fails, no states.json",
+              r.returncode != 0 and not (td / "s2.json").exists(), r.stderr[-200:])
+        sc = [sys.executable, str(ROOT / "scaffold.py"), "--pr", "1", "--no-suites"]
+        r = subprocess.run(sc + ["--out", str(td / "o1"), "--patch", str(good), "--patch-base", "a" * 40],
+                           capture_output = True, text = True)
+        wf = next((td / "o1" / ".github" / "workflows").glob("*.yml"), None) if r.returncode == 0 else None
+        text = wf.read_text(encoding = "utf-8") if wf else ""
+        check("scaffold: PATCH_BASE / PATCH_FILE rendered and the diff copied",
+              f'PATCH_BASE: "{"a" * 40}"' in text and 'PATCH_FILE: "amd_ci/patches/fix.diff"' in text
+              and (td / "o1" / "amd_ci" / "patches" / "fix.diff").is_file(), r.stdout[-300:] + r.stderr[-300:])
+        spaced = td / "my fix.diff"
+        spaced.write_text(good.read_text(encoding = "utf-8"), encoding = "utf-8")
+        for name, extra in (("a non-SHA base", ["--patch", str(good), "--patch-base", 'abc" ; x']),
+                            ("a file name with a space", ["--patch", str(spaced), "--patch-base", "a" * 40]),
+                            ("--patch without --patch-base", ["--patch", str(good)]),
+                            ("--patch with --merged", ["--patch", str(good), "--patch-base", "a" * 40, "--merged"])):
+            r = subprocess.run(sc + ["--out", str(td / "o2"), *extra], capture_output = True, text = True)
+            check(f"scaffold refuses {name}", r.returncode != 0 and not (td / "o2").exists(), r.stderr[-200:])
+
+
+def test_push_queue_locks_through_a_read_only_lock_file() -> None:
+    print("\npush_queue: another user's 0644 queue.lock still gives an exclusive lock")
+    import fcntl
+    import tempfile
+    if os.geteuid() == 0:
+        check("read-only lock (skipped as root: the mode bit is ignored)", False, "run as a normal user")
+        return
+    q = _load(ROOT / "push_queue.py")
+    with tempfile.TemporaryDirectory() as td:
+        old = os.environ.get("AMD_CI_QUEUE_DIR")
+        os.environ["AMD_CI_QUEUE_DIR"] = td
+        try:
+            lock = Path(td) / "queue.lock"
+            lock.write_text("", encoding = "utf-8")
+            os.chmod(lock, 0o444)
+            with q.locked_state() as state:
+                state["tickets"].append({"id": "x"})
+                probe = os.open(lock, os.O_RDONLY)
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = False
+                except OSError:
+                    held = True
+                finally:
+                    os.close(probe)
+            saved = json.loads((Path(td) / "queue.json").read_text(encoding = "utf-8"))
+            check("lock is held exclusively and the state is written back",
+                  held and saved["tickets"] == [{"id": "x"}], f"held={held} {saved}")
+        finally:
+            if old is None:
+                os.environ.pop("AMD_CI_QUEUE_DIR", None)
+            else:
+                os.environ["AMD_CI_QUEUE_DIR"] = old
+
+
+def main() -> int:
+    print("AMD CI selftest")
+    test_void_rule()
+    test_added_tests_are_not_a_regression()
+    test_probe_skips_tests_absent_at_a_state()
+    test_lint_rules_fire()
+    test_scaffold_rejects_subdir_prefixed_tests()
+    test_bounds_are_stated_even_when_there_are_none()
+    test_a_non_result_does_not_leave_the_job_green()
+    test_fixture_failure_is_inconclusive_not_a_pass()
+    test_fixture_metadata_is_not_mistaken_for_a_state()
+    test_spoofed_devices_cannot_satisfy_multi_gpu()
+    test_spoof_flag_targets_the_gpu_job()
+    test_custom_probe_args_follow_the_separator()
+    test_linux_gpu_step_hands_the_pytest_probe_its_tests()
+    test_a_pytest_run_that_never_ran_is_not_a_pass()
+    test_windows_is_reachable_but_docker_on_windows_is_not()
+    test_windows_lint_rules_fire()
+    test_scaffold_windows_emits_the_measured_selector()
+    test_a_dead_label_is_an_error_not_a_wait()
+    test_a_tuple_verdict_is_read_for_its_bool()
+    test_a_verdict_can_be_redecided_without_the_probes()
+    test_windows_arch_comes_from_the_video_controller()
+    test_toolkit_text_io_names_its_encoding()
+    test_nvidia_identity_reaches_the_vendor_branches()
+    test_spoofed_vendor_cannot_satisfy_nvidia()
+    test_spoof_nvidia_lands_before_differential_on_both_templates()
+    test_a_dropped_clone_is_retried_from_scratch()
+    test_scaffold_targets_another_repo_without_studio()
+    test_states_follow_the_default_branch()
+    test_rocm_kpack_criteria_need_a_real_gpu_and_a_real_crash()
+    test_shared_gpu_drops_the_group_and_declares_the_gap()
+    test_push_queue_never_evicts_its_own_and_requeues_evictions()
+    test_push_queue_judges_the_gpu_job_not_the_run()
+    test_patch_mode_renders_applies_and_refuses()
+    test_push_queue_locks_through_a_read_only_lock_file()
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} failure(s):")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("all self-tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
