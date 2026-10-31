@@ -460,7 +460,7 @@ SKIP = os.environ.get("K15_SKIP_ITEMS")
 SKIPPED = [r for r in RES if SKIP and r["verdict"] == "INCONCLUSIVE" and re.search(SKIP, r["os"] + ":" + r["item"])]
 RES = [r for r in RES if r not in SKIPPED]
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
-MD.append("# k15 AMD gfx1151: 5d2e25dbaf9 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
+MD.append("# k15 AMD gfx1151: a58cb888e2b (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
 for r in RES:
     MD.append("| %s | %s | **%s** | %s |" % (r["item"], r["os"], r["verdict"], r["why"].replace("|", "/")[:1800]))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """k15_plan.py: the k15 AMD matrix on one gfx1151 host (Linux or Windows), one k15_bench.py call per step, one log per step.
 
-Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (5d2e25dbaf9), k10 = ff5a2337 + k10.patch (a162dce854, the last
+Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (a58cb888e2b), k10 = ff5a2337 + k10.patch (a162dce854, the last
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.

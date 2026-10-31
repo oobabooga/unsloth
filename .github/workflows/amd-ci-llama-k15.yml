@@ -1,11 +1,11 @@
-name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 5d2e25dbaf9 vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5)"
+name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 a58cb888e2b vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5)"
 
 # k15c: the correctness half of amd-ci-llama-k15 (which keeps the timing). No job joins amd-ci-gfx1151-gpu, so the card may have a co-tenant:
 # no timing / memory number from this run is evidence. Linux: HIP build + targeted and FULL test-backend-ops + test-graph-src-type + the eager
 # fallback md5 cells on the small q35 model. Windows: HIP build + targeted and FULL test-backend-ops + test-graph-src-type.
 
 # Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
-# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..5d2e25dbaf9).
+# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..a58cb888e2b).
 # Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
 # b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
