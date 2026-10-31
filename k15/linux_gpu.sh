@@ -10,7 +10,7 @@ W="$AMD_CI_WORK"; OUT="$W/out"; J="$GITHUB_WORKSPACE/k15"; R="$W/k15"; mkdir -p 
   df -h "$W" | tail -1; } > "$OUT/gpu_diag.txt" 2>&1
 cat "$OUT/gpu_diag.txt"
 export K6P_DIR="$R" K6P_DEV=ROCm0 K6P_OUT="$OUT/bench"
-( python3 -u "$J/k15_bench.py" dl --models q35,q3m,g4e2b > "$OUT/dl.log" 2>&1 ) &
+( python3 -u "$J/k15_bench.py" dl --models "${K15_DL_MODELS:-q35,q3m,g4e2b}" > "$OUT/dl.log" 2>&1 ) &
 DLP=$!
 for n in k15 k10 up; do
   tar xzf "$W/art/bin_$n/bin_$n.tgz" -C "$R/bins" 2>/dev/null || tar xzf "$W/art/bin_$n.tgz" -C "$R/bins"

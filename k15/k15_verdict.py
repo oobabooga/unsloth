@@ -455,6 +455,10 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
     item11(rows, os_)
 item9(load("k15-linux-cpu"))
 
+# k15c (correctness ticket): items it does not run are dropped when they have no rows (INCONCLUSIVE), and listed as skipped
+SKIP = os.environ.get("K15_SKIP_ITEMS")
+SKIPPED = [r for r in RES if SKIP and r["verdict"] == "INCONCLUSIVE" and re.search(SKIP, r["os"] + ":" + r["item"])]
+RES = [r for r in RES if r not in SKIPPED]
 order = {"FAIL": 0, "VOID": 1, "INCONCLUSIVE": 2, "PASS": 3, "NO_REGRESSION": 3}
 MD.append("# k15 AMD gfx1151: 5d2e25dbaf9 (k15) vs a162dce854 (k10), upstream merge base ff5a2337\n")
 MD.append("| item | OS | verdict | evidence |\n|---|---|---|---|")
@@ -464,6 +468,8 @@ counts = {}
 for r in RES:
     counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
 MD.append("\nTotals: %s\n" % counts)
+if SKIPPED:
+    MD.append("Skipped (not in this ticket, no rows): %s\n" % ", ".join("%s (%s)" % (r["item"], r["os"]) for r in SKIPPED))
 MD.append(untested("linux"))
 MD.append("")
 MD.append(untested("windows"))

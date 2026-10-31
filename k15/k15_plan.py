@@ -125,7 +125,7 @@ def rows():
 
 
 T0 = time.time()
-step("dl", "dl", "--models", "q35,q3m,g4e2b", timeout=7200)
+step("dl", "dl", "--models", os.environ.get("K15_DL_MODELS") or "q35,q3m,g4e2b", timeout=7200)
 step("devinfo", "devinfo", arms="k15,k10" + ("" if WIN else ",up"))
 
 # 2. fusion cases: default, each disable switch, all five; GDN (default / in-place off / gates off, + k10's GATED_DELTA_NET);

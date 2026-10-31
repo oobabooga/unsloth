@@ -20,7 +20,7 @@ Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) dri
 
 $env:K6P_DIR = $R; $env:K6P_OUT = "$OUT\bench"; $env:K6P_DEV = "ROCm0"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
-  -ArgumentList @("-u", "`"$J\k15_bench.py`"", "dl", "--models", "q35,q3m,g4e2b")
+  -ArgumentList @("-u", "`"$J\k15_bench.py`"", "dl", "--models", $(if ($env:K15_DL_MODELS) { $env:K15_DL_MODELS } else { "q35,q3m,g4e2b" }))
 
 # TheRock toolchain: the dist tarball of the release's weekly pin (as the k9 / k10 / k10s runs)
 $ROCM_VER = if ($env:ROCM_VER) { $env:ROCM_VER } else { "10.2.0a20261017" }

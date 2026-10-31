@@ -1,4 +1,8 @@
-name: "AMD CI k15: llama.cpp k15 5d2e25dbaf9 vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
+name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 5d2e25dbaf9 vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5)"
+
+# k15c: the correctness half of amd-ci-llama-k15 (which keeps the timing). No job joins amd-ci-gfx1151-gpu, so the card may have a co-tenant:
+# no timing / memory number from this run is evidence. Linux: HIP build + targeted and FULL test-backend-ops + test-graph-src-type + the eager
+# fallback md5 cells on the small q35 model. Windows: HIP build + targeted and FULL test-backend-ops + test-graph-src-type.
 
 # Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
 # the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..5d2e25dbaf9).
@@ -8,7 +12,7 @@ name: "AMD CI k15: llama.cpp k15 5d2e25dbaf9 vs k10 a162dce854 on gfx1151 Linux 
 
 on:
   push:
-    branches: [amd-ci-llama-k15]
+    branches: [amd-ci-llama-k15c]
   workflow_dispatch:
 
 permissions:
@@ -120,17 +124,15 @@ jobs:
           if-no-files-found: warn
 
   gpu-linux:
-    name: "k15 vs k10, Linux ROCm gfx1151 (exclusive)"
+    name: "k15 vs k10, Linux ROCm gfx1151 (correctness, shared GPU)"
     # after cpu-linux: this run's own CPU job never shares a Linux box with the measurement
     needs: [hosted-build, cpu-linux]
     if: ${{ always() }}
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull,tbopad,stock
+      K15_STEPS: ops,gst,mmid,eager,tbofull,stock
+      K15_DL_MODELS: q35
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -182,14 +184,12 @@ jobs:
           if-no-files-found: warn
 
   gpu-windows:
-    name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + test-backend-ops, shared GPU)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull
+      K15_STEPS: ops,gst,mmid,tbofull
+      K15_DL_MODELS: q35
     timeout-minutes: 360
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
     defaults:
       run:
         shell: powershell
@@ -245,6 +245,9 @@ jobs:
           pattern: info_*
           path: ${{ runner.temp }}/in
       - name: Judge
+        env:
+          # items this correctness ticket does not run (timing / q3m cells stay with amd-ci-llama-k15): reported as skipped when they have no rows
+          K15_SKIP_ITEMS: "^(linux|windows):(6 |7 |8 |10 |11 |r2 |r4 |r5 )|^windows:3 eager"
         run: |
           set +e
           python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
