@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k15_bench.py: llama.cpp k15 (47c58bfdffe) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
+"""k15_bench.py: llama.cpp k15 (01b29f323fc) vs k10 (a162dce854) on gfx1151, one platform (Linux / Windows), stdlib only.
 
 Derived from the k10s k6p_bench.py (ci_k6_amd 737e0eb). Every measurement is a fresh process; arm order rotates per rep.
 env: K6P_DIR work root (bins/<arm dir>, models/, out/), ARMS "name:dir[:VAR=VAL;...]", K6P_DEV device (ROCm0).
@@ -211,7 +211,8 @@ class Sampler:
 
 PAT = re.compile(r"buffer size|memory breakdown|\| +- |MoE cache|moe_cache|out of memory|error|failed|GGML_ASSERT|offload|load_tensors|"
                  r"n_ubatch|n_batch|mmap|load.mode|ROCm0|MTL0|ggml_cuda_init|Device 0|system_info|build|fit|pinned|host|prefetch|lend|"
-                 r"weight.stream|integrated|unified|warning|abort|exception|non-consecutive|PLE|lazy|draft length|without the graph|gather kept|draft|speculative", re.I)
+                 r"weight.stream|integrated|unified|warning|abort|exception|non-consecutive|PLE|lazy|draft length|without the graph|gather kept|draft|speculative|"
+                 r"k19-tpp|greedy requests|async seed|seed from the routing|tail member|VRAM watch|banks back|dense host pin", re.I)
 
 
 def memstats(s):
@@ -283,7 +284,26 @@ def memstats(s):
             "pf_notused_n": len(g(r"host weight prefetch not used")),
             "oom_n": len(g(r"out of memory")),
             "release_lines": [l.strip()[-240:] for l in g(r"[^\n]*(?:banks are released for it|MoE cache banks released|pool memory the released group|free after the released banks)[^\n]*")][:6],
-            "load_mode_lines": [l.strip()[-200:] for l in g(r"[^\n]*(?:load mode|lazy mode|lazy_mode)[^\n]*")][:4]}
+            "load_mode_lines": [l.strip()[-200:] for l in g(r"[^\n]*(?:load mode|lazy mode|lazy_mode)[^\n]*")][:4],
+            # k19-igpu (k15-land-igpu): engagement lines of the paths that now take an integrated GPU, and of those that must stay off
+            "dev_greedy_on_n": len(g(r"greedy requests are sampled on the device: on")),
+            "dev_greedy_off_n": len(g(r"greedy requests are sampled on the device: off")),
+            "tpp_lines": [l.strip()[-260:] for l in g(r"[^\n]*k19-tpp:[^\n]*")][:3],
+            "tpp_nogpu_n": len(g(r"k19-tpp: off: no GPU")),
+            "tpp_cache_off_n": len(g(r"k19-tpp: off: 3-draft windows are off because the MoE cache is on")),
+            "tpp_stay": [[int(x), int(y)] for x, y in g(r"MTP stays at 2 drafts here \((\d+) GPUs, lowest compute capability (-?\d+)")][:2],
+            "tpp_on": [[int(n), int(f), int(c), bool(z)] for n, f, c, z in
+                       g(r"k19-tpp: MTP drafts 2, a 3rd where it pays \(need (\d+) MiB for model \+ drafter, (\d+) MiB free on (\d+) GPUs(, no GPU: forced)?")][:2],
+            "seed_lines_n": len(g(r"seed from the routing of ubatch")),
+            "async_seed_n": len(g(r"async seed: \d+ routings read without a sync")),
+            "async_seed_reads": sum(int(x) for x in g(r"async seed: (\d+) routings read without a sync")),
+            "dft_release_n": len(g(r"the MTP drafter's device compute buffers \([\d.]+ MiB\) are freed for the group")),
+            "tail_pins": [[int(t), int(n), d] for t, n, d in g(r"tail member of (\d+) tokens: (\d+) nodes pinned to (\S+?),")][:8],
+            "vram_watch_n": len(g(r"VRAM watch: \S+ free")),
+            "banks_back_n": len(g(r"MoE cache banks back \(")),
+            "dense_pin_nodev_n": len(g(r"dense host pin: no device that page-locks host memory")),
+            "dense_pin_done_n": len(g(r"dense host pin: [\d.]+ of [\d.]+ MiB")),
+            "lend_lines_n": len(g(r"MTP drafter (?:host copy made|weights can be lent|weights lent to the group|weights not lent)"))}
 
 
 def filt(lp, s, head=120):

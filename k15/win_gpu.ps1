@@ -89,7 +89,8 @@ function Build-Tree($tree, $name, $ctest) {
   return $true
 }
 $TREES = Get-Content -Encoding utf8 "$J\TREES"
-foreach ($n in "k10", "k15") {
+$TREE_NAMES = if (Test-Path "$J\IG_SHA") { @("k10", "k15", "ig") } else { @("k10", "k15") }
+foreach ($n in $TREE_NAMES) {
   $S = "$W\src_$n"
   New-Item -ItemType Directory -Force -Path $S | Out-Null
   git -C $S init -q
@@ -98,7 +99,7 @@ foreach ($n in "k10", "k15") {
   git -C $S fetch -q --depth 1 origin $BASE
   git -C $S checkout -q --detach $BASE
   if ((git -C $S rev-parse HEAD).Trim() -ne $BASE) { Write-Host "FATAL: checkout $n"; exit 1 }
-  $patches = if ($n -eq "k10") { @("k10") } else { @("k10", "k15d") }
+  $patches = if ($n -eq "k10") { @("k10") } elseif ($n -eq "ig") { @("k10", "k15d", "igd") } else { @("k10", "k15d") }
   foreach ($p in $patches) {
     & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\$p.patch.gz" "$W\$p.patch"
     git -C $S apply --index --whitespace=nowarn "$W\$p.patch"
@@ -121,7 +122,7 @@ $dl.WaitForExit()
 Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-Object { -not $_.StartsWith("ROW") } | Select-Object -Last 5
 # a server per arm must see ROCm0 (a bundle that falls back to the CPU would measure nothing)
 $op = $env:PATH
-foreach ($n in "k10", "k15") { $sv = Get-ChildItem -Recurse "$R\bins\$n" -Filter "llama-server.exe" | Select-Object -First 1; $env:PATH = "$($sv.DirectoryName);$op"; $c = (& $sv.FullName --list-devices 2>&1 | Select-String "ROCm0").Count; Log "devices $n : ROCm0 x$c"; if ($c -lt 1) { Write-Host "FATAL: $n sees no ROCm0"; exit 1 } }
+foreach ($n in $TREE_NAMES) { $sv = Get-ChildItem -Recurse "$R\bins\$n" -Filter "llama-server.exe" | Select-Object -First 1; $env:PATH = "$($sv.DirectoryName);$op"; $c = (& $sv.FullName --list-devices 2>&1 | Select-String "ROCm0").Count; Log "devices $n : ROCm0 x$c"; if ($c -lt 1) { Write-Host "FATAL: $n sees no ROCm0"; exit 1 } }
 $env:PATH = $op
 & $PY -u "$J\k15_plan.py" "$OUT\plan"
 if (-not (Test-Path "$OUT\bench\rows.jsonl")) { exit 1 }

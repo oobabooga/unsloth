@@ -1,11 +1,11 @@
-name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 47c58bfdffe vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5)"
+name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 01b29f323fc (+ ig 744545a4054) vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5, replay fallback, draft guard, k19-igpu items)"
 
 # k15c: the correctness half of amd-ci-llama-k15 (which keeps the timing). No job joins amd-ci-gfx1151-gpu, so the card may have a co-tenant:
 # no timing / memory number from this run is evidence. Linux: HIP build + targeted and FULL test-backend-ops + test-graph-src-type + the eager
-# fallback md5 cells on the small q35 model. Windows: HIP build + targeted and FULL test-backend-ops + test-graph-src-type.
+# fallback md5 cells on q35 + r2 replay fallback, 10 draft guard and the 7 k19-igpu items on q3m. Windows: the same without the eager cells.
 
 # Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
-# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..47c58bfdffe).
+# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..01b29f323fc; ig = + k15/igd.patch.gz = 01b29f323fc..744545a4054, k19-igpu).
 # Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
 # b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [k15, k10, up, k15cpu]
+        n: [k15, k10, up, k15cpu, ig]
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -129,8 +129,8 @@ jobs:
     needs: [hosted-build, cpu-linux]
     if: ${{ always() }}
     env:
-      K15_STEPS: ops,gst,mmid,eager,tbofull,stock
-      K15_DL_MODELS: q35
+      K15_STEPS: ops,gst,mmid,eager,replay,dguard,igpu,tbofull,stock
+      K15_DL_MODELS: q35,q3m
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -187,8 +187,8 @@ jobs:
     name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + test-backend-ops, shared GPU)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K15_STEPS: ops,gst,mmid,tbofull
-      K15_DL_MODELS: q35
+      K15_STEPS: ops,gst,mmid,replay,dguard,igpu,tbofull
+      K15_DL_MODELS: q35,q3m
     timeout-minutes: 360
     defaults:
       run:
@@ -246,8 +246,9 @@ jobs:
           path: ${{ runner.temp }}/in
       - name: Judge
         env:
-          # items this correctness ticket does not run (timing / q3m cells stay with amd-ci-llama-k15): reported as skipped when they have no rows
-          K15_SKIP_ITEMS: "^(linux|windows):(4 |5 |6 |7 |8 |10 |11 |r2 |r4 |r5 )|^windows:3 eager|^linux:3 eager fallback q3m"
+          # items this correctness ticket does not run (timing / gdn / race / mailbox / relsplit / b3 / PLE / bench stay with amd-ci-llama-k15):
+          # reported as skipped when they have no rows. Item 10, r2 replay commit fallback and the igpu items run here and are never skipped
+          K15_SKIP_ITEMS: "^(linux|windows):(4 |5 |6 |7 |8 |11 |r2 (?!replay)|r4 |r5 )|^windows:3 eager|^linux:3 eager fallback q3m"
         run: |
           set +e
           python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
