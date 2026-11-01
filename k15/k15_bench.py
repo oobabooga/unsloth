@@ -699,8 +699,18 @@ def do_tbo():
              "tail": s[-400:]}
         log("TBO", arm, op, rc, r["passed"], len(fl), fl[:2])
         row(r)
+        # q41 (coordinator 11-01): with GGML_TBO_LOG_ERR the op's ERR of EVERY case is kept ("<case>: <OP> ERR <x>", inputs' [NONE]
+        # entries dropped), not only the failures and the last 3000 characters (r1 of q41 kept 12 of ~170 cases)
+        errs = []
+        if (ARM_ENV.get(arm) or {}).get("GGML_TBO_LOG_ERR"):
+            for l in s.splitlines():
+                l = re.sub(r"\x1b\[[0-9;]*m", "", l)
+                mm = re.search(r"\[([A-Z_]+)\] ERR_ALL = ([0-9.]+)", l)
+                cm = re.search(r"\s((?:[A-Z_]+)\(.*\)): ", l)
+                if mm and cm:
+                    errs.append("%s: %s ERR %s" % (cm.group(1), mm.group(1), mm.group(2)))
         with open(lp.replace(".log", ".filtered.log"), "w", encoding="utf-8") as fh:
-            fh.write("\n".join(fl[:400] + ["--- tail ---", s[-3000:]]))
+            fh.write("\n".join(fl[:400] + (["--- ERR_ALL ---"] + errs if errs else []) + ["--- tail ---", s[-3000:]]))
         os.remove(lp)
 
 
