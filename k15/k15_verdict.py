@@ -282,15 +282,21 @@ def item_r2(rows, os_):
         add("r2 replay commit fallback, 4 GB budget", os_, "INCONCLUSIVE", "missing %s" % [a for a in R if R[a] is None])
     else:
         k = {a: text_key(R[a]) for a in R}
-        why = "md5 %s; replay commits %s; fallback commits %s; reserve off + forced: %s" % (
+        why = "md5 %s; replay commits %s; fallback commits %s; fallback warnings %s; reserve off + forced: %s" % (
             {a: (v and "/".join(x[:8] for x in v if x)) for a, v in k.items()}, {a: st(R[a]).get("rs_commits") for a in R if R[a]},
-            {a: st(R[a]).get("rs_fallback_commits") for a in R if R[a]}, "aborted" if died(R["r4_fb0"]) else "ran" if R["r4_fb0"] else "missing")
+            {a: st(R[a]).get("rs_fallback_commits") for a in R if R[a]}, {a: st(R[a]).get("rs_fallback_warn_n") for a in R if R[a]},
+            "aborted" if died(R["r4_fb0"]) else "ran" if R["r4_fb0"] else "missing")
+        # engagement: the commit counters print at context teardown, which a Windows server stopped without a graceful shutdown never
+        # reaches (run 41265043892: 0 / 0 on Windows, 48 / 48 on Linux); the "runs in the reserved fallback buffer" warning prints at the
+        # first fallback commit, so it counts as engagement too
+        ff_engaged = st(R["r4_ff"]).get("rs_fallback_commits", 0) > 0 or st(R["r4_ff"]).get("rs_fallback_warn_n", 0) > 0
         if any(died(R[a]) for a in ("r4_d", "r4_d2", "r4_ff")):
             add("r2 replay commit fallback, 4 GB budget", os_, "FAIL", "an arm aborted: %s; %s" % ([a for a in ("r4_d", "r4_d2", "r4_ff") if died(R[a])], why))
         elif k["r4_d"] != k["r4_d2"]:
             add("r2 replay commit fallback, 4 GB budget", os_, "VOID", "A/A pair differs; " + why)
-        elif st(R["r4_ff"]).get("rs_fallback_commits", 0) == 0:
-            add("r2 replay commit fallback, 4 GB budget", os_, "VOID", "LLAMA_RS_REPLAY_FALLBACK_FORCE=1 put no commit in the fallback buffer; " + why)
+        elif not ff_engaged:
+            add("r2 replay commit fallback, 4 GB budget", os_, "VOID", "LLAMA_RS_REPLAY_FALLBACK_FORCE=1 put no commit in the fallback buffer "
+                "(no count, no warning); " + why)
         elif k["r4_ff"] != k["r4_d"]:
             add("r2 replay commit fallback, 4 GB budget", os_, "FAIL", "the fallback buffer changes the text; " + why)
         else:
