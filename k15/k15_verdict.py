@@ -386,6 +386,172 @@ def item10(rows, os_):
         add("10 draft guard (no 192 MiB floor on HIP)", os_, "PASS", why)
 
 
+# ---------------------------------------------------------------- k19-igpu (k15-land-igpu)
+def keys3(r):
+    """dec / p2k / p8k text md5 (the 8k cell is the layer-major group these paths run in)"""
+    if not r or died(r):
+        return None
+    return tuple((r.get(c) or {}).get("md5") for c in ("dec", "p2k", "p8k"))
+
+
+def item_igpu(rows, os_):
+    st = lambda r: (r or {}).get("stats") or {}
+    sh = lambda k: k and "/".join((x or "-")[:8] for x in k)
+    A = {a: one(rows, a, "q3m") for a in ("igb_d", "igh_d", "igh_d2", "igh_sa0", "igh_dg0", "igh_dr", "igb_dr",
+                                          "igb_tf", "igh_tf", "igt_b", "igt_h", "igt_h0", "igr_b", "igr_h")}
+    K = {a: keys3(r) for a, r in A.items()}
+
+    def need(item, arms):
+        miss = [a for a in arms if A[a] is None]
+        if miss:
+            add(item, os_, "INCONCLUSIVE", "rows missing %s (step igpu did not run, or no head bin)" % miss)
+            return False
+        dead = [a for a in arms if died(A[a])]
+        if dead:
+            add(item, os_, "FAIL", "aborted / no answer: %s %s" % (dead, [st(A[a]).get("err_lines") or A[a].get("err") for a in dead][:2]))
+            return False
+        return True
+
+    aa = K["igh_d"] is not None and K["igh_d"] == K["igh_d2"]
+    aa_why = "A/A igh_d %s igh_d2 %s" % (sh(K["igh_d"]), sh(K["igh_d2"]))
+
+    # 1. device greedy: the head turns it on (base: no line at all), the text is that of LLAMA_SERVER_DEVICE_GREEDY=0
+    it = "igpu-1 device greedy on an IGPU"
+    if need(it, ["igb_d", "igh_d", "igh_d2", "igh_dg0"]):
+        hb, hh, h0 = st(A["igb_d"]).get("dev_greedy_on_n", 0), st(A["igh_d"]).get("dev_greedy_on_n", 0), st(A["igh_dg0"]).get("dev_greedy_on_n", 0)
+        tg = {a: (A[a].get("dec") or {}).get("tg_tps") for a in ("igb_d", "igh_d", "igh_d2", "igh_dg0")}
+        why = "'sampled on the device: on' lines base %d head %d head(GREEDY=0) %d; md5 head %s greedy-off %s; %s; dec tok/s %s" % (
+            hb, hh, h0, sh(K["igh_d"]), sh(K["igh_dg0"]), aa_why, tg)
+        if hb:
+            add(it, os_, "VOID", "the base already samples on the device (no defect to fix); " + why)
+        elif not aa:
+            add(it, os_, "VOID", "A/A head pair differs; " + why)
+        elif hh == 0 or h0:
+            add(it, os_, "FAIL", "the head does not turn device greedy on (or the kill switch does not turn it off); " + why)
+        elif K["igh_d"] != K["igh_dg0"]:
+            add(it, os_, "FAIL", "text differs from LLAMA_SERVER_DEVICE_GREEDY=0; " + why)
+        else:
+            noise = abs(tg["igh_d"] - tg["igh_d2"]) / max(tg["igh_d"], 1e-9) if tg["igh_d"] and tg["igh_d2"] else 0
+            slow = tg["igb_d"] and tg["igh_d"] and min(tg["igh_d"], tg["igh_d2"]) < tg["igb_d"] * (1 - noise - 0.05)
+            add(it, os_, "FAIL" if slow else "PASS", ("decode slower than the base beyond A/A + 5%; " if slow else "") + why)
+
+    # 2. k19-tpp: default names 1 GPU (base: 'no GPU'); forced on a cache tier stays off; forced where it fits prices 1 GPU with the
+    #    host's available memory counted once (base: 0 GPUs, 'no GPU: forced')
+    it = "igpu-2 k19-tpp GPU set"
+    if need(it, ["igb_d", "igh_d", "igh_dr", "igb_tf", "igh_tf"]):
+        b, h, hd = st(A["igb_d"]), st(A["igh_d"]), st(A["igh_dr"])
+        bt, ht = st(A["igb_tf"]).get("tpp_on") or [], st(A["igh_tf"]).get("tpp_on") or []
+        avail = ((A["igh_tf"].get("host") or {}).get("mem") or {}).get("avail")
+        why = "default: base no-GPU %d, head stays %s; forced on a cache tier: head cache-off %d; forced where it fits: base %s head %s " \
+              "(MemAvailable at bench start %s MiB)" % (b.get("tpp_nogpu_n", 0), h.get("tpp_stay"), hd.get("tpp_cache_off_n", 0), bt, ht, avail)
+        if not b.get("tpp_lines"):
+            add(it, os_, "VOID", "the base logs no k19-tpp line (bin without k19-tpp, or not the MTP shape); " + why)
+        elif b.get("tpp_nogpu_n", 0) == 0 or not (bt and bt[0][2] == 0):
+            add(it, os_, "VOID", "the base already counts the IGPU (no defect to fix); " + why)
+        elif h.get("tpp_nogpu_n", 0) or not h.get("tpp_stay") or h["tpp_stay"][0][0] != 1:
+            add(it, os_, "FAIL", "the head default does not name 1 GPU; " + why)
+        elif hd.get("tpp_cache_off_n", 0) == 0:
+            add(it, os_, "FAIL", "LLAMA_SPEC_TPP=1 on a cache tier is not turned off by the MoE cache rule; " + why)
+        elif not ht or ht[0][2] != 1 or ht[0][3]:
+            add(it, os_, "FAIL", "forced where it fits: the head does not price 1 GPU; " + why)
+        elif avail and not (0.5 * avail <= ht[0][1] <= 1.25 * avail):
+            add(it, os_, "FAIL", "the head's free memory is not the host's available memory counted once; " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+    # 3. async MoE seed: seeds happen (verbose seed lines), the base reads none asynchronously, the head does; text = SEED_ASYNC=0
+    it = "igpu-3 async MoE seed on an IGPU"
+    if need(it, ["igb_d", "igh_d", "igh_d2", "igh_sa0"]):
+        b, h, h0 = st(A["igb_d"]), st(A["igh_d"]), st(A["igh_sa0"])
+        pp = {a: (A[a].get("p8k") or {}).get("pp_tps") for a in ("igb_d", "igh_d", "igh_d2", "igh_sa0")}
+        why = "seed lines base %d head %d; async reads base %d head %d (lines %d) async-off %d; md5 head %s async-off %s; %s; pp8k %s" % (
+            b.get("seed_lines_n", 0), h.get("seed_lines_n", 0), b.get("async_seed_reads", 0), h.get("async_seed_reads", 0),
+            h.get("async_seed_n", 0), h0.get("async_seed_reads", 0), sh(K["igh_d"]), sh(K["igh_sa0"]), aa_why, pp)
+        if b.get("seed_lines_n", 0) == 0 or h.get("seed_lines_n", 0) == 0:
+            add(it, os_, "VOID", "no layer-major group seeded the cache (the path cannot run here); " + why)
+        elif b.get("async_seed_reads", 0):
+            add(it, os_, "VOID", "the base already reads asynchronously (no defect to fix); " + why)
+        elif not aa:
+            add(it, os_, "VOID", "A/A head pair differs; " + why)
+        elif h.get("async_seed_reads", 0) == 0 or h0.get("async_seed_reads", 0):
+            add(it, os_, "FAIL", "the head seeds without an asynchronous read (or the kill switch does not stop it); " + why)
+        elif K["igh_d"] != K["igh_sa0"]:
+            add(it, os_, "FAIL", "text differs from LLAMA_MOE_LM_SEED_ASYNC=0 (the k15-pp2 wrong-expert race?); " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+    # 4. drafter compute release, forced by the floor: the base never releases on an IGPU, the head does, same text as without
+    it = "igpu-4 drafter compute release on an IGPU"
+    if need(it, ["igb_dr", "igh_dr", "igh_d", "igh_d2"]):
+        nb, nh = st(A["igb_dr"]).get("dft_release_n", 0), st(A["igh_dr"]).get("dft_release_n", 0)
+        why = "release lines (LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB=1000000) base %d head %d; md5 head forced %s default %s; %s" % (
+            nb, nh, sh(K["igh_dr"]), sh(K["igh_d"]), aa_why)
+        if nb:
+            add(it, os_, "VOID", "the base already releases (no defect to fix); " + why)
+        elif not aa:
+            add(it, os_, "VOID", "A/A head pair differs; " + why)
+        elif nh == 0:
+            # (the release needs a merged layer-major group: the verbose seed lines are its evidence)
+            add(it, os_, "VOID" if st(A["igh_dr"]).get("seed_lines_n", 0) == 0 else "FAIL",
+                "the forced floor released nothing on the head%s; " % (" (no layer-major group seen)" if st(A["igh_dr"]).get("seed_lines_n", 0) == 0 else "") + why)
+        elif K["igh_dr"] != K["igh_d"]:
+            add(it, os_, "FAIL", "text differs from the default; " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+    # 5. LM tail member (opt-in, no MTP): base pins to none, head to the device; head text = tail off
+    it = "igpu-5 LM tail member on an IGPU (LLAMA_LM_TAIL=1)"
+    if need(it, ["igt_b", "igt_h", "igt_h0"]):
+        pb, ph = st(A["igt_b"]).get("tail_pins") or [], st(A["igt_h"]).get("tail_pins") or []
+        pp = {a: (A[a].get("p8k") or {}).get("pp_tps") for a in ("igt_b", "igt_h", "igt_h0")}
+        why = "tail pins base %s head %s; md5 head %s tail-off %s; pp6k %s (one rep each, not gated)" % (
+            pb[:2], ph[:2], sh(K["igt_h"]), sh(K["igt_h0"]), pp)
+        if not pb or not ph:
+            add(it, os_, "VOID", "no tail member formed (no 'tail member of N tokens' line); " + why)
+        elif any(d != "none" for _, _, d in pb):
+            add(it, os_, "VOID", "the base already pins the tail to a device (no defect to fix); " + why)
+        elif any(d == "none" or n == 0 for _, n, d in ph):
+            add(it, os_, "FAIL", "the head left the tail member's ops off the device; " + why)
+        elif K["igt_h"] != K["igt_h0"]:
+            add(it, os_, "FAIL", "text differs from the tail off (exact without a drafter); " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+    # 6. logs: VRAM watch (8 GB arms), free after the released banks returned (4 GB arms)
+    it = "igpu-6 free-memory logs on an IGPU"
+    if need(it, ["igb_d", "igh_d", "igr_b", "igr_h"]):
+        vb, vh = st(A["igb_d"]).get("vram_watch_n", 0), st(A["igh_d"]).get("vram_watch_n", 0)
+        rb, rh = st(A["igr_b"]), st(A["igr_h"])
+        why = "VRAM watch lines base %d head %d; 4 GB: bank releases base %d head %d, free-after lines base %d head %d" % (
+            vb, vh, rb.get("bank_release_n", 0), rh.get("bank_release_n", 0), rb.get("free_after_release_n", 0), rh.get("free_after_release_n", 0))
+        if vb or rb.get("free_after_release_n", 0):
+            add(it, os_, "VOID", "the base already logs them (no defect to fix); " + why)
+        elif vh == 0:
+            add(it, os_, "FAIL", "LLAMA_VRAM_WATCH=1 logged nothing on the head; " + why)
+        elif rh.get("bank_release_n", 0) == 0:
+            add(it, os_, "VOID", "VRAM watch fixed, but no group released the banks at 4 GB (the free-after line cannot show); " + why)
+        elif rh.get("free_after_release_n", 0) == 0:
+            add(it, os_, "FAIL", "the head released the banks but logged no free-after line; " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+    # 7. discrete-only paths stay off: the dense host pin check runs and finds no device on both, no lend, same KV buffers
+    it = "igpu-7 discrete-only paths unchanged on an IGPU"
+    if need(it, ["igb_d", "igh_d", "igb_tf", "igh_tf"]):
+        b, h = st(A["igb_d"]), st(A["igh_d"])
+        pb, ph = st(A["igb_tf"]), st(A["igh_tf"])   # no MoE cache there: the dense host pin check runs (LLAMA_DENSE_HOST_PIN=1)
+        kvb = lambda x: [re.sub(r"^\S+ \S+ ", "", l) for l in x.get("kv_buf") or []]   # without the timestamp
+        why = "dense pin 'no device' base %d head %d, pinned base %d head %d; lend lines base %d head %d; KV buffers same %s" % (
+            pb.get("dense_pin_nodev_n", 0), ph.get("dense_pin_nodev_n", 0), pb.get("dense_pin_done_n", 0), ph.get("dense_pin_done_n", 0),
+            b.get("lend_lines_n", 0), h.get("lend_lines_n", 0), kvb(b) == kvb(h))
+        if ph.get("dense_pin_done_n", 0) or h.get("lend_lines_n", 0) != b.get("lend_lines_n", 0) or kvb(b) != kvb(h):
+            add(it, os_, "FAIL", "a discrete-only path changed on the IGPU; " + why)
+        elif pb.get("dense_pin_nodev_n", 0) == 0 or ph.get("dense_pin_nodev_n", 0) == 0:
+            add(it, os_, "VOID", "the dense host pin check did not run (LLAMA_DENSE_HOST_PIN=1 logged no 'no device' line at -lv 4); " + why)
+        else:
+            add(it, os_, "PASS", why)
+
+
 # ---------------------------------------------------------------- 11. bench
 def item11(rows, os_):
     for model, mode in (("q3m", "spill8192"), ("q35", "full")):
@@ -458,6 +624,7 @@ for os_, fname in (("linux", "k15-linux-gpu"), ("windows", "k15-windows-gpu")):
     item45(rows, os_)
     item_r2(rows, os_)
     item10(rows, os_)
+    item_igpu(rows, os_)
     item11(rows, os_)
 item9(load("k15-linux-cpu"))
 

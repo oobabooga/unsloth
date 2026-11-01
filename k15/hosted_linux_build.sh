@@ -19,7 +19,9 @@ S="$T/src"; mkdir -p "$S"
 git -C "$S" init -q; git -C "$S" config core.autocrlf false; git -C "$S" remote add origin https://github.com/ggml-org/llama.cpp
 git -C "$S" fetch -q --depth 1 origin "$BASE" && git -C "$S" checkout -q --detach "$BASE" || { echo "FATAL: fetch"; exit 1; }
 git -C "$S" config user.email ci@localhost; git -C "$S" config user.name ci
+[ "$N" = ig ] && [ ! -f "$J/IG_SHA" ] && { echo "ig: no k15/IG_SHA in this ticket, skipped"; exit 0; }
 case $N in up) PS=""; WANT=$(cat "$J/UP_SHA");; k10) PS="k10"; WANT=$(cat "$J/K10_SHA");; k15|k15cpu) PS="k10 k15d"; WANT=$(cat "$J/K15_SHA");;
+  ig) PS="k10 k15d igd"; WANT=$(cat "$J/IG_SHA");;
   *) echo "FATAL: unknown $N"; exit 1;; esac
 for p in $PS; do
   gunzip -c "$J/$p.patch.gz" > "$T/$p.patch"

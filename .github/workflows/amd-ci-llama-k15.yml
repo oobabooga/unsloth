@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [k15, k10, up, k15cpu]
+        n: [k15, k10, up, k15cpu, ig]
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }

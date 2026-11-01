@@ -5,7 +5,8 @@ Bins (K6P_DIR/bins): k15 = upstream ff5a2337 + k10.patch + k15d.patch (47c58bfdf
 head that ran on AMD), up = stock ff5a2337 (upstream merge base; Linux only, used only to attribute a full test-backend-ops failure).
 Pins for every exactness arm (k15 gate rule): LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_FETCH_OVERLAP=0, GGML_CUDA_VERIFY_REASSOC=0 and a
 fixed --moe-cache-mib (never auto) except where the test list asks for --moe-cache-mib 0.
-K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, relsplit, b3, ple, dguard, bench, tbofull, tbopad, stock.
+K15_STEPS (comma list, default all): ops, gst, mmid, eager, gdn, race, mailbox, replay, relsplit, b3, ple, dguard, igpu, bench, tbofull, tbopad, stock.
+igpu (k19-igpu, k15-land-igpu): head bin K15_IG_BIN (default bins/ig) vs the k15 bin as base, 14 q3m launches (Linux ~8 min, Windows ~12).
 """
 import json, os, subprocess, sys, time
 
@@ -13,7 +14,7 @@ J = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["K6P_DIR"], "plan_logs")
 os.makedirs(OUT, exist_ok=True)
 WIN = os.name == "nt"
-STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull,tbopad,stock").split(","))
+STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,igpu,bench,tbofull,tbopad,stock").split(","))
 
 PIN = "LLAMA_MOE_CPU_MISS=0;LLAMA_MOE_CACHE_FETCH_OVERLAP=0;GGML_CUDA_VERIFY_REASSOC=0"
 C1 = "K6P_MOE=1024"                     # pinned MoE cache for q3m (covers the 2-token MTP window + tail; rule: never auto / 0)
@@ -65,6 +66,27 @@ ARMS = [
     "ple_d:k15:K6P_ARGS=--lazy-mode on", "ple_0:k15:K6P_ARGS=--lazy-mode on;LLAMA_PLE_RESIDENT=0", "ple_d2:k15:K6P_ARGS=--lazy-mode on",
     # draft guard: the default k15 MTP launches must keep the draft; a forced floor shows the check runs on HIP (non-vacuity)
     "dg_force:k15:LLAMA_DRAFT_MIN_FREE_MIB=1000000",
+]
+# k19-igpu (k15-land-igpu): the paths that now take an integrated GPU, head bin IG vs the k15 bin (base), q3m + MTP, a fixed 4096 MiB
+# cache (above LLAMA_MOE_LM_RELEASE_FRAC, so the groups seed instead of releasing the banks) and the 8k prompt (4 ubatches of 2048: a
+# layer-major group). Every arm logs the layer-major seeds (engagement of the async seed) and the VRAM watch
+IG = os.environ.get("K15_IG_BIN", "ig")
+IGE = PIN + ";K6P_MOE=4096;LLAMA_MOE_LAYER_MAJOR_LOG=1;LLAMA_VRAM_WATCH=1"
+TL = PIN + ";K6P_MOE=4096;LLAMA_LM_TAIL=1;LLAMA_LM_TAIL_DEBUG=1"
+ARMS += [
+    # base / head x2 (A/A) / async seed off / device greedy off; forced drafter release head + base (base must not release: the defect),
+    # LLAMA_SPEC_TPP=1 on the forced-release head arm (a cache tier: the window must stay off there, the base forced it on)
+    "igb_d:k15:" + IGE, "igh_d:%s:%s" % (IG, IGE), "igh_d2:%s:%s" % (IG, IGE),
+    "igh_sa0:%s:%s;LLAMA_MOE_LM_SEED_ASYNC=0" % (IG, IGE), "igh_dg0:%s:%s;LLAMA_SERVER_DEVICE_GREEDY=0" % (IG, IGE),
+    "igh_dr:%s:%s;LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB=1000000;LLAMA_SPEC_TPP=1" % (IG, IGE),
+    "igb_dr:k15:%s;LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB=1000000" % IGE,
+    # k19-tpp forced where everything fits (no cache): the head prices 1 GPU with the device's free memory counted once, the base 0 GPUs.
+    # No MoE cache there, so the dense host pin check runs (LLAMA_DENSE_HOST_PIN=1): it must find no device on the IGPU, base and head
+    "igb_tf:k15:LLAMA_SPEC_TPP=1;LLAMA_DENSE_HOST_PIN=1", "igh_tf:%s:LLAMA_SPEC_TPP=1;LLAMA_DENSE_HOST_PIN=1" % IG,
+    # LM tail member (opt-in), no MTP (exact only without a drafter): base pins to none, head to ROCm0; head tail off = text reference
+    "igt_b:k15:" + TL, "igt_h:%s:%s" % (IG, TL), "igt_h0:%s:%s" % (IG, PIN + ";K6P_MOE=4096"),
+    # released banks (the shipping cache at a 4 GB budget releases them for the 8k group): the free-after log line, base vs head
+    "igr_b:k15:" + PIN, "igr_h:%s:%s" % (IG, PIN),
 ]
 MTP = "--spec-type draft-mtp --spec-draft-n-max 2"
 PLAN = []
@@ -126,7 +148,7 @@ def rows():
 
 T0 = time.time()
 step("dl", "dl", "--models", "q35,q3m,g4e2b", timeout=7200)
-step("devinfo", "devinfo", arms="k15,k10" + ("" if WIN else ",up"))
+step("devinfo", "devinfo", arms="k15,k10" + ("" if WIN else ",up") + (",igh_d" if os.path.isdir(os.path.join(os.environ["K6P_DIR"], "bins", IG)) else ""))
 
 # 2. fusion cases: default, each disable switch, all five; GDN (default / in-place off / gates off, + k10's GATED_DELTA_NET);
 #    GATED_MMVQ / GATED_Q8_1 (default / GATED_Q8_1=0 / DISABLE_GLU_Q8_1=1). New cases exist only in k15's test-backend-ops,
@@ -174,6 +196,17 @@ if "gdn" in STEPS:
 # 10. draft guard: forced floor (the k15 default MTP launches of every q3m step are the "draft kept" evidence)
 if "dguard" in STEPS:
     step("dguard_q3m", "time", "--cell", "q3m:spill8192", "--reps", "1", arms="dg_force", extra=MTP, timeout=1800)
+# k19-igpu: 7 + 2 + 3 + 2 launches; skipped (rows missing -> INCONCLUSIVE) without the head bin
+if "igpu" in STEPS:
+    if not os.path.isdir(os.path.join(os.environ["K6P_DIR"], "bins", IG)):
+        print("STEP igpu skipped: no bins/%s (the k15-land-igpu bundle)" % IG, flush=True)
+    else:
+        step("igpu_q3m", "time", "--cell", "q3m:spill8192", "--reps", "1", arms="igb_d,igh_d,igh_d2,igh_sa0,igh_dg0,igh_dr,igb_dr",
+             extra=MTP, p8k=7900, timeout=3600)
+        step("igpu_tpp_full", "time", "--cell", "q3m:full", "--reps", "1", arms="igb_tf,igh_tf", extra=MTP, timeout=1200)
+        # 6160 tokens = 3 x 2048 + 16: a 16-token last ubatch, the tail member
+        step("igpu_tail", "time", "--cell", "q3m:spill8192", "--reps", "1", arms="igt_b,igt_h,igt_h0", p8k=6160, timeout=1800)
+        step("igpu_rel_4g", "time", "--cell", "q3m:spill4096", "--reps", "1", arms="igr_b,igr_h", extra=MTP, p8k=7900, timeout=1200)
 # 11. no-regression bench (before the full suites: the shortest item that needs the exclusive card), A/A (k10 / k10b, k15 / k15b), rotating order, unpinned shipping defaults (as k10: cache auto)
 if "bench" in STEPS:
     step("bench_q3m", "time", "--cell", "q3m:spill8192", "--reps", "3", arms="k10,k10b,k15,k15b", extra=MTP, timeout=7200)
