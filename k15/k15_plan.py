@@ -18,7 +18,15 @@ STEPS = set((os.environ.get("K15_STEPS") or "ops,gst,mmid,eager,gdn,race,mailbox
 
 PIN = "LLAMA_MOE_CPU_MISS=0;LLAMA_MOE_CACHE_FETCH_OVERLAP=0;GGML_CUDA_VERIFY_REASSOC=0"
 C1 = "K6P_MOE=1024"                     # pinned MoE cache for q3m (covers the 2-token MTP window + tail; rule: never auto / 0)
-FAULT = "GGML_CUDA_GRAPH_UPDATE_FAULT=7;GGML_CUDA_GRAPH_INSTANTIATE_FAULT=1"
+# k19-hipfb: the fault fires on the Nth SUCCESSFUL cudaGraphExecUpdate of the process (ggml-cuda.cu ggml_cuda_graph_update_executable),
+# one per graph capture. N=7 never fired on the q35 cell (dense, no MTP, 3 short requests: a handful of captures, run 41230494065
+# VOID); N=1 fails the first capture and every recapture after it, so any capture reaches the fallback. FAULT_MIX (N=2) also
+# replays the captures in between (fallback and replay in one process). HT = GGML_CUDA_HOST_TIMING=16: the positive control,
+# "cudaGraphLaunch over the last 16 launches" per 16 graph launches, "N% CUDA graphs" per 16 graph_compute calls (no sync, no text change)
+FAULT = "GGML_CUDA_GRAPH_UPDATE_FAULT=1;GGML_CUDA_GRAPH_INSTANTIATE_FAULT=1"
+FAULT_MIX = "GGML_CUDA_GRAPH_UPDATE_FAULT=2;GGML_CUDA_GRAPH_INSTANTIATE_FAULT=1"
+HT = "GGML_CUDA_HOST_TIMING=16"
+C1 = C1 + ";" + HT   # every q3m matrix arm (m_*) carries the control, so item 3 q3m has it and the race / GDN / mailbox arms stay alike
 KS5 = ("GGML_CUDA_DISABLE_CONV_CAT_FUSION=1;GGML_CUDA_DISABLE_QSA_POOL_FUSION=1;GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1;"
        "GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1;GGML_CUDA_QSA_SEL_GRID=0")
 ARMS = [
@@ -34,9 +42,9 @@ ARMS = [
     "k10_p0:k10:K6P_PAD=0", "k10_p37:k10:K6P_PAD=37", "k10_p4096:k10:K6P_PAD=4096",
     "k15_gst:k15:GGML_CUDA_GRAPH_WHY=40", "k15_gstp:k15:GGML_CUDA_GRAPH_WHY=40;K6P_PAD=4096",
     # exactness arms, pinned (q3m arms add C1 below; q35 is dense, no cache)
-    "e_g:k15:%s;GGML_CUDA_DISABLE_GRAPHS=1" % PIN, "e_d:k15:%s" % PIN, "e_d2:k15:%s" % PIN,
-    "e_f1:k15:%s;%s" % (PIN, FAULT), "e_f2:k15:%s;%s;GGML_CUDA_GRAPH_DESTROY_FAULT=1" % (PIN, FAULT),
-    "e_fks:k15:%s;%s;GGML_CUDA_GRAPH_EAGER_FALLBACK=0" % (PIN, FAULT),
+    "e_g:k15:%s;%s;GGML_CUDA_DISABLE_GRAPHS=1" % (PIN, HT), "e_d:k15:%s;%s" % (PIN, HT), "e_d2:k15:%s;%s" % (PIN, HT),
+    "e_f1:k15:%s;%s;%s" % (PIN, HT, FAULT), "e_f2:k15:%s;%s;%s;GGML_CUDA_GRAPH_DESTROY_FAULT=1" % (PIN, HT, FAULT),
+    "e_fks:k15:%s;%s;%s;GGML_CUDA_GRAPH_EAGER_FALLBACK=0" % (PIN, HT, FAULT), "e_fm:k15:%s;%s;%s" % (PIN, HT, FAULT_MIX),
     "m_g:k15:%s;%s;GGML_CUDA_DISABLE_GRAPHS=1" % (PIN, C1), "m_d:k15:%s;%s" % (PIN, C1), "m_d2:k15:%s;%s" % (PIN, C1),
     "m_f1:k15:%s;%s;%s" % (PIN, C1, FAULT), "m_f2:k15:%s;%s;%s;GGML_CUDA_GRAPH_DESTROY_FAULT=1" % (PIN, C1, FAULT),
     "m_fks:k15:%s;%s;%s;GGML_CUDA_GRAPH_EAGER_FALLBACK=0" % (PIN, C1, FAULT),
@@ -173,7 +181,7 @@ if "mmid" in STEPS:
 # 3. eager fallback on HIP graphs: graphs off / default x2 / faults / faults + destroy fault / faults with the fallback off (the old
 #    behaviour: must abort, else the fault never reached the path), dense GDN q35 full and MoE GDN q3m 8 GB + MTP, pinned cache
 if "eager" in STEPS:
-    step("eager_q35", "time", "--cell", "q35:full", "--reps", "1", arms="e_g,e_d,e_d2,e_f1,e_f2,e_fks", timeout=3600)
+    step("eager_q35", "time", "--cell", "q35:full", "--reps", "1", arms="e_g,e_d,e_d2,e_f1,e_f2,e_fks,e_fm", timeout=3600)
 # 3 + 5 + 4 (pinned cache): one q3m matrix, every arm the same flags but its switch
 if STEPS & {"eager", "race", "gdn", "mailbox"}:
     step("exact_q3m", "time", "--cell", "q3m:spill8192", "--reps", "1",

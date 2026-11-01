@@ -211,7 +211,7 @@ class Sampler:
 
 PAT = re.compile(r"buffer size|memory breakdown|\| +- |MoE cache|moe_cache|out of memory|error|failed|GGML_ASSERT|offload|load_tensors|"
                  r"n_ubatch|n_batch|mmap|load.mode|ROCm0|MTL0|ggml_cuda_init|Device 0|system_info|build|fit|pinned|host|prefetch|lend|"
-                 r"weight.stream|integrated|unified|warning|abort|exception|non-consecutive|PLE|lazy|draft length|without the graph|gather kept|draft|speculative|"
+                 r"weight.stream|integrated|unified|warning|abort|exception|non-consecutive|PLE|lazy|draft length|without the graph|cudaGraphLaunch over|host timing over|gather kept|draft|speculative|"
                  r"k19-tpp|greedy requests|async seed|seed from the routing|tail member|VRAM watch|banks back|dense host pin", re.I)
 
 
@@ -252,6 +252,12 @@ def memstats(s):
             # k15: eager fallback after a failed graph instantiation (be6d2579151), GDN in-place gather kept (f4345bce9db, with
             # GGML_CUDA_GDN_STATE_IN_PLACE_DEBUG=1), the post-draft free-memory floor (828b560b09c), the MTP draft context
             "eager_fallback_n": len(g(r"this evaluation runs without the graph")),
+            # k19-hipfb positive control (GGML_CUDA_HOST_TIMING=N): graph launches (a lower bound: N per line) and the CUDA-graph share
+            # of each N-call window; a binary without the knob logs neither (host_timing_n 0 = no control, not "no graphs")
+            "graph_launch_n": sum(int(x) for x in g(r"cudaGraphLaunch over the last (\d+) launches")),
+            "host_timing_n": len(g(r"host timing over the last \d+ calls")),
+            "graph_pct_max": max([float(x) for x in g(r"evaluate/launch [\d.]+ us per call, ([\d.]+)% CUDA graphs")] or [0.0]),
+            "graph_launch_lines": [l.strip()[-200:] for l in g(r"[^\n]*cudaGraphLaunch over the last[^\n]*")][:2],
             "eager_fallback": [l.strip()[-260:] for l in g(r"[^\n]*this evaluation runs without the graph[^\n]*")][:3],
             "gather_kept_n": len(g(r"gather kept")),
             "gather_kept": [l.strip()[-220:] for l in g(r"[^\n]*gather kept[^\n]*")][:3],

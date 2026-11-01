@@ -161,6 +161,11 @@ jobs:
         with:
           name: bin_up
           path: ${{ env.AMD_CI_WORK }}/art/bin_up
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: bin_ig
+          path: ${{ env.AMD_CI_WORK }}/art/bin_ig
       - name: Cells
         timeout-minutes: 345
         run: |
@@ -247,8 +252,8 @@ jobs:
       - name: Judge
         env:
           # items this correctness ticket does not run (timing / gdn / race / mailbox / relsplit / b3 / PLE / bench stay with amd-ci-llama-k15):
-          # reported as skipped when they have no rows. Item 10, r2 replay commit fallback and the igpu items run here and are never skipped
-          K15_SKIP_ITEMS: "^(linux|windows):(4 |5 |6 |7 |8 |11 |r2 (?!replay)|r4 |r5 )|^windows:3 eager|^linux:3 eager fallback q3m"
+          # reported as skipped when they have no rows. Item 10, r2 replay commit fallback, 3 eager fallback (Linux, q35 + q3m) and the igpu items run here and are never skipped
+          K15_SKIP_ITEMS: "^(linux|windows):(4 |5 |6 |7 |8 |11 |r2 (?!replay)|r4 |r5 )|^windows:3 eager"
         run: |
           set +e
           python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"

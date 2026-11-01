@@ -206,29 +206,51 @@ def eq_report(rows, arms, model):
 
 
 def item3(rows, os_):
+    # k19-hipfb: positive control first (default arms replayed graphs, graphs-off arm did not), then the fault arms (UPDATE_FAULT=1:
+    # every capture fails its update, so a capture that happened must log the fallback), then md5 = graphs-off
     for model, p in (("q35", "e_"), ("q3m", "m_")):
+        name = "3 eager fallback " + model
         A = {k: one(rows, p + k, model) for k in ("g", "d", "d2", "f1", "f2", "fks")}
         if any(A[k] is None for k in A):
-            add("3 eager fallback " + model, os_, "INCONCLUSIVE", "missing arms %s" % [k for k in A if A[k] is None])
+            add(name, os_, "INCONCLUSIVE", "missing arms %s" % [k for k in A if A[k] is None])
             continue
+        fm = one(rows, p + "fm", model)
+        if fm is not None:
+            A["fm"] = fm
+        st = {k: (A[k].get("stats") or {}) for k in A}
         keys = {k: text_key(A[k]) for k in A}
-        fb = {k: (A[k].get("stats") or {}).get("eager_fallback_n", 0) for k in A}
-        why = "md5 %s; fallback lines %s" % ({k: (v and "/".join(x[:8] for x in v if x)) for k, v in keys.items()}, fb)
-        if any(died(A[k]) for k in ("g", "d", "d2", "f1", "f2")):
-            add("3 eager fallback " + model, os_, "FAIL", "an arm aborted or did not answer: %s; %s" % (
-                [k for k in ("g", "d", "d2", "f1", "f2") if died(A[k])], why))
+        fb = {k: st[k].get("eager_fallback_n", 0) for k in A}
+        nl = {k: st[k].get("graph_launch_n", 0) for k in A}
+        ht = {k: st[k].get("host_timing_n", 0) for k in A}
+        pct = {k: st[k].get("graph_pct_max", 0.0) for k in A}
+        why = "md5 %s; fallback lines %s; graph launches >= %s; max %%CUDA graphs %s; host timing lines %s" % (
+            {k: (v and "/".join(x[:8] for x in v if x)) for k, v in keys.items()}, fb, nl, pct, ht)
+        live = [k for k in A if k != "fks"]
+        if any(died(A[k]) for k in live):
+            add(name, os_, "FAIL", "an arm aborted or did not answer: %s; %s" % ([k for k in live if died(A[k])], why))
+        elif any(ht[k] == 0 for k in ("g", "d", "d2")):
+            add(name, os_, "INCONCLUSIVE", "no GGML_CUDA_HOST_TIMING lines (positive control absent: harness or binary); " + why)
+        elif nl["g"] > 0 or pct["g"] > 0:
+            add(name, os_, "VOID", "negative control failed: the graphs-off arm launched graphs; " + why)
+        elif nl["d"] == 0 or nl["d2"] == 0:
+            add(name, os_, "VOID", "positive control failed: no CUDA/HIP graph launch in a default arm (graphs never replayed on this "
+                "device / cell, so the fallback has nothing to fall back from); " + why)
         elif keys["d"] != keys["d2"]:
-            add("3 eager fallback " + model, os_, "VOID", "A/A default pair differs (text not reproducible at these pins); " + why)
+            add(name, os_, "VOID", "A/A default pair differs (text not reproducible at these pins); " + why)
         elif fb["f1"] == 0 or fb["f2"] == 0:
-            add("3 eager fallback " + model, os_, "VOID", "a fault arm logged no 'runs without the graph' (fallback never ran); " + why)
+            add(name, os_, "FAIL", "default arms launched graphs but a fault arm (every update fails) logged no fallback: the injection or "
+                "the fallback is unreachable on this backend; " + why)
         elif not died(A["fks"]):
-            add("3 eager fallback " + model, os_, "VOID", "faults with GGML_CUDA_GRAPH_EAGER_FALLBACK=0 did not abort: the injected failure "
-                "did not reach the old abort path, so the fault arms prove nothing; " + why)
+            add(name, os_, "FAIL", "the fault reached the fallback (f1 / f2) but GGML_CUDA_GRAPH_EAGER_FALLBACK=0 did not abort; " + why)
         elif not (keys["f1"] == keys["g"] and keys["f2"] == keys["g"] and keys["d"] == keys["g"]):
-            add("3 eager fallback " + model, os_, "FAIL", "text differs from graphs-off; " + why)
+            add(name, os_, "FAIL", "text differs from graphs-off; " + why)
+        elif "fm" in A and keys["fm"] != keys["g"]:
+            add(name, os_, "FAIL", "mixed arm (UPDATE_FAULT=2: fallback and replay in one process) text differs from graphs-off; " + why)
         else:
-            add("3 eager fallback " + model, os_, "PASS", "graphs off = default x2 = faults = faults + destroy fault; fallback off aborts "
-                "(%s); " % str((A["fks"].get("stats") or {}).get("err_lines") or A["fks"].get("err", ""))[:200] + why)
+            mix = ("" if "fm" not in A else "; mixed arm %s" % ("engaged both (fallback %d, launches >= %d)" % (fb["fm"], nl["fm"])
+                   if fb["fm"] > 0 and nl["fm"] > 0 else "did not engage both paths (reported, not gating)"))
+            add(name, os_, "PASS", "graphs launched in default arms (>= %d / %d), none graphs-off; graphs off = default x2 = faults = faults "
+                "+ destroy fault; fallback off aborts (%s)%s; " % (nl["d"], nl["d2"], str(st["fks"].get("err_lines") or A["fks"].get("err", ""))[:200], mix) + why)
 
 
 def same_set(rows, model, arms, item, os_, aa_pairs, extra=""):
