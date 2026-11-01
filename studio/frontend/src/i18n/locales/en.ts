@@ -5,10 +5,13 @@ export const en = {
   chatBackground: {
     noBackground: "No background",
     sizing: "Image sizing",
+    sizingPosition: "Image sizing & position",
     fill: "Fill",
     fit: "Fit",
     stretch: "Stretch",
     original: "Original size",
+    fitWidth: "Fit width",
+    fitHeight: "Fit height",
     zoom: "Zoom",
     outline: "Composer outline",
     fade: "Fade to background",
@@ -27,6 +30,8 @@ export const en = {
     visibility: "Visibility",
     blur: "Image blur",
     position: "Position",
+    horizontal: "Horizontal position",
+    vertical: "Vertical position",
     positionValue: "Horizontal {x}%, vertical {y}%",
     newChat: "New chat",
     conversation: "Conversation",
@@ -2171,10 +2176,14 @@ export const en = {
         label: "Install type",
         description:
           "Chat only (GGUF). The full install adds training, export, video, safetensors models and additional image generation features.",
+        descriptionCpu:
+          "Chat only (GGUF). No supported GPU was found, so the full install adds training on the CPU.",
         action: "Upgrade to full install",
         confirmTitle: "Upgrade to the full install?",
         confirmDescription:
           "This Chat only install runs GGUF models. The full install adds PyTorch for this machine's GPU, which enables training, export, video, safetensors models and additional image generation features. It downloads several gigabytes (at least 5 GB of disk space) and restarts the server. Chats, models and settings are kept. This can take several minutes.",
+        confirmDescriptionCpu:
+          "This Chat only install runs GGUF models. No supported GPU was found on this machine, so the full install adds PyTorch for the CPU, which enables training on the CPU. CPU training is much slower than GPU training. It needs at least 5 GB of disk space and restarts the server. Chats, models and settings are kept. This can take several minutes.",
         confirmAction: "Upgrade",
         keywords:
           "full install upgrade install type chat only gguf add training train training fine-tune pytorch torch export video image generation safetensors",
@@ -3596,6 +3605,8 @@ export const en = {
   },
   studio: {
     routeTitle: "Train",
+    cpuTrainingNotice:
+      "No GPU was found, so training runs on the CPU. It is much slower than GPU training and supports text models only (LoRA or full finetuning).",
     wizard: {
       modelTitle: "Model",
       modelDescription: "Select model and training method",

@@ -8,10 +8,13 @@ export const vi = {
   chatBackground: {
     noBackground: "Không có nền",
     sizing: "Kích thước ảnh",
+    sizingPosition: "Kích thước và vị trí ảnh",
     fill: "Lấp đầy",
     fit: "Vừa khung",
     stretch: "Kéo giãn",
     original: "Kích thước gốc",
+    fitWidth: "Vừa chiều rộng",
+    fitHeight: "Vừa chiều cao",
     zoom: "Thu phóng",
     outline: "Viền ô soạn tin",
     fade: "Mờ dần vào nền",
@@ -30,6 +33,8 @@ export const vi = {
     visibility: "Độ hiển thị",
     blur: "Độ mờ ảnh",
     position: "Vị trí",
+    horizontal: "Vị trí ngang",
+    vertical: "Vị trí dọc",
     positionValue: "Ngang {x}%, dọc {y}%",
     newChat: "Cuộc trò chuyện mới",
     conversation: "Cuộc trò chuyện",
@@ -2353,10 +2358,14 @@ export const vi = {
         label: "Loại cài đặt",
         description:
           "Chỉ trò chuyện (GGUF). Bản cài đặt đầy đủ bổ sung huấn luyện, xuất, video, mô hình safetensors và các tính năng tạo ảnh bổ sung.",
+        descriptionCpu:
+          "Chỉ trò chuyện (GGUF). Không tìm thấy GPU được hỗ trợ, nên bản cài đặt đầy đủ bổ sung huấn luyện trên CPU.",
         action: "Nâng cấp lên bản cài đặt đầy đủ",
         confirmTitle: "Nâng cấp lên bản cài đặt đầy đủ?",
         confirmDescription:
           "Bản cài đặt Chỉ trò chuyện này chạy các mô hình GGUF. Bản cài đặt đầy đủ bổ sung PyTorch cho GPU của máy này, cho phép huấn luyện, xuất, video, mô hình safetensors và các tính năng tạo ảnh bổ sung. Quá trình này tải xuống vài gigabyte (cần ít nhất 5 GB dung lượng ổ đĩa) và khởi động lại máy chủ. Cuộc trò chuyện, mô hình và cài đặt được giữ nguyên. Quá trình này có thể mất vài phút.",
+        confirmDescriptionCpu:
+          "Bản cài đặt Chỉ trò chuyện này chạy các mô hình GGUF. Không tìm thấy GPU được hỗ trợ trên máy này, nên bản cài đặt đầy đủ bổ sung PyTorch cho CPU, cho phép huấn luyện trên CPU. Huấn luyện trên CPU chậm hơn nhiều so với trên GPU. Quá trình này cần ít nhất 5 GB dung lượng ổ đĩa và khởi động lại máy chủ. Cuộc trò chuyện, mô hình và cài đặt được giữ nguyên. Quá trình này có thể mất vài phút.",
         confirmAction: "Nâng cấp",
         keywords:
           "cài đặt đầy đủ nâng cấp loại cài đặt chỉ trò chuyện huấn luyện tinh chỉnh xuất tạo ảnh full install upgrade install type chat only gguf add training train fine-tune pytorch torch export video image generation safetensors",
@@ -3885,6 +3894,8 @@ export const vi = {
   },
   studio: {
     routeTitle: "Huấn luyện",
+    cpuTrainingNotice:
+      "Không tìm thấy GPU, nên quá trình huấn luyện chạy trên CPU. Việc này chậm hơn nhiều so với huấn luyện trên GPU và chỉ hỗ trợ mô hình văn bản (LoRA hoặc tinh chỉnh toàn bộ).",
     wizard: {
       modelTitle: "Mô hình",
       modelDescription: "Chọn mô hình và phương pháp huấn luyện",

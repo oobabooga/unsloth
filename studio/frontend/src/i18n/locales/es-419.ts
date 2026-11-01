@@ -8,10 +8,13 @@ export const es419 = {
   chatBackground: {
     noBackground: "Sin fondo",
     sizing: "Tamaño de imagen",
+    sizingPosition: "Tamaño y posición de imagen",
     fill: "Rellenar",
     fit: "Ajustar",
     stretch: "Estirar",
     original: "Tamaño original",
+    fitWidth: "Ajustar al ancho",
+    fitHeight: "Ajustar a la altura",
     zoom: "Zoom",
     outline: "Contorno del campo de mensaje",
     fade: "Desvanecer hacia el fondo",
@@ -30,6 +33,8 @@ export const es419 = {
     visibility: "Visibilidad",
     blur: "Desenfoque de imagen",
     position: "Posición",
+    horizontal: "Posición horizontal",
+    vertical: "Posición vertical",
     positionValue: "Horizontal {x} %, vertical {y} %",
     newChat: "Nuevo chat",
     conversation: "Conversación",
@@ -2383,10 +2388,14 @@ export const es419 = {
         label: "Tipo de instalación",
         description:
           "Solo chat (GGUF). La instalación completa agrega entrenamiento, exportación, video, modelos safetensors y más funciones de generación de imágenes.",
+        descriptionCpu:
+          "Solo chat (GGUF). No se encontró una GPU compatible, así que la instalación completa agrega entrenamiento en la CPU.",
         action: "Actualizar a la instalación completa",
         confirmTitle: "¿Actualizar a la instalación completa?",
         confirmDescription:
           "Esta instalación de solo chat ejecuta modelos GGUF. La instalación completa agrega PyTorch para la GPU de esta computadora, lo que habilita el entrenamiento, la exportación, el video, los modelos safetensors y más funciones de generación de imágenes. Descarga varios gigabytes (al menos 5 GB de espacio en disco) y reinicia el servidor. Se conservan los chats, los modelos y la configuración. Puede tardar varios minutos.",
+        confirmDescriptionCpu:
+          "Esta instalación de solo chat ejecuta modelos GGUF. No se encontró una GPU compatible en esta computadora, así que la instalación completa agrega PyTorch para la CPU, lo que habilita el entrenamiento en la CPU. Entrenar en la CPU es mucho más lento que en una GPU. Necesita al menos 5 GB de espacio en disco y reinicia el servidor. Se conservan los chats, los modelos y la configuración. Puede tardar varios minutos.",
         confirmAction: "Actualizar",
         keywords:
           "full install upgrade tipo de instalación instalación completa actualizar solo chat chat only gguf entrenamiento entrenar train training fine-tune ajuste fino pytorch torch exportar export video generación de imágenes safetensors",
@@ -3947,6 +3956,8 @@ export const es419 = {
   },
   studio: {
     routeTitle: "Entrenar",
+    cpuTrainingNotice:
+      "No se encontró ninguna GPU, así que el entrenamiento se ejecuta en la CPU. Es mucho más lento que en una GPU y solo admite modelos de texto (LoRA o ajuste fino completo).",
     wizard: {
       modelTitle: "Modelo",
       modelDescription: "Selecciona el modelo y el método de entrenamiento",

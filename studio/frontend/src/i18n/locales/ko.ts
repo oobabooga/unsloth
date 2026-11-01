@@ -8,10 +8,13 @@ export const ko = {
   chatBackground: {
     noBackground: "배경 없음",
     sizing: "이미지 크기 조정",
+    sizingPosition: "이미지 크기 및 위치",
     fill: "채우기",
     fit: "맞추기",
     stretch: "늘이기",
     original: "원본 크기",
+    fitWidth: "너비에 맞추기",
+    fitHeight: "높이에 맞추기",
     zoom: "확대",
     outline: "메시지 입력창 테두리",
     fade: "배경으로 페이드",
@@ -30,6 +33,8 @@ export const ko = {
     visibility: "표시 강도",
     blur: "이미지 흐림",
     position: "위치",
+    horizontal: "가로 위치",
+    vertical: "세로 위치",
     positionValue: "가로 {x}%, 세로 {y}%",
     newChat: "새 채팅",
     conversation: "대화",
@@ -2130,10 +2135,14 @@ export const ko = {
         label: "설치 유형",
         description:
           "채팅 전용(GGUF). 전체 설치에는 학습, 내보내기, 동영상, safetensors 모델, 더 많은 이미지 생성 기능이 추가됩니다.",
+        descriptionCpu:
+          "채팅 전용(GGUF). 지원되는 GPU가 없어 전체 설치에는 CPU 학습이 추가됩니다.",
         action: "전체 설치로 업그레이드",
         confirmTitle: "전체 설치로 업그레이드할까요?",
         confirmDescription:
           "이 채팅 전용 설치는 GGUF 모델을 실행합니다. 전체 설치는 이 컴퓨터의 GPU에 맞는 PyTorch를 추가하여 학습, 내보내기, 동영상, safetensors 모델, 더 많은 이미지 생성 기능을 사용할 수 있게 합니다. 수 GB(디스크 공간 5GB 이상)를 다운로드하고 서버를 다시 시작합니다. 채팅, 모델, 설정은 유지됩니다. 몇 분 정도 걸릴 수 있습니다.",
+        confirmDescriptionCpu:
+          "이 채팅 전용 설치는 GGUF 모델을 실행합니다. 이 컴퓨터에서 지원되는 GPU를 찾지 못했으므로 전체 설치는 CPU용 PyTorch를 추가하여 CPU에서 학습할 수 있게 합니다. CPU 학습은 GPU 학습보다 훨씬 느립니다. 디스크 공간이 5GB 이상 필요하며 서버를 다시 시작합니다. 채팅, 모델, 설정은 유지됩니다. 몇 분 정도 걸릴 수 있습니다.",
         confirmAction: "업그레이드",
         keywords:
           "full install upgrade 설치 유형 전체 설치 업그레이드 채팅 전용 chat only gguf add training 학습 훈련 train fine-tune pytorch torch 내보내기 동영상 이미지 생성 safetensors",
@@ -3575,6 +3584,8 @@ export const ko = {
     imageTraining: "이미지 학습",
     goToImageTraining: "이미지 LoRA 학습",
     routeTitle: "학습",
+    cpuTrainingNotice:
+      "GPU를 찾지 못해 학습이 CPU에서 실행됩니다. GPU 학습보다 훨씬 느리며 텍스트 모델(LoRA 또는 전체 파인튜닝)만 지원합니다.",
     wizard: {
       modelTitle: "모델",
       modelDescription: "모델과 학습 방법 선택",

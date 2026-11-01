@@ -8,10 +8,13 @@ export const cs = {
   chatBackground: {
     noBackground: "Bez pozadí",
     sizing: "Velikost obrázku",
+    sizingPosition: "Velikost a pozice obrázku",
     fill: "Vyplnit",
     fit: "Přizpůsobit",
     stretch: "Roztáhnout",
     original: "Původní velikost",
+    fitWidth: "Přizpůsobit šířce",
+    fitHeight: "Přizpůsobit výšce",
     zoom: "Přiblížení",
     outline: "Obrys pole zprávy",
     fade: "Prolnout do pozadí",
@@ -30,6 +33,8 @@ export const cs = {
     visibility: "Viditelnost",
     blur: "Rozmazání obrázku",
     position: "Pozice",
+    horizontal: "Vodorovná pozice",
+    vertical: "Svislá pozice",
     positionValue: "Vodorovně {x} %, svisle {y} %",
     newChat: "Nový chat",
     conversation: "Konverzace",
@@ -2364,10 +2369,14 @@ export const cs = {
         label: "Typ instalace",
         description:
           "Pouze chat (GGUF). Úplná instalace přidává trénování, export, video, modely safetensors a další funkce generování obrázků.",
+        descriptionCpu:
+          "Pouze chat (GGUF). Nebyla nalezena podporovaná GPU, takže úplná instalace přidává trénování na CPU.",
         action: "Upgradovat na úplnou instalaci",
         confirmTitle: "Upgradovat na úplnou instalaci?",
         confirmDescription:
           "Tato instalace Pouze chat spouští modely GGUF. Úplná instalace přidává PyTorch pro GPU tohoto počítače, což umožňuje trénování, export, video, modely safetensors a další funkce generování obrázků. Stáhne několik gigabajtů (potřeba je alespoň 5 GB místa na disku) a restartuje server. Chaty, modely a nastavení zůstanou zachovány. Může to trvat několik minut.",
+        confirmDescriptionCpu:
+          "Tato instalace Pouze chat spouští modely GGUF. V tomto počítači nebyla nalezena podporovaná GPU, takže úplná instalace přidává PyTorch pro CPU, což umožňuje trénování na CPU. Trénování na CPU je mnohem pomalejší než na GPU. Je potřeba alespoň 5 GB místa na disku a server se restartuje. Chaty, modely a nastavení zůstanou zachovány. Může to trvat několik minut.",
         confirmAction: "Upgradovat",
         keywords:
           "úplná instalace upgrade typ instalace pouze chat gguf přidat trénování trénovat doladění fine-tune pytorch torch export video generování obrázků safetensors full install training",
@@ -3901,6 +3910,8 @@ export const cs = {
   },
   studio: {
     routeTitle: "Trénování",
+    cpuTrainingNotice:
+      "Nebyla nalezena žádná GPU, takže trénování běží na CPU. Je mnohem pomalejší než trénování na GPU a podporuje pouze textové modely (LoRA nebo úplné doladění).",
     wizard: {
       modelTitle: "Model",
       modelDescription: "Vyberte model a metodu trénování",

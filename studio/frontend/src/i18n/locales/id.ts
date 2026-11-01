@@ -8,10 +8,13 @@ export const id = {
   chatBackground: {
     noBackground: "Tanpa latar belakang",
     sizing: "Ukuran gambar",
+    sizingPosition: "Ukuran dan posisi gambar",
     fill: "Isi",
     fit: "Sesuaikan",
     stretch: "Regangkan",
     original: "Ukuran asli",
+    fitWidth: "Sesuaikan lebar",
+    fitHeight: "Sesuaikan tinggi",
     zoom: "Zoom",
     outline: "Garis tepi kolom pesan",
     fade: "Pudarkan ke latar belakang",
@@ -30,6 +33,8 @@ export const id = {
     visibility: "Visibilitas",
     blur: "Keburaman gambar",
     position: "Posisi",
+    horizontal: "Posisi horizontal",
+    vertical: "Posisi vertikal",
     positionValue: "Horizontal {x}%, vertikal {y}%",
     newChat: "Chat baru",
     conversation: "Percakapan",
@@ -2347,10 +2352,14 @@ export const id = {
         label: "Jenis instalasi",
         description:
           "Hanya chat (GGUF). Instalasi lengkap menambahkan pelatihan, ekspor, video, model safetensors, dan fitur pembuatan gambar tambahan.",
+        descriptionCpu:
+          "Hanya chat (GGUF). Tidak ditemukan GPU yang didukung, jadi instalasi lengkap menambahkan pelatihan di CPU.",
         action: "Tingkatkan ke instalasi lengkap",
         confirmTitle: "Tingkatkan ke instalasi lengkap?",
         confirmDescription:
           "Instalasi Hanya chat ini menjalankan model GGUF. Instalasi lengkap menambahkan PyTorch untuk GPU mesin ini, yang mengaktifkan pelatihan, ekspor, video, model safetensors, dan fitur pembuatan gambar tambahan. Proses ini mengunduh beberapa gigabyte (minimal 5 GB ruang disk) dan memulai ulang server. Chat, model, dan pengaturan tetap disimpan. Proses ini dapat memakan waktu beberapa menit.",
+        confirmDescriptionCpu:
+          "Instalasi Hanya chat ini menjalankan model GGUF. Tidak ditemukan GPU yang didukung di mesin ini, jadi instalasi lengkap menambahkan PyTorch untuk CPU, yang mengaktifkan pelatihan di CPU. Pelatihan di CPU jauh lebih lambat daripada di GPU. Proses ini memerlukan ruang disk minimal 5 GB dan memulai ulang server. Chat, model, dan pengaturan tetap disimpan. Proses ini dapat memakan waktu beberapa menit.",
         confirmAction: "Tingkatkan",
         keywords:
           "full install upgrade install type chat only gguf add training train training fine-tune pytorch torch export video image generation safetensors instalasi lengkap tingkatkan pelatihan latih ekspor gambar",
@@ -3882,6 +3891,8 @@ export const id = {
   },
   studio: {
     routeTitle: "Latih",
+    cpuTrainingNotice:
+      "Tidak ditemukan GPU, jadi pelatihan berjalan di CPU. Pelatihan ini jauh lebih lambat daripada di GPU dan hanya mendukung model teks (LoRA atau finetuning penuh).",
     wizard: {
       modelTitle: "Model",
       modelDescription: "Pilih model dan metode pelatihan",

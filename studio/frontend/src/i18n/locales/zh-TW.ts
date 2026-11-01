@@ -8,10 +8,13 @@ export const zhTW = {
   chatBackground: {
     noBackground: "無背景",
     sizing: "圖片縮放方式",
+    sizingPosition: "圖片縮放與位置",
     fill: "填滿",
     fit: "符合",
     stretch: "延展",
     original: "原始大小",
+    fitWidth: "符合寬度",
+    fitHeight: "符合高度",
     zoom: "縮放",
     outline: "訊息輸入框外框",
     fade: "漸隱至背景",
@@ -30,6 +33,8 @@ export const zhTW = {
     visibility: "可見度",
     blur: "圖片模糊",
     position: "位置",
+    horizontal: "水平位置",
+    vertical: "垂直位置",
     positionValue: "水平 {x}%，垂直 {y}%",
     newChat: "新對話",
     conversation: "對話",
@@ -2230,10 +2235,14 @@ export const zhTW = {
         label: "安裝類型",
         description:
           "僅聊天（GGUF）。完整安裝會加入訓練、匯出、影片、safetensors 模型及更多圖片生成功能。",
+        descriptionCpu:
+          "僅聊天（GGUF）。找不到支援的 GPU，因此完整安裝會加入 CPU 訓練。",
         action: "升級為完整安裝",
         confirmTitle: "要升級為完整安裝嗎？",
         confirmDescription:
           "此「僅聊天」安裝可執行 GGUF 模型。完整安裝會為這台電腦的 GPU 加入 PyTorch，以啟用訓練、匯出、影片、safetensors 模型及更多圖片生成功能。這會下載數 GB 的資料（至少需要 5 GB 磁碟空間）並重新啟動伺服器。聊天、模型和設定都會保留。此程序可能需要幾分鐘。",
+        confirmDescriptionCpu:
+          "此「僅聊天」安裝可執行 GGUF 模型。這台電腦找不到支援的 GPU，因此完整安裝會加入 CPU 版的 PyTorch，以啟用 CPU 訓練。CPU 訓練比 GPU 訓練慢得多。這需要至少 5 GB 磁碟空間，並會重新啟動伺服器。聊天、模型和設定都會保留。此程序可能需要幾分鐘。",
         confirmAction: "升級",
         keywords:
           "完整安裝 升級 安裝類型 僅聊天 gguf 加入訓練 訓練 微調 pytorch torch 匯出 影片 圖片生成 safetensors full install upgrade chat only training fine-tune export video image generation",
@@ -3686,6 +3695,8 @@ export const zhTW = {
   },
   studio: {
     routeTitle: "訓練",
+    cpuTrainingNotice:
+      "找不到 GPU，因此訓練會在 CPU 上執行。它比 GPU 訓練慢得多，且僅支援文字模型（LoRA 或完整微調）。",
     wizard: {
       modelTitle: "模型",
       modelDescription: "選取模型與訓練方法",

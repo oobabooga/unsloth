@@ -8,10 +8,13 @@ export const he = {
   chatBackground: {
     noBackground: "ללא רקע",
     sizing: "התאמת גודל תמונה",
+    sizingPosition: "גודל ומיקום התמונה",
     fill: "מילוי",
     fit: "התאמה",
     stretch: "מתיחה",
     original: "גודל מקורי",
+    fitWidth: "התאמה לרוחב",
+    fitHeight: "התאמה לגובה",
     zoom: "זום",
     outline: "מסגרת שדה ההודעה",
     fade: "דעיכה אל הרקע",
@@ -30,6 +33,8 @@ export const he = {
     visibility: "נראות",
     blur: "טשטוש תמונה",
     position: "מיקום",
+    horizontal: "מיקום אופקי",
+    vertical: "מיקום אנכי",
     positionValue: "אופקי {x}%, אנכי {y}%",
     newChat: "צ׳אט חדש",
     conversation: "שיחה",
@@ -2211,10 +2216,14 @@ export const he = {
         label: "סוג התקנה",
         description:
           "צ'אט בלבד (GGUF). ההתקנה המלאה מוסיפה אימון, ייצוא, וידאו, מודלים של safetensors ותכונות נוספות ליצירת תמונות.",
+        descriptionCpu:
+          "צ'אט בלבד (GGUF). לא נמצא GPU נתמך, ולכן ההתקנה המלאה מוסיפה אימון על ה-CPU.",
         action: "שדרג להתקנה מלאה",
         confirmTitle: "לשדרג להתקנה המלאה?",
         confirmDescription:
           "התקנה זו של צ'אט בלבד מריצה מודלים של GGUF. ההתקנה המלאה מוסיפה את PyTorch עבור ה-GPU של מכונה זו, ומאפשרת אימון, ייצוא, וידאו, מודלים של safetensors ותכונות נוספות ליצירת תמונות. היא מורידה כמה ג'יגה-בייט (לפחות 5 GB של שטח דיסק) ומפעילה מחדש את השרת. הצ'אטים, המודלים וההגדרות יישמרו. התהליך עשוי להימשך מספר דקות.",
+        confirmDescriptionCpu:
+          "התקנה זו של צ'אט בלבד מריצה מודלים של GGUF. לא נמצא GPU נתמך במכונה זו, ולכן ההתקנה המלאה מוסיפה את PyTorch עבור ה-CPU, ומאפשרת אימון על ה-CPU. אימון על CPU איטי בהרבה מאימון על GPU. היא דורשת לפחות 5 GB של שטח דיסק ומפעילה מחדש את השרת. הצ'אטים, המודלים וההגדרות יישמרו. התהליך עשוי להימשך מספר דקות.",
         confirmAction: "שדרג",
         keywords:
           "full install upgrade סוג התקנה התקנה מלאה שדרוג צ'אט בלבד chat only gguf add training אימון train fine-tune pytorch torch ייצוא וידאו יצירת תמונות safetensors",
@@ -3666,6 +3675,8 @@ export const he = {
   },
   studio: {
     routeTitle: "אימון",
+    cpuTrainingNotice:
+      "לא נמצא GPU, ולכן האימון רץ על ה-CPU. הוא איטי בהרבה מאימון על GPU ותומך במודלי טקסט בלבד (LoRA או כוונון מלא).",
     wizard: {
       modelTitle: "מודל",
       modelDescription: "בחר מודל ושיטת אימון",

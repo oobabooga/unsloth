@@ -8,10 +8,13 @@ export const th = {
   chatBackground: {
     noBackground: "ไม่มีพื้นหลัง",
     sizing: "การปรับขนาดภาพ",
+    sizingPosition: "ขนาดและตำแหน่งภาพ",
     fill: "เติมเต็ม",
     fit: "พอดี",
     stretch: "ยืด",
     original: "ขนาดต้นฉบับ",
+    fitWidth: "พอดีความกว้าง",
+    fitHeight: "พอดีความสูง",
     zoom: "ซูม",
     outline: "เส้นขอบช่องข้อความ",
     fade: "จางเข้าสู่พื้นหลัง",
@@ -30,6 +33,8 @@ export const th = {
     visibility: "การมองเห็น",
     blur: "ความเบลอของภาพ",
     position: "ตำแหน่ง",
+    horizontal: "ตำแหน่งแนวนอน",
+    vertical: "ตำแหน่งแนวตั้ง",
     positionValue: "แนวนอน {x}% แนวตั้ง {y}%",
     newChat: "แชทใหม่",
     conversation: "การสนทนา",
@@ -2243,10 +2248,14 @@ export const th = {
         label: "ประเภทการติดตั้ง",
         description:
           "แชทเท่านั้น (GGUF) การติดตั้งแบบเต็มจะเพิ่มการเทรน การส่งออก วิดีโอ โมเดล safetensors และฟีเจอร์การสร้างรูปภาพเพิ่มเติม",
+        descriptionCpu:
+          "แชทเท่านั้น (GGUF) ไม่พบ GPU ที่รองรับ การติดตั้งแบบเต็มจึงเพิ่มการเทรนบน CPU",
         action: "อัปเกรดเป็นการติดตั้งแบบเต็ม",
         confirmTitle: "อัปเกรดเป็นการติดตั้งแบบเต็มหรือไม่",
         confirmDescription:
           "การติดตั้งแบบแชทเท่านั้นนี้รันโมเดล GGUF การติดตั้งแบบเต็มจะเพิ่ม PyTorch สำหรับ GPU ของเครื่องนี้ ซึ่งเปิดใช้การเทรน การส่งออก วิดีโอ โมเดล safetensors และฟีเจอร์การสร้างรูปภาพเพิ่มเติม โดยจะดาวน์โหลดหลายกิกะไบต์ (ใช้พื้นที่ดิสก์อย่างน้อย 5 GB) และรีสตาร์ทเซิร์ฟเวอร์ แชท โมเดล และการตั้งค่าจะยังคงอยู่ ขั้นตอนนี้อาจใช้เวลาหลายนาที",
+        confirmDescriptionCpu:
+          "การติดตั้งแบบแชทเท่านั้นนี้รันโมเดล GGUF ไม่พบ GPU ที่รองรับในเครื่องนี้ การติดตั้งแบบเต็มจึงเพิ่ม PyTorch สำหรับ CPU ซึ่งเปิดใช้การเทรนบน CPU การเทรนบน CPU ช้ากว่าบน GPU มาก ต้องใช้พื้นที่ดิสก์อย่างน้อย 5 GB และจะรีสตาร์ทเซิร์ฟเวอร์ แชท โมเดล และการตั้งค่าจะยังคงอยู่ อาจใช้เวลาหลายนาที",
         confirmAction: "อัปเกรด",
         keywords:
           "ติดตั้งแบบเต็ม อัปเกรด ประเภทการติดตั้ง แชทเท่านั้น เทรน ปรับแต่งโมเดล ส่งออก วิดีโอ สร้างรูปภาพ full install upgrade install type chat only gguf add training train training fine-tune pytorch torch export video image generation safetensors",
@@ -3711,6 +3720,8 @@ export const th = {
   },
   studio: {
     routeTitle: "เทรน",
+    cpuTrainingNotice:
+      "ไม่พบ GPU การเทรนจึงทำงานบน CPU ซึ่งช้ากว่าการเทรนบน GPU มาก และรองรับเฉพาะโมเดลข้อความ (LoRA หรือ full finetuning)",
     wizard: {
       modelTitle: "โมเดล",
       modelDescription: "เลือกโมเดลและวิธีการเทรน",

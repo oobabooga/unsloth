@@ -8,10 +8,13 @@ export const tr = {
   chatBackground: {
     noBackground: "Arka plan yok",
     sizing: "Görüntü boyutlandırma",
+    sizingPosition: "Görüntü boyutu ve konumu",
     fill: "Doldur",
     fit: "Sığdır",
     stretch: "Uzat",
     original: "Özgün boyut",
+    fitWidth: "Genişliğe sığdır",
+    fitHeight: "Yüksekliğe sığdır",
     zoom: "Yakınlaştırma",
     outline: "Mesaj kutusu kenarlığı",
     fade: "Arka plana doğru soldur",
@@ -30,6 +33,8 @@ export const tr = {
     visibility: "Görünürlük",
     blur: "Görüntü bulanıklığı",
     position: "Konum",
+    horizontal: "Yatay konum",
+    vertical: "Dikey konum",
     positionValue: "Yatay %{x}, dikey %{y}",
     newChat: "Yeni sohbet",
     conversation: "Sohbet",
@@ -2341,10 +2346,14 @@ export const tr = {
         label: "Kurulum türü",
         description:
           "Yalnızca sohbet (GGUF). Tam kurulum; eğitim, dışa aktarma, video, safetensors modelleri ve ek görüntü üretme özellikleri ekler.",
+        descriptionCpu:
+          "Yalnızca sohbet (GGUF). Desteklenen bir GPU bulunamadı, bu nedenle tam kurulum CPU üzerinde eğitim ekler.",
         action: "Tam kuruluma yükselt",
         confirmTitle: "Tam kuruluma yükseltilsin mi?",
         confirmDescription:
           "Bu Yalnızca sohbet kurulumu GGUF modellerini çalıştırır. Tam kurulum, bu makinenin GPU'su için PyTorch ekler; bu da eğitimi, dışa aktarmayı, videoyu, safetensors modellerini ve ek görüntü üretme özelliklerini etkinleştirir. Birkaç gigabayt indirir (en az 5 GB disk alanı) ve sunucuyu yeniden başlatır. Sohbetler, modeller ve ayarlar korunur. Bu işlem birkaç dakika sürebilir.",
+        confirmDescriptionCpu:
+          "Bu Yalnızca sohbet kurulumu GGUF modellerini çalıştırır. Bu makinede desteklenen bir GPU bulunamadı, bu nedenle tam kurulum CPU için PyTorch ekler; bu da CPU üzerinde eğitimi etkinleştirir. CPU üzerinde eğitim, GPU'ya göre çok daha yavaştır. En az 5 GB disk alanı gerektirir ve sunucuyu yeniden başlatır. Sohbetler, modeller ve ayarlar korunur. Bu işlem birkaç dakika sürebilir.",
         confirmAction: "Yükselt",
         keywords:
           "tam kurulum yükselt kurulum türü yalnızca sohbet gguf eğitim eğit ince ayar pytorch torch dışa aktar video görüntü üretme safetensors full install upgrade chat only training fine-tune export image generation",
@@ -3881,6 +3890,8 @@ export const tr = {
   },
   studio: {
     routeTitle: "Eğitim",
+    cpuTrainingNotice:
+      "GPU bulunamadı, bu nedenle eğitim CPU üzerinde çalışır. GPU eğitiminden çok daha yavaştır ve yalnızca metin modellerini destekler (LoRA veya tam ince ayar).",
     wizard: {
       modelTitle: "Model",
       modelDescription: "Model ve eğitim yöntemini seçin",

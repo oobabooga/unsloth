@@ -8,10 +8,13 @@ export const nl = {
   chatBackground: {
     noBackground: "Geen achtergrond",
     sizing: "Afbeeldingsgrootte",
+    sizingPosition: "Afbeeldingsgrootte en positie",
     fill: "Vullen",
     fit: "Passend maken",
     stretch: "Uitrekken",
     original: "Oorspronkelijke grootte",
+    fitWidth: "Passend in breedte",
+    fitHeight: "Passend in hoogte",
     zoom: "Zoom",
     outline: "Rand om berichtveld",
     fade: "Vervagen naar achtergrond",
@@ -30,6 +33,8 @@ export const nl = {
     visibility: "Zichtbaarheid",
     blur: "Afbeelding vervagen",
     position: "Positie",
+    horizontal: "Horizontale positie",
+    vertical: "Verticale positie",
     positionValue: "Horizontaal {x}%, verticaal {y}%",
     newChat: "Nieuwe chat",
     conversation: "Gesprek",
@@ -2386,10 +2391,14 @@ export const nl = {
         label: "Installatietype",
         description:
           "Alleen chat (GGUF). De volledige installatie voegt training, export, video, safetensors-modellen en extra functies voor het genereren van afbeeldingen toe.",
+        descriptionCpu:
+          "Alleen chat (GGUF). Er is geen ondersteunde GPU gevonden, dus de volledige installatie voegt training op de CPU toe.",
         action: "Upgraden naar volledige installatie",
         confirmTitle: "Upgraden naar de volledige installatie?",
         confirmDescription:
           "Deze installatie voor Alleen chat draait GGUF-modellen. De volledige installatie voegt PyTorch toe voor de GPU van deze machine, waarmee training, export, video, safetensors-modellen en extra functies voor het genereren van afbeeldingen beschikbaar worden. Er worden enkele gigabytes gedownload (minimaal 5 GB schijfruimte) en de server wordt opnieuw gestart. Chats, modellen en instellingen blijven behouden. Dit kan enkele minuten duren.",
+        confirmDescriptionCpu:
+          "Deze installatie voor Alleen chat draait GGUF-modellen. Er is op deze machine geen ondersteunde GPU gevonden, dus de volledige installatie voegt PyTorch voor de CPU toe, waarmee training op de CPU beschikbaar wordt. Training op de CPU is veel trager dan op een GPU. Er is minimaal 5 GB schijfruimte nodig en de server wordt opnieuw gestart. Chats, modellen en instellingen blijven behouden. Dit kan enkele minuten duren.",
         confirmAction: "Upgraden",
         keywords:
           "volledige installatie upgraden installeren installatietype alleen chat gguf training trainen finetunen fine-tune pytorch torch export exporteren video afbeeldingen genereren safetensors",
@@ -3931,6 +3940,8 @@ export const nl = {
   },
   studio: {
     routeTitle: "Trainen",
+    cpuTrainingNotice:
+      "Er is geen GPU gevonden, dus training draait op de CPU. Dit is veel trager dan training op een GPU en ondersteunt alleen tekstmodellen (LoRA of volledige finetuning).",
     wizard: {
       modelTitle: "Model",
       modelDescription: "Selecteer model en trainingsmethode",

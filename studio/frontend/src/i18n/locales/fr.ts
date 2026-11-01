@@ -8,10 +8,13 @@ export const fr = {
   chatBackground: {
     noBackground: "Aucun arrière-plan",
     sizing: "Dimensionnement de l’image",
+    sizingPosition: "Dimensionnement et position de l’image",
     fill: "Remplir",
     fit: "Ajuster",
     stretch: "Étirer",
     original: "Taille d’origine",
+    fitWidth: "Ajuster à la largeur",
+    fitHeight: "Ajuster à la hauteur",
     zoom: "Zoom",
     outline: "Contour du champ de message",
     fade: "Fondu vers l’arrière-plan",
@@ -30,6 +33,8 @@ export const fr = {
     visibility: "Visibilité",
     blur: "Flou de l’image",
     position: "Position",
+    horizontal: "Position horizontale",
+    vertical: "Position verticale",
     positionValue: "Horizontal {x} %, vertical {y} %",
     newChat: "Nouveau chat",
     conversation: "Conversation",
@@ -2165,10 +2170,14 @@ export const fr = {
         label: "Type d'installation",
         description:
           "Chat uniquement (GGUF). L'installation complète ajoute l'entraînement, l'export, la vidéo, les modèles safetensors et des fonctionnalités supplémentaires de génération d'images.",
+        descriptionCpu:
+          "Chat uniquement (GGUF). Aucun GPU compatible n'a été trouvé, l'installation complète ajoute donc l'entraînement sur le CPU.",
         action: "Passer à l'installation complète",
         confirmTitle: "Passer à l'installation complète ?",
         confirmDescription:
           "Cette installation Chat uniquement exécute des modèles GGUF. L'installation complète ajoute PyTorch pour le GPU de cette machine, ce qui active l'entraînement, l'export, la vidéo, les modèles safetensors et des fonctionnalités supplémentaires de génération d'images. Elle télécharge plusieurs gigaoctets (au moins 5 Go d'espace disque) et redémarre le serveur. Les discussions, les modèles et les paramètres sont conservés. Cela peut prendre plusieurs minutes.",
+        confirmDescriptionCpu:
+          "Cette installation Chat uniquement exécute des modèles GGUF. Aucun GPU compatible n'a été trouvé sur cette machine, l'installation complète ajoute donc PyTorch pour le CPU, ce qui active l'entraînement sur le CPU. L'entraînement sur CPU est beaucoup plus lent que sur GPU. Elle nécessite au moins 5 Go d'espace disque et redémarre le serveur. Les discussions, les modèles et les paramètres sont conservés. Cela peut prendre plusieurs minutes.",
         confirmAction: "Mettre à niveau",
         keywords:
           "full install upgrade type d'installation installation complète mise à niveau chat uniquement chat only gguf add training entraînement entraîner train fine-tune pytorch torch export vidéo génération d'images safetensors",
@@ -3638,6 +3647,8 @@ export const fr = {
     imageTraining: "Entraînement d'image",
     goToImageTraining: "Entraîner des LoRA d'image",
     routeTitle: "Entraîner",
+    cpuTrainingNotice:
+      "Aucun GPU n'a été trouvé, l'entraînement s'exécute donc sur le CPU. Il est beaucoup plus lent que sur GPU et ne prend en charge que les modèles de texte (LoRA ou finetuning complet).",
     wizard: {
       modelTitle: "Modèle",
       modelDescription: "Sélectionner le modèle et la méthode d'entraînement",
