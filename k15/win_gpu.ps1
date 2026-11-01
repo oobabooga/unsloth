@@ -110,6 +110,7 @@ foreach ($n in $TREE_NAMES) {
   $tree = (git -C $S write-tree).Trim()
   Log "$n tree $tree expect $exp ($($want.Substring(0, 11)))"
   if ($tree -ne $exp) { Write-Host "FATAL: the applied $n tree is not $want"; exit 1 }
+  if ($env:TBO_ERRLOG) { & $PY "$J\tbo_errlog_patch.py" $S; if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: tbo_errlog_patch ($n)"; exit 1 }; Log "$n tbo_errlog_patch applied" }
   $hm = (Select-String -Path "$S\ggml\src\ggml-cuda\vendors\hip.h" -Pattern "^#define cudaErrorInvalidValue hipErrorInvalidValue").Count
   Log "$n hip.h cudaErrorInvalidValue mapping lines: $hm"
   if (-not (Build-Tree $S $n ($n -eq "k15"))) { Write-Host "FATAL: $n build"; exit 1 }

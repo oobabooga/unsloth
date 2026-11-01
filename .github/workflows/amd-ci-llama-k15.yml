@@ -1,4 +1,4 @@
-name: "AMD CI k15c (correctness, shared GPU): llama.cpp k15 01b29f323fc (+ ig 744545a4054) vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5, replay fallback, draft guard, k19-igpu items)"
+name: "AMD CI k15c (correctness, shared GPU; q41: q4_1 ERR distributions k15 vs k10): llama.cpp k15 01b29f323fc (+ ig 744545a4054) vs k10 a162dce854 on gfx1151 Linux + Windows (HIP build, test-backend-ops, graph src types, eager md5, replay fallback, draft guard, k19-igpu items)"
 
 # k15c: the correctness half of amd-ci-llama-k15 (which keeps the timing). No job joins amd-ci-gfx1151-gpu, so the card may have a co-tenant:
 # no timing / memory number from this run is evidence. Linux: HIP build + targeted and FULL test-backend-ops + test-graph-src-type + the eager
@@ -56,6 +56,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h / | tail -1
       - name: Build
+        env:
+          TBO_ERRLOG: "1"   # q41 ticket: test-only ERR log / seed patch of test-backend-ops (k15/tbo_errlog_patch.py)
         run: |
           bash k15/hosted_linux_build.sh ${{ matrix.n }}
       - uses: actions/upload-artifact@v4
@@ -129,8 +131,8 @@ jobs:
     needs: [hosted-build, cpu-linux]
     if: ${{ always() }}
     env:
-      K15_STEPS: ops,gst,mmid,eager,replay,dguard,igpu,tbofull,stock
-      K15_DL_MODELS: q35,q3m
+      K15_STEPS: q41
+      K15_DL_MODELS: q35
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     steps:
@@ -192,8 +194,9 @@ jobs:
     name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + test-backend-ops, shared GPU)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K15_STEPS: ops,gst,mmid,replay,dguard,igpu,tbofull
-      K15_DL_MODELS: q35,q3m
+      K15_STEPS: q41
+      K15_DL_MODELS: q35
+      TBO_ERRLOG: "1"
     timeout-minutes: 360
     defaults:
       run:
@@ -253,7 +256,7 @@ jobs:
         env:
           # items this correctness ticket does not run (timing / gdn / race / mailbox / relsplit / b3 / PLE / bench stay with amd-ci-llama-k15):
           # reported as skipped when they have no rows. Item 10, r2 replay commit fallback, 3 eager fallback (Linux, q35 + q3m) and the igpu items run here and are never skipped
-          K15_SKIP_ITEMS: "^(linux|windows):(4 |5 |6 |7 |8 |11 |r2 (?!replay)|r4 |r5 )|^windows:3 eager"
+          K15_SKIP_ITEMS: ".*"
         run: |
           set +e
           python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"

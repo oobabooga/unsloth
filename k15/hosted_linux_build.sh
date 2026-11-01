@@ -31,6 +31,8 @@ done
 TREE=$(git -C "$S" write-tree); EXP=$(grep "^$WANT " "$J/TREES" | cut -d' ' -f2)
 echo "tree $N $TREE expect $EXP (${WANT:0:11})" | tee "$I/SRC_CHECK_$N"
 [ -n "$EXP" ] && [ "$TREE" = "$EXP" ] || { echo "FATAL: the applied tree is not ${WANT:0:11}"; exit 1; }
+# q41 ticket: the test-only ERR log / seed patch of test-backend-ops (after the tree check; TBO_ERRLOG unset = stock)
+if [ -n "${TBO_ERRLOG:-}" ]; then python3 "$J/tbo_errlog_patch.py" "$S" | tee -a "$I/SRC_CHECK_$N" || exit 1; fi
 # 1. the eager-fallback error mapping in the HIP vendor header (be6d2579151): present on k15, absent on the base trees
 c=$(grep -c "^#define cudaErrorInvalidValue hipErrorInvalidValue" "$S/ggml/src/ggml-cuda/vendors/hip.h"); echo "hip.h cudaErrorInvalidValue mapping lines: $c" | tee -a "$I/SRC_CHECK_$N"
 git -C "$S" diff --cached --shortstat "$BASE" | tee -a "$I/SRC_CHECK_$N"

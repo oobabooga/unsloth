@@ -220,6 +220,17 @@ if "bench" in STEPS:
     step("bench_q3m", "time", "--cell", "q3m:spill8192", "--reps", "3", arms="k10,k10b,k15,k15b", extra=MTP, timeout=7200)
     step("bench_q35", "time", "--cell", "q35:full", "--reps", "3", arms="k10,k10b,k15,k15b", timeout=3600)
 # 2 + 6. full test-backend-ops, k15 / k10, then k15 with the 4096-byte pad; stock only when a fork bin fails something (attribution)
+# q41 (coordinator 11-01, Windows q4_1 borderline in r7 / r8): MUL_MAT / MUL_MAT_ID q4_1 cases, k15 and k10 interleaved (the order flips
+# every rep), 20 reps each, env pads 0 / 37 / 4096 in turn; GGML_TBO_LOG_ERR=1 (every compared output's ERR, tbo_errlog_patch.py) and
+# GGML_TBO_SEED=rep for reps 1-4 (identical inputs for k15 and k10 per case); the ERR distributions are read from the logs
+Q41_REPS = int(os.environ.get("K15_Q41_REPS", "20"))
+for _r in range(1, Q41_REPS + 1):
+    for _b in ("k15", "k10"):
+        ARMS.append("q41_%s_r%02d:%s:GGML_TBO_LOG_ERR=1;K6P_PAD=%d%s" % (_b, _r, _b, (0, 37, 4096)[_r % 3], ";GGML_TBO_SEED=%d" % _r if _r <= 4 else ""))
+if "q41" in STEPS:
+    for _r in range(1, Q41_REPS + 1):
+        for _b in (("k15", "k10") if _r % 2 else ("k10", "k15")):
+            step("q41_%s_r%02d" % (_b, _r), "tbo", "--bin", "q41_%s_r%02d" % (_b, _r), "--ops", "MUL_MAT@type_a=q4_1;MUL_MAT_ID@type_a=q4_1", "--timeout", "1800", timeout=1900)
 if "tbofull" in STEPS:
     for b in ("k15", "k10"):
         step("tbofull_" + b, "tbo", "--bin", b, "--ops", "ALL", "--timeout", "7200", timeout=7500)
