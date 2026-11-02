@@ -20,6 +20,7 @@ def main():
         sys.path.insert(0, str(Path(args.checkout) / "studio/backend"))
         import torch
         from core.inference import diffusion_memory as memory
+        from utils.hardware import trusted_mem_get_info
 
         result.update(
             torch = torch.__version__,
@@ -27,6 +28,7 @@ def main():
             gpu = torch.cuda.get_device_name(),
         )
         target = SimpleNamespace(device = "cuda", backend = "rocm")
+        result["trusted_info"] = list(trusted_mem_get_info())
         first = memory.settled_snapshot_device_memory(target, delay_s = 0)
         result["snapshot"] = dataclasses.asdict(first)
         before = torch.cuda.memory_allocated()
