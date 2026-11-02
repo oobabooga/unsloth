@@ -54,7 +54,7 @@ def main():
         try:
             proc = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=environment)
             text = proc.stdout + proc.stderr
-            record = {"rc": proc.returncode, "path": path, "path_length": len(path), "file_exists_python": Path(path).is_file(), "open_failed": "failed to open GGUF file" in text, "metadata_seen": "general.architecture" in text, "command": command}
+            record = {"rc": proc.returncode, "path": path, "path_length": len(path), "file_exists_python": Path(path).is_file(), "open_failed": "failed to open GGUF file" in text, "header_read": "key not found in model: llama.context_length" in text, "command": command}
         except subprocess.TimeoutExpired as exc:
             text = str(exc)
             record = {"timeout": True, "path_length": len(path)}
@@ -66,7 +66,7 @@ def main():
     gaps = untested_section(detect(require_torch=False), ["windows", "nvidia", "multi_gpu"])
     (output / "capability_gaps.md").write_text(gaps, encoding="utf-8")
     print(gaps, flush=True)
-    return int(any(r.get("timeout") for r in observations.values()) or not observations["short"].get("metadata_seen"))
+    return int(any(r.get("timeout") for r in observations.values()) or not observations["short"].get("header_read"))
 
 
 if __name__ == "__main__":
