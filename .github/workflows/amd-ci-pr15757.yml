@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 15757"
 
 on:
   push:
-    branches: [amd-ci-pr15757]
+    branches: [amd-ci-pr15757-windows]
   workflow_dispatch:
 
 permissions:
@@ -141,7 +141,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/python/test_load_probe_memo.py
+            --python "$env:AMD_CI_PY" -- --subdir . --tests tests/python/test_load_probe_memo.py tests/python/test_revision_forwarding.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
