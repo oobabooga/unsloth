@@ -147,6 +147,11 @@ import {
 } from "@/features/chat";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import {
+  BookmarkTurnButton,
+  BookmarkTurnMenuItem,
+  TurnNavigator,
+} from "@/components/assistant-ui/turn-navigation";
+import {
   IntentAwareScrollProvider,
   useDetachThreadFromBottom,
   useIntentAwareAutoScroll,
@@ -356,6 +361,7 @@ import {
   showForkFailedToast,
   type PlusMenuItemId,
   usePlusMenuPrefsStore,
+  useBookmarkedTurnsStore,
   writeComposerDraft,
   normalizeChatImage,
 } from "@/features/chat";
@@ -2312,6 +2318,8 @@ export const Thread: FC<{
               <ThreadWelcome hideComposer={hideComposer} threadId={threadId} />
             </AuiIf>
           )}
+
+          <TurnNavigator viewportRef={viewportElRef} />
 
           {/* Drop-in for ThreadPrimitive.Messages that bounds a long thread's first commit to
           the tail and mounts the rest over the following frames. Nothing unmounts and the
@@ -7695,24 +7703,25 @@ const GeneratingStatus: FC = () => {
   );
   const showDetails = useChatPreferencesStore((s) => s.showGenerationDetails);
   const locale = useLocale();
+  const t = useT();
   const percent = prefill ? prefillPercent(prefill) : null;
   // Held at 100% until the first token: going back to Working... for that moment would flash too.
   if (prefill === null || !labelShown || percent === null || decoding) {
     return (
       <span className="generating-glint text-sm text-muted-foreground">
-        Working...
+        {t("generationStats.working")}
       </span>
     );
   }
-  const timeLeft = formatPrefillTimeLeft(prefill);
+  const timeLeft = formatPrefillTimeLeft(prefill, t);
   return (
     <span
       data-slot="prefill-progress"
       className="generating-glint text-sm text-muted-foreground tabular-nums whitespace-normal!"
     >
-      Processing prompt {percent}%
+      {t("generationStats.processingPrompt", { percent })}
       {timeLeft ? ` · ${timeLeft}` : null}
-      {showDetails ? ` · ${formatPrefillDetails(prefill, locale)}` : null}
+      {showDetails ? ` · ${formatPrefillDetails(prefill, t, locale)}` : null}
     </span>
   );
 };
@@ -8520,6 +8529,9 @@ function useDeleteMessage() {
         messageId,
         remoteId,
       });
+      if (remoteId) {
+        useBookmarkedTurnsStore.getState().forgetTurns(remoteId, [messageId]);
+      }
     } catch (error) {
       console.error("Failed to delete message", error);
       toast.error("Failed to delete message");
@@ -8863,6 +8875,7 @@ const AssistantActionBar: FC = () => {
                   Save to project sources
                 </ActionBarMorePrimitive.Item>
               )}
+              <BookmarkTurnMenuItem className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground" />
             </div>
           </ActionBarMorePrimitive.Content>
         </ActionBarMorePrimitive.Root>
@@ -8995,6 +9008,7 @@ const UserActionBar: FC = () => {
           </TooltipIconButton>
         </ActionBarPrimitive.Edit>
       )}
+      <BookmarkTurnButton />
       <RewindMessageButton />
       <ForkCountBadge />
       <ForkMessageButton />
