@@ -127,7 +127,7 @@ def native(exe, model, mode, output):
 
 
 def backend_recovery(checkout, exe, model, output):
-    os.environ["UNSLOTH_STUDIO_HOME"] = str(output / "home")
+    os.environ["UNSLOTH_STUDIO_HOME"] = str(output.parent.parent.parent / "runtime" / output.name)
     sys.path.insert(0, str(checkout / "studio/backend"))
     from core.inference import llama_cpp
     from core.inference.llama_cpp import GgufLoadIntent, LlamaCppBackend
@@ -139,7 +139,7 @@ def backend_recovery(checkout, exe, model, output):
     backend._get_gpu_free_memory = lambda *_args, **_kwargs: []
     backend._can_estimate_kv = lambda: False
     launches = []
-    injected = False
+    injected = 0
     original = subprocess.Popen
 
     def popen(cmd, *args, **kwargs):
@@ -147,8 +147,10 @@ def backend_recovery(checkout, exe, model, output):
         if isinstance(cmd, (list, tuple)) and Path(str(cmd[0])) == exe and "-m" in cmd:
             launches.append(list(cmd))
             fit_modes = [cmd[i + 1] for i, flag in enumerate(cmd[:-1]) if flag in ("--fit", "-fit")]
-            if len(launches) == 1 and (not fit_modes or fit_modes[-1] == "on"):
-                injected = True
+            cpu_only = any(cmd[i + 1] == "none" for i, flag in enumerate(cmd[:-1])
+                           if flag in ("--device", "-dev"))
+            if not cpu_only and (not fit_modes or fit_modes[-1] == "on"):
+                injected += 1
                 crash = ("import ctypes; print('common_params_fit_impl: getting device memory data "
                          "for initial parameters:', flush=True); ctypes.windll.kernel32.ExitProcess(0xC0000005)")
                 return original([sys.executable, "-c", crash], *args, **kwargs)
@@ -185,7 +187,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     result = {"platform": sys.platform, "native_driver_fault_reproduced": False}
     try:
-        cache = args.out.parent.parent / "vulkan-fixture"
+        cache = args.out.parent.parent.parent / "vulkan-fixture"
         cache.mkdir(exist_ok=True)
         marker = Path(sys.prefix) / "issue16395_real_deps"
         if not marker.exists():
@@ -205,7 +207,7 @@ def main():
         result["devices"] = devices.stdout + devices.stderr
         result["native"] = {mode: native(exe, model, mode, args.out.with_suffix(f".{mode}.log"))
                             for mode in ("on", "off")}
-        result["backend"] = backend_recovery(args.checkout, exe, model, args.out.parent)
+        result["backend"] = backend_recovery(args.checkout, exe, model, args.out.with_suffix(""))
     except Exception:
         result["error"] = traceback.format_exc()
     args.out.write_text(json.dumps(result, indent=2), encoding="utf-8")

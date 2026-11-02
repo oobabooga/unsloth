@@ -16,10 +16,12 @@ def gpu_decode(value):
 def recovered(value):
     data = value.get("backend") or {}
     launches = data.get("launches") or []
+    fit_modes = [cmd[i + 1] for cmd in launches[1:] for i, flag in enumerate(cmd[:-1])
+                 if flag in ("--fit", "-fit")]
     return bool(data.get("loaded") and not data.get("cpu_fallback_reason")
                 and data.get("fault_injected")
                 and (data.get("completion") or {}).get("tokens_predicted") == 8
-                and len(launches) >= 2 and "off" in launches[1])
+                and "off" in fit_modes)
 
 
 def gates(observations):
@@ -55,5 +57,5 @@ def table(observations):
             native = value.get("native") or {}
             lines.append(f"| {name} | {bool(gpu_decode(native.get('on') or {}))} | "
                          f"{bool(gpu_decode(native.get('off') or {}))} | {recovered(value)} |")
-    lines.append("\nThe first child failure is injected. Native RX 5700 XT driver failure is not reproduced by this check.")
+    lines.append("\nFit-on GPU child failures are injected. Native RX 5700 XT driver failure is not reproduced by this check.")
     return "\n".join(lines)
