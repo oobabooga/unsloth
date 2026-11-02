@@ -39,6 +39,7 @@ permissions:
 env:
   PR: "15757"
   UPSTREAM: "https://github.com/unslothai/unsloth"
+  NEEDS: "windows"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "0"
 
@@ -126,6 +127,8 @@ jobs:
           $py = "$env:AMD_CI_WORK\venv\Scripts\python.exe"
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install -q "$env:AMD_CI_WORK\states\head[huggingface]" bitsandbytes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
