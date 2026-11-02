@@ -13,7 +13,7 @@ from __future__ import annotations
 
 TITLE = "Backend suites, base versus head"
 MODE = "regression"
-NEEDS: list[str] = []
+NEEDS: list[str] = ["windows"]
 
 
 # pytest exit codes: 0 ok, 1 tests failed, 2 interrupted, 3 internal error,
