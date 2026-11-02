@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 15421"
 
 on:
   push:
-    branches: [amd-ci-pr15421]
+    branches: [amd-ci-issue15412-path-probe]
   workflow_dispatch:
 
 permissions:
