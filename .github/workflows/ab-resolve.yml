@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-name: "A/B resolve (ab-pincheck-d)"
+name: "A/B resolve (ab-pincheck-e)"
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
 # release per upstream b#### tag. Splits the heavy build work into seven reusable
@@ -29,7 +29,7 @@ name: "A/B resolve (ab-pincheck-d)"
 
 on:
   push:
-    branches: [ab-pincheck-d]
+    branches: [ab-pincheck-e]
 
 permissions:
   contents: write
