@@ -1,8 +1,41 @@
+diff --git a/studio/backend/core/inference/diffusion_device.py b/studio/backend/core/inference/diffusion_device.py
+index 127b041a0e..f95deda96c 100644
+--- a/studio/backend/core/inference/diffusion_device.py
++++ b/studio/backend/core/inference/diffusion_device.py
+@@ -524,6 +524,28 @@ def smi_free_total_mib(ordinal: int) -> tuple[Optional[int], Optional[int]]:
+     return None, None
+ 
+ 
++def smi_util_pct(ordinal: int) -> Optional[float]:
++    """nvidia-smi utilization.gpu (percent) of torch ordinal ``ordinal``, without a CUDA context; None wherever
++    :func:`smi_free_total_mib` would not trust the rows. Never raises."""
++    try:
++        from utils.hardware import hardware as hw
++
++        if hw.IS_ROCM or hw._cuda_instance_ids_active() or not hw._cuda_order_matches_smi():
++            return None
++        visible = hw.get_parent_visible_gpu_ids()
++        if not 0 <= int(ordinal) < len(visible):
++            return None
++        index = visible[int(ordinal)]
++        result = hw._smi_visible_utilization(hw._get_parent_visible_gpu_spec())
++        for device in (result or {}).get("devices", []):
++            if device.get("index") == index:
++                util = device.get("gpu_utilization_pct")
++                return None if util is None else float(util)
++    except Exception:  # noqa: BLE001 -- unknown utilisation: the memory test alone decides
++        pass
++    return None
++
++
+ def auto_cuda_ranking_possible_cached() -> Optional[bool]:
+     """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
+ 
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..3c587e2453 100644
+index 4ab7e593fd..dcbc2896be 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
-@@ -52,6 +52,24 @@ def multigpu_mode() -> str:
+@@ -52,6 +52,82 @@ def multigpu_mode() -> str:
      return "auto"
  
  
@@ -17,17 +50,75 @@ index 4ab7e593fd..3c587e2453 100644
 +    return (os.environ.get(AUTO_CFG_PARALLEL_ENV) or "").strip().lower() in ("0", "off", "false", "no")
 +
 +
++# ... and computes at most this much (nvidia-smi utilization.gpu, percent): a card running another job is not lent.
++AUTO_CFG_PARALLEL_IDLE_UTIL_PCT = 5.0
++
++
 +def _idle_card(probe: Any) -> bool:
 +    free, total = getattr(probe, "free_mib", None), getattr(probe, "total_mib", None)
 +    if free is None or total is None:
 +        return False
++    util = getattr(probe, "util_pct", None)
++    if util is not None and float(util) > AUTO_CFG_PARALLEL_IDLE_UTIL_PCT:
++        return False
 +    return int(total) - int(free) <= AUTO_CFG_PARALLEL_IDLE_USED_MIB
++
++
++def automatic_partner(
++    primary: Any,
++    cards: Sequence[Any],
++    need_mib: int,
++    *,
++    p2p: Optional[dict[int, bool]] = None,
++) -> tuple[Optional[int], str]:
++    """The card Automatic lends a load's replica to, from ``cards`` (DeviceProbe-like: ordinal, name, total_mib,
++    free_mib, util_pct), or None and the reason. Pure: no device is touched.
++
++    One partner per load, on any number of cards: CFG-parallel and the batch split each need exactly one second
++    copy, and a third copy would have no second call to run (a step has at most two guidance branches, and a batch is
++    cut in two). The cards left over stay free for another load (keep multiple models loaded) or another app.
++
++    A card is a candidate only when it is (in this order of rejection):
++      - not the primary;
++      - the same card model as the primary (same kernels, so the branches agree and neither card waits on a slower
++        one; a mixed pair such as a 4090 with a 3060 is never paired automatically, ``force`` overrides);
++      - idle: at most ``AUTO_CFG_PARALLEL_IDLE_USED_MIB`` in use and at most ``AUTO_CFG_PARALLEL_IDLE_UTIL_PCT``
++        utilisation (another process's work is never slowed and its memory never taken);
++      - able to hold the replica plus its reserve.
++    Among candidates: the most usable free memory, then a peer-to-peer link to the primary, then the lowest ordinal.
++    A static rule, not a trial: on identical idle cards the measured gains are 1.46x to 1.79x (well beyond A/A)."""
++    p2p = p2p or {}
++    pidx = getattr(primary, "ordinal", None)
++    pname = getattr(primary, "name", None)
++    rejected: dict[str, list[int]] = {}
++    fits: list[tuple[int, int, int]] = []
++    for card in cards:
++        o = int(card.ordinal)
++        if o == pidx:
++            continue
++        if not pname or card.name != pname:
++            rejected.setdefault("a different card model", []).append(o)
++            continue
++        if not _idle_card(card):
++            rejected.setdefault("busy", []).append(o)
++            continue
++        free = int(card.free_mib)
++        usable = free - _replica_reserve_mib(free, card.total_mib)
++        if usable < int(need_mib):
++            rejected.setdefault(f"short of the {int(need_mib)} MiB replica", []).append(o)
++            continue
++        fits.append((usable, 1 if p2p.get(o) else 0, -o))
++    if fits:
++        return -max(fits)[2], "idle card of the same model"
++    if not rejected:
++        return None, "no other card"
++    return None, "; ".join(f"cuda:{','.join(map(str, v))} {k}" for k, v in rejected.items())
 +
 +
  def cfg_parallel_mode() -> str:
      """``off`` / ``auto`` (default) / ``force`` (also across different card models)."""
      if multigpu_mode() == "off":
-@@ -195,8 +213,8 @@ def selection_scope(
+@@ -195,8 +271,8 @@ def selection_scope(
      if selection is None:
          yield None
          return
@@ -38,7 +129,42 @@ index 4ab7e593fd..3c587e2453 100644
          install_compile_recorder()
      token = _SELECTION.set(selection)
      try:
-@@ -1034,6 +1052,29 @@ def _module_device(module: Any) -> Any:
+@@ -238,6 +314,7 @@ class DeviceProbe:
+     name: str
+     total_mib: Optional[int]
+     free_mib: Optional[int]
++    util_pct: Optional[float] = None
+ 
+ 
+ _PROBE_LOCK = threading.Lock()
+@@ -276,10 +353,25 @@ def probe_devices(ordinals: Sequence[int]) -> dict[int, DeviceProbe]:
+     out: dict[int, DeviceProbe] = {}
+     for o in ords:
+         free, total = _free_total_mib(o)
+-        out[o] = DeviceProbe(ordinal = o, name = _NAMES.get(o, ""), total_mib = total, free_mib = free)
++        out[o] = DeviceProbe(
++            ordinal = o, name = _NAMES.get(o, ""), total_mib = total, free_mib = free, util_pct = _util_pct(o)
++        )
+     return out
+ 
+ 
++def _util_pct(ordinal: int) -> Optional[float]:
++    """nvidia-smi utilisation of a card an automatic load may borrow; None elsewhere (unknown counts as idle)."""
++    selection = _SELECTION.get()
++    if selection is None or not selection.automatic or int(ordinal) == selection.primary:
++        return None
++    try:
++        from .diffusion_device import smi_util_pct
++
++        return smi_util_pct(int(ordinal))
++    except Exception:  # noqa: BLE001
++        return None
++
++
+ def best_secondary(
+     selection: MultiGpuSelection,
+     probes: Optional[dict[int, DeviceProbe]] = None,
+@@ -1034,6 +1126,29 @@ def _module_device(module: Any) -> Any:
      return None
  
  
@@ -68,7 +194,85 @@ index 4ab7e593fd..3c587e2453 100644
  def _device_context(device: Any):
      torch = _torch()
      if getattr(device, "type", None) == "cuda" and device.index is not None:
-@@ -2859,6 +2900,11 @@ class CfgParallelRouter:
+@@ -2425,7 +2540,10 @@ class CfgParallelRouter:
+             "kv_cache_declined": 0,
+             "kv_prefill_primary_calls": 0,
+             "replica_failures": 0,
++            "batch_splits": 0,
+         }
++        # the last render ran one call per step (no guidance branches): a batch can split from its first step
++        self.last_render_single = False
+         # source prefix-KV cache id -> (source cache, the tensors it held when copied, the replica's copy)
+         self.kv_mirrors: dict[int, tuple[Any, list, Any]] = {}
+         self.kv_declined: dict[int, tuple[Any, list]] = {}
+@@ -2495,6 +2613,7 @@ class CfgParallelRouter:
+         self.prev_latent = None
+         self.template = None
+         self.b0_leaves = {}
++        self.last_render_single = self.singles >= 1 and not self.cfg_seen
+         self.branch = 0
+         # the next render shows its own guidance shape: no speculative branch before its first odd call
+         self.cfg_seen = False
+@@ -2564,6 +2683,15 @@ class CfgParallelRouter:
+                 self._prefetch(args, kwargs)
+                 sig = _call_signature(args, kwargs)
+                 self._launch_prediction(latent, sig)
++        if (
++            self.branch == 0
++            and not self.cfg_seen
++            and (self.singles >= 1 or self.last_render_single)
++            and self.disabled_reason is None
++        ):
++            out = self._batch_split(latent, args, kwargs)
++            if out is not None:
++                return out
+         prefill = self.branch % 2 == 1 and _is_prefill(kwargs)
+         if (
+             self.branch % 2 == 1
+@@ -2616,6 +2744,42 @@ class CfgParallelRouter:
+         self.stats["primary_calls"] += 1
+         return self._primary_noting(sig, args, kwargs)
+ 
++    def _batch_split(self, latent: Any, args: tuple, kwargs: dict) -> Any:
++        """A step without guidance branches (a distilled model, or both branches batched into one call) whose batch is
++        even: the first half runs on the source, the second on the replica at the same time. Only for denoiser classes
++        whose every batched input is known (``_DIT_BATCH_SPLIT_KWARGS``); anything else, an odd batch, or the kill
++        switch keeps the call whole. None = not split (the caller runs it whole)."""
++        torch = _torch()
++        module = self.module_ref()
++        allowed = _DIT_BATCH_SPLIT_KWARGS.get(type(module).__name__) if module is not None else None
++        if allowed is None or _batch_split_disabled() or torch.compiler.is_compiling():
++            return None
++        if getattr(module, "_compiled_call_impl", None) is not None:
++            return None
++        n = latent.shape[0] if isinstance(latent, torch.Tensor) and latent.dim() >= 1 else 0
++        if n < 2 or n % 2 or args:
++            return None
++        if any(k not in allowed and v is not None and v is not False for k, v in kwargs.items()):
++            return None
++        if kwargs.get("joint_attention_kwargs"):
++            return None
++        try:
++            (a0, k0), (a1, k1) = [(_split_batch(args, n, h), _split_batch(kwargs, n, h)) for h in (0, 1)]
++        except TypeError:
++            return None
++        res = self.run_pair(lambda: self._primary_noting(None, a0, k0), a1, k1)
++        # run_pair forgets the step: keep this one's latent so the next call is read as a new step
++        self.prev_latent = latent
++        self.branch = 0
++        if res is None:
++            return None
++        first, second = res
++        if second is None:
++            second = self._primary(*a1, **k1)
++        self.stats["primary_calls"] += 1
++        self.stats["batch_splits"] += 1
++        return _join_batch(first, second)
++
+     def run_pair(
+         self, primary_call: Callable[[], Any], args: tuple, kwargs: dict
+     ) -> Optional[tuple]:
+@@ -2859,6 +3023,11 @@ class CfgParallelRouter:
                  t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
              ) // (1 << 20)
              free, total = self._secondary_free_total_mib()
@@ -80,7 +284,7 @@ index 4ab7e593fd..3c587e2453 100644
              reserve = _replica_reserve_mib(free, total)
              if free is not None and need_mib + reserve > free:
                  raise RuntimeError(
-@@ -3013,10 +3059,127 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+@@ -3013,10 +3182,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
      return lambda: replica(*args, **kwargs)
  
  
@@ -179,6 +383,25 @@ index 4ab7e593fd..3c587e2453 100644
 +        return _join_batch(first, second)
 +
 +
++# DiT classes whose batch may be cut along dim 0 (every per-sample input is a dim-0 tensor; ids, when unbatched, keep
++# a leading size that is the token count, never the batch). Z-Image passes per-sample lists and has its own split.
++_DIT_BATCH_SPLIT_KWARGS = {
++    "FluxTransformer2DModel": frozenset(
++        {"hidden_states", "encoder_hidden_states", "pooled_projections", "timestep", "img_ids", "txt_ids", "guidance",
++         "joint_attention_kwargs", "return_dict"}
++    ),
++    "Flux2Transformer2DModel": frozenset(
++        {"hidden_states", "encoder_hidden_states", "timestep", "img_ids", "txt_ids", "guidance",
++         "joint_attention_kwargs", "return_dict"}
++    ),
++}
++BATCH_SPLIT_ENV = "UNSLOTH_DIFFUSION_BATCH_SPLIT"
++
++
++def _batch_split_disabled() -> bool:
++    return (os.environ.get(BATCH_SPLIT_ENV) or "").strip().lower() in ("0", "off", "false", "no")
++
++
  _CFG_ROUTERS: "weakref.WeakKeyDictionary[Any, CfgParallelRouter]" = weakref.WeakKeyDictionary()
  _CFG_DECLINES: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
  
@@ -208,7 +431,7 @@ index 4ab7e593fd..3c587e2453 100644
  def cfg_parallel_decline(
      pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
  ) -> Optional[str]:
-@@ -3030,17 +3193,20 @@ def cfg_parallel_decline(
+@@ -3030,17 +3335,20 @@ def cfg_parallel_decline(
      # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
      if is_layer_split(pipe):
          return "denoiser is split across cards (layer split)"
@@ -232,7 +455,7 @@ index 4ab7e593fd..3c587e2453 100644
          return "no DiT denoiser (a U-Net batches its guidance branches)"
      from .diffusion_layer_split import is_layer_split
  
-@@ -3057,7 +3223,8 @@ def cfg_parallel_decline(
+@@ -3057,7 +3365,8 @@ def cfg_parallel_decline(
          return "two-expert denoiser"
      if getattr(denoiser, "_compiled_call_impl", None) is not None:
          return "denoiser is compiled whole"
@@ -242,7 +465,17 @@ index 4ab7e593fd..3c587e2453 100644
          return "denoiser is not on a CUDA card"
      return None
  
-@@ -3089,8 +3256,8 @@ def install_cfg_parallel(
+@@ -3083,14 +3392,15 @@ def install_cfg_parallel(
+     offload_policy: str,
+     logger: Any = None,
+ ) -> Optional[str]:
+-    """Arm CFG-parallel on ``pipe.transformer`` when a secondary card can hold a replica. The replica is built on the
+-    first step that shows two branches, so a guidance-distilled model never pays for it. Returns the decline reason or
+-    None when armed."""
++    """Arm CFG-parallel on ``pipe.transformer`` (or a U-Net) when a secondary card can hold a replica. The replica is
++    built on the first step that shows two branches, or, for a FLUX.1 / FLUX.2 denoiser, the first step of a render
++    without branches whose batch is even (batch split): a distilled model rendering one image never pays for it.
++    Automatic placement lends one card per load (:func:`automatic_partner`). Returns the decline reason or None."""
      selection = current_selection()
      reason = cfg_parallel_decline(pipe, offload_policy = offload_policy, selection = selection)
      if reason is None:
@@ -253,30 +486,42 @@ index 4ab7e593fd..3c587e2453 100644
          probes = probe_devices((selection.primary, *selection.secondaries))
          same = [
              o
-@@ -3100,6 +3267,10 @@ def install_cfg_parallel(
+@@ -3100,6 +3410,21 @@ def install_cfg_parallel(
              and probes[o].name == probes[primary.index].name
          ]
          candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
 +        automatic = selection.automatic and cfg_parallel_mode() != "force"
++        auto_reason = None
 +        if automatic:
-+            # nothing else may live on a card Automatic borrows for a replica
++            # nothing else may live on a card Automatic borrows for a replica (busy: memory in use or computing)
++            need = sum(
++                t.numel() * t.element_size() for t in (*denoiser.parameters(), *denoiser.buffers())
++            ) // (1 << 20)
++            pick, auto_reason = automatic_partner(
++                probes.get(primary.index) or DeviceProbe(primary.index, "", None, None),
++                [probes[o] for o in selection.secondaries if probes.get(o) is not None and probes[o].free_mib is not None],
++                need,
++            )
 +            candidates = [o for o in candidates if _idle_card(probes.get(o))]
++            if pick is not None:
++                candidates = [pick]
          try:
              placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
          except TypeError:
-@@ -3109,6 +3280,11 @@ def install_cfg_parallel(
+@@ -3109,6 +3434,12 @@ def install_cfg_parallel(
              candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
          if not candidates and occupied:
              reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
 +        elif not candidates and automatic and same:
 +            reason = (
-+                f"automatic GPU placement: no idle card for a replica (more than "
-+                f"{AUTO_CFG_PARALLEL_IDLE_USED_MIB} MiB in use; select several cards or set {CFG_PARALLEL_ENV}=force)"
++                f"automatic GPU placement: no idle card for a replica ({auto_reason}; idle = at most "
++                f"{AUTO_CFG_PARALLEL_IDLE_USED_MIB} MiB in use and {AUTO_CFG_PARALLEL_IDLE_UTIL_PCT:g}% busy; "
++                f"select several cards or set {CFG_PARALLEL_ENV}=force)"
 +            )
          elif not candidates:
              reason = "secondary card is a different model (bit-identity needs the same kernels)"
          else:
-@@ -3133,10 +3309,14 @@ def install_cfg_parallel(
+@@ -3133,10 +3464,14 @@ def install_cfg_parallel(
                  graph = _resident_graph(denoiser)
                  if graph is not None:
                      del denoiser.__dict__["forward"]
@@ -292,22 +537,241 @@ index 4ab7e593fd..3c587e2453 100644
                  try:
                      _CFG_ROUTERS[pipe] = router
                  except TypeError:
-@@ -3147,8 +3327,9 @@ def install_cfg_parallel(
+@@ -3147,8 +3482,10 @@ def install_cfg_parallel(
                  denoiser._unsloth_cfg_router = router
                  if logger is not None:
                      logger.info(
 -                        "diffusion.multigpu: CFG-parallel armed (replica on cuda:%s when guidance runs two branches)",
-+                        "diffusion.multigpu: CFG-parallel armed (replica on cuda:%s when guidance runs two branches%s)",
++                        "diffusion.multigpu: CFG-parallel armed (replica on cuda:%s when guidance runs two branches or"
++                        " an even batch splits%s)",
                          best,
 +                        "; U-Net batch split" if router_cls is UnetCfgParallelRouter else "",
                      )
                  return None
      if selection is not None:
+diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
+new file mode 100644
+index 0000000000..193d780e69
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Automatic multi-GPU policy: which card a load borrows (pure decision table over 2-8 cards) and the batch split of
++distilled DiTs (FLUX.1 / FLUX.2) across the pair."""
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from core.inference import diffusion_multigpu as mg  # noqa: E402
++
++T4 = "Tesla T4"
++TOTAL = 15360
++
++
++def card(o, name = T4, used = 400, util = 0.0, total = TOTAL):
++    return mg.DeviceProbe(ordinal = o, name = name, total_mib = total, free_mib = total - used, util_pct = util)
++
++
++NEED = 6000
++
++
++@pytest.mark.parametrize(
++    "cards, expect, why",
++    [
++        # two identical idle cards: the other one
++        ([card(0), card(1)], 1, "idle card"),
++        # four cards: the idle one with the most free memory; the rest stay free for other loads
++        ([card(0), card(1, used = 900), card(2, used = 500), card(3, used = 700)], 2, "idle card"),
++        # busy by memory (another process holds 2 GiB) or by compute (util above 5%): skipped
++        ([card(0), card(1, used = 2048), card(2, util = 40.0), card(3)], 3, "idle card"),
++        # a different model (4090 + 3060 style) is never paired automatically
++        ([card(0, name = "RTX 4090"), card(1, name = "RTX 3060")], None, "a different card model"),
++        # same model but every other card busy
++        ([card(0), card(1, used = 3000), card(2, util = 90.0)], None, "busy"),
++        # same model, idle, but the replica does not fit
++        ([card(0, total = 6144), card(1, total = 6144, used = 400)], None, "short of the"),
++        # only the primary
++        ([card(0)], None, "no other card"),
++        # unknown utilisation counts as idle (memory still decides)
++        ([card(0), card(1, util = None)], 1, "idle card"),
++    ],
++)
++def test_automatic_partner_decision_table(cards, expect, why):
++    pick, reason = mg.automatic_partner(cards[0], cards, NEED)
++    assert pick == expect
++    assert why in reason
++
++
++def test_automatic_partner_prefers_a_peer_link_on_a_tie_then_the_lowest_ordinal():
++    cards = [card(0), card(1), card(2), card(3)]
++    assert mg.automatic_partner(cards[0], cards, NEED)[0] == 1
++    assert mg.automatic_partner(cards[0], cards, NEED, p2p = {3: True})[0] == 3
++
++
++def test_automatic_partner_eight_cards_lends_exactly_one():
++    cards = [card(o, used = 400 + 10 * o) for o in range(8)]
++    pick, _ = mg.automatic_partner(cards[3], cards, NEED)
++    assert pick == 0  # most free among the other seven; one replica per load whatever the card count
++
++
++def test_idle_card_requires_low_memory_and_low_utilisation():
++    assert mg._idle_card(card(1))
++    assert not mg._idle_card(card(1, used = 2000))
++    assert not mg._idle_card(card(1, util = mg.AUTO_CFG_PARALLEL_IDLE_UTIL_PCT + 1))
++    assert mg._idle_card(card(1, util = mg.AUTO_CFG_PARALLEL_IDLE_UTIL_PCT))
++
++
++class FluxTransformer2DModel(torch.nn.Module):
++    """Named like diffusers' FLUX.1 class: the batch split keys on the class name."""
++
++    def __init__(self):
++        super().__init__()
++        self.x = torch.nn.Linear(8, 8)
++        self.t = torch.nn.Linear(6, 8)
++        self.calls = []
++
++    def forward(
++        self, hidden_states, encoder_hidden_states = None, pooled_projections = None, timestep = None, img_ids = None,
++        txt_ids = None, guidance = None, joint_attention_kwargs = None, return_dict = True, **extra,
++    ):
++        self.calls.append(int(hidden_states.shape[0]))
++        h = self.x(hidden_states) * timestep[:, None, None] * guidance[:, None, None]
++        h = h + self.t(encoder_hidden_states).mean(1, keepdim = True) + pooled_projections[:, None, :8]
++        h = h + img_ids.float().mean() + txt_ids.float().mean()
++        for value in extra.values():
++            if isinstance(value, torch.Tensor):
++                h = h + value.sum()
++        return (h,) if not return_dict else type("Out", (), {"sample": h})()
++
++
++class OtherTransformer(FluxTransformer2DModel):
++    pass
++
++
++def _router(model):
++    built = []
++
++    def factory():
++        r = mg.build_replica(model, torch.device("cpu"))
++        built.append(r)
++        return r
++
++    router = mg.CfgParallelRouter(model, primary = "cpu", secondary = "cpu", replica_factory = factory)
++    model.forward = router
++    return router, built
++
++
++def _flux_loop(model, batch, steps, **extra):
++    g = torch.Generator().manual_seed(5)
++    latents = torch.randn(batch, 16, 8, generator = g)
++    emb = torch.randn(batch, 7, 6, generator = g)
++    pooled = torch.randn(batch, 12, generator = g)
++    img_ids = torch.randn(16, 3, generator = g)  # unbatched: leading size is the token count
++    txt_ids = torch.zeros(7, 3)
++    for i in range(steps):
++        t = torch.full((batch,), 1.0 - i / steps)
++        out = model(
++            hidden_states = latents, encoder_hidden_states = emb, pooled_projections = pooled, timestep = t,
++            img_ids = img_ids, txt_ids = txt_ids, guidance = torch.full((batch,), 3.5), return_dict = False, **extra,
++        )[0]
++        latents = latents - 0.1 * out
++    return latents
++
++
++def _reference(cls, batch, steps):
++    torch.manual_seed(0)
++    model = cls()
++    return model, _flux_loop(model, batch, steps)
++
++
++def test_distilled_flux_batch_splits_from_the_second_step_and_matches_one_card():
++    ref_model, ref = _reference(FluxTransformer2DModel, 4, 5)
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, built = _router(model)
++    out = _flux_loop(model, 4, 5)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    # step 1 learns there is one call per step (no guidance branch); steps 2-5 split 4 -> 2 + 2
++    assert router.stats["batch_splits"] == 4
++    assert len(built) == 1
++    assert model.calls[0] == 4
++    assert sorted(set(model.calls[1:])) == [2]
++    assert built[0].calls.count(2) == 4  # (the copy carries the source's call log from before it was built)
++
++
++def test_next_render_splits_from_its_first_step():
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, _ = _router(model)
++    _flux_loop(model, 2, 3)
++    router.end_render()
++    before = router.stats["batch_splits"]
++    _flux_loop(model, 2, 3)
++    assert router.stats["batch_splits"] - before == 3
++
++
++def test_odd_batch_unknown_class_unknown_input_and_kill_switch_stay_whole(monkeypatch):
++    for cls, batch, extra in (
++        (FluxTransformer2DModel, 3, {}),
++        (OtherTransformer, 4, {}),
++        (FluxTransformer2DModel, 4, {"controlnet_block_samples": torch.ones(1)}),
++    ):
++        torch.manual_seed(0)
++        model = cls()
++        router, built = _router(model)
++        _flux_loop(model, batch, 3, **extra)
++        assert router.stats["batch_splits"] == 0, (cls.__name__, batch, list(extra))
++        assert not built
++    monkeypatch.setenv(mg.BATCH_SPLIT_ENV, "0")
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, built = _router(model)
++    _flux_loop(model, 4, 3)
++    assert router.stats["batch_splits"] == 0 and not built
++
++
++def test_guided_render_keeps_cfg_routing_and_does_not_batch_split():
++    """True CFG (two calls per step, same latent): the odd branch goes to the replica as before."""
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, _ = _router(model)
++    g = torch.Generator().manual_seed(5)
++    latents = torch.randn(2, 16, 8, generator = g)
++    kw = dict(
++        encoder_hidden_states = torch.randn(2, 7, 6, generator = g), pooled_projections = torch.randn(2, 12, generator = g),
++        img_ids = torch.zeros(16, 3), txt_ids = torch.zeros(7, 3), guidance = torch.full((2,), 3.5), return_dict = False,
++    )
++    for i in range(4):
++        t = torch.full((2,), 1.0 - i / 4)
++        c = model(hidden_states = latents, timestep = t, **kw)[0]
++        u = model(hidden_states = latents, timestep = t, **kw)[0]
++        latents = latents - 0.1 * (u + 4.0 * (c - u))
++    assert router.stats["batch_splits"] == 0
++    assert router.stats["replica_calls"] >= 3
++
++
++def test_replica_failure_during_a_batch_split_recomputes_on_the_source():
++    ref_model, ref = _reference(FluxTransformer2DModel, 2, 4)
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++
++    class Boom(torch.nn.Module):
++        def forward(self, *a, **k):
++            raise RuntimeError("replica gone")
++
++    router = mg.CfgParallelRouter(model, primary = "cpu", secondary = "cpu", replica_factory = Boom)
++    model.forward = router
++    out = _flux_loop(model, 2, 4)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    assert router.disabled_reason is not None
 diff --git a/studio/backend/tests/test_diffusion_auto_placement.py b/studio/backend/tests/test_diffusion_auto_placement.py
-index 835ec3f4f4..2da99bf3c5 100644
+index 835ec3f4f4..c00cbf4f79 100644
 --- a/studio/backend/tests/test_diffusion_auto_placement.py
 +++ b/studio/backend/tests/test_diffusion_auto_placement.py
-@@ -261,13 +261,15 @@ def test_a_fits_one_card_uses_one_card_and_no_cfg_parallel(monkeypatch):
+@@ -261,13 +261,17 @@ def test_a_fits_one_card_uses_one_card_and_no_cfg_parallel(monkeypatch):
      d = decide(monkeypatch, host, _sizes(dit = 3900, te = 1600))
      assert d.plan is d.one_card and d.plan.offload_policy == dm.OFFLOAD_NONE
      assert d.plan.secondary_ordinal is None and d.plan.layer_split is None
@@ -321,15 +785,19 @@ index 835ec3f4f4..2da99bf3c5 100644
      kinds = {r["kind"]: r["reason"] for r in p["rejected"]}
      assert kinds["companion_split"].startswith("not needed")
 -    assert "automatic" in kinds["cfg_parallel"]
++    # Automatic now borrows an idle card of the same model for CFG-parallel (every guided model that fits ran
++    # 1.46-1.79x faster on 2x T4); the fake pipeline declines only because it has no denoiser module
 +    assert "no DiT denoiser" in kinds["cfg_parallel"]
      assert set(host.mem_get_info_calls) <= {0}
  
  
-@@ -288,7 +290,7 @@ def test_b_companion_split_puts_the_text_encoder_on_the_second_card(monkeypatch)
+@@ -288,7 +292,9 @@ def test_b_companion_split_puts_the_text_encoder_on_the_second_card(monkeypatch)
      assert d.plan.offload_policy == dm.OFFLOAD_NONE and d.plan.secondary_ordinal == 1
      assert "text_encoder" in d.plan.secondary_components
      assert d.plan.layer_split is None
 -    assert d.cfg_parallel is not None and "automatic" in d.cfg_parallel
++    # Automatic now borrows an idle card of the same model for CFG-parallel (every guided model that fits ran
++    # 1.46-1.79x faster on 2x T4); the fake pipeline declines only because it has no denoiser module
 +    assert d.cfg_parallel is not None and "no DiT denoiser" in d.cfg_parallel
      p = _placement(d)
      assert p["chosen"] == "companion_split"

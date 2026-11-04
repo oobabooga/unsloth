@@ -44,6 +44,7 @@ CELLS = (
     "cfg_sdxl_unet_compiled",
     "cfg_flux_offload",
     "auto_selection",
+    "batch_flux",
 )
 
 
@@ -170,7 +171,13 @@ def _sdxl():
     return pipe, kw
 
 
-BUILD = {"flux": _flux, "qwen": _qwen, "zimage": _zimage, "wan": _wan, "sdxl": _sdxl}
+def _flux_b2():
+    pipe, _ = _flux()
+    # distilled-style call: no negative branch, two images per prompt (one batch-2 forward per step)
+    return pipe, dict(guidance_scale = 3.5, num_images_per_prompt = 2, height = 64, width = 64)
+
+
+BUILD = {"flux_b2": _flux_b2, "flux": _flux, "qwen": _qwen, "zimage": _zimage, "wan": _wan, "sdxl": _sdxl}
 
 
 def _den(pipe):
@@ -506,6 +513,8 @@ def child(cell: str) -> dict:
         return cell_cfg(cell, "flux", False, offload = True)
     if cell == "auto_selection":
         return cell_auto()
+    if cell == "batch_flux":
+        return cell_cfg(cell, "flux_b2", False)
     if cell == "cfg_flux":
         return cell_cfg(cell, "flux", False)
     if cell == "cfg_qwen":

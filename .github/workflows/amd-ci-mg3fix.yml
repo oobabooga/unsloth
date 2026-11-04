@@ -1,4 +1,4 @@
-name: "AMD CI: diffusion multi-GPU wiring under a spoofed second device (eb648c2047 vs eb648c2047 + three CFG-parallel fixes)"
+name: "AMD CI: diffusion multi-GPU wiring under a spoofed second device (eb648c2047 vs eb648c2047 + CFG-parallel fixes 1-4)"
 
 # Generated from amd_ci/templates/workflow.yml (scaffold.py --shared-gpu --spoof-devices 1), then the
 # states step swapped for a fixed base SHA plus a patch (no PR exists for the head yet) and the
@@ -143,6 +143,7 @@ jobs:
               tests/test_gpu_residency_coexistence.py tests/test_gpu_order_preserved.py \
               tests/test_offload_planner.py tests/test_video_fast_pin.py \
               tests/test_diffusion_unet_cfg_parallel.py tests/test_diffusion_auto_placement.py \
+              tests/test_diffusion_auto_multigpu_policy.py \
               tests/test_system_poll_no_cuda_context.py tests/test_skipif_version_strings.py
           cat "$AMD_CI_WORK/out/tests/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/tests"

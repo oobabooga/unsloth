@@ -20,10 +20,10 @@ MODE = "regression"
 NEEDS = ["gpu", "rocm", "multi_gpu", "discrete_gpu", "linux"]
 
 _CFG = ("cfg_flux", "cfg_qwen", "cfg_flux_compiled", "zimage_pair", "video_wan_cfg", "cfg_sdxl_unet", "cfg_flux_offload",
-        "cfg_sdxl_unet_compiled")
+        "cfg_sdxl_unet_compiled", "batch_flux")
 # a U-Net CFG split runs each half at batch B instead of 2B (different GEMM shapes) and a group-offloaded primary
 # against a resident replica: close to one card, not bit-identical by construction
-_TOL = {"cfg_sdxl_unet": 0.02, "cfg_flux_offload": 0.02, "cfg_sdxl_unet_compiled": 0.02}
+_TOL = {"cfg_sdxl_unet": 0.02, "cfg_flux_offload": 0.02, "cfg_sdxl_unet_compiled": 0.02, "batch_flux": 0.02}
 _SPLIT = ("split_flux", "split_wan")
 
 
