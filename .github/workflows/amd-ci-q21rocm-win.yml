@@ -136,7 +136,9 @@ jobs:
           # torch[device-gfx1151]==2.11.0+rocm7.14.0; no triton-windows (CUDA branch only); diffusers pin.
           & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1151]==2.11.0+rocm7.14.0"
           if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: ROCm torch install failed"; exit $LASTEXITCODE }
-          & $py -m pip install -q "diffusers==0.42.1" transformers accelerate safetensors numpy pillow
+          $states = Get-Content "$env:AMD_CI_WORK\out\states.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $req = Join-Path $states.paths.base "studio\backend\requirements"
+          & $py -m pip install -q -r (Join-Path $req "studio.txt") -r (Join-Path $req "diffusers-pin.txt") transformers accelerate numpy pillow
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'avail', torch.cuda.is_available()); print(torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else 'no device'); import importlib.util as u; print('triton', u.find_spec('triton') is not None)"
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 `
