@@ -1,0 +1,881 @@
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..3bb870d98a 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -3413,8 +3413,20 @@ def _read_cast_cache(
+         if not cands:
+             return []
+         if device is not None:
+-            from .video_small_host import stage_misses
+-            stage_misses(cands, device, logger = logger, cancel_check = cancel_check)
++            from .video_small_host import converted_others_mib, stage_misses
++            others = converted_others_mib(
++                source,
++                cands,
++                torch_dtype = pipe_kwargs.get("torch_dtype"),
++                cache_dir = None
++                if source and os.path.isdir(str(source))
++                else pipe_kwargs.get("cache_dir"),
++                revision = revision,
++                skip = tuple(pipe_kwargs),
++            )
++            stage_misses(
++                cands, device, logger = logger, cancel_check = cancel_check, others_mib = others
++            )
+         hits = read_all(cands, logger = logger, cancel_check = cancel_check)
+         pipe_kwargs.update(hits)
+         if hits:
+diff --git a/studio/backend/core/inference/video_small_host.py b/studio/backend/core/inference/video_small_host.py
+index 6045d2539c..30c2f70e73 100644
+--- a/studio/backend/core/inference/video_small_host.py
++++ b/studio/backend/core/inference/video_small_host.py
+@@ -83,6 +83,10 @@ class StagePlan:
+     available_mib: Optional[int] = None
+     reserve_mib: int = 0
+     skipped: dict = field(default_factory = dict)
++    # component -> MiB of it placed on the card when it is staged split across the card and host RAM
++    split: dict = field(default_factory = dict)
++    # MiB the same load converts in host RAM outside the cast cache (a bf16 encoder cast to fp16)
++    others_mib: int = 0
+ 
+ 
+ def plan_stage(
+@@ -93,60 +97,100 @@ def plan_stage(
+     device_free_mib: Optional[int],
+     forced: bool = False,
+     disabled: bool = False,
++    others_mib: int = 0,
+ ) -> StagePlan:
+-    """``misses``: component -> loaded MiB. Stage largest first (each must fit the card) until the rest fits host RAM."""
++    """``misses``: component -> loaded MiB. Stage largest first until the rest fits host RAM; ``others_mib`` is what
++    the same load converts in host RAM besides them (it cannot be staged, so it is priced, not moved). A miss larger
++    than the card is staged split: the card holds what fits, host RAM the rest (when that rest fits)."""
+     if disabled:
+         return StagePlan(False, f"{SMALL_HOST_ENV}=0")
+     sizes = {k: int(v) for k, v in misses.items() if v is not None}
+     dense = sum(sizes.values())
++    others = max(0, int(others_mib or 0))
+     if not sizes:
+-        return StagePlan(False, "no cast-cache miss to convert", dense_mib = 0)
++        return StagePlan(False, "no cast-cache miss to convert", dense_mib = 0, others_mib = others)
+     if available_mib is None and not forced:
+-        return StagePlan(False, "host RAM unreadable", dense_mib = dense)
+-    fits = available_mib is not None and dense + reserve_mib <= int(available_mib)
++        return StagePlan(False, "host RAM unreadable", dense_mib = dense, others_mib = others)
++    beside = f" + {others} MiB of other converted components" if others else ""
++    fits = available_mib is not None and dense + others + reserve_mib <= int(available_mib)
+     if fits and not forced:
+         return StagePlan(
+             False,
+-            f"dense conversion ({dense} MiB) fits {available_mib} MiB available host RAM",
++            f"dense conversion ({dense} MiB{beside}) fits {available_mib} MiB available host RAM",
+             dense_mib = dense,
+             available_mib = available_mib,
+             reserve_mib = reserve_mib,
++            others_mib = others,
+         )
+     stage = []
+     skipped = {}
++    split = {}
+     left = dense
+     for name, mib in sorted(sizes.items(), key = lambda kv: (-kv[1], kv[0])):
+-        if not forced and available_mib is not None and left + reserve_mib <= int(available_mib):
++        if (
++            not forced
++            and available_mib is not None
++            and left + others + reserve_mib <= int(available_mib)
++        ):
+             break
+         if mib < _STAGE_MIN_MIB:
+             skipped[name] = "small"
+             continue
+-        if device_free_mib is None or mib + _DEVICE_MARGIN_MIB > int(device_free_mib):
+-            skipped[name] = (
+-                f"needs {mib + _DEVICE_MARGIN_MIB} MiB of the card, {device_free_mib} MiB free"
+-            )
++        card = None if device_free_mib is None else int(device_free_mib) - _DEVICE_MARGIN_MIB
++        if card is not None and mib <= card:
++            stage.append(name)
++            left -= mib
++            continue
++        # Split: the card's share plus a host share that fits beside the rest of the load's conversions.
++        host_room = (
++            None
++            if available_mib is None
++            else int(available_mib) - reserve_mib - others - (left - mib)
++        )
++        if (
++            card is not None
++            and card >= _STAGE_MIN_MIB
++            and host_room is not None
++            and mib - card <= host_room
++        ):
++            stage.append(name)
++            split[name] = card
++            left -= mib
+             continue
+-        stage.append(name)
+-        left -= mib
++        skipped[name] = (
++            f"needs {mib + _DEVICE_MARGIN_MIB} MiB of the card, {device_free_mib} MiB free, and its host share "
++            f"does not fit {host_room} MiB"
++        )
+     why = (
+         f"{SMALL_HOST_ENV}=1"
+         if forced
+-        else f"dense conversion needs ~{dense} MiB + {reserve_mib} MiB reserve of host RAM, "
++        else f"dense conversion needs ~{dense} MiB{beside} + {reserve_mib} MiB reserve of host RAM, "
+         f"{available_mib} MiB available"
+     )
+-    return StagePlan(bool(stage), why, tuple(stage), dense, available_mib, reserve_mib, skipped)
++    return StagePlan(
++        bool(stage), why, tuple(stage), dense, available_mib, reserve_mib, skipped, split, others
++    )
+ 
+ 
+ def _component_dir(cand: Any) -> str:
+     return str(Path(cand.config_path).parent)
+ 
+ 
+-def _device_load_kwargs(cand: Any, device: Any) -> dict:
++def _device_load_kwargs(cand: Any, device: Any, card_mib: Optional[int] = None) -> dict:
+     from .diffusion_cast_cache import _load_kwargs
+ 
+     kwargs = _load_kwargs(cand)
+     kwargs.pop("output_loading_info", None)
+-    kwargs["device_map"] = {"": str(device)}
++    if card_mib is None:
++        kwargs["device_map"] = {"": str(device)}
++        return kwargs
++    import torch
++
++    # Split: accelerate fills the card up to ``card_mib`` block by block, the rest lands in host RAM.
++    dev = torch.device(device)
++    index = dev.index if dev.index is not None else torch.cuda.current_device()
++    kwargs["device_map"] = "auto"
++    kwargs["max_memory"] = {index: f"{int(card_mib)}MiB", "cpu": "1024GiB"}
+     return kwargs
+ 
+ 
+@@ -156,8 +200,10 @@ def stage_on_device(
+     *,
+     logger: Any = None,
+     cancel_check: Optional[Callable[[], None]] = None,
++    card_mib: Optional[int] = None,
+ ) -> bool:
+-    """Load ``cand`` alone onto ``device``, write its cast-cache entry from the device tensors, free it."""
++    """Load ``cand`` alone onto ``device`` (split with host RAM past ``card_mib``), write its cast-cache entry from
++    the loaded tensors, free it."""
+     import torch
+ 
+     from .diffusion_cast_cache import _state_names, save
+@@ -165,7 +211,9 @@ def stage_on_device(
+     t0 = time.perf_counter()
+     module = None
+     try:
+-        module = cand.cls.from_pretrained(_component_dir(cand), **_device_load_kwargs(cand, device))
++        module = cand.cls.from_pretrained(
++            _component_dir(cand), **_device_load_kwargs(cand, device, card_mib)
++        )
+         module.eval()
+         if cancel_check is not None:
+             cancel_check()
+@@ -176,9 +224,10 @@ def stage_on_device(
+         path = save(cand, module, logger = logger, check = cancel_check)
+         if logger is not None:
+             logger.info(
+-                "video.small_host: %s staged on %s in %.1f s (%s)",
++                "video.small_host: %s staged on %s%s in %.1f s (%s)",
+                 cand.component,
+                 device,
++                f" (split: {card_mib} MiB on the card, the rest in host RAM)" if card_mib else "",
+                 time.perf_counter() - t0,
+                 "cast cache written" if path else "not written",
+             )
+@@ -206,12 +255,58 @@ def _device_free_mib(device: Any) -> Optional[int]:
+         return None
+ 
+ 
++def converted_others_mib(
++    source: Any,
++    cands: list,
++    *,
++    torch_dtype: Any,
++    cache_dir: Optional[str] = None,
++    revision: Optional[str] = None,
++    skip: Any = (),
++) -> int:
++    """MiB the pipeline load converts in host RAM outside the cast cache: half-precision shards of a component that
++    is not a cast candidate but loads at the other half dtype (bf16 -> fp16 on a float16 card), which become anonymous
++    memory beside the cast-cache misses. 0 when unreadable."""
++    try:
++        import torch
++
++        from . import diffusion_cast_cache as cc
++
++        index = cc._read_json(cc._cache._local_file(str(source), "model_index.json", cache_dir, revision))
++        if not isinstance(index, dict):
++            return 0
++        names = {c.component for c in cands}
++        skip = set(skip or ())
++        total = 0
++        for component, spec in index.items():
++            if component.startswith("_") or component in skip or component in names:
++                continue
++            if not isinstance(spec, (list, tuple)) or len(spec) != 2 or spec[0] not in cc._LIBRARIES:
++                continue
++            dtype = cc._component_dtype(torch_dtype, component)
++            if not cc._is_half(dtype):
++                continue
++            want = "F16" if dtype == torch.float16 else "BF16"
++            for shard in cc._shards_of(str(source), component, cc._STEMS[spec[0]], cache_dir, revision) or ():
++                header = cc._shard_header(shard) or {}
++                for name, entry in header.items():
++                    if name == "__metadata__" or not isinstance(entry, dict):
++                        continue
++                    if entry.get("dtype") in ("F16", "BF16") and entry.get("dtype") != want:
++                        begin, end = (int(v) for v in entry.get("data_offsets") or (0, 0))
++                        total += end - begin
++        return -(-total // _MIB)
++    except Exception:  # noqa: BLE001 - unpriced, as before
++        return 0
++
++
+ def stage_misses(
+     cands: list,
+     device: Any,
+     *,
+     logger: Any = None,
+     cancel_check: Optional[Callable[[], None]] = None,
++    others_mib: int = 0,
+ ) -> list:
+     """Stage the misses of ``cands`` a dense load would not fit; returns the staged components. Never raises except
+     a cancel."""
+@@ -235,6 +330,7 @@ def stage_misses(
+             device_free_mib = _device_free_mib(device),
+             forced = stage_forced(),
+             disabled = stage_disabled(),
++            others_mib = others_mib,
+         )
+         if logger is not None and (plan.engaged or plan.skipped or misses):
+             logger.info(
+@@ -249,7 +345,13 @@ def stage_misses(
+         for name in plan.stage:
+             if cancel_check is not None:
+                 cancel_check()
+-            if stage_on_device(by_name[name], device, logger = logger, cancel_check = cancel_check):
++            if stage_on_device(
++                by_name[name],
++                device,
++                logger = logger,
++                cancel_check = cancel_check,
++                card_mib = plan.split.get(name),
++            ):
+                 done.append(name)
+         return done
+     except Exception as exc:  # noqa: BLE001 - the dense load still runs
+diff --git a/studio/backend/tests/test_video_small_host.py b/studio/backend/tests/test_video_small_host.py
+index 390bbff94b..dbf12550f6 100644
+--- a/studio/backend/tests/test_video_small_host.py
++++ b/studio/backend/tests/test_video_small_host.py
+@@ -60,11 +60,19 @@ def test_stages_largest_first_until_the_rest_fits():
+     assert plan.stage == ("text_encoder", "transformer")
+ 
+ 
+-def test_card_too_small_for_the_encoder_keeps_the_dense_load():
++def test_card_too_small_for_the_encoder_stages_it_split():
+     plan = VS.plan_stage(WAN13, available_mib = 10100, reserve_mib = 3072, device_free_mib = 11000)
+-    # the encoder does not fit the card; the DiT alone does but cannot rescue the load: staged anyway, logged
++    # the encoder does not fit the card: the card takes what fits, host RAM the 2.5 GB rest, and the DiT then
++    # converts densely beside it
++    assert plan.stage == ("text_encoder",)
++    assert plan.split == {"text_encoder": 11000 - VS._DEVICE_MARGIN_MIB}
++
++
++def test_a_split_whose_host_share_does_not_fit_keeps_the_dense_load():
++    plan = VS.plan_stage(WAN13, available_mib = 10100, reserve_mib = 3072, device_free_mib = 4000)
++    # 9.5 GB of the encoder would stay in host RAM beside the DiT: no split; the DiT alone is staged, logged
+     assert "text_encoder" in plan.skipped
+-    assert plan.stage == ("transformer",)
++    assert plan.stage == ("transformer",) and plan.split == {}
+ 
+ 
+ def test_kill_switch_and_force(monkeypatch):
+@@ -265,3 +273,57 @@ def test_non_cuda_device_never_stages(pipe_dir, monkeypatch):
+     calls = _wire(monkeypatch, available = 10)
+     assert VS.stage_misses(list(_cands(pipe_dir).values()), "cpu") == []
+     assert calls == []
++
++
++# HunyuanVideo-1.5 on a Kaggle T4 (31 GB host, 15 GB card): the fp32 DiT converts to fp16 (18.4 GiB, a cast-cache
++# miss) while the bf16 Qwen2.5-VL-7B converts to fp16 beside it (15.6 GiB, not a cast candidate). Pricing the DiT
++# alone let every load through and the host ran out of RAM (rc -9).
++HV15_T4 = {"transformer": 18827}
++HV15_TE_MIB = 15600
++
++
++def test_the_encoder_converted_beside_the_dit_is_priced():
++    old = VS.plan_stage(HV15_T4, available_mib = 29238, reserve_mib = 3174, device_free_mib = 14600)
++    assert not old.engaged  # the DiT alone "fits"
++    plan = VS.plan_stage(
++        HV15_T4, available_mib = 29238, reserve_mib = 3174, device_free_mib = 14600, others_mib = HV15_TE_MIB
++    )
++    assert plan.engaged and plan.stage == ("transformer",)
++    # 15 GB card: split, 13.8 GB on the card and 4.9 GB in host RAM beside the encoder's 15.6
++    assert plan.split == {"transformer": 14600 - VS._DEVICE_MARGIN_MIB}
++    assert plan.others_mib == HV15_TE_MIB and "other converted components" in plan.reason
++
++
++def test_others_that_fit_change_nothing():
++    plan = VS.plan_stage(HV15_T4, available_mib = 60000, reserve_mib = 6000, device_free_mib = 14600, others_mib = HV15_TE_MIB)
++    assert not plan.engaged and "fits" in plan.reason
++
++
++def test_converted_others_counts_only_a_half_dtype_change(pipe_dir):
++    import safetensors.torch as st
++
++    te = pipe_dir / "text_encoder"
++    for f in te.glob("*.safetensors"):
++        f.unlink()
++    st.save_file({"w": torch.zeros(1024, 512, dtype = torch.bfloat16)}, str(te / "model.safetensors"))
++    cands = [c for c in CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT)]
++    assert {c.component for c in cands} == {"transformer"}  # the bf16 encoder is not a cast candidate
++    fp16 = VS.converted_others_mib(pipe_dir, cands, torch_dtype = FP16_DEFAULT)
++    assert fp16 == 1  # 1 MiB of bf16 converted to fp16 in host RAM
++    bf16 = VS.converted_others_mib(pipe_dir, cands, torch_dtype = {"default": torch.bfloat16, "vae": torch.float32})
++    assert bf16 == 0  # same dtype: memory-mapped, nothing converted
++    assert VS.converted_others_mib(pipe_dir, cands, torch_dtype = FP16_DEFAULT, skip = ("text_encoder",)) == 0
++
++
++def test_split_load_kwargs_cap_the_card():
++    import types
++    from unittest import mock
++
++    cand = types.SimpleNamespace()
++
++    with mock.patch.object(CC, "_load_kwargs", lambda c: {"torch_dtype": torch.float16, "output_loading_info": True}):
++        whole = VS._device_load_kwargs(cand, "cuda:0")
++        split = VS._device_load_kwargs(cand, "cuda:0", card_mib = 13832)
++    assert whole["device_map"] == {"": "cuda:0"} and "max_memory" not in whole
++    assert split["device_map"] == "auto" and split["max_memory"][0] == "13832MiB"
++    assert "output_loading_info" not in split
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..1d98fe2c2e 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -10981,6 +10981,19 @@ class VideoBackend:
+                         + "; loaded the released bfloat16 denoiser instead"
+                     )
+                 else:
++                    if scheme == "int8":
++                        from .video_minimax_h3_keep import apply_h3_int8_keep
++
++                        apply_h3_int8_keep(
++                            transformer,
++                            fetch_base,
++                            (f"{workflow.upper()}/{denoiser_component}", denoiser_component),
++                            dtype = dtype,
++                            hf_token = hf_token,
++                            cache_dir = hub_cache_dir(),
++                            local_files_only = local_files_only,
++                            logger = logger,
++                        )
+                     # Must seed before load_components, which skips set attributes (avoids the 66.3 GB fetch).
+                     pipe.update_components(**{denoiser_component: transformer})
+                     transformer_quant_engaged = scheme
+diff --git a/studio/backend/core/inference/video_minimax_h3_keep.py b/studio/backend/core/inference/video_minimax_h3_keep.py
+new file mode 100644
+index 0000000000..a33b92ebf7
+--- /dev/null
++++ b/studio/backend/core/inference/video_minimax_h3_keep.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""MiniMax-H3 int8 denoiser keep list: the text side path (``token_refiner`` + ``condition_proj``, 13 Linears, 0.4 GB)
++runs at bfloat16, as ComfyUI's published int8_convrot DiT keeps it. The hosted int8 checkpoint quantized those too; at
++640x352x124 they carried most of its drift from the bf16 reference. Their released bf16 weights are read from the
++released transformer shard (ranged reads of just those tensors, or the cached shard), cached once beside the prequant
++cache, and swapped in as plain Linears before placement. ``UNSLOTH_H3_INT8_KEEP_BF16=0`` keeps the int8 ones."""
++
++from __future__ import annotations
++
++import json
++import os
++import struct
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++H3_INT8_KEEP_ENV = "UNSLOTH_H3_INT8_KEEP_BF16"
++# Original (ComfyUI) layout prefixes of the Linears kept dense, as the published int8_convrot DiT header shows.
++H3_KEEP_PREFIXES = ("token_refiner.", "condition_proj.")
++_INDEX = "model.safetensors.index.json"
++_RANGE_DEADLINE_S = 600.0
++_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}
++
++
++def h3_int8_keep_enabled() -> bool:
++    return str(os.environ.get(H3_INT8_KEEP_ENV, "")).strip().lower() not in ("0", "off", "false", "no")
++
++
++def _keep_key(key: str) -> bool:
++    return key.startswith(H3_KEEP_PREFIXES) and key.endswith((".weight", ".bias"))
++
++
++def _cache_file(repo: str, subfolder: str, revision: Optional[str]) -> Path:
++    from .diffusion_prequant_cache import cache_root
++
++    tag = "_".join(x for x in (repo.replace("/", "--"), subfolder.replace("/", "--"), (revision or "main")[:12]) if x)
++    return cache_root() / "h3_keep" / f"{tag}.safetensors"
++
++
++def _tensor_from(raw: bytes, dtype_tag: str, shape: list) -> Any:
++    import torch
++
++    dtype = getattr(torch, _DTYPES[dtype_tag])
++    return torch.frombuffer(bytearray(raw), dtype = dtype).reshape(shape).clone()
++
++
++def _read_ranged(read: Any, wanted: list) -> dict:
++    """``{key: tensor}`` of ``wanted`` from one safetensors file through ``read(start, end)`` (inclusive)."""
++    n = struct.unpack("<Q", read(0, 7))[0]
++    header = json.loads(read(8, 8 + n - 1))
++    base = 8 + n
++    out = {}
++    for key in wanted:
++        entry = header.get(key)
++        if not isinstance(entry, dict) or entry.get("dtype") not in _DTYPES:
++            raise ValueError(f"{key}: not a readable tensor in the released shard")
++        begin, end = (int(v) for v in entry["data_offsets"])
++        out[key] = _tensor_from(read(base + begin, base + end - 1), entry["dtype"], entry["shape"])
++    return out
++
++
++def fetch_keep_tensors(
++    repo: str,
++    subfolder: str,
++    *,
++    revision: Optional[str] = None,
++    hf_token: Optional[str] = None,
++    cache_dir: Optional[str] = None,
++    local_files_only: bool = False,
++    logger: Any = None,
++) -> Optional[dict]:
++    """Original-layout ``{key: tensor}`` of the kept Linears from ``repo``/``subfolder``'s released shards, or None."""
++    cached = _cache_file(repo, subfolder, revision)
++    if cached.is_file():
++        from safetensors.torch import load_file
++
++        return load_file(str(cached))
++    from huggingface_hub import hf_hub_download, hf_hub_url, try_to_load_from_cache
++
++    index_path = hf_hub_download(
++        repo,
++        f"{subfolder}/{_INDEX}",
++        revision = revision,
++        token = hf_token,
++        cache_dir = cache_dir,
++        local_files_only = local_files_only,
++    )
++    weight_map = json.loads(Path(index_path).read_text(encoding = "utf-8")).get("weight_map") or {}
++    by_shard: dict = {}
++    for key, shard in weight_map.items():
++        if _keep_key(key):
++            by_shard.setdefault(shard, []).append(key)
++    if not by_shard:
++        return None
++    tensors: dict = {}
++    t0 = time.perf_counter()
++    for shard, keys in sorted(by_shard.items()):
++        local = try_to_load_from_cache(repo, f"{subfolder}/{shard}", cache_dir = cache_dir, revision = revision)
++        if isinstance(local, str):
++            from safetensors import safe_open
++
++            with safe_open(local, framework = "pt") as fh:
++                tensors.update({k: fh.get_tensor(k) for k in keys})
++            continue
++        if local_files_only:
++            return None
++        from huggingface_hub.utils import build_hf_headers
++
++        from .prequant_header_probe import _hub_range_reader
++
++        url = hf_hub_url(repo, f"{subfolder}/{shard}", revision = revision)
++        read = _hub_range_reader(url, build_hf_headers(token = hf_token), time.monotonic() + _RANGE_DEADLINE_S)
++        tensors.update(_read_ranged(read, keys))
++    try:
++        from safetensors.torch import save_file
++
++        cached.parent.mkdir(parents = True, exist_ok = True)
++        tmp = cached.with_suffix(".tmp")
++        save_file({k: v.contiguous() for k, v in tensors.items()}, str(tmp))
++        os.replace(tmp, cached)
++    except Exception as exc:  # noqa: BLE001 - a later load fetches again
++        if logger is not None:
++            logger.warning("video.h3_int8_keep: could not cache the kept weights: %s", exc)
++    if logger is not None:
++        logger.info(
++            "video.h3_int8_keep: read %d released bf16 tensors (%.2f GB) from %s/%s in %.1f s",
++            len(tensors),
++            sum(t.numel() * t.element_size() for t in tensors.values()) / 1e9,
++            repo,
++            subfolder,
++            time.perf_counter() - t0,
++        )
++    return tensors
++
++
++def to_diffusers(tensors: dict) -> dict:
++    """Original-layout tensors -> diffusers names (fused qkv split, SwiGLU fc1 rows reordered), via the ComfyUI map."""
++    import torch
++
++    from .video_minimax_h3_comfy import h3_comfy_key_map
++
++    out = {}
++    for key, tensor in tensors.items():
++        for name, rows in h3_comfy_key_map(key, tuple(tensor.shape)):
++            out[name] = (
++                tensor
++                if rows is None
++                else torch.cat([tensor[start : start + n] for start, n in rows], dim = 0)
++            )
++    return out
++
++
++# A swapped Linear must agree with the quantized one it replaces (same weights up to int8 error) on a probe input;
++# below this cosine the mapping is wrong and every swap is refused.
++_AGREE_MIN_COSINE = 0.98
++
++
++def _agreement(old: Any, new: Any) -> Optional[float]:
++    """Cosine of ``old(x)`` and ``new(x)`` on one random batch, or None when ``old`` cannot run here."""
++    import torch
++
++    try:
++        g = torch.Generator().manual_seed(0)
++        x = torch.randn(16, new.in_features, generator = g).to(new.weight.dtype)
++        with torch.no_grad():
++            a = old(x).float().flatten()
++            b = new(x).float().flatten()
++        return float(torch.nn.functional.cosine_similarity(a, b, dim = 0))
++    except Exception:  # noqa: BLE001 - a quantized forward that needs the device
++        return None
++
++
++def restore_dense_keep(transformer: Any, weights: dict, *, dtype: Any, logger: Any = None) -> int:
++    """Swap each kept quantized Linear for a plain Linear at ``dtype`` holding the released weights. Returns swaps.
++    Every swap is checked first against the module it replaces; one disagreement refuses them all."""
++    import torch
++    from torch import nn
++
++    plan = []
++    worst = None
++    stems = sorted({k[: -len(".weight")] for k in weights if k.endswith(".weight")})
++    for stem in stems:
++        parent_name, _, attr = stem.rpartition(".")
++        try:
++            parent = transformer.get_submodule(parent_name) if parent_name else transformer
++            old = getattr(parent, attr)
++        except (AttributeError, KeyError):
++            continue
++        weight = weights[f"{stem}.weight"]
++        out_f, in_f = weight.shape
++        bias = weights.get(f"{stem}.bias")
++        if bias is None:
++            old_bias = getattr(old, "bias", None)
++            bias = old_bias.detach() if isinstance(old_bias, torch.Tensor) else None
++        new = nn.Linear(in_f, out_f, bias = bias is not None, device = "cpu", dtype = dtype)
++        with torch.no_grad():
++            new.weight.copy_(weight.to(dtype))
++            if bias is not None:
++                new.bias.copy_(bias.to(device = "cpu", dtype = dtype))
++        new.requires_grad_(False)
++        agree = _agreement(old, new)
++        if agree is not None:
++            worst = agree if worst is None else min(worst, agree)
++            if agree < _AGREE_MIN_COSINE:
++                if logger is not None:
++                    logger.warning(
++                        "video.h3_int8_keep: %s disagrees with the quantized module (cosine %.4f); kept int8",
++                        stem,
++                        agree,
++                    )
++                return 0
++        plan.append((parent, attr, new))
++    for parent, attr, new in plan:
++        setattr(parent, attr, new)
++    swapped = len(plan)
++    if logger is not None and worst is not None:
++        logger.info("video.h3_int8_keep: swapped Linears agree with the int8 ones (min cosine %.4f)", worst)
++    if logger is not None:
++        logger.info(
++            "video.h3_int8_keep: %d text-path Linears (token_refiner, context_embedder) run at %s, as ComfyUI's "
++            "int8_convrot DiT keeps them",
++            swapped,
++            str(dtype).replace("torch.", ""),
++        )
++    return swapped
++
++
++def apply_h3_int8_keep(
++    transformer: Any,
++    repo: str,
++    subfolders: tuple,
++    *,
++    dtype: Any,
++    revision: Optional[str] = None,
++    hf_token: Optional[str] = None,
++    cache_dir: Optional[str] = None,
++    local_files_only: bool = False,
++    logger: Any = None,
++) -> int:
++    """Never raises: any failure keeps the int8 Linears (the hosted model as before)."""
++    if not h3_int8_keep_enabled():
++        return 0
++    last = None
++    for subfolder in subfolders:
++        try:
++            tensors = fetch_keep_tensors(
++                repo,
++                subfolder,
++                revision = revision,
++                hf_token = hf_token,
++                cache_dir = cache_dir,
++                local_files_only = local_files_only,
++                logger = logger,
++            )
++        except Exception as exc:  # noqa: BLE001
++            last = exc
++            continue
++        if tensors:
++            try:
++                return restore_dense_keep(transformer, to_diffusers(tensors), dtype = dtype, logger = logger)
++            except Exception as exc:  # noqa: BLE001
++                last = exc
++                break
++    if logger is not None:
++        logger.info("video.h3_int8_keep: kept the int8 text path (%s)", last or "no released shard index")
++    return 0
+diff --git a/studio/backend/tests/test_video_h3_int8_keep.py b/studio/backend/tests/test_video_h3_int8_keep.py
+new file mode 100644
+index 0000000000..2dcda9d212
+--- /dev/null
++++ b/studio/backend/tests/test_video_h3_int8_keep.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""MiniMax-H3 int8 keep list: the text path (token_refiner + condition_proj) runs at bf16 from the released weights,
++as ComfyUI's published int8_convrot DiT keeps it."""
++
++from __future__ import annotations
++
++import json
++import struct
++
++import pytest
++
++torch = pytest.importorskip("torch")
++diffusers = pytest.importorskip("diffusers")
++
++
++def _tiny_h3():
++    torch.manual_seed(0)
++    return diffusers.MiniMaxH3Transformer3DModel(
++        num_attention_heads = 2,
++        attention_head_dim = 16,
++        hidden_size = 32,
++        num_layers = 1,
++        num_refiner_layers = 2,
++        ffn_dim = 64,
++        text_dim = 24,
++    ).to(torch.bfloat16)
++
++
++def _released_from(model):
++    """Original (ComfyUI) layout of the model's text path: the inverse of h3_comfy_key_map, built by hand."""
++    sd = model.state_dict()
++    out = {}
++    for i in range(2):
++        d = f"token_refiner.refiner_blocks.{i}"
++        o = f"token_refiner.blocks.{i}"
++        out[f"{o}.attn.qkv_proj.weight"] = torch.cat([sd[f"{d}.attn.to_{p}.weight"] for p in "qkv"], 0)
++        out[f"{o}.attn.out_proj.weight"] = sd[f"{d}.attn.to_out.0.weight"]
++        v, g = sd[f"{d}.ff.net.0.proj.weight"].chunk(2, 0)  # diffusers SwiGLU [value; gate]
++        out[f"{o}.mlp.fc1.weight"] = torch.cat([g, v], 0)  # ComfyUI [gate; value]
++        out[f"{o}.mlp.fc2.weight"] = sd[f"{d}.ff.net.2.weight"]
++    out["condition_proj.weight"] = sd["context_embedder.weight"]
++    out["condition_proj.bias"] = sd["context_embedder.bias"]
++    return out
++
++
++def test_released_text_path_maps_back_onto_the_diffusers_model():
++    from core.inference.video_minimax_h3_keep import to_diffusers
++
++    model = _tiny_h3()
++    mapped = to_diffusers(_released_from(model))
++    sd = model.state_dict()
++    assert len(mapped) == 2 * 6 + 2
++    for k, v in mapped.items():
++        assert torch.equal(sd[k], v), k
++
++
++def test_kept_linears_are_swapped_for_plain_ones_with_the_released_weights():
++    from core.inference.video_minimax_h3_keep import restore_dense_keep, to_diffusers
++
++    ref = _tiny_h3()
++    model = _tiny_h3()
++    with torch.no_grad():  # stand-in for the quantized text path: the same weights up to a small error
++        for name, mod in model.named_modules():
++            if (name.startswith("token_refiner") or name == "context_embedder") and isinstance(mod, torch.nn.Linear):
++                mod.weight.mul_(1.01)
++    n = restore_dense_keep(model, to_diffusers(_released_from(ref)), dtype = torch.bfloat16)
++    assert n == 2 * 6 + 1
++    for name, mod in model.named_modules():
++        if name.startswith("token_refiner") or name == "context_embedder":
++            if isinstance(mod, torch.nn.Linear):
++                assert type(mod) is torch.nn.Linear and mod.weight.dtype == torch.bfloat16
++                assert torch.equal(mod.weight, ref.get_submodule(name).weight), name
++    # the block stack is untouched
++    assert torch.equal(
++        model.transformer_blocks[0].attn.to_q.weight, ref.transformer_blocks[0].attn.to_q.weight
++    )
++
++
++def _safetensors_bytes(tensors: dict) -> bytes:
++    header, blobs, off = {}, [], 0
++    for k, t in tensors.items():
++        raw = t.contiguous().view(torch.uint8).numpy().tobytes()
++        header[k] = {"dtype": {torch.bfloat16: "BF16", torch.float32: "F32"}[t.dtype], "shape": list(t.shape),
++                     "data_offsets": [off, off + len(raw)]}
++        blobs.append(raw)
++        off += len(raw)
++    h = json.dumps(header).encode()
++    return struct.pack("<Q", len(h)) + h + b"".join(blobs)
++
++
++def test_ranged_reads_take_only_the_asked_tensors():
++    from core.inference.video_minimax_h3_keep import _read_ranged
++
++    tensors = {"token_refiner.blocks.0.attn.out_proj.weight": torch.randn(4, 4).to(torch.bfloat16),
++               "blocks.0.mlp.fc1.weight": torch.randn(64, 32).to(torch.bfloat16)}
++    blob = _safetensors_bytes(tensors)
++    asked = []
++
++    def read(start, end):
++        asked.append((start, end))
++        return blob[start : end + 1]
++
++    got = _read_ranged(read, ["token_refiner.blocks.0.attn.out_proj.weight"])
++    assert torch.equal(got["token_refiner.blocks.0.attn.out_proj.weight"], tensors["token_refiner.blocks.0.attn.out_proj.weight"])
++    read_bytes = sum(e - s + 1 for s, e in asked)
++    assert read_bytes < len(blob) // 2  # the block weight was never read
++
++
++def test_kill_switch_and_failures_keep_the_int8_model(monkeypatch):
++    from core.inference import video_minimax_h3_keep as K
++
++    model = _tiny_h3()
++    before = {k: v.clone() for k, v in model.state_dict().items()}
++    monkeypatch.setenv(K.H3_INT8_KEEP_ENV, "0")
++    assert K.apply_h3_int8_keep(model, "unsloth/MiniMax-H3", ("FL2VA/transformer",), dtype = torch.bfloat16) == 0
++    monkeypatch.delenv(K.H3_INT8_KEEP_ENV)
++
++    def boom(*a, **k):
++        raise OSError("offline")
++
++    monkeypatch.setattr(K, "fetch_keep_tensors", boom)
++    assert K.apply_h3_int8_keep(model, "unsloth/MiniMax-H3", ("FL2VA/transformer",), dtype = torch.bfloat16) == 0
++    assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())
++
++
++def test_cached_weights_are_reused_offline(tmp_path, monkeypatch):
++    from core.inference import diffusion_prequant_cache as C
++    from core.inference import video_minimax_h3_keep as K
++    from safetensors.torch import save_file
++
++    monkeypatch.setenv(C.ENV_DIR, str(tmp_path))
++    path = K._cache_file("unsloth/MiniMax-H3", "FL2VA/transformer", None)
++    path.parent.mkdir(parents = True)
++    ref = _tiny_h3()
++    save_file(_released_from(ref), str(path))
++    got = K.fetch_keep_tensors("unsloth/MiniMax-H3", "FL2VA/transformer", local_files_only = True)
++    assert set(got) == set(_released_from(ref))
++
++
++def test_a_wrong_mapping_is_refused():
++    from core.inference.video_minimax_h3_keep import restore_dense_keep, to_diffusers
++
++    ref = _tiny_h3()
++    model = _tiny_h3()
++    released = _released_from(ref)
++    # fc1 rows in the wrong order (a layout mistake): the swapped SwiGLU disagrees with the module it replaces
++    k = "token_refiner.blocks.0.mlp.fc1.weight"
++    released[k] = torch.cat(released[k].chunk(2, 0)[::-1], 0)
++    assert restore_dense_keep(model, to_diffusers(released), dtype = torch.bfloat16) == 0
++    assert all(torch.equal(model.state_dict()[n], ref.state_dict()[n]) for n in ref.state_dict())
+diff --git a/studio/backend/core/inference/video_families.py b/studio/backend/core/inference/video_families.py
+index 623655a93e..6adcca1525 100644
+--- a/studio/backend/core/inference/video_families.py
++++ b/studio/backend/core/inference/video_families.py
+@@ -923,6 +923,19 @@ _FAMILIES: tuple[VideoFamily, ...] = (
+         profile = FamilyProfile(
+             scheme_deny = _NVFP4_GATE_FAILED,
+             int8_exclude_tokens = _HUNYUAN15_INT8_EXCLUDES,
++            # Runtime int8 ConvRot on the block stack (every input axis 256-divisible); opt-in with
++            # UNSLOTH_DIFFUSION_INT8_CONVROT=1 until its accuracy / speed A/B decides the default.
++            int8_convrot = ConvRotSpec(
++                group = 256,
++                suffixes = (
++                    "attn.to_q",
++                    "attn.to_k",
++                    "attn.to_v",
++                    "attn.to_out.0",
++                    "ff.net.0.proj",
++                    "ff.net.2",
++                ),
++            ),
+             nvfp4_zero_row_tokens = _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS,
+             preview_factors = "hv15",
+             auto_static_skip = (
+diff --git a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+index a6b8c70cce..a8bf55efca 100644
+--- a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
++++ b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+@@ -2095,8 +2095,15 @@
+     "convrot_filename": null,
+     "convrot_repo": null,
+     "convrot_spec": [
+-     0,
+-     []
++     256,
++     [
++      "attn.to_q",
++      "attn.to_k",
++      "attn.to_v",
++      "attn.to_out.0",
++      "ff.net.0.proj",
++      "ff.net.2"
++     ]
+     ],
+     "convrot_variant_repos": [],
+     "exclude": [
+@@ -4361,6 +4368,17 @@
+    "time_embed"
+   ],
+   "int8_family_convrot": {
++   "hunyuanvideo-1.5": [
++    256,
++    [
++     "attn.to_q",
++     "attn.to_k",
++     "attn.to_v",
++     "attn.to_out.0",
++     "ff.net.0.proj",
++     "ff.net.2"
++    ]
++   ],
+    "moss-image": [
+     256,
+     [
