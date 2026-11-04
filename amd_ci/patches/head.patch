@@ -1,3 +1,47 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 172fb79620..1443e982c5 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -135,6 +135,8 @@ from .diffusion_multigpu import (
+     install_cfg_parallel,
+     multigpu_mode,
+     invalidate_cfg_replica,
++    mirror_cfg_replica_adapter_scales,
++    set_cfg_parallel_fallback,
+     placement_status as multigpu_placement_status,
+     refine_plan_for_multigpu,
+     uninstall_cfg_parallel,
+@@ -10891,6 +10893,19 @@ class DiffusionBackend:
+                         transformer_quant = transformer_quant_engaged,
+                         logger = logger,
+                     )
++                    # CFG-parallel wins when armed (cfg_batch declines a wrapped forward); if its replica fails at
++                    # render time, CFG batching takes over from the next render instead of unbatched branches.
++                    set_cfg_parallel_fallback(
++                        pipe,
++                        functools.partial(
++                            install_cfg_batch,
++                            pipe,
++                            offload_policy = effective_policy,
++                            speed_mode = speed_mode,
++                            transformer_quant = transformer_quant_engaged,
++                            logger = logger,
++                        ),
++                    )
+                     # Z-Image guided steps at the guidance-off batch: turning CFG on compiles and records nothing new.
+                     # compiled_only: an eager denoiser keeps the batched guided call (no graph to protect).
+                     install_zimage_cfg_split(
+@@ -13127,7 +13142,9 @@ class DiffusionBackend:
+                 pipe._unsloth_loras = desired
+                 # A captured graph bakes the scales in.
+                 cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
+-                invalidate_cfg_replica(pipe, "the LoRA adapters changed", logger)
++                # Same adapters, new scales: the replica takes the scales; a rebuild only when they do not line up.
++                if not mirror_cfg_replica_adapter_scales(pipe, logger):
++                    invalidate_cfg_replica(pipe, "the LoRA adapters changed", logger)
+                 return
+         # Read before loading, so a file rewritten during the load reads as changed next time.
+         file_sigs = _lora_file_sigs(desired)
 diff --git a/studio/backend/core/inference/diffusion_device.py b/studio/backend/core/inference/diffusion_device.py
 index 127b041a0e..f95deda96c 100644
 --- a/studio/backend/core/inference/diffusion_device.py
@@ -32,7 +76,7 @@ index 127b041a0e..f95deda96c 100644
      """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
  
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..7f71191dc1 100644
+index 4ab7e593fd..b8a8e139fc 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
 @@ -52,6 +52,82 @@ def multigpu_mode() -> str:
@@ -206,7 +250,19 @@ index 4ab7e593fd..7f71191dc1 100644
          # source prefix-KV cache id -> (source cache, the tensors it held when copied, the replica's copy)
          self.kv_mirrors: dict[int, tuple[Any, list, Any]] = {}
          self.kv_declined: dict[int, tuple[Any, list]] = {}
-@@ -2495,6 +2614,7 @@ class CfgParallelRouter:
+@@ -2459,8 +2578,10 @@ class CfgParallelRouter:
+     def disable(self, reason: str) -> None:
+         if self.disabled_reason is None:
+             self.disabled_reason = reason
+-            if reason.startswith("replica "):
++            if reason.startswith("replica ") or "no longer idle" in reason or "carries hooks" in reason:
+                 self.stats["replica_failures"] += 1
++                # the load's CFG batching lever takes over after this render (end_cfg_render), not unbatched branches
++                self.fallback_pending = getattr(self, "fallback", None) is not None
+             if self.logger is not None:
+                 self.logger.warning(
+                     "diffusion.multigpu: CFG-parallel disabled (%s); one card from here", reason
+@@ -2495,6 +2616,7 @@ class CfgParallelRouter:
          self.prev_latent = None
          self.template = None
          self.b0_leaves = {}
@@ -214,7 +270,7 @@ index 4ab7e593fd..7f71191dc1 100644
          self.branch = 0
          # the next render shows its own guidance shape: no speculative branch before its first odd call
          self.cfg_seen = False
-@@ -2564,6 +2684,15 @@ class CfgParallelRouter:
+@@ -2564,6 +2686,15 @@ class CfgParallelRouter:
                  self._prefetch(args, kwargs)
                  sig = _call_signature(args, kwargs)
                  self._launch_prediction(latent, sig)
@@ -230,7 +286,7 @@ index 4ab7e593fd..7f71191dc1 100644
          prefill = self.branch % 2 == 1 and _is_prefill(kwargs)
          if (
              self.branch % 2 == 1
-@@ -2616,17 +2745,64 @@ class CfgParallelRouter:
+@@ -2616,17 +2747,64 @@ class CfgParallelRouter:
          self.stats["primary_calls"] += 1
          return self._primary_noting(sig, args, kwargs)
  
@@ -298,7 +354,7 @@ index 4ab7e593fd..7f71191dc1 100644
              return None
          self._drop_pending()
          self.template = None
-@@ -2859,6 +3035,11 @@ class CfgParallelRouter:
+@@ -2859,6 +3037,11 @@ class CfgParallelRouter:
                  t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
              ) // (1 << 20)
              free, total = self._secondary_free_total_mib()
@@ -310,7 +366,7 @@ index 4ab7e593fd..7f71191dc1 100644
              reserve = _replica_reserve_mib(free, total)
              if free is not None and need_mib + reserve > free:
                  raise RuntimeError(
-@@ -3013,10 +3194,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+@@ -3013,10 +3196,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
      return lambda: replica(*args, **kwargs)
  
  
@@ -457,7 +513,7 @@ index 4ab7e593fd..7f71191dc1 100644
  def cfg_parallel_decline(
      pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
  ) -> Optional[str]:
-@@ -3030,17 +3347,20 @@ def cfg_parallel_decline(
+@@ -3030,17 +3349,20 @@ def cfg_parallel_decline(
      # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
      if is_layer_split(pipe):
          return "denoiser is split across cards (layer split)"
@@ -481,7 +537,7 @@ index 4ab7e593fd..7f71191dc1 100644
          return "no DiT denoiser (a U-Net batches its guidance branches)"
      from .diffusion_layer_split import is_layer_split
  
-@@ -3057,7 +3377,8 @@ def cfg_parallel_decline(
+@@ -3057,7 +3379,8 @@ def cfg_parallel_decline(
          return "two-expert denoiser"
      if getattr(denoiser, "_compiled_call_impl", None) is not None:
          return "denoiser is compiled whole"
@@ -491,7 +547,7 @@ index 4ab7e593fd..7f71191dc1 100644
          return "denoiser is not on a CUDA card"
      return None
  
-@@ -3083,14 +3404,15 @@ def install_cfg_parallel(
+@@ -3083,14 +3406,15 @@ def install_cfg_parallel(
      offload_policy: str,
      logger: Any = None,
  ) -> Optional[str]:
@@ -512,7 +568,7 @@ index 4ab7e593fd..7f71191dc1 100644
          probes = probe_devices((selection.primary, *selection.secondaries))
          same = [
              o
-@@ -3100,6 +3422,21 @@ def install_cfg_parallel(
+@@ -3100,6 +3424,21 @@ def install_cfg_parallel(
              and probes[o].name == probes[primary.index].name
          ]
          candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
@@ -534,7 +590,7 @@ index 4ab7e593fd..7f71191dc1 100644
          try:
              placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
          except TypeError:
-@@ -3109,6 +3446,12 @@ def install_cfg_parallel(
+@@ -3109,6 +3448,12 @@ def install_cfg_parallel(
              candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
          if not candidates and occupied:
              reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
@@ -547,7 +603,7 @@ index 4ab7e593fd..7f71191dc1 100644
          elif not candidates:
              reason = "secondary card is a different model (bit-identity needs the same kernels)"
          else:
-@@ -3133,10 +3476,14 @@ def install_cfg_parallel(
+@@ -3133,10 +3478,14 @@ def install_cfg_parallel(
                  graph = _resident_graph(denoiser)
                  if graph is not None:
                      del denoiser.__dict__["forward"]
@@ -563,7 +619,7 @@ index 4ab7e593fd..7f71191dc1 100644
                  try:
                      _CFG_ROUTERS[pipe] = router
                  except TypeError:
-@@ -3147,8 +3494,10 @@ def install_cfg_parallel(
+@@ -3147,8 +3496,10 @@ def install_cfg_parallel(
                  denoiser._unsloth_cfg_router = router
                  if logger is not None:
                      logger.info(
@@ -575,12 +631,127 @@ index 4ab7e593fd..7f71191dc1 100644
                      )
                  return None
      if selection is not None:
+@@ -3183,6 +3534,45 @@ def invalidate_cfg_replica(
+     return True
+ 
+ 
++_ADAPTER_SCALE_ATTRS = ("scaling", "_active_adapter", "_disable_adapters")
++
++
++def mirror_cfg_replica_adapter_scales(pipe: Any, logger: Any = None) -> bool:
++    """After a LoRA weight-only change (``set_adapters`` on the same adapter set), copy each adapter layer's scales
++    and active-adapter state onto the CFG-parallel replica instead of dropping it. True when mirrored (the replica now
++    computes what the source does); False when there was nothing to mirror or the layers do not line up, in which case
++    the caller drops the replica as before."""
++    try:
++        router = _CFG_ROUTERS.get(pipe) if pipe is not None else None
++    except TypeError:
++        return False
++    if router is None or router.replica is None:
++        return False
++    module = router.module_ref()
++    if module is None:
++        return False
++    src = [(n, m) for n, m in module.named_modules() if isinstance(getattr(m, "scaling", None), dict)]
++    dst = dict(
++        (n, m) for n, m in router.replica.named_modules() if isinstance(getattr(m, "scaling", None), dict)
++    )
++    if not src or len(src) != len(dst):
++        return False
++    for name, layer in src:
++        copy_layer = dst.get(name)
++        if copy_layer is None or set(copy_layer.scaling) != set(layer.scaling):
++            return False  # a different adapter set: only a rebuild is right
++    for name, layer in src:
++        copy_layer = dst[name]
++        for attr in _ADAPTER_SCALE_ATTRS:
++            if attr in layer.__dict__:
++                value = layer.__dict__[attr]
++                copy_layer.__dict__[attr] = dict(value) if isinstance(value, dict) else copy.copy(value)
++    router.stats["adapter_scale_mirrors"] = router.stats.get("adapter_scale_mirrors", 0) + 1
++    if logger is not None:
++        logger.info("diffusion.multigpu: CFG-parallel replica kept; LoRA scales mirrored onto it (%d layers)", len(src))
++    return True
++
++
+ def _router_slot(module: Any, router: Any) -> Any:
+     """``module`` when ``router`` is its forward, the outer layer (static step skip) whose inner it is, else None."""
+     slot = module.__dict__.get("forward")
+@@ -3231,6 +3621,37 @@ def end_cfg_render(pipe: Any) -> None:
+         return
+     if router is not None:
+         router.end_render()
++        if getattr(router, "fallback_pending", False):
++            # The replica failed at render time: hand the denoiser to the fallback (CFG batching, #16261) between
++            # renders, never inside one. The render that failed finished on the source.
++            fallback, router.fallback, router.fallback_pending = router.fallback, None, False
++            reason = router.disabled_reason
++            uninstall_cfg_parallel(pipe)
++            try:
++                result = fallback()
++            except Exception as exc:  # noqa: BLE001 - an optional lever: one card stands
++                result = f"{type(exc).__name__}: {exc}"
++            if router.logger is not None:
++                router.logger.info(
++                    "diffusion.multigpu: CFG-parallel off after a render-time replica failure (%s); CFG batching %s",
++                    reason,
++                    "armed" if result is None else f"not armed ({result})",
++                )
++
++
++def set_cfg_parallel_fallback(pipe: Any, fallback: Callable[[], Optional[str]]) -> bool:
++    """Register the lever that replaces CFG-parallel when its replica fails at render time (CFG batching): called once,
++    after ``uninstall_cfg_parallel``, between renders; returns its decline reason or None when armed. True when a
++    router was armed to carry it."""
++    try:
++        router = _CFG_ROUTERS.get(pipe) if pipe is not None else None
++    except TypeError:
++        return False
++    if router is None:
++        return False
++    router.fallback = fallback
++    router.fallback_pending = False
++    return True
+ 
+ 
+ def release_cfg_prefix_kv(pipe: Any) -> None:
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..78c400b851 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -125,6 +125,7 @@ from .diffusion_multigpu import (
+     is_split as multigpu_is_split,
+     placement_status as multigpu_placement_status,
+     refine_plan_for_multigpu,
++    set_cfg_parallel_fallback,
+     uninstall_cfg_parallel,
+     with_load_selection,
+ )
+@@ -10522,6 +10523,18 @@ class VideoBackend:
+                 transformer_quant = transformer_quant_engaged,
+                 logger = logger,
+             )
++            # a render-time replica failure hands the denoiser to CFG batching from the next render
++            set_cfg_parallel_fallback(
++                pipe,
++                functools.partial(
++                    install_cfg_batch,
++                    pipe,
++                    offload_policy = offload_policy,
++                    speed_mode = speed_mode,
++                    transformer_quant = transformer_quant_engaged,
++                    logger = logger,
++                ),
++            )
+             # Opt-in (UNSLOTH_DIFFUSION_BG_COMPILE=1): off by default so the same seed twice repeats.
+             from . import diffusion_bg_compile as bg_compile
+ 
 diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
 new file mode 100644
-index 0000000000..3da833c2ec
+index 0000000000..113cc75478
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,382 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -811,6 +982,158 @@ index 0000000000..3da833c2ec
 +    router, _ = _router(model)
 +    _flux_loop(model, 2, 3, controlnet_block_samples = torch.ones(1))
 +    assert "unknown inputs" in router.stats["batch_split_skip"]
++
++
++# --- LoRA weight-only change: mirror the scales onto the replica instead of dropping it ---------------------------
++
++
++class _Pipe:
++    pass
++
++
++def _lora_model(seed = 0):
++    peft = pytest.importorskip("peft")
++    torch.manual_seed(seed)
++    model = FluxTransformer2DModel()
++    cfg = peft.LoraConfig(r = 4, lora_alpha = 4, target_modules = ["x", "t"], init_lora_weights = False)
++    peft.inject_adapter_in_model(cfg, model, adapter_name = "style")
++    return model
++
++
++def _set_scale(model, scale):
++    from peft.tuners.lora import LoraLayer
++
++    for mod in model.modules():
++        if isinstance(mod, LoraLayer):
++            mod.set_scale("style", scale)
++
++
++def _one_call(model):
++    g = torch.Generator().manual_seed(9)
++    x = torch.randn(2, 16, 8, generator = g)
++    return model(
++        hidden_states = x, encoder_hidden_states = torch.randn(2, 7, 6, generator = g),
++        pooled_projections = torch.randn(2, 12, generator = g), timestep = torch.ones(2), img_ids = torch.zeros(16, 3),
++        txt_ids = torch.zeros(7, 3), guidance = torch.ones(2), return_dict = False,
++    )[0]
++
++
++def test_weight_only_lora_change_mirrors_scales_onto_the_replica_bitwise():
++    model = _lora_model()
++    router, built = _router(model)
++    pipe = _Pipe()
++    mg._CFG_ROUTERS[pipe] = router
++    try:
++        router._build_replica()
++        replica = router.replica
++        assert replica is not None
++        _set_scale(model, 0.5)
++        assert mg.mirror_cfg_replica_adapter_scales(pipe)
++        assert router.replica is replica and router.stats["replica_rebuilds"] == 0
++        with torch.no_grad():
++            src = router.orig_forward(
++                hidden_states = torch.ones(2, 16, 8), encoder_hidden_states = torch.ones(2, 7, 6),
++                pooled_projections = torch.ones(2, 12), timestep = torch.ones(2), img_ids = torch.zeros(16, 3),
++                txt_ids = torch.zeros(7, 3), guidance = torch.ones(2), return_dict = False,
++            )[0]
++            rep = replica(
++                hidden_states = torch.ones(2, 16, 8), encoder_hidden_states = torch.ones(2, 7, 6),
++                pooled_projections = torch.ones(2, 12), timestep = torch.ones(2), img_ids = torch.zeros(16, 3),
++                txt_ids = torch.zeros(7, 3), guidance = torch.ones(2), return_dict = False,
++            )[0]
++        assert torch.equal(src, rep)
++        fresh = _lora_model()
++        _set_scale(fresh, 0.5)
++        with torch.no_grad():
++            assert torch.equal(_one_call(fresh), _one_call(router.replica))
++    finally:
++        mg._CFG_ROUTERS.pop(pipe, None)
++
++
++def test_a_changed_adapter_set_is_not_mirrored():
++    peft = pytest.importorskip("peft")
++    model = _lora_model()
++    router, _ = _router(model)
++    pipe = _Pipe()
++    mg._CFG_ROUTERS[pipe] = router
++    try:
++        router._build_replica()
++        cfg = peft.LoraConfig(r = 4, lora_alpha = 4, target_modules = ["x"], init_lora_weights = False)
++        peft.inject_adapter_in_model(cfg, model, adapter_name = "second")
++        assert not mg.mirror_cfg_replica_adapter_scales(pipe)
++        assert not mg.mirror_cfg_replica_adapter_scales(_Pipe())  # no router: nothing to mirror
++    finally:
++        mg._CFG_ROUTERS.pop(pipe, None)
++
++
++# --- replica failure at render time: CFG batching takes over from the next render --------------------------------
++
++
++def _cfg_steps(model, steps = 3):
++    g = torch.Generator().manual_seed(4)
++    latents = torch.randn(1, 16, 8, generator = g)
++    kw = dict(
++        encoder_hidden_states = torch.randn(1, 7, 6, generator = g), pooled_projections = torch.randn(1, 12, generator = g),
++        img_ids = torch.zeros(16, 3), txt_ids = torch.zeros(7, 3), guidance = torch.ones(1), return_dict = False,
++    )
++    for i in range(steps):
++        t = torch.full((1,), 1.0 - i / steps)
++        c = model(hidden_states = latents, timestep = t, **kw)[0]
++        u = model(hidden_states = latents, timestep = t, **kw)[0]
++        latents = latents - 0.1 * (u + 4.0 * (c - u))
++    return latents
++
++
++def test_render_time_replica_failure_hands_over_to_cfg_batching_between_renders():
++    torch.manual_seed(0)
++    ref = _cfg_steps(FluxTransformer2DModel())
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++
++    def boom():
++        raise RuntimeError("out of memory on cuda:1")
++
++    router = mg.CfgParallelRouter(model, primary = "cpu", secondary = "cpu", replica_factory = boom)
++    model.forward = router
++    pipe = _Pipe()
++    mg._CFG_ROUTERS[pipe] = router
++    calls = []
++    assert mg.set_cfg_parallel_fallback(pipe, lambda: calls.append("cfg_batch") or None)
++    out = _cfg_steps(model)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)  # the failing render finishes on the source
++    assert router.disabled_reason.startswith("replica unavailable")
++    assert calls == []  # never swapped inside a render
++    mg.end_cfg_render(pipe)
++    assert calls == ["cfg_batch"]
++    assert pipe not in mg._CFG_ROUTERS and "forward" not in model.__dict__  # router gone, cfg_batch can wrap it
++    mg.end_cfg_render(pipe)
++    assert calls == ["cfg_batch"]  # once
++
++
++def test_no_fallback_without_a_failure_and_none_registered():
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, _ = _router(model)
++    pipe = _Pipe()
++    mg._CFG_ROUTERS[pipe] = router
++    calls = []
++    mg.set_cfg_parallel_fallback(pipe, lambda: calls.append(1))
++    _cfg_steps(model)
++    mg.end_cfg_render(pipe)
++    assert calls == [] and mg._CFG_ROUTERS.get(pipe) is router
++    mg._CFG_ROUTERS.pop(pipe, None)
++    assert not mg.set_cfg_parallel_fallback(_Pipe(), lambda: None)
++
++
++def test_weight_only_lora_path_mirrors_before_it_would_drop_the_replica():
++    import inspect
++
++    from core.inference import diffusion
++
++    src = inspect.getsource(diffusion)
++    branch = src.split("if _lora_weights_only_change(")[1].split("# Read before loading")[0]
++    assert "mirror_cfg_replica_adapter_scales(pipe, logger)" in branch
++    assert branch.index("mirror_cfg_replica_adapter_scales") < branch.index("invalidate_cfg_replica")
 diff --git a/studio/backend/tests/test_diffusion_auto_placement.py b/studio/backend/tests/test_diffusion_auto_placement.py
 index 835ec3f4f4..c00cbf4f79 100644
 --- a/studio/backend/tests/test_diffusion_auto_placement.py
