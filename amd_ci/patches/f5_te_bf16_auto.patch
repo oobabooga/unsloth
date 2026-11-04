@@ -1,0 +1,390 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 172fb79620..f6c8b766cb 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -372,6 +372,9 @@ from .diffusion_precision import (
+     normalize_te_quant,
+     quantize_text_encoders,
+     resolve_te_quant_request,
++    TE_BF16_AUTO_REASON,
++    te_bf16_auto_wanted,
++    te_bf16_auto_fits,
+     te_quant_needs_resident_weights,
+     te_quant_supported,
+     te_quant_unsupported_reason,
+@@ -5490,9 +5493,24 @@ class DiffusionBackend:
+                 kwargs["text_encoder_quant"] = _te_quant_for_supplied_encoders(
+                     kwargs.get("text_encoder_quant")
+                 )
++            # An unset request on a family listed in TE_BF16_AUTO_FAMILIES keeps the bf16 encoder when the card has room
++            # for it with the denoiser resident; settled here, before the dense encoder shards would be skipped.
++            te_bf16_auto = (
++                not local_files_only
++                and not (component_overrides is not None and component_overrides.text_encoder_components)
++                and te_bf16_auto_wanted(
++                    kwargs.get("text_encoder_quant"),
++                    getattr(fam, "name", None),
++                    getattr(fam, "te_quant_auto", None),
++                    kind,
++                )
++                and self._te_bf16_auto_room(fam, base, kind, kwargs)
++            )
++            kwargs["_te_bf16_auto"] = te_bf16_auto
+             # Skip the dense shards the pre-cast encoder replaces, using the same resolver as the injection; kwargs keep the raw request.
+             te_quant_planned, _ = resolve_te_quant_request(
+-                kwargs.get("text_encoder_quant"), getattr(fam, "te_quant_auto", None)
++                "none" if te_bf16_auto else kwargs.get("text_encoder_quant"),
++                getattr(fam, "te_quant_auto", None),
+             )
+             te_prequant_files = {
+                 c: v
+@@ -8017,6 +8035,8 @@ class DiffusionBackend:
+         _pipeline_prequant_skipped: tuple[str, ...] = (),
+         _prequant_unreachable: tuple[str, ...] = (),
+         _te_prequant_resolved: bool = True,
++        # _run_load proved room for the bf16 encoder on an unset request (diffusion_precision.te_bf16_auto_fits).
++        _te_bf16_auto: bool = False,
+         _hosted_vae_planned: bool = False,
+         # begin_load's ``normalize_token`` of the request token: False stays the anonymous sentinel.
+         _hub_token: Any = None,
+@@ -8054,6 +8074,14 @@ class DiffusionBackend:
+         text_encoder_quant, text_encoder_quant_auto = resolve_te_quant_request(
+             text_encoder_quant, getattr(fam, "te_quant_auto", None)
+         )
++        te_bf16_auto_engaged = bool(_te_bf16_auto and text_encoder_quant_auto)
++        if te_bf16_auto_engaged:
++            logger.info(
++                "diffusion.text_encoder_quant: bf16 kept automatically for %s instead of '%s' (room on the card)",
++                fam.name,
++                text_encoder_quant,
++            )
++            text_encoder_quant, text_encoder_quant_auto = None, False
+         if text_encoder_quant_auto:
+             logger.info(
+                 "diffusion.text_encoder_quant: '%s' selected automatically for %s (unset request)",
+@@ -10792,6 +10820,11 @@ class DiffusionBackend:
+                                     te_quant,
+                                     auto = text_encoder_quant_auto,
+                                     family = fam.name,
++                                )
++                                + (
++                                    f"; {TE_BF16_AUTO_REASON}"
++                                    if te_bf16_auto_engaged and te_quant is None
++                                    else ""
+                                 ),
+                                 te_outcome.status,
+                             ),
+@@ -12003,6 +12036,84 @@ class DiffusionBackend:
+             text_encoder_quant = text_encoder_quant,
+         )
+ 
++    def _te_bf16_auto_room(self, fam: Any, base: str, kind: str, kwargs: dict) -> bool:
++        """Whether this card holds the load with the bf16 text encoder, everything resident, plus the margin
++        (te_bf16_auto_fits). Priced on the denoiser the dense-encoder plan would seed (bf16 table when it seeds none),
++        with this process's own reservation credited as free like _seed_plan_stays_resident. Unanswerable keeps int8."""
++        try:
++            memory_mode = kwargs.get("memory_mode")
++            cpu_offload = bool(kwargs.get("cpu_offload"))
++            gpu_ordinal = kwargs.get("gpu_ordinal")
++            fetch_base = prefer_ungated_mirror(base, kwargs.get("hf_token"))
++            scheme = self._pipeline_planned_denoiser_scheme(
++                fam,
++                base = base,
++                kind = kind,
++                transformer_quant = kwargs.get("transformer_quant"),
++                speed_mode = kwargs.get("speed_mode"),
++                memory_mode = memory_mode,
++                cpu_offload = cpu_offload,
++                loras = kwargs.get("loras"),
++                transformer_prequant_path = kwargs.get("transformer_prequant_path"),
++                gpu_ordinal = gpu_ordinal,
++                repo_id = kwargs["repo_id"],
++                fast_accum = kwargs.get("transformer_quant_fast_accum"),
++                text_encoder_quant = None,
++            )
++            with diffusion_device_scope(gpu_ordinal):
++                target = self._target_for_ordinal(fam, gpu_ordinal)
++                memory = snapshot_device_memory(target)
++                if getattr(target, "device", None) == "cuda" and memory.free_mib is not None:
++                    import torch
++
++                    free = int(memory.free_mib) + int(torch.cuda.memory_reserved()) // (1024 * 1024)
++                    if memory.total_mib is not None:
++                        free = min(free, int(memory.total_mib))
++                    memory = DeviceMemory(
++                        memory.backend, memory.device, memory.memory_kind, free, memory.total_mib
++                    )
++                base_local_dir = base if _is_local_path(base) else None
++                if scheme not in (None, PIPELINE_SEED_DECLINED):
++                    plan = self._seeded_pipeline_plan(
++                        scheme,
++                        target,
++                        base,
++                        fam,
++                        memory_mode,
++                        cpu_offload,
++                        repo_id = kwargs["repo_id"],
++                        base_local_dir = base_local_dir,
++                        fetch_base = fetch_base,
++                        device_memory_override = memory,
++                        text_encoder_quant = None,
++                    )
++                else:
++                    plan = self._bf16_table_plan(
++                        target,
++                        fam,
++                        base,
++                        memory_mode,
++                        cpu_offload,
++                        kind = kind,
++                        repo_id = kwargs["repo_id"],
++                        fetch_base = fetch_base,
++                        base_local_dir = base_local_dir,
++                        text_encoder_quant = None,
++                        device_memory_override = memory,
++                    )
++            fits, why = te_bf16_auto_fits(plan)
++        except Exception as exc:  # noqa: BLE001 - an optional upgrade must not fail the load
++            logger.debug("diffusion.text_encoder_quant: bf16 room preview skipped: %r", exc)
++            return False
++        logger.info(
++            "diffusion.text_encoder_quant: bf16 encoder %s for %s (%s, denoiser seed %s)",
++            "kept" if fits else "not kept",
++            getattr(fam, "name", None),
++            why,
++            scheme,
++        )
++        return fits
++
+     def _seed_plan_stays_resident(
+         self, scheme: str, target: Any, *args: Any, **kwargs: Any
+     ) -> bool:
+diff --git a/studio/backend/core/inference/diffusion_precision.py b/studio/backend/core/inference/diffusion_precision.py
+index 201c54b50b..120240437b 100644
+--- a/studio/backend/core/inference/diffusion_precision.py
++++ b/studio/backend/core/inference/diffusion_precision.py
+@@ -97,6 +97,61 @@ def resolve_te_quant_request(
+     return (AutoTeQuant(scheme) if scheme is not None else None), True
+ 
+ 
++# Families whose automatic int8 encoder is the larger share of the default load's error AND whose bf16 encoder costs no
++# speed once resident. qwen-image (Qwen2.5-VL-7B, 2512, 16 prompts, G4, LPIPS vs the bf16 pipeline): int8 ConvRot
++# encoder 0.087 mean, bf16 encoder 0.059 at the same s/img, +6.1 GiB resident.
++TE_BF16_AUTO_FAMILIES = frozenset({"qwen-image"})
++TE_BF16_AUTO_ENV = "UNSLOTH_DIFFUSION_TE_BF16_AUTO"
++TE_BF16_AUTO_REASON = "bf16 text encoder kept automatically: the denoiser stays resident with room for it"
++
++
++def te_bf16_auto_enabled() -> bool:
++    import os
++
++    return os.environ.get(TE_BF16_AUTO_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
++
++
++def te_bf16_auto_wanted(
++    raw_request: Optional[str], family: Optional[str], auto_scheme: Optional[str], kind: Optional[str]
++) -> bool:
++    """Whether an unset / auto text-encoder request may be upgraded to the bf16 encoder (room still to be proven).
++    An explicit pick (none, off, fp8, int8, ...) always wins, as does the kill switch."""
++    if not te_bf16_auto_enabled() or not te_quant_is_auto(raw_request):
++        return False
++    if kind != "pipeline" or (family or "").lower() not in TE_BF16_AUTO_FAMILIES:
++        return False
++    return normalize_te_quant(auto_scheme) == TE_QUANT_INT8
++
++
++def te_bf16_auto_margin_mib(required_mib: int) -> int:
++    return max(512, int(required_mib) // 10)
++
++
++def te_bf16_auto_fits(plan: Any) -> tuple[bool, str]:
++    """``plan`` is priced with the bf16 encoder on this card's free memory. Engage only when it keeps everything
++    resident on one discrete card with ``max(512 MiB, 10%)`` of the requirement still free."""
++    if plan is None:
++        return False, "no plan"
++    from .diffusion_memory import OFFLOAD_NONE
++
++    if getattr(plan, "offload_policy", None) != OFFLOAD_NONE:
++        return False, f"plan offloads ({getattr(plan, 'offload_policy', None)})"
++    if getattr(plan, "stream_text_encoders", False) or getattr(plan, "secondary_ordinal", None) is not None:
++        return False, "plan streams or splits"
++    memory = getattr(plan, "device_memory", None)
++    if getattr(memory, "memory_kind", None) != "discrete_vram":
++        return False, f"memory kind {getattr(memory, 'memory_kind', None)}"
++    estimates = getattr(plan, "estimates", None) or {}
++    required = estimates.get("resident_required_mib")
++    budget = estimates.get("safe_device_budget_mib")
++    if required is None or budget is None:
++        return False, "unsized plan"
++    margin = te_bf16_auto_margin_mib(required)
++    if int(required) + margin > int(budget):
++        return False, f"needs {int(required)} + {margin} MiB, budget {int(budget)} MiB"
++    return True, f"needs {int(required)} + {margin} MiB, budget {int(budget)} MiB"
++
++
+ def effective_te_quant(mode: Optional[str], family: Optional[str]) -> Optional[str]:
+     """An explicit int8 on a family with no keep-bf16 schedule becomes fp8 before support is checked."""
+     normalized = normalize_te_quant(mode)
+diff --git a/studio/backend/tests/test_diffusion_te_bf16_auto.py b/studio/backend/tests/test_diffusion_te_bf16_auto.py
+new file mode 100644
+index 0000000000..9f173969ba
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_te_bf16_auto.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""An unset text-encoder request on qwen-image keeps the bf16 encoder when the card holds the whole load resident
++with room to spare, and the int8 ConvRot file otherwise. Explicit picks and the kill switch always win."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++from core.inference import diffusion_precision as prec
++from core.inference.diffusion_memory import (
++    OFFLOAD_GROUP,
++    OFFLOAD_NONE,
++    DeviceMemory,
++)
++
++
++@pytest.fixture(autouse = True)
++def _no_kill_switch(monkeypatch):
++    monkeypatch.delenv(prec.TE_BF16_AUTO_ENV, raising = False)
++
++
++@pytest.mark.parametrize(
++    "raw, family, auto_scheme, kind, expected",
++    [
++        (None, "qwen-image", "int8", "pipeline", True),
++        ("auto", "qwen-image", "int8", "pipeline", True),
++        ("", "qwen-image", "int8", "pipeline", True),
++        ("none", "qwen-image", "int8", "pipeline", False),
++        ("off", "qwen-image", "int8", "pipeline", False),
++        ("int8", "qwen-image", "int8", "pipeline", False),
++        ("fp8", "qwen-image", "int8", "pipeline", False),
++        (None, "qwen-image", "fp8", "pipeline", False),
++        (None, "qwen-image", None, "pipeline", False),
++        (None, "qwen-image", "int8", "gguf", False),
++        (None, "qwen-image", "int8", "single_file", False),
++        (None, "flux.3-klein", "int8", "pipeline", False),
++        (None, "qwen-image-edit", "int8", "pipeline", False),
++    ],
++)
++def test_wanted_table(raw, family, auto_scheme, kind, expected):
++    assert prec.te_bf16_auto_wanted(raw, family, auto_scheme, kind) is expected
++
++
++@pytest.mark.parametrize("value", ["0", "false", "off", "no"])
++def test_kill_switch(monkeypatch, value):
++    monkeypatch.setenv(prec.TE_BF16_AUTO_ENV, value)
++    assert prec.te_bf16_auto_wanted(None, "qwen-image", "int8", "pipeline") is False
++
++
++def _plan(required, budget, *, policy = OFFLOAD_NONE, kind = "discrete_vram", stream = False, secondary = None):
++    return types.SimpleNamespace(
++        offload_policy = policy,
++        stream_text_encoders = stream,
++        secondary_ordinal = secondary,
++        device_memory = types.SimpleNamespace(memory_kind = kind),
++        estimates = {"resident_required_mib": required, "safe_device_budget_mib": budget},
++    )
++
++
++@pytest.mark.parametrize(
++    "plan, expected",
++    [
++        (None, False),
++        (_plan(50_000, 90_000), True),
++        # Margin is 10% above 5120 MiB of requirement: 50000 + 5000 is the edge.
++        (_plan(50_000, 55_000), True),
++        (_plan(50_000, 54_999), False),
++        # And 512 MiB below it.
++        (_plan(4_000, 4_512), True),
++        (_plan(4_000, 4_511), False),
++        (_plan(50_000, 90_000, policy = OFFLOAD_GROUP), False),
++        (_plan(50_000, 90_000, stream = True), False),
++        (_plan(50_000, 90_000, secondary = 1), False),
++        (_plan(50_000, 90_000, kind = "unified_memory"), False),
++        (_plan(None, 90_000), False),
++        (_plan(50_000, None), False),
++    ],
++)
++def test_fits_table(plan, expected):
++    assert prec.te_bf16_auto_fits(plan)[0] is expected
++
++
++GIB = 1024
++
++
++@pytest.fixture
++def backend(monkeypatch):
++    """The real planners on a stub card: only the memory reading, the device and the Hub probes are faked."""
++    import torch
++
++    from core.inference import diffusion as dmod
++    from core.inference import diffusion_auto_policy as ap
++    from core.inference import diffusion_memory as mem
++    from core.inference import diffusion_transformer_quant as tq
++
++    monkeypatch.setattr(mem, "_installed_torchao_version", lambda: (0, 18))
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (12, 0))
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_a, **_k: 0)
++    monkeypatch.setattr(tq, "_scheme_supported", lambda scheme, device = None, unproven_ok = False: scheme in ("int8", "fp8"))
++    monkeypatch.setattr(tq, "_is_consumer_gpu", lambda *_a, **_k: True)
++    monkeypatch.setattr(ap, "_hf_cache_free_mib", lambda: 10**7)
++    card: dict = {}
++    for module in (dmod, mem):
++        for fn in ("snapshot_device_memory", "settled_snapshot_device_memory", "reclaimable_snapshot_device_memory"):
++            if hasattr(module, fn):
++                monkeypatch.setattr(module, fn, lambda *_a, **_k: card["memory"])
++    target = types.SimpleNamespace(
++        device = "cuda",
++        dtype = torch.bfloat16,
++        backend = "cuda",
++        supports_model_cpu_offload = True,
++        supports_default_torch_compile = True,
++        ordinal = None,
++        capability = (12, 0),
++    )
++    b = dmod.DiffusionBackend.__new__(dmod.DiffusionBackend)
++    b._resolve_device_target = lambda *_a, **_k: target
++    b._target_for_ordinal = lambda *_a, **_k: target
++    b._cache_bytes = lambda *_a, **_k: 0
++    b._released_transformer_cached = lambda *_a, **_k: False
++    # The seed probe reads the Hub; the bf16-table branch is the one an unseeded default load prices.
++    b._pipeline_planned_denoiser_scheme = lambda *_a, **_k: card.get("seed")
++
++    def room(gib: int, seed = None) -> bool:
++        from core.inference.diffusion_families import _FAMILIES
++
++        fam = next(f for f in _FAMILIES if f.name == "qwen-image")
++        base = "Qwen/Qwen-Image-2512"
++        card["seed"] = seed
++        card["memory"] = DeviceMemory("cuda", "cuda", "discrete_vram", gib * GIB - 600, gib * GIB)
++        return b._te_bf16_auto_room(fam, base, "pipeline", {"repo_id": base})
++
++    return room
++
++
++def test_big_card_keeps_the_bf16_encoder_and_small_cards_do_not(backend):
++    # Qwen-Image 2512 bf16 DiT + bf16 Qwen2.5-VL-7B + VAE priced from the family table (~64 GiB with activations):
++    # 80 and 96 GiB cards hold it with the margin; smaller cards would offload, so they keep the int8 ConvRot file.
++    assert backend(96) is True
++    assert backend(80) is True
++    assert backend(64) is False
++    assert backend(24) is False
++
++
++
++def test_seeded_int8_denoiser_is_priced_on_its_artifact(backend):
++    # The default G4 load seeds the hosted int8 denoiser: ~47 GiB with the bf16 encoder, so 64 GiB keeps it and a
++    # 56 GiB card, where the int8 encoder load is still resident, does not.
++    assert backend(96, "int8") is True
++    assert backend(64, "int8") is True
++    assert backend(56, "int8") is False
++    assert backend(24, "int8") is False
