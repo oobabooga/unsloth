@@ -18,10 +18,10 @@ jobs:
           free -h
           lspci -nn | grep -iE 'vga|display|processing accelerator' || true
           ls /sys/class/drm/ || true
-          for c in /sys/class/drm/card*/device; do echo "$c"; cat "$c/mem_info_vram_total" "$c/mem_info_gtt_total" 2>/dev/null; done
+          for c in /sys/class/drm/card[0-9]/device; do echo "$c vram_total=$(cat "$c/mem_info_vram_total" 2>/dev/null) gtt_total=$(cat "$c/mem_info_gtt_total" 2>/dev/null)"; done
           ls /usr/share/vulkan/icd.d/ /etc/vulkan/icd.d/ 2>/dev/null || true
           vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverName|apiVersion' || echo "no vulkaninfo"
-          df -h "$RUNNER_TEMP"
+          df -h "$RUNNER_TEMP" || true
       - name: Vulkan driver
         run: |
           if ls /usr/share/vulkan/icd.d/ 2>/dev/null | grep -qi radeon; then echo "RADV present"; exit 0; fi
