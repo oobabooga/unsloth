@@ -18,7 +18,7 @@ permissions:
 env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # base = origin/main when the branch was cut; head = base + amd_ci/patches/head.patch (empty = base itself)
-  BASE_SHA: "eb648c2047b73d9ae900399dafd5accd38d1daeb"
+  BASE_SHA: "c917be4918481eb09f1aaa249a5face769f99170"
 
 jobs:
 

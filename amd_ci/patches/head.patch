@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
-index 172fb79620..1443e982c5 100644
+index 40caed79a4..35aed730ee 100644
 --- a/studio/backend/core/inference/diffusion.py
 +++ b/studio/backend/core/inference/diffusion.py
 @@ -135,6 +135,8 @@ from .diffusion_multigpu import (
@@ -11,7 +11,7 @@ index 172fb79620..1443e982c5 100644
      placement_status as multigpu_placement_status,
      refine_plan_for_multigpu,
      uninstall_cfg_parallel,
-@@ -10891,6 +10893,19 @@ class DiffusionBackend:
+@@ -10893,6 +10895,19 @@ class DiffusionBackend:
                          transformer_quant = transformer_quant_engaged,
                          logger = logger,
                      )
@@ -31,7 +31,7 @@ index 172fb79620..1443e982c5 100644
                      # Z-Image guided steps at the guidance-off batch: turning CFG on compiles and records nothing new.
                      # compiled_only: an eager denoiser keeps the batched guided call (no graph to protect).
                      install_zimage_cfg_split(
-@@ -13127,7 +13142,9 @@ class DiffusionBackend:
+@@ -13129,7 +13144,9 @@ class DiffusionBackend:
                  pipe._unsloth_loras = desired
                  # A captured graph bakes the scales in.
                  cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
@@ -76,7 +76,7 @@ index 127b041a0e..f95deda96c 100644
      """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
  
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..f91c92bbe1 100644
+index 4ab7e593fd..d6a2f86063 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
 @@ -52,6 +52,82 @@ def multigpu_mode() -> str:
@@ -208,13 +208,14 @@ index 4ab7e593fd..f91c92bbe1 100644
  def best_secondary(
      selection: MultiGpuSelection,
      probes: Optional[dict[int, DeviceProbe]] = None,
-@@ -648,6 +740,118 @@ def _one_card_rejection(plan: Any, primary: int) -> PlacementCandidate:
+@@ -648,6 +740,145 @@ def _one_card_rejection(plan: Any, primary: int) -> PlacementCandidate:
      )
  
  
-+# Automatic keeps one card when streaming the denoiser is hidden behind its compute: a layer split adds no parallelism
-+# (its blocks run one card after the other), so it only removes the stream, and below this exposed share the cards'
-+# own speed spread (T4s 10% apart under the same load) decides instead.
++# Automatic placement order: one card (plus a second-card copy for guided steps / even batches) before a layer split,
++# when a copy fits and streaming the denoiser on one card is hidden behind its compute: a layer split adds no
++# parallelism (its blocks run one card after the other), so it only removes the stream, and below this exposed share
++# the cards' own speed spread (T4s 10% apart under the same load) decides instead.
 +STREAM_HIDDEN_FRACTION = 0.05
 +STREAM_GATE_ENV = "UNSLOTH_DIFFUSION_SPLIT_STREAM_GATE"
 +_GEMM_PROBES: dict = {}
@@ -280,6 +281,15 @@ index 4ab7e593fd..f91c92bbe1 100644
 +        return None
 +    if getattr(plan, "offload_policy", None) != "group":
 +        return None
++    denoiser_cls = type(getattr(pipe, "transformer", None)).__name__
++    if denoiser_cls not in _DIT_BATCH_SPLIT_KWARGS:
++        # Only where a second-card copy can serve every kind of request this family runs (an even batch splits, a
++        # guided step pairs): elsewhere (Z-Image, measured 2.3-3.1x faster split) the split stays as on main.
++        return None
++    partner = _copy_partner(pipe, selection)
++    if partner is None:
++        # the copy does not fit an idle same-model card: the split stays (FLUX.2-klein-9B: 0-14% faster split)
++        return None
 +    try:
 +        from .diffusion_memory import _COST_CANVAS_PX, _offload_cost_measurements
 +
@@ -315,10 +325,27 @@ index 4ab7e593fd..f91c92bbe1 100644
 +    if exposed >= STREAM_HIDDEN_FRACTION:
 +        return None
 +    return (
-+        f"streaming is hidden behind compute: {_gib(streamed)} streamed per step in {transfer:.2f} s against "
-+        f"{compute:.2f} s of compute ({exposed:.0%} exposed at {_COST_CANVAS_PX}px), so a split would not be faster "
-+        f"than one card; {STREAM_GATE_ENV}=0 tries it"
++        f"one card plus a copy on cuda:{partner}: streaming is hidden behind compute ({_gib(streamed)} per step in "
++        f"{transfer:.2f} s against {compute:.2f} s, {exposed:.0%} exposed at {_COST_CANVAS_PX}px), so a split would "
++        f"not be faster, while the copy splits even batches and guided steps; {STREAM_GATE_ENV}=0 tries the split"
 +    )
++
++
++def _copy_partner(pipe: Any, selection: Any) -> Optional[int]:
++    """The idle same-model card a whole copy of the denoiser fits on (:func:`automatic_partner`), or None. Sized from
++    nvidia-smi for the secondaries, so no context is opened on them."""
++    try:
++        denoiser = getattr(pipe, "transformer", None)
++        need = sum(t.numel() * t.element_size() for t in (*denoiser.parameters(), *denoiser.buffers())) >> 20
++        probes = probe_devices((selection.primary, *selection.secondaries))
++        primary = probes.get(int(selection.primary))
++        cards = [probes[o] for o in selection.secondaries if probes.get(o) is not None and probes[o].free_mib is not None]
++        if primary is None:
++            return None
++        pick, _why = automatic_partner(primary, cards, need)
++        return pick
++    except Exception:  # noqa: BLE001 - unsized: the split is tried as before
++        return None
 +
 +
 +_STREAM_ESTIMATES: "weakref.WeakKeyDictionary[Any, dict]" = weakref.WeakKeyDictionary()
@@ -327,7 +354,7 @@ index 4ab7e593fd..f91c92bbe1 100644
  def refine_plan_for_multigpu(
      pipe: Any,
      plan: Any,
-@@ -763,6 +967,19 @@ def refine_plan_for_multigpu(
+@@ -763,6 +994,19 @@ def refine_plan_for_multigpu(
          rejected.append(_one_card_rejection(plan, primary))
  
      def layer_split_or_plan() -> Any:
@@ -347,7 +374,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          refined = refine_plan_for_layer_split(
              pipe,
              plan,
-@@ -1034,6 +1251,29 @@ def _module_device(module: Any) -> Any:
+@@ -1034,6 +1278,29 @@ def _module_device(module: Any) -> Any:
      return None
  
  
@@ -377,7 +404,7 @@ index 4ab7e593fd..f91c92bbe1 100644
  def _device_context(device: Any):
      torch = _torch()
      if getattr(device, "type", None) == "cuda" and device.index is not None:
-@@ -1336,6 +1576,12 @@ def placement_status(pipe: Any) -> Optional[dict[str, Any]]:
+@@ -1336,6 +1603,12 @@ def placement_status(pipe: Any) -> Optional[dict[str, Any]]:
      if info is None and cfg is None and declined is None and layer is None and decision is None:
          return None
      out: dict[str, Any] = dict(info or {})
@@ -390,7 +417,7 @@ index 4ab7e593fd..f91c92bbe1 100644
      from .diffusion_layer_split import layer_split_stats
  
      live = {
-@@ -2425,7 +2671,11 @@ class CfgParallelRouter:
+@@ -2425,7 +2698,11 @@ class CfgParallelRouter:
              "kv_cache_declined": 0,
              "kv_prefill_primary_calls": 0,
              "replica_failures": 0,
@@ -402,7 +429,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          # source prefix-KV cache id -> (source cache, the tensors it held when copied, the replica's copy)
          self.kv_mirrors: dict[int, tuple[Any, list, Any]] = {}
          self.kv_declined: dict[int, tuple[Any, list]] = {}
-@@ -2459,8 +2709,10 @@ class CfgParallelRouter:
+@@ -2459,8 +2736,10 @@ class CfgParallelRouter:
      def disable(self, reason: str) -> None:
          if self.disabled_reason is None:
              self.disabled_reason = reason
@@ -414,7 +441,7 @@ index 4ab7e593fd..f91c92bbe1 100644
              if self.logger is not None:
                  self.logger.warning(
                      "diffusion.multigpu: CFG-parallel disabled (%s); one card from here", reason
-@@ -2495,6 +2747,7 @@ class CfgParallelRouter:
+@@ -2495,6 +2774,7 @@ class CfgParallelRouter:
          self.prev_latent = None
          self.template = None
          self.b0_leaves = {}
@@ -422,7 +449,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          self.branch = 0
          # the next render shows its own guidance shape: no speculative branch before its first odd call
          self.cfg_seen = False
-@@ -2564,6 +2817,15 @@ class CfgParallelRouter:
+@@ -2564,6 +2844,15 @@ class CfgParallelRouter:
                  self._prefetch(args, kwargs)
                  sig = _call_signature(args, kwargs)
                  self._launch_prediction(latent, sig)
@@ -438,7 +465,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          prefill = self.branch % 2 == 1 and _is_prefill(kwargs)
          if (
              self.branch % 2 == 1
-@@ -2616,17 +2878,64 @@ class CfgParallelRouter:
+@@ -2616,17 +2905,64 @@ class CfgParallelRouter:
          self.stats["primary_calls"] += 1
          return self._primary_noting(sig, args, kwargs)
  
@@ -506,7 +533,7 @@ index 4ab7e593fd..f91c92bbe1 100644
              return None
          self._drop_pending()
          self.template = None
-@@ -2859,6 +3168,11 @@ class CfgParallelRouter:
+@@ -2859,6 +3195,11 @@ class CfgParallelRouter:
                  t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
              ) // (1 << 20)
              free, total = self._secondary_free_total_mib()
@@ -518,7 +545,7 @@ index 4ab7e593fd..f91c92bbe1 100644
              reserve = _replica_reserve_mib(free, total)
              if free is not None and need_mib + reserve > free:
                  raise RuntimeError(
-@@ -3013,10 +3327,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+@@ -3013,10 +3354,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
      return lambda: replica(*args, **kwargs)
  
  
@@ -665,7 +692,7 @@ index 4ab7e593fd..f91c92bbe1 100644
  def cfg_parallel_decline(
      pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
  ) -> Optional[str]:
-@@ -3030,17 +3480,20 @@ def cfg_parallel_decline(
+@@ -3030,17 +3507,20 @@ def cfg_parallel_decline(
      # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
      if is_layer_split(pipe):
          return "denoiser is split across cards (layer split)"
@@ -689,7 +716,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          return "no DiT denoiser (a U-Net batches its guidance branches)"
      from .diffusion_layer_split import is_layer_split
  
-@@ -3057,7 +3510,8 @@ def cfg_parallel_decline(
+@@ -3057,7 +3537,8 @@ def cfg_parallel_decline(
          return "two-expert denoiser"
      if getattr(denoiser, "_compiled_call_impl", None) is not None:
          return "denoiser is compiled whole"
@@ -699,7 +726,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          return "denoiser is not on a CUDA card"
      return None
  
-@@ -3083,14 +3537,15 @@ def install_cfg_parallel(
+@@ -3083,14 +3564,15 @@ def install_cfg_parallel(
      offload_policy: str,
      logger: Any = None,
  ) -> Optional[str]:
@@ -720,7 +747,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          probes = probe_devices((selection.primary, *selection.secondaries))
          same = [
              o
-@@ -3100,6 +3555,21 @@ def install_cfg_parallel(
+@@ -3100,6 +3582,21 @@ def install_cfg_parallel(
              and probes[o].name == probes[primary.index].name
          ]
          candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
@@ -742,7 +769,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          try:
              placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
          except TypeError:
-@@ -3109,6 +3579,12 @@ def install_cfg_parallel(
+@@ -3109,6 +3606,12 @@ def install_cfg_parallel(
              candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
          if not candidates and occupied:
              reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
@@ -755,7 +782,7 @@ index 4ab7e593fd..f91c92bbe1 100644
          elif not candidates:
              reason = "secondary card is a different model (bit-identity needs the same kernels)"
          else:
-@@ -3133,10 +3609,14 @@ def install_cfg_parallel(
+@@ -3133,10 +3636,14 @@ def install_cfg_parallel(
                  graph = _resident_graph(denoiser)
                  if graph is not None:
                      del denoiser.__dict__["forward"]
@@ -771,7 +798,7 @@ index 4ab7e593fd..f91c92bbe1 100644
                  try:
                      _CFG_ROUTERS[pipe] = router
                  except TypeError:
-@@ -3147,8 +3627,10 @@ def install_cfg_parallel(
+@@ -3147,8 +3654,10 @@ def install_cfg_parallel(
                  denoiser._unsloth_cfg_router = router
                  if logger is not None:
                      logger.info(
@@ -783,7 +810,7 @@ index 4ab7e593fd..f91c92bbe1 100644
                      )
                  return None
      if selection is not None:
-@@ -3183,6 +3665,50 @@ def invalidate_cfg_replica(
+@@ -3183,6 +3692,50 @@ def invalidate_cfg_replica(
      return True
  
  
@@ -834,7 +861,7 @@ index 4ab7e593fd..f91c92bbe1 100644
  def _router_slot(module: Any, router: Any) -> Any:
      """``module`` when ``router`` is its forward, the outer layer (static step skip) whose inner it is, else None."""
      slot = module.__dict__.get("forward")
-@@ -3231,6 +3757,37 @@ def end_cfg_render(pipe: Any) -> None:
+@@ -3231,6 +3784,37 @@ def end_cfg_render(pipe: Any) -> None:
          return
      if router is not None:
          router.end_render()
@@ -873,7 +900,7 @@ index 4ab7e593fd..f91c92bbe1 100644
  
  def release_cfg_prefix_kv(pipe: Any) -> None:
 diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
-index b9317f62ff..78c400b851 100644
+index e9a92ef312..20620691bc 100644
 --- a/studio/backend/core/inference/video.py
 +++ b/studio/backend/core/inference/video.py
 @@ -125,6 +125,7 @@ from .diffusion_multigpu import (
@@ -884,7 +911,7 @@ index b9317f62ff..78c400b851 100644
      uninstall_cfg_parallel,
      with_load_selection,
  )
-@@ -10522,6 +10523,18 @@ class VideoBackend:
+@@ -10526,6 +10527,18 @@ class VideoBackend:
                  transformer_quant = transformer_quant_engaged,
                  logger = logger,
              )
@@ -905,10 +932,10 @@ index b9317f62ff..78c400b851 100644
  
 diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
 new file mode 100644
-index 0000000000..f380df7e20
+index 0000000000..e000ec5872
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,455 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1335,15 +1362,25 @@ index 0000000000..f380df7e20
 +        automatic = False
 +
 +    class Pipe:
++        transformer = FluxTransformer2DModel().half()
++
++    class Other:
 +        transformer = torch.nn.Linear(64, 64).half()
 +
 +    sizes = {"transformer": (8 * 1024, "dit")}
 +    from core.inference import diffusion_memory as dm
 +
 +    monkeypatch.setattr(dm, "_offload_cost_measurements", lambda: (11.0, 10.0))
++    monkeypatch.setattr(mg, "_copy_partner", lambda pipe, sel: 1)
++    monkeypatch.setattr(mg, "_gemm_tflops", lambda o, d: 1e-9)
++    # a family whose copy cannot serve its requests (no batch split): the split stays
++    assert mg._hidden_stream_reason(Other(), Plan(), sizes, Sel()) is None
 +    monkeypatch.setattr(mg, "_gemm_tflops", lambda o, d: 1e-9)  # compute dominates: hidden
 +    pipe = Pipe()
 +    assert "hidden behind compute" in mg._hidden_stream_reason(pipe, Plan(), sizes, Sel())
++    monkeypatch.setattr(mg, "_copy_partner", lambda pipe, sel: None)  # the copy does not fit: the split stays
++    assert mg._hidden_stream_reason(pipe, Plan(), sizes, Sel()) is None
++    monkeypatch.setattr(mg, "_copy_partner", lambda pipe, sel: 1)
 +    assert mg._hidden_stream_reason(pipe, Plan(), sizes, Explicit()) is None
 +    capacity = Plan()
 +    capacity.offload_policy = "sequential"
