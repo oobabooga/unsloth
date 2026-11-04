@@ -144,6 +144,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -m pip install -q diffusers transformers accelerate safetensors numpy pillow psutil
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # the backend conftest imports Studio's own deps (httpx, structlog, ...): the head's requirements, best effort,
+          # then the ones the selected tests are known to need
+          & $py -m pip install -q -r "$env:AMD_CI_WORK\states\head\studio\backend\requirements\studio.txt"
+          & $py -m pip install -q httpx structlog fastapi pydantic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "import torch, diffusers; print(torch.__version__, diffusers.__version__)"
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # If the change needs a ROCm torch, install it here and then re-gate with
