@@ -76,7 +76,7 @@ index 127b041a0e..f95deda96c 100644
      """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
  
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..40998ff655 100644
+index 4ab7e593fd..f91c92bbe1 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
 @@ -52,6 +52,82 @@ def multigpu_mode() -> str:
@@ -208,7 +208,146 @@ index 4ab7e593fd..40998ff655 100644
  def best_secondary(
      selection: MultiGpuSelection,
      probes: Optional[dict[int, DeviceProbe]] = None,
-@@ -1034,6 +1126,29 @@ def _module_device(module: Any) -> Any:
+@@ -648,6 +740,118 @@ def _one_card_rejection(plan: Any, primary: int) -> PlacementCandidate:
+     )
+ 
+ 
++# Automatic keeps one card when streaming the denoiser is hidden behind its compute: a layer split adds no parallelism
++# (its blocks run one card after the other), so it only removes the stream, and below this exposed share the cards'
++# own speed spread (T4s 10% apart under the same load) decides instead.
++STREAM_HIDDEN_FRACTION = 0.05
++STREAM_GATE_ENV = "UNSLOTH_DIFFUSION_SPLIT_STREAM_GATE"
++_GEMM_PROBES: dict = {}
++
++
++def _gemm_tflops(device_index: int, dtype: Any) -> Optional[float]:
++    """Dense GEMM TFLOPS of ``device_index`` in ``dtype`` (the denoiser's compute dtype: fp16 on a T4, where bf16 runs
++    emulated), best of a few runs, cached."""
++    key = (int(device_index), str(dtype))
++    if key in _GEMM_PROBES:
++        return _GEMM_PROBES[key]
++    result = None
++    try:
++        torch = _torch()
++        with torch.cuda.device(int(device_index)):
++            a = torch.randn(4096, 3072, dtype = dtype, device = "cuda")
++            b = torch.randn(3072, 3072, dtype = dtype, device = "cuda")
++            start, end = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
++            torch.mm(a, b)
++            torch.cuda.synchronize()
++            best = float("inf")
++            for _ in range(3):
++                start.record()
++                for _ in range(10):
++                    torch.mm(a, b)
++                end.record()
++                end.synchronize()
++                best = min(best, start.elapsed_time(end) / 10)
++            del a, b
++        if best > 0:
++            result = 2.0 * 4096 * 3072 * 3072 / (best / 1000.0) / 1e12
++    except Exception:  # noqa: BLE001 - unmeasurable: no gate
++        result = None
++    _GEMM_PROBES[key] = result
++    return result
++
++
++def stream_exposure(
++    streamed_mib: int, dense_params: float, *, h2d_gib_s: float, tflops: float, side_px: int = 1024
++) -> tuple[float, float, float]:
++    """(transfer s, compute s, exposed share) of one denoise step streaming ``streamed_mib`` while computing a DiT of
++    ``dense_params`` parameters at ``side_px``. Exposed share = time the step waits on the stream / step time. Pure."""
++    from .diffusion_memory import _DIT_COMPUTE_EFFICIENCY, _DIT_PIXELS_PER_TOKEN
++
++    transfer = max(0, int(streamed_mib)) / 1024.0 / max(float(h2d_gib_s), 1e-6)
++    tokens = (int(side_px) // _DIT_PIXELS_PER_TOKEN) ** 2
++    compute = _DIT_COMPUTE_EFFICIENCY * 2.0 * float(dense_params) * tokens / (max(float(tflops), 1e-6) * 1e12)
++    step = max(transfer, compute)
++    exposed = max(0.0, transfer - compute) / step if step > 0 else 0.0
++    return transfer, compute, exposed
++
++
++def _hidden_stream_reason(pipe: Any, plan: Any, sizes: dict, selection: Any) -> Optional[str]:
++    """Why Automatic keeps the one-card streamed plan instead of a layer split, or None (try the split as before).
++
++    Only for an automatic selection whose one-card plan streams the denoiser in groups (a capacity plan such as
++    sequential / whole-module offload keeps the split), priced at Studio's cost canvas from this card's measured
++    pinned H2D bandwidth and its GEMM throughput in the denoiser's dtype. ``UNSLOTH_DIFFUSION_SPLIT_STREAM_GATE=0``
++    restores the old choice."""
++    if not getattr(selection, "automatic", False):
++        return None
++    if (os.environ.get(STREAM_GATE_ENV) or "").strip().lower() in ("0", "off", "false", "no"):
++        return None
++    if getattr(plan, "offload_policy", None) != "group":
++        return None
++    try:
++        from .diffusion_memory import _COST_CANVAS_PX, _offload_cost_measurements
++
++        measured = _offload_cost_measurements()
++        denoiser = getattr(pipe, "transformer", None)
++        if measured is None or denoiser is None:
++            return None
++        dtype = next((p.dtype for p in denoiser.parameters() if p.is_floating_point()), None)
++        dtype = getattr(denoiser, "dtype", None) or dtype
++        if dtype is None or not getattr(dtype, "is_floating_point", False) or dtype.itemsize < 2:
++            dtype = _torch().float16
++        if dtype == _torch().float32:
++            dtype = _torch().float16
++        tflops = _gemm_tflops(int(selection.primary), dtype)
++        if tflops is None:
++            return None
++        dit = _denoiser_mib(sizes)
++        resident = int(getattr(plan, "resident_transformer_mib", None) or 0)
++        streamed = max(0, dit - resident)
++        params = sum(p.numel() for p in denoiser.parameters())
++        transfer, compute, exposed = stream_exposure(
++            streamed, params, h2d_gib_s = measured[0], tflops = tflops, side_px = _COST_CANVAS_PX
++        )
++    except Exception:  # noqa: BLE001 - unpriced: the split is tried as before
++        return None
++    try:
++        _STREAM_ESTIMATES[pipe] = {
++            "streamed_mib": streamed, "h2d_gib_s": round(measured[0], 2), "tflops": round(tflops, 1),
++            "transfer_s": round(transfer, 3), "compute_s": round(compute, 3), "exposed": round(exposed, 3),
++        }
++    except TypeError:
++        pass
++    if exposed >= STREAM_HIDDEN_FRACTION:
++        return None
++    return (
++        f"streaming is hidden behind compute: {_gib(streamed)} streamed per step in {transfer:.2f} s against "
++        f"{compute:.2f} s of compute ({exposed:.0%} exposed at {_COST_CANVAS_PX}px), so a split would not be faster "
++        f"than one card; {STREAM_GATE_ENV}=0 tries it"
++    )
++
++
++_STREAM_ESTIMATES: "weakref.WeakKeyDictionary[Any, dict]" = weakref.WeakKeyDictionary()
++
++
+ def refine_plan_for_multigpu(
+     pipe: Any,
+     plan: Any,
+@@ -763,6 +967,19 @@ def refine_plan_for_multigpu(
+         rejected.append(_one_card_rejection(plan, primary))
+ 
+     def layer_split_or_plan() -> Any:
++        hidden = None if layer_force else _hidden_stream_reason(pipe, plan, sizes, selection)
++        if hidden is not None:
++            rejected.append(PlacementCandidate("layer_split", hidden))
++            _record_decision(
++                pipe,
++                selection,
++                "offload",
++                f"one card with '{plan.offload_policy}' offload on cuda:{primary} ({hidden})",
++                rejected,
++            )
++            if logger is not None:
++                logger.info("diffusion.multigpu: layer split not used (%s)", hidden)
++            return plan
+         refined = refine_plan_for_layer_split(
+             pipe,
+             plan,
+@@ -1034,6 +1251,29 @@ def _module_device(module: Any) -> Any:
      return None
  
  
@@ -238,7 +377,20 @@ index 4ab7e593fd..40998ff655 100644
  def _device_context(device: Any):
      torch = _torch()
      if getattr(device, "type", None) == "cuda" and device.index is not None:
-@@ -2425,7 +2540,11 @@ class CfgParallelRouter:
+@@ -1336,6 +1576,12 @@ def placement_status(pipe: Any) -> Optional[dict[str, Any]]:
+     if info is None and cfg is None and declined is None and layer is None and decision is None:
+         return None
+     out: dict[str, Any] = dict(info or {})
++    try:
++        stream = _STREAM_ESTIMATES.get(pipe)
++    except TypeError:
++        stream = None
++    if stream is not None:
++        out["stream_estimate"] = dict(stream)
+     from .diffusion_layer_split import layer_split_stats
+ 
+     live = {
+@@ -2425,7 +2671,11 @@ class CfgParallelRouter:
              "kv_cache_declined": 0,
              "kv_prefill_primary_calls": 0,
              "replica_failures": 0,
@@ -250,7 +402,7 @@ index 4ab7e593fd..40998ff655 100644
          # source prefix-KV cache id -> (source cache, the tensors it held when copied, the replica's copy)
          self.kv_mirrors: dict[int, tuple[Any, list, Any]] = {}
          self.kv_declined: dict[int, tuple[Any, list]] = {}
-@@ -2459,8 +2578,10 @@ class CfgParallelRouter:
+@@ -2459,8 +2709,10 @@ class CfgParallelRouter:
      def disable(self, reason: str) -> None:
          if self.disabled_reason is None:
              self.disabled_reason = reason
@@ -262,7 +414,7 @@ index 4ab7e593fd..40998ff655 100644
              if self.logger is not None:
                  self.logger.warning(
                      "diffusion.multigpu: CFG-parallel disabled (%s); one card from here", reason
-@@ -2495,6 +2616,7 @@ class CfgParallelRouter:
+@@ -2495,6 +2747,7 @@ class CfgParallelRouter:
          self.prev_latent = None
          self.template = None
          self.b0_leaves = {}
@@ -270,7 +422,7 @@ index 4ab7e593fd..40998ff655 100644
          self.branch = 0
          # the next render shows its own guidance shape: no speculative branch before its first odd call
          self.cfg_seen = False
-@@ -2564,6 +2686,15 @@ class CfgParallelRouter:
+@@ -2564,6 +2817,15 @@ class CfgParallelRouter:
                  self._prefetch(args, kwargs)
                  sig = _call_signature(args, kwargs)
                  self._launch_prediction(latent, sig)
@@ -286,7 +438,7 @@ index 4ab7e593fd..40998ff655 100644
          prefill = self.branch % 2 == 1 and _is_prefill(kwargs)
          if (
              self.branch % 2 == 1
-@@ -2616,17 +2747,64 @@ class CfgParallelRouter:
+@@ -2616,17 +2878,64 @@ class CfgParallelRouter:
          self.stats["primary_calls"] += 1
          return self._primary_noting(sig, args, kwargs)
  
@@ -354,7 +506,7 @@ index 4ab7e593fd..40998ff655 100644
              return None
          self._drop_pending()
          self.template = None
-@@ -2859,6 +3037,11 @@ class CfgParallelRouter:
+@@ -2859,6 +3168,11 @@ class CfgParallelRouter:
                  t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
              ) // (1 << 20)
              free, total = self._secondary_free_total_mib()
@@ -366,7 +518,7 @@ index 4ab7e593fd..40998ff655 100644
              reserve = _replica_reserve_mib(free, total)
              if free is not None and need_mib + reserve > free:
                  raise RuntimeError(
-@@ -3013,10 +3196,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+@@ -3013,10 +3327,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
      return lambda: replica(*args, **kwargs)
  
  
@@ -513,7 +665,7 @@ index 4ab7e593fd..40998ff655 100644
  def cfg_parallel_decline(
      pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
  ) -> Optional[str]:
-@@ -3030,17 +3349,20 @@ def cfg_parallel_decline(
+@@ -3030,17 +3480,20 @@ def cfg_parallel_decline(
      # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
      if is_layer_split(pipe):
          return "denoiser is split across cards (layer split)"
@@ -537,7 +689,7 @@ index 4ab7e593fd..40998ff655 100644
          return "no DiT denoiser (a U-Net batches its guidance branches)"
      from .diffusion_layer_split import is_layer_split
  
-@@ -3057,7 +3379,8 @@ def cfg_parallel_decline(
+@@ -3057,7 +3510,8 @@ def cfg_parallel_decline(
          return "two-expert denoiser"
      if getattr(denoiser, "_compiled_call_impl", None) is not None:
          return "denoiser is compiled whole"
@@ -547,7 +699,7 @@ index 4ab7e593fd..40998ff655 100644
          return "denoiser is not on a CUDA card"
      return None
  
-@@ -3083,14 +3406,15 @@ def install_cfg_parallel(
+@@ -3083,14 +3537,15 @@ def install_cfg_parallel(
      offload_policy: str,
      logger: Any = None,
  ) -> Optional[str]:
@@ -568,7 +720,7 @@ index 4ab7e593fd..40998ff655 100644
          probes = probe_devices((selection.primary, *selection.secondaries))
          same = [
              o
-@@ -3100,6 +3424,21 @@ def install_cfg_parallel(
+@@ -3100,6 +3555,21 @@ def install_cfg_parallel(
              and probes[o].name == probes[primary.index].name
          ]
          candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
@@ -590,7 +742,7 @@ index 4ab7e593fd..40998ff655 100644
          try:
              placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
          except TypeError:
-@@ -3109,6 +3448,12 @@ def install_cfg_parallel(
+@@ -3109,6 +3579,12 @@ def install_cfg_parallel(
              candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
          if not candidates and occupied:
              reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
@@ -603,7 +755,7 @@ index 4ab7e593fd..40998ff655 100644
          elif not candidates:
              reason = "secondary card is a different model (bit-identity needs the same kernels)"
          else:
-@@ -3133,10 +3478,14 @@ def install_cfg_parallel(
+@@ -3133,10 +3609,14 @@ def install_cfg_parallel(
                  graph = _resident_graph(denoiser)
                  if graph is not None:
                      del denoiser.__dict__["forward"]
@@ -619,7 +771,7 @@ index 4ab7e593fd..40998ff655 100644
                  try:
                      _CFG_ROUTERS[pipe] = router
                  except TypeError:
-@@ -3147,8 +3496,10 @@ def install_cfg_parallel(
+@@ -3147,8 +3627,10 @@ def install_cfg_parallel(
                  denoiser._unsloth_cfg_router = router
                  if logger is not None:
                      logger.info(
@@ -631,7 +783,7 @@ index 4ab7e593fd..40998ff655 100644
                      )
                  return None
      if selection is not None:
-@@ -3183,6 +3534,50 @@ def invalidate_cfg_replica(
+@@ -3183,6 +3665,50 @@ def invalidate_cfg_replica(
      return True
  
  
@@ -682,7 +834,7 @@ index 4ab7e593fd..40998ff655 100644
  def _router_slot(module: Any, router: Any) -> Any:
      """``module`` when ``router`` is its forward, the outer layer (static step skip) whose inner it is, else None."""
      slot = module.__dict__.get("forward")
-@@ -3231,6 +3626,37 @@ def end_cfg_render(pipe: Any) -> None:
+@@ -3231,6 +3757,37 @@ def end_cfg_render(pipe: Any) -> None:
          return
      if router is not None:
          router.end_render()
@@ -753,10 +905,10 @@ index b9317f62ff..78c400b851 100644
  
 diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
 new file mode 100644
-index 0000000000..385cf4c154
+index 0000000000..f380df7e20
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,445 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1146,6 +1298,62 @@ index 0000000000..385cf4c154
 +    branch = src.split("if _lora_weights_only_change(")[1].split("# Read before loading")[0]
 +    assert "mirror_cfg_replica_adapter_scales(pipe, logger)" in branch
 +    assert branch.index("mirror_cfg_replica_adapter_scales") < branch.index("invalidate_cfg_replica")
++
++
++# --- layer split only where streaming is exposed ------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "streamed_mib, params, h2d, tflops, side, expect_hidden",
++    [
++        # FLUX.1-dev int8 on a T4: about 7 GiB streamed per step at ~11 GiB/s against 12B params of compute at 1024px
++        (7 * 1024, 12e9, 11.0, 40.0, 1024, True),
++        # the same model at 512px: still hidden (about 3% exposed)
++        (7 * 1024, 12e9, 11.0, 40.0, 512, True),
++        # a small DiT streaming most of its weights (Z-Image-Turbo at 512px): exposed
++        (10 * 1024, 6e9, 11.0, 40.0, 512, False),
++        # nothing streamed: hidden
++        (0, 9e9, 11.0, 40.0, 1024, True),
++    ],
++)
++def test_stream_exposure_table(streamed_mib, params, h2d, tflops, side, expect_hidden):
++    transfer, compute, exposed = mg.stream_exposure(streamed_mib, params, h2d_gib_s = h2d, tflops = tflops, side_px = side)
++    assert (exposed < mg.STREAM_HIDDEN_FRACTION) is expect_hidden
++    assert 0.0 <= exposed <= 1.0 and transfer >= 0 and compute > 0
++
++
++def test_split_gate_applies_only_to_automatic_group_plans(monkeypatch):
++    class Plan:
++        offload_policy = "group"
++        resident_transformer_mib = 1024
++
++    class Sel:
++        automatic = True
++        primary = 0
++
++    class Explicit(Sel):
++        automatic = False
++
++    class Pipe:
++        transformer = torch.nn.Linear(64, 64).half()
++
++    sizes = {"transformer": (8 * 1024, "dit")}
++    from core.inference import diffusion_memory as dm
++
++    monkeypatch.setattr(dm, "_offload_cost_measurements", lambda: (11.0, 10.0))
++    monkeypatch.setattr(mg, "_gemm_tflops", lambda o, d: 1e-9)  # compute dominates: hidden
++    pipe = Pipe()
++    assert "hidden behind compute" in mg._hidden_stream_reason(pipe, Plan(), sizes, Sel())
++    assert mg._hidden_stream_reason(pipe, Plan(), sizes, Explicit()) is None
++    capacity = Plan()
++    capacity.offload_policy = "sequential"
++    assert mg._hidden_stream_reason(pipe, capacity, sizes, Sel()) is None
++    monkeypatch.setenv(mg.STREAM_GATE_ENV, "0")
++    assert mg._hidden_stream_reason(pipe, Plan(), sizes, Sel()) is None
++    monkeypatch.delenv(mg.STREAM_GATE_ENV)
++    monkeypatch.setattr(mg, "_gemm_tflops", lambda o, d: 1e9)  # compute negligible: exposed, split tried
++    assert mg._hidden_stream_reason(pipe, Plan(), sizes, Sel()) is None
++    assert mg._STREAM_ESTIMATES[pipe]["exposed"] > 0.9
 diff --git a/studio/backend/tests/test_diffusion_auto_placement.py b/studio/backend/tests/test_diffusion_auto_placement.py
 index 835ec3f4f4..c00cbf4f79 100644
 --- a/studio/backend/tests/test_diffusion_auto_placement.py
