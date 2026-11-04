@@ -76,7 +76,7 @@ index 127b041a0e..f95deda96c 100644
      """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
  
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..b8a8e139fc 100644
+index 4ab7e593fd..40998ff655 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
 @@ -52,6 +52,82 @@ def multigpu_mode() -> str:
@@ -631,7 +631,7 @@ index 4ab7e593fd..b8a8e139fc 100644
                      )
                  return None
      if selection is not None:
-@@ -3183,6 +3534,45 @@ def invalidate_cfg_replica(
+@@ -3183,6 +3534,50 @@ def invalidate_cfg_replica(
      return True
  
  
@@ -668,6 +668,11 @@ index 4ab7e593fd..b8a8e139fc 100644
 +            if attr in layer.__dict__:
 +                value = layer.__dict__[attr]
 +                copy_layer.__dict__[attr] = dict(value) if isinstance(value, dict) else copy.copy(value)
++    try:
++        # the fingerprint covers adapter scales: record the new ones as the replica's, else the next step rebuilds it
++        router.fingerprint = weights_fingerprint(module)
++    except Exception:  # noqa: BLE001 - unverifiable: drop the replica as before
++        return False
 +    router.stats["adapter_scale_mirrors"] = router.stats.get("adapter_scale_mirrors", 0) + 1
 +    if logger is not None:
 +        logger.info("diffusion.multigpu: CFG-parallel replica kept; LoRA scales mirrored onto it (%d layers)", len(src))
@@ -677,7 +682,7 @@ index 4ab7e593fd..b8a8e139fc 100644
  def _router_slot(module: Any, router: Any) -> Any:
      """``module`` when ``router`` is its forward, the outer layer (static step skip) whose inner it is, else None."""
      slot = module.__dict__.get("forward")
-@@ -3231,6 +3621,37 @@ def end_cfg_render(pipe: Any) -> None:
+@@ -3231,6 +3626,37 @@ def end_cfg_render(pipe: Any) -> None:
          return
      if router is not None:
          router.end_render()
@@ -748,10 +753,10 @@ index b9317f62ff..78c400b851 100644
  
 diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
 new file mode 100644
-index 0000000000..113cc75478
+index 0000000000..385cf4c154
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,389 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1046,6 +1051,13 @@ index 0000000000..113cc75478
 +        _set_scale(fresh, 0.5)
 +        with torch.no_grad():
 +            assert torch.equal(_one_call(fresh), _one_call(router.replica))
++        # a guided render after the change keeps the same replica (no rebuild) and matches a one-card fresh load
++        with torch.no_grad():
++            out = _cfg_steps(model)
++            fresh_out = _cfg_steps(fresh)
++        assert router.replica is replica and router.stats["replica_rebuilds"] == 0
++        assert router.stats["replica_calls"] >= 2
++        assert torch.equal(out, fresh_out)
 +    finally:
 +        mg._CFG_ROUTERS.pop(pipe, None)
 +
