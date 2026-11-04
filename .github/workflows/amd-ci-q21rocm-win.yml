@@ -143,6 +143,10 @@ jobs:
           # install_python_stack.py _select_torchao_spec: torch 2.11 -> torchao 0.17.0 (no-deps keeps ROCm torch)
           & $py -m pip install -q --no-deps "torchao==0.17.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Studio installs unsloth_zoo; diffusion_patch_backend.apply_patch needs it (no-deps keeps ROCm torch).
+          & $py -m pip install -q --no-deps "unsloth_zoo"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'avail', torch.cuda.is_available()); print(torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else 'no device'); import importlib.util as u; print('triton', u.find_spec('triton') is not None)"
           & $py "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --require windows rocm gpu --expect-arch gfx1151 `
             --out "$env:AMD_CI_WORK\out\host.json"
@@ -159,7 +163,7 @@ jobs:
           Push-Location (Join-Path $states.paths.head "studio\backend")
           & $env:AMD_CI_PY -m pytest -vv --tb=long -p no:cacheprovider tests/test_diffusion_rocm_fused.py::test_teardown_survives_a_later_eager_layer tests/test_diffusion_convrot.py::test_loader_installs_the_rotation_the_checkpoint_records tests/test_diffusion_convrot.py::test_loader_leaves_a_plain_checkpoint_alone 2>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\diag_win.log"
           & $env:AMD_CI_PY -m pytest -q -p no:cacheprovider tests/test_diffusion_rocm_fused.py 2>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\diag_rocm_fused_alone.log"
-          & $env:AMD_CI_PY -c "import torchao, diffusers, transformers, sys; print(torchao.__version__, diffusers.__version__, transformers.__version__, sys.version)" 2>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\diag_versions.log"
+          & $env:AMD_CI_PY -c "import torchao, diffusers, transformers, sys; from core.inference.diffusion_patch_backend import _helper; print('zoo patch helper', _helper('patch')); print(torchao.__version__, diffusers.__version__, transformers.__version__, sys.version)" 2>&1 | Out-File -Encoding utf8 "$env:AMD_CI_WORK\out\diag_versions.log"
           Pop-Location
           exit 0
 
