@@ -1,4 +1,4 @@
-name: "AMD CI (Windows): eb648c2047 vs eb648c2047 + three CFG-parallel fixes"
+name: "AMD CI (Windows): eb648c2047 vs eb648c2047 + CFG-parallel fixes 1-4"
 
 # Generated from amd_ci/templates/workflow_windows.yml by scaffold.py --windows, then the states step
 # swapped for a fixed base SHA plus amd_ci/patches/head.patch (no PR exists for the head yet), and the
@@ -164,7 +164,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/pytest_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/pytest_no_regression.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --tests tests/test_diffusion_unet_cfg_parallel.py tests/test_diffusion_multigpu.py tests/test_diffusion_auto_placement.py
+            --python "$env:AMD_CI_PY" -- --tests tests/test_diffusion_unet_cfg_parallel.py tests/test_diffusion_multigpu.py tests/test_diffusion_auto_placement.py tests/test_diffusion_auto_multigpu_policy.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
