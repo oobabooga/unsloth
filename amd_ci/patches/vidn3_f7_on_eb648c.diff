@@ -1,0 +1,222 @@
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..9ab593d44b 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -2302,6 +2302,45 @@ def _video_index_repo(base: str, *, local_files_only: bool = False) -> str:
+     return mirror
+ 
+ 
++def _video_offline_pinned_snapshot(
++    base: Optional[str], fetch_repo: Optional[str] = None
++) -> Optional[tuple[str, str]]:
++    """``(repo, commit)`` of the one cached pipeline snapshot of ``base``'s mirror pair (``fetch_repo`` first) when
++    that repo has no ``refs/main``: a fetch pinned to a commit writes only ``snapshots/<commit>``, which an unpinned
++    offline lookup cannot resolve. None when a repo has ``refs/main`` (it resolves as is), when no or several
++    snapshots hold a pipeline index (ambiguous), or for a local path."""
++    from .diffusion_families import _is_local_path, mirror_repo
++
++    repos: list[str] = []
++    for repo in (fetch_repo, base, mirror_repo(base)):
++        if repo and not _is_local_path(repo) and repo.lower() not in [r.lower() for r in repos]:
++            repos.append(repo)
++    root = Path(hub_cache_dir())
++    found: list[tuple[str, str]] = []
++    for repo in repos:
++        folder = root / ("models--" + repo.replace("/", "--"))
++        if not folder.is_dir():
++            continue
++        if (folder / "refs" / "main").is_file():
++            return None
++        snaps = folder / "snapshots"
++        if not snaps.is_dir():
++            continue
++        holding = [
++            d.name
++            for d in snaps.iterdir()
++            if d.is_dir()
++            and any(
++                (d / name).is_file() for name in ("model_index.json", "modular_model_index.json")
++            )
++        ]
++        if len(holding) > 1:
++            return None
++        if holding:
++            found.append((repo, holding[0]))
++    return found[0] if len(found) == 1 else None
++
++
+ def _video_offline_cache_miss(exc: BaseException) -> bool:
+     return isinstance(exc, OSError) or bool(getattr(exc, "cache_miss", False))
+ 
+@@ -5856,6 +5895,26 @@ class VideoBackend:
+                 if base_fetch_choice
+                 else (base_plan.revision if base_plan is not None else None)
+             )
++            if (
++                kwargs["_base_fetch_revision"] is None
++                and base_local is None
++                and not local_files_only
++                and kind == "pipeline"
++                and hub_reachability.hub_unreachable()
++            ):
++                # A plan-pinned fetch writes snapshots/<commit> and no refs/main, so with no plan (the Hub is down)
++                # neither the cached check nor from_pretrained could find the snapshot by "main". Pin the one cached
++                # snapshot instead; the checks below still refuse it when it is incomplete.
++                pinned_snapshot = _video_offline_pinned_snapshot(
++                    base, kwargs.get("_base_fetch_repo")
++                )
++                if pinned_snapshot is not None:
++                    kwargs["_base_fetch_repo"], kwargs["_base_fetch_revision"] = pinned_snapshot
++                    logger.info(
++                        "video.hub_unreachable: %s has one cached snapshot (%s) and no refs/main; pinning it",
++                        pinned_snapshot[0],
++                        pinned_snapshot[1][:12],
++                    )
+             from .safetensors_pread import pread_safetensors
+ 
+             from .diffusion_families import pinned_repo_revision
+diff --git a/studio/backend/tests/test_video_offline_pinned_snapshot.py b/studio/backend/tests/test_video_offline_pinned_snapshot.py
+new file mode 100644
+index 0000000000..655b3f491f
+--- /dev/null
++++ b/studio/backend/tests/test_video_offline_pinned_snapshot.py
+@@ -0,0 +1,139 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""A returning video load while the Hub is down, on a cache a plan-pinned fetch wrote: the snapshot sits under
++snapshots/<commit> with no refs/main (the Kaggle T4 fp16 route fetches the Wan 5B mirror pinned to its commit), so
++an unpinned offline lookup of "main" finds nothing. The load pins the one cached snapshot instead."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++pytest.importorskip("torch")
++
++MIRROR = "unsloth/Wan2.2-TI2V-5B-FP8"
++UPSTREAM = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
++SHA = "78dce9f849d0bda6fd9c5f174240a76cb295fa09"
++INDEX = {
++    "_class_name": "WanPipeline",
++    "scheduler": ["diffusers", "UniPCMultistepScheduler"],
++    "text_encoder": ["transformers", "UMT5EncoderModel"],
++    "tokenizer": ["transformers", "T5TokenizerFast"],
++    "transformer": ["diffusers", "WanTransformer3DModel"],
++    "vae": ["diffusers", "AutoencoderKLWan"],
++}
++
++
++def _snapshot(
++    cache,
++    repo,
++    sha,
++    *,
++    tokenizer = True,
++    ref = False,
++):
++    folder = cache / ("models--" + repo.replace("/", "--"))
++    snap = folder / "snapshots" / sha
++    (snap / "scheduler").mkdir(parents = True)
++    (snap / "model_index.json").write_text(json.dumps(INDEX))
++    (snap / "scheduler" / "scheduler_config.json").write_text("{}")
++    if tokenizer:
++        (snap / "tokenizer").mkdir()
++        (snap / "tokenizer" / "tokenizer_config.json").write_text("{}")
++        (snap / "tokenizer" / "tokenizer.json").write_text('{"model": {}}')
++    if ref:
++        (folder / "refs").mkdir(parents = True)
++        (folder / "refs" / "main").write_text(sha)
++    return snap
++
++
++@pytest.fixture
++def cache(tmp_path, monkeypatch):
++    from core.inference import hub_reachability
++    from core.inference import video as V
++
++    monkeypatch.setattr(V, "hub_cache_dir", lambda: str(tmp_path))
++    monkeypatch.setattr(hub_reachability, "hub_unreachable", lambda *a, **k: True)
++    return tmp_path
++
++
++def _family():
++    from core.inference.video_families import detect_video_family
++    return detect_video_family("wan2.2-ti2v-5b")
++
++
++def test_the_one_pinned_snapshot_without_refs_main_is_used(cache):
++    from core.inference import video as V
++
++    _snapshot(cache, MIRROR, SHA)
++    assert V._video_offline_pinned_snapshot(UPSTREAM, MIRROR) == (MIRROR, SHA)
++    assert V._video_offline_pinned_snapshot(UPSTREAM) == (
++        MIRROR,
++        SHA,
++    )  # found through the mirror pair
++
++
++def test_with_the_pin_the_cached_check_accepts_the_snapshot(cache):
++    """main passes revision=None here: refs/main is missing, the manifest is not found, the load goes online."""
++    from core.inference import video as V
++
++    _snapshot(cache, MIRROR, SHA)
++    fam = _family()
++    assert not V._video_cached_while_hub_unreachable(
++        None, MIRROR, None, None, revision = None, family = fam
++    )
++    repo, sha = V._video_offline_pinned_snapshot(UPSTREAM, MIRROR)
++    assert V._video_cached_while_hub_unreachable(None, repo, None, None, revision = sha, family = fam)
++
++
++def test_an_incomplete_pinned_snapshot_is_still_refused(cache):
++    from core.inference import video as V
++
++    _snapshot(cache, MIRROR, SHA, tokenizer = False)
++    repo, sha = V._video_offline_pinned_snapshot(UPSTREAM, MIRROR)
++    assert not V._video_cached_while_hub_unreachable(
++        None, repo, None, None, revision = sha, family = _family()
++    )
++
++
++def test_a_repo_with_refs_main_resolves_as_before(cache):
++    from core.inference import video as V
++    _snapshot(cache, MIRROR, SHA, ref = True)
++    assert V._video_offline_pinned_snapshot(UPSTREAM, MIRROR) is None
++
++
++def test_several_snapshots_are_ambiguous(cache):
++    from core.inference import video as V
++
++    _snapshot(cache, MIRROR, SHA)
++    _snapshot(cache, MIRROR, "0" * 40)
++    assert V._video_offline_pinned_snapshot(UPSTREAM, MIRROR) is None
++
++
++def test_both_sides_of_the_pair_cached_without_refs_is_ambiguous(cache):
++    from core.inference import video as V
++
++    _snapshot(cache, MIRROR, SHA)
++    _snapshot(cache, UPSTREAM, "1" * 40)
++    assert V._video_offline_pinned_snapshot(UPSTREAM, MIRROR) is None
++
++
++def test_nothing_cached_or_a_local_path(cache, tmp_path):
++    from core.inference import video as V
++    assert V._video_offline_pinned_snapshot(UPSTREAM, MIRROR) is None
++    assert V._video_offline_pinned_snapshot(str(tmp_path), None) is None
++
++
++def test_the_offline_snapshot_lookup_needs_the_commit(cache):
++    """The mechanism, on huggingface_hub itself: local_files_only with no revision looks for refs/main."""
++    from huggingface_hub import snapshot_download
++    from huggingface_hub.errors import LocalEntryNotFoundError
++
++    snap = _snapshot(cache, MIRROR, SHA)
++    with pytest.raises(LocalEntryNotFoundError):
++        snapshot_download(MIRROR, cache_dir = str(cache), local_files_only = True)
++    assert snapshot_download(
++        MIRROR, cache_dir = str(cache), local_files_only = True, revision = SHA
++    ) == str(snap)
