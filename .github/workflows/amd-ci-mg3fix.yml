@@ -143,7 +143,7 @@ jobs:
               tests/test_gpu_residency_coexistence.py tests/test_gpu_order_preserved.py \
               tests/test_offload_planner.py tests/test_video_fast_pin.py \
               tests/test_diffusion_unet_cfg_parallel.py tests/test_diffusion_auto_placement.py \
-              tests/test_diffusion_auto_multigpu_policy.py tests/test_diffusion_cfg_batch.py tests/test_diffusion_lora.py \
+              tests/test_diffusion_auto_multigpu_policy.py tests/test_diffusion_cfg_batch.py tests/test_diffusion_lora.py tests/test_diffusion_layer_split_plan.py \
               tests/test_system_poll_no_cuda_context.py tests/test_skipif_version_strings.py
           cat "$AMD_CI_WORK/out/tests/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/tests"
