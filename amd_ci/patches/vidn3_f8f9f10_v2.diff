@@ -1,0 +1,1418 @@
+diff --git a/studio/backend/core/inference/diffusion_cast_cache.py b/studio/backend/core/inference/diffusion_cast_cache.py
+index 46e8e15180..bf01c6578a 100644
+--- a/studio/backend/core/inference/diffusion_cast_cache.py
++++ b/studio/backend/core/inference/diffusion_cast_cache.py
+@@ -772,110 +772,214 @@ def save(
+                 logger, "info", f"{cand.component}: not cached (rescaled in place for fp16 decode)"
+             )
+             return None
+-        names = list(cand.names)
+         reader = _Reader(module, check)
+         why = _matches_source(cand, reader)
+         if why is not None:
+             _log(logger, "info", f"{cand.component}: not cached ({why})")
+             return None
+-        import torch
++        return _persist(cand, reader, logger = logger, t0 = t0)
++    except Exception as exc:  # noqa: BLE001 - a cache write never fails a load
++        _log(
++            logger,
++            "warning",
++            f"{cand.component}: save failed: {type(exc).__name__}: {str(exc)[:200]}",
++        )
++        return None
++
+ 
+-        nbytes = 0
+-        for _n, dtype, shape in names:
+-            count = 1
+-            for d in shape:
+-                count *= int(d)
+-            nbytes += count * torch.empty((), dtype = dtype).element_size()
+-        budget = _cache.max_cache_bytes()
+-        if budget is not None and nbytes > budget:
+-            _log(logger, "info", f"{cand.component}: not cached (larger than the cache budget)")
++def _persist(cand: CastCandidate, reader: Any, *, logger: Any = None, t0: float = 0.0) -> Optional[str]:
++    """Write ``cand.names`` through ``reader`` into the cast cache; returns the artifact path or None. Raises."""
++    import torch
++
++    root = _cache.cache_root()
++    names = list(cand.names)
++    nbytes = 0
++    for _n, dtype, shape in names:
++        count = 1
++        for d in shape:
++            count *= int(d)
++        nbytes += count * torch.empty((), dtype = dtype).element_size()
++    budget = _cache.max_cache_bytes()
++    if budget is not None and nbytes > budget:
++        _log(logger, "info", f"{cand.component}: not cached (larger than the cache budget)")
++        return None
++    with _cache._writer_lock(root, cand.key) as locked:
++        if not locked:
+             return None
+-        with _cache._writer_lock(root, cand.key) as locked:
+-            if not locked:
++        existing = _cache._entry(cand.key)
++        if existing is not None:
++            with _cache._lock:
++                rejected = os.path.realpath(str(existing)) in _cache._REJECTED
++            if not rejected:
+                 return None
+-            existing = _cache._entry(cand.key)
+-            if existing is not None:
+-                with _cache._lock:
+-                    rejected = os.path.realpath(str(existing)) in _cache._REJECTED
+-                if not rejected:
+-                    return None
+-                _cache._reclaim(root / cand.key)
+-            root.mkdir(parents = True, exist_ok = True)
+-            need = nbytes + max(_cache._DISK_MARGIN_BYTES, nbytes // 20)
++            _cache._reclaim(root / cand.key)
++        root.mkdir(parents = True, exist_ok = True)
++        need = nbytes + max(_cache._DISK_MARGIN_BYTES, nbytes // 20)
++        free = shutil.disk_usage(str(root)).free
++        if free < need:
++            _cache.evict(root = root, extra_free_bytes = need - free, keep = cand.key, logger = logger)
+             free = shutil.disk_usage(str(root)).free
+-            if free < need:
+-                _cache.evict(root = root, extra_free_bytes = need - free, keep = cand.key, logger = logger)
+-                free = shutil.disk_usage(str(root)).free
+-            if free < need:
+-                _log(
+-                    logger,
+-                    "info",
+-                    f"{cand.component}: not cached (disk short: {free / 2**30:.1f} GiB free, "
+-                    f"need {need / 2**30:.1f} GiB)",
+-                )
+-                return None
+-            source_bytes = sum(os.path.getsize(os.path.realpath(s)) for s in cand.shards)
+-            meta = {
+-                "key": cand.key,
+-                "component": cand.component,
+-                "class": cand.class_name,
+-                "dtype": cand.parts["dtype"],
+-                "source_gib": round(source_bytes / 2**30, 2),
+-                "torch_version": str(torch.__version__),
+-            }
+-            kdir = root / cand.key
+-            kdir.mkdir(parents = True, exist_ok = True)
+-            shutil.copyfile(cand.config_path, kdir / "config.json")
+-            fd, tmp = tempfile.mkstemp(
+-                dir = str(kdir), prefix = f".{_cache.FILE_NAME}.", suffix = _cache._TEMP_SUFFIX
++        if free < need:
++            _log(
++                logger,
++                "info",
++                f"{cand.component}: not cached (disk short: {free / 2**30:.1f} GiB free, "
++                f"need {need / 2**30:.1f} GiB)",
+             )
+-            os.close(fd)
+-            hasher = hashlib.sha256()
+-            try:
+-                size = _write(
+-                    tmp,
+-                    cand,
+-                    {CAST_META_KEY: json.dumps(meta, sort_keys = True)},
+-                    hasher,
+-                    reader,
+-                )
+-                os.replace(tmp, kdir / _cache.FILE_NAME)
+-                tmp = None
+-            finally:
+-                if tmp is not None:
+-                    try:
+-                        os.unlink(tmp)
+-                    except OSError:
+-                        pass
+-            sha = hasher.hexdigest()
+-            _cache._record_verified(kdir, sha)
+-            manifest = {
+-                "key": cand.key,
+-                "bytes": size,
+-                "sha256": sha,
+-                "created": time.time(),
+-                "parts": cand.parts,
+-            }
+-            _cache._atomic_bytes(
+-                kdir / _cache.MANIFEST_NAME,
+-                json.dumps(manifest, indent = 1, default = str).encode("utf-8"),
++            return None
++        source_bytes = sum(os.path.getsize(os.path.realpath(s)) for s in cand.shards)
++        meta = {
++            "key": cand.key,
++            "component": cand.component,
++            "class": cand.class_name,
++            "dtype": cand.parts["dtype"],
++            "source_gib": round(source_bytes / 2**30, 2),
++            "torch_version": str(torch.__version__),
++        }
++        kdir = root / cand.key
++        kdir.mkdir(parents = True, exist_ok = True)
++        shutil.copyfile(cand.config_path, kdir / "config.json")
++        fd, tmp = tempfile.mkstemp(
++            dir = str(kdir), prefix = f".{_cache.FILE_NAME}.", suffix = _cache._TEMP_SUFFIX
++        )
++        os.close(fd)
++        hasher = hashlib.sha256()
++        try:
++            size = _write(
++                tmp,
++                cand,
++                {CAST_META_KEY: json.dumps(meta, sort_keys = True)},
++                hasher,
++                reader,
+             )
+-            _cache._touch(kdir)
+-        _log(
+-            logger,
+-            "info",
+-            f"{cand.component}: saved the {cand.parts['dtype']} cast ({cand.key}, {size / 2**30:.2f} GiB from "
+-            f"{source_bytes / 2**30:.2f} GiB of source shards, in {time.perf_counter() - t0:.1f} s)",
++            os.replace(tmp, kdir / _cache.FILE_NAME)
++            tmp = None
++        finally:
++            if tmp is not None:
++                try:
++                    os.unlink(tmp)
++                except OSError:
++                    pass
++        sha = hasher.hexdigest()
++        _cache._record_verified(kdir, sha)
++        manifest = {
++            "key": cand.key,
++            "bytes": size,
++            "sha256": sha,
++            "created": time.time(),
++            "parts": cand.parts,
++        }
++        _cache._atomic_bytes(
++            kdir / _cache.MANIFEST_NAME,
++            json.dumps(manifest, indent = 1, default = str).encode("utf-8"),
+         )
+-        _cache.evict(logger = logger, keep = cand.key)
+-        return str(kdir / _cache.FILE_NAME)
+-    except Exception as exc:  # noqa: BLE001 - a cache write never fails a load
++        _cache._touch(kdir)
++    _log(
++        logger,
++        "info",
++        f"{cand.component}: saved the {cand.parts['dtype']} cast ({cand.key}, {size / 2**30:.2f} GiB from "
++        f"{source_bytes / 2**30:.2f} GiB of source shards, in {time.perf_counter() - t0:.1f} s)",
++    )
++    _cache.evict(logger = logger, keep = cand.key)
++    return str(kdir / _cache.FILE_NAME)
++
++
++class _ShardReader:
++    """``tensor(name)`` straight from the source shards, cast to the cached dtype: one tensor in RAM at a time."""
++
++    def __init__(self, cand: CastCandidate, where: dict, check: Any) -> None:
++        self.cand = cand
++        self.where = where
++        self.check = check
++        self.dtypes = {n: d for n, d, _s in cand.names}
++        self._open: dict = {}
++
++    def tensor(self, name: str) -> Any:
++        from safetensors import safe_open
++
++        shard = self.where[name]
++        fh = self._open.get(shard)
++        if fh is None:
++            for old in self._open.values():
++                old.__exit__(None, None, None)
++            self._open = {shard: safe_open(shard, framework = "pt").__enter__()}
++            fh = self._open[shard]
++        return fh.get_tensor(name).to(self.dtypes[name])
++
++    def close(self) -> None:
++        for fh in self._open.values():
++            try:
++                fh.__exit__(None, None, None)
++            except Exception:  # noqa: BLE001
++                pass
++        self._open = {}
++
++
++def _source_names(cand: CastCandidate) -> tuple[Optional[list], dict]:
++    """``([(name, dtype, shape)], {name: shard})`` a ``from_pretrained(torch_dtype = cand.dtype)`` load would hold, from
++    an empty-weights instance of the class (diffusers only) and the shard headers; (None, {}) when they disagree."""
++    import torch
++
++    if cand.library != "diffusers":
++        return None, {}
++    from accelerate import init_empty_weights
++
++    config = cand.cls.load_config(os.path.dirname(cand.config_path))
++    with init_empty_weights():
++        model = cand.cls.from_config(config)
++    keep = tuple(str(m) for m in (getattr(cand.cls, "_keep_in_fp32_modules", None) or ()))
++    tied = _tied_keys(model)
++    where: dict = {}
++    tags: dict = {}
++    for shard in cand.shards:
++        header = _shard_header(shard) or {}
++        for key, entry in header.items():
++            if key != "__metadata__" and isinstance(entry, dict):
++                where[key] = shard
++                tags[key] = entry
++    names = []
++    for name, tensor in model.state_dict(keep_vars = True).items():
++        if name in tied and name not in where:
++            continue
++        entry = tags.get(name)
++        if entry is None or [int(d) for d in entry.get("shape", ())] != [int(d) for d in tensor.shape]:
++            return None, {}
++        dtype = tensor.dtype
++        if dtype.is_floating_point:
++            dtype = torch.float32 if any(k in name.split(".") for k in keep) else cand.dtype
++        names.append((name, dtype, tuple(int(d) for d in tensor.shape)))
++    return names, where
++
++
++def save_from_source(
++    cand: CastCandidate,
++    *,
++    logger: Any = None,
++    check: Optional[Any] = None,
++) -> Optional[str]:
++    """Write ``cand``'s cast straight from its source shards, one tensor in RAM at a time, for a component whose
++    dense load would not fit host RAM; the load then maps the cached file. Returns the path or None. Never raises."""
++    check = check or (lambda: None)
++    t0 = time.perf_counter()
++    reader = None
++    try:
++        names, where = _source_names(cand)
++        if not names:
++            _log(logger, "info", f"{cand.component}: not cached from source (its tensors do not match the class)")
++            return None
++        cand.names = names
++        reader = _ShardReader(cand, where, check)
++        return _persist(cand, reader, logger = logger, t0 = t0)
++    except Exception as exc:  # noqa: BLE001 - the dense load still runs
+         _log(
+             logger,
+             "warning",
+-            f"{cand.component}: save failed: {type(exc).__name__}: {str(exc)[:200]}",
++            f"{cand.component}: source cast failed: {type(exc).__name__}: {str(exc)[:200]}",
+         )
+         return None
++    finally:
++        if reader is not None:
++            reader.close()
+ 
+ 
+ class CastWrites:
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..3bb870d98a 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -3413,8 +3413,20 @@ def _read_cast_cache(
+         if not cands:
+             return []
+         if device is not None:
+-            from .video_small_host import stage_misses
+-            stage_misses(cands, device, logger = logger, cancel_check = cancel_check)
++            from .video_small_host import converted_others_mib, stage_misses
++            others = converted_others_mib(
++                source,
++                cands,
++                torch_dtype = pipe_kwargs.get("torch_dtype"),
++                cache_dir = None
++                if source and os.path.isdir(str(source))
++                else pipe_kwargs.get("cache_dir"),
++                revision = revision,
++                skip = tuple(pipe_kwargs),
++            )
++            stage_misses(
++                cands, device, logger = logger, cancel_check = cancel_check, others_mib = others
++            )
+         hits = read_all(cands, logger = logger, cancel_check = cancel_check)
+         pipe_kwargs.update(hits)
+         if hits:
+diff --git a/studio/backend/core/inference/video_small_host.py b/studio/backend/core/inference/video_small_host.py
+index 6045d2539c..4c2e9133bc 100644
+--- a/studio/backend/core/inference/video_small_host.py
++++ b/studio/backend/core/inference/video_small_host.py
+@@ -83,6 +83,10 @@ class StagePlan:
+     available_mib: Optional[int] = None
+     reserve_mib: int = 0
+     skipped: dict = field(default_factory = dict)
++    # component -> MiB of it placed on the card when it is staged split across the card and host RAM
++    split: dict = field(default_factory = dict)
++    # MiB the same load converts in host RAM outside the cast cache (a bf16 encoder cast to fp16)
++    others_mib: int = 0
+ 
+ 
+ def plan_stage(
+@@ -93,60 +97,100 @@ def plan_stage(
+     device_free_mib: Optional[int],
+     forced: bool = False,
+     disabled: bool = False,
++    others_mib: int = 0,
+ ) -> StagePlan:
+-    """``misses``: component -> loaded MiB. Stage largest first (each must fit the card) until the rest fits host RAM."""
++    """``misses``: component -> loaded MiB. Stage largest first until the rest fits host RAM; ``others_mib`` is what
++    the same load converts in host RAM besides them (it cannot be staged, so it is priced, not moved). A miss larger
++    than the card is staged split: the card holds what fits, host RAM the rest (when that rest fits)."""
+     if disabled:
+         return StagePlan(False, f"{SMALL_HOST_ENV}=0")
+     sizes = {k: int(v) for k, v in misses.items() if v is not None}
+     dense = sum(sizes.values())
++    others = max(0, int(others_mib or 0))
+     if not sizes:
+-        return StagePlan(False, "no cast-cache miss to convert", dense_mib = 0)
++        return StagePlan(False, "no cast-cache miss to convert", dense_mib = 0, others_mib = others)
+     if available_mib is None and not forced:
+-        return StagePlan(False, "host RAM unreadable", dense_mib = dense)
+-    fits = available_mib is not None and dense + reserve_mib <= int(available_mib)
++        return StagePlan(False, "host RAM unreadable", dense_mib = dense, others_mib = others)
++    beside = f" + {others} MiB of other converted components" if others else ""
++    fits = available_mib is not None and dense + others + reserve_mib <= int(available_mib)
+     if fits and not forced:
+         return StagePlan(
+             False,
+-            f"dense conversion ({dense} MiB) fits {available_mib} MiB available host RAM",
++            f"dense conversion ({dense} MiB{beside}) fits {available_mib} MiB available host RAM",
+             dense_mib = dense,
+             available_mib = available_mib,
+             reserve_mib = reserve_mib,
++            others_mib = others,
+         )
+     stage = []
+     skipped = {}
++    split = {}
+     left = dense
+     for name, mib in sorted(sizes.items(), key = lambda kv: (-kv[1], kv[0])):
+-        if not forced and available_mib is not None and left + reserve_mib <= int(available_mib):
++        if (
++            not forced
++            and available_mib is not None
++            and left + others + reserve_mib <= int(available_mib)
++        ):
+             break
+         if mib < _STAGE_MIN_MIB:
+             skipped[name] = "small"
+             continue
+-        if device_free_mib is None or mib + _DEVICE_MARGIN_MIB > int(device_free_mib):
+-            skipped[name] = (
+-                f"needs {mib + _DEVICE_MARGIN_MIB} MiB of the card, {device_free_mib} MiB free"
+-            )
++        card = None if device_free_mib is None else int(device_free_mib) - _DEVICE_MARGIN_MIB
++        if card is not None and mib <= card:
++            stage.append(name)
++            left -= mib
++            continue
++        # Split: the card's share plus a host share that fits beside the rest of the load's conversions.
++        host_room = (
++            None
++            if available_mib is None
++            else int(available_mib) - reserve_mib - others - (left - mib)
++        )
++        if (
++            card is not None
++            and card >= _STAGE_MIN_MIB
++            and host_room is not None
++            and mib - card <= host_room
++        ):
++            stage.append(name)
++            split[name] = card
++            left -= mib
+             continue
+-        stage.append(name)
+-        left -= mib
++        skipped[name] = (
++            f"needs {mib + _DEVICE_MARGIN_MIB} MiB of the card, {device_free_mib} MiB free, and its host share "
++            f"does not fit {host_room} MiB"
++        )
+     why = (
+         f"{SMALL_HOST_ENV}=1"
+         if forced
+-        else f"dense conversion needs ~{dense} MiB + {reserve_mib} MiB reserve of host RAM, "
++        else f"dense conversion needs ~{dense} MiB{beside} + {reserve_mib} MiB reserve of host RAM, "
+         f"{available_mib} MiB available"
+     )
+-    return StagePlan(bool(stage), why, tuple(stage), dense, available_mib, reserve_mib, skipped)
++    return StagePlan(
++        bool(stage), why, tuple(stage), dense, available_mib, reserve_mib, skipped, split, others
++    )
+ 
+ 
+ def _component_dir(cand: Any) -> str:
+     return str(Path(cand.config_path).parent)
+ 
+ 
+-def _device_load_kwargs(cand: Any, device: Any) -> dict:
++def _device_load_kwargs(cand: Any, device: Any, card_mib: Optional[int] = None) -> dict:
+     from .diffusion_cast_cache import _load_kwargs
+ 
+     kwargs = _load_kwargs(cand)
+     kwargs.pop("output_loading_info", None)
+-    kwargs["device_map"] = {"": str(device)}
++    if card_mib is None:
++        kwargs["device_map"] = {"": str(device)}
++        return kwargs
++    import torch
++
++    # Split: accelerate fills the card up to ``card_mib`` block by block, the rest lands in host RAM.
++    dev = torch.device(device)
++    index = dev.index if dev.index is not None else torch.cuda.current_device()
++    kwargs["device_map"] = "auto"
++    kwargs["max_memory"] = {index: f"{int(card_mib)}MiB", "cpu": "1024GiB"}
+     return kwargs
+ 
+ 
+@@ -156,8 +200,10 @@ def stage_on_device(
+     *,
+     logger: Any = None,
+     cancel_check: Optional[Callable[[], None]] = None,
++    card_mib: Optional[int] = None,
+ ) -> bool:
+-    """Load ``cand`` alone onto ``device``, write its cast-cache entry from the device tensors, free it."""
++    """Load ``cand`` alone onto ``device`` (split with host RAM past ``card_mib``), write its cast-cache entry from
++    the loaded tensors, free it."""
+     import torch
+ 
+     from .diffusion_cast_cache import _state_names, save
+@@ -165,7 +211,9 @@ def stage_on_device(
+     t0 = time.perf_counter()
+     module = None
+     try:
+-        module = cand.cls.from_pretrained(_component_dir(cand), **_device_load_kwargs(cand, device))
++        module = cand.cls.from_pretrained(
++            _component_dir(cand), **_device_load_kwargs(cand, device, card_mib)
++        )
+         module.eval()
+         if cancel_check is not None:
+             cancel_check()
+@@ -176,9 +224,10 @@ def stage_on_device(
+         path = save(cand, module, logger = logger, check = cancel_check)
+         if logger is not None:
+             logger.info(
+-                "video.small_host: %s staged on %s in %.1f s (%s)",
++                "video.small_host: %s staged on %s%s in %.1f s (%s)",
+                 cand.component,
+                 device,
++                f" (split: {card_mib} MiB on the card, the rest in host RAM)" if card_mib else "",
+                 time.perf_counter() - t0,
+                 "cast cache written" if path else "not written",
+             )
+@@ -206,12 +255,58 @@ def _device_free_mib(device: Any) -> Optional[int]:
+         return None
+ 
+ 
++def converted_others_mib(
++    source: Any,
++    cands: list,
++    *,
++    torch_dtype: Any,
++    cache_dir: Optional[str] = None,
++    revision: Optional[str] = None,
++    skip: Any = (),
++) -> int:
++    """MiB the pipeline load converts in host RAM outside the cast cache: half-precision shards of a component that
++    is not a cast candidate but loads at the other half dtype (bf16 -> fp16 on a float16 card), which become anonymous
++    memory beside the cast-cache misses. 0 when unreadable."""
++    try:
++        import torch
++
++        from . import diffusion_cast_cache as cc
++
++        index = cc._read_json(cc._cache._local_file(str(source), "model_index.json", cache_dir, revision))
++        if not isinstance(index, dict):
++            return 0
++        names = {c.component for c in cands}
++        skip = set(skip or ())
++        total = 0
++        for component, spec in index.items():
++            if component.startswith("_") or component in skip or component in names:
++                continue
++            if not isinstance(spec, (list, tuple)) or len(spec) != 2 or spec[0] not in cc._LIBRARIES:
++                continue
++            dtype = cc._component_dtype(torch_dtype, component)
++            if not cc._is_half(dtype):
++                continue
++            want = "F16" if dtype == torch.float16 else "BF16"
++            for shard in cc._shards_of(str(source), component, cc._STEMS[spec[0]], cache_dir, revision) or ():
++                header = cc._shard_header(shard) or {}
++                for name, entry in header.items():
++                    if name == "__metadata__" or not isinstance(entry, dict):
++                        continue
++                    if entry.get("dtype") in ("F16", "BF16") and entry.get("dtype") != want:
++                        begin, end = (int(v) for v in entry.get("data_offsets") or (0, 0))
++                        total += end - begin
++        return -(-total // _MIB)
++    except Exception:  # noqa: BLE001 - unpriced, as before
++        return 0
++
++
+ def stage_misses(
+     cands: list,
+     device: Any,
+     *,
+     logger: Any = None,
+     cancel_check: Optional[Callable[[], None]] = None,
++    others_mib: int = 0,
+ ) -> list:
+     """Stage the misses of ``cands`` a dense load would not fit; returns the staged components. Never raises except
+     a cancel."""
+@@ -235,6 +330,7 @@ def stage_misses(
+             device_free_mib = _device_free_mib(device),
+             forced = stage_forced(),
+             disabled = stage_disabled(),
++            others_mib = others_mib,
+         )
+         if logger is not None and (plan.engaged or plan.skipped or misses):
+             logger.info(
+@@ -246,11 +342,51 @@ def stage_misses(
+             )
+         done = []
+         by_name = {c.component: c for c in cands}
++        from .diffusion_cast_cache import save_from_source
++
+         for name in plan.stage:
+             if cancel_check is not None:
+                 cancel_check()
+-            if stage_on_device(by_name[name], device, logger = logger, cancel_check = cancel_check):
++            if plan.split.get(name) and not stage_forced():
++                # A card / host split loads through accelerate's cpu offload, whose host share comes back as meta
++                # tensors (nothing to write); the source shards cast one tensor at a time instead, card untouched.
++                t0 = time.perf_counter()
++                if save_from_source(by_name[name], logger = logger, check = cancel_check) is not None:
++                    done.append(name)
++                    if logger is not None:
++                        logger.info(
++                            "video.small_host: %s cast written from its source shards in %.1f s (host RAM: one "
++                            "tensor at a time); the load maps it",
++                            name,
++                            time.perf_counter() - t0,
++                        )
++                    continue
++            if stage_on_device(
++                by_name[name],
++                device,
++                logger = logger,
++                cancel_check = cancel_check,
++                card_mib = plan.split.get(name),
++            ):
+                 done.append(name)
++        if plan.engaged and plan.skipped and not stage_disabled():
++            # Neither the card nor a card / host split takes it: write its cast from the source shards one tensor at a
++            # time, so the load maps the cached file instead of converting the whole component in host RAM.
++            for name in plan.skipped:
++                if name not in by_name:
++                    continue
++                if cancel_check is not None:
++                    cancel_check()
++                t0 = time.perf_counter()
++                if save_from_source(by_name[name], logger = logger, check = cancel_check) is not None:
++                    done.append(name)
++                    if logger is not None:
++                        logger.info(
++                            "video.small_host: %s cast written from its source shards in %.1f s (host RAM: one "
++                            "tensor at a time); the load maps it",
++                            name,
++                            time.perf_counter() - t0,
++                        )
+         return done
+     except Exception as exc:  # noqa: BLE001 - the dense load still runs
+         if cancel_check is not None:
+diff --git a/studio/backend/tests/test_diffusion_cast_cache.py b/studio/backend/tests/test_diffusion_cast_cache.py
+index 43efb39fa5..56c4dcffe1 100644
+--- a/studio/backend/tests/test_diffusion_cast_cache.py
++++ b/studio/backend/tests/test_diffusion_cast_cache.py
+@@ -291,3 +291,63 @@ def test_resident_device_module_is_read_back_bit_identical(pipe_dir):
+     hit = CC.read(cand)
+     for k, v in hit.state_dict().items():
+         assert v.dtype == reference[k].dtype and torch.equal(_bits(v), _bits(reference[k])), k
++
++
++def test_source_cast_matches_the_live_module_cast_bit_for_bit(pipe_dir, tmp_path, monkeypatch):
++    """A component too big for host RAM is cast from its source shards one tensor at a time: the cached file is the
++    same file the live-module write produces (same key, same bytes), and reads back as the dense load."""
++    cand = _by_name(CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT))["transformer"]
++    path = CC.save_from_source(cand)
++    assert path is not None and C.path_in_cache(path)
++    from_source = Path(path).read_bytes()
++    hit = CC.read(_by_name(CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT))["transformer"])
++    assert hit is not None
++    dense = _dense(cand)
++    _identical(dense, hit)
++    # the live-module write of the same component, into a second cache root: identical bytes (bar the timestamp-free
++    # metadata, which is the same too)
++    monkeypatch.setenv(C.ENV_DIR, str(tmp_path / "cache_live"))
++    live = _by_name(CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT))["transformer"]
++    live_path = _save(live, dense)
++    assert live_path is not None
++    assert Path(live_path).read_bytes() == from_source
++
++
++def test_source_cast_refuses_a_class_its_shards_do_not_match(pipe_dir):
++    cand = _by_name(CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT))["transformer"]
++    cand.cls = diffusers.UNet2DModel  # a different architecture: names / shapes disagree with the shards
++    cand.config_path = str(pipe_dir / "transformer" / "config.json")
++    assert CC.save_from_source(cand) is None
++    # transformers components are not cast from source (their dense load is the small one)
++    te = _by_name(CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT))["text_encoder"]
++    assert CC.save_from_source(te) is None
++
++
++def test_source_cast_of_a_hunyuanvideo15_denoiser_reads_back_as_the_dense_load(tmp_path):
++    """The HunyuanVideo-1.5 case: its fp32 DiT (31 GB) does not fit a 31 GB host beside the converted encoder."""
++    torch.manual_seed(0)
++    model = diffusers.HunyuanVideo15Transformer3DModel(
++        in_channels = 9,
++        out_channels = 4,
++        num_attention_heads = 2,
++        attention_head_dim = 32,
++        num_layers = 1,
++        num_refiner_layers = 1,
++        mlp_ratio = 2.0,
++        text_embed_dim = 64,
++        text_embed_2_dim = 32,
++        image_embed_dim = 32,
++        rope_axes_dim = (8, 12, 12),
++        target_size = 64,
++    ).to(torch.float32)
++    root = tmp_path / "HunyuanVideo-1.5-tiny"
++    model.save_pretrained(root / "transformer", max_shard_size = "200KB")
++    (root / "model_index.json").write_text(
++        json.dumps({"_class_name": "HunyuanVideo15Pipeline", "transformer": ["diffusers", "HunyuanVideo15Transformer3DModel"]})
++    )
++    cand = _by_name(CC.candidates(root, torch_dtype = FP16_DEFAULT))["transformer"]
++    assert len(cand.shards) > 1
++    assert CC.save_from_source(cand) is not None
++    hit = CC.read(_by_name(CC.candidates(root, torch_dtype = FP16_DEFAULT))["transformer"])
++    assert hit is not None
++    _identical(_dense(cand), hit)
+diff --git a/studio/backend/tests/test_video_small_host.py b/studio/backend/tests/test_video_small_host.py
+index 390bbff94b..e86324067c 100644
+--- a/studio/backend/tests/test_video_small_host.py
++++ b/studio/backend/tests/test_video_small_host.py
+@@ -60,11 +60,19 @@ def test_stages_largest_first_until_the_rest_fits():
+     assert plan.stage == ("text_encoder", "transformer")
+ 
+ 
+-def test_card_too_small_for_the_encoder_keeps_the_dense_load():
++def test_card_too_small_for_the_encoder_stages_it_split():
+     plan = VS.plan_stage(WAN13, available_mib = 10100, reserve_mib = 3072, device_free_mib = 11000)
+-    # the encoder does not fit the card; the DiT alone does but cannot rescue the load: staged anyway, logged
++    # the encoder does not fit the card: the card takes what fits, host RAM the 2.5 GB rest, and the DiT then
++    # converts densely beside it
++    assert plan.stage == ("text_encoder",)
++    assert plan.split == {"text_encoder": 11000 - VS._DEVICE_MARGIN_MIB}
++
++
++def test_a_split_whose_host_share_does_not_fit_keeps_the_dense_load():
++    plan = VS.plan_stage(WAN13, available_mib = 10100, reserve_mib = 3072, device_free_mib = 4000)
++    # 9.5 GB of the encoder would stay in host RAM beside the DiT: no split; the DiT alone is staged, logged
+     assert "text_encoder" in plan.skipped
+-    assert plan.stage == ("transformer",)
++    assert plan.stage == ("transformer",) and plan.split == {}
+ 
+ 
+ def test_kill_switch_and_force(monkeypatch):
+@@ -265,3 +273,107 @@ def test_non_cuda_device_never_stages(pipe_dir, monkeypatch):
+     calls = _wire(monkeypatch, available = 10)
+     assert VS.stage_misses(list(_cands(pipe_dir).values()), "cpu") == []
+     assert calls == []
++
++
++# HunyuanVideo-1.5 on a Kaggle T4 (31 GB host, 15 GB card): the fp32 DiT converts to fp16 (18.4 GiB, a cast-cache
++# miss) while the bf16 Qwen2.5-VL-7B converts to fp16 beside it (15.6 GiB, not a cast candidate). Pricing the DiT
++# alone let every load through and the host ran out of RAM (rc -9).
++HV15_T4 = {"transformer": 18827}
++HV15_TE_MIB = 15600
++
++
++def test_the_encoder_converted_beside_the_dit_is_priced():
++    old = VS.plan_stage(HV15_T4, available_mib = 29238, reserve_mib = 3174, device_free_mib = 14600)
++    assert not old.engaged  # the DiT alone "fits"
++    plan = VS.plan_stage(
++        HV15_T4, available_mib = 29238, reserve_mib = 3174, device_free_mib = 14600, others_mib = HV15_TE_MIB
++    )
++    assert plan.engaged and plan.stage == ("transformer",)
++    # 15 GB card: split, 13.8 GB on the card and 4.9 GB in host RAM beside the encoder's 15.6
++    assert plan.split == {"transformer": 14600 - VS._DEVICE_MARGIN_MIB}
++    assert plan.others_mib == HV15_TE_MIB and "other converted components" in plan.reason
++
++
++def test_others_that_fit_change_nothing():
++    plan = VS.plan_stage(HV15_T4, available_mib = 60000, reserve_mib = 6000, device_free_mib = 14600, others_mib = HV15_TE_MIB)
++    assert not plan.engaged and "fits" in plan.reason
++
++
++def test_converted_others_counts_only_a_half_dtype_change(pipe_dir):
++    import safetensors.torch as st
++
++    te = pipe_dir / "text_encoder"
++    for f in te.glob("*.safetensors"):
++        f.unlink()
++    st.save_file({"w": torch.zeros(1024, 512, dtype = torch.bfloat16)}, str(te / "model.safetensors"))
++    cands = [c for c in CC.candidates(pipe_dir, torch_dtype = FP16_DEFAULT)]
++    assert {c.component for c in cands} == {"transformer"}  # the bf16 encoder is not a cast candidate
++    fp16 = VS.converted_others_mib(pipe_dir, cands, torch_dtype = FP16_DEFAULT)
++    assert fp16 == 1  # 1 MiB of bf16 converted to fp16 in host RAM
++    bf16 = VS.converted_others_mib(pipe_dir, cands, torch_dtype = {"default": torch.bfloat16, "vae": torch.float32})
++    assert bf16 == 0  # same dtype: memory-mapped, nothing converted
++    assert VS.converted_others_mib(pipe_dir, cands, torch_dtype = FP16_DEFAULT, skip = ("text_encoder",)) == 0
++
++
++def test_split_load_kwargs_cap_the_card():
++    import types
++    from unittest import mock
++
++    cand = types.SimpleNamespace()
++
++    with mock.patch.object(CC, "_load_kwargs", lambda c: {"torch_dtype": torch.float16, "output_loading_info": True}):
++        whole = VS._device_load_kwargs(cand, "cuda:0")
++        split = VS._device_load_kwargs(cand, "cuda:0", card_mib = 13832)
++    assert whole["device_map"] == {"": "cuda:0"} and "max_memory" not in whole
++    assert split["device_map"] == "auto" and split["max_memory"][0] == "13832MiB"
++    assert "output_loading_info" not in split
++
++
++def test_a_dit_neither_the_card_nor_a_split_takes_is_cast_from_its_shards(pipe_dir, monkeypatch):
++    """The HunyuanVideo-1.5 T4 case: the fp16 DiT is bigger than the card and its host share does not fit, so its cast
++    is written from the source shards one tensor at a time and the load maps it (no dense conversion in host RAM)."""
++    from core.inference import video as V
++
++    sizes = {"text_encoder": 100, "transformer": 20000}
++    monkeypatch.setattr(VS, "loaded_mib", lambda cand: sizes[cand.component])
++    calls = _wire(monkeypatch, available = 3000, total = 13000)
++    pipe_kwargs = {"torch_dtype": dict(FP16_DEFAULT), "cache_dir": None, "local_files_only": True}
++    written = []
++    real = CC.save_from_source
++    monkeypatch.setattr(CC, "save_from_source", lambda cand, **kw: written.append(cand.component) or real(cand, **kw))
++    missed = V._read_cast_cache(
++        pipe_kwargs, source = str(pipe_dir), revision = None, base = None, device = "cuda"
++    )
++    assert written == ["transformer"] and ("transformer", "cuda") not in calls
++    assert "transformer" in pipe_kwargs and "transformer" not in [c.component for c in missed]
++    _identical(pipe_kwargs["transformer"], _dense(_cands(pipe_dir)["transformer"]))
++
++
++def test_source_cast_respects_the_kill_switch(pipe_dir, monkeypatch):
++    from core.inference import video as V
++
++    monkeypatch.setenv(VS.SMALL_HOST_ENV, "0")
++    sizes = {"text_encoder": 100, "transformer": 20000}
++    monkeypatch.setattr(VS, "loaded_mib", lambda cand: sizes[cand.component])
++    _wire(monkeypatch, available = 3000, total = 13000)
++    pipe_kwargs = {"torch_dtype": dict(FP16_DEFAULT), "cache_dir": None, "local_files_only": True}
++    V._read_cast_cache(pipe_kwargs, source = str(pipe_dir), revision = None, base = None, device = "cuda")
++    assert "transformer" not in pipe_kwargs
++
++
++def test_a_split_plan_casts_from_the_source_shards_instead(pipe_dir, monkeypatch):
++    """A DiT a little over the card was split card / host through accelerate's cpu offload, whose host share loads
++    as meta tensors (nothing to write, on the Kaggle T4 the dense load then ran out of host RAM): it is cast from
++    its source shards instead, without touching the card."""
++    from core.inference import video as V
++
++    sizes = {"text_encoder": 100, "transformer": 16000}
++    monkeypatch.setattr(VS, "loaded_mib", lambda cand: sizes[cand.component])
++    calls = _wire(monkeypatch, available = 18000, total = 20000)
++    written = []
++    real = CC.save_from_source
++    monkeypatch.setattr(CC, "save_from_source", lambda cand, **kw: written.append(cand.component) or real(cand, **kw))
++    pipe_kwargs = {"torch_dtype": dict(FP16_DEFAULT), "cache_dir": None, "local_files_only": True}
++    V._read_cast_cache(pipe_kwargs, source = str(pipe_dir), revision = None, base = None, device = "cuda")
++    assert written == ["transformer"] and ("transformer", "cuda") not in calls
++    _identical(pipe_kwargs["transformer"], _dense(_cands(pipe_dir)["transformer"]))
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index b9317f62ff..1d98fe2c2e 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -10981,6 +10981,19 @@ class VideoBackend:
+                         + "; loaded the released bfloat16 denoiser instead"
+                     )
+                 else:
++                    if scheme == "int8":
++                        from .video_minimax_h3_keep import apply_h3_int8_keep
++
++                        apply_h3_int8_keep(
++                            transformer,
++                            fetch_base,
++                            (f"{workflow.upper()}/{denoiser_component}", denoiser_component),
++                            dtype = dtype,
++                            hf_token = hf_token,
++                            cache_dir = hub_cache_dir(),
++                            local_files_only = local_files_only,
++                            logger = logger,
++                        )
+                     # Must seed before load_components, which skips set attributes (avoids the 66.3 GB fetch).
+                     pipe.update_components(**{denoiser_component: transformer})
+                     transformer_quant_engaged = scheme
+diff --git a/studio/backend/core/inference/video_minimax_h3_keep.py b/studio/backend/core/inference/video_minimax_h3_keep.py
+new file mode 100644
+index 0000000000..4ad09a6c54
+--- /dev/null
++++ b/studio/backend/core/inference/video_minimax_h3_keep.py
+@@ -0,0 +1,310 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""MiniMax-H3 int8 denoiser keep list: the text side path (``token_refiner`` + ``condition_proj``, 13 Linears, 0.4 GB)
++runs at bfloat16, as ComfyUI's published int8_convrot DiT keeps it. The hosted int8 checkpoint quantized those too; at
++640x352x124 they carried most of its drift from the bf16 reference. Their released bf16 weights are read from the
++released transformer shard (ranged reads of just those tensors, or the cached shard), cached once beside the prequant
++cache, and swapped in as plain Linears before placement. ``UNSLOTH_H3_INT8_KEEP_BF16=0`` keeps the int8 ones."""
++
++from __future__ import annotations
++
++import json
++import os
++import struct
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++H3_INT8_KEEP_ENV = "UNSLOTH_H3_INT8_KEEP_BF16"
++# Original (ComfyUI) layout prefixes of the Linears kept dense, as the published int8_convrot DiT header shows.
++H3_KEEP_PREFIXES = ("token_refiner.", "condition_proj.")
++_INDEX = "model.safetensors.index.json"
++_RANGE_DEADLINE_S = 600.0
++_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}
++
++
++def h3_int8_keep_enabled() -> bool:
++    return str(os.environ.get(H3_INT8_KEEP_ENV, "")).strip().lower() not in ("0", "off", "false", "no")
++
++
++def _keep_key(key: str) -> bool:
++    return key.startswith(H3_KEEP_PREFIXES) and key.endswith((".weight", ".bias"))
++
++
++def _cache_file(repo: str, subfolder: str, revision: Optional[str]) -> Path:
++    from .diffusion_prequant_cache import cache_root
++
++    tag = "_".join(x for x in (repo.replace("/", "--"), subfolder.replace("/", "--"), (revision or "main")[:12]) if x)
++    return cache_root() / "h3_keep" / f"{tag}.safetensors"
++
++
++def _tensor_from(raw: bytes, dtype_tag: str, shape: list) -> Any:
++    import torch
++
++    dtype = getattr(torch, _DTYPES[dtype_tag])
++    return torch.frombuffer(bytearray(raw), dtype = dtype).reshape(shape).clone()
++
++
++def _read_ranged(read: Any, wanted: list) -> dict:
++    """``{key: tensor}`` of ``wanted`` from one safetensors file through ``read(start, end)`` (inclusive)."""
++    n = struct.unpack("<Q", read(0, 7))[0]
++    header = json.loads(read(8, 8 + n - 1))
++    base = 8 + n
++    out = {}
++    for key in wanted:
++        entry = header.get(key)
++        if not isinstance(entry, dict) or entry.get("dtype") not in _DTYPES:
++            raise ValueError(f"{key}: not a readable tensor in the released shard")
++        begin, end = (int(v) for v in entry["data_offsets"])
++        out[key] = _tensor_from(read(base + begin, base + end - 1), entry["dtype"], entry["shape"])
++    return out
++
++
++def _fs_range_reader(repo: str, path: str, revision: Optional[str], hf_token: Optional[str]) -> Any:
++    """``read(start, end)`` (inclusive) through ``HfFileSystem.cat_file`` (its own redirect / Xet handling)."""
++    from huggingface_hub import HfFileSystem
++
++    fs = HfFileSystem(token = hf_token)
++    target = f"{repo}@{revision}/{path}" if revision else f"{repo}/{path}"
++
++    def _read(start: int, end: int) -> bytes:
++        data = fs.cat_file(target, start = start, end = end + 1)
++        if len(data) != end - start + 1:
++            raise OSError(f"short read: {len(data)} of {end - start + 1} bytes")
++        return data
++
++    return _read
++
++
++def fetch_keep_tensors(
++    repo: str,
++    subfolder: str,
++    *,
++    revision: Optional[str] = None,
++    hf_token: Optional[str] = None,
++    cache_dir: Optional[str] = None,
++    local_files_only: bool = False,
++    logger: Any = None,
++) -> Optional[dict]:
++    """Original-layout ``{key: tensor}`` of the kept Linears from ``repo``/``subfolder``'s released shards, or None."""
++    cached = _cache_file(repo, subfolder, revision)
++    if cached.is_file():
++        from safetensors.torch import load_file
++
++        return load_file(str(cached))
++    from huggingface_hub import hf_hub_download, hf_hub_url, try_to_load_from_cache
++
++    index_path = hf_hub_download(
++        repo,
++        f"{subfolder}/{_INDEX}",
++        revision = revision,
++        token = hf_token,
++        cache_dir = cache_dir,
++        local_files_only = local_files_only,
++    )
++    weight_map = json.loads(Path(index_path).read_text(encoding = "utf-8")).get("weight_map") or {}
++    by_shard: dict = {}
++    for key, shard in weight_map.items():
++        if _keep_key(key):
++            by_shard.setdefault(shard, []).append(key)
++    if not by_shard:
++        return None
++    tensors: dict = {}
++    t0 = time.perf_counter()
++    for shard, keys in sorted(by_shard.items()):
++        local = try_to_load_from_cache(repo, f"{subfolder}/{shard}", cache_dir = cache_dir, revision = revision)
++        if isinstance(local, str):
++            from safetensors import safe_open
++
++            with safe_open(local, framework = "pt") as fh:
++                tensors.update({k: fh.get_tensor(k) for k in keys})
++            continue
++        if local_files_only:
++            return None
++        from huggingface_hub.utils import build_hf_headers
++
++        from .prequant_header_probe import _hub_range_reader
++
++        url = hf_hub_url(repo, f"{subfolder}/{shard}", revision = revision)
++        read = _hub_range_reader(url, build_hf_headers(token = hf_token), time.monotonic() + _RANGE_DEADLINE_S)
++        try:
++            tensors.update(_read_ranged(read, keys))
++        except Exception as exc:  # noqa: BLE001 - second transport below
++            if logger is not None:
++                logger.info("video.h3_int8_keep: ranged read of %s failed (%r); retrying through HfFileSystem", shard, exc)
++            tensors.update(_read_ranged(_fs_range_reader(repo, f"{subfolder}/{shard}", revision, hf_token), keys))
++    try:
++        from safetensors.torch import save_file
++
++        cached.parent.mkdir(parents = True, exist_ok = True)
++        tmp = cached.with_suffix(".tmp")
++        save_file({k: v.contiguous() for k, v in tensors.items()}, str(tmp))
++        os.replace(tmp, cached)
++    except Exception as exc:  # noqa: BLE001 - a later load fetches again
++        if logger is not None:
++            logger.warning("video.h3_int8_keep: could not cache the kept weights: %s", exc)
++    if logger is not None:
++        logger.info(
++            "video.h3_int8_keep: read %d released bf16 tensors (%.2f GB) from %s/%s in %.1f s",
++            len(tensors),
++            sum(t.numel() * t.element_size() for t in tensors.values()) / 1e9,
++            repo,
++            subfolder,
++            time.perf_counter() - t0,
++        )
++    return tensors
++
++
++def to_diffusers(tensors: dict, head_dim: Optional[int] = None) -> dict:
++    """Released-layout tensors -> diffusers names: renames and the SwiGLU fc1 reorder via the ComfyUI map, but the
++    fused qkv split per head (the released checkpoint runs [q; k; v] of head 0, then head 1, ...; ComfyUI's files
++    regroup it by thirds). ``head_dim``: the head width (default: the tensors' own q_norm width, else 128)."""
++    import torch
++
++    from .video_minimax_h3_comfy import h3_comfy_key_map
++
++    if head_dim is None:
++        norms = [t for k, t in tensors.items() if k.endswith(".attn.q_norm.weight") and t.dim() == 1]
++        head_dim = int(norms[0].shape[0]) if norms else 128
++    out = {}
++    for key, tensor in tensors.items():
++        if key.endswith(".attn.qkv_proj.weight"):
++            rows, cols = tensor.shape
++            if rows % (3 * head_dim):
++                raise ValueError(f"{key}: {rows} rows are not q, k and v of {head_dim}-wide heads")
++            q, k, v = tensor.reshape(-1, 3, head_dim, cols).unbind(1)
++            stem = h3_comfy_key_map(key, (rows, cols))[0][0][: -len("to_q.weight")]
++            for part, t in (("to_q", q), ("to_k", k), ("to_v", v)):
++                out[f"{stem}{part}.weight"] = t.reshape(-1, cols).contiguous()
++            continue
++        for name, rows in h3_comfy_key_map(key, tuple(tensor.shape)):
++            out[name] = (
++                tensor
++                if rows is None
++                else torch.cat([tensor[start : start + n] for start, n in rows], dim = 0)
++            )
++    return out
++
++
++# A swapped Linear must agree with the quantized one it replaces (same weights up to int8 error) on a probe input;
++# below this cosine the mapping is wrong and every swap is refused.
++_AGREE_MIN_COSINE = 0.98
++
++
++def _agreement(old: Any, new: Any) -> Optional[float]:
++    """Cosine of ``old(x)`` and ``new(x)`` on one random batch, or None when ``old`` cannot run here."""
++    import torch
++
++    try:
++        g = torch.Generator().manual_seed(0)
++        x = torch.randn(16, new.in_features, generator = g).to(new.weight.dtype)
++        with torch.no_grad():
++            a = old(x).float().flatten()
++            b = new(x).float().flatten()
++        return float(torch.nn.functional.cosine_similarity(a, b, dim = 0))
++    except Exception:  # noqa: BLE001 - a quantized forward that needs the device
++        return None
++
++
++def restore_dense_keep(transformer: Any, weights: dict, *, dtype: Any, logger: Any = None) -> int:
++    """Swap each kept quantized Linear for a plain Linear at ``dtype`` holding the released weights. Returns swaps.
++    Every swap is checked first against the module it replaces; one disagreement refuses them all."""
++    import torch
++    from torch import nn
++
++    plan = []
++    worst = None
++    stems = sorted({k[: -len(".weight")] for k in weights if k.endswith(".weight")})
++    for stem in stems:
++        parent_name, _, attr = stem.rpartition(".")
++        try:
++            parent = transformer.get_submodule(parent_name) if parent_name else transformer
++            old = getattr(parent, attr)
++        except (AttributeError, KeyError):
++            continue
++        weight = weights[f"{stem}.weight"]
++        if weight.dim() != 2 or not hasattr(old, "in_features"):
++            continue  # norms in the kept blocks stay as loaded; only the Linears are swapped
++        out_f, in_f = weight.shape
++        bias = weights.get(f"{stem}.bias")
++        if bias is None:
++            old_bias = getattr(old, "bias", None)
++            bias = old_bias.detach() if isinstance(old_bias, torch.Tensor) else None
++        new = nn.Linear(in_f, out_f, bias = bias is not None, device = "cpu", dtype = dtype)
++        with torch.no_grad():
++            new.weight.copy_(weight.to(dtype))
++            if bias is not None:
++                new.bias.copy_(bias.to(device = "cpu", dtype = dtype))
++        new.requires_grad_(False)
++        agree = _agreement(old, new)
++        if agree is not None:
++            worst = agree if worst is None else min(worst, agree)
++            if agree < _AGREE_MIN_COSINE:
++                if logger is not None:
++                    logger.warning(
++                        "video.h3_int8_keep: %s disagrees with the quantized module (cosine %.4f); kept int8",
++                        stem,
++                        agree,
++                    )
++                return 0
++        plan.append((parent, attr, new))
++    for parent, attr, new in plan:
++        setattr(parent, attr, new)
++    swapped = len(plan)
++    if logger is not None and worst is not None:
++        logger.info("video.h3_int8_keep: swapped Linears agree with the int8 ones (min cosine %.4f)", worst)
++    if logger is not None:
++        logger.info(
++            "video.h3_int8_keep: %d text-path Linears (token_refiner, context_embedder) run at %s, as ComfyUI's "
++            "int8_convrot DiT keeps them",
++            swapped,
++            str(dtype).replace("torch.", ""),
++        )
++    return swapped
++
++
++def apply_h3_int8_keep(
++    transformer: Any,
++    repo: str,
++    subfolders: tuple,
++    *,
++    dtype: Any,
++    revision: Optional[str] = None,
++    hf_token: Optional[str] = None,
++    cache_dir: Optional[str] = None,
++    local_files_only: bool = False,
++    logger: Any = None,
++) -> int:
++    """Never raises: any failure keeps the int8 Linears (the hosted model as before)."""
++    if not h3_int8_keep_enabled():
++        return 0
++    errors: list = []
++    for subfolder in subfolders:
++        try:
++            tensors = fetch_keep_tensors(
++                repo,
++                subfolder,
++                revision = revision,
++                hf_token = hf_token,
++                cache_dir = cache_dir,
++                local_files_only = local_files_only,
++                logger = logger,
++            )
++        except Exception as exc:  # noqa: BLE001
++            errors.append(f"{subfolder}: {exc!r}")
++            continue
++        if tensors:
++            try:
++                head_dim = getattr(getattr(transformer, "config", None), "attention_head_dim", None)
++                return restore_dense_keep(
++                    transformer, to_diffusers(tensors, head_dim), dtype = dtype, logger = logger
++                )
++            except Exception as exc:  # noqa: BLE001
++                errors.append(f"{subfolder}: {exc!r}")
++                break
++    if logger is not None:
++        logger.info(
++            "video.h3_int8_keep: kept the int8 text path (%s)", "; ".join(errors) or "no released shard index"
++        )
++    return 0
+diff --git a/studio/backend/tests/test_video_h3_int8_keep.py b/studio/backend/tests/test_video_h3_int8_keep.py
+new file mode 100644
+index 0000000000..17999683c7
+--- /dev/null
++++ b/studio/backend/tests/test_video_h3_int8_keep.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""MiniMax-H3 int8 keep list: the text path (token_refiner + condition_proj) runs at bf16 from the released weights,
++as ComfyUI's published int8_convrot DiT keeps it."""
++
++from __future__ import annotations
++
++import json
++import struct
++
++import pytest
++
++torch = pytest.importorskip("torch")
++diffusers = pytest.importorskip("diffusers")
++
++
++def _tiny_h3():
++    torch.manual_seed(0)
++    return diffusers.MiniMaxH3Transformer3DModel(
++        num_attention_heads = 2,
++        attention_head_dim = 16,
++        hidden_size = 32,
++        num_layers = 1,
++        num_refiner_layers = 2,
++        ffn_dim = 64,
++        text_dim = 24,
++    ).to(torch.bfloat16)
++
++
++def _released_from(model):
++    """Original (ComfyUI) layout of the model's text path: the inverse of h3_comfy_key_map, built by hand."""
++    sd = model.state_dict()
++    out = {}
++    for i in range(2):
++        d = f"token_refiner.refiner_blocks.{i}"
++        o = f"token_refiner.blocks.{i}"
++        # released layout: per head, [q; k; v] of that head (16-wide heads here)
++        q, k, v = (sd[f"{d}.attn.to_{p}.weight"].unflatten(0, (-1, 16)) for p in "qkv")
++        out[f"{o}.attn.qkv_proj.weight"] = torch.stack([q, k, v], 1).flatten(0, 2)
++        out[f"{o}.attn.out_proj.weight"] = sd[f"{d}.attn.to_out.0.weight"]
++        v, g = sd[f"{d}.ff.net.0.proj.weight"].chunk(2, 0)  # diffusers SwiGLU [value; gate]
++        out[f"{o}.mlp.fc1.weight"] = torch.cat([g, v], 0)  # ComfyUI [gate; value]
++        out[f"{o}.mlp.fc2.weight"] = sd[f"{d}.ff.net.2.weight"]
++    out["condition_proj.weight"] = sd["context_embedder.weight"]
++    out["condition_proj.bias"] = sd["context_embedder.bias"]
++    return out
++
++
++def _with_norms(model, out):
++    """The released shard also carries the text path's norm weights (1-D), which match the keep prefixes."""
++    sd = model.state_dict()
++    for i in range(2):
++        d = f"token_refiner.refiner_blocks.{i}"
++        o = f"token_refiner.blocks.{i}"
++        out[f"{o}.norm1.weight"] = sd[f"{d}.norm1.weight"]
++        out[f"{o}.norm2.weight"] = sd[f"{d}.norm2.weight"]
++        out[f"{o}.attn.q_norm.weight"] = sd[f"{d}.attn.norm_q.weight"]
++        out[f"{o}.attn.k_norm.weight"] = sd[f"{d}.attn.norm_k.weight"]
++    out["token_refiner.final_norm.weight"] = sd["token_refiner.final_norm.weight"]
++    return out
++
++
++def test_released_text_path_maps_back_onto_the_diffusers_model():
++    from core.inference.video_minimax_h3_keep import to_diffusers
++
++    model = _tiny_h3()
++    mapped = to_diffusers(_released_from(model), 16)
++    sd = model.state_dict()
++    assert len(mapped) == 2 * 6 + 2
++    for k, v in mapped.items():
++        assert torch.equal(sd[k], v), k
++
++
++def test_kept_linears_are_swapped_for_plain_ones_with_the_released_weights():
++    from core.inference.video_minimax_h3_keep import restore_dense_keep, to_diffusers
++
++    ref = _tiny_h3()
++    model = _tiny_h3()
++    with torch.no_grad():  # stand-in for the quantized text path: the same weights up to a small error
++        for name, mod in model.named_modules():
++            if (name.startswith("token_refiner") or name == "context_embedder") and isinstance(mod, torch.nn.Linear):
++                mod.weight.mul_(1.01)
++    # the released shard's norm weights ride along (1-D): only the Linears are swapped, the norms are left as loaded
++    n = restore_dense_keep(model, to_diffusers(_with_norms(ref, _released_from(ref))), dtype = torch.bfloat16)
++    assert n == 2 * 6 + 1
++    for name, mod in model.named_modules():
++        if name.startswith("token_refiner") or name == "context_embedder":
++            if isinstance(mod, torch.nn.Linear):
++                assert type(mod) is torch.nn.Linear and mod.weight.dtype == torch.bfloat16
++                assert torch.equal(mod.weight, ref.get_submodule(name).weight), name
++    # the block stack is untouched
++    assert torch.equal(
++        model.transformer_blocks[0].attn.to_q.weight, ref.transformer_blocks[0].attn.to_q.weight
++    )
++
++
++def _safetensors_bytes(tensors: dict) -> bytes:
++    header, blobs, off = {}, [], 0
++    for k, t in tensors.items():
++        raw = t.contiguous().view(torch.uint8).numpy().tobytes()
++        header[k] = {"dtype": {torch.bfloat16: "BF16", torch.float32: "F32"}[t.dtype], "shape": list(t.shape),
++                     "data_offsets": [off, off + len(raw)]}
++        blobs.append(raw)
++        off += len(raw)
++    h = json.dumps(header).encode()
++    return struct.pack("<Q", len(h)) + h + b"".join(blobs)
++
++
++def test_ranged_reads_take_only_the_asked_tensors():
++    from core.inference.video_minimax_h3_keep import _read_ranged
++
++    tensors = {"token_refiner.blocks.0.attn.out_proj.weight": torch.randn(4, 4).to(torch.bfloat16),
++               "blocks.0.mlp.fc1.weight": torch.randn(64, 32).to(torch.bfloat16)}
++    blob = _safetensors_bytes(tensors)
++    asked = []
++
++    def read(start, end):
++        asked.append((start, end))
++        return blob[start : end + 1]
++
++    got = _read_ranged(read, ["token_refiner.blocks.0.attn.out_proj.weight"])
++    assert torch.equal(got["token_refiner.blocks.0.attn.out_proj.weight"], tensors["token_refiner.blocks.0.attn.out_proj.weight"])
++    read_bytes = sum(e - s + 1 for s, e in asked)
++    assert read_bytes < len(blob) // 2  # the block weight was never read
++
++
++def test_kill_switch_and_failures_keep_the_int8_model(monkeypatch):
++    from core.inference import video_minimax_h3_keep as K
++
++    model = _tiny_h3()
++    before = {k: v.clone() for k, v in model.state_dict().items()}
++    monkeypatch.setenv(K.H3_INT8_KEEP_ENV, "0")
++    assert K.apply_h3_int8_keep(model, "unsloth/MiniMax-H3", ("FL2VA/transformer",), dtype = torch.bfloat16) == 0
++    monkeypatch.delenv(K.H3_INT8_KEEP_ENV)
++
++    def boom(*a, **k):
++        raise OSError("offline")
++
++    monkeypatch.setattr(K, "fetch_keep_tensors", boom)
++    assert K.apply_h3_int8_keep(model, "unsloth/MiniMax-H3", ("FL2VA/transformer",), dtype = torch.bfloat16) == 0
++    assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())
++
++
++def test_cached_weights_are_reused_offline(tmp_path, monkeypatch):
++    from core.inference import diffusion_prequant_cache as C
++    from core.inference import video_minimax_h3_keep as K
++    from safetensors.torch import save_file
++
++    monkeypatch.setenv(C.ENV_DIR, str(tmp_path))
++    path = K._cache_file("unsloth/MiniMax-H3", "FL2VA/transformer", None)
++    path.parent.mkdir(parents = True)
++    ref = _tiny_h3()
++    save_file(_released_from(ref), str(path))
++    got = K.fetch_keep_tensors("unsloth/MiniMax-H3", "FL2VA/transformer", local_files_only = True)
++    assert set(got) == set(_released_from(ref))
++
++
++def test_a_wrong_mapping_is_refused():
++    from core.inference.video_minimax_h3_keep import restore_dense_keep, to_diffusers
++
++    ref = _tiny_h3()
++    model = _tiny_h3()
++    released = _released_from(ref)
++    # fc1 rows in the wrong order (a layout mistake): the swapped SwiGLU disagrees with the module it replaces
++    k = "token_refiner.blocks.0.mlp.fc1.weight"
++    released[k] = torch.cat(released[k].chunk(2, 0)[::-1], 0)
++    assert restore_dense_keep(model, to_diffusers(released, 16), dtype = torch.bfloat16) == 0
++    assert all(torch.equal(model.state_dict()[n], ref.state_dict()[n]) for n in ref.state_dict())
++
++
++def test_a_qkv_split_by_thirds_is_refused():
++    """The released qkv runs per head; read as [q; k; v] thirds it mixes heads and projections (the old ComfyUI
++    map's mistake), and the agreement check refuses every swap."""
++    from core.inference.video_minimax_h3_keep import restore_dense_keep, to_diffusers
++
++    ref = _tiny_h3()
++    model = _tiny_h3()
++    released = _released_from(ref)
++    sd = ref.state_dict()
++    for i in range(2):
++        released[f"token_refiner.blocks.{i}.attn.qkv_proj.weight"] = torch.cat(
++            [sd[f"token_refiner.refiner_blocks.{i}.attn.to_{p}.weight"] for p in "qkv"], 0
++        )
++    assert restore_dense_keep(model, to_diffusers(released, 16), dtype = torch.bfloat16) == 0
+diff --git a/studio/backend/core/inference/video_families.py b/studio/backend/core/inference/video_families.py
+index 623655a93e..6adcca1525 100644
+--- a/studio/backend/core/inference/video_families.py
++++ b/studio/backend/core/inference/video_families.py
+@@ -923,6 +923,19 @@ _FAMILIES: tuple[VideoFamily, ...] = (
+         profile = FamilyProfile(
+             scheme_deny = _NVFP4_GATE_FAILED,
+             int8_exclude_tokens = _HUNYUAN15_INT8_EXCLUDES,
++            # Runtime int8 ConvRot on the block stack (every input axis 256-divisible); opt-in with
++            # UNSLOTH_DIFFUSION_INT8_CONVROT=1 until its accuracy / speed A/B decides the default.
++            int8_convrot = ConvRotSpec(
++                group = 256,
++                suffixes = (
++                    "attn.to_q",
++                    "attn.to_k",
++                    "attn.to_v",
++                    "attn.to_out.0",
++                    "ff.net.0.proj",
++                    "ff.net.2",
++                ),
++            ),
+             nvfp4_zero_row_tokens = _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS,
+             preview_factors = "hv15",
+             auto_static_skip = (
+diff --git a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+index a6b8c70cce..a8bf55efca 100644
+--- a/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
++++ b/studio/backend/tests/fixtures/diffusion_family_data_freeze.json
+@@ -2095,8 +2095,15 @@
+     "convrot_filename": null,
+     "convrot_repo": null,
+     "convrot_spec": [
+-     0,
+-     []
++     256,
++     [
++      "attn.to_q",
++      "attn.to_k",
++      "attn.to_v",
++      "attn.to_out.0",
++      "ff.net.0.proj",
++      "ff.net.2"
++     ]
+     ],
+     "convrot_variant_repos": [],
+     "exclude": [
+@@ -4361,6 +4368,17 @@
+    "time_embed"
+   ],
+   "int8_family_convrot": {
++   "hunyuanvideo-1.5": [
++    256,
++    [
++     "attn.to_q",
++     "attn.to_k",
++     "attn.to_v",
++     "attn.to_out.0",
++     "ff.net.0.proj",
++     "ff.net.2"
++    ]
++   ],
+    "moss-image": [
+     256,
+     [
