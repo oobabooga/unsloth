@@ -1,0 +1,253 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 172fb79620..e68124e2ef 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -291,6 +291,7 @@ from .diffusion_speed import (
+     fp16_compile_explicit_only,
+     fp16_unet_offloaded,
+     fresh_compile_count,
++    restore_unfused_projections,
+     int8_gemm_live,
+     arm_graphs_after_placement,
+     normalize_speed_mode,
+@@ -13129,6 +13130,8 @@ class DiffusionBackend:
+                 cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
+                 invalidate_cfg_replica(pipe, "the LoRA adapters changed", logger)
+                 return
++        # PEFT targets to_q / to_k / to_v: a fused U-Net that dropped them gets them back first (bit-exact).
++        restore_unfused_projections(getattr(pipe, "unet", None))
+         # Read before loading, so a file rewritten during the load reads as changed next time.
+         file_sigs = _lora_file_sigs(desired)
+         try:
+diff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py
+index 1b1fbb31cf..9cfc77601d 100644
+--- a/studio/backend/core/inference/diffusion_speed.py
++++ b/studio/backend/core/inference/diffusion_speed.py
+@@ -2028,6 +2028,7 @@ def _fuse_qkv(pipe: Any, logger: Any) -> bool:
+             ):  # the pipe-level fuse resets every VAE processor to FusedAttnProcessor2_0
+                 from . import diffusion_vae_fused  # noqa: PLC0415
+                 diffusion_vae_fused.install_attention_processors(vae)
++            drop_unfused_projections(_denoiser_unet(pipe), logger)
+             return True
+         except Exception as exc:  # noqa: BLE001 - optimisation only
+             _warn(logger, "fuse_qkv_projections", exc)
+@@ -2044,6 +2045,96 @@ def _fuse_qkv(pipe: Any, logger: Any) -> bool:
+     return engaged
+ 
+ 
++DROP_UNFUSED_QKV_ENV = "UNSLOTH_DIFFUSION_DROP_UNFUSED_QKV"
++_DROPPED_ATTR = "_unsloth_dropped_projections"
++
++
++def _fused_attention_drops(module: Any) -> tuple:
++    """The projections diffusers' fused processor no longer calls: self attention runs ``to_qkv`` (q, k, v unused),
++    cross attention ``to_q`` + ``to_kv`` (k, v unused)."""
++    if not getattr(module, "fused_projections", False):
++        return ()
++    if getattr(module, "is_cross_attention", False):
++        return ("to_k", "to_v") if getattr(module, "to_kv", None) is not None else ()
++    return ("to_q", "to_k", "to_v") if getattr(module, "to_qkv", None) is not None else ()
++
++
++def drop_unfused_projections(unet: Any, logger: Any = None) -> int:
++    """Delete the unfused projections a U-Net QKV fuse left beside ``to_qkv`` / ``to_kv`` (SDXL: 1235 MiB). Kept when
++    a PEFT adapter is attached (it targets them) or the modules carry hooks; ``restore_unfused_projections`` rebuilds
++    them bit-exactly from the fused weights. UNSLOTH_DIFFUSION_DROP_UNFUSED_QKV=0 keeps them."""
++    if unet is None or (os.environ.get(DROP_UNFUSED_QKV_ENV) or "").strip().lower() in ("0", "off", "false", "no"):
++        return 0
++    try:
++        import torch
++        from torch import nn
++
++        if any(hasattr(m, "lora_A") for m in unet.modules()):
++            return 0  # PEFT adapters wrap to_q / to_k / to_v
++        plan = []
++        for module in unet.modules():
++            names = _fused_attention_drops(module)
++            if not names:
++                continue
++            parts = [getattr(module, n, None) for n in names]
++            if not all(type(p) is nn.Linear for p in parts):
++                return 0  # quantised / wrapped projections: leave the whole U-Net as it is
++            if any(p._forward_pre_hooks or p._forward_hooks or hasattr(p, "_hf_hook") for p in parts):
++                return 0
++            plan.append((module, names))
++        freed = 0
++        for module, names in plan:
++            shapes = []
++            for n in names:
++                p = getattr(module, n)
++                freed += sum(t.numel() * t.element_size() for t in p.parameters())
++                shapes.append((n, p.in_features, p.out_features, p.bias is not None))
++                delattr(module, n)
++            setattr(module, _DROPPED_ATTR, tuple(shapes))
++        if plan and torch.cuda.is_available():
++            torch.cuda.empty_cache()
++        if plan and logger is not None:
++            logger.info(
++                "diffusion.speed: dropped the unfused projections beside the fused QKV on %d attention modules "
++                "(%d MiB)",
++                len(plan),
++                freed >> 20,
++            )
++        return freed
++    except Exception as exc:  # noqa: BLE001 - memory only: a failed drop keeps what is left
++        _warn(logger, "dropping the unfused projections", exc)
++        return 0
++
++
++def restore_unfused_projections(unet: Any) -> int:
++    """Rebuild the projections ``drop_unfused_projections`` deleted, row slices of the fused weights (bit-exact: the
++    fuse concatenated them unchanged). Returns the modules restored."""
++    if unet is None:
++        return 0
++    import torch
++    from torch import nn
++
++    restored = 0
++    for module in unet.modules():
++        shapes = getattr(module, _DROPPED_ATTR, None)
++        if not shapes:
++            continue
++        fused = module.to_kv if getattr(module, "is_cross_attention", False) else module.to_qkv
++        rows = 0
++        for name, fin, fout, has_bias in shapes:
++            lin = nn.Linear(fin, fout, bias = has_bias, device = "meta")
++            with torch.no_grad():
++                grad = bool(fused.weight.requires_grad)
++                lin.weight = nn.Parameter(fused.weight[rows : rows + fout].clone(), requires_grad = grad)
++                if has_bias:
++                    lin.bias = nn.Parameter(fused.bias[rows : rows + fout].clone(), requires_grad = grad)
++            setattr(module, name, lin)
++            rows += fout
++        delattr(module, _DROPPED_ATTR)
++        restored += 1
++    return restored
++
++
+ def _warn(logger: Any, what: str, exc: Exception) -> None:
+     if logger is not None:
+         logger.warning("diffusion.speed: %s failed: %s", what, exc)
+diff --git a/studio/backend/tests/test_diffusion_drop_unfused_qkv.py b/studio/backend/tests/test_diffusion_drop_unfused_qkv.py
+new file mode 100644
+index 0000000000..47673589ce
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_drop_unfused_qkv.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""The U-Net QKV fuse drops the projections its fused processor no longer calls, bit-identically, and can rebuild them."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("diffusers")
++
++from core.inference import diffusion_speed as dspeed  # noqa: E402
++
++ENV = "UNSLOTH_DIFFUSION_DROP_UNFUSED_QKV"
++
++
++def _unet():
++    from diffusers import UNet2DConditionModel
++
++    torch.manual_seed(0)
++    return UNet2DConditionModel(
++        sample_size = 8,
++        in_channels = 4,
++        out_channels = 4,
++        layers_per_block = 1,
++        block_out_channels = (32, 64),
++        down_block_types = ("DownBlock2D", "CrossAttnDownBlock2D"),
++        up_block_types = ("CrossAttnUpBlock2D", "UpBlock2D"),
++        cross_attention_dim = 24,
++        attention_head_dim = 8,
++        norm_num_groups = 8,
++    ).eval()
++
++
++def _inputs():
++    g = torch.Generator().manual_seed(1)
++    return torch.randn(1, 4, 8, 8, generator = g), torch.tensor([10]), torch.randn(1, 3, 24, generator = g)
++
++
++def _bytes(m) -> int:
++    return sum(p.numel() * p.element_size() for p in m.parameters())
++
++
++def _pipe(unet):
++    return types.SimpleNamespace(unet = unet, vae = None, fuse_qkv_projections = unet.fuse_qkv_projections)
++
++
++def _attn(unet):
++    from diffusers.models.attention_processor import Attention
++
++    return [m for m in unet.modules() if isinstance(m, Attention)]
++
++
++@pytest.fixture(autouse = True)
++def _env(monkeypatch):
++    monkeypatch.delenv(ENV, raising = False)
++
++
++def test_fuse_drops_the_unused_projections_and_output_is_bit_identical(monkeypatch):
++    # the claim is about the drop, not the fuse: a fused U-Net that keeps its unfused copies (main) against one that
++    # dropped them (the fused GEMM itself may differ from three GEMMs in the last bit on some BLAS builds)
++    kept = _unet()
++    monkeypatch.setenv(ENV, "0")
++    dspeed._fuse_qkv(_pipe(kept), None)
++    monkeypatch.delenv(ENV)
++    with torch.no_grad():
++        before = kept(*_inputs()).sample
++    unet = _unet()
++    unfused_bytes = _bytes(unet)
++    assert dspeed._fuse_qkv(_pipe(unet), None) is True
++    with torch.no_grad():
++        after = unet(*_inputs()).sample
++    assert torch.equal(before, after)
++    # the fused weights replace the dropped ones byte for byte: nothing is held twice
++    assert _bytes(unet) == unfused_bytes
++    for m in _attn(unet):
++        if m.is_cross_attention:
++            assert hasattr(m, "to_q") and not hasattr(m, "to_k") and not hasattr(m, "to_v")
++        else:
++            assert not any(hasattr(m, n) for n in ("to_q", "to_k", "to_v"))
++
++
++def test_restore_rebuilds_the_projections_bit_exactly():
++    unet = _unet()
++    originals = {
++        (i, n): getattr(m, n).weight.detach().clone()
++        for i, m in enumerate(_attn(unet))
++        for n in ("to_q", "to_k", "to_v")
++    }
++    dspeed._fuse_qkv(_pipe(unet), None)
++    assert dspeed.restore_unfused_projections(unet) == len(_attn(unet))
++    for (i, n), w in originals.items():
++        assert torch.equal(getattr(_attn(unet)[i], n).weight, w)
++    assert dspeed.restore_unfused_projections(unet) == 0  # nothing left to rebuild
++
++
++def test_kill_switch_keeps_them(monkeypatch):
++    monkeypatch.setenv(ENV, "0")
++    unet = _unet()
++    unfused_bytes = _bytes(unet)
++    dspeed._fuse_qkv(_pipe(unet), None)
++    assert all(hasattr(m, "to_k") for m in _attn(unet))
++    assert _bytes(unet) > unfused_bytes
++
++
++def test_a_peft_adapter_keeps_them():
++    pytest.importorskip("peft")
++    from peft import LoraConfig
++
++    unet = _unet()
++    unet.add_adapter(LoraConfig(r = 2, lora_alpha = 2, target_modules = ["to_q", "to_k", "to_v"]), adapter_name = "a")
++    unet.fuse_qkv_projections()
++    assert dspeed.drop_unfused_projections(unet) == 0
++    assert all(hasattr(m, "to_k") for m in _attn(unet))
