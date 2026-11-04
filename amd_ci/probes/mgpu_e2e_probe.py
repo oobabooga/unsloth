@@ -41,6 +41,7 @@ CELLS = (
     "split_wan",
     "component_flux",
     "cfg_sdxl_unet",
+    "cfg_sdxl_unet_compiled",
     "cfg_flux_offload",
     "auto_selection",
 )
@@ -283,7 +284,7 @@ def cell_cfg(name: str, family: str, compiled: bool, offload: bool = False) -> d
         rec["zimage_ref_decline"] = zs.install_zimage_cfg_split(pipe, offload_policy = "none")
     if compiled:
         mg.install_compile_recorder()
-        rec["compiled_blocks"] = _compile_blocks(pipe.transformer)
+        rec["compiled_blocks"] = _compile_blocks(_den(pipe))
     ref_out = [_call(pipe, kw, p, steps, family, zs) for p in prompts]
     ref = [_hash(o) for o in ref_out]
     ref_t = [_tensor(o) for o in ref_out]
@@ -310,7 +311,7 @@ def cell_cfg(name: str, family: str, compiled: bool, offload: bool = False) -> d
     rec["selection"] = None if selection is None else [selection.primary, *selection.secondaries]
     with mg.selection_scope(selection):
         if compiled:
-            rec["compiled_blocks"] = _compile_blocks(pipe.transformer)
+            rec["compiled_blocks"] = _compile_blocks(_den(pipe))
         rec["decline"] = mg.install_cfg_parallel(pipe, offload_policy = "group" if offload else "none")
     router = getattr(_den(pipe), "_unsloth_cfg_router", None)
     rec["armed"] = router is not None
@@ -499,6 +500,8 @@ def cell_auto() -> dict:
 def child(cell: str) -> dict:
     if cell == "cfg_sdxl_unet":
         return cell_cfg(cell, "sdxl", False)
+    if cell == "cfg_sdxl_unet_compiled":
+        return cell_cfg(cell, "sdxl", True)
     if cell == "cfg_flux_offload":
         return cell_cfg(cell, "flux", False, offload = True)
     if cell == "auto_selection":

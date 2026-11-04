@@ -19,10 +19,11 @@ TITLE = "Multi-GPU wiring on tiny pipelines (spoofed second device)"
 MODE = "regression"
 NEEDS = ["gpu", "rocm", "multi_gpu", "discrete_gpu", "linux"]
 
-_CFG = ("cfg_flux", "cfg_qwen", "cfg_flux_compiled", "zimage_pair", "video_wan_cfg", "cfg_sdxl_unet", "cfg_flux_offload")
+_CFG = ("cfg_flux", "cfg_qwen", "cfg_flux_compiled", "zimage_pair", "video_wan_cfg", "cfg_sdxl_unet", "cfg_flux_offload",
+        "cfg_sdxl_unet_compiled")
 # a U-Net CFG split runs each half at batch B instead of 2B (different GEMM shapes) and a group-offloaded primary
 # against a resident replica: close to one card, not bit-identical by construction
-_TOL = {"cfg_sdxl_unet": 0.02, "cfg_flux_offload": 0.02}
+_TOL = {"cfg_sdxl_unet": 0.02, "cfg_flux_offload": 0.02, "cfg_sdxl_unet_compiled": 0.02}
 _SPLIT = ("split_flux", "split_wan")
 
 
@@ -39,6 +40,8 @@ def _defects(o: dict) -> dict[str, str]:
                 out[name] = f"Z-Image halves never ran as a parallel pair (split status {c.get('zimage_status')})"
             elif not (c.get("router_stats") or {}).get("replica_calls"):
                 out[name] = f"armed but 0 replica calls (disabled: {c.get('router_disabled')})"
+            elif c.get("compiled") and any((c.get("prompt2_new") or {}).get(k) for k in ("unique_graphs", "graph_breaks", "recompiles")):
+                out[name] = f"follow-up render compiled again: {c.get('prompt2_new')}"
             elif name in _TOL and max(c.get("max_abs_diff") or [1e9]) <= _TOL[name]:
                 pass
             elif c.get("bit_identical") is not True:
@@ -82,7 +85,7 @@ def table(obs: dict) -> str:
             armed = c.get("armed", c.get("engaged_plan", c.get("secondary_ordinal")))
             rows.append(f"| {cell} | {name} | {c.get('ok')} | {armed} | {rs.get('replica_calls', '')} "
                         f"| {rs.get('pairs_parallel', '')} | {c.get('bit_identical')} "
-                        f"| {str(bad.get(cell, '') or c.get('max_abs_diff') or c.get('selection') or '')[:160]} |")
+                        f"| {str(bad.get(cell, '') or c.get('max_abs_diff') or c.get('selection') or '')[:160]} {c.get('prompt2_new') or ''} |")
     return "\n".join(rows)
 
 

@@ -152,6 +152,8 @@ jobs:
         run: |
           set +e
           export HF_HOME="$AMD_CI_WORK/hf"
+          # a private compile cache: the runner's shared /mnt/scratch triton cache returned EBADMSG in round 1
+          export TRITON_CACHE_DIR="$AMD_CI_WORK/triton_cache" TORCHINDUCTOR_CACHE_DIR="$AMD_CI_WORK/inductor_cache"
           "$AMD_CI_PY" amd_ci/lib/differential.py \
             --states "$AMD_CI_WORK/out/states.json" \
             --probe amd_ci/probes/mgpu_e2e_probe.py \
