@@ -1,0 +1,692 @@
+diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
+index 4ab7e593fd..3c587e2453 100644
+--- a/studio/backend/core/inference/diffusion_multigpu.py
++++ b/studio/backend/core/inference/diffusion_multigpu.py
+@@ -52,6 +52,24 @@ def multigpu_mode() -> str:
+     return "auto"
+ 
+ 
++UNET_CFG_PARALLEL_ENV = "UNSLOTH_DIFFUSION_CFG_PARALLEL_UNET"
++# Automatic (no gpu_ids) arms CFG-parallel on an idle card of the same model; 0 keeps the replica to explicit picks.
++AUTO_CFG_PARALLEL_ENV = "UNSLOTH_DIFFUSION_CFG_PARALLEL_AUTO"
++# A card counts as idle when no more than this is in use on it (driver + another process's context).
++AUTO_CFG_PARALLEL_IDLE_USED_MIB = 1024
++
++
++def automatic_cfg_parallel_off() -> bool:
++    return (os.environ.get(AUTO_CFG_PARALLEL_ENV) or "").strip().lower() in ("0", "off", "false", "no")
++
++
++def _idle_card(probe: Any) -> bool:
++    free, total = getattr(probe, "free_mib", None), getattr(probe, "total_mib", None)
++    if free is None or total is None:
++        return False
++    return int(total) - int(free) <= AUTO_CFG_PARALLEL_IDLE_USED_MIB
++
++
+ def cfg_parallel_mode() -> str:
+     """``off`` / ``auto`` (default) / ``force`` (also across different card models)."""
+     if multigpu_mode() == "off":
+@@ -195,8 +213,8 @@ def selection_scope(
+     if selection is None:
+         yield None
+         return
+-    # Only a CFG replica reads the recorded compile arguments; automatic placement never builds one.
+-    if not selection.automatic or cfg_parallel_mode() == "force":
++    # Only a CFG replica reads the recorded compile arguments; automatic placement builds one unless its lever is off.
++    if not selection.automatic or cfg_parallel_mode() == "force" or not automatic_cfg_parallel_off():
+         install_compile_recorder()
+     token = _SELECTION.set(selection)
+     try:
+@@ -1034,6 +1052,29 @@ def _module_device(module: Any) -> Any:
+     return None
+ 
+ 
++def _execution_device(module: Any) -> Any:
++    """The card ``module`` computes on: its first tensor's device, or, for a group-offloaded denoiser whose first
++    tensors sit in host memory between calls, the CUDA card its offload groups load onto."""
++    device = _module_device(module)
++    if device is not None and getattr(device, "type", None) == "cuda":
++        return device
++    try:
++        from .diffusion_memory import _offload_groups
++
++        for group in _offload_groups(module):
++            onload = getattr(group, "onload_device", None)
++            if onload is not None and getattr(onload, "type", None) == "cuda":
++                onload = _torch().device(onload)
++                if onload.index is None:
++                    # an automatic load on the current card onloads to bare "cuda": name the card, so the replica
++                    # search compares it with the secondaries by ordinal
++                    onload = _torch().device("cuda", _torch().cuda.current_device())
++                return onload
++    except Exception:  # noqa: BLE001 - unknown: the parameter device stands
++        pass
++    return device
++
++
+ def _device_context(device: Any):
+     torch = _torch()
+     if getattr(device, "type", None) == "cuda" and device.index is not None:
+@@ -2859,6 +2900,11 @@ class CfgParallelRouter:
+                 t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
+             ) // (1 << 20)
+             free, total = self._secondary_free_total_mib()
++            if getattr(self, "automatic_idle_only", False) and not _idle_card(
++                DeviceProbe(ordinal = self.secondary.index, name = "", total_mib = total, free_mib = free)
++            ):
++                # Automatic borrowed this card because it was idle at load; something else took it since
++                raise RuntimeError(f"{self.secondary} is no longer idle ({free} of {total} MiB free)")
+             reserve = _replica_reserve_mib(free, total)
+             if free is not None and need_mib + reserve > free:
+                 raise RuntimeError(
+@@ -3013,10 +3059,127 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+     return lambda: replica(*args, **kwargs)
+ 
+ 
++# U-Net keyword arguments a batch split may carry; any other tensor-bearing keyword keeps the call whole on the source.
++_UNET_SPLIT_KWARGS = frozenset(
++    {
++        "encoder_hidden_states",
++        "timestep_cond",
++        "added_cond_kwargs",
++        "cross_attention_kwargs",
++        "down_block_additional_residuals",
++        "mid_block_additional_residual",
++        "return_dict",
++    }
++)
++
++
++def _unet_cfg_parallel_disabled() -> bool:
++    return (os.environ.get(UNET_CFG_PARALLEL_ENV) or "").strip().lower() in ("0", "off", "false", "no")
++
++
++def _split_batch(value: Any, n: int, half: int, depth: int = 0) -> Any:
++    """``value`` with every tensor of leading size ``n`` cut to its ``half`` (0 = first, 1 = second) along dim 0;
++    other tensors and plain values are shared. Raises TypeError on an object it cannot see into."""
++    torch = _torch()
++    if isinstance(value, torch.Tensor):
++        if value.dim() >= 1 and value.shape[0] == n:
++            b = n // 2
++            return value[:b] if half == 0 else value[b:]
++        return value
++    if value is None or isinstance(value, _PLAIN_TYPES):
++        return value
++    if depth > 4:
++        raise TypeError("nested too deep")
++    if isinstance(value, dict):
++        return {k: _split_batch(v, n, half, depth + 1) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return type(value)(_split_batch(v, n, half, depth + 1) for v in value)
++    raise TypeError(f"cannot split {type(value).__name__}")
++
++
++def _join_batch(a: Any, b: Any) -> Any:
++    torch = _torch()
++    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
++        return torch.cat([a, b.to(a.device)], dim = 0)
++    if isinstance(a, tuple) and isinstance(b, tuple) and len(a) == len(b) and a:
++        return (_join_batch(a[0], b[0]),) + tuple(a[1:])
++    sample_a, sample_b = getattr(a, "sample", None), getattr(b, "sample", None)
++    if isinstance(sample_a, torch.Tensor) and isinstance(sample_b, torch.Tensor):
++        return type(a)(sample = torch.cat([sample_a, sample_b.to(sample_a.device)], dim = 0))
++    raise TypeError(f"unexpected U-Net output {type(a).__name__}")
++
++
++class UnetCfgParallelRouter(CfgParallelRouter):
++    """CFG-parallel for a U-Net (SDXL / SD 1.x / 2.x): diffusers sends both guidance branches through ONE call at batch
++    ``2 * B``, so there is no second call to route. Each such call is cut in half along the batch: the first half runs
++    on the source card, the second on the replica at the same time (:meth:`CfgParallelRouter.run_pair`), and the two
++    outputs are concatenated. A U-Net treats every sample on its own, so the math is the same; the bits differ only
++    where the batch-B kernels round differently from batch 2B. Any even batch splits (two images without guidance
++    too, which then builds the replica). Odd batches, unknown inputs, a compiled-whole module and an unavailable
++    replica run the whole call on the source. ``UNSLOTH_DIFFUSION_CFG_PARALLEL_UNET=0`` keeps U-Nets on one card."""
++
++    def __call__(self, *args: Any, **kwargs: Any) -> Any:
++        torch = _torch()
++        module = self.module_ref()
++        if (
++            self._pairing
++            or self.disabled_reason is not None
++            or _background_compile_call()
++            or torch.compiler.is_compiling()
++            # compiled whole after the router was installed (a deferred speed profile): its graph owns the call
++            or getattr(module, "_compiled_call_impl", None) is not None
++        ):
++            self.stats["primary_calls"] += 1
++            return self._primary(*args, **kwargs)
++        sample = kwargs.get("sample", args[0] if args else None)
++        n = sample.shape[0] if isinstance(sample, torch.Tensor) and sample.dim() >= 1 else 0
++        halves = None
++        if n >= 2 and n % 2 == 0 and set(k for k in kwargs if k not in ("sample", "timestep")) <= _UNET_SPLIT_KWARGS:
++            try:
++                halves = [(_split_batch(args, n, h), _split_batch(kwargs, n, h)) for h in (0, 1)]
++            except TypeError:
++                halves = None
++        if halves is None:
++            self.stats["primary_calls"] += 1
++            return self._primary(*args, **kwargs)
++        (a0, k0), (a1, k1) = halves
++        self.stats["primary_calls"] += 1
++        # the primary half waits for a cold replica (a first call may compile) and marks its signature warm
++        res = self.run_pair(lambda: self._primary_noting(None, a0, k0), a1, k1)
++        if res is None:
++            return self._primary(*args, **kwargs)
++        first, second = res
++        if second is None:
++            second = self._primary(*a1, **k1)
++        return _join_batch(first, second)
++
++
+ _CFG_ROUTERS: "weakref.WeakKeyDictionary[Any, CfgParallelRouter]" = weakref.WeakKeyDictionary()
+ _CFG_DECLINES: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
+ 
+ 
++def _cfg_denoiser(pipe: Any) -> Any:
++    """The module CFG-parallel routes: ``pipe.transformer``, else a U-Net (batch split, :class:`UnetCfgParallelRouter`)
++    unless ``UNSLOTH_DIFFUSION_CFG_PARALLEL_UNET=0``."""
++    denoiser = getattr(pipe, "transformer", None)
++    if denoiser is not None:
++        return denoiser
++    unet = getattr(pipe, "unet", None)
++    if unet is not None and type(unet).__name__ == "UNet2DConditionModel" and not _unet_cfg_parallel_disabled():
++        if _batch_coupled_processors(unet):
++            return None  # PAG-style processors chunk the batch themselves: a dim-0 split would mix their thirds
++        return unet
++    return None
++
++
++def _batch_coupled_processors(unet: Any) -> bool:
++    try:
++        processors = getattr(unet, "attn_processors", None) or {}
++        return any("PAG" in type(p).__name__ for p in processors.values())
++    except Exception:  # noqa: BLE001 - unreadable: treat as coupled
++        return True
++
++
+ def cfg_parallel_decline(
+     pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
+ ) -> Optional[str]:
+@@ -3030,17 +3193,20 @@ def cfg_parallel_decline(
+     # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
+     if is_layer_split(pipe):
+         return "denoiser is split across cards (layer split)"
+-    # A replica takes a whole denoiser's worth of another card; automatic placement only borrows one to avoid offload.
+-    if selection.automatic and mode != "force":
++    # A replica takes a whole denoiser's worth of another card: automatic placement borrows one only when it is the
++    # same card model and idle at load (install_cfg_parallel keeps only those), or always under force.
++    if selection.automatic and mode != "force" and automatic_cfg_parallel_off():
+         return f"automatic GPU placement (select several cards or set {CFG_PARALLEL_ENV}=force)"
+     from .diffusion_bg_compile import load_time_enabled as bg_compile_enabled
+ 
+     if bg_compile_enabled():
+         # its replays call the denoiser, which would enter the router and race a render's branch state
+         return "background compile replays through the denoiser (UNSLOTH_DIFFUSION_BG_COMPILE)"
+-    denoiser = getattr(pipe, "transformer", None)
++    denoiser = _cfg_denoiser(pipe)
+     torch = _torch()
+     if not isinstance(denoiser, torch.nn.Module):
++        if isinstance(getattr(pipe, "unet", None), torch.nn.Module) and _unet_cfg_parallel_disabled():
++            return f"U-Net CFG-parallel off ({UNET_CFG_PARALLEL_ENV}=0)"
+         return "no DiT denoiser (a U-Net batches its guidance branches)"
+     from .diffusion_layer_split import is_layer_split
+ 
+@@ -3057,7 +3223,8 @@ def cfg_parallel_decline(
+         return "two-expert denoiser"
+     if getattr(denoiser, "_compiled_call_impl", None) is not None:
+         return "denoiser is compiled whole"
+-    if _module_device(denoiser) is None or _module_device(denoiser).type != "cuda":
++    device = _execution_device(denoiser)
++    if device is None or device.type != "cuda":
+         return "denoiser is not on a CUDA card"
+     return None
+ 
+@@ -3089,8 +3256,8 @@ def install_cfg_parallel(
+     selection = current_selection()
+     reason = cfg_parallel_decline(pipe, offload_policy = offload_policy, selection = selection)
+     if reason is None:
+-        denoiser = pipe.transformer
+-        primary = _module_device(denoiser)
++        denoiser = _cfg_denoiser(pipe)
++        primary = _execution_device(denoiser)
+         probes = probe_devices((selection.primary, *selection.secondaries))
+         same = [
+             o
+@@ -3100,6 +3267,10 @@ def install_cfg_parallel(
+             and probes[o].name == probes[primary.index].name
+         ]
+         candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
++        automatic = selection.automatic and cfg_parallel_mode() != "force"
++        if automatic:
++            # nothing else may live on a card Automatic borrows for a replica
++            candidates = [o for o in candidates if _idle_card(probes.get(o))]
+         try:
+             placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
+         except TypeError:
+@@ -3109,6 +3280,11 @@ def install_cfg_parallel(
+             candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
+         if not candidates and occupied:
+             reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
++        elif not candidates and automatic and same:
++            reason = (
++                f"automatic GPU placement: no idle card for a replica (more than "
++                f"{AUTO_CFG_PARALLEL_IDLE_USED_MIB} MiB in use; select several cards or set {CFG_PARALLEL_ENV}=force)"
++            )
+         elif not candidates:
+             reason = "secondary card is a different model (bit-identity needs the same kernels)"
+         else:
+@@ -3133,10 +3309,14 @@ def install_cfg_parallel(
+                 graph = _resident_graph(denoiser)
+                 if graph is not None:
+                     del denoiser.__dict__["forward"]
+-                router = CfgParallelRouter(
++                router_cls = (
++                    UnetCfgParallelRouter if denoiser is not getattr(pipe, "transformer", None) else CfgParallelRouter
++                )
++                router = router_cls(
+                     denoiser, primary = primary, secondary = f"cuda:{best}", logger = logger
+                 )
+                 router.inner = graph
++                router.automatic_idle_only = automatic
+                 try:
+                     _CFG_ROUTERS[pipe] = router
+                 except TypeError:
+@@ -3147,8 +3327,9 @@ def install_cfg_parallel(
+                 denoiser._unsloth_cfg_router = router
+                 if logger is not None:
+                     logger.info(
+-                        "diffusion.multigpu: CFG-parallel armed (replica on cuda:%s when guidance runs two branches)",
++                        "diffusion.multigpu: CFG-parallel armed (replica on cuda:%s when guidance runs two branches%s)",
+                         best,
++                        "; U-Net batch split" if router_cls is UnetCfgParallelRouter else "",
+                     )
+                 return None
+     if selection is not None:
+diff --git a/studio/backend/tests/test_diffusion_auto_placement.py b/studio/backend/tests/test_diffusion_auto_placement.py
+index 835ec3f4f4..2da99bf3c5 100644
+--- a/studio/backend/tests/test_diffusion_auto_placement.py
++++ b/studio/backend/tests/test_diffusion_auto_placement.py
+@@ -261,13 +261,15 @@ def test_a_fits_one_card_uses_one_card_and_no_cfg_parallel(monkeypatch):
+     d = decide(monkeypatch, host, _sizes(dit = 3900, te = 1600))
+     assert d.plan is d.one_card and d.plan.offload_policy == dm.OFFLOAD_NONE
+     assert d.plan.secondary_ordinal is None and d.plan.layer_split is None
+-    assert d.cfg_parallel is not None and "automatic" in d.cfg_parallel
++    # Automatic now offers CFG-parallel on an idle card of the same model: declined here only because the fake
++    # pipeline has no denoiser module (UNSLOTH_DIFFUSION_CFG_PARALLEL_AUTO=0 restores the automatic decline)
++    assert d.cfg_parallel is not None and "no DiT denoiser" in d.cfg_parallel
+     p = _placement(d)
+     assert p["chosen"] == "one_card"
+     assert p["summary"].startswith("placement: one card: everything resident on cuda:0")
+     kinds = {r["kind"]: r["reason"] for r in p["rejected"]}
+     assert kinds["companion_split"].startswith("not needed")
+-    assert "automatic" in kinds["cfg_parallel"]
++    assert "no DiT denoiser" in kinds["cfg_parallel"]
+     assert set(host.mem_get_info_calls) <= {0}
+ 
+ 
+@@ -288,7 +290,7 @@ def test_b_companion_split_puts_the_text_encoder_on_the_second_card(monkeypatch)
+     assert d.plan.offload_policy == dm.OFFLOAD_NONE and d.plan.secondary_ordinal == 1
+     assert "text_encoder" in d.plan.secondary_components
+     assert d.plan.layer_split is None
+-    assert d.cfg_parallel is not None and "automatic" in d.cfg_parallel
++    assert d.cfg_parallel is not None and "no DiT denoiser" in d.cfg_parallel
+     p = _placement(d)
+     assert p["chosen"] == "companion_split"
+     assert "text_encoder" in p["summary"] and "on cuda:1" in p["summary"]
+diff --git a/studio/backend/tests/test_diffusion_multigpu.py b/studio/backend/tests/test_diffusion_multigpu.py
+index 60c749b1ac..7c8a5a6282 100644
+--- a/studio/backend/tests/test_diffusion_multigpu.py
++++ b/studio/backend/tests/test_diffusion_multigpu.py
+@@ -1879,11 +1879,14 @@ def test_automatic_load_splits_only_when_one_card_would_offload(monkeypatch):
+     assert fits.secondary_ordinal is None
+ 
+ 
+-def test_automatic_placement_does_not_arm_cfg_parallel(monkeypatch):
++def test_automatic_placement_arms_cfg_parallel_only_with_the_auto_lever(monkeypatch):
+     class Pipe:
+         transformer = _Dit()
+ 
+     automatic = mg.MultiGpuSelection(primary = 0, secondaries = (1,), automatic = True)
++    # default: past the automatic gate (install_cfg_parallel then keeps only idle cards of the same model)
++    assert "CUDA" in mg.cfg_parallel_decline(Pipe(), offload_policy = "none", selection = automatic)
++    monkeypatch.setenv(mg.AUTO_CFG_PARALLEL_ENV, "0")
+     assert "automatic" in mg.cfg_parallel_decline(
+         Pipe(), offload_policy = "none", selection = automatic
+     )
+@@ -1918,14 +1921,20 @@ def test_begin_load_marks_an_unpicked_load_automatic(module_file):
+     assert ast.unparse(value.orelse.orelse) == "[]"
+ 
+ 
+-def test_automatic_selection_leaves_module_compile_alone(monkeypatch):
++def test_automatic_selection_leaves_module_compile_alone_without_the_auto_lever(monkeypatch):
+     def original(self, *args, **kwargs):
+         return self
+ 
+     monkeypatch.setattr(torch.nn.Module, "compile", original)
++    monkeypatch.setenv(mg.AUTO_CFG_PARALLEL_ENV, "0")
+     automatic = mg.MultiGpuSelection(primary = 0, secondaries = (1,), automatic = True)
+     with mg.selection_scope(automatic):
+         assert torch.nn.Module.compile is original
++    monkeypatch.delenv(mg.AUTO_CFG_PARALLEL_ENV)
++    with mg.selection_scope(automatic):
++        # Automatic may build a CFG replica, which re-applies the recorded compile arguments
++        assert getattr(torch.nn.Module.compile, "_unsloth_recorder", False)
++    monkeypatch.setattr(torch.nn.Module, "compile", original)
+     with mg.selection_scope(mg.MultiGpuSelection(primary = 0, secondaries = (1,))):
+         assert getattr(torch.nn.Module.compile, "_unsloth_recorder", False)
+ 
+diff --git a/studio/backend/tests/test_diffusion_unet_cfg_parallel.py b/studio/backend/tests/test_diffusion_unet_cfg_parallel.py
+new file mode 100644
+index 0000000000..a77ecb3b80
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_unet_cfg_parallel.py
+@@ -0,0 +1,308 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""CFG-parallel for U-Nets (SDXL / SD): one batch-2B call cut into two batch-B halves, the second on the replica."""
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from core.inference import diffusion_multigpu as mg  # noqa: E402
++
++
++class UNet2DConditionModel(torch.nn.Module):
++    """Named like diffusers' class: the router keys on the class name."""
++
++    def __init__(self):
++        super().__init__()
++        self.conv = torch.nn.Conv2d(4, 4, 3, padding = 1)
++        self.text = torch.nn.Linear(8, 4)
++        self.add = torch.nn.Linear(6, 4)
++        self.calls = []
++
++    def forward(
++        self,
++        sample,
++        timestep,
++        encoder_hidden_states,
++        added_cond_kwargs = None,
++        cross_attention_kwargs = None,
++        return_dict = True,
++        **extra,
++    ):
++        self.calls.append(int(sample.shape[0]))
++        h = self.conv(sample) * timestep
++        h = h + self.text(encoder_hidden_states).mean(1)[:, :, None, None]
++        if added_cond_kwargs:
++            h = h + self.add(added_cond_kwargs["time_ids"])[:, :, None, None]
++        for key, value in extra.items():
++            if isinstance(value, torch.Tensor):
++                h = h + value.sum()
++        return (h,) if not return_dict else type("Out", (), {"sample": h})()
++
++
++def _router(unet):
++    replicas = []
++
++    def factory():
++        r = mg.build_replica(unet, torch.device("cpu"))
++        replicas.append(r)
++        return r
++
++    router = mg.UnetCfgParallelRouter(unet, primary = "cpu", secondary = "cpu", replica_factory = factory)
++    unet.forward = router
++    return router, replicas
++
++
++def _sdxl_loop(unet, latents, steps, batch = 1, cfg = True, **extra):
++    g = torch.Generator().manual_seed(3)
++    cond = torch.randn(batch, 5, 8, generator = g)
++    uncond = torch.randn(batch, 5, 8, generator = g)
++    ids = torch.randn(batch, 6, generator = g)
++    for i in range(steps):
++        t = torch.tensor(1.0 - i / steps)
++        if cfg:
++            x = torch.cat([latents] * 2)
++            emb = torch.cat([uncond, cond])
++            tid = torch.cat([ids, ids])
++        else:
++            x, emb, tid = latents, cond, ids
++        out = unet(
++            x, t, encoder_hidden_states = emb, added_cond_kwargs = {"time_ids": tid}, return_dict = False, **extra
++        )[0]
++        if cfg:
++            u, c = out.chunk(2)
++            out = u + 5.0 * (c - u)
++        latents = latents - 0.1 * out
++    return latents
++
++
++def test_unet_cfg_parallel_matches_one_card_and_runs_halves_on_the_replica():
++    torch.manual_seed(0)
++    unet = UNet2DConditionModel()
++    lat = torch.randn(1, 4, 8, 8)
++    ref = _sdxl_loop(unet, lat.clone(), steps = 4)
++    assert unet.calls == [2, 2, 2, 2]
++    unet.calls.clear()
++    router, replicas = _router(unet)
++    out = _sdxl_loop(unet, lat.clone(), steps = 4)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    assert len(replicas) == 1 and replicas[0] is not unet
++    # the source runs one half per step; the replica the other
++    assert unet.calls == [1, 1, 1, 1]
++    assert replicas[0].calls == [1, 1, 1, 1]
++    assert router.stats["pairs_parallel"] == 4 and router.stats["replica_calls"] == 4
++    assert router.describe()["disabled_reason"] is None
++
++
++def test_unet_batch_two_per_branch_is_cut_in_half():
++    unet = UNet2DConditionModel()
++    lat = torch.randn(2, 4, 8, 8)
++    ref = _sdxl_loop(unet, lat.clone(), steps = 2, batch = 2)
++    unet.calls.clear()
++    router, replicas = _router(unet)
++    out = _sdxl_loop(unet, lat.clone(), steps = 2, batch = 2)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    assert unet.calls == [2, 2] and replicas[0].calls == [2, 2]
++
++
++def test_unet_odd_batch_stays_whole_on_the_source():
++    unet = UNet2DConditionModel()
++    router, replicas = _router(unet)
++    _sdxl_loop(unet, torch.randn(1, 4, 8, 8), steps = 3, cfg = False)
++    assert unet.calls == [1, 1, 1] and replicas == [] and router.replica is None
++    assert router.stats["replica_calls"] == 0
++
++
++def test_unet_unknown_tensor_keyword_stays_whole_on_the_source():
++    unet = UNet2DConditionModel()
++    router, replicas = _router(unet)
++    _sdxl_loop(unet, torch.randn(1, 4, 8, 8), steps = 2, mystery = torch.ones(2, 3))
++    assert unet.calls == [2, 2] and replicas == []
++
++
++def test_unet_replica_failure_recomputes_on_the_source():
++    unet = UNet2DConditionModel()
++    lat = torch.randn(1, 4, 8, 8)
++    ref = _sdxl_loop(unet, lat.clone(), steps = 3)
++
++    def broken():
++        raise RuntimeError("no room")
++
++    router = mg.UnetCfgParallelRouter(unet, primary = "cpu", secondary = "cpu", replica_factory = broken)
++    unet.forward = router
++    out = _sdxl_loop(unet, lat.clone(), steps = 3)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    assert "replica unavailable" in (router.disabled_reason or "")
++
++
++def test_unet_is_a_cfg_parallel_candidate(monkeypatch):
++    class Pipe:
++        transformer = None
++        unet = UNet2DConditionModel()
++
++    sel = mg.MultiGpuSelection(primary = 0, secondaries = (1,))
++    # resident on the CPU here: past the U-Net gate, refused only for not being on a CUDA card
++    assert mg.cfg_parallel_decline(Pipe(), offload_policy = "none", selection = sel) == "denoiser is not on a CUDA card"
++    assert mg._cfg_denoiser(Pipe()) is Pipe.unet
++    monkeypatch.setenv(mg.UNET_CFG_PARALLEL_ENV, "0")
++    assert mg._cfg_denoiser(Pipe()) is None
++    assert mg.UNET_CFG_PARALLEL_ENV in mg.cfg_parallel_decline(Pipe(), offload_policy = "none", selection = sel)
++
++
++def test_real_diffusers_unet_split_matches_batched():
++    diffusers = pytest.importorskip("diffusers")
++    torch.manual_seed(0)
++    unet = diffusers.UNet2DConditionModel(
++        sample_size = 8,
++        in_channels = 4,
++        out_channels = 4,
++        layers_per_block = 1,
++        block_out_channels = (8, 16),
++        down_block_types = ("DownBlock2D", "CrossAttnDownBlock2D"),
++        up_block_types = ("CrossAttnUpBlock2D", "UpBlock2D"),
++        cross_attention_dim = 8,
++        attention_head_dim = 2,
++        norm_num_groups = 4,
++        addition_embed_type = "text_time",
++        addition_time_embed_dim = 4,
++        projection_class_embeddings_input_dim = 8 + 6 * 4,
++    ).eval()
++    x = torch.randn(2, 4, 8, 8)
++    emb = torch.randn(2, 5, 8)
++    added = {"text_embeds": torch.randn(2, 8), "time_ids": torch.randn(2, 6)}
++    t = torch.tensor(500.0)
++    with torch.no_grad():
++        ref = unet(x, t, encoder_hidden_states = emb, added_cond_kwargs = added, return_dict = False)[0]
++        router = mg.UnetCfgParallelRouter(
++            unet, primary = "cpu", secondary = "cpu",
++            replica_factory = lambda: mg.build_replica(unet, torch.device("cpu")),
++        )
++        unet.forward = router
++        out = unet(x, t, encoder_hidden_states = emb, added_cond_kwargs = added, return_dict = False)[0]
++        out2 = unet(x, t, encoder_hidden_states = emb, added_cond_kwargs = added).sample
++    torch.testing.assert_close(out, ref, rtol = 1e-4, atol = 1e-5)
++    torch.testing.assert_close(out2, ref, rtol = 1e-4, atol = 1e-5)
++    assert router.stats["pairs_parallel"] == 2
++
++
++def test_unet_with_batch_chunking_processors_is_not_a_candidate():
++    class PAGCFGIdentitySelfAttnProcessor2_0:
++        pass
++
++    class Pipe:
++        transformer = None
++        unet = UNet2DConditionModel()
++
++    Pipe.unet.attn_processors = {"down.attn1.processor": PAGCFGIdentitySelfAttnProcessor2_0()}
++    assert mg._cfg_denoiser(Pipe()) is None
++
++
++def test_unet_compiled_whole_after_install_runs_whole_on_the_source():
++    unet = UNet2DConditionModel()
++    router, replicas = _router(unet)
++    # a deferred whole-module compile landed after the router: nn.Module.__call__ now goes through it
++    unet._compiled_call_impl = lambda *a, **k: unet.forward(*a, **k)
++    _sdxl_loop(unet, torch.randn(1, 4, 8, 8), steps = 2)
++    assert unet.calls == [2, 2] and replicas == []
++class _Dit(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.proj = torch.nn.Linear(4, 4)
++
++    def forward(self, hidden_states, timestep = None, encoder_hidden_states = None, return_dict = False):
++        return (self.proj(hidden_states),)
++
++
++def _automatic_install(monkeypatch, used_mib, names = ("Tesla T4", "Tesla T4"), env = None):
++    class Pipe:
++        transformer = _Dit()
++
++    probes = {
++        o: mg.DeviceProbe(ordinal = o, name = names[o], total_mib = 15360, free_mib = 15360 - used_mib[o])
++        for o in (0, 1)
++    }
++    if env is not None:
++        monkeypatch.setenv(mg.AUTO_CFG_PARALLEL_ENV, env)
++    monkeypatch.setattr(mg, "_module_device", lambda m: torch.device("cuda", 0))
++    monkeypatch.setattr(mg, "probe_devices", lambda ordinals, **kw: {o: probes[o] for o in ordinals})
++    monkeypatch.setattr(mg, "_hooks_present", lambda m: None)
++    monkeypatch.setattr(mg, "is_layer_split", lambda p: False, raising = False)
++    pipe = Pipe()
++    try:
++        with mg.selection_scope(mg.MultiGpuSelection(primary = 0, secondaries = (1,), automatic = True)):
++            return mg.install_cfg_parallel(pipe, offload_policy = "none")
++    finally:
++        mg.uninstall_cfg_parallel(pipe)
++
++
++def test_automatic_arms_cfg_parallel_on_an_idle_card_of_the_same_model(monkeypatch):
++    assert _automatic_install(monkeypatch, used_mib = (9000, 3)) is None
++
++
++def test_automatic_keeps_a_busy_second_card_free(monkeypatch):
++    reason = _automatic_install(monkeypatch, used_mib = (9000, 4000))
++    assert reason is not None and "no idle card" in reason
++
++
++def test_automatic_never_borrows_a_different_card_model(monkeypatch):
++    reason = _automatic_install(monkeypatch, used_mib = (9000, 3), names = ("Tesla T4", "Tesla P4"))
++    assert reason is not None and "different model" in reason
++
++
++def test_automatic_cfg_parallel_kill_switch(monkeypatch):
++    reason = _automatic_install(monkeypatch, used_mib = (9000, 3), env = "0")
++    assert reason is not None and "automatic GPU placement" in reason
++
++
++def test_automatic_selection_records_compile_arguments_for_a_replica(monkeypatch):
++    calls = []
++    monkeypatch.setattr(mg, "install_compile_recorder", lambda: calls.append(1) or True)
++    with mg.selection_scope(mg.MultiGpuSelection(primary = 0, secondaries = (1,), automatic = True)):
++        pass
++    assert calls == [1]
++    monkeypatch.setenv(mg.AUTO_CFG_PARALLEL_ENV, "0")
++    with mg.selection_scope(mg.MultiGpuSelection(primary = 0, secondaries = (1,), automatic = True)):
++        pass
++    assert calls == [1]
++
++
++def test_automatic_replica_is_not_built_on_a_card_that_got_busy(monkeypatch):
++    unet = UNet2DConditionModel()
++    router, replicas = _router(unet)
++    router.automatic_idle_only = True
++    monkeypatch.setattr(router, "_secondary_free_total_mib", lambda: (9000, 15360))
++    lat = torch.randn(1, 4, 8, 8)
++    _sdxl_loop(unet, lat, steps = 2)
++    assert replicas == [] and "no longer idle" in (router.disabled_reason or "")
++    assert unet.calls[-1] == 2  # whole on the source from then on
++
++
++def test_group_offloaded_denoiser_runs_cfg_parallel_from_its_onload_card(monkeypatch):
++    from core.inference import diffusion_memory as dm
++
++    class Group:
++        onload_device = torch.device("cuda", 0)
++
++    class Pipe:
++        transformer = _Dit()
++
++    monkeypatch.setattr(dm, "_offload_groups", lambda module: [Group()])
++    monkeypatch.setattr(mg, "_hooks_present", lambda m: None)
++    sel = mg.MultiGpuSelection(primary = 0, secondaries = (1,))
++    # parameters in host memory between calls, groups load onto cuda:0: a CFG-parallel candidate
++    assert mg._execution_device(Pipe.transformer) == torch.device("cuda", 0)
++    assert mg.cfg_parallel_decline(Pipe(), offload_policy = "group", selection = sel) is None
++    monkeypatch.setattr(dm, "_offload_groups", lambda module: [])
++    assert mg.cfg_parallel_decline(Pipe(), offload_policy = "group", selection = sel) == "denoiser is not on a CUDA card"
++
++
++def test_group_offloaded_onto_bare_cuda_names_the_current_card(monkeypatch):
++    from core.inference import diffusion_memory as dm
++
++    class Group:
++        onload_device = torch.device("cuda")
++
++    monkeypatch.setattr(dm, "_offload_groups", lambda module: [Group()])
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    assert mg._execution_device(_Dit()) == torch.device("cuda", 0)
