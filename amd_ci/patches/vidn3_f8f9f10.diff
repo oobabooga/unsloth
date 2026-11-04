@@ -385,10 +385,10 @@ index b9317f62ff..1d98fe2c2e 100644
                      transformer_quant_engaged = scheme
 diff --git a/studio/backend/core/inference/video_minimax_h3_keep.py b/studio/backend/core/inference/video_minimax_h3_keep.py
 new file mode 100644
-index 0000000000..a33b92ebf7
+index 0000000000..e547973eeb
 --- /dev/null
 +++ b/studio/backend/core/inference/video_minimax_h3_keep.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,291 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -452,6 +452,22 @@ index 0000000000..a33b92ebf7
 +    return out
 +
 +
++def _fs_range_reader(repo: str, path: str, revision: Optional[str], hf_token: Optional[str]) -> Any:
++    """``read(start, end)`` (inclusive) through ``HfFileSystem.cat_file`` (its own redirect / Xet handling)."""
++    from huggingface_hub import HfFileSystem
++
++    fs = HfFileSystem(token = hf_token)
++    target = f"{repo}@{revision}/{path}" if revision else f"{repo}/{path}"
++
++    def _read(start: int, end: int) -> bytes:
++        data = fs.cat_file(target, start = start, end = end + 1)
++        if len(data) != end - start + 1:
++            raise OSError(f"short read: {len(data)} of {end - start + 1} bytes")
++        return data
++
++    return _read
++
++
 +def fetch_keep_tensors(
 +    repo: str,
 +    subfolder: str,
@@ -503,7 +519,12 @@ index 0000000000..a33b92ebf7
 +
 +        url = hf_hub_url(repo, f"{subfolder}/{shard}", revision = revision)
 +        read = _hub_range_reader(url, build_hf_headers(token = hf_token), time.monotonic() + _RANGE_DEADLINE_S)
-+        tensors.update(_read_ranged(read, keys))
++        try:
++            tensors.update(_read_ranged(read, keys))
++        except Exception as exc:  # noqa: BLE001 - second transport below
++            if logger is not None:
++                logger.info("video.h3_int8_keep: ranged read of %s failed (%r); retrying through HfFileSystem", shard, exc)
++            tensors.update(_read_ranged(_fs_range_reader(repo, f"{subfolder}/{shard}", revision, hf_token), keys))
 +    try:
 +        from safetensors.torch import save_file
 +
@@ -633,7 +654,7 @@ index 0000000000..a33b92ebf7
 +    """Never raises: any failure keeps the int8 Linears (the hosted model as before)."""
 +    if not h3_int8_keep_enabled():
 +        return 0
-+    last = None
++    errors: list = []
 +    for subfolder in subfolders:
 +        try:
 +            tensors = fetch_keep_tensors(
@@ -646,16 +667,18 @@ index 0000000000..a33b92ebf7
 +                logger = logger,
 +            )
 +        except Exception as exc:  # noqa: BLE001
-+            last = exc
++            errors.append(f"{subfolder}: {exc!r}")
 +            continue
 +        if tensors:
 +            try:
 +                return restore_dense_keep(transformer, to_diffusers(tensors), dtype = dtype, logger = logger)
 +            except Exception as exc:  # noqa: BLE001
-+                last = exc
++                errors.append(f"{subfolder}: {exc!r}")
 +                break
 +    if logger is not None:
-+        logger.info("video.h3_int8_keep: kept the int8 text path (%s)", last or "no released shard index")
++        logger.info(
++            "video.h3_int8_keep: kept the int8 text path (%s)", "; ".join(errors) or "no released shard index"
++        )
 +    return 0
 diff --git a/studio/backend/tests/test_video_h3_int8_keep.py b/studio/backend/tests/test_video_h3_int8_keep.py
 new file mode 100644
