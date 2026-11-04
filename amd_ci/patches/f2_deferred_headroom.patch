@@ -1,0 +1,337 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 172fb79620..da9c8fe6e5 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -290,6 +290,7 @@ from .diffusion_speed import (
+     family_compiles_regionally,
+     fp16_compile_explicit_only,
+     fp16_unet_offloaded,
++    fused_qkv_added_bytes,
+     fresh_compile_count,
+     int8_gemm_live,
+     arm_graphs_after_placement,
+@@ -3051,6 +3052,85 @@ def _learned_peak_for_keys(
+     return None
+ 
+ 
++DEFERRED_HEADROOM_ENV = "UNSLOTH_DIFFUSION_DEFERRED_HEADROOM"
++# Room kept free above the eager peak plus the profile's added weights: allocator fragmentation, the stable range's
++# granularity and the compiled render's cuBLAS / cuDNN workspaces (SDXL 2048^2 at 8 GiB: 346 MiB short of this OOMs).
++_DEFERRED_HEADROOM_MIN_BYTES = 512 << 20
++_DEFERRED_HEADROOM_FRACTION = 0.10
++
++
++_DEFERRED_EAGER_PEAK_ATTR = "_unsloth_deferred_eager_peak"
++
++
++def _deferred_peak_now(dev: Any) -> int:
++    from .diffusion_stable_arena import peak_mapped_bytes
++    import torch
++
++    return int(torch.cuda.max_memory_allocated(dev)) + int(peak_mapped_bytes(dev.index))
++
++
++def _cuda_device_of(state: Any) -> Any:
++    import torch
++
++    dev = torch.device(str(getattr(state, "device", "")))
++    if dev.type != "cuda" or not torch.cuda.is_available():
++        return None
++    return dev if dev.index is not None else torch.device("cuda", torch.cuda.current_device())
++
++
++def _note_deferred_eager_peak(state: Any) -> None:
++    """Keep the highest device peak of this load's eager renders, read as each one ends (a caller may reset the peak
++    counters before the next generate, which would hide them from a read at engagement)."""
++    try:
++        dev = _cuda_device_of(state)
++        if dev is None:
++            return
++        pipe = state.pipe
++        peak = max(_deferred_peak_now(dev), int(getattr(pipe, _DEFERRED_EAGER_PEAK_ATTR, 0) or 0))
++        setattr(pipe, _DEFERRED_EAGER_PEAK_ATTR, peak)
++    except Exception:  # noqa: BLE001 - measurement only
++        pass
++
++
++def _deferred_profile_headroom_short(state: Any) -> Optional[str]:
++    """Why the deferred profile would not fit on the card, else None. The eager renders' measured peak plus the bytes
++    the profile adds to the denoiser (the U-Net QKV fuse keeps the unfused projections) must leave a margin inside
++    what this process can hold: free device memory plus its own allocator cache and stable ranges."""
++    if (os.environ.get(DEFERRED_HEADROOM_ENV) or "").strip().lower() in ("0", "off", "false", "no"):
++        return None
++    if getattr(state, "offload_policy", OFFLOAD_NONE) not in (OFFLOAD_NONE, OFFLOAD_MODEL):
++        return None  # streamed / grouped denoisers never hold the whole module on the card
++    added = fused_qkv_added_bytes(getattr(state, "pipe", None))
++    if added <= 0:
++        return None
++    try:
++        import torch
++
++        dev = _cuda_device_of(state)
++        if dev is None:
++            return None
++        from .diffusion_stable_arena import mapped_bytes
++
++        # the eager renders this load ran, as each one ended (plus anything since)
++        peak = max(
++            _deferred_peak_now(dev),
++            int(getattr(state.pipe, _DEFERRED_EAGER_PEAK_ATTR, 0) or 0),
++        )
++        free, _total = torch.cuda.mem_get_info(dev)
++        capacity = int(free) + int(torch.cuda.memory_reserved(dev)) + int(mapped_bytes(dev.index))
++    except Exception:  # noqa: BLE001 - unreadable: engage as before
++        return None
++    need = peak + added
++    need += max(_DEFERRED_HEADROOM_MIN_BYTES, int(need * _DEFERRED_HEADROOM_FRACTION))
++    if need <= capacity:
++        return None
++    mib = 1 << 20
++    return (
++        f"eager peak {peak // mib} MiB + {added // mib} MiB of fused QKV weights + margin = {need // mib} MiB, "
++        f"this process can hold {capacity // mib} MiB"
++    )
++
++
+ def _follow_live_graph_mode(state: Any) -> None:
+     """Keep a deferred profile's identity on the CUDA graph mode actually running (armed, then possibly dropped)."""
+     pipe = getattr(state, "pipe", None)
+@@ -13248,6 +13328,20 @@ class DiffusionBackend:
+                 "under the offload hooks)"
+             )
+             return
++        short = _deferred_profile_headroom_short(state)
++        if short is not None:
++            # declined before anything is patched: this load keeps rendering exactly as speed_mode=off
++            object.__setattr__(state, "deferred_static_plan", None)
++            logger.info(
++                "diffusion.speed: deferred profile declined, staying eager for this load (%s; %s=0 engages it "
++                "anyway)",
++                short,
++                DEFERRED_HEADROOM_ENV,
++            )
++            entry = (state.resolved or {}).get("speed_mode")
++            if isinstance(entry, dict):
++                entry["reason"] = f"auto: compiled profile declined, it does not fit on the card ({short})"
++            return
+         plan = state.deferred_static_plan
+         object.__setattr__(state, "deferred_static_plan", None)
+         tc = (state.resolved or {}).get("transformer_cache")
+@@ -14743,6 +14837,8 @@ class DiffusionBackend:
+                 # Count the finished generation (drives deferred speed); a batch is one generation.
+                 if (_hires_pass is None or not _hires_pass.refine) and not aux_pass:
+                     object.__setattr__(state, "generation_count", state.generation_count + 1)
++                    if state.speed_deferred:
++                        _note_deferred_eager_peak(state)
+                 result = {
+                     "images": list(images),
+                     "seed": int(seed),
+diff --git a/studio/backend/core/inference/diffusion_speed.py b/studio/backend/core/inference/diffusion_speed.py
+index 1b1fbb31cf..f5838ca23a 100644
+--- a/studio/backend/core/inference/diffusion_speed.py
++++ b/studio/backend/core/inference/diffusion_speed.py
+@@ -995,6 +995,42 @@ def _denoiser_unet(pipe: Any) -> Any:
+     return None
+ 
+ 
++def fused_qkv_added_bytes(pipe: Any) -> int:
++    """Device bytes the default tier's U-Net QKV fuse adds. diffusers' ``fuse_projections`` builds ``to_qkv`` /
++    ``to_kv`` beside the ``to_q`` / ``to_k`` / ``to_v`` it keeps, so a U-Net that moves whole (model offload) or stays
++    resident carries both (SDXL: 4897 MiB grows to 6132 MiB). 0 when the tier would not fuse."""
++    unet = _denoiser_unet(pipe)
++    if unet is None:
++        return 0
++    try:
++        import torch
++        from .diffusion_native_quant import is_native_quantised
++
++        if any(is_native_quantised(dit) for dit in _denoiser_dits(pipe)):
++            return 0
++        total = 0
++        for module in unet.modules():
++            if not callable(getattr(module, "fuse_projections", None)) or getattr(
++                module, "fused_projections", False
++            ):
++                continue
++            names = (
++                ("to_k", "to_v")
++                if getattr(module, "is_cross_attention", False)
++                else ("to_q", "to_k", "to_v")
++            )
++            if getattr(module, "add_q_proj", None) is not None:
++                names += ("add_q_proj", "add_k_proj", "add_v_proj")
++            for name in names:
++                linear = getattr(module, name, None)
++                for t in (getattr(linear, "weight", None), getattr(linear, "bias", None)):
++                    if isinstance(t, torch.Tensor):
++                        total += t.numel() * t.element_size()
++        return total
++    except Exception:  # noqa: BLE001 - unreadable: no extra bytes claimed
++        return 0
++
++
+ def compiled_shapes_are_static(pipe: Any, speed_mode: Optional[str]) -> bool:
+     """Whether this load's compiled artifacts are per-(width, height, batch); the compile cache keys on it."""
+     mode = normalize_speed_mode(speed_mode)
+diff --git a/studio/backend/tests/test_diffusion_deferred_headroom.py b/studio/backend/tests/test_diffusion_deferred_headroom.py
+new file mode 100644
+index 0000000000..9c863d8f95
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_deferred_headroom.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""The deferred speed profile declines when the eager peak plus the fused QKV copies would not fit on the card."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++torch = pytest.importorskip("torch")
++diffusers = pytest.importorskip("diffusers")
++
++from core.inference import diffusion as dmod  # noqa: E402
++from core.inference import diffusion_speed as dspeed  # noqa: E402
++
++MIB = 1 << 20
++HEADROOM_ENV = "UNSLOTH_DIFFUSION_DEFERRED_HEADROOM"
++
++
++def _tiny_unet():
++    from diffusers import UNet2DConditionModel
++
++    torch.manual_seed(0)
++    return UNet2DConditionModel(
++        sample_size = 8,
++        in_channels = 4,
++        out_channels = 4,
++        layers_per_block = 1,
++        block_out_channels = (32, 64),
++        down_block_types = ("DownBlock2D", "CrossAttnDownBlock2D"),
++        up_block_types = ("CrossAttnUpBlock2D", "UpBlock2D"),
++        cross_attention_dim = 24,
++        attention_head_dim = 8,
++        norm_num_groups = 8,
++    )
++
++
++def _bytes(module) -> int:
++    return sum(p.numel() * p.element_size() for p in module.parameters())
++
++
++def test_added_bytes_equal_what_diffusers_fuse_adds():
++    unet = _tiny_unet()
++    pipe = types.SimpleNamespace(unet = unet)
++    added = dspeed.fused_qkv_added_bytes(pipe)
++    before = _bytes(unet)
++    unet.fuse_qkv_projections()
++    assert added > 0
++    assert _bytes(unet) - before == added
++    # already fused: nothing more to add
++    assert dspeed.fused_qkv_added_bytes(pipe) == 0
++
++
++def test_no_unet_adds_nothing():
++    assert dspeed.fused_qkv_added_bytes(types.SimpleNamespace(transformer = object())) == 0
++
++
++@pytest.fixture
++def card(monkeypatch):
++    """A fake CUDA card: ``peak`` / ``free`` / ``reserved`` in MiB."""
++    reading = {"peak": 0, "free": 0, "reserved": 0}
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda dev = None: reading["peak"] * MIB)
++    monkeypatch.setattr(
++        torch.cuda, "mem_get_info", lambda dev = None: (reading["free"] * MIB, 24576 * MIB)
++    )
++    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda dev = None: reading["reserved"] * MIB)
++    monkeypatch.delenv(HEADROOM_ENV, raising = False)
++    return reading
++
++
++@pytest.fixture
++def engage(monkeypatch):
++    ran = []
++    monkeypatch.setattr(
++        dmod.DiffusionBackend, "_engage_deferred_profile", lambda self, state: ran.append(state)
++    )
++    monkeypatch.setattr(dmod, "invalidate_cfg_replica", lambda *a, **k: None)
++    monkeypatch.setattr(dmod, "drop_displaced_cfg_router", lambda *a, **k: None)
++    backend = object.__new__(dmod.DiffusionBackend)
++
++    def make(offload_policy = dmod.OFFLOAD_MODEL):
++        return types.SimpleNamespace(
++            pipe = types.SimpleNamespace(unet = _tiny_unet()),
++            speed_deferred = True,
++            deferred_static_plan = {"every": 3, "min_steps": 20},
++            resolved = {"speed_mode": {"value": "deferred", "reason": "auto"}},
++            transformer_cache = None,
++            offload_policy = offload_policy,
++            device = "cuda:0",
++        )
++
++    def run(offload_policy = dmod.OFFLOAD_MODEL, state = None):
++        state = state if state is not None else make(offload_policy)
++        dmod.DiffusionBackend._engage_deferred_speed(backend, state)
++        return state, bool(ran and ran[-1] is state)
++
++    run.make = make
++    return run
++
++
++def test_profile_declined_when_the_render_would_not_fit(card, engage):
++    # SDXL 2048^2 at 8 GiB on an L4: eager peak 6197 MiB, 544 MiB free beside a 7234 MiB cache
++    # (the tiny U-Net's fused copies are KiB: the peak sits 300 MiB inside capacity, short of the margin)
++    card.update(peak = 7778 - 300, free = 544, reserved = 7234)
++    state, engaged = engage()
++    assert not engaged
++    assert state.speed_deferred is False  # never retried on this load
++    assert state.deferred_static_plan is None  # no static skip either: renders stay as speed_mode=off
++    assert "declined" in state.resolved["speed_mode"]["reason"]
++
++
++def test_profile_engages_when_the_render_fits(card, engage):
++    # SDXL 1024^2 at 8 GiB: eager peak 5232 MiB leaves room for the fused copies
++    card.update(peak = 5232, free = 1322, reserved = 6456)
++    _state, engaged = engage()
++    assert engaged
++
++
++def test_header_names_the_kill_switch():
++    assert dmod.DEFERRED_HEADROOM_ENV == HEADROOM_ENV
++
++
++def test_kill_switch_engages_regardless(card, engage, monkeypatch):
++    card.update(peak = 7700, free = 50, reserved = 7728)
++    monkeypatch.setenv(HEADROOM_ENV, "0")
++    _state, engaged = engage()
++    assert engaged
++
++
++def test_grouped_offload_is_not_gated(card, engage):
++    card.update(peak = 7700, free = 50, reserved = 7728)
++    _state, engaged = engage(offload_policy = dmod.OFFLOAD_GROUP)
++    assert engaged
++
++
++def test_unreadable_card_engages(card, engage, monkeypatch):
++    def boom(dev = None):
++        raise RuntimeError("no reading")
++
++    monkeypatch.setattr(torch.cuda, "mem_get_info", boom)
++    card.update(peak = 7700)
++    _state, engaged = engage()
++    assert engaged
++
++
++def test_eager_peak_read_at_render_end_survives_a_counter_reset(card, engage):
++    # a caller resets the peak counters before the 3rd generate: the eager peak noted as render 2 ended still counts
++    state = engage.make()
++    card.update(peak = 7778 - 300, free = 544, reserved = 7234)
++    dmod._note_deferred_eager_peak(state)
++    card["peak"] = 10
++    _state, engaged = engage(state = state)
++    assert not engaged
