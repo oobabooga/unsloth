@@ -1,0 +1,482 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 172fb79620..e3ca10345a 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -1923,6 +1923,15 @@ def _generation_defaults_for(
+     return {"steps": int(steps), "guidance": float(guidance)}
+ 
+ 
++def _lora_fuse_dits(pipe: Any) -> list:
++    from .diffusion_autoopt import targets as _targets
++
++    try:
++        return list(_targets.denoiser_dits(pipe))
++    except Exception:  # noqa: BLE001 - no DiT: the U-Net alone
++        return []
++
++
+ def _refuse_lora_without_loader(fam: Any, loras: Any) -> None:
+     """A family whose pipeline has no LoRA loader refuses an active selection before anything loads."""
+     from core.inference import diffusion_lora
+@@ -13085,6 +13094,7 @@ class DiffusionBackend:
+ 
+         if not specs:
+             if current:
++                self._unfuse_loras(state, pipe)
+                 try:
+                     pipe.unload_lora_weights()
+                 except Exception:  # noqa: BLE001 -- best-effort clear
+@@ -13115,7 +13125,11 @@ class DiffusionBackend:
+             cancel = cancel,
+         )
+         if desired == current:
++            # the same set as the last render: fold it into the weights (no-op once folded)
++            self._fuse_constant_loras(state, pipe)
+             return
++        # a change: put the original weights back first, so the paths below see exactly the unfused model
++        self._unfuse_loras(state, pipe)
+         names = [name for name, _p, _w in desired]
+         weights = [w for _n, _p, w in desired]
+         if _lora_weights_only_change(state, pipe, current, desired):
+@@ -13154,6 +13168,33 @@ class DiffusionBackend:
+         cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
+         invalidate_cfg_replica(pipe, "the LoRA adapters changed", logger)
+ 
++    def _fuse_constant_loras(self, state: Any, pipe: Any) -> None:
++        """Fold an unchanged LoRA set into a resident dense denoiser (diffusion_lora_fuse); any failure stays unfused."""
++        from . import diffusion_lora_fuse as lora_fuse
++
++        if not lora_fuse.enabled() or lora_fuse.fused(pipe):
++            return
++        if getattr(state, "offload_policy", None) != OFFLOAD_NONE or getattr(
++            pipe, "_unsloth_loras_baked", False
++        ):
++            return  # offloaded weights move every render; quantised bakes keep their own path
++        denoisers = [
++            m for m in (getattr(pipe, "unet", None), *_lora_fuse_dits(pipe)) if m is not None
++        ]
++        denoisers = list({id(m): m for m in denoisers}.values())
++        if denoisers and lora_fuse.fuse(pipe, denoisers, logger):
++            # graphs recorded the unfused forward; a CFG replica copied the unfused weights
++            cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
++            invalidate_cfg_replica(pipe, "the LoRA set was folded into the weights", logger)
++
++    def _unfuse_loras(self, state: Any, pipe: Any) -> None:
++        """Restore the original weights of a folded LoRA set (bit-exact) before any change to it."""
++        from . import diffusion_lora_fuse as lora_fuse
++
++        if lora_fuse.unfuse(pipe):
++            cuda_graph.reset_all(getattr(state, "cuda_graphs", ()))
++            invalidate_cfg_replica(pipe, "the folded LoRA set was restored", logger)
++
+     def _adjust_baked_loras(
+         self,
+         state: Any,
+diff --git a/studio/backend/core/inference/diffusion_lora_fuse.py b/studio/backend/core/inference/diffusion_lora_fuse.py
+new file mode 100644
+index 0000000000..7cead6047d
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_lora_fuse.py
+@@ -0,0 +1,182 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Folds an unchanged LoRA set into a resident dense denoiser's weights, and restores them bit-exactly before a change.
++
++PEFT runs every adapted layer as ``base(x) + B(A(x)) * scale``: two extra GEMMs per layer on every step. Once the
++same set renders twice, the second render folds ``B @ A * scale`` into the base weights (fp32 add, one rounding to the
++weight dtype) and marks each layer merged, so PEFT's forward runs the base layer alone. The original weights are kept
++on the card when it has ample room (a restore is then a device copy), else in pinned host chunks, and copied back
++before any change, so the weights-only fast path (``set_adapters``) runs on exactly the weights it would have seen
++unfused. Opt out with UNSLOTH_DIFFUSION_LORA_FUSE=0."""
++
++from __future__ import annotations
++
++import os
++from typing import Any, Optional
++
++LORA_FUSE_ENV = "UNSLOTH_DIFFUSION_LORA_FUSE"
++BACKUP_ENV = "UNSLOTH_DIFFUSION_LORA_FUSE_BACKUP"
++_DEVICE_BACKUP_MIN_FREE = 8 << 30
++_FUSED_ATTR = "_unsloth_lora_fused"
++_ALIGN = 64
++_CHUNK = 64 << 20  # a power of two: no rounding waste in the pinned host allocator
++
++
++def enabled() -> bool:
++    return (os.environ.get(LORA_FUSE_ENV) or "").strip().lower() not in ("0", "off", "false", "no")
++
++
++def fused(pipe: Any) -> bool:
++    return bool(getattr(pipe, _FUSED_ATTR, None))
++
++
++def _lora_layers(module: Any) -> list:
++    return [
++        m
++        for m in module.modules()
++        if hasattr(m, "lora_A") and hasattr(m, "get_base_layer") and callable(getattr(m, "get_delta_weight", None))
++    ]
++
++
++def _plan(denoisers: list) -> Optional[list]:
++    """(layer, active adapters, base weight) per adapted layer, or None when any layer cannot fold exactly."""
++    import torch
++
++    plan = []
++    for denoiser in denoisers:
++        for layer in _lora_layers(denoiser):
++            if getattr(layer, "merged", False) or getattr(layer, "disable_adapters", False):
++                return None
++            active = [a for a in (getattr(layer, "active_adapters", None) or ()) if a in layer.lora_A]
++            if not active:
++                continue
++            if any(
++                (getattr(layer, "use_dora", {}) or {}).get(a) or (getattr(layer, "lora_bias", {}) or {}).get(a)
++                for a in active
++            ):
++                return None  # DoRA / LoRA bias change more than the weight
++            weight = getattr(layer.get_base_layer(), "weight", None)
++            if (
++                not isinstance(weight, torch.Tensor)
++                or type(weight.data) is not torch.Tensor  # quantised / GGUF / torchao subclasses
++                or not weight.is_floating_point()
++                or weight.device.type == "meta"
++            ):
++                return None
++            plan.append((layer, active, weight))
++    return plan or None
++
++
++def fuse(pipe: Any, denoisers: list, logger: Any = None) -> bool:
++    """Fold the active adapters into ``denoisers``' weights; True when they are folded (now or already)."""
++    if fused(pipe):
++        return True
++    plan = _plan(denoisers)
++    if plan is None:
++        return False
++    import torch
++
++    device = plan[0][2].device
++    if any(w.device != device for _l, _a, w in plan):
++        return False
++    # Packed into power-of-two chunks: the pinned host allocator rounds every block up to a power of two, so one
++    # slab of the whole backup would hold up to twice its size.
++    places, sizes, used = [], [], _CHUNK
++    for _layer, _active, weight in plan:
++        nbytes = -(-weight.numel() * weight.element_size() // _ALIGN) * _ALIGN
++        if nbytes > _CHUNK:
++            places.append((len(sizes), 0))
++            sizes.append(nbytes)
++            used = _CHUNK
++            continue
++        if used + nbytes > _CHUNK:
++            sizes.append(_CHUNK)
++            used = 0
++        places.append((len(sizes) - 1, used))
++        used += nbytes
++    total = sum(sizes)
++    on_device = _backup_on_device(device, total)
++    try:
++        if on_device:
++            chunks = [torch.empty(n, dtype = torch.uint8, device = device) for n in sizes]
++        else:
++            chunks = [torch.empty(n, dtype = torch.uint8, pin_memory = device.type == "cuda") for n in sizes]
++    except Exception:  # noqa: BLE001 - no room for the backup: stay unfused
++        return False
++    entries = []
++    try:
++        for (layer, active, weight), (ci, off) in zip(plan, places):
++            nbytes = weight.numel() * weight.element_size()
++            backup = chunks[ci][off : off + nbytes].view(weight.dtype).view(weight.shape)
++            backup.copy_(weight.detach())
++            delta = None
++            for adapter in active:
++                d = layer.get_delta_weight(adapter).float()
++                delta = d if delta is None else delta + d
++            with torch.no_grad():
++                weight.copy_((weight.float() + delta).to(weight.dtype))
++            layer.merged_adapters = list(active)
++            entries.append((layer, weight, backup))
++        _sync(device)
++    except Exception as exc:  # noqa: BLE001 - put back what was folded, stay unfused
++        _restore(entries)
++        if logger is not None:
++            logger.warning("diffusion.lora_fuse: fold failed, staying unfused: %s", exc)
++        return False
++    setattr(pipe, _FUSED_ATTR, {"entries": entries, "chunks": chunks})
++    if logger is not None:
++        logger.info(
++            "diffusion.lora_fuse: folded the unchanged LoRA set into %d layers (%d MiB kept on the %s to restore)",
++            len(entries),
++            total >> 20,
++            "card" if on_device else "host",
++        )
++    return True
++
++
++def _restore(entries: list) -> None:
++    import torch
++
++    with torch.no_grad():
++        for layer, weight, backup in entries:
++            weight.copy_(backup)
++            layer.merged_adapters = []
++    if entries:
++        _sync(entries[0][1].device)
++
++
++def _backup_on_device(device: Any, nbytes: int) -> bool:
++    """Keep the backup beside the weights (a restore is then a device copy, not a host upload) only when the card keeps
++    max(8 GiB, a quarter of it) free after it; UNSLOTH_DIFFUSION_LORA_FUSE_BACKUP=host / device forces either."""
++    mode = (os.environ.get(BACKUP_ENV) or "auto").strip().lower()
++    if device.type != "cuda" or mode == "host":
++        return False
++    if mode == "device":
++        return True
++    try:
++        import torch
++
++        free, total = torch.cuda.mem_get_info(device)
++    except Exception:  # noqa: BLE001 - unreadable: the host
++        return False
++    return int(free) - int(nbytes) >= max(_DEVICE_BACKUP_MIN_FREE, int(total) // 4)
++
++
++def _sync(device: Any) -> None:
++    if device.type == "cuda":
++        import torch
++
++        torch.cuda.synchronize(device)
++
++
++def unfuse(pipe: Any) -> bool:
++    """Copy the original weights back (bit-exact) and run the adapters unfused again; True when anything was folded."""
++    state = getattr(pipe, _FUSED_ATTR, None)
++    if not state:
++        return False
++    try:
++        _restore(state["entries"])
++    finally:
++        setattr(pipe, _FUSED_ATTR, None)
++    return True
+diff --git a/studio/backend/tests/test_diffusion_lora_fuse.py b/studio/backend/tests/test_diffusion_lora_fuse.py
+new file mode 100644
+index 0000000000..8703363eeb
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_lora_fuse.py
+@@ -0,0 +1,214 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""An unchanged LoRA set is folded into a resident dense denoiser and restored bit-exactly before a change."""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("diffusers")
++pytest.importorskip("peft")
++
++from core.inference import diffusion as dmod  # noqa: E402
++
++FUSE_ENV = "UNSLOTH_DIFFUSION_LORA_FUSE"
++
++
++def _unet_with_lora():
++    from diffusers import UNet2DConditionModel
++    from peft import LoraConfig
++
++    torch.manual_seed(0)
++    unet = UNet2DConditionModel(
++        sample_size = 8,
++        in_channels = 4,
++        out_channels = 4,
++        layers_per_block = 1,
++        block_out_channels = (32, 64),
++        down_block_types = ("DownBlock2D", "CrossAttnDownBlock2D"),
++        up_block_types = ("CrossAttnUpBlock2D", "UpBlock2D"),
++        cross_attention_dim = 24,
++        attention_head_dim = 8,
++        norm_num_groups = 8,
++    ).eval()
++    unet.add_adapter(
++        LoraConfig(r = 4, lora_alpha = 4, target_modules = ["to_q", "to_k", "to_v", "to_out.0"], init_lora_weights = False),
++        adapter_name = "px",
++    )
++    return unet
++
++
++def _inputs():
++    g = torch.Generator().manual_seed(1)
++    return (
++        torch.randn(1, 4, 8, 8, generator = g),
++        torch.tensor([10]),
++        torch.randn(1, 3, 24, generator = g),
++    )
++
++
++def _base_weights(unet) -> dict:
++    return {
++        n: p.detach().clone()
++        for n, p in unet.named_parameters()
++        if "lora_" not in n
++    }
++
++
++class _Pipe(types.SimpleNamespace):
++    def set_adapters(self, names, adapter_weights = None):
++        self.unet.set_adapters(names, weights = adapter_weights)
++        self.calls.append(("set_adapters", tuple(names), tuple(adapter_weights or ())))
++
++
++@pytest.fixture
++def engine(monkeypatch):
++    monkeypatch.delenv(FUSE_ENV, raising = False)
++    monkeypatch.setattr(dmod, "_refuse_lora_without_loader", lambda *a, **k: None)
++    monkeypatch.setattr(dmod, "_lora_load_block_reason", lambda pipe: None)
++    monkeypatch.setattr(dmod, "invalidate_cfg_replica", lambda *a, **k: None)
++    from core.inference import diffusion_lora
++
++    monkeypatch.setattr(diffusion_lora, "lora_unavailable_reason", lambda **k: None)
++    monkeypatch.setattr(dmod, "_lora_file_sigs", lambda desired: ("sig",))
++    backend = object.__new__(dmod.DiffusionBackend)
++    unet = _unet_with_lora()
++    pipe = _Pipe(unet = unet, calls = [], _unsloth_loras = (("px", "/x/px.safetensors", 1.0),))
++    setattr(pipe, dmod._LORA_FILE_SIGS_ATTR, ("sig",))
++    state = types.SimpleNamespace(
++        pipe = pipe,
++        family = None,
++        kind = "pipeline",
++        transformer_quant = None,
++        offload_policy = dmod.OFFLOAD_NONE,
++        hf_token = None,
++        speed_optims = (),
++        cuda_graphs = (),
++    )
++    monkeypatch.setattr(
++        dmod.DiffusionBackend,
++        "_resolve_lora_set",
++        lambda self, specs, **k: tuple(("px", "/x/px.safetensors", float(w)) for _i, w in specs),
++    )
++
++    def apply(weight):
++        dmod.DiffusionBackend._apply_loras(backend, state, [("px", weight)], __import__("threading").Event())
++
++    return types.SimpleNamespace(apply = apply, state = state, pipe = pipe, unet = unet)
++
++
++def _merged_layers(unet) -> int:
++    return sum(1 for m in unet.modules() if hasattr(m, "lora_A") and getattr(m, "merged", False))
++
++
++def test_unchanged_set_is_folded_and_matches_unfused(engine):
++    x = _inputs()
++    with torch.no_grad():
++        unfused = engine.unet(*x).sample
++    engine.apply(1.0)  # same set as the last render
++    assert _merged_layers(engine.unet) > 0
++    with torch.no_grad():
++        folded = engine.unet(*x).sample
++    torch.testing.assert_close(folded, unfused, rtol = 1e-4, atol = 1e-5)
++
++
++def test_change_restores_the_original_weights_bit_exactly(engine):
++    before = _base_weights(engine.unet)
++    engine.apply(1.0)
++    assert _merged_layers(engine.unet) > 0
++    engine.apply(0.5)  # a strength change: restore, then the weights-only path
++    assert _merged_layers(engine.unet) == 0
++    after = _base_weights(engine.unet)
++    assert before.keys() == after.keys()
++    assert all(torch.equal(before[k], after[k]) for k in before)
++    assert ("set_adapters", ("px",), (0.5,)) in engine.pipe.calls
++
++
++def test_changed_output_equals_a_never_folded_model(engine):
++    x = _inputs()
++    reference = _unet_with_lora()
++    reference.set_adapters(["px"], weights = [0.5])
++    with torch.no_grad():
++        expected = reference(*x).sample
++    engine.apply(1.0)
++    engine.apply(0.5)
++    with torch.no_grad():
++        got = engine.unet(*x).sample
++    assert torch.equal(got, expected)
++
++
++def test_kill_switch_never_folds(engine, monkeypatch):
++    monkeypatch.setenv(FUSE_ENV, "0")
++    engine.apply(1.0)
++    assert _merged_layers(engine.unet) == 0
++
++
++def test_offloaded_denoiser_is_not_folded(engine):
++    engine.state.offload_policy = dmod.OFFLOAD_MODEL
++    engine.apply(1.0)
++    assert _merged_layers(engine.unet) == 0
++
++
++def test_removing_the_set_restores_before_unload(engine):
++    before = _base_weights(engine.unet)
++    engine.apply(1.0)
++    seen = {}
++
++    def unload():
++        seen["merged"] = _merged_layers(engine.unet)
++        seen["equal"] = all(torch.equal(before[k], v) for k, v in _base_weights(engine.unet).items())
++
++    engine.pipe.unload_lora_weights = unload
++    dmod.DiffusionBackend._apply_loras(
++        object.__new__(dmod.DiffusionBackend), engine.state, [], __import__("threading").Event()
++    )
++    assert seen == {"merged": 0, "equal": True}
++
++
++@pytest.mark.parametrize(
++    "free_gib, total_gib, mode, expected",
++    [
++        (80, 96, None, True),  # G4: 75 GiB stay free
++        (10, 24, None, False),  # L4 with SDXL resident: 5.6 GiB would stay free
++        (80, 96, "host", False),
++        (10, 24, "device", True),
++    ],
++)
++def test_backup_lands_on_the_card_only_with_ample_room(monkeypatch, free_gib, total_gib, mode, expected):
++    from core.inference import diffusion_lora_fuse as lf
++
++    gib = 1 << 30
++    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev = None: (free_gib * gib, total_gib * gib))
++    if mode is None:
++        monkeypatch.delenv(lf.BACKUP_ENV, raising = False)
++    else:
++        monkeypatch.setenv(lf.BACKUP_ENV, mode)
++    assert lf._backup_on_device(torch.device("cuda", 0), int(4.4 * gib)) is expected
++    assert lf._backup_on_device(torch.device("cpu"), int(4.4 * gib)) is False
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU (CUDA or ROCm)")
++@pytest.mark.parametrize("backup", ["device", "host"])
++def test_fold_and_restore_on_the_gpu_in_bf16(engine, monkeypatch, backup):
++    # the real placement: bf16 weights on the card, the backup on the card or in pinned host memory
++    from core.inference import diffusion_lora_fuse as lf
++
++    monkeypatch.setenv(lf.BACKUP_ENV, backup)
++    engine.unet.to("cuda", torch.bfloat16)
++    x = tuple(t.to("cuda") if t.is_floating_point() is False else t.to("cuda", torch.bfloat16) for t in _inputs())
++    before = _base_weights(engine.unet)
++    with torch.no_grad():
++        unfused = engine.unet(*x).sample.float()
++    engine.apply(1.0)
++    assert _merged_layers(engine.unet) > 0
++    with torch.no_grad():
++        folded = engine.unet(*x).sample.float()
++    assert (folded - unfused).abs().max().item() < 0.05 * max(1.0, unfused.abs().max().item())
++    engine.apply(0.5)
++    assert _merged_layers(engine.unet) == 0
++    after = _base_weights(engine.unet)
++    assert all(torch.equal(before[k], after[k]) for k in before)
