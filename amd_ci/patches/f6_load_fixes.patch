@@ -1,0 +1,399 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 40caed79a4..36e54f1539 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -413,6 +413,7 @@ from .diffusion_sampler import (
+     DEFAULT_SAMPLER,
+     apply_checkpoint_prediction_type,
+     apply_pipeline_prediction_type,
++    start_root_single_marks,
+     build_scheduler,
+     sampler_options,
+ )
+@@ -6056,6 +6057,11 @@ class DiffusionBackend:
+                 return None
+             if not pipeline_seed_supported(fam):
+                 return None
++            # A UNet denoiser (SDXL) has no dense quant scheme and no seed: skip the scheme probe, a child process.
++            if getattr(fam, "denoiser_attr", "transformer") != "transformer" and not getattr(
++                fam, "prequant_repos", ()
++            ):
++                return None
+             raw = transformer_quant
+             auto = raw is None or str(raw).strip().lower() in ("", "auto")
+             # Speed=off rewrites AUTO to off (no seed); an explicit scheme upgrades speed to default, so seed it to keep the load off the released bf16 shards.
+@@ -9492,6 +9498,16 @@ class DiffusionBackend:
+                                         )
+                                     # The prefetched snapshot dir keeps from_pretrained off the hub (24 GB per FLUX.1
+                                     # otherwise)
++                                    _marks_future = (
++                                        start_root_single_marks(
++                                            _base_local_dir or fetch_base,
++                                            fetch_base,
++                                            hub_token,
++                                            not local_files_only,
++                                        )
++                                        if fam.single_file_is_pipeline
++                                        else None
++                                    )
+                                     try:
+                                         with _converted_shards_pread(dtype, small_host):
+                                             pipe = pipeline_cls.from_pretrained(
+@@ -9518,6 +9534,7 @@ class DiffusionBackend:
+                                             # Not hf_token: that collapsed False (anonymous) to None (ambient).
+                                             hf_token = hub_token,
+                                             allow_network = not local_files_only,
++                                            marks_future = _marks_future,
+                                         )
+                                 if small_host is not None and small_host.engaged:
+                                     plan = self._apply_small_host_route(
+diff --git a/studio/backend/core/inference/diffusion_sampler.py b/studio/backend/core/inference/diffusion_sampler.py
+index f2603d5c95..01dc932a19 100644
+--- a/studio/backend/core/inference/diffusion_sampler.py
++++ b/studio/backend/core/inference/diffusion_sampler.py
+@@ -255,17 +255,22 @@ def _marks_key(repo_id: str, commit: str) -> str:
+ 
+ 
+ def _recorded_marks(repo_id: str, commit: Optional[str]) -> list[dict[str, Any]]:
++    return _recorded_marks_or_none(repo_id, commit) or []
++
++
++def _recorded_marks_or_none(repo_id: str, commit: Optional[str]) -> Optional[list[dict[str, Any]]]:
++    """The markers an earlier read recorded for this exact commit, or None when nothing is recorded."""
+     import json
+ 
+     path = _marks_record_path()
+     if not commit or path is None:
+-        return []
++        return None
+     try:
+         hit = json.loads(path.read_text(encoding = "utf-8")).get(_marks_key(repo_id, commit))
+     except Exception:  # noqa: BLE001 - absent / unreadable record: nothing recorded
+-        return []
++        return None
+     if not isinstance(hit, list) or not all(_well_formed_marks(m) for m in hit):
+-        return []
++        return None
+     return [_marker_overrides(set(m.get("markers") or ())) for m in hit]
+ 
+ 
+@@ -358,6 +363,10 @@ def _root_single_marks(
+         # A cache-only load of a snapshot an online load already read keeps that read's verdict.
+         return _recorded_marks(rid, commit)
+     if commit:
++        # A commit is immutable, so what an earlier read recorded for it is the answer: no Hub round trips.
++        recorded = _recorded_marks_or_none(rid, commit)
++        if recorded is not None:
++            return recorded
+         # Read the snapshot the record is keyed on, never a HEAD that moved past the staged copy.
+         rev = {"revision": commit}
+     try:
+@@ -373,16 +382,25 @@ def _root_single_marks(
+             for f in api.list_repo_files(rid, token = hf_token, **rev)
+             if "/" not in f and f.lower().endswith(".safetensors")
+         )
+-        markers = [
+-            sorted(
++
++
++        def _read(name: str) -> list[str]:
++            return sorted(
+                 k
+                 for k in api.parse_safetensors_file_metadata(
+                     rid, name, token = hf_token, **rev
+                 ).tensors
+                 if k in ("v_pred", "ztsnr")
+             )
+-            for name in names
+-        ]
++
++        # One header per root file, each two round trips: read them side by side, in name order.
++        if len(names) > 1:
++            from concurrent.futures import ThreadPoolExecutor
++
++            with ThreadPoolExecutor(max_workers = min(8, len(names))) as pool:
++                markers = list(pool.map(_read, names))
++        else:
++            markers = [_read(name) for name in names]
+     except Exception:  # noqa: BLE001 - offline / gated / odd: an earlier read of this snapshot, else the config
+         return _recorded_marks(rid, commit)
+     _record_marks(rid, commit, markers)
+@@ -395,6 +413,7 @@ def pipeline_prediction_overrides(
+     repo_id: Optional[str] = None,
+     hf_token: Any = None,
+     allow_network: bool = False,
++    precomputed_marks: Optional[list[dict[str, Any]]] = None,
+ ) -> dict[str, Any]:
+     """Scheduler overrides a diffusers SDXL pipeline directory asks for. Empty when it asks for none.
+ 
+@@ -406,7 +425,11 @@ def pipeline_prediction_overrides(
+     which never samples the terminal timestep that zero-SNR training exists for (the marker path
+     sets ``trailing`` for the same reason)."""
+     overrides: dict[str, Any] = {}
+-    marks = _root_single_marks(root, repo_id, hf_token, allow_network)
++    marks = (
++        _root_single_marks(root, repo_id, hf_token, allow_network)
++        if precomputed_marks is None
++        else precomputed_marks
++    )
+     if marks and marks[0] and all(m == marks[0] for m in marks):
+         overrides.update(marks[0])
+     config = config or {}
+@@ -453,13 +476,48 @@ def apply_pipeline_prediction_type(
+     repo_id: Optional[str] = None,
+     hf_token: Any = None,
+     allow_network: bool = False,
++    marks_future: Any = None,
+ ) -> bool:
+     """``apply_checkpoint_prediction_type`` for a diffusers pipeline directory
+-    (``pipeline_prediction_overrides``). True when it changed; idempotent."""
++    (``pipeline_prediction_overrides``). True when it changed; idempotent. ``marks_future`` is a
++    ``start_root_single_marks`` read begun before the weights loaded; any failure of it reads again here."""
+     config = getattr(getattr(pipe, "scheduler", None), "config", None)
++    precomputed = None
++    if marks_future is not None:
++        try:
++            precomputed = marks_future.result()
++        except Exception:  # noqa: BLE001 - the overlapped read failed: read it again in line
++            precomputed = None
+     return _apply_scheduler_overrides(
+         pipe,
+-        pipeline_prediction_overrides(config, root, repo_id, hf_token, allow_network),
++        pipeline_prediction_overrides(
++            config, root, repo_id, hf_token, allow_network, precomputed_marks = precomputed
++        ),
+         logger,
+         "pipeline v-prediction",
+     )
++
++
++def start_root_single_marks(
++    root: Optional[str],
++    repo_id: Optional[str] = None,
++    hf_token: Any = None,
++    allow_network: bool = False,
++) -> Any:
++    """``_root_single_marks`` on a daemon thread (the caller's context copied, so a pinned revision holds), so its Hub
++    header reads overlap the weight load. Returns a ``concurrent.futures.Future``."""
++    import contextvars
++    import threading
++    from concurrent.futures import Future
++
++    future: Future = Future()
++    ctx = contextvars.copy_context()
++
++    def _run() -> None:
++        try:
++            future.set_result(ctx.run(_root_single_marks, root, repo_id, hf_token, allow_network))
++        except BaseException as exc:  # noqa: BLE001 - handed to the waiter
++            future.set_exception(exc)
++
++    threading.Thread(target = _run, name = "sdxl-marks", daemon = True).start()
++    return future
+diff --git a/studio/backend/tests/test_diffusion_unet_skips_scheme_probe.py b/studio/backend/tests/test_diffusion_unet_skips_scheme_probe.py
+new file mode 100644
+index 0000000000..a954a5eaa2
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_unet_skips_scheme_probe.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""A UNet pipeline (SDXL) has no dense quant scheme and no hosted seed, so planning its load must not run the
++transformer-quant scheme probe (a spawned child process, about 3 s of every SDXL load on an L4)."""
++
++from __future__ import annotations
++
++import pytest
++
++pytest.importorskip("torch")
++
++
++def _fam(name):
++    from core.inference.diffusion_families import _FAMILIES
++
++    return next(f for f in _FAMILIES if f.name == name)
++
++
++def test_sdxl_plans_no_seed_without_probing(monkeypatch):
++    from core.inference import diffusion as D
++
++    probed = []
++
++    def boom(*a, **k):
++        # The planner swallows exceptions, so record the call instead of raising.
++        probed.append(True)
++        return None
++
++    monkeypatch.setattr(D, "_planned_quant_scheme", boom)
++    monkeypatch.setattr(D, "dense_transformer_supported", lambda *a, **k: probed.append(True) or True)
++    monkeypatch.setattr(D, "_pipeline_quant_uncompilable_reason", lambda *a, **k: None)
++    monkeypatch.setattr(D, "_auto_keeps_bf16_reason", lambda *a, **k: None)
++    backend = D.DiffusionBackend.__new__(D.DiffusionBackend)
++    backend._target_for_ordinal = lambda *a, **k: object()
++    fam = _fam("sdxl")
++    assert fam.denoiser_attr == "unet" and not fam.prequant_repos
++    got = backend._pipeline_planned_denoiser_scheme(
++        fam,
++        base = fam.base_repo,
++        kind = "pipeline",
++        transformer_quant = None,
++        speed_mode = None,
++        repo_id = fam.base_repo,
++    )
++    assert got is None
++    assert probed == []
++
++
++def test_a_transformer_family_still_reaches_the_scheme_pick(monkeypatch):
++    from core.inference import diffusion as D
++
++    seen = []
++
++    def stop(*a, **k):
++        seen.append(True)
++        return False
++
++    monkeypatch.setattr(D, "dense_transformer_supported", stop)
++    backend = D.DiffusionBackend.__new__(D.DiffusionBackend)
++    backend._target_for_ordinal = lambda *a, **k: object()
++    fam = _fam("z-image")
++    backend._pipeline_planned_denoiser_scheme(
++        fam,
++        base = fam.base_repo,
++        kind = "pipeline",
++        transformer_quant = None,
++        speed_mode = None,
++        repo_id = fam.base_repo,
++    )
++    assert seen == [True]
+diff --git a/studio/backend/tests/test_diffusion_vpred_sdxl_detect.py b/studio/backend/tests/test_diffusion_vpred_sdxl_detect.py
+index d0930886f7..58a39bf573 100644
+--- a/studio/backend/tests/test_diffusion_vpred_sdxl_detect.py
++++ b/studio/backend/tests/test_diffusion_vpred_sdxl_detect.py
+@@ -672,10 +672,16 @@ def test_a_recorded_marker_read_is_per_snapshot_commit(hub_cache, monkeypatch):
+     other.mkdir()
+     # Another commit of the repo was never read: its shipped config stands offline.
+     assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(other), NOOB, None, False) == {}
+-    # An online read that finds no markers replaces the record, so an eps re-release stays eps offline.
+-    _stub_noob_hub(monkeypatch, SDXL_UNET_KEYS, [])
+-    assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(snap), NOOB, None, True) == {}
+-    assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(snap), NOOB, None, False) == {}
++    # A commit is immutable: a later online load of the same snapshot answers from the record, no Hub call.
++    seen = []
++    _stub_noob_hub(monkeypatch, SDXL_UNET_KEYS, seen)
++    assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(snap), NOOB, None, True) == VPRED
++    assert seen == []
++    # A re-release is a new commit: read online, recorded under its own key.
++    newer = _staged_snapshot(hub_cache, commit = "e" * 40)
++    assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(newer), NOOB, None, True) == {}
++    assert seen == ["list", "header"]
++    assert pipeline_prediction_overrides(NOOB_SCHEDULER, str(newer), NOOB, None, False) == {}
+ 
+ 
+ def test_an_unrecorded_cache_only_load_keeps_the_shipped_config(hub_cache, monkeypatch):
+@@ -886,3 +892,104 @@ def test_concurrent_marker_records_keep_every_entry(hub_cache, monkeypatch):
+     b.join(5)
+     record = json.loads(sampler._marks_record_path().read_text(encoding = "utf-8"))
+     assert {sampler._marks_key(NOOB, "a" * 40), sampler._marks_key(NOOB, "b" * 40)} <= set(record)
++
++
++def test_the_root_headers_are_read_side_by_side_in_name_order(hub_cache, monkeypatch):
++    import threading
++    import time
++
++    import huggingface_hub
++
++    snap = _staged_snapshot(hub_cache)
++    names = ["a.safetensors", "b.safetensors", "c.safetensors"]
++    active, peak = [0], [0]
++    lock = threading.Lock()
++
++    def files(self, repo_id, token = None, **kw):
++        return ["model_index.json", *names]
++
++    def parse(self, repo_id, filename, token = None, **kw):
++        with lock:
++            active[0] += 1
++            peak[0] = max(peak[0], active[0])
++        time.sleep(0.2)
++        with lock:
++            active[0] -= 1
++        keys = ["v_pred", "ztsnr"] if filename == "c.safetensors" else []
++        return types.SimpleNamespace(tensors = {k: None for k in keys}, metadata = {})
++
++    monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files", files)
++    monkeypatch.setattr(huggingface_hub.HfApi, "parse_safetensors_file_metadata", parse)
++    from core.inference import diffusion_sampler as smp
++
++    marks = smp._root_single_marks(str(snap), NOOB, None, True)
++    assert peak[0] > 1
++    # Results stay in name order: only the last file carries the markers.
++    assert [bool(m) for m in marks] == [False, False, True]
++
++
++def test_the_overlapped_marker_read_matches_the_inline_one(hub_cache, monkeypatch):
++    diffusers = pytest.importorskip("diffusers")
++    from core.inference import diffusion_sampler as smp
++
++    snap = _staged_snapshot(hub_cache)
++    seen = []
++    _stub_noob_hub(monkeypatch, SDXL_UNET_KEYS + ["v_pred", "ztsnr"], seen)
++    future = smp.start_root_single_marks(str(snap), NOOB, None, True)
++    pipe = types.SimpleNamespace(
++        scheduler = diffusers.EulerDiscreteScheduler.from_config(NOOB_SCHEDULER)
++    )
++    assert smp.apply_pipeline_prediction_type(
++        pipe, str(snap), repo_id = NOOB, allow_network = True, marks_future = future
++    )
++    assert seen == ["list", "header"]
++    assert pipe.scheduler.config.prediction_type == "v_prediction"
++
++
++def test_a_failed_overlapped_read_is_read_again_inline(hub_cache, monkeypatch):
++    from concurrent.futures import Future
++
++    diffusers = pytest.importorskip("diffusers")
++    from core.inference import diffusion_sampler as smp
++
++    snap = _staged_snapshot(hub_cache)
++    seen = []
++    _stub_noob_hub(monkeypatch, SDXL_UNET_KEYS + ["v_pred", "ztsnr"], seen)
++    failed: Future = Future()
++    failed.set_exception(RuntimeError("thread died"))
++    pipe = types.SimpleNamespace(
++        scheduler = diffusers.EulerDiscreteScheduler.from_config(NOOB_SCHEDULER)
++    )
++    assert smp.apply_pipeline_prediction_type(
++        pipe, str(snap), repo_id = NOOB, allow_network = True, marks_future = failed
++    )
++    assert seen == ["list", "header"]
++
++
++def test_the_load_starts_the_marker_read_before_the_weights():
++    import ast
++
++    source = (
++        Path(__file__).resolve().parents[1] / "core" / "inference" / "diffusion.py"
++    ).read_text(encoding = "utf-8")
++    tree = ast.parse(source)
++    starts = [
++        c.lineno
++        for c in ast.walk(tree)
++        if isinstance(c, ast.Call) and getattr(c.func, "id", None) == "start_root_single_marks"
++    ]
++    loads = [
++        c.lineno
++        for c in ast.walk(tree)
++        if isinstance(c, ast.Call)
++        and isinstance(c.func, ast.Attribute)
++        and c.func.attr == "from_pretrained"
++        and getattr(c.func.value, "id", None) == "pipeline_cls"
++    ]
++    applies = [
++        c
++        for c in ast.walk(tree)
++        if isinstance(c, ast.Call) and getattr(c.func, "id", None) == "apply_pipeline_prediction_type"
++    ]
++    assert len(starts) == 1 and any(starts[0] < line < starts[0] + 20 for line in loads)
++    assert "marks_future" in {k.arg for k in applies[0].keywords}
