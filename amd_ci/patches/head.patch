@@ -32,7 +32,7 @@ index 127b041a0e..f95deda96c 100644
      """``auto_cuda_ranking_possible`` when it can be answered from state already in memory, else None.
  
 diff --git a/studio/backend/core/inference/diffusion_multigpu.py b/studio/backend/core/inference/diffusion_multigpu.py
-index 4ab7e593fd..dcbc2896be 100644
+index 4ab7e593fd..7f71191dc1 100644
 --- a/studio/backend/core/inference/diffusion_multigpu.py
 +++ b/studio/backend/core/inference/diffusion_multigpu.py
 @@ -52,6 +52,82 @@ def multigpu_mode() -> str:
@@ -194,18 +194,19 @@ index 4ab7e593fd..dcbc2896be 100644
  def _device_context(device: Any):
      torch = _torch()
      if getattr(device, "type", None) == "cuda" and device.index is not None:
-@@ -2425,7 +2540,10 @@ class CfgParallelRouter:
+@@ -2425,7 +2540,11 @@ class CfgParallelRouter:
              "kv_cache_declined": 0,
              "kv_prefill_primary_calls": 0,
              "replica_failures": 0,
 +            "batch_splits": 0,
++            "batch_split_skip": None,
          }
 +        # the last render ran one call per step (no guidance branches): a batch can split from its first step
 +        self.last_render_single = False
          # source prefix-KV cache id -> (source cache, the tensors it held when copied, the replica's copy)
          self.kv_mirrors: dict[int, tuple[Any, list, Any]] = {}
          self.kv_declined: dict[int, tuple[Any, list]] = {}
-@@ -2495,6 +2613,7 @@ class CfgParallelRouter:
+@@ -2495,6 +2614,7 @@ class CfgParallelRouter:
          self.prev_latent = None
          self.template = None
          self.b0_leaves = {}
@@ -213,7 +214,7 @@ index 4ab7e593fd..dcbc2896be 100644
          self.branch = 0
          # the next render shows its own guidance shape: no speculative branch before its first odd call
          self.cfg_seen = False
-@@ -2564,6 +2683,15 @@ class CfgParallelRouter:
+@@ -2564,6 +2684,15 @@ class CfgParallelRouter:
                  self._prefetch(args, kwargs)
                  sig = _call_signature(args, kwargs)
                  self._launch_prediction(latent, sig)
@@ -229,7 +230,7 @@ index 4ab7e593fd..dcbc2896be 100644
          prefill = self.branch % 2 == 1 and _is_prefill(kwargs)
          if (
              self.branch % 2 == 1
-@@ -2616,6 +2744,42 @@ class CfgParallelRouter:
+@@ -2616,17 +2745,64 @@ class CfgParallelRouter:
          self.stats["primary_calls"] += 1
          return self._primary_noting(sig, args, kwargs)
  
@@ -244,19 +245,25 @@ index 4ab7e593fd..dcbc2896be 100644
 +        if allowed is None or _batch_split_disabled() or torch.compiler.is_compiling():
 +            return None
 +        if getattr(module, "_compiled_call_impl", None) is not None:
-+            return None
++            return self._skip_split("denoiser is compiled whole")
 +        n = latent.shape[0] if isinstance(latent, torch.Tensor) and latent.dim() >= 1 else 0
-+        if n < 2 or n % 2 or args:
++        if n < 2 or n % 2:
 +            return None
-+        if any(k not in allowed and v is not None and v is not False for k, v in kwargs.items()):
-+            return None
++        if args:
++            return self._skip_split("positional inputs")
++        extra = sorted(k for k, v in kwargs.items() if k not in allowed and v is not None and v is not False)
++        if extra:
++            return self._skip_split(f"unknown inputs {extra}")
 +        if kwargs.get("joint_attention_kwargs"):
-+            return None
++            return self._skip_split("attention kwargs")
 +        try:
 +            (a0, k0), (a1, k1) = [(_split_batch(args, n, h), _split_batch(kwargs, n, h)) for h in (0, 1)]
-+        except TypeError:
-+            return None
-+        res = self.run_pair(lambda: self._primary_noting(None, a0, k0), a1, k1)
++        except TypeError as exc:
++            return self._skip_split(f"unsplittable input ({exc})")
++        # inside the denoiser's own call: its root hooks already wrap the whole batch, so run_pair need not refuse them
++        res = self.run_pair(lambda: self._primary_noting(None, a0, k0), a1, k1, inside_call = True)
++        if res is None:
++            self._skip_split(f"pair not run ({self.disabled_reason or 'replica unavailable'})")
 +        # run_pair forgets the step: keep this one's latent so the next call is read as a new step
 +        self.prev_latent = latent
 +        self.branch = 0
@@ -269,10 +276,29 @@ index 4ab7e593fd..dcbc2896be 100644
 +        self.stats["batch_splits"] += 1
 +        return _join_batch(first, second)
 +
++    def _skip_split(self, reason: str) -> None:
++        self.stats["batch_split_skip"] = reason
++        return None
++
      def run_pair(
-         self, primary_call: Callable[[], Any], args: tuple, kwargs: dict
+-        self, primary_call: Callable[[], Any], args: tuple, kwargs: dict
++        self, primary_call: Callable[[], Any], args: tuple, kwargs: dict, *, inside_call: bool = False
      ) -> Optional[tuple]:
-@@ -2859,6 +3023,11 @@ class CfgParallelRouter:
+         """Second half on the replica, ``primary_call`` on the source. ``(first, second)``; None = run both on source;
+-        ``second`` None = replica failed."""
++        ``second`` None = replica failed. ``inside_call``: called from within the denoiser's own ``__call__`` (batch
++        split), whose root hooks already ran around the whole call."""
+         if self.disabled_reason is not None or _background_compile_call():
+             return None
+         module = self.module_ref()
+         if module is None or _holds_opaque_tensors((args, kwargs)):
+             return None
+-        if any(getattr(module, attr, None) for attr in _ROOT_HOOK_DICTS):
++        if not inside_call and any(getattr(module, attr, None) for attr in _ROOT_HOOK_DICTS):
+             return None
+         self._drop_pending()
+         self.template = None
+@@ -2859,6 +3035,11 @@ class CfgParallelRouter:
                  t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers())
              ) // (1 << 20)
              free, total = self._secondary_free_total_mib()
@@ -284,7 +310,7 @@ index 4ab7e593fd..dcbc2896be 100644
              reserve = _replica_reserve_mib(free, total)
              if free is not None and need_mib + reserve > free:
                  raise RuntimeError(
-@@ -3013,10 +3182,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
+@@ -3013,10 +3194,146 @@ def _replica_call(replica: Any, args: tuple, kwargs: dict) -> Callable[[], Any]:
      return lambda: replica(*args, **kwargs)
  
  
@@ -431,7 +457,7 @@ index 4ab7e593fd..dcbc2896be 100644
  def cfg_parallel_decline(
      pipe: Any, *, offload_policy: str, selection: Optional[MultiGpuSelection]
  ) -> Optional[str]:
-@@ -3030,17 +3335,20 @@ def cfg_parallel_decline(
+@@ -3030,17 +3347,20 @@ def cfg_parallel_decline(
      # A replica is a whole denoiser on one card, which a denoiser cut across cards cannot be.
      if is_layer_split(pipe):
          return "denoiser is split across cards (layer split)"
@@ -455,7 +481,7 @@ index 4ab7e593fd..dcbc2896be 100644
          return "no DiT denoiser (a U-Net batches its guidance branches)"
      from .diffusion_layer_split import is_layer_split
  
-@@ -3057,7 +3365,8 @@ def cfg_parallel_decline(
+@@ -3057,7 +3377,8 @@ def cfg_parallel_decline(
          return "two-expert denoiser"
      if getattr(denoiser, "_compiled_call_impl", None) is not None:
          return "denoiser is compiled whole"
@@ -465,7 +491,7 @@ index 4ab7e593fd..dcbc2896be 100644
          return "denoiser is not on a CUDA card"
      return None
  
-@@ -3083,14 +3392,15 @@ def install_cfg_parallel(
+@@ -3083,14 +3404,15 @@ def install_cfg_parallel(
      offload_policy: str,
      logger: Any = None,
  ) -> Optional[str]:
@@ -486,7 +512,7 @@ index 4ab7e593fd..dcbc2896be 100644
          probes = probe_devices((selection.primary, *selection.secondaries))
          same = [
              o
-@@ -3100,6 +3410,21 @@ def install_cfg_parallel(
+@@ -3100,6 +3422,21 @@ def install_cfg_parallel(
              and probes[o].name == probes[primary.index].name
          ]
          candidates = same if cfg_parallel_mode() != "force" else list(selection.secondaries)
@@ -508,7 +534,7 @@ index 4ab7e593fd..dcbc2896be 100644
          try:
              placed = ((_PLACEMENTS.get(pipe) or {}).get("placement") or {}).values()
          except TypeError:
-@@ -3109,6 +3434,12 @@ def install_cfg_parallel(
+@@ -3109,6 +3446,12 @@ def install_cfg_parallel(
              candidates = [o for o in candidates if f"cuda:{o}" not in occupied]
          if not candidates and occupied:
              reason = f"the only replica card ({', '.join(sorted(occupied))}) holds the split's components"
@@ -521,7 +547,7 @@ index 4ab7e593fd..dcbc2896be 100644
          elif not candidates:
              reason = "secondary card is a different model (bit-identity needs the same kernels)"
          else:
-@@ -3133,10 +3464,14 @@ def install_cfg_parallel(
+@@ -3133,10 +3476,14 @@ def install_cfg_parallel(
                  graph = _resident_graph(denoiser)
                  if graph is not None:
                      del denoiser.__dict__["forward"]
@@ -537,7 +563,7 @@ index 4ab7e593fd..dcbc2896be 100644
                  try:
                      _CFG_ROUTERS[pipe] = router
                  except TypeError:
-@@ -3147,8 +3482,10 @@ def install_cfg_parallel(
+@@ -3147,8 +3494,10 @@ def install_cfg_parallel(
                  denoiser._unsloth_cfg_router = router
                  if logger is not None:
                      logger.info(
@@ -551,10 +577,10 @@ index 4ab7e593fd..dcbc2896be 100644
      if selection is not None:
 diff --git a/studio/backend/tests/test_diffusion_auto_multigpu_policy.py b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
 new file mode 100644
-index 0000000000..193d780e69
+index 0000000000..3da833c2ec
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_auto_multigpu_policy.py
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,230 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -767,6 +793,24 @@ index 0000000000..193d780e69
 +    out = _flux_loop(model, 2, 4)
 +    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
 +    assert router.disabled_reason is not None
++
++
++def test_batch_split_skips_are_recorded_and_stay_exact():
++    """A foreign root hook cannot be mirrored onto a replica, and an unknown input cannot be split: both renders stay
++    on the source, match one card, and say why."""
++    ref_model, ref = _reference(FluxTransformer2DModel, 2, 3)
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    model.register_forward_pre_hook(lambda mod, args: None)
++    router, built = _router(model)
++    out = _flux_loop(model, 2, 3)
++    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
++    assert router.stats["batch_splits"] == 0 and "carries hooks" in router.stats["batch_split_skip"]
++    torch.manual_seed(0)
++    model = FluxTransformer2DModel()
++    router, _ = _router(model)
++    _flux_loop(model, 2, 3, controlnet_block_samples = torch.ones(1))
++    assert "unknown inputs" in router.stats["batch_split_skip"]
 diff --git a/studio/backend/tests/test_diffusion_auto_placement.py b/studio/backend/tests/test_diffusion_auto_placement.py
 index 835ec3f4f4..c00cbf4f79 100644
 --- a/studio/backend/tests/test_diffusion_auto_placement.py
