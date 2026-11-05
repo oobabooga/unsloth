@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
-index 865e8783ad..633dd751fd 100644
+index 865e8783ad..2ca0e70d00 100644
 --- a/studio/backend/core/inference/llama_cpp.py
 +++ b/studio/backend/core/inference/llama_cpp.py
 @@ -130,6 +130,7 @@ from core.inference.llama_server_args import (
@@ -17,8 +17,8 @@ index 865e8783ad..633dd751fd 100644
 +# The same override where nobody chose the mode: llama.cpp's auto is none on an iGPU.
 +_PAGEABLE_AUTO_OVERRIDE_NOTE = (
 +    " On this integrated GPU llama.cpp loads without memory mapping by default, which reads "
-+    "every byte into memory up front and cannot complete at this size, so Unsloth loaded it "
-+    "with memory mapping instead."
++    "every byte into memory up front and can run out of memory at this size, so Unsloth "
++    "loaded it with memory mapping instead."
 +)
 +# Appended when the override also reads the lookup tables lazily.
 +_PAGEABLE_LAZY_TABLE_NOTE = " Its lookup tables are read from disk as needed."
@@ -30,7 +30,7 @@ index 865e8783ad..633dd751fd 100644
      "mapping it started with; load the model again to run it as you asked."
  )
 +_PAGEABLE_AUTO_OVERRIDE_TEXT_ONLY_NOTICE = (
-+    "With its vision projector in system RAM this model was too large to load without "
++    "With its vision projector in system RAM this model could run out of memory without "
 +    "memory mapping, llama.cpp's default on this integrated GPU, so Unsloth loaded it with "
 +    "memory mapping instead. The projector then failed to start and this session is "
 +    "text-only, which the weights alone would have fit. The running server keeps the "
@@ -251,7 +251,7 @@ index 865e8783ad..633dd751fd 100644
                          if _retry_pageable_note:
                              # Onto whichever notice first-notice-wins kept above; a
 diff --git a/studio/backend/core/inference/llama_server_args.py b/studio/backend/core/inference/llama_server_args.py
-index 6708b4d641..ea724272c1 100644
+index 6708b4d641..460b6c2003 100644
 --- a/studio/backend/core/inference/llama_server_args.py
 +++ b/studio/backend/core/inference/llama_server_args.py
 @@ -1716,10 +1716,18 @@ def _pageable_env_value(
@@ -275,7 +275,17 @@ index 6708b4d641..ea724272c1 100644
      # Only RAM-reserving launches are rewritten; pageable dio or mmap keeps every token, mlock included.
      _mlock_now, _reserves_now = resolve_effective_memory_state(tokens, env)
      drop_shadowed_mlock = _reserves_now and not _mlock_now
-@@ -1793,10 +1801,15 @@ _LOAD_MODE_RESERVING_VALUES = frozenset({"none", "mlock"})
+@@ -1772,6 +1780,9 @@ def force_pageable_load(
+             else:
+                 env[name] = new_value
+             overridden.append(name)
++    # Dropping none/--no-mmap hands the mode back to auto, which is none again on these devices.
++    if overridden and auto_unmapped and load_mode_left_auto(out, env):
++        out.extend(["--load-mode", "mmap"])
+     return out, overridden
+ 
+ 
+@@ -1793,10 +1804,15 @@ _LOAD_MODE_RESERVING_VALUES = frozenset({"none", "mlock"})
  
  
  def resolve_effective_memory_state(
@@ -293,7 +303,7 @@ index 6708b4d641..ea724272c1 100644
      return mlock, reserves_ram
  
  
-@@ -1808,37 +1821,65 @@ def resolve_effective_direct_io(
+@@ -1808,37 +1824,65 @@ def resolve_effective_direct_io(
  
  
  def resolve_effective_load_state(
@@ -366,7 +376,7 @@ index 6708b4d641..ea724272c1 100644
  
      tokens = [str(a) for a in (argv or [])]
      i, n = 0, len(tokens)
-@@ -1850,30 +1891,34 @@ def resolve_effective_load_state(
+@@ -1850,30 +1894,34 @@ def resolve_effective_load_state(
              continue
          if flag in _MLOCK_FLAGS:
              # Only the mlock bit matters: mlock and mmap+mlock both replace an earlier DirectIO mode.
@@ -402,7 +412,7 @@ index 6708b4d641..ea724272c1 100644
              i += 1
          elif flag in _LOAD_MODE_FLAGS:
              if "=" in tok:
-@@ -1887,10 +1932,11 @@ def resolve_effective_load_state(
+@@ -1887,10 +1935,11 @@ def resolve_effective_load_state(
                  mlock = value in _LOAD_MODE_MLOCK_VALUES
                  reserves_ram = value in _LOAD_MODE_RESERVING_VALUES
                  direct_io = value == "dio"
@@ -416,10 +426,10 @@ index 6708b4d641..ea724272c1 100644
  
  def memory_state_satisfies_settings(
 diff --git a/studio/backend/tests/test_llama_cpp_placement.py b/studio/backend/tests/test_llama_cpp_placement.py
-index 9700da8541..7f501ce96f 100644
+index 9700da8541..4fe5621455 100644
 --- a/studio/backend/tests/test_llama_cpp_placement.py
 +++ b/studio/backend/tests/test_llama_cpp_placement.py
-@@ -2679,6 +2679,126 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
+@@ -2679,6 +2679,154 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
      assert backend.last_load_warning is None
  
  
@@ -463,6 +473,29 @@ index 9700da8541..7f501ce96f 100644
 +    return backend, gguf
 +
 +
++from core.inference.llama_server_args import resolve_effective_load_state  # noqa: E402
++
++
++@pytest.mark.parametrize(
++    "extra_args, env",
++    [(["--no-mmap"], {}), ([], {"LLAMA_ARG_NO_MMAP": "1"}), (["--load-mode=none"], {})],
++    ids = ["no-mmap", "env-no-mmap", "load-mode-none-equals"],
++)
++def test_every_unmapped_selector_on_an_igpu_ends_up_mapped(tmp_path, monkeypatch, extra_args, env):
++    """Removing the selector is not enough there: the mode the child resolves must be pageable."""
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++    for name, value in env.items():
++        monkeypatch.setenv(name, value)
++
++    launched = _launch(backend, gguf, extra_args = extra_args)
++
++    assert (
++        resolve_effective_load_state(launched["cmd"], launched["env"], auto_unmapped = True)[1]
++        is False
++    )
++    assert "was set to load without memory mapping" in (backend.last_load_warning or "")
++
++
 +def _modes(cmd, flag):
 +    return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == flag and i + 1 < len(cmd)]
 +
@@ -476,6 +509,7 @@ index 9700da8541..7f501ce96f 100644
 +
 +    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
 +    assert _modes(cmd, "--lazy-mode") == ["on"], cmd
++    assert resolve_effective_load_state(cmd, {}, auto_unmapped = True)[1] is False
 +    warning = backend.last_load_warning or ""
 +    assert "On this integrated GPU llama.cpp loads without memory mapping by default" in warning
 +    assert "lookup tables are read from disk as needed" in warning
@@ -536,9 +570,13 @@ index 9700da8541..7f501ce96f 100644
 +    or mmap prefetch would still read the whole table."""
 +    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
 +
-+    cmd = _launch(backend, gguf, extra_args = ["--load-mode", "none"])["cmd"]
++    launched = _launch(backend, gguf, extra_args = ["--load-mode", "none"])
++    cmd = launched["cmd"]
 +
 +    assert not _unmapped_tokens(cmd), cmd
++    # Dropping none alone hands the mode back to auto, which is none again on this device.
++    assert _modes(cmd, "--load-mode")[-1:] == ["mmap"], cmd
++    assert resolve_effective_load_state(cmd, launched["env"], auto_unmapped = True)[1] is False
 +    assert _modes(cmd, "--lazy-mode") == ["on"], cmd
 +    assert "was set to load without memory mapping" in (backend.last_load_warning or "")
 +
@@ -546,7 +584,7 @@ index 9700da8541..7f501ce96f 100644
  def _unmapped_tokens(cmd):
      """The tokens in ``cmd`` that select a mode llama.cpp does not mmap."""
      out = []
-@@ -5779,7 +5899,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
+@@ -5779,7 +5927,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
      assert src.index("_vulkan_igpu_ids = (") < src.index(
          "_gpu_mem = self._vulkan_auto_gpu_memory(_gpu_mem)"
      )
@@ -555,7 +593,7 @@ index 9700da8541..7f501ce96f 100644
  
  
  def test_the_oversized_readings_share_their_preflights_ram_snapshot():
-@@ -7075,3 +7195,33 @@ def test_the_checkpoint_discount_removes_only_the_checkpoints():
+@@ -7075,3 +7223,33 @@ def test_the_checkpoint_discount_removes_only_the_checkpoints():
          without = backend._slots_that_fit_on_gpu(*args, ctx_checkpoints = 0, **kw)
          assert with_ckpts == without
      assert without[1] is False and without[2] < 8
@@ -590,10 +628,10 @@ index 9700da8541..7f501ce96f 100644
 +    )
 +    assert backend._last_load_warning == expected
 diff --git a/studio/backend/tests/test_llama_server_args.py b/studio/backend/tests/test_llama_server_args.py
-index a3bf4865bc..267e3800b6 100644
+index a3bf4865bc..aa648bc4c3 100644
 --- a/studio/backend/tests/test_llama_server_args.py
 +++ b/studio/backend/tests/test_llama_server_args.py
-@@ -1568,3 +1568,66 @@ def test_translate_ngram_mod_does_not_consume_a_following_flag(chain_with_mtp):
+@@ -1568,3 +1568,80 @@ def test_translate_ngram_mod_does_not_consume_a_following_flag(chain_with_mtp):
      out = translate_ngram_mod_args(args, "legacy", chain_with_mtp = chain_with_mtp)
      assert out[-2:] == ["--top-k", "/restricted/model.gguf"]
      validate_extra_args(out)
@@ -654,6 +692,20 @@ index a3bf4865bc..267e3800b6 100644
 +    env = {"LLAMA_ARG_LOAD_MODE": "auto"}
 +    out, _ = _lsa.force_pageable_load([], env, auto_unmapped = True)
 +    assert _lsa.resolve_effective_memory_state(out, env, auto_unmapped = True) == (False, False)
++    # A removed none or --no-mmap leaves auto behind, which is none again on an iGPU.
++    for argv, env in (
++        (["--load-mode", "none"], {}),
++        (["--no-mmap"], {}),
++        ([], {"LLAMA_ARG_NO_MMAP": "1"}),
++    ):
++        out, overridden = _lsa.force_pageable_load(argv, env, auto_unmapped = True)
++        assert overridden and out[-2:] == ["--load-mode", "mmap"], (argv, env, out)
++        assert _lsa.resolve_effective_memory_state(out, env, auto_unmapped = True) == (False, False)
++    # A lock keeps its own pageable spelling.
++    assert _lsa.force_pageable_load(["--load-mode", "mlock"], {}, auto_unmapped = True)[0] == [
++        "--load-mode",
++        "mmap+mlock",
++    ]
 +    # Off an iGPU auto already maps; a chosen mmap needs nothing either way.
 +    assert _lsa.force_pageable_load([], {}) == ([], [])
 +    assert _lsa.force_pageable_load(["--load-mode", "mmap"], {}, auto_unmapped = True) == (
