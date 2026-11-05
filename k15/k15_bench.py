@@ -44,6 +44,9 @@ MODELS = {
     # k15 r2: the smallest arch with a lazy-marked PLE table (gemma4 per_layer_tok_embd, TENSOR_READ_LAZY); --lazy-mode on makes it lazy
     "g4e2b": ("unsloth/gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf", "0314792d7f1f7e229411f620751375812bb9faf2", 3106738272, False),
     "q3m": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "Qwen3.6-35B-A3B-UD-Q3_K_M.gguf", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d", 17104402720, True),
+    # k19: the real MoE of the gfx1151 run (built-in MTP head) and a generic MoE without a drafter (host-bound small device, host team)
+    "q36": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d", 22853663008, True),
+    "lfm": ("unsloth/LFM2.5-24B-A2B-GGUF", "LFM2.5-24B-A2B-UD-Q4_K_XL.gguf", "aacc77834f6aa568c93b4dbd6d295059736be98c", 14876901632, True),
 }
 SHARDS = {}
 MD = os.environ.get("MODEL_DIR", os.path.join(K, "models"))
@@ -83,7 +86,7 @@ for n, d in BINS.items():
             break
 
 
-INTERNAL = ("K6P_PAD", "K6P_MOE", "K6P_ARGS", "K6P_NO_MOE")
+INTERNAL = ("K6P_PAD", "K6P_MOE", "K6P_ARGS", "K6P_NO_MOE", "K6P_NOFAKE")
 
 
 def benv(arm):
@@ -212,7 +215,7 @@ class Sampler:
 PAT = re.compile(r"buffer size|memory breakdown|\| +- |MoE cache|moe_cache|out of memory|error|failed|GGML_ASSERT|offload|load_tensors|"
                  r"n_ubatch|n_batch|mmap|load.mode|ROCm0|MTL0|ggml_cuda_init|Device 0|system_info|build|fit|pinned|host|prefetch|lend|"
                  r"weight.stream|integrated|unified|warning|abort|exception|non-consecutive|PLE|lazy|draft length|without the graph|gather kept|draft|speculative|"
-                 r"k19-tpp|greedy requests|async seed|seed from the routing|tail member|VRAM watch|banks back|dense host pin", re.I)
+                 r"k19-tpp|greedy requests|async seed|seed from the routing|tail member|VRAM watch|banks back|dense host pin|k19-|small device|host-bound|CPU misses|AVX-512|FAKE", re.I)
 
 
 def memstats(s):
@@ -303,7 +306,19 @@ def memstats(s):
             "banks_back_n": len(g(r"MoE cache banks back \(")),
             "dense_pin_nodev_n": len(g(r"dense host pin: no device that page-locks host memory")),
             "dense_pin_done_n": len(g(r"dense host pin: [\d.]+ of [\d.]+ MiB")),
-            "lend_lines_n": len(g(r"MTP drafter (?:host copy made|weights can be lent|weights lent to the group|weights not lent)"))}
+            "lend_lines_n": len(g(r"MTP drafter (?:host copy made|weights can be lent|weights lent to the group|weights not lent)")),
+            # k19-int3 engagement: fit tiers (small device / k19-place8 / k19-placemid / host-bound), the drafter on the CPU at 8 GB,
+            # CPU-miss decisions, the AVX-512 IQ3_S kernel notice, the fake free budget
+            "tier_lines": [l.strip()[-300:] for l in g(r"[^\n]*(?:small device|k19-place8|k19-placemid|host-bound|draft model is placed on the CPU|IQ3_S dot products on)[^\n]*")][:16],
+            "small_dev_n": len(g(r"small device")),
+            "place8_n": len(g(r"k19-place8")),
+            "placemid_n": len(g(r"k19-placemid")),
+            "hostbound_n": len(g(r"host-bound")),
+            "draft_cpu_n": len(g(r"the draft model is placed on the CPU")),
+            "cpu_miss_on_n": len(g(r"CPU misses(?!: off| off)")),
+            "cpu_miss_off_n": len(g(r"CPU misses off")),
+            "accept": [l.strip()[-160:] for l in g(r"[^\n]*draft acceptance rate[^\n]*")][-2:],
+            "kv_tail": [l.strip()[-200:] for l in g(r"[^\n]*llama_moe_cache[^\n]*(?:slots|MiB)[^\n]*")][:4]}
 
 
 def filt(lp, s, head=120):
@@ -440,6 +455,13 @@ def prompt_tokens(port, model, n=2000):
         return json.load(fh)
 
 
+def dec_ids(port, model):
+    f = os.path.join(K, "prompt_%s_dec.json" % model)
+    if not os.path.exists(f):
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(post(port, "/tokenize", {"content": DEC_PROMPT, "add_special": True})["tokens"], fh)
+
+
 def mode_flags(model, mode, target, arm=None):
     """mode[_ubN]: full / spillN / cpu, _ubN appends -ub N. Arm keys (ARMS third field): K6P_NO_MOE=1 drops --moe-cache-mib (plain
     upstream does not know it), K6P_ARGS="..." appends arguments (e.g. -ub 4096)."""
@@ -452,7 +474,7 @@ def mode_flags(model, mode, target, arm=None):
         f += ["-ngl", "0"]
     else:
         f += ["--fit", "on"]
-        if mode.startswith("spill") and target is not None:
+        if (mode.startswith("spill") or mode.startswith("cap")) and target is not None:
             f += ["--fit-target", str(target)]
     if moe and mode != "cpu":
         f += ["--moe-cache-mib", ARM_ENV.get(arm, {}).get("K6P_MOE") or os.environ.get("K6P_MOE") or "auto"]
@@ -482,9 +504,11 @@ def kill(p):
             pass
 
 
-def popen(argv, fh, arm):
+def popen(argv, fh, arm, extra_env=None):
     kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {"start_new_session": True}
-    p = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT, env=benv(arm), cwd=BINS[arm], **kw)
+    env = benv(arm)
+    env.update(extra_env or {})
+    p = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT, env=env, cwd=BINS[arm], **kw)
     # k15: the live child's pid, so k15_plan.py can stop it (and its group) when a step overruns its budget
     with open(os.path.join(K, "child.pid"), "w", encoding="utf-8") as pf:
         pf.write(str(p.pid))
@@ -498,10 +522,11 @@ def run_server(arm, model, mode, target, tag):
     argv = [binp(arm, "llama-server"), "-m", mpath(model), "-c", "8192", "-fa", "on", "-np", "1", "--host", "127.0.0.1",
             "--port", str(port), "-lv", "4"] + mode_flags(model, mode, target, arm)
     fh = open(lp, "w", encoding="utf-8")
-    fh.write("CMD %s\n" % " ".join(argv))
+    ce = cap_env(mode, arm)
+    fh.write("CMD %s\nCAPENV %s\n" % (" ".join(argv), json.dumps(ce)))
     fh.flush()
     t0 = time.time()
-    p = popen(argv, fh, arm)
+    p = popen(argv, fh, arm, ce)
     smp = Sampler(p.pid)
     ok = False
     while time.time() - t0 < 1800:
@@ -515,13 +540,14 @@ def run_server(arm, model, mode, target, tag):
         except Exception:
             pass
         time.sleep(0.25)
-    res = {"load_s": round(time.time() - t0, 2), "ok": ok, "argv": argv[1:]}
+    res = {"load_s": round(time.time() - t0, 2), "ok": ok, "argv": argv[1:], "cap_env": ce}
     if ok:
         try:
             res["mem_idle"] = mem_snap(p.pid, smp)
             res["warm"] = complete(port, "The capital of France is", 8)
             res["dec"] = complete(port, DEC_PROMPT, 128)
             res["mem_dec"] = mem_snap(p.pid, smp)
+            dec_ids(port, model)
             res["p2k"] = complete(port, prompt_tokens(port, model), 128)
             res["mem_p2k"] = mem_snap(p.pid, smp)
             if P8K:
@@ -561,9 +587,22 @@ def warm_cache(model):
 _TGT = {}
 
 
+def cap_env(mode, arm):
+    """k19 capN: the device reports N MiB free (GGML_CUDA_FAKE_FREE_MIB, STRICT: allocations past it fail as on a card of that size), so
+    --fit and its tier rules (small device / k19-place8 / k19-placemid) see an N MiB device. Arms whose build lacks the knob (upstream
+    ff5a2337: K6P_NOFAKE=1) get --fit-target free - N instead (cell_target)"""
+    if not mode.startswith("cap") or ARM_ENV.get(arm, {}).get("K6P_NOFAKE"):
+        return {}
+    return {"GGML_CUDA_FAKE_FREE_MIB": mode[3:].split("_")[0], "GGML_CUDA_FAKE_FREE_STRICT": "1"}
+
+
 def cell_target(model, mode, arm):
     """spillN: --fit-target = this arm's own free device memory - N MiB, so every arm gets the same N MiB budget even when the
     builds' HIP runtimes report different free memory (run 2 Windows: release 100414 MiB vs TheRock 7.14 build 78471 MiB)"""
+    if mode.startswith("cap"):
+        if not ARM_ENV.get(arm, {}).get("K6P_NOFAKE"):
+            return None, int(mode[3:].split("_")[0])
+        mode = "spill" + mode[3:]
     if not mode.startswith("spill"):
         return None, None
     budget = int(mode[5:].split("_")[0])
@@ -734,6 +773,130 @@ def do_dl():
         fh.write("done\n")
 
 
+# ---------------------------------------------------------------- k19: tiny-model correctness on the device (generated models of every arch)
+def do_archs():
+    """test-llama-archs -o DIR (the arm's own generator: every architecture, dense / MoE / MTP, random weights) then
+    test-llama-context --models DIR (context state handling per arch on the default backend = ROCm0 here), GGML_SCHED_DEBUG_REALLOC=1
+    as the ctest; rc + PASS / FAIL lines per arm"""
+    arm = a.bin
+    d = os.path.join(K, "archs_" + arm)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    r = {"kind": "archs", "bin": arm, "arm_env": ARM_ENV.get(arm)}
+    for exe, args in (("test-llama-archs", ["-o", d + os.sep]), ("test-llama-context", ["--models", d + os.sep])):
+        x = binp(arm, exe)
+        if not os.path.exists(x):
+            r[exe] = {"err": "missing"}
+            continue
+        lp = os.path.join(LOGS, "archs_%s_%s.log" % (arm, exe))
+        t = time.time()
+        with open(lp, "w", encoding="utf-8") as fh:
+            p = popen([x] + args, fh, arm, {"GGML_SCHED_DEBUG_REALLOC": "1"})
+            try:
+                rc = p.wait(a.timeout)
+            except subprocess.TimeoutExpired:
+                kill(p)
+                rc = "timeout"
+        s = rd(lp)
+        r[exe] = {"rc": rc, "wall_s": round(time.time() - t), "n_models": len(glob.glob(os.path.join(d, "**", "*.gguf"), recursive=True)),
+                  "fail_lines": [l[:240] for l in s.splitlines() if re.search(r"FAIL|mismatch|GGML_ASSERT|error|abort", l, re.I)][:60],
+                  "pass_n": len(re.findall(r"\bPASS|\bOK\b", s)), "fail_n": len(re.findall(r"\bFAIL", s)),
+                  "rocm": bool(re.search(r"ROCm0", s)), "tail": s[-1500:]}
+        with open(lp.replace(".log", ".filtered.log"), "w", encoding="utf-8") as fh:
+            fh.write(s[-60000:])
+        os.remove(lp)
+        log("ARCHS", arm, exe, rc, r[exe]["n_models"], r[exe]["fail_n"], r[exe]["fail_lines"][:3])
+    row(r)
+
+
+# ---------------------------------------------------------------- k19: PolyStrata (strata-poly --serve, the stdin protocol)
+def do_poly():
+    """PolyStrata f472d85a's strata-poly on the same GGUF: --serve, GEN <n> <ids> on stdin, T <id> per token, DONE <gen> <prompt>
+    <prompt_ms> <decode_ms> ...; the prompts are the token ids our server made for the same text (prompt_<model>_dec.json / prompt_<model>.json)"""
+    model = a.model
+    exe = os.path.join(K, "bins", "poly", "strata-poly" + EXE)
+    if not os.path.exists(exe) or not os.path.exists(mpath(model)):
+        row({"kind": "poly", "model": model, "err": "missing " + (exe if not os.path.exists(exe) else mpath(model))})
+        return
+    ids = {}
+    for c, f in (("dec", "prompt_%s_dec.json" % model), ("p2k", "prompt_%s.json" % model)):
+        if os.path.exists(os.path.join(K, f)):
+            with open(os.path.join(K, f), encoding="utf-8") as fh:
+                ids[c] = json.load(fh)
+    warm_cache(model)
+    for rep in range(a.reps):
+        lp = os.path.join(LOGS, "poly_%s_r%d.log" % (model, rep))
+        prof = os.path.join(K, "poly_prof_%s.txt" % model)
+        argv = [exe, "--serve", "--model", mpath(model), "--max-context", "8192", "--expert-profile", prof, "--eos-ids", "2147483647",
+                "--conversation-cache-mib", "auto"]
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = os.path.dirname(exe) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        if WIN:
+            env["PATH"] = os.path.dirname(exe) + os.pathsep + env.get("PATH", "")
+        tun = sorted(glob.glob(os.path.join(K, "bins", "poly", "tools", "hip", "gfx1151-hipblaslt-*.txt")))
+        res = {"kind": "poly", "model": model, "rep": rep, "argv": argv[1:], "tuning_tables": [os.path.basename(x) for x in tun]}
+        errf = open(lp, "w", encoding="utf-8")
+        t0 = time.time()
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {"start_new_session": True}
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=env,
+                             cwd=os.path.dirname(exe), **kw)
+        with open(os.path.join(K, "child.pid"), "w", encoding="utf-8") as pf:
+            pf.write(str(p.pid))
+        smp = Sampler(p.pid)
+        ready = False
+        timer = threading.Timer(1800, lambda: p.kill())
+        timer.start()
+        try:
+            for line in p.stdout:
+                if line.startswith("READY"):
+                    ready = True
+                    break
+            res["load_s"] = round(time.time() - t0, 2)
+            res["ok"] = ready
+            if ready:
+                for c, n in (("warm", 8), ("dec", 128), ("p2k", 128)):
+                    tok = ids.get("dec" if c == "warm" else c)
+                    if not tok:
+                        continue
+                    if c == "warm":
+                        tok = tok[:6]
+                    t1 = time.time()
+                    p.stdin.write("GEN %d %s\n" % (n, ",".join(map(str, tok))))
+                    p.stdin.flush()
+                    out = []
+                    for line in p.stdout:
+                        if line.startswith("T "):
+                            out.append(int(line.split()[1]))
+                        elif line.startswith("DONE"):
+                            d = line.split()
+                            f = lambda i: float(d[i]) if len(d) > i else None
+                            gen_n, prompt_n, prompt_ms, decode_ms = f(1), f(2), f(3), f(4)
+                            res[c] = {"wall_s": round(time.time() - t1, 3), "n_prompt": prompt_n, "n_gen": gen_n,
+                                      "pp_tps": round(prompt_n / prompt_ms * 1000, 2) if prompt_ms else None,
+                                      "tg_tps": round(gen_n / decode_ms * 1000, 3) if decode_ms else None,
+                                      "tok_md5": hashlib.md5(json.dumps(out).encode()).hexdigest(), "done": line.strip()[:300]}
+                            break
+        except Exception as e:  # noqa: BLE001
+            res["err"] = repr(e)[:300]
+        timer.cancel()
+        try:
+            p.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        kill(p)
+        res.update(smp.done())
+        errf.close()
+        s = rd(lp)
+        res["poly_lines"] = [l[:300] for l in s.splitlines() if re.search(r"strata|HIP|gfx|expert|VRAM|hipBLAS|error|tuning|draft|mtp", l, re.I)][:60]
+        res["abort"] = bool(re.search(r"Segmentation|Aborted|core dumped|HIP error|error:", s))
+        row(res)
+        with open(lp.replace(".log", ".filtered.log"), "w", encoding="utf-8") as fh:
+            fh.write(s[-40000:])
+        os.remove(lp)
+        log("POLY", model, rep, res.get("ok"), res.get("load_s"), {c: (res.get(c) or {}).get("tg_tps") for c in ("dec", "p2k")},
+            {c: (res.get(c) or {}).get("pp_tps") for c in ("p2k",)}, res.get("err", ""))
+
+
 log("HOST", json.dumps(HOST), "BINS", BINS, "ARM_ENV", ARM_ENV, "TAGS", TAG, "DEV", DEV)
-{"time": do_time, "kld": do_kld, "tbo": do_tbo, "dl": do_dl, "devinfo": do_devinfo, "exe": do_exe}[a.what]()
+{"time": do_time, "kld": do_kld, "tbo": do_tbo, "dl": do_dl, "devinfo": do_devinfo, "exe": do_exe, "archs": do_archs, "poly": do_poly}[a.what]()
 log("=== K6P %s %s DONE ===" % (a.what, a.cell or a.model or a.ops[:40]))

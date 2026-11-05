@@ -1,4 +1,6 @@
 #!/bin/bash
+# k19 (amd-ci-llama-k19): NAME = up (ff5a2337 stock, the base) | pf (k15 7f0111d448c = up + k10.patch + pfd.patch, md5 / tier reference)
+#   | i3 (k19-int3 eddd38eef9a + the HIP build fix 058773ab6c3 = pf + i3d.patch, the head). The k15cpu branch below is unused.
 # hosted_linux_build.sh NAME: the release's Linux ROCm recipe (unsloth-prebuilt-rocm.yml linux leg) on a GitHub-hosted ubuntu-22.04, as in
 # the k9 / k10 / k10s runs: TheRock dist tarball (ROCM_VER, the weekly pin of b11734-mix-c208e5f), clang from /opt/rocm/llvm, release
 # cmake flags (GGML_HIP_GRAPHS at its default), the ROCm runtime libs + rocblas / hipblaslt kernels (kpack step) beside the binaries,
@@ -19,9 +21,7 @@ S="$T/src"; mkdir -p "$S"
 git -C "$S" init -q; git -C "$S" config core.autocrlf false; git -C "$S" remote add origin https://github.com/ggml-org/llama.cpp
 git -C "$S" fetch -q --depth 1 origin "$BASE" && git -C "$S" checkout -q --detach "$BASE" || { echo "FATAL: fetch"; exit 1; }
 git -C "$S" config user.email ci@localhost; git -C "$S" config user.name ci
-[ "$N" = ig ] && [ ! -f "$J/IG_SHA" ] && { echo "ig: no k15/IG_SHA in this ticket, skipped"; exit 0; }
-case $N in up) PS=""; WANT=$(cat "$J/UP_SHA");; k10) PS="k10"; WANT=$(cat "$J/K10_SHA");; k15|k15cpu) PS="k10 k15d"; WANT=$(cat "$J/K15_SHA");;
-  ig) PS="k10 k15d igd"; WANT=$(cat "$J/IG_SHA");;
+case $N in up) PS=""; WANT=$(cat "$J/UP_SHA");; pf) PS="k10 pfd"; WANT=$(cat "$J/PF_SHA");; i3) PS="k10 pfd i3d"; WANT=$(cat "$J/I3_SHA");;
   *) echo "FATAL: unknown $N"; exit 1;; esac
 for p in $PS; do
   gunzip -c "$J/$p.patch.gz" > "$T/$p.patch"

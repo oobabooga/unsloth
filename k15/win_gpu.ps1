@@ -1,8 +1,9 @@
-# win_gpu.ps1 (k15): gfx1151 Windows 11. Build k10 (ff5a2337 + k10.patch.gz = a162dce854) and k15 (+ k15d.patch.gz = 95b695923af) with
+# win_gpu.ps1 (k19, from k15): gfx1151 Windows 11. Build up (ff5a2337 stock, the base) and i3 (+ k10.patch.gz + pfd.patch.gz + i3d.patch.gz =
+# k19-int3 eddd38eef9a + HIP fix 058773ab6c3) with
 # TheRock (the release's weekly pin) and the release's Windows ROCm flags (unsloth-prebuilt-rocm.yml windows leg: shared libs,
 # GGML_BACKEND_DL, CPU_ALL_VARIANTS, RPC, OPENMP off, ROCWMMA FA off, GGML_HIP_GRAPHS at its default), tests ON for both (test-backend-ops
 # is the base arm of the existing cases), TheRock's DLLs + rocblas / hipblaslt kernels beside the exes (as the release does), then the
-# k15_plan.py matrix (K15_STEPS from the workflow). Rows -> out\rows_win.jsonl. Writes only under $env:AMD_CI_WORK (= RUNNER_TEMP).
+# k19_plan.py matrix (K19_STEPS from the workflow). Rows -> out\rows_win.jsonl. Writes only under $env:AMD_CI_WORK (= RUNNER_TEMP).
 $ErrorActionPreference = "Continue"
 $min = if ($env:K15_STEP_MIN) { [int]$env:K15_STEP_MIN } else { 350 }
 $env:K15_DEADLINE = "$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $min * 60 - 300)"
@@ -20,7 +21,7 @@ Get-CimInstance Win32_VideoController | ForEach-Object { Log "GPU $($_.Name) dri
 
 $env:K6P_DIR = $R; $env:K6P_OUT = "$OUT\bench"; $env:K6P_DEV = "ROCm0"; $env:PYTHONIOENCODING = "utf-8"
 $dl = Start-Process -FilePath $PY -PassThru -NoNewWindow -RedirectStandardOutput "$OUT\dl.log" -RedirectStandardError "$OUT\dl.err" `
-  -ArgumentList @("-u", "`"$J\k15_bench.py`"", "dl", "--models", "q35,q3m,g4e2b")
+  -ArgumentList @("-u", "`"$J\k15_bench.py`"", "dl", "--models", "q35,q36,lfm")
 
 # TheRock toolchain: the dist tarball of the release's weekly pin (as the k9 / k10 / k10s runs)
 $ROCM_VER = if ($env:ROCM_VER) { $env:ROCM_VER } else { "10.2.0a20261017" }
@@ -89,7 +90,7 @@ function Build-Tree($tree, $name, $ctest) {
   return $true
 }
 $TREES = Get-Content -Encoding utf8 "$J\TREES"
-$TREE_NAMES = if (Test-Path "$J\IG_SHA") { @("k10", "k15", "ig") } else { @("k10", "k15") }
+$TREE_NAMES = @("up", "i3")
 foreach ($n in $TREE_NAMES) {
   $S = "$W\src_$n"
   New-Item -ItemType Directory -Force -Path $S | Out-Null
@@ -99,7 +100,7 @@ foreach ($n in $TREE_NAMES) {
   git -C $S fetch -q --depth 1 origin $BASE
   git -C $S checkout -q --detach $BASE
   if ((git -C $S rev-parse HEAD).Trim() -ne $BASE) { Write-Host "FATAL: checkout $n"; exit 1 }
-  $patches = if ($n -eq "k10") { @("k10") } elseif ($n -eq "ig") { @("k10", "k15d", "igd") } else { @("k10", "k15d") }
+  $patches = if ($n -eq "up") { @() } else { @("k10", "pfd", "i3d") }
   foreach ($p in $patches) {
     & $PY -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "$J\$p.patch.gz" "$W\$p.patch"
     git -C $S apply --index --whitespace=nowarn "$W\$p.patch"
@@ -112,11 +113,11 @@ foreach ($n in $TREE_NAMES) {
   if ($tree -ne $exp) { Write-Host "FATAL: the applied $n tree is not $want"; exit 1 }
   $hm = (Select-String -Path "$S\ggml\src\ggml-cuda\vendors\hip.h" -Pattern "^#define cudaErrorInvalidValue hipErrorInvalidValue").Count
   Log "$n hip.h cudaErrorInvalidValue mapping lines: $hm"
-  if (-not (Build-Tree $S $n ($n -eq "k15"))) { Write-Host "FATAL: $n build"; exit 1 }
+  if (-not (Build-Tree $S $n ($n -eq "i3"))) { Write-Host "FATAL: $n build"; exit 1 }
   Set-Content -Encoding utf8 -Path "$R\bins\$n\TAG" -Value "$n $($want.Substring(0, 11)) hip gfx1151 TheRock $ROCM_VER"
 }
 Get-ChildItem "C:\Windows\System32\amdhip64*" -ErrorAction SilentlyContinue | ForEach-Object { Log "system32: $($_.Name) $($_.VersionInfo.FileVersion)" }
-Get-ChildItem "$R\bins\k15" -Filter "amdhip64*.dll" | ForEach-Object { Log "k15: $($_.Name) $($_.VersionInfo.FileVersion)" }
+Get-ChildItem "$R\bins\i3" -Filter "amdhip64*.dll" | ForEach-Object { Log "k15: $($_.Name) $($_.VersionInfo.FileVersion)" }
 
 $dl.WaitForExit()
 Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-Object { -not $_.StartsWith("ROW") } | Select-Object -Last 5
@@ -124,5 +125,5 @@ Get-Content "$OUT\dl.log", "$OUT\dl.err" -ErrorAction SilentlyContinue | Where-O
 $op = $env:PATH
 foreach ($n in $TREE_NAMES) { $sv = Get-ChildItem -Recurse "$R\bins\$n" -Filter "llama-server.exe" | Select-Object -First 1; $env:PATH = "$($sv.DirectoryName);$op"; $c = (& $sv.FullName --list-devices 2>&1 | Select-String "ROCm0").Count; Log "devices $n : ROCm0 x$c"; if ($c -lt 1) { Write-Host "FATAL: $n sees no ROCm0"; exit 1 } }
 $env:PATH = $op
-& $PY -u "$J\k15_plan.py" "$OUT\plan"
+& $PY -u "$J\k19_plan.py" "$OUT\plan"
 if (-not (Test-Path "$OUT\bench\rows.jsonl")) { exit 1 }

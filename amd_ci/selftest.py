@@ -1064,6 +1064,50 @@ def test_patch_mode_renders_applies_and_refuses() -> None:
             check(f"scaffold refuses {name}", r.returncode != 0 and not (td / "o2").exists(), r.stderr[-200:])
 
 
+def test_push_queue_finishes_orphans_and_leaves_others_tickets_alone() -> None:
+    print("\npush_queue: orphans finish instead of pushing late; another user's unreachable dir is skipped")
+    q = _load(ROOT / "push_queue.py")
+    now = 1_000_000.0
+    h = 3600.0
+    ts = [{"id": "old", "branch": "old", "state": "waiting", "created": now - (q.MAX_WAIT_H + 1) * h},
+          {"id": "new", "branch": "new", "state": "waiting", "created": now - h},
+          {"id": "lost", "branch": "lost", "state": "pushed", "created": now - 2 * h, "pushed_at": now - (q.NO_RUN_H + 1) * h},
+          {"id": "live", "branch": "live", "state": "pushed", "created": now - 2 * h, "pushed_at": now - (q.NO_RUN_H + 1) * h,
+           "run_id": 7}]
+    got = q.expire(ts, now)
+    check("a waiting ticket past MAX_WAIT_H and a pushed one with no run past NO_RUN_H finish",
+          sorted(got) == ["lost", "old"] and ts[0]["conclusion"] == "expired" and ts[2]["conclusion"] == "no_run", str(ts))
+    check("a fresh waiter and a pushed ticket with a run stay", ts[1]["state"] == "waiting" and ts[3]["state"] == "pushed")
+
+    pushed = []
+    def fake(t):
+        if t["id"] == "theirs":
+            raise q.NotMine(t["id"])
+        pushed.append(t["id"])
+        t["state"] = "pushed"
+        return True
+    q2 = [{"id": "theirs", "mode": "exclusive", "state": "waiting", "os": "linux", "created": 1},
+          {"id": "mine", "mode": "exclusive", "state": "waiting", "os": "linux", "created": 2}]
+    q.dispatch(q2, push_fn = fake)
+    check("an unreachable ticket is skipped, not failed, and the next one goes",
+          pushed == ["mine"] and q2[0]["state"] == "waiting" and "push_failures" not in q2[0], str(q2))
+    with tempfile.TemporaryDirectory() as td:
+        locked = Path(td) / "home"
+        (locked / "ws").mkdir(parents = True)
+        os.chmod(locked, 0o000)
+        try:
+            t = {"id": "x", "dir": str(locked / "ws" / "ci"), "user": "someone-else", "branch": "b"}
+            raised = False
+            try:
+                q.push(t)
+            except q.NotMine:
+                raised = True
+            check("push() on another user's unreachable dir raises NotMine instead of ending the ticket",
+                  raised and "push_failures" not in t, str(t))
+        finally:
+            os.chmod(locked, 0o755)
+
+
 def test_push_queue_locks_through_a_read_only_lock_file() -> None:
     print("\npush_queue: another user's 0644 queue.lock still gives an exclusive lock")
     import fcntl
@@ -1092,6 +1136,11 @@ def test_push_queue_locks_through_a_read_only_lock_file() -> None:
             saved = json.loads((Path(td) / "queue.json").read_text(encoding = "utf-8"))
             check("lock is held exclusively and the state is written back",
                   held and saved["tickets"] == [{"id": "x"}], f"held={held} {saved}")
+            tick = Path(td) / "tick.lock"
+            tick.write_text("", encoding = "utf-8")
+            os.chmod(tick, 0o444)
+            with q.tick_lock() as mine:
+                check("another user's 0644 tick.lock still lets a tick run", mine is True, str(mine))
         finally:
             if old is None:
                 os.environ.pop("AMD_CI_QUEUE_DIR", None)
@@ -1135,6 +1184,7 @@ def main() -> int:
     test_push_queue_judges_the_gpu_job_not_the_run()
     test_patch_mode_renders_applies_and_refuses()
     test_push_queue_locks_through_a_read_only_lock_file()
+    test_push_queue_finishes_orphans_and_leaves_others_tickets_alone()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} failure(s):")

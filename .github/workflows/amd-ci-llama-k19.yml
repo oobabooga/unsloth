@@ -1,27 +1,26 @@
-name: "AMD CI k15: llama.cpp k15 01b29f323fc vs k10 a162dce854 on gfx1151 Linux + Windows (test-backend-ops, eager fallback, GDN, race fix, draft guard, CPU MMID, bench)"
+name: "AMD CI k19: llama.cpp k19-int3 eddd38eef9a (+ HIP fix 058773ab6c3) vs upstream ff5a2337 (+ k15 7f0111d448c, PolyStrata f472d85a) on gfx1151 Linux + Windows"
 
-# Trees, all from upstream ggml-org ff5a2337 (the merge base of both heads): up = stock ff5a2337, k10 = + k15/k10.patch.gz (a162dce854,
-# the last head that ran on AMD: amd-ci-llama-k10 / k10s), k15 = + k10.patch.gz + k15/k15d.patch.gz (git diff a162dce8543..01b29f323fc; ig = + k15/igd.patch.gz = 01b29f323fc..744545a4054, k19-igpu).
-# Each applied tree is checked against the head's tree hash (k15/TREES). ROCm builds use the release recipe and the TheRock weekly pin of
-# b11734-mix-c208e5f (10.2.0a20261017), as the k9 / k10 / k10s runs. Matrix: k15/k15_plan.py; judged by k15/k15_verdict.py (verdict job).
+# Trees, all from upstream ggml-org ff5a2337: up = stock (the base), pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
+# i3 = pf + k15/i3d.patch.gz (k19-int3 eddd38eef9a + 058773ab6c3, the HIP build fix). Each applied tree is checked against k15/TREES.
+# ROCm builds: the release recipe and the TheRock weekly pin 10.2.0a20261017, as every earlier llama run. PolyStrata: its own Strix Halo
+# recipe, no source change. Matrix: k15/k19_plan.py; tables: k15/k19_tab.py (summary job).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
 
 on:
   push:
-    branches: [amd-ci-llama-k15]
+    branches: [amd-ci-llama-k19]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  # nothing is written into the checkout on the self-hosted boxes (no __pycache__ beside amd_ci/lib or k15/)
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
 
   linux-control:
-    name: "k15 linux control (selector diagnosis for the Windows leg)"
+    name: "k19 linux control (selector diagnosis for the Windows leg)"
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 10
     env:
@@ -33,17 +32,15 @@ jobs:
           set +e
           echo "control leg: the same selector with Linux in place of Windows"
           echo "machine: $(uname -n)"
-          echo "If this job runs and the Windows GPU job stays queued (not pending on the GPU group), the Windows selector matched"
-          echo "no runner. If BOTH stay queued, the pool is busy."
 
   hosted-build:
-    name: "Linux build ${{ matrix.n }} (hosted ubuntu-22.04, release recipe; HIP gfx1151 + CPU ctest, or CPU-only MMID tests)"
+    name: "Linux build ${{ matrix.n }} (hosted ubuntu-22.04, release recipe; HIP gfx1151 + CPU ctest)"
     runs-on: ubuntu-22.04
     timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
-        n: [k15, k10, up, k15cpu, ig]
+        n: [i3, up, pf]
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -59,7 +56,7 @@ jobs:
         with:
           name: bin_${{ matrix.n }}
           path: ${{ runner.temp }}/art
-          if-no-files-found: ignore   # a deliberately skipped build (ig without k15/IG_SHA) uploads nothing and must not show red
+          if-no-files-found: ignore
           retention-days: 3
       - uses: actions/upload-artifact@v4
         if: always()
@@ -69,63 +66,41 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  cpu-linux:
-    name: "k15 CPU multi-column MUL_MAT_ID on the gfx1151 host CPU (Zen 5), HIP masked"
-    needs: [hosted-build]
-    if: ${{ always() }}
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 90
-    env:
-      HIP_VISIBLE_DEVICES: ""
-      ROCR_VISIBLE_DEVICES: ""
+  hosted-poly:
+    name: "Linux build PolyStrata f472d85a (hosted ubuntu-22.04, its Strix Halo recipe, gfx1151)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - name: Preamble
+      - name: Free disk
         run: |
-          source amd_ci/lib/preamble.sh "k15-linux-cpu"
-      - name: Host gate
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
+      - name: Build
         run: |
-          set +e
-          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host_cpu.json" > /dev/null
-          rc=$?
-          grep -m1 "model name" /proc/cpuinfo
-          if [ $rc -ne 0 ]; then echo "GATE FAILED: gate.py rc=$rc"; exit 1; fi
-          if ! grep -q -w avx512f /proc/cpuinfo; then echo "GATE FAILED: no avx512f (not the Zen 5 host)"; exit 1; fi
-          echo "gate ok"
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin_k15cpu
-          path: ${{ env.AMD_CI_WORK }}/art/bin_k15cpu
-      - name: test-mmid-multi + CPU MUL_MAT_ID, GGML_CPU_MMID_MULTI_K 1 / 0, avx512 + avx2
-        timeout-minutes: 75
-        run: |
-          set +e
-          bash k15/linux_cpu.sh
-          rc=$?
-          echo "job rc=$rc"
-          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
-      - name: Stop leftover test processes
-        if: always()
-        run: |
-          set +e
-          for p in $(pgrep -u "$(id -u)" -x test-mmid-multi; pgrep -u "$(id -u)" -x test-backend-op); do kill -9 "$p"; done
-          echo "cleanup done"
+          bash k15/hosted_poly_build.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k15-linux-cpu
-          path: ${{ env.AMD_CI_WORK }}/out
+          name: bin_poly
+          path: ${{ runner.temp }}/art
+          if-no-files-found: ignore
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: info_poly
+          path: ${{ runner.temp }}/info
           retention-days: 7
           if-no-files-found: warn
 
   gpu-linux:
-    name: "k15 vs k10, Linux ROCm gfx1151 (exclusive)"
-    # after cpu-linux: this run's own CPU job never shares a Linux box with the measurement
-    needs: [hosted-build, cpu-linux]
+    name: "k19 vs up, Linux ROCm gfx1151 (exclusive)"
+    needs: [hosted-build, hosted-poly]
     if: ${{ always() }}
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull,tbopad,stock
+      K19_STEPS: archs,ops,exe,exact,bench,tiers,lfm,poly,tbofull
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 360
     concurrency:
@@ -136,7 +111,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Preamble
         run: |
-          source amd_ci/lib/preamble.sh "k15-linux-gpu"
+          source amd_ci/lib/preamble.sh "k19-linux-gpu"
       - name: Hardware gate
         run: |
           set +e
@@ -148,17 +123,22 @@ jobs:
           echo "gate ok"
       - uses: actions/download-artifact@v4
         with:
-          name: bin_k15
-          path: ${{ env.AMD_CI_WORK }}/art/bin_k15
+          name: bin_i3
+          path: ${{ env.AMD_CI_WORK }}/art/bin_i3
       - uses: actions/download-artifact@v4
-        with:
-          name: bin_k10
-          path: ${{ env.AMD_CI_WORK }}/art/bin_k10
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: bin_up
           path: ${{ env.AMD_CI_WORK }}/art/bin_up
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: bin_pf
+          path: ${{ env.AMD_CI_WORK }}/art/bin_pf
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: bin_poly
+          path: ${{ env.AMD_CI_WORK }}/art/bin_poly
       - name: Cells
         timeout-minutes: 345
         run: |
@@ -171,21 +151,21 @@ jobs:
         if: always()
         run: |
           set +e
-          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x test-backend-op; pgrep -u "$(id -u)" -x test-graph-src-); do kill -9 "$p"; done
+          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x test-backend-op; pgrep -u "$(id -u)" -x strata-poly; pgrep -u "$(id -u)" -f "test-llama-c[o]ntext"); do kill -9 "$p"; done
           echo "cleanup done"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k15-linux-gpu
+          name: k19-linux-gpu
           path: ${{ env.AMD_CI_WORK }}/out
           retention-days: 7
           if-no-files-found: warn
 
   gpu-windows:
-    name: "k15 vs k10, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    name: "k19 vs up, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K15_STEPS: ops,gst,mmid,eager,gdn,race,mailbox,replay,relsplit,b3,ple,dguard,bench,tbofull
+      K19_STEPS: archs,ops,exe,exact,bench,tiers,lfm,tbofull
     timeout-minutes: 360
     concurrency:
       group: amd-ci-gfx1151-gpu
@@ -198,14 +178,14 @@ jobs:
         with: { persist-credentials: false }
       - name: Preamble
         run: |
-          .\amd_ci\lib\preamble.ps1 -Name "k15-windows"
+          .\amd_ci\lib\preamble.ps1 -Name "k19-windows"
       - name: Host gate
         run: |
           $ErrorActionPreference = "Continue"
           Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
           & "C:\Program Files\Python312\python.exe" "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\windows\host.json"
           if ($LASTEXITCODE -ne 0) { Write-Host "GATE FAILED"; exit 1 }
-      - name: Build k10 / k15 with the release's TheRock, cells
+      - name: Build up / i3 with the release's TheRock, cells
         timeout-minutes: 350
         run: |
           $ErrorActionPreference = "Continue"
@@ -215,19 +195,19 @@ jobs:
         if: always()
         run: |
           $ErrorActionPreference = "Continue"
-          Get-Process -Name llama-server, test-backend-ops, test-graph-src-type -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name llama-server, test-backend-ops, test-llama-context, test-llama-archs -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "cleanup done"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k15-windows-gpu
+          name: k19-windows-gpu
           path: ${{ env.AMD_CI_WORK }}\out
           retention-days: 7
           if-no-files-found: warn
 
-  verdict:
-    name: "k15 verdict (judges the artifacts; red on FAIL / VOID / INCONCLUSIVE)"
-    needs: [hosted-build, cpu-linux, gpu-linux, gpu-windows]
+  summary:
+    name: "k19 tables (md5 groups, speed medians, engagement; red only when no rows came back)"
+    needs: [hosted-build, hosted-poly, gpu-linux, gpu-windows]
     if: ${{ always() }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
@@ -237,19 +217,19 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: k15-*
+          pattern: k19-*
           path: ${{ runner.temp }}/in
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           pattern: info_*
           path: ${{ runner.temp }}/in
-      - name: Judge
+      - name: Tables
         run: |
           set +e
-          python3 k15/k15_verdict.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
+          python3 k15/k19_tab.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
           rc=$?
-          cat "$RUNNER_TEMP/verdict/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/verdict/TABLES.md" >> "$GITHUB_STEP_SUMMARY"
           exit $rc
       - uses: actions/upload-artifact@v4
         if: always()

@@ -43,6 +43,10 @@ MAX_SHARED = int(os.environ.get("AMD_CI_QUEUE_MAX_SHARED", "12"))  # of ~15 runn
 POLL_S = int(os.environ.get("AMD_CI_QUEUE_POLL_S", "120"))
 MAX_ATTEMPTS = int(os.environ.get("AMD_CI_QUEUE_MAX_ATTEMPTS", "20"))
 MAX_PUSH_FAILURES = 3
+# A ticket nobody advanced for this long is an orphan (its session is gone): finished, never pushed late.
+MAX_WAIT_H = float(os.environ.get("AMD_CI_QUEUE_MAX_WAIT_H", "72"))
+# A `pushed` ticket whose run never showed up holds the exclusive slot for good: finished after this.
+NO_RUN_H = float(os.environ.get("AMD_CI_QUEUE_NO_RUN_H", "6"))
 GH_TIMEOUT_S = 60
 PUSH_TIMEOUT_S = 300
 
@@ -66,14 +70,24 @@ def queue_dir() -> Path:
     return d
 
 
+def _open_lock(path: Path) -> int:
+    """A descriptor to flock: created 0666 (whatever the umask), else read-only when another user made
+    it 0644. flock only needs an open descriptor, so a read-only one locks just as well."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except PermissionError:
+        return os.open(path, os.O_RDONLY)
+    try:
+        os.fchmod(fd, 0o666)
+    except OSError:
+        pass   # not ours: someone else's file, already open read-write
+    return fd
+
+
 @contextmanager
 def locked_state():
     d = queue_dir()
-    try:
-        fd = os.open(d / "queue.lock", os.O_RDWR | os.O_CREAT, 0o666)
-    except PermissionError:
-        # Created 0644 by another user (umask): flock only needs an open descriptor, read-only is enough.
-        fd = os.open(d / "queue.lock", os.O_RDONLY)
+    fd = _open_lock(d / "queue.lock")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         path = d / "queue.json"
@@ -95,7 +109,7 @@ def locked_state():
 def tick_lock():
     """One tick at a time host-wide, without blocking: True when this process holds it. The state
     lock is only held to read and to write back, never across a `gh` call or a push."""
-    fd = os.open(queue_dir() / "tick.lock", os.O_RDWR | os.O_CREAT, 0o666)
+    fd = _open_lock(queue_dir() / "tick.lock")
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -257,8 +271,15 @@ def _push_failed(ticket: dict, why: str) -> bool:
     return False
 
 
+class NotMine(Exception):
+    """The ticket's branch dir is another user's and not reachable from this one (a 0700 home)."""
+
+
 def push(ticket: dict) -> bool:
     d = Path(ticket["dir"])
+    if ticket.get("user") not in (None, getpass.getuser()) and not os.access(d.parent, os.X_OK):
+        # Unreachable is not deleted: only its owner's tick can push it, so it stays waiting for them.
+        raise NotMine(str(d))
     if not d.is_dir():
         return _push_failed(ticket, f"{d} no longer exists")
     git = ["git", "-C", str(d)]
@@ -293,11 +314,32 @@ def dispatch(tickets: list[dict], max_shared: int = MAX_SHARED, push_fn = None) 
     for _ in range(len(tickets) + 1):
         retry = False
         for tid in plan([t for t in tickets if t["id"] not in failed], max_shared):
-            if not push_fn(by_id[tid]):
+            try:
+                ok = push_fn(by_id[tid])
+            except NotMine:
+                ok = False   # skipped this pass, not counted against it: the next waiter goes instead
+            if not ok:
                 failed.add(tid)
                 retry = True
         if not retry:
             break
+
+
+def expire(tickets: list[dict], now: float | None = None) -> list[str]:
+    """Finish orphans in place: a waiting ticket older than MAX_WAIT_H (`expired`, its session is long
+    gone and a late push would only queue stale work), and a pushed ticket with no run NO_RUN_H after
+    its push (`no_run`, else it holds the exclusive slot forever). Returns their branches."""
+    now = time.time() if now is None else now
+    out = []
+    for t in tickets:
+        if t["state"] == "waiting" and now - t.get("created", now) > MAX_WAIT_H * 3600:
+            t["state"], t["conclusion"] = "done", "expired"
+        elif t["state"] == "pushed" and not t.get("run_id") and now - t.get("pushed_at", now) > NO_RUN_H * 3600:
+            t["state"], t["conclusion"] = "done", "no_run"
+        else:
+            continue
+        out.append(t["branch"])
+    return out
 
 
 def tick(max_shared: int = MAX_SHARED) -> None:
@@ -313,6 +355,8 @@ def tick(max_shared: int = MAX_SHARED) -> None:
                 ran = gpu_steps_ran(run["databaseId"]) if not jobs and run and run.get("status") == "completed" \
                     and run.get("conclusion") == "cancelled" else None
                 apply_run(t, run, ran, jobs)
+        for b in expire(tickets):
+            print(f"finished orphaned ticket {b}")
         dispatch(tickets, max_shared)
         with locked_state() as state:
             mine_ids = {t["id"] for t in tickets}
