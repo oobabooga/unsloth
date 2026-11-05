@@ -206,12 +206,16 @@ export const fa = {
         history: "در حال خواندن سابقهٔ مرور شما",
         move: "در حال حرکت دادن ماوس",
         drag: "در حال کشیدن",
+        tabs: "در حال بررسی زبانه‌ها",
+        readFile: "در حال خواندن فایل",
+        editFile: "در حال ویرایش فایل",
       },
     },
     title: "مرورگر",
     tabs: "زبانه‌های مرورگر",
     newTab: "زبانهٔ جدید",
     newTabFullView: "زبانهٔ جدید در نمای کامل",
+    newTabFloating: "زبانه جدید در پنجره شناور",
     closeTab: "بستن زبانه",
     close: "بستن مرورگر",
     show: "نمایش مرورگر",
@@ -359,6 +363,8 @@ export const fa = {
     askBeforeDownloadingSetting: "پرسیدن پیش از دانلود",
     askBeforeDownloadingSettingDescription:
       "تأیید فایل‌های وب‌سایت‌ها پیش از ذخیره شدن.",
+    askBeforeProgramDownloadsSetting: "پرسیدن پیش از دانلود برنامه‌ها",
+    askBeforeProgramDownloadsSettingDescription: "تأیید فایل‌هایی که می‌توانند برنامه اجرا کنند، مانند .exe یا .dmg، حتی وقتی دانلودهای دیگر نمی‌پرسند.",
     downloadSitesSetting: "مجوزهای دانلود سایت‌ها",
     downloadSitesSettingDescription:
       "سایت‌هایی که انتخاب کرده‌اید دانلود از آن‌ها همیشه مجاز یا مسدود باشد.",
@@ -367,6 +373,7 @@ export const fa = {
     downloadSitesFor: "دانلودها از {host}",
     downloadSitesRemove: "فراموش کردن {host}",
     downloadSiteAllow: "همیشه اجازه بده",
+    downloadSiteAllowAll: "اجازه به برنامه‌ها هم",
     downloadSiteBlock: "همیشه مسدود کن",
     downloadPrompt: {
       title: "این فایل دانلود شود؟",
@@ -374,6 +381,9 @@ export const fa = {
       dangerous:
         "فایل‌هایی از این نوع می‌توانند برنامه‌هایی را روی رایانهٔ شما اجرا کنند. فقط در صورتی دانلود کنید که به {host} اعتماد دارید.",
       remember: "به خاطر سپردن برای دفعهٔ بعد",
+      once: "دفعهٔ بعد بپرس",
+      site: "همیشه برای {host}",
+      all: "همیشه دانلود کن، از همهٔ سایت‌ها",
       cancel: "لغو",
       download: "دانلود",
       blocked: "یک دانلود از {host} مسدود شد.",
@@ -422,6 +432,12 @@ export const fa = {
       openChat: "باز کردن در نمای کامل",
       moveLeft: "انتقال به قاب چپ",
       moveRight: "انتقال به قاب راست",
+    },
+    floating: {
+      enter: "پنجره شناور",
+      dock: "چسباندن به کنار",
+      close: "بستن پنجره شناور",
+      handle: "جابه‌جایی پنجره. کلیدهای جهت آن را جابه‌جا می‌کنند و Shift همراه کلیدهای جهت اندازه‌اش را تغییر می‌دهد.",
     },
     annotate: {
       countOne: "1 حاشیه‌نویسی",
@@ -1190,6 +1206,9 @@ export const fa = {
         "در هر خط یک مدل، برای مثال unsloth/Qwen3-4B-GGUF، یا unsloth/* برای یک سازمان کامل. برای مجاز کردن همهٔ مدل‌ها، خالی بگذارید.",
       modelAccessSave: "ذخیره",
       modelAccessLimited: "دسترسی محدود به مدل",
+      rename: "تغییر نام",
+      renameTitle: "تغییر نام {username}",
+      renameDescription: "نامی را که این حساب با آن وارد می‌شود انتخاب کنید. گفتگوها، فایل‌ها و کلیدهای API در همین حساب می‌مانند. کاربر از حساب خارج می‌شود و با نام جدید و گذرواژهٔ فعلی دوباره وارد می‌شود.",
       empty: "هنوز حساب دیگری وجود ندارد",
       setupCode: "کد راه‌اندازی",
       setupFor: "کد راه‌اندازی برای {username}",
@@ -4217,8 +4236,6 @@ export const fa = {
             "به نظر می‌رسد این مجموعه‌داده شامل تصویر است که قابل جریان‌دهی نیست.",
           audioDataset:
             "به نظر می‌رسد این مجموعه‌داده شامل صدا است که قابل جریان‌دهی نیست.",
-          appleSilicon:
-            "جریان‌دهی هنوز روی Apple Silicon (MLX) پشتیبانی نمی‌شود.",
         },
         options: {
           trainOnCompletions: "فقط تکمیل‌های دستیار",

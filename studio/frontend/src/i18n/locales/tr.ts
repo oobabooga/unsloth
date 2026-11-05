@@ -206,12 +206,16 @@ export const tr = {
         history: "Tarama geçmişiniz okunuyor",
         move: "Fare hareket ettiriliyor",
         drag: "Sürükleniyor",
+        tabs: "Sekmelere bakılıyor",
+        readFile: "Dosya okunuyor",
+        editFile: "Dosya düzenleniyor",
       },
     },
     title: "Tarayıcı",
     tabs: "Tarayıcı sekmeleri",
     newTab: "Yeni sekme",
     newTabFullView: "Tam görünümde yeni sekme",
+    newTabFloating: "Kayan pencerede yeni sekme",
     closeTab: "Sekmeyi kapat",
     close: "Tarayıcıyı kapat",
     show: "Tarayıcıyı göster",
@@ -360,6 +364,8 @@ export const tr = {
     askBeforeDownloadingSetting: "İndirmeden önce sor",
     askBeforeDownloadingSettingDescription:
       "Web sitelerinden gelen dosyalar kaydedilmeden önce onayınız istenir.",
+    askBeforeProgramDownloadsSetting: "Program indirmeden önce sor",
+    askBeforeProgramDownloadsSettingDescription: ".exe veya .dmg gibi program çalıştırabilen dosyaları, diğer indirmeler sormasa bile onayla.",
     downloadSitesSetting: "Site indirme izinleri",
     downloadSitesSettingDescription:
       "İndirmelerine her zaman izin vermeyi veya engellemeyi seçtiğiniz siteler.",
@@ -368,6 +374,7 @@ export const tr = {
     downloadSitesFor: "İndirme kaynağı: {host}",
     downloadSitesRemove: "Unut: {host}",
     downloadSiteAllow: "Her zaman izin ver",
+    downloadSiteAllowAll: "Programlara da izin ver",
     downloadSiteBlock: "Her zaman engelle",
     downloadPrompt: {
       title: "Bu dosya indirilsin mi?",
@@ -376,6 +383,9 @@ export const tr = {
       dangerous:
         "Bu tür dosyalar bilgisayarınızda program çalıştırabilir. Yalnızca {host} kaynağına güveniyorsanız indirin.",
       remember: "Sonraki sefer için hatırla",
+      once: "Bir dahaki sefere sor",
+      site: "{host} için her zaman",
+      all: "Her siteden her zaman indir",
       cancel: "İptal",
       download: "İndir",
       blocked: "Şu kaynaktan gelen bir indirme engellendi: {host}",
@@ -424,6 +434,12 @@ export const tr = {
       openChat: "Tam görünümde aç",
       moveLeft: "Sol bölmeye taşı",
       moveRight: "Sağ bölmeye taşı",
+    },
+    floating: {
+      enter: "Kayan pencere",
+      dock: "Yana sabitle",
+      close: "Kayan pencereyi kapat",
+      handle: "Pencereyi taşı. Ok tuşları taşır; Shift ve ok tuşları boyutunu değiştirir.",
     },
     annotate: {
       countOne: "1 ek açıklama",
@@ -1193,6 +1209,9 @@ export const tr = {
         "Her satıra bir model; örneğin unsloth/Qwen3-4B-GGUF veya bir kuruluşun tamamı için unsloth/*. Tüm modellere izin vermek için boş bırakın.",
       modelAccessSave: "Kaydet",
       modelAccessLimited: "Sınırlı model erişimi",
+      rename: "Yeniden adlandır",
+      renameTitle: "{username} hesabını yeniden adlandır",
+      renameDescription: "Bu hesabın oturum açarken kullandığı adı seçin. Sohbetler, dosyalar ve API anahtarları hesapta kalır. Kullanıcının oturumu kapatılır ve yeni ad ile mevcut parolasıyla yeniden oturum açar.",
       empty: "Henüz başka hesap yok",
       setupCode: "Kurulum kodu",
       setupFor: "Kurulum kodu: {username}",
@@ -4229,8 +4248,6 @@ export const tr = {
             "Bu veri kümesi görüntülerden oluşuyor gibi görünüyor; görüntüler akış olarak alınamaz.",
           audioDataset:
             "Bu veri kümesi seslerden oluşuyor gibi görünüyor; sesler akış olarak alınamaz.",
-          appleSilicon:
-            "Akış henüz Apple Silicon (MLX) üzerinde desteklenmiyor.",
         },
         options: {
           trainOnCompletions: "yalnızca asistan yanıtları",

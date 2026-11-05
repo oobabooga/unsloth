@@ -2472,6 +2472,13 @@ _MAX_IDENTICAL_TOOL_RESULTS = 3
 _UNSET = object()
 
 
+def _with_template_extras(reasoning_kw: Optional[dict], extras: Optional[dict]) -> Optional[dict]:
+    """The caller's other template tags (e.g. verification) under Studio's resolved reasoning keys."""
+    if not extras:
+        return reasoning_kw
+    return {**extras, **(reasoning_kw or {})}
+
+
 # A result with this tail is the window's answer, not the tool's.
 _WINDOW_NOTICE_MARKER = "chars for the model;"
 # Zero-budget results use _zero_room_stub, which lacks the marker above; missing it lets a model re-read slices forever, so catch it too.
@@ -7916,15 +7923,42 @@ def _load_probe_memo_scope():
     prev = (
         getattr(_LOAD_PROBE_STATE, "metal_transient", None),
         getattr(_LOAD_PROBE_STATE, "logged", None),
+        getattr(_LOAD_PROBE_STATE, "companion_listings", None),
     )
     _LOAD_PROBE_STATE.metal_transient = {}
     _LOAD_PROBE_STATE.logged = set()
+    _LOAD_PROBE_STATE.companion_listings = {}
     try:
         yield
     finally:
         _LOAD_PROBE_STATE.armed = False
         _LOAD_PROBE_STATE.rows = None
-        _LOAD_PROBE_STATE.metal_transient, _LOAD_PROBE_STATE.logged = prev
+        (
+            _LOAD_PROBE_STATE.metal_transient,
+            _LOAD_PROBE_STATE.logged,
+            _LOAD_PROBE_STATE.companion_listings,
+        ) = prev
+
+
+def _companion_repo_files(hf_repo: str, hf_token: Optional[str]) -> list[str]:
+    """One load's companion lookups share a listing until a download; failures are never kept."""
+    from huggingface_hub import list_repo_files
+
+    store = getattr(_LOAD_PROBE_STATE, "companion_listings", None)
+    key = (hf_repo, hf_token)
+    if store is not None and key in store:
+        return list(store[key])
+    files = list(call_hub_with_anonymous_retry(list_repo_files, hf_token, hf_repo))
+    if store is not None:
+        store[key] = tuple(files)
+    return files
+
+
+def _forget_companion_listings() -> None:
+    """A download can take minutes, so later lookups list again."""
+    store = getattr(_LOAD_PROBE_STATE, "companion_listings", None)
+    if store:
+        store.clear()
 
 
 def _info_once_per_load(msg: str, *args) -> None:
@@ -14534,6 +14568,10 @@ class LlamaCppBackend:
         """Free/total per NVIDIA GPU via NVML in a child for hosts whose nvidia-smi is absent or hung; a row without memory voids the answer."""
         if sys.platform == "darwin" or os.environ.get("UNSLOTH_NVIDIA_LIBRARY_PROBE", "1") == "0":
             return []
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cvd is not None and not cvd.strip():
+            # Hides every GPU: _nvml_rows_visible keeps no row, and other _NVML_ROWS readers need a non-blank mask.
+            return []
         script = LlamaCppBackend._nvidia_probe_script()
         if script is None:
             return []
@@ -19848,16 +19886,12 @@ class LlamaCppBackend:
         listing_answered = False
         # Retryable failure; a permanent error also leaves the listing unanswered.
         listing_failed = False
-        from huggingface_hub import list_repo_files
-
         # Retry transient listing errors only; offline raises at once and falls through to cache.
         for attempt in range(3):
             if cancel_event.is_set():
                 return None
             try:
-                target = _pick_from(
-                    call_hub_with_anonymous_retry(list_repo_files, hf_token, hf_repo)
-                )
+                target = _pick_from(_companion_repo_files(hf_repo, hf_token))
                 listing_answered = True
                 listing_failed = False
                 break
@@ -19934,6 +19968,7 @@ class LlamaCppBackend:
                 outcome["listed"] = False
                 outcome["listed_live"] = False
             return None
+        _forget_companion_listings()
         try:
             logger.info(f"Downloading {label}: {hf_repo}/{target}")
             # Same policy; companions are best-effort (caller below swallows failures to None).
@@ -36972,6 +37007,7 @@ class LlamaCppBackend:
         thinking_budget_tokens: Optional[int] = None,
         _allow_respawn_retry: bool = True,
         compact_context: bool = False,
+        chat_template_kwargs: Optional[dict] = None,
     ) -> Generator[Union[str, dict], None, None]:
         """Streams a chat completion via /v1/chat/completions (llama-server applies template and vision); yields cumulative text like InferenceBackend."""
         if not self.is_loaded:
@@ -37020,9 +37056,10 @@ class LlamaCppBackend:
             payload["timings_per_token"] = True
         if logit_bias:
             payload["logit_bias"] = logit_bias
-        # Per-request enable_thinking / reasoning_effort / preserve_thinking
-        _reasoning_kw = self._request_reasoning_kwargs(
-            enable_thinking, reasoning_effort, preserve_thinking
+        # Per-request enable_thinking / reasoning_effort / preserve_thinking, plus the caller's other tags
+        _reasoning_kw = _with_template_extras(
+            self._request_reasoning_kwargs(enable_thinking, reasoning_effort, preserve_thinking),
+            chat_template_kwargs,
         )
         if _reasoning_kw is not None:
             payload["chat_template_kwargs"] = _reasoning_kw
@@ -37196,6 +37233,7 @@ class LlamaCppBackend:
                 tools_withheld = tools_withheld,
                 thinking_budget_tokens = thinking_budget_tokens,
                 compact_context = compact_context,
+                chat_template_kwargs = chat_template_kwargs,
                 _allow_respawn_retry = False,
             )
 
@@ -37416,6 +37454,7 @@ class LlamaCppBackend:
         compact_context: bool = False,
         website_policy: Optional[dict] = None,
         live_permissions = None,
+        chat_template_kwargs: Optional[dict] = None,
     ) -> Generator[dict, None, None]:
         """
         Agentic loop: let the model call tools, execute them, and continue.
@@ -37990,8 +38029,11 @@ class LlamaCppBackend:
                 neutralize_control_markup_in_messages,
             )
 
-            _reasoning_kw = self._request_reasoning_kwargs(
-                _effective_enable_thinking, _effective_reasoning_effort, preserve_thinking
+            _reasoning_kw = _with_template_extras(
+                self._request_reasoning_kwargs(
+                    _effective_enable_thinking, _effective_reasoning_effort, preserve_thinking
+                ),
+                chat_template_kwargs,
             )
             # On a continuation only the remainder of the caller's cap; read before the payload.
             _iteration_max_tokens = (
@@ -39155,8 +39197,9 @@ class LlamaCppBackend:
                             )
                             _cap_left_l = _loop_budget_left(_spent_l)
                             # Recompute kwargs with thinking off so admission prices the real request.
-                            _off_kw_l = self._request_reasoning_kwargs(
-                                False, None, preserve_thinking
+                            _off_kw_l = _with_template_extras(
+                                self._request_reasoning_kwargs(False, None, preserve_thinking),
+                                chat_template_kwargs,
                             )
                             # Counted ONCE normally: eviction below runs only on a candidate already found too large.
                             _fits_l = _cap_left_l != 0 and _loop_continuation_fits(
@@ -40612,8 +40655,9 @@ class LlamaCppBackend:
         _final_tools = _last_sent_tools
         from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
 
-        _reasoning_kw = self._request_reasoning_kwargs(
-            enable_thinking, reasoning_effort, preserve_thinking
+        _reasoning_kw = _with_template_extras(
+            self._request_reasoning_kwargs(enable_thinking, reasoning_effort, preserve_thinking),
+            chat_template_kwargs,
         )
         _final_max_tokens = (
             max_tokens
@@ -41252,7 +41296,10 @@ class LlamaCppBackend:
                                 _candidate_r, None, self.markup_profile
                             )
                             # Admit with thinking-off kwargs, matching the request actually sent.
-                            _off_kw = self._request_reasoning_kwargs(False, None, preserve_thinking)
+                            _off_kw = _with_template_extras(
+                                self._request_reasoning_kwargs(False, None, preserve_thinking),
+                                chat_template_kwargs,
+                            )
                             _next_cap_r = _remaining_output_budget()
                             # Protect the current user turn and recovery tail.
                             _recovery_tail = _candidate_r[-2:]
