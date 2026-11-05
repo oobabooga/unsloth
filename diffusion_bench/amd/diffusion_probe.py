@@ -455,6 +455,9 @@ def main() -> int:
     ap.add_argument("--spec", default = str(TOOLKIT / "specs" / "amd_strix_small.json"))
     ap.add_argument("--only", action = "append", default = [],
                     help = f"fnmatch on cell tags, repeatable (default {' '.join(DEFAULT_ONLY)})")
+    ap.add_argument("--state-only", action = "append", default = [], metavar = "STATE=PATTERN",
+                    help = "fnmatch for one state only, repeatable; when a state has any, they replace --only there "
+                           "(e.g. head='zimg_s_*' re-runs only the Studio cells on the patched tree)")
     ap.add_argument("--work", type = Path, default = None,
                     help = "work root (default $AMD_CI_WORK/dbench, else next to --out)")
     ap.add_argument("--models-dir", type = Path, default = None, help = "default <work>/models, shared by states")
@@ -512,9 +515,10 @@ def main() -> int:
                  TOOLKIT / "specs" / f"{args.spec}.json"]
         spec_path = next((c for c in cands if c.is_file()), cands[0])
         raw = json.loads(spec_path.read_text(encoding = "utf-8"))
-        only = args.only or DEFAULT_ONLY
+        per_state = [v for k, _, v in (x.partition("=") for x in args.state_only) if k == args.state and v]
+        only = per_state or args.only or DEFAULT_ONLY
         spec = derive_spec(raw, only, args.dry)
-        obs["spec"] = {"name": raw.get("name"), "path": str(spec_path), "only": only,
+        obs["spec"] = {"name": raw.get("name"), "path": str(spec_path), "only": only, "per_state": bool(per_state),
                        "selected": [c["tag"] for c in spec["cells"]]}
         if not spec["cells"]:
             raise RuntimeError(f"no cells of {spec_path.name} match {only}")
