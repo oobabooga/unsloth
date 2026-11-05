@@ -1,0 +1,408 @@
+name: "AMD CI: sd.cpp PR recheck (#37 #38 #14 #48) on gfx1151"
+
+# Builds run on GitHub-hosted runners with the exact unsloth-sd-prebuilt.yml leg recipes, then the
+# gfx1151 boxes run base and head of every item in ONE job on ONE machine (renders interleaved per rep).
+#   vk   : #35 base (344a3b66) vs #37 head (030a7999) vs #38 head (a2c3b975), Linux RADV + Windows AMD driver
+#   cpu  : #35 base vs #48 head (0ad6060c, CPU stack tip) on Zen 5, Linux CPU-all-variants leg
+#   rocm : #14's build-linux-rocm recipe on current master (aba3a1c5); #14 itself conflicts with master
+
+on:
+  push:
+    branches: [amd-ci-sdrc-amd]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build-vk-linux:
+    name: "build vk linux ${{ matrix.label }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: base, pr: "35", sha: 344a3b663b31612586f9e9a0f3582eef385fa73c}
+          - {label: h37, pr: "37", sha: 030a7999d2dae43e27c5dd10aee87d1e12a378ef}
+          - {label: h38, pr: "38", sha: a2c3b975a261d745d7a5ff9f5020c602c9a2df70}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Vulkan build deps (as the prebuilt leg)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev xz-utils ninja-build
+          archive="$RUNNER_TEMP/vulkansdk.tar.xz"; sdk_root="$RUNNER_TEMP/vulkansdk"
+          curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root" && tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
+          echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: bash sdrc/build.sh ${{ matrix.label }} ${{ matrix.pr }} ${{ matrix.sha }} vk "$RUNNER_TEMP/out/${{ matrix.label }}"
+      - name: Pack (tar keeps the exec bits)
+        run: tar -C "$RUNNER_TEMP/out" -cf "$RUNNER_TEMP/vk-${{ matrix.label }}.tar" ${{ matrix.label }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "vk-${{ matrix.label }}", path: "${{ runner.temp }}/vk-${{ matrix.label }}.tar", retention-days: 5 }
+
+  build-cpu-linux:
+    name: "build cpu linux ${{ matrix.label }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: base, pr: "35", sha: 344a3b663b31612586f9e9a0f3582eef385fa73c}
+          - {label: h48, pr: "48", sha: 0ad6060ce4eb65a3ea73856b1d4f0b4eca07ede0}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+      - name: Build
+        run: bash sdrc/build.sh ${{ matrix.label }} ${{ matrix.pr }} ${{ matrix.sha }} cpu "$RUNNER_TEMP/out/${{ matrix.label }}"
+      - name: Pack
+        run: tar -C "$RUNNER_TEMP/out" -cf "$RUNNER_TEMP/cpu-${{ matrix.label }}.tar" ${{ matrix.label }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "cpu-${{ matrix.label }}", path: "${{ runner.temp }}/cpu-${{ matrix.label }}.tar", retention-days: 5 }
+
+  build-vk-win:
+    name: "build vk windows ${{ matrix.label }}"
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: base, pr: "35", sha: 344a3b663b31612586f9e9a0f3582eef385fa73c}
+          - {label: h37, pr: "37", sha: 030a7999d2dae43e27c5dd10aee87d1e12a378ef}
+          - {label: h38, pr: "38", sha: a2c3b975a261d745d7a5ff9f5020c602c9a2df70}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: choco install ninja --no-progress
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+      - name: Install Vulkan SDK (as the prebuilt leg)
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $env:VULKAN_SHA256) { throw 'Vulkan SDK installer SHA256 mismatch' }
+          $install = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($install.ExitCode -ne 0) { exit $install.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+      - name: Build
+        run: ./sdrc/build_win.ps1 -Label ${{ matrix.label }} -Pr ${{ matrix.pr }} -Sha ${{ matrix.sha }} -Out "$env:RUNNER_TEMP/out/${{ matrix.label }}"
+      - uses: actions/upload-artifact@v4
+        with: { name: "vkwin-${{ matrix.label }}", path: "${{ runner.temp }}/out/${{ matrix.label }}", retention-days: 5 }
+
+  build-rocm:
+    # unsloth-sd-prebuilt.yml build-linux-rocm from PR #14, on current master's tree (aba3a1c5): #14's own tree is
+    # 198 commits behind and conflicts. ccache dropped (cold cache either way); everything else is the PR's steps.
+    name: "build rocm (PR 14 recipe, master tree)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ROCM_VERSION: "7.14.0"
+      GPU_TARGETS: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, path: tooling }
+      - name: Free disk for the ROCm wheels
+        run: |
+          set -eux
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache
+          docker system prune -af || true
+          df -h /
+      - name: Source (master + ggml-patches, as resolve)
+        run: |
+          set -euxo pipefail
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          git -C src checkout -q aba3a1c1e0c61a20f3db0c41641704cda279d043
+          git -C src submodule update --init --depth 1 ggml
+          cd src && for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply --verbose "../$p"; done
+      - name: Install ROCm (TheRock wheels)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build patchelf
+          python3 -m venv .rocm
+          . .rocm/bin/activate
+          python -m pip install -q --upgrade pip
+          DEVICE="$(echo "$GPU_TARGETS" | sed 's/;/,device-/g; s/^/device-/')"
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,${DEVICE}]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          {
+            echo "ROCM_PATH=$ROCM_PATH"
+            echo "HIP_PATH=$ROCM_PATH"
+            echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"
+            echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$(rocm-sdk path --bin)" >> "$GITHUB_PATH"
+          echo "$(pwd)/.rocm/bin" >> "$GITHUB_PATH"
+          df -h /
+      - name: Build sd-cli + sd-server (ROCm)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          T0=$(date +%s)
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600" \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_HIPBLAS=ON \
+            -DHIP_PLATFORM=amd \
+            -DGPU_TARGETS="$GPU_TARGETS"
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+          echo "rocm build took $(( $(date +%s) - T0 )) s"
+      - name: Stage the bundle with the ROCm runtime
+        run: |
+          set -euo pipefail
+          BIN="${GITHUB_WORKSPACE}/src/build/bin"
+          STAGE="${GITHUB_WORKSPACE}/rocm-bundle"
+          rm -rf "$STAGE" && mkdir -p "$STAGE/lib" "$STAGE/.kpack"
+          cp "$BIN/sd-cli" "$BIN/sd-server" "$STAGE/"
+          ldd "$STAGE/sd-cli" "$STAGE/sd-server" \
+            | awk -v r="$ROCM_PATH/" 'index($3, r) == 1 { print $3 }' | sort -u > "$RUNNER_TEMP/rocm-libs.txt"
+          if [ ! -s "$RUNNER_TEMP/rocm-libs.txt" ]; then
+            echo "ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?" >&2
+            exit 1
+          fi
+          while read -r so; do cp -L "$so" "$STAGE/lib/"; done < "$RUNNER_TEMP/rocm-libs.txt"
+          for t in rocblas hipblaslt; do
+            compgen -G "$STAGE/lib/lib$t.so*" > /dev/null || continue
+            mkdir -p "$STAGE/lib/$t"
+            cp -rL "$ROCM_PATH/lib/$t/library" "$STAGE/lib/$t/"
+          done
+          for so in "$STAGE"/lib/*.so*; do
+            objcopy -O binary --only-section=.rocm_kpack_ref "$so" "$RUNNER_TEMP/kpack_ref.bin"
+            for name in $(strings "$RUNNER_TEMP/kpack_ref.bin" | grep -o '\.kpack/[A-Za-z0-9_]*_@GFXARCH@' \
+                | sed 's#^\.kpack/##; s#_@GFXARCH@$##' | sort -u); do
+              for gfx in ${GPU_TARGETS//;/ }; do
+                cp -L "$ROCM_PATH/.kpack/${name}_${gfx}.kpack" "$STAGE/.kpack/"
+              done
+            done
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "$STAGE/sd-cli" "$STAGE/sd-server"
+          for f in "$STAGE"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' "$f"; done
+          echo "bundled $(wc -l < "$RUNNER_TEMP/rocm-libs.txt") ROCm libraries, $( (ls "$STAGE/.kpack" | wc -l) || true) kpack archives"
+          cat "$RUNNER_TEMP/rocm-libs.txt"
+          du -sh "$STAGE"
+          if LD_LIBRARY_PATH= ldd "$STAGE/sd-cli" "$STAGE/sd-server" | grep -i 'not found'; then
+            echo "ERROR: unresolved libraries after bundling" >&2
+            exit 1
+          fi
+      - name: Package bundle (PR 14 package_bundle KEEP_LAYOUT, ported onto master's packager)
+        env:
+          BIN_DIR: ${{ github.workspace }}/rocm-bundle
+          KEEP_LAYOUT: "1"
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: sdrc
+          LABEL: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          COMMIT: aba3a1c1e0c61a20f3db0c41641704cda279d043
+          SOURCE_REPO: unslothai/stable-diffusion.cpp
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/sdrc/package_bundle.py && ls -la dist
+      - uses: actions/upload-artifact@v4
+        with: { name: rocm-bundle, path: "dist/sd-sdrc-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip", retention-days: 5 }
+
+  gpu-linux:
+    name: "gfx1151 Linux: Vulkan RADV (#35/#37/#38) + Zen 5 CPU (#35/#48)"
+    needs: [build-vk-linux, build-cpu-linux]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    # Shared GPU (no amd-ci-gfx1151-gpu group): the group is busy with other sessions' benches, and this job's
+    # arms are interleaved per rep on one machine, so a co-tenant hits base and head alike. exclusive_gpu is a gap.
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdrc-linux"
+      - name: Host gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux vulkan --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          (vulkaninfo --summary 2>&1 | head -60) > "$AMD_CI_WORK/out/vulkaninfo.txt" || true
+          lscpu > "$AMD_CI_WORK/out/lscpu.txt" 2>&1 || true
+          uname -n
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "vk-*" }
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "cpu-*" }
+      - name: Unpack + env
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/bin/vk" "$AMD_CI_WORK/bin/cpu"
+          for l in base h37 h38; do tar -C "$AMD_CI_WORK/bin/vk" -xf "$RUNNER_TEMP/dl/vk-$l/vk-$l.tar"; done
+          for l in base h48; do tar -C "$AMD_CI_WORK/bin/cpu" -xf "$RUNNER_TEMP/dl/cpu-$l/cpu-$l.tar"; done
+          cat "$AMD_CI_WORK"/bin/*/*/srcinfo.txt | grep label=
+          python3 -m venv "$AMD_CI_WORK/venv" && "$AMD_CI_WORK/venv/bin/pip" install -q pillow numpy
+      - name: Vulkan (RADV)
+        timeout-minutes: 120
+        run: |
+          set +e
+          V="$AMD_CI_WORK/bin/vk"
+          "$AMD_CI_WORK/venv/bin/python" -u sdrc/run.py --plan vk --bin base=$V/base --bin h37=$V/h37 --bin h38=$V/h38 \
+            --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/vk" --reps 3 2>&1 | tail -80
+          exit 0
+      - name: Zen 5 CPU
+        timeout-minutes: 90
+        env:
+          HIP_VISIBLE_DEVICES: ""
+          ROCR_VISIBLE_DEVICES: ""
+        run: |
+          set +e
+          C="$AMD_CI_WORK/bin/cpu"
+          "$AMD_CI_WORK/venv/bin/python" -u sdrc/run.py --plan cpu --bin base=$C/base --bin h48=$C/h48 \
+            --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/cpu" --reps 3 2>&1 | tail -80
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdrc-linux
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdrc-linux-png, path: "${{ env.AMD_CI_WORK }}/out/**/*_r0.png", retention-days: 7, if-no-files-found: warn }
+
+  gpu-linux-rocm:
+    name: "gfx1151 Linux: ROCm bundle (PR 14 recipe)"
+    needs: [build-rocm, gpu-linux]
+    if: ${{ !cancelled() && needs.build-rocm.result == 'success' }}
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdrc-rocm"
+      - name: Host gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          (rocminfo 2>&1 | grep -E "Name:|gfx" | head -20) > "$AMD_CI_WORK/out/rocminfo.txt" || true
+          ls /opt/rocm* -d 2>/dev/null || echo "no /opt/rocm"
+      - uses: actions/download-artifact@v4
+        with: { name: rocm-bundle, path: "${{ runner.temp }}/dl" }
+      - name: Unpack
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/bin/rocm" && cd "$AMD_CI_WORK/bin/rocm"
+          python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')" "$RUNNER_TEMP"/dl/*.zip
+          D="$(dirname "$(find . -name sd-cli -type f | head -1 || true)")"
+          chmod +x "$D/sd-cli" "$D/sd-server"
+          echo "ROCM_BIN=$AMD_CI_WORK/bin/rocm/$D" >> "$GITHUB_ENV"
+          ls -la "$D" "$D/lib" | head -40; du -sh "$D"
+          (cd "$D" && env -u LD_LIBRARY_PATH ldd ./sd-cli | grep -E "not found|=> /" | head -40)
+          python3 -m venv "$AMD_CI_WORK/venv" && "$AMD_CI_WORK/venv/bin/pip" install -q pillow numpy
+      - name: ROCm smoke
+        timeout-minutes: 60
+        run: |
+          set +e
+          "$AMD_CI_WORK/venv/bin/python" -u sdrc/run.py --plan rocm --bin rocm="$ROCM_BIN" \
+            --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/rocm" 2>&1 | tail -60
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdrc-rocm, path: "${{ env.AMD_CI_WORK }}/out", retention-days: 7, if-no-files-found: warn }
+
+  linux-control:
+    name: "linux control (selector diagnosis for the Windows job)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  gpu-windows:
+    name: "gfx1151 Windows 11: Vulkan AMD driver (#35/#37/#38)"
+    needs: [build-vk-win]
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "sdrc-windows"
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe", "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\capability.py" 2>&1 | Out-File -Encoding ascii "$env:AMD_CI_WORK\out\capability.json"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List | Out-File -Encoding ascii "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List | Out-File -Encoding ascii -Append "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-Content "$env:AMD_CI_WORK\out\gpu.txt"
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "vkwin-*" }
+      - name: Venv
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -m pip install -q pillow numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$env:RUNNER_TEMP\dl\vkwin-base\srcinfo.txt", "$env:RUNNER_TEMP\dl\vkwin-h37\srcinfo.txt", "$env:RUNNER_TEMP\dl\vkwin-h38\srcinfo.txt"
+      - name: Vulkan (AMD Windows driver)
+        timeout-minutes: 150
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = "$env:RUNNER_TEMP\dl"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -u sdrc\run.py --plan vk --bin "base=$d\vkwin-base" --bin "h37=$d\vkwin-h37" --bin "h38=$d\vkwin-h38" `
+            --models "$env:AMD_CI_WORK\models" --out "$env:AMD_CI_WORK\out\vk" --reps 3 2>&1 | Select-Object -Last 80
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdrc-windows
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
