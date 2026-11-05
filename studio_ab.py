@@ -6,6 +6,7 @@ ap.add_argument("--base", required=True)
 ap.add_argument("--home", required=True)
 ap.add_argument("--repo", required=True)
 ap.add_argument("--variant", required=True)
+ap.add_argument("--model-path", default=None, help="Load this local GGUF instead of repo + variant")
 ap.add_argument("--out", required=True)
 ap.add_argument("--pwfile", required=True)
 a = ap.parse_args()
@@ -49,8 +50,10 @@ def login():
 
 tok = login()
 logs_before = set(glob.glob(os.path.join(a.home, "logs", "llama-server", "*.log")))
-body = {"model_path": a.repo, "gguf_variant": a.variant, "max_seq_length": 4096,
+body = {"model_path": a.model_path or a.repo, "max_seq_length": 4096,
         "speculative_type": "off", "disable_vision": True}
+if not a.model_path:
+    body["gguf_variant"] = a.variant
 t0 = time.time()
 st, r = call("POST", "/api/inference/load", body, tok, timeout=3600)
 res["load_seconds"] = round(time.time() - t0, 1)
@@ -76,6 +79,6 @@ for p in new_logs:
     txt = open(p, errors="replace").read()
     keep = [l for l in txt.splitlines() if re.search(r"load_mode =|lazy read|failed to allocate|unable to allocate|error loading|out of memory|model buffer size|CPU_Mapped|Host model|ROCm0 model|Vulkan0 model|file size|memory breakdown|projected to use", l)]
     res["llama_logs"].append({"path": os.path.basename(p), "lines": keep[:60]})
-call("POST", "/api/inference/unload", {"model_path": a.repo}, tok, timeout=600)
+call("POST", "/api/inference/unload", {"model_path": model_id or a.model_path or a.repo}, tok, timeout=600)
 json.dump(res, open(a.out, "w"), indent=1, default=str)
 print(json.dumps({k: res.get(k) for k in ("load_status", "load_seconds")}))
