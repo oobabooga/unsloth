@@ -1,0 +1,211 @@
+name: "AMD CI: sd.cpp #38 VAE-only conv direct (3d7baa21) vs a2c3b975 on gfx1151"
+
+# Builds run on GitHub-hosted runners with the exact unsloth-sd-prebuilt.yml leg recipes, then the
+# gfx1151 boxes run base and head of every item in ONE job on ONE machine (renders interleaved per rep).
+#   vk   : #35 base (344a3b66) vs #37 head (030a7999) vs #38 head (a2c3b975), Linux RADV + Windows AMD driver
+#   cpu  : #35 base vs #48 head (0ad6060c, CPU stack tip) on Zen 5, Linux CPU-all-variants leg
+#   rocm : #14's build-linux-rocm recipe on current master (aba3a1c5); #14 itself conflicts with master
+
+on:
+  push:
+    branches: [amd-ci-sdrc-amd-38b]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vk-linux:
+    name: "build vk linux ${{ matrix.label }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: old, pr: "38", sha: a2c3b975a261d745d7a5ff9f5020c602c9a2df70}
+          - {label: new, pr: "38", sha: 3d7baa21881be53bf91abb5f304a74d6164f7a20}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Vulkan build deps (as the prebuilt leg)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev xz-utils ninja-build
+          archive="$RUNNER_TEMP/vulkansdk.tar.xz"; sdk_root="$RUNNER_TEMP/vulkansdk"
+          curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root" && tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
+          echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: bash sdrc/build.sh ${{ matrix.label }} ${{ matrix.pr }} ${{ matrix.sha }} vk "$RUNNER_TEMP/out/${{ matrix.label }}"
+      - name: Pack (tar keeps the exec bits)
+        run: tar -C "$RUNNER_TEMP/out" -cf "$RUNNER_TEMP/vk-${{ matrix.label }}.tar" ${{ matrix.label }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "vk-${{ matrix.label }}", path: "${{ runner.temp }}/vk-${{ matrix.label }}.tar", retention-days: 5 }
+
+  build-vk-win:
+    name: "build vk windows ${{ matrix.label }}"
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: old, pr: "38", sha: a2c3b975a261d745d7a5ff9f5020c602c9a2df70}
+          - {label: new, pr: "38", sha: 3d7baa21881be53bf91abb5f304a74d6164f7a20}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: choco install ninja --no-progress
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+      - name: Install Vulkan SDK (as the prebuilt leg)
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $env:VULKAN_SHA256) { throw 'Vulkan SDK installer SHA256 mismatch' }
+          $install = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($install.ExitCode -ne 0) { exit $install.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+      - name: Build
+        run: ./sdrc/build_win.ps1 -Label ${{ matrix.label }} -Pr ${{ matrix.pr }} -Sha ${{ matrix.sha }} -Out "$env:RUNNER_TEMP/out/${{ matrix.label }}"
+      - uses: actions/upload-artifact@v4
+        with: { name: "vkwin-${{ matrix.label }}", path: "${{ runner.temp }}/out/${{ matrix.label }}", retention-days: 5 }
+
+  gpu-linux:
+    name: "gfx1151 Linux RADV: #38 old vs new head"
+    needs: [build-vk-linux]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    # Shared GPU (no amd-ci-gfx1151-gpu group): the group is busy with other sessions' benches, and this job's
+    # arms are interleaved per rep on one machine, so a co-tenant hits base and head alike. exclusive_gpu is a gap.
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdrc38-linux"
+      - name: Host gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux vulkan --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          (vulkaninfo --summary 2>&1 | head -60) > "$AMD_CI_WORK/out/vulkaninfo.txt" || true
+          lscpu > "$AMD_CI_WORK/out/lscpu.txt" 2>&1 || true
+          uname -n
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "vk-*" }
+      - name: Unpack + env
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/bin/vk"
+          for l in old new; do tar -C "$AMD_CI_WORK/bin/vk" -xf "$RUNNER_TEMP/dl/vk-$l/vk-$l.tar"; done
+          cat "$AMD_CI_WORK"/bin/vk/*/srcinfo.txt | grep label=
+          python3 -m venv "$AMD_CI_WORK/venv" && "$AMD_CI_WORK/venv/bin/pip" install -q pillow numpy
+      - name: "#38 old vs new (RADV)"
+        timeout-minutes: 120
+        run: |
+          set +e
+          V="$AMD_CI_WORK/bin/vk"
+          "$AMD_CI_WORK/venv/bin/python" -u sdrc/run.py --plan vk38 --bin old=$V/old --bin new=$V/new \
+            --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/vk38" --reps 3 2>&1 | tail -60
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdrc38-linux
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+
+  linux-control:
+    name: "linux control (selector diagnosis for the Windows job)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  gpu-windows:
+    name: "gfx1151 Windows AMD driver: #38 old vs new head"
+    needs: [build-vk-win]
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "sdrc38-windows"
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe", "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\capability.py" 2>&1 | Out-File -Encoding ascii "$env:AMD_CI_WORK\out\capability.json"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List | Out-File -Encoding ascii "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List | Out-File -Encoding ascii -Append "$env:AMD_CI_WORK\out\gpu.txt"
+          Get-Content "$env:AMD_CI_WORK\out\gpu.txt"
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "vkwin-*" }
+      - name: Venv
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\venv"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -m pip install -q pillow numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$env:RUNNER_TEMP\dl\vkwin-old\srcinfo.txt", "$env:RUNNER_TEMP\dl\vkwin-new\srcinfo.txt"
+      - name: Vulkan (AMD Windows driver)
+        timeout-minutes: 150
+        run: |
+          $ErrorActionPreference = "Continue"
+          $d = "$env:RUNNER_TEMP\dl"
+          & "$env:AMD_CI_WORK\venv\Scripts\python.exe" -u sdrc\run.py --plan vk38 --bin "old=$d\vkwin-old" --bin "new=$d\vkwin-new" `
+            --models "$env:AMD_CI_WORK\models" --out "$env:AMD_CI_WORK\out\vk38" --reps 3 2>&1 | Select-Object -Last 80
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdrc38-windows
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+
+
