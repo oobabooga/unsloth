@@ -1,0 +1,221 @@
+name: "AMD CI: low-precision GEMM paths on gfx1151 (Linux, nov5-gemm)"
+
+# Scaffolded by amd_ci/scaffold.py, then the GPU job body replaced by a measurement probe
+# (amd_ci/probes/gemm_lowp/). Measurement only: nothing is compared base vs head, no secret is referenced,
+# the only download besides wheels is a few weight rows of a public ungated model (HTTP range reads).
+#
+# Arm A: torch from repo.amd.com/rocm/whl/gfx1151 (what Studio's install.sh routes Strix Halo to: torch>=2.11,<2.12)
+# Arm B: torch 2.14.1+rocm7.2 from download.pytorch.org
+# Every probe step writes JSON under $AMD_CI_WORK/out and never fails the job.
+
+on:
+  push:
+    branches: [amd-ci-nov5-gemm]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  gpu:
+    name: "low-precision GEMM probe (exclusive GPU)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    # The shared GPU group: one GPU measurement at a time across all branches.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "nov5-gemm"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Host toolchain facts
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          {
+            echo "python3: $(python3 --version 2>&1)"; uname -a; nproc; free -g; df -h "$RUNNER_TEMP"
+            echo "hipcc on PATH: $(command -v hipcc)"; hipcc --version 2>&1 | head -3
+            echo "/opt/rocm*: $(ls -d /opt/rocm* 2>/dev/null)"
+            echo "cc: $(command -v cc) gcc: $(command -v gcc)"; gcc --version 2>&1 | head -1
+            command -v rocm-smi && rocm-smi --showclocks 2>&1 | head -20
+            command -v amd-smi && amd-smi metric -c 2>&1 | head -30
+          } > "$O/host_toolchain.txt" 2>&1
+          cat "$O/host_toolchain.txt"
+          exit 0
+
+      - name: "Arm A venv: torch>=2.11,<2.12 from repo.amd.com/rocm/whl/gfx1151 (Studio's Strix route)"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$AMD_CI_WORK/bin" sh > "$O/uv_install.log" 2>&1
+          export UV_PYTHON_INSTALL_DIR="$AMD_CI_WORK/uvpy" UV_CACHE_DIR="$AMD_CI_WORK/uvcache"
+          echo "UV_PYTHON_INSTALL_DIR=$UV_PYTHON_INSTALL_DIR" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$UV_CACHE_DIR" >> "$GITHUB_ENV"
+          "$AMD_CI_WORK/bin/uv" venv --seed --python 3.13 "$AMD_CI_WORK/vA" > "$O/A_venv.log" 2>&1
+          P="$AMD_CI_WORK/vA/bin/python"
+          T0=$(date +%s)
+          "$P" -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch>=2.11.0,<2.12.0" > "$O/A_torch_install.log" 2>&1
+          echo "arm A torch rc=$? in $(( $(date +%s) - T0 )) s"
+          "$P" -m pip install ninja >> "$O/A_torch_install.log" 2>&1
+          "$P" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|pytorch|ninja|numpy)" | tee "$O/A_pkgs.txt"
+          echo "PYA=$P" >> "$GITHUB_ENV"
+          "$P" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+          echo "gate rc=$?"
+          exit 0
+
+      - name: "A: env + dense bf16/fp16"
+        timeout-minutes: 10
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"; PR=amd_ci/probes/gemm_lowp/probe.py
+          export TORCHINDUCTOR_CACHE_DIR="$AMD_CI_WORK/ind_A" TRITON_CACHE_DIR="$AMD_CI_WORK/triton_A" TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          for s in env dense; do timeout 540 "$PYA" "$PR" --section $s --out "$O/A_$s.json" > "$O/A_$s.log" 2>&1; echo "$s rc=$?"; done
+          exit 0
+
+      - name: "A: build HIP WMMA kernels (f16, bf16, iu8, iu4, w4a16)"
+        timeout-minutes: 15
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          "$PYA" amd_ci/probes/gemm_lowp/build_wmma.py --python "$PYA" --lib-dir "$AMD_CI_WORK/wmma_libs" --out "$O/build_wmma.json" > "$O/build_wmma.log" 2>&1
+          echo "build rc=$?"
+          "$PYA" -c "import json; d=json.load(open('$O/build_wmma.json')); print('chosen', d.get('chosen')); print({k: v.get('rc') for k, v in d.get('builds', {}).items()}); print({k: v.get('wmma_ops') for k, v in d.get('asm', {}).items()})"
+          cp "$AMD_CI_WORK"/wmma_libs/*.s "$O/" 2>/dev/null
+          exit 0
+
+      - name: "A: HIP WMMA peak + GEMMs"
+        timeout-minutes: 15
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          timeout 840 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section hip --lib-dir "$AMD_CI_WORK/wmma_libs" --out "$O/A_hip.json" > "$O/A_hip.log" 2>&1
+          echo "hip rc=$?"
+          exit 0
+
+      - name: "A: _int_mm + Studio eager W8A8"
+        timeout-minutes: 12
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          timeout 660 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section intmm --out "$O/A_intmm.json" > "$O/A_intmm.log" 2>&1
+          echo "intmm rc=$?"
+          exit 0
+
+      - name: "A: Triton fused W8A8 / bf16 / W4A16"
+        timeout-minutes: 20
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          export TRITON_CACHE_DIR="$AMD_CI_WORK/triton_A"
+          timeout 1140 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section triton --out "$O/A_triton.json" > "$O/A_triton.log" 2>&1
+          echo "triton rc=$?"
+          exit 0
+
+      - name: "A: torch.compile (Studio _w8a8_rows, MLP block)"
+        timeout-minutes: 20
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          export TORCHINDUCTOR_CACHE_DIR="$AMD_CI_WORK/ind_A" TRITON_CACHE_DIR="$AMD_CI_WORK/triton_A"
+          timeout 1140 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section compile --out "$O/A_compile.json" > "$O/A_compile.log" 2>&1
+          echo "compile rc=$?"
+          exit 0
+
+      - name: "A: hipBLASLt TunableOp off vs on"
+        timeout-minutes: 20
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          timeout 1140 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section tunable --work "$RUNNER_TEMP" --out "$O/A_tunable.json" > "$O/A_tunable.log" 2>&1
+          echo "tunable rc=$?"
+          cp "$RUNNER_TEMP"/tunableop_results_*.csv "$O/" 2>/dev/null
+          exit 0
+
+      - name: "A: accuracy proxy (FLUX.2-klein-4B weight rows) + block GEMM share + load_inline"
+        timeout-minutes: 20
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCHINDUCTOR_CACHE_DIR="$AMD_CI_WORK/ind_A"
+          timeout 600 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section accuracy --out "$O/A_accuracy.json" > "$O/A_accuracy.log" 2>&1
+          echo "accuracy rc=$?"
+          timeout 300 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section block --out "$O/A_block.json" > "$O/A_block.log" 2>&1
+          echo "block rc=$?"
+          ROOT=$("$PYA" -c "import json; print((json.load(open('$O/build_wmma.json')).get('chosen') or {}).get('root', ''))")
+          ROCM_HOME="$ROOT" ROCM_PATH="$ROOT" HIP_PATH="$ROOT" PYTORCH_ROCM_ARCH=gfx1151 PATH="$ROOT/bin:$PATH" \
+            timeout 420 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section inline --inline-dir "$AMD_CI_WORK/inline" --out "$O/A_inline.json" > "$O/A_inline.log" 2>&1
+          echo "inline rc=$?"
+          exit 0
+
+      - name: "Arm B venv: torch 2.14.1+rocm7.2 from download.pytorch.org"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"
+          "$AMD_CI_WORK/bin/uv" venv --seed --python 3.13 "$AMD_CI_WORK/vB" > "$O/B_venv.log" 2>&1
+          P="$AMD_CI_WORK/vB/bin/python"
+          T0=$(date +%s)
+          "$P" -m pip install torch==2.14.1+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2 > "$O/B_torch_install.log" 2>&1
+          echo "arm B torch rc=$? in $(( $(date +%s) - T0 )) s"
+          "$P" -m pip list 2>/dev/null | grep -i -E "^(torch|triton|rocm|pytorch|numpy)" | tee "$O/B_pkgs.txt"
+          echo "PYB=$P" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: "B: env, dense, _int_mm, Triton, compile, TunableOp, block"
+        timeout-minutes: 60
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out"; PR=amd_ci/probes/gemm_lowp/probe.py
+          export TORCHINDUCTOR_CACHE_DIR="$AMD_CI_WORK/ind_B" TRITON_CACHE_DIR="$AMD_CI_WORK/triton_B" TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+          for s in env dense intmm compile triton tunable block; do
+            timeout 1080 "$PYB" "$PR" --section $s --work "$RUNNER_TEMP" --out "$O/B_$s.json" > "$O/B_$s.log" 2>&1
+            echo "$s rc=$?"
+          done
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          set +e
+          python3 amd_ci/probes/gemm_lowp/summarize.py --dir "$AMD_CI_WORK/out" --out "$AMD_CI_WORK/out/SUMMARY.md"
+          cat "$AMD_CI_WORK/out/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+          head -c 20000 "$AMD_CI_WORK/out/SUMMARY.md"
+          exit 0
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            [ "$pid" = "$$" ] && continue
+            cwd=$(readlink "$d/cwd" 2>/dev/null)
+            case "$cwd" in
+              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
+            esac
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov5-gemm
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 14
+          if-no-files-found: warn
