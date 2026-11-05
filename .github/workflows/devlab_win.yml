@@ -14,7 +14,7 @@ env:
 jobs:
   windows:
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
-    timeout-minutes: 330
+    timeout-minutes: 360
     steps:
       - name: Host facts and checkouts
         shell: powershell
@@ -35,18 +35,15 @@ jobs:
           $tree = git -C "$W\B" write-tree
           $want = (Get-Content "$W\tree.txt").Trim()
           if ($tree -ne $want) { throw "B tree $tree differs from $want" } else { "B tree matches the branch commit" }
-      - name: Start the model download in the background
-        shell: powershell
-        run: |
-          python -m venv "$env:W\hfv"
-          & "$env:W\hfv\Scripts\pip.exe" -q install "huggingface_hub[hf_xet]>=0.34"
-          $env:HF_HOME = "$env:W\hf"
-          Start-Process -WindowStyle Hidden -FilePath "$env:W\hfv\Scripts\hf.exe" -ArgumentList "download", $env:REPO, "--include", "UD-Q5_K_XL/*" -RedirectStandardOutput "$env:W\out\dl.log" -RedirectStandardError "$env:W\out\dl.err.log"
-          "started $(Get-Date -Format o)" | Set-Content "$env:W\out\dl-start.txt"
       - name: Install Studio from A
         shell: powershell
         run: |
           $env:UNSLOTH_STUDIO_HOME = "$env:W\home"; $env:UNSLOTH_SKIP_AUTOSTART = "1"; $env:HF_HOME = "$env:W\hf"
+          # The runner kills a step's children when the step ends, so the download runs and finishes inside this step.
+          python -m venv "$env:W\hfv"
+          & "$env:W\hfv\Scripts\pip.exe" -q install "huggingface_hub[hf_xet]>=0.34"
+          $dl = Start-Process -PassThru -WindowStyle Hidden -FilePath "$env:W\hfv\Scripts\hf.exe" -ArgumentList "download", $env:REPO, "--include", "UD-Q5_K_XL/*" -RedirectStandardOutput "$env:W\out\dl.log" -RedirectStandardError "$env:W\out\dl.err.log"
+          $dl0 = Get-Date
           Set-Location "$env:W\A"
           $t0 = Get-Date
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 --local *> "$env:W\out\install.log"
@@ -56,19 +53,14 @@ jobs:
           $s = Get-ChildItem -Recurse -Filter llama-server.exe "$env:W\home" -ErrorAction SilentlyContinue | Select-Object -First 1
           $s.FullName | Set-Content "$env:W\server.txt"
           Get-Content "$env:W\home\llama.cpp\BUILD_INFO.txt" -ErrorAction SilentlyContinue | Select-Object -First 8
-          cmd /c "`"$($s.FullName)`" --help 2>nul" | Select-String -Context 0,8 -Pattern "--load-mode|--lazy-mode" | Out-String | Tee-Object -FilePath "$env:W\out\load-mode-help.txt"
+          $dl.WaitForExit()
+          "download rc=$($dl.ExitCode) seconds=$([int]((Get-Date) - $dl0).TotalSeconds)" | Tee-Object -FilePath "$env:W\out\dl-summary.txt"
+          Get-ChildItem -Recurse -Filter "*UD-Q5_K_XL*.gguf" "$env:W\hf" | Measure-Object -Sum Length | ForEach-Object { "Q5 bytes on disk: $($_.Sum)" } | Tee-Object -FilePath "$env:W\out\dl-summary.txt" -Append
           exit $rc
       - name: T2 UD-Q5_K_XL (147 GiB) A then B, then raw matrix
         shell: powershell
         run: |
           $env:HF_HOME = "$env:W\hf"; $env:UNSLOTH_STUDIO_HOME = "$env:W\home"
-          for ($i = 0; $i -lt 1500; $i++) {
-            $hfp = Get-Process hf -ErrorAction SilentlyContinue
-            if (-not $hfp) { break }
-            Start-Sleep 10
-          }
-          "download finished $(Get-Date -Format o)" | Add-Content "$env:W\out\dl-start.txt"
-          Get-Content "$env:W\out\dl.err.log" -Tail 5 -ErrorAction SilentlyContinue
           $py = "$env:W\home\unsloth_studio\Scripts\python.exe"
           foreach ($pair in @(@("A", 8921), @("B", 8922))) {
             $side = $pair[0]; $port = $pair[1]
