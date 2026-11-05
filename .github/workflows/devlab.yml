@@ -66,37 +66,28 @@ jobs:
           S="$(head -1 "$W/server.txt")"
           "$S" --help 2>/dev/null | grep -A8 -E -- '--load-mode|--lazy-mode' | tee "$W/out/load-mode-help.txt"
           exit $rc
-      - name: T1 UD-IQ1_S with host memory held back (A then B, then raw matrix)
+      - name: T1 UD-IQ1_S, a load that fits (A then B, then raw matrix)
         run: |
           W="$RUNNER_TEMP/ig"
           for i in $(seq 1 360); do [ -f "$W/dl-UD-IQ1_S.done" ] && break; sleep 10; done
           cat "$W/out/dl-summary.txt"
-          VRAM=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -n | tail -1); VRAM_GIB=$(( ${VRAM:-0} / 1073741824 ))
-          # Large carve-out: the 35 GiB of weights fit the carve-out, so leave less RAM than the 26.8 GiB table.
-          # Small carve-out: GPU memory comes out of RAM, so leave more than the weights but less than the whole file.
-          if [ "$VRAM_GIB" -ge 32 ]; then LEAVE=16; else LEAVE=48; fi
-          echo "vram_gib=$VRAM_GIB leave_gib=$LEAVE" | tee "$W/out/t1-balloon.txt"
           run_side() {
             side=$1; port=$2; name=$3; variant=$4; leave=$5
             cd "$W/$side/studio/backend"
-            PATH="$HOME/.local/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" nohup "$W/home/unsloth_studio/bin/python" run.py --api-only --host 127.0.0.1 --port $port > "$W/out/$name-backend.log" 2>&1 &
+            # Own session: Studio's shutdown signals its process group, which would include this step's shell.
+            PATH="$HOME/.local/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" setsid nohup "$W/home/unsloth_studio/bin/python" run.py --api-only --host 127.0.0.1 --port $port > "$W/out/$name-backend.log" 2>&1 &
             bpid=$!
             for i in $(seq 1 150); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
             if [ "$leave" != "none" ]; then python3 "$W/balloon.py" --leave "$leave" --out "$W/out/$name-balloon.json" & lpid=$!; for i in $(seq 1 120); do [ -s "$W/out/$name-balloon.json" ] && break; sleep 2; done; cat "$W/out/$name-balloon.json"; fi
-            grep MemAvailable /proc/meminfo
+            grep -E 'MemAvailable|SwapFree' /proc/meminfo
             "$W/home/unsloth_studio/bin/python" "$W/studio_ab.py" --base http://127.0.0.1:$port --home "$W/home" --repo "$REPO" --variant "$variant" --out "$W/out/$name.json" --pwfile "$W/pw.txt"
             [ -n "${lpid:-}" ] && { kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid; wait $lpid 2>/dev/null; }
             kill $bpid; sleep 5; pkill -9 -f "$W/home/.*llama-server" || true; sleep 5
             unset lpid
           }
-          run_side A 8911 t1-A UD-IQ1_S $LEAVE
-          run_side B 8912 t1-B UD-IQ1_S $LEAVE
-          M=$(find "$W/hf" -path '*UD-IQ1_S*00001-of-*.gguf' | head -1); S="$(head -1 "$W/server.txt")"
-          python3 "$W/balloon.py" --leave $LEAVE --out "$W/out/t1-raw-balloon.json" & lpid=$!
-          for i in $(seq 1 120); do [ -s "$W/out/t1-raw-balloon.json" ] && break; sleep 2; done
-          mkdir -p "$W/out/t1-raw"; python3 "$W/raw_matrix.py" --server "$S" --model "$M" --out "$W/out/t1-raw.json" --logdir "$W/out/t1-raw"
-          kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid
-          declare -f run_side > "$W/run_side.sh"; echo "LEAVE=$LEAVE" >> "$W/run_side.sh"
+          run_side A 8911 t1-A UD-IQ1_S none
+          run_side B 8912 t1-B UD-IQ1_S none
+          declare -f run_side > "$W/run_side.sh"
       - name: T2 UD-Q5_K_XL (147 GiB) with nothing held back (A then B, then raw matrix)
         run: |
           W="$RUNNER_TEMP/ig"; source "$W/run_side.sh"

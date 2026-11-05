@@ -18,6 +18,11 @@ def avail_gib():
             return int(line.split()[1]) / 1024**2
 
 
+def swap_used_gib():
+    vals = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith(("SwapTotal", "SwapFree"))}
+    return (vals.get("SwapTotal", 0) - vals.get("SwapFree", 0)) / 1024**2
+
+
 results = {}
 for name, extra in CASES.items():
     log = os.path.join(a.logdir, f"raw-{name}.log")
@@ -25,11 +30,11 @@ for name, extra in CASES.items():
            "--fit", "on", "--no-mmproj", "-lv", "3", *extra]
     t0 = time.time(); r = {"cmd": " ".join(cmd[1:])}
     p = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
-    min_avail = avail_gib(); hwm = 0; ok = False
+    min_avail = avail_gib(); hwm = 0; ok = False; swap0 = swap_used_gib(); swap_peak = swap0
     while time.time() - t0 < 1500:
         if p.poll() is not None:
             break
-        min_avail = min(min_avail, avail_gib())
+        min_avail = min(min_avail, avail_gib()); swap_peak = max(swap_peak, swap_used_gib())
         try:
             hwm = max(hwm, int(re.search(r"VmHWM:\s+(\d+)", open(f"/proc/{p.pid}/status").read()).group(1)) / 1024**2)
         except Exception:
@@ -58,7 +63,7 @@ for name, extra in CASES.items():
                 hwm = max(hwm, int(re.search(r"VmHWM:\s+(\d+)", open(f"/proc/{p.pid}/status").read()).group(1)) / 1024**2)
             except Exception:
                 pass
-    r.update(min_avail_gib=round(min_avail, 2), peak_rss_gib=round(hwm, 2))
+    r.update(min_avail_gib=round(min_avail, 2), peak_rss_gib=round(hwm, 2), swap_used_start_gib=round(swap0, 2), swap_used_peak_gib=round(swap_peak, 2))
     try:
         os.killpg(p.pid, signal.SIGKILL)
     except Exception:
