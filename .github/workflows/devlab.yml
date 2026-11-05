@@ -1,0 +1,78 @@
+name: AMD DevLab CI
+
+on:
+  push:
+    branches: [amd-devlab-ci]
+
+permissions:
+  contents: read
+
+env:
+  SHA: 0ab3f0773de4731dbc6e8efacd71ef9b9053e8c7
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - name: Hardware
+        run: |
+          uname -a; lscpu | head -15; free -h
+          ls -l /dev/accel* || true
+          ulimit -l
+          ldd --version | head -1
+      - name: Setup
+        run: |
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/tmp
+          git init -q "$W/repo" && cd "$W/repo"
+          git fetch -q --depth 1 https://github.com/unslothai/unsloth "$SHA" && git checkout -q FETCH_HEAD
+          python3 -m venv "$W/venv" && "$W/venv/bin/pip" install -q httpx structlog
+      - name: Enable NPU with main's pins (2026.43.3 / v1.0.10)
+        run: |
+          W="$RUNNER_TEMP/w"; export TMPDIR="$W/tmp"
+          "$W/venv/bin/python" -u ci/npu_smoke.py "$W/repo" "$W/npu" enable
+      - name: Update pins, upgrade on first use, download, load, chat
+        run: |
+          W="$RUNNER_TEMP/w"; export TMPDIR="$W/tmp"
+          cp ci/new_pins.json "$W/repo/studio/lemonade_prebuilt_pins.json"
+          "$W/venv/bin/python" -u ci/npu_smoke.py "$W/repo" "$W/npu" chat
+      - name: Lemonade logs
+        if: always()
+        run: find "$RUNNER_TEMP/w/npu" -maxdepth 4 -name '*.log' -exec tail -n 60 {} + 2>/dev/null || true
+
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - name: Setup
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = "$env:RUNNER_TEMP\w"; New-Item -ItemType Directory -Force "$W\tmp" | Out-Null
+          git init -q "$W\repo"
+          git -C "$W\repo" fetch -q --depth 1 https://github.com/unslothai/unsloth $env:SHA
+          git -C "$W\repo" checkout -q FETCH_HEAD
+          python -m venv "$W\venv"
+          & "$W\venv\Scripts\python.exe" -m pip install -q httpx structlog
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Enable NPU with main's pins (2026.43.3 / v1.0.10)
+        run: |
+          $W = "$env:RUNNER_TEMP\w"; $env:TMP = "$W\tmp"; $env:TEMP = "$W\tmp"
+          & "$W\venv\Scripts\python.exe" -u ci\npu_smoke.py "$W\repo" "$W\npu" enable
+          exit $LASTEXITCODE
+      - name: Update pins, upgrade on first use, download, load, chat
+        run: |
+          $W = "$env:RUNNER_TEMP\w"; $env:TMP = "$W\tmp"; $env:TEMP = "$W\tmp"
+          Copy-Item ci\new_pins.json "$W\repo\studio\lemonade_prebuilt_pins.json" -Force
+          & "$W\venv\Scripts\python.exe" -u ci\npu_smoke.py "$W\repo" "$W\npu" chat
+          exit $LASTEXITCODE
