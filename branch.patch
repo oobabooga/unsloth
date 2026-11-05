@@ -1,0 +1,623 @@
+diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
+index 865e8783ad..3805005d47 100644
+--- a/studio/backend/core/inference/llama_cpp.py
++++ b/studio/backend/core/inference/llama_cpp.py
+@@ -130,6 +130,7 @@ from core.inference.llama_server_args import (
+     extra_args_select_load_mode,
+     fit_is_enabled_in,
+     force_pageable_load,
++    load_mode_left_auto,
+     memory_env_selects_load_mode,
+     memory_state_satisfies_settings,
+     fit_is_effectively_on,
+@@ -7779,6 +7780,14 @@ _PAGEABLE_OVERRIDE_NOTE = (
+     "RAM up front and cannot complete at this size, so Unsloth loaded it with memory "
+     "mapping instead."
+ )
++# The same override where nobody chose the mode: llama.cpp's auto is none on an iGPU.
++_PAGEABLE_AUTO_OVERRIDE_NOTE = (
++    " On this integrated GPU llama.cpp loads without memory mapping by default, which reads "
++    "every byte into memory up front and cannot complete at this size, so Unsloth loaded it "
++    "with memory mapping instead."
++)
++# Appended when the override also reads the lookup tables lazily.
++_PAGEABLE_LAZY_TABLE_NOTE = " Its lookup tables are read from disk as needed."
+ # The override is reported, not undone: the running server is already memory-mapped.
+ _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE = (
+     "This model was set to load without memory mapping, and with its vision projector "
+@@ -7787,6 +7796,13 @@ _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE = (
+     "which the weights alone would have fit. The running server keeps the memory "
+     "mapping it started with; load the model again to run it as you asked."
+ )
++_PAGEABLE_AUTO_OVERRIDE_TEXT_ONLY_NOTICE = (
++    "With its vision projector in system RAM this model was too large to load without "
++    "memory mapping, llama.cpp's default on this integrated GPU, so Unsloth loaded it with "
++    "memory mapping instead. The projector then failed to start and this session is "
++    "text-only, which the weights alone would have fit. The running server keeps the "
++    "memory mapping it started with; load the model again to load it without."
++)
+ _CGROUP_ROOT = "/sys/fs/cgroup"
+ _PROC_SELF_CGROUP = "/proc/self/cgroup"
+ 
+@@ -10366,6 +10382,7 @@ class LlamaCppBackend:
+                 "supports_video_timestamp_interval": False,
+                 "supports_video_ffmpeg_dir": None,
+                 "supports_load_mode": False,
++                "supports_load_mode_auto": False,
+                 "supports_moe_cache": False,
+                 "supports_moe_cache_auto": False,
+                 "supports_lazy_mode": False,
+@@ -10437,6 +10454,7 @@ class LlamaCppBackend:
+         supports_video_timestamp_interval = False
+         supports_video_ffmpeg_dir = None
+         supports_load_mode = False
++        supports_load_mode_auto = False
+         supports_moe_cache = False
+         supports_moe_cache_auto = False
+         supports_lazy_mode = False
+@@ -10651,6 +10669,14 @@ class LlamaCppBackend:
+             # --load-mode supersedes --mlock / --no-mmap, which are deprecated.
+             # Pre-initialised above: a failed probe must fall back, not raise.
+             supports_load_mode = _is_real("--load-mode")
++            # "auto: mmap, unless a device does not support it": without it, mmap is the default everywhere.
++            supports_load_mode_auto = bool(
++                supports_load_mode
++                and re.search(
++                    r"(?<![a-z0-9_+-])auto(?![a-z0-9_+-])",
++                    (blocks.get("--load-mode") or "").lower(),
++                )
++            )
+             # "auto" is a fork addition; upstream builds exit on it, so fail closed.
+             supports_moe_cache = bool(probe_ok and _is_real("--moe-cache-mib"))
+             supports_moe_cache_auto = bool(
+@@ -10764,6 +10790,7 @@ class LlamaCppBackend:
+             "supports_video_timestamp_interval": supports_video_timestamp_interval,
+             "supports_video_ffmpeg_dir": supports_video_ffmpeg_dir,
+             "supports_load_mode": supports_load_mode,
++            "supports_load_mode_auto": supports_load_mode_auto,
+             "supports_moe_cache": supports_moe_cache,
+             "supports_moe_cache_auto": supports_moe_cache_auto,
+             "supports_lazy_mode": supports_lazy_mode,
+@@ -15671,12 +15698,69 @@ class LlamaCppBackend:
+             "yes",
+         )
+ 
++    def _auto_load_mode_unmapped(
++        self,
++        server_caps: Optional[Mapping[str, object]],
++        *,
++        child_has_no_gpu: bool = False,
++        **devices,
++    ) -> bool:
++        """Whether llama.cpp resolves ``--load-mode auto`` to ``none`` for this child: the build
++        has ``auto`` and a model device lacks ggml's ``mmap_support``. The same capability turns
++        ``--lazy-mode auto`` off (src/llama-model.cpp, ``load_tensors``), so
++        ``_lazy_auto_resolves_off`` answers both; ``devices`` are its keyword arguments."""
++        if child_has_no_gpu or not (server_caps or {}).get("supports_load_mode_auto"):
++            return False
++        try:
++            return bool(self._lazy_auto_resolves_off(**devices))
++        except Exception as e:  # noqa: BLE001 -- unknown devices: keep the launch as is
++            logger.debug("Could not tell whether llama.cpp maps this load: %s", e)
++            return False
++
++    def _paged_lookup_table_flags(
++        self,
++        model_path: Optional[str],
++        caps: Optional[Mapping[str, object]],
++        argv: Iterable[str],
++        env: Optional[Mapping[str, str]] = None,
++    ) -> list[str]:
++        """``[<lazy flag>, "on"]`` when an oversized load is paged on a device where llama.cpp
++        turns ``--lazy-mode auto`` off, so the tables auto streams on other devices are read from
++        disk again (mmap prefetch skips lazy ranges, llama-mmap.cpp). Empty when env or argv
++        chose a lazy mode, or nothing would stream."""
++        caps = caps or {}
++        if not model_path or not caps.get("supports_lazy_mode"):
++            return []
++        flag = str(caps.get("lazy_mode_flag") or "--lazy-mode")
++        source_env = os.environ if env is None else env
++        flags, env_name = _LAZY_MODE_SPELLINGS.get(flag, (frozenset({flag}), ""))
++        argv = list(argv or ())
++        if (env_name and str(source_env.get(env_name) or "").strip()) or _extra_args_set_any_flag(
++            argv, flags
++        ):
++            return []
++        if self._lazy_read_host_bytes(model_path, caps = caps, extra_args = argv, env = source_env) <= 0:
++            return []
++        return [flag, "on"]
++
+     def _page_an_oversized_unmapped_load(
+-        self, cmd: Iterable[str], env: Optional[dict], oversized
++        self,
++        cmd: Iterable[str],
++        env: Optional[dict],
++        oversized,
++        *,
++        auto_unmapped: bool = False,
++        lazy_table_flags: Optional[Callable[[list], list]] = None,
+     ) -> tuple[list, Optional[str]]:
+-        """Returns (cmd, note); rewrites an oversized non-pageable load to mmap so it finishes; judges effective env state, not argv; never blocks."""
++        """Returns (cmd, note); rewrites an oversized non-pageable load to mmap so it finishes; judges effective env state, not argv; never blocks.
++
++        ``auto_unmapped`` (``_auto_load_mode_unmapped``): llama.cpp loads this child unmapped by
++        default, so a mode nothing selected is rewritten too, and ``lazy_table_flags(argv)``
++        restores the lookup-table streaming that device turned off."""
+         original = cmd if isinstance(cmd, list) else list(cmd or ())
+-        _mlock_now, _reserves_ram_now = resolve_effective_memory_state(original, env)
++        _mlock_now, _reserves_ram_now = resolve_effective_memory_state(
++            original, env, auto_unmapped = auto_unmapped
++        )
+         if not _reserves_ram_now:
+             return original, None
+         try:
+@@ -15686,15 +15770,25 @@ class LlamaCppBackend:
+             # Advisory pricing: an unreadable host or GGUF leaves the launch alone.
+             logger.debug("Could not price the load for a pageable override.", exc_info = True)
+             return original, None
+-        paged, overridden = force_pageable_load(original, env)
++        from_auto = auto_unmapped and load_mode_left_auto(original, env)
++        paged, overridden = force_pageable_load(original, env, auto_unmapped = auto_unmapped)
+         if not overridden:
+             return original, None
++        lazy: list = []
++        if auto_unmapped and lazy_table_flags is not None:
++            try:
++                lazy = list(lazy_table_flags(paged) or [])
++            except Exception:  # noqa: BLE001 -- the mapping alone still lets the load finish
++                logger.debug("Lookup tables: could not price lazy reads.", exc_info = True)
++        paged = [*paged, *lazy]
+         logger.warning(
+             "Overriding the unmapped load mode (%s) for an oversized model: it would "
+-            "allocate the whole model in host RAM instead of paging it in.",
++            "allocate the whole model in host RAM instead of paging it in.%s",
+             ", ".join(overridden),
++            f" Lookup tables: {' '.join(lazy)}." if lazy else "",
+         )
+-        return paged, _PAGEABLE_OVERRIDE_NOTE
++        note = _PAGEABLE_AUTO_OVERRIDE_NOTE if from_auto else _PAGEABLE_OVERRIDE_NOTE
++        return paged, note + (_PAGEABLE_LAZY_TABLE_NOTE if lazy else "")
+ 
+     @property
+     def last_load_warning(self) -> Optional[str]:
+@@ -15750,7 +15844,11 @@ class LlamaCppBackend:
+             # The discrete guard never charged the projector, so its verdict stands.
+             self._last_load_warning = host_msg + suffix
+         elif suffix.strip():
+-            self._last_load_warning = _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE
++            self._last_load_warning = (
++                _PAGEABLE_AUTO_OVERRIDE_TEXT_ONLY_NOTICE
++                if _PAGEABLE_AUTO_OVERRIDE_NOTE in suffix
++                else _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE
++            )
+         else:
+             self._last_load_warning = None
+         logger.info(
+@@ -30554,8 +30652,29 @@ class LlamaCppBackend:
+                         )
+                     )
+ 
++                # On an iGPU llama.cpp's auto is none, so an oversized load nobody pinned to a
++                # mode would still read every byte into memory; same devices as the guard above.
++                _launch_auto_unmapped = self._auto_load_mode_unmapped(
++                    server_caps,
++                    child_has_no_gpu = _child_has_no_gpu,
++                    gpu_indices = [row[0] for row in _reachable_gpus] or None,
++                    detected_gpus = _reachable_gpus,
++                    shared_gpu_ids = _shared_gpu_ids,
++                    is_vulkan_backend = is_vulkan_backend,
++                    probe_integrated_cuda = False,
++                    extra_args = cmd,
++                    env = env,
++                    device_list = False,
++                    integrated_gpu_ids = _vulkan_igpu_ids,
++                )
+                 cmd, _pageable_note = self._page_an_oversized_unmapped_load(
+-                    cmd, env, _launch_is_oversized
++                    cmd,
++                    env,
++                    _launch_is_oversized,
++                    auto_unmapped = _launch_auto_unmapped,
++                    lazy_table_flags = lambda argv: self._paged_lookup_table_flags(
++                        model_path, server_caps, argv, env
++                    ),
+                 )
+                 if _pageable_note:
+                     # Record the argv that actually launches, and snapshot it too, since arch-crash retry restores it.
+@@ -32111,7 +32230,24 @@ class LlamaCppBackend:
+                             )
+ 
+                         cmd, _retry_pageable_note = self._page_an_oversized_unmapped_load(
+-                            cmd, env, _retry_is_oversized
++                            cmd,
++                            env,
++                            _retry_is_oversized,
++                            auto_unmapped = self._auto_load_mode_unmapped(
++                                server_caps,
++                                gpu_indices = [row[0] for row in _retry_rows] or None,
++                                detected_gpus = _retry_rows,
++                                shared_gpu_ids = _shared_gpu_ids,
++                                is_vulkan_backend = is_vulkan_backend,
++                                probe_integrated_cuda = False,
++                                extra_args = cmd,
++                                env = env,
++                                device_list = False,
++                                integrated_gpu_ids = _vulkan_igpu_ids,
++                            ),
++                            lazy_table_flags = lambda argv: self._paged_lookup_table_flags(
++                                model_path, server_caps, argv, env
++                            ),
+                         )
+                         if _retry_pageable_note:
+                             # Onto whichever notice first-notice-wins kept above; a
+diff --git a/studio/backend/core/inference/llama_server_args.py b/studio/backend/core/inference/llama_server_args.py
+index 6708b4d641..ea724272c1 100644
+--- a/studio/backend/core/inference/llama_server_args.py
++++ b/studio/backend/core/inference/llama_server_args.py
+@@ -1716,10 +1716,18 @@ def _pageable_env_value(
+ 
+ 
+ def force_pageable_load(
+-    argv: Optional[Iterable[str]], env: Optional[dict] = None
++    argv: Optional[Iterable[str]],
++    env: Optional[dict] = None,
++    *,
++    auto_unmapped: bool = False,
+ ) -> tuple[list[str], list[str]]:
+-    """Rewrites none/mlock to pageable: effective locks become mmap+mlock, shadowed locks stay dropped; decided by pre-rewrite state, not tokens."""
++    """Rewrites none/mlock to pageable: effective locks become mmap+mlock, shadowed locks stay dropped; decided by pre-rewrite state, not tokens.
++
++    ``auto_unmapped``: the child's devices make llama.cpp resolve ``auto`` to ``none``, so a mode
++    nothing selected is rewritten too, by appending ``--load-mode mmap`` (last wins over env)."""
+     tokens = [str(a) for a in (argv or [])]
++    if auto_unmapped and load_mode_left_auto(tokens, env):
++        return [*tokens, "--load-mode", "mmap"], ["auto, which is none on this GPU"]
+     # Only RAM-reserving launches are rewritten; pageable dio or mmap keeps every token, mlock included.
+     _mlock_now, _reserves_now = resolve_effective_memory_state(tokens, env)
+     drop_shadowed_mlock = _reserves_now and not _mlock_now
+@@ -1793,10 +1801,15 @@ _LOAD_MODE_RESERVING_VALUES = frozenset({"none", "mlock"})
+ 
+ 
+ def resolve_effective_memory_state(
+-    argv: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
++    argv: Optional[Iterable[str]],
++    env: Optional[Mapping[str, str]] = None,
++    *,
++    auto_unmapped: bool = False,
+ ) -> tuple[bool, bool]:
+     """What the child runs with: env supplies defaults, argv overrides last-wins, as llama.cpp does."""
+-    mlock, reserves_ram, _direct_io = resolve_effective_load_state(argv, env)
++    mlock, reserves_ram, _direct_io = resolve_effective_load_state(
++        argv, env, auto_unmapped = auto_unmapped
++    )
+     return mlock, reserves_ram
+ 
+ 
+@@ -1808,37 +1821,65 @@ def resolve_effective_direct_io(
+ 
+ 
+ def resolve_effective_load_state(
+-    argv: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
++    argv: Optional[Iterable[str]],
++    env: Optional[Mapping[str, str]] = None,
++    *,
++    auto_unmapped: bool = False,
+ ) -> tuple[bool, bool, bool]:
+     """``(mlock, reserves_ram, direct_io)``. Every branch that resolves the mode
+-    assigns all three, so the DirectIO bit cannot fall out of step with the pair."""
++    assigns all three, so the DirectIO bit cannot fall out of step with the pair.
++
++    ``auto_unmapped``: a device of this child lacks ggml's ``mmap_support`` (a CUDA, HIP or
++    Vulkan iGPU), where llama.cpp resolves ``--load-mode auto`` to ``none``
++    (src/llama-model.cpp, ``load_tensors``). Without it ``auto`` reads as mmap."""
++    mlock, reserves_ram, direct_io, auto = _resolve_load_state(argv, env)
++    if auto and auto_unmapped:
++        return False, True, False
++    return mlock, reserves_ram, direct_io
++
++
++def load_mode_left_auto(
++    argv: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
++) -> bool:
++    """Whether nothing in env or argv selects a load mode other than ``auto``, so llama.cpp
++    picks one per device. Any legacy flag counts as a choice: only builds without ``auto``
++    accept them."""
++    return _resolve_load_state(argv, env)[3]
++
++
++def _resolve_load_state(
++    argv: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
++) -> tuple[bool, bool, bool, bool]:
++    """``(mlock, reserves_ram, direct_io, auto)``, last selector wins, env before argv."""
+     env = env or {}
+     mlock = False
+     reserves_ram = False
+     direct_io = False
++    auto = True
+     # Env vars run the flag's handler in registration order, so a later one overwrites the mode.
+     if str(env.get("LLAMA_ARG_MLOCK", "")).strip().lower() in _ENV_TRUE_VALUES:
+         # Either mode it can mean maps or buffers the weights; neither streams.
+-        mlock, direct_io = True, False
++        mlock, direct_io, auto = True, False, False
+     # LLAMA_ARG_NO_<NAME> present forces false whatever the value, and beats the affirmative var.
+     _mmap_env = "0" if "LLAMA_ARG_NO_MMAP" in env else str(env.get("LLAMA_ARG_MMAP", ""))
+     _mmap_env = _mmap_env.strip().lower()
+     if _mmap_env in _ENV_TRUE_VALUES:
+-        mlock, reserves_ram, direct_io = False, False, False
++        mlock, reserves_ram, direct_io, auto = False, False, False, False
+     elif _mmap_env in _ENV_FALSE_VALUES:
+-        mlock, reserves_ram, direct_io = False, True, False
++        mlock, reserves_ram, direct_io, auto = False, True, False, False
+     # LLAMA_ARG_DIO likewise: on selects DirectIO, off selects "none".
+     _dio_env = "0" if "LLAMA_ARG_NO_DIO" in env else str(env.get("LLAMA_ARG_DIO", ""))
+     _dio_env = _dio_env.strip().lower()
+     if _dio_env in _ENV_TRUE_VALUES:
+-        mlock, reserves_ram, direct_io = False, False, True
++        mlock, reserves_ram, direct_io, auto = False, False, True, False
+     elif _dio_env in _ENV_FALSE_VALUES:
+-        mlock, reserves_ram, direct_io = False, True, False
++        mlock, reserves_ram, direct_io, auto = False, True, False, False
+     _mode_env = str(env.get("LLAMA_ARG_LOAD_MODE", "")).strip().lower()
+     if _mode_env:
+         mlock = _mode_env in _LOAD_MODE_MLOCK_VALUES
+         reserves_ram = _mode_env in _LOAD_MODE_RESERVING_VALUES
+         direct_io = _mode_env == "dio"
++        auto = _mode_env == "auto"
+ 
+     tokens = [str(a) for a in (argv or [])]
+     i, n = 0, len(tokens)
+@@ -1850,30 +1891,34 @@ def resolve_effective_load_state(
+             continue
+         if flag in _MLOCK_FLAGS:
+             # Only the mlock bit matters: mlock and mmap+mlock both replace an earlier DirectIO mode.
+-            mlock, direct_io = True, False
++            mlock, direct_io, auto = True, False, False
+             i += 1
+         elif flag in _NO_MMAP_FLAGS:
+             # --no-mmap resets the whole mode, clearing an earlier --mlock.
+             mlock = False
+             reserves_ram = True
+             direct_io = False
++            auto = False
+             i += 1
+         elif flag in _DIO_ON_FLAGS:
+             # Deprecated load-mode selector resets the mode, dropping mlock; DirectIO holds no full host copy.
+             mlock = False
+             reserves_ram = False
+             direct_io = True
++            auto = False
+             i += 1
+         elif flag in _DIO_OFF_FLAGS:
+             # Not plain mmap: upstream maps these to mode `none` (full host buffer).
+             mlock = False
+             reserves_ram = True
+             direct_io = False
++            auto = False
+             i += 1
+         elif flag == "--mmap":
+             mlock = False
+             reserves_ram = False
+             direct_io = False
++            auto = False
+             i += 1
+         elif flag in _LOAD_MODE_FLAGS:
+             if "=" in tok:
+@@ -1887,10 +1932,11 @@ def resolve_effective_load_state(
+                 mlock = value in _LOAD_MODE_MLOCK_VALUES
+                 reserves_ram = value in _LOAD_MODE_RESERVING_VALUES
+                 direct_io = value == "dio"
++                auto = value == "auto"
+             i += step
+         else:
+             i += 1
+-    return mlock, reserves_ram, direct_io
++    return mlock, reserves_ram, direct_io, auto
+ 
+ 
+ def memory_state_satisfies_settings(
+diff --git a/studio/backend/tests/test_llama_cpp_placement.py b/studio/backend/tests/test_llama_cpp_placement.py
+index 9700da8541..40a832cfc4 100644
+--- a/studio/backend/tests/test_llama_cpp_placement.py
++++ b/studio/backend/tests/test_llama_cpp_placement.py
+@@ -2679,6 +2679,121 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
+     assert backend.last_load_warning is None
+ 
+ 
++_GiB = 1024**3
++# The DeepSeek-V4.1-Flash UD-IQ1_S Engram table: 256 x 768022850 IQ4_NL rows.
++_DEEPSEEK41_TABLE = 110_595_290_400
++
++
++def _igpu_backend(
++    tmp_path,
++    monkeypatch,
++    *,
++    avail_mib,
++    gguf_gb = 216.97,
++    table = _DEEPSEEK41_TABLE,
++    igpu = True,
++    load_mode_auto = True,
++):
++    """An integrated CUDA SoC (RTX Spark N1X, DGX Spark): llama.cpp resolves both auto modes off,
++    and the APU preflight prices the pool against system RAM."""
++    backend, gguf = _apu_backend(tmp_path, gguf_gb = gguf_gb, avail_mib = avail_mib, monkeypatch = monkeypatch)
++    backend._lazy_auto_resolves_off = lambda **_kw: igpu
++    backend._gguf_tensor_scan = lambda _path: (
++        "deepseek41",
++        {"per_layer_token_embd.weight": table, "blk.0.ffn_up_exps.weight": int(gguf_gb * _GiB) - table},
++        0,
++    )
++    caps = dict(LlamaCppBackend.probe_server_capabilities.__func__(LlamaCppBackend, None))
++    caps.update(
++        supports_load_mode = True,
++        supports_load_mode_auto = load_mode_auto,
++        supports_lazy_mode = True,
++        lazy_mode_flag = "--lazy-mode",
++    )
++    monkeypatch.setattr(LlamaCppBackend, "probe_server_capabilities", lambda *a, **k: caps)
++    return backend, gguf
++
++
++def _modes(cmd, flag):
++    return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == flag and i + 1 < len(cmd)]
++
++
++def test_an_oversized_igpu_load_left_on_auto_is_mapped_and_streams_its_table(tmp_path, monkeypatch):
++    """DC-060: on an iGPU llama.cpp's auto is none, so a 217 GB model nobody pinned to a mode read
++    its whole 103 GiB Engram table into one host buffer. The override must apply to auto there."""
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++
++    cmd = _launch(backend, gguf)["cmd"]
++
++    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
++    assert _modes(cmd, "--lazy-mode") == ["on"], cmd
++    warning = backend.last_load_warning or ""
++    assert "On this integrated GPU llama.cpp loads without memory mapping by default" in warning
++    assert "lookup tables are read from disk as needed" in warning
++    assert "was set to load without memory mapping" not in warning
++    assert backend._memory_state == (False, False)
++
++
++def test_an_igpu_load_that_fits_keeps_llama_cpps_default(tmp_path, monkeypatch):
++    """The control: room to run, so nothing is overridden; none is the faster load on an iGPU."""
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 400 * 1024)
++
++    cmd = _launch(backend, gguf)["cmd"]
++
++    assert "--load-mode" not in cmd and "--lazy-mode" not in cmd, cmd
++    assert backend.last_load_warning is None
++
++
++@pytest.mark.parametrize(
++    "igpu, load_mode_auto",
++    [(False, True), (True, False)],
++    ids = ["discrete-gpu-auto-is-mmap", "build-without-auto"],
++)
++def test_auto_is_left_alone_where_it_already_maps(tmp_path, monkeypatch, igpu, load_mode_auto):
++    """A device with mmap support, or a build whose default is mmap everywhere: auto already
++    pages, so the oversized load launches as before."""
++    backend, gguf = _igpu_backend(
++        tmp_path, monkeypatch, avail_mib = 17 * 1024, igpu = igpu, load_mode_auto = load_mode_auto
++    )
++
++    cmd = _launch(backend, gguf)["cmd"]
++
++    assert "--load-mode" not in cmd and "--lazy-mode" not in cmd, cmd
++    assert "memory mapping instead" not in (backend.last_load_warning or "")
++
++
++def test_a_user_lazy_mode_survives_the_igpu_override(tmp_path, monkeypatch):
++    """The mapping is owed, the lazy mode is the user's: only an unset one is restored."""
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++
++    cmd = _launch(backend, gguf, extra_args = ["--lazy-mode", "off"])["cmd"]
++
++    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
++    assert _modes(cmd, "--lazy-mode") == ["off"], cmd
++    assert "lookup tables are read from disk" not in (backend.last_load_warning or "")
++
++
++def test_an_igpu_model_without_a_table_is_only_mapped(tmp_path, monkeypatch):
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024, table = 0)
++
++    cmd = _launch(backend, gguf)["cmd"]
++
++    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
++    assert "--lazy-mode" not in cmd, cmd
++
++
++def test_an_explicit_none_on_an_igpu_also_streams_the_table(tmp_path, monkeypatch):
++    """The existing rewrite of a user's none keeps its wording; on an iGPU it gains the lazy read,
++    or mmap prefetch would still read the whole table."""
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++
++    cmd = _launch(backend, gguf, extra_args = ["--load-mode", "none"])["cmd"]
++
++    assert not _unmapped_tokens(cmd), cmd
++    assert _modes(cmd, "--lazy-mode") == ["on"], cmd
++    assert "was set to load without memory mapping" in (backend.last_load_warning or "")
++
++
+ def _unmapped_tokens(cmd):
+     """The tokens in ``cmd`` that select a mode llama.cpp does not mmap."""
+     out = []
+@@ -5779,7 +5894,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
+     assert src.index("_vulkan_igpu_ids = (") < src.index(
+         "_gpu_mem = self._vulkan_auto_gpu_memory(_gpu_mem)"
+     )
+-    assert src.count("integrated_gpu_ids = _vulkan_igpu_ids") == 5
++    assert src.count("integrated_gpu_ids = _vulkan_igpu_ids") == 7
+ 
+ 
+ def test_the_oversized_readings_share_their_preflights_ram_snapshot():
+diff --git a/studio/backend/tests/test_llama_server_args.py b/studio/backend/tests/test_llama_server_args.py
+index a3bf4865bc..267e3800b6 100644
+--- a/studio/backend/tests/test_llama_server_args.py
++++ b/studio/backend/tests/test_llama_server_args.py
+@@ -1568,3 +1568,66 @@ def test_translate_ngram_mod_does_not_consume_a_following_flag(chain_with_mtp):
+     out = translate_ngram_mod_args(args, "legacy", chain_with_mtp = chain_with_mtp)
+     assert out[-2:] == ["--top-k", "/restricted/model.gguf"]
+     validate_extra_args(out)
++
++
++# On an iGPU llama.cpp resolves --load-mode auto to none (ggml mmap_support is false there).
++
++
++@pytest.mark.parametrize(
++    "argv, env, auto",
++    [
++        ([], {}, True),
++        (["--load-mode", "auto"], {}, True),
++        (["--load-mode=auto"], {}, True),
++        (["--load-mode", "none", "--load-mode", "auto"], {}, True),
++        ([], {"LLAMA_ARG_LOAD_MODE": "auto"}, True),
++        (["--load-mode", "auto"], {"LLAMA_ARG_LOAD_MODE": "mmap"}, True),
++        (["--load-mode", "mmap"], {}, False),
++        (["--load-mode", "none"], {}, False),
++        ([], {"LLAMA_ARG_LOAD_MODE": "mmap"}, False),
++        (["--mlock"], {}, False),
++        (["--mmap"], {}, False),
++        (["--no-mmap"], {}, False),
++        ([], {"LLAMA_ARG_NO_MMAP": "0"}, False),
++        ([], {"LLAMA_ARG_DIO": "1"}, False),
++        (["--load-mode"], {}, True),
++    ],
++)
++def test_load_mode_left_auto(argv, env, auto):
++    assert _lsa.load_mode_left_auto(argv, env) is auto
++
++
++def test_auto_reserves_ram_only_where_llama_cpp_resolves_it_to_none():
++    assert _lsa.resolve_effective_load_state([], {}) == (False, False, False)
++    assert _lsa.resolve_effective_load_state([], {}, auto_unmapped = True) == (False, True, False)
++    assert _lsa.resolve_effective_memory_state(["--load-mode", "auto"], {}, auto_unmapped = True) == (
++        False,
++        True,
++    )
++    # A chosen mode is what it says, whatever the device.
++    assert _lsa.resolve_effective_load_state(["--load-mode", "mmap"], {}, auto_unmapped = True) == (
++        False,
++        False,
++        False,
++    )
++    assert _lsa.resolve_effective_load_state(["--load-mode", "dio"], {}, auto_unmapped = True) == (
++        False,
++        False,
++        True,
++    )
++
++
++def test_the_pageable_rewrite_maps_an_unselected_mode_on_an_igpu():
++    out, overridden = _lsa.force_pageable_load(["--fit", "on"], {}, auto_unmapped = True)
++    assert out == ["--fit", "on", "--load-mode", "mmap"] and overridden
++    assert _lsa.resolve_effective_memory_state(out, {}, auto_unmapped = True) == (False, False)
++    # An inherited LLAMA_ARG_LOAD_MODE=auto loses to the appended argv.
++    env = {"LLAMA_ARG_LOAD_MODE": "auto"}
++    out, _ = _lsa.force_pageable_load([], env, auto_unmapped = True)
++    assert _lsa.resolve_effective_memory_state(out, env, auto_unmapped = True) == (False, False)
++    # Off an iGPU auto already maps; a chosen mmap needs nothing either way.
++    assert _lsa.force_pageable_load([], {}) == ([], [])
++    assert _lsa.force_pageable_load(["--load-mode", "mmap"], {}, auto_unmapped = True) == (
++        ["--load-mode", "mmap"],
++        [],
++    )

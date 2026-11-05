@@ -1,0 +1,93 @@
+name: AMD DevLab iGPU pageable load A/B (Windows)
+
+on:
+  push:
+    branches: [devlab-igpu-pageable-win]
+
+permissions: {}
+
+env:
+  BASE_SHA: 0ab3f0773d
+  REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Host facts and checkouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = Join-Path $env:RUNNER_TEMP ("igw-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force "$W\out", "$W\hf", "$W\tmp" | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "W=$W"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-String | Tee-Object -FilePath "$W\out\host.txt"
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | Format-List | Out-String | Tee-Object -FilePath "$W\out\host.txt" -Append
+          foreach ($f in "branch.patch", "tree.txt", "studio_ab.py", "raw_matrix_win.py") { Invoke-WebRequest -UseBasicParsing "$env:RAW/$f" -OutFile "$W\$f" }
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\A"
+          git -C "$W\A" checkout -q $env:BASE_SHA
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\B"
+          git -C "$W\B" checkout -q $env:BASE_SHA
+          git -C "$W\B" apply --whitespace=nowarn "$W\branch.patch"
+          git -C "$W\B" add -A
+          $tree = git -C "$W\B" write-tree
+          $want = (Get-Content "$W\tree.txt").Trim()
+          if ($tree -ne $want) { throw "B tree $tree differs from $want" } else { "B tree matches the branch commit" }
+      - name: Start the model download in the background
+        shell: powershell
+        run: |
+          python -m venv "$env:W\hfv"
+          & "$env:W\hfv\Scripts\pip.exe" -q install "huggingface_hub[hf_xet]>=0.34"
+          $env:HF_HOME = "$env:W\hf"
+          Start-Process -WindowStyle Hidden -FilePath "$env:W\hfv\Scripts\hf.exe" -ArgumentList "download", $env:REPO, "--include", "UD-Q5_K_XL/*" -RedirectStandardOutput "$env:W\out\dl.log" -RedirectStandardError "$env:W\out\dl.err.log"
+          "started $(Get-Date -Format o)" | Set-Content "$env:W\out\dl-start.txt"
+      - name: Install Studio from A
+        shell: powershell
+        run: |
+          $env:UNSLOTH_STUDIO_HOME = "$env:W\home"; $env:UNSLOTH_SKIP_AUTOSTART = "1"; $env:HF_HOME = "$env:W\hf"
+          Set-Location "$env:W\A"
+          $t0 = Get-Date
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 --local *> "$env:W\out\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:W\out\install.log" -Tail 30
+          "install rc=$rc seconds=$([int]((Get-Date) - $t0).TotalSeconds)"
+          $s = Get-ChildItem -Recurse -Filter llama-server.exe "$env:W\home" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $s.FullName | Set-Content "$env:W\server.txt"
+          Get-Content "$env:W\home\llama.cpp\BUILD_INFO.txt" -ErrorAction SilentlyContinue | Select-Object -First 8
+          cmd /c "`"$($s.FullName)`" --help 2>nul" | Select-String -Context 0,8 -Pattern "--load-mode|--lazy-mode" | Out-String | Tee-Object -FilePath "$env:W\out\load-mode-help.txt"
+          exit $rc
+      - name: T2 UD-Q5_K_XL (147 GiB) A then B, then raw matrix
+        shell: powershell
+        run: |
+          $env:HF_HOME = "$env:W\hf"; $env:UNSLOTH_STUDIO_HOME = "$env:W\home"
+          for ($i = 0; $i -lt 1500; $i++) {
+            $hfp = Get-Process hf -ErrorAction SilentlyContinue
+            if (-not $hfp) { break }
+            Start-Sleep 10
+          }
+          "download finished $(Get-Date -Format o)" | Add-Content "$env:W\out\dl-start.txt"
+          Get-Content "$env:W\out\dl.err.log" -Tail 5 -ErrorAction SilentlyContinue
+          $py = "$env:W\home\unsloth_studio\Scripts\python.exe"
+          foreach ($pair in @(@("A", 8921), @("B", 8922))) {
+            $side = $pair[0]; $port = $pair[1]
+            $p = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory "$env:W\$side\studio\backend" -FilePath $py `
+              -ArgumentList "run.py", "--api-only", "--host", "127.0.0.1", "--port", "$port" `
+              -RedirectStandardOutput "$env:W\out\t2-$side-backend.log" -RedirectStandardError "$env:W\out\t2-$side-backend.err.log"
+            for ($i = 0; $i -lt 180; $i++) { try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/api/health" | Out-Null; break } catch { Start-Sleep 2 } }
+            & $py "$env:W\studio_ab.py" --base "http://127.0.0.1:$port" --home "$env:W\home" --repo $env:REPO --variant UD-Q5_K_XL --out "$env:W\out\t2-$side.json" --pwfile "$env:W\pw.txt"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep 10
+          }
+          $m = Get-ChildItem -Recurse -Filter "*UD-Q5_K_XL*00001-of-*.gguf" "$env:W\hf" | Select-Object -First 1
+          New-Item -ItemType Directory -Force "$env:W\out\t2-raw" | Out-Null
+          & $py "$env:W\raw_matrix_win.py" --server (Get-Content "$env:W\server.txt") --model $m.FullName --out "$env:W\out\t2-raw.json" --logdir "$env:W\out\t2-raw"
+          exit 0
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-pageable-windows
+          path: ${{ env.W }}\out
