@@ -1,0 +1,1507 @@
+{
+ "name": "amd_nov5",
+ "description": "Generate specs/amd_nov5.json: Unsloth Studio (main) vs ComfyUI v0.44.0 on gfx1151 (Strix Halo, Linux ROCm), bf16.\n\nEvery ComfyUI file is built on the runner from the OFFICIAL model repos by amd/nov5_prep.py (klein, f3, zimg, q21)\nand convert_comfy.py (Wan2.2-TI2V-5B); nothing comes from a Comfy-Org / comfyanonymous Hugging Face repo. Studio\nreads the same official snapshots (DBENCH_MODEL_<ALIAS> set by the prep step), so both stacks run the same weights.\n\nArms per family (tag = <fam>_<arm>):\n  s_def     Studio main defaults, its own gfx1151 torch (repo.amd.com 2.11 + ROCm 7.13); no flash_attn importable\n            (flash-attention is installed with pip --target into a separate dir that only the flash arms put on\n            sys.path, via DBENCH_EXTRA_SYSPATH in run_cell.py)\n  s_flash   s_def + DAO-AILab flash-attention (Triton AMD backend) importable: attention auto (what shipping it gives)\n  s_flashx  s_flash with attention_backend=\"flash\" (explicit)\n  s_pt72n   Studio main in a venv on download.pytorch.org torch 2.14.1+rocm7.2 (ComfyUI README torch)\n  c_rock    ComfyUI v0.44.0 on Studio's torch (same torch as s_def), default flags\n  c_def     ComfyUI v0.44.0, README ROCm install (download.pytorch.org rocm7.2 -> 2.14.1), default flags\n  c_nockhip c_rock + COMFY_KITCHEN_DISABLE_HIP=1 (comfy-kitchen fused HIP kernels off: isolates their share)\n  s_pt72n_flash  s_pt72n + the flash-attention dir (both Studio levers stacked)\n  *_2_repeat     A/A copies of s_def, s_flash and c_rock (noise floor)\n",
+ "models": {
+  "flux2_klein_4b": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "flux3_klein": {
+   "repo": "unsloth/flux-3-image-klein",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "variants/*"
+    ]
+   }
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 2,
+  "warmup": 1,
+  "short_n": 0,
+  "options": {
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "klein_s_def",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_c_rock",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family": "flux2-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-2-klein-4b.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_klein_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux2_klein_vae_diffusers.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "klein_s_flash",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "klein_c_def",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family": "flux2-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-2-klein-4b.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_klein_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux2_klein_vae_diffusers.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "klein_s_pt72n",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "klein_c_nockhip",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family": "flux2-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-2-klein-4b.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_klein_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux2_klein_vae_diffusers.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI",
+    "COMFY_KITCHEN_DISABLE_HIP": "1"
+   }
+  },
+  {
+   "tag": "klein_s_flashx",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "klein_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_c_rock_2_repeat",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family": "flux2-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-2-klein-4b.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_klein_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux2_klein_vae_diffusers.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "klein_s_pt72n_flash",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "klein_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "f3_s_def",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_rock",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "f3_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-3-image-klein.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_4b_flux3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux3_ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_flash",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "f3_c_def",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "f3_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-3-image-klein.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_4b_flux3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux3_ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_pt72n",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "f3_c_nockhip",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "f3_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-3-image-klein.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_4b_flux3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux3_ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI",
+    "COMFY_KITCHEN_DISABLE_HIP": "1"
+   }
+  },
+  {
+   "tag": "f3_s_flashx",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "f3_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "f3_c_rock_2_repeat",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "f3_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family": "flux3-klein",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/flux-3-image-klein.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_4b_flux3_te_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/flux3_ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "f3_s_pt72n_flash",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "f3_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@flux3_klein",
+   "ref": "f3_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 16,
+   "short_steps": 4,
+   "n": 2,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_flux3_klein_distilled_t2i: 16 steps, CFG 1, er_sde / simple",
+   "options": {
+    "family_override": "flux.3-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "zimg_s_def",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "zimg_c_rock",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/z_image_turbo_official_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_zimage_official_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/ae_zimage.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "zimg_s_flash",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "zimg_c_def",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/z_image_turbo_official_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_zimage_official_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/ae_zimage.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "zimg_s_pt72n",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "zimg_c_nockhip",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/z_image_turbo_official_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_zimage_official_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/ae_zimage.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI",
+    "COMFY_KITCHEN_DISABLE_HIP": "1"
+   }
+  },
+  {
+   "tag": "zimg_s_flashx",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "zimg_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "zimg_c_rock_2_repeat",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/z_image_turbo_official_dit_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3_4b_zimage_official_merged.safetensors",
+     "vae": "$AMD_CI_WORK/cm/ae_zimage.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "zimg_s_pt72n_flash",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "zimg_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "q21_s_def",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_rock",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/qwen_image_2.1_official_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_8b_q21_official_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/qwen_image_2.1_vae_official_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_flash",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "q21_c_def",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/qwen_image_2.1_official_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_8b_q21_official_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/qwen_image_2.1_vae_official_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_pt72n",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "q21_c_nockhip",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/qwen_image_2.1_official_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_8b_q21_official_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/qwen_image_2.1_vae_official_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI",
+    "COMFY_KITCHEN_DISABLE_HIP": "1"
+   }
+  },
+  {
+   "tag": "q21_s_flashx",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "q21_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_c_rock_2_repeat",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/qwen_image_2.1_official_bf16.safetensors",
+     "te": "$AMD_CI_WORK/cm/qwen3vl_8b_q21_official_bf16.safetensors",
+     "vae": "$AMD_CI_WORK/cm/qwen_image_2.1_vae_official_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "q21_s_pt72n_flash",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "q21_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "short_n": 1,
+   "warmup": 1,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "wan_s_def",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_c_rock",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/wan2.2_ti2v_5B_bf16_official.safetensors",
+     "te": "$AMD_CI_WORK/cm/umt5_xxl_bf16_official.safetensors",
+     "vae": "$AMD_CI_WORK/cm/wan2.2_vae_official.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "wan_s_flash",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "wan_c_def",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/wan2.2_ti2v_5B_bf16_official.safetensors",
+     "te": "$AMD_CI_WORK/cm/umt5_xxl_bf16_official.safetensors",
+     "vae": "$AMD_CI_WORK/cm/wan2.2_vae_official.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_default/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "wan_s_pt72n",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "wan_c_nockhip",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/wan2.2_ti2v_5B_bf16_official.safetensors",
+     "te": "$AMD_CI_WORK/cm/umt5_xxl_bf16_official.safetensors",
+     "vae": "$AMD_CI_WORK/cm/wan2.2_vae_official.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI",
+    "COMFY_KITCHEN_DISABLE_HIP": "1"
+   }
+  },
+  {
+   "tag": "wan_s_flashx",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "wan_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "wan_c_rock_2_repeat",
+   "backend": "comfyui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$AMD_CI_WORK/cm/wan2.2_ti2v_5B_bf16_official.safetensors",
+     "te": "$AMD_CI_WORK/cm/umt5_xxl_bf16_official.safetensors",
+     "vae": "$AMD_CI_WORK/cm/wan2.2_vae_official.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "$AMD_CI_WORK/comfy_venv_rock/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "$AMD_CI_WORK/ComfyUI"
+   }
+  },
+  {
+   "tag": "wan_s_pt72n_flash",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "wan_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_flash",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "short_n": 0,
+   "warmup": 1,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (21 frames)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_EXTRA_SYSPATH": "$AMD_CI_WORK/fa_site",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  }
+ ]
+}

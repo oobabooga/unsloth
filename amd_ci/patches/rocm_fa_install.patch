@@ -1,0 +1,642 @@
+diff --git a/studio/backend/core/inference/__init__.py b/studio/backend/core/inference/__init__.py
+index c746a53c88..446bc8e815 100644
+--- a/studio/backend/core/inference/__init__.py
++++ b/studio/backend/core/inference/__init__.py
+@@ -22,6 +22,14 @@ from typing import TYPE_CHECKING
+ # Same ROCm AOTriton opt-in as main.py, for entries that skip main.py; read at first SDPA dispatch, setdefault keeps explicit 0; else gfx1151 runs MATH
+ os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+ 
++# Same Triton-only flash-attn switch as main.py, for entries that skip main.py; no-op off ROCm.
++try:
++    from utils.rocm_flash_attn import default_triton_amd_env as _default_triton_amd_env
++
++    _default_triton_amd_env()
++except Exception:  # noqa: BLE001 - an optional speedup never breaks the package import
++    pass
++
+ __all__ = [
+     "InferenceBackend",
+     "InferenceOrchestrator",
+diff --git a/studio/backend/main.py b/studio/backend/main.py
+index 5c20404ebf..ff5a80ba8e 100644
+--- a/studio/backend/main.py
++++ b/studio/backend/main.py
+@@ -30,6 +30,14 @@ try:
+ except Exception:
+     pass
+ 
++# A Triton-only flash-attn (setup installs it on RDNA3/4) imports only with its backend switch set;
++# before anything imports flash_attn, and inherited by spawned workers. Never on CUDA hosts.
++try:
++    from utils.rocm_flash_attn import default_triton_amd_env as _default_triton_amd_env
++    _default_triton_amd_env()
++except Exception:
++    pass
++
+ # normalize allocator booleans before torch parses them; spawned workers inherit the environment.
+ from utils.allocator_conf import normalize_allocator_conf as _normalize_allocator_conf
+ 
+diff --git a/studio/backend/tests/test_rocm_flash_attn_install.py b/studio/backend/tests/test_rocm_flash_attn_install.py
+new file mode 100644
+index 0000000000..857331062c
+--- /dev/null
++++ b/studio/backend/tests/test_rocm_flash_attn_install.py
+@@ -0,0 +1,341 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""flash-attn's Triton AMD backend: installed by setup on Linux ROCm RDNA3/4 only, best effort, and
++its import switch defaulted only for a Triton-only build on ROCm torch."""
++
++from __future__ import annotations
++
++import importlib.machinery
++import os
++import subprocess
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++from utils import rocm_flash_attn as rfa
++
++_INSTALL_SCRIPT = Path(__file__).resolve().parents[2] / "install_python_stack.py"
++
++_ROCM_ENV = {
++    "python_tag": "cp312",
++    "torch_mm": "2.11",
++    "torch_version": "2.11.0+rocm7.13.0",
++    "cuda_version": "",
++    "cuda_major": "",
++    "hip_version": "7.13.0",
++    "cxx11abi": "TRUE",
++    "platform_tag": "linux_x86_64",
++}
++_CUDA_ENV = {**_ROCM_ENV, "hip_version": "", "cuda_major": "13", "cuda_version": "13.0"}
++
++
++@pytest.fixture
++def ips(monkeypatch):
++    sys.modules.pop("install_python_stack", None)
++    monkeypatch.syspath_prepend(str(_INSTALL_SCRIPT.parent))
++    import install_python_stack
++
++    monkeypatch.delenv("UNSLOTH_STUDIO_SKIP_FLASHATTN_INSTALL", raising = False)
++    monkeypatch.delenv(rfa.SKIP_INSTALL_ENV, raising = False)
++    return install_python_stack
++
++
++class _Host:
++    """install_python_stack with every host fact and side effect replaced."""
++
++    def __init__(
++        self,
++        ips,
++        monkeypatch,
++        *,
++        env,
++        gfx = ("gfx1151",),
++        windows = False,
++        install_ok = True,
++        importable_after = True,
++        installed_version = None,
++    ):
++        self.calls: list[tuple] = []
++        self.notes: list[str] = []
++        self.steps: list[str] = []
++        self.removed = 0
++        self.wheel_urls: list[str] = []
++        self.installed = False
++        self.env_during_install: dict = {}
++        monkeypatch.setattr(ips, "NO_TORCH", False)
++        monkeypatch.setattr(ips, "IS_MACOS", False)
++        monkeypatch.setattr(ips, "IS_WINDOWS", windows)
++        monkeypatch.setattr(ips.sys, "platform", "win32" if windows else "linux")
++        monkeypatch.setattr(ips, "probe_torch_wheel_env", lambda **_: dict(env))
++        monkeypatch.setattr(ips, "_detect_amd_gfx_codes", lambda *a, **k: list(gfx))
++        monkeypatch.setattr(ips, "_flash_attn_gpu_below_floor", lambda: False)
++        monkeypatch.setattr(
++            ips, "_flash_attn_importable", lambda: self.installed and importable_after
++        )
++        monkeypatch.setattr(
++            ips,
++            "_installed_distribution_version",
++            lambda name: "2.8.4" if self.installed else installed_version,
++        )
++        monkeypatch.setattr(ips, "_remove_stale_flash_attn", self._remove)
++        monkeypatch.setattr(ips, "_note", lambda message, *a, **k: self.notes.append(message))
++        monkeypatch.setattr(ips, "_step", lambda label, value, *a, **k: self.steps.append(value))
++        monkeypatch.setattr(ips, "url_exists", lambda url: self.wheel_urls.append(url) or False)
++        self.install_ok = install_ok
++        monkeypatch.setattr(ips, "pip_install_try", self._pip_install_try)
++
++    def _remove(self):
++        self.removed += 1
++
++    def _pip_install_try(self, label, *args, **kwargs):
++        self.calls.append(args)
++        if rfa.FLASH_ATTN_TRITON_AMD_SPEC in args:
++            self.env_during_install = {
++                name: os.environ.get(name) for name in rfa.FLASH_ATTN_TRITON_AMD_BUILD_ENV
++            }
++            self.installed = self.install_ok
++            return self.install_ok
++        return True
++
++    @property
++    def fa_install_args(self):
++        return [args for args in self.calls if rfa.FLASH_ATTN_TRITON_AMD_SPEC in args]
++
++
++# --- installer ---------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("gfx", ["gfx1151", "gfx1100", "gfx1150", "gfx1201"])
++def test_installs_on_linux_rocm_rdna(ips, monkeypatch, gfx):
++    host = _Host(ips, monkeypatch, env = _ROCM_ENV, gfx = (gfx,))
++    ips._ensure_flash_attn()
++    assert len(host.fa_install_args) == 1
++    args = host.fa_install_args[0]
++    assert "--no-build-isolation" in args and "--no-deps" in args
++    # Build deps first, in a separate call.
++    assert set(rfa.FLASH_ATTN_TRITON_AMD_BUILD_DEPS) <= set(host.calls[0])
++    # The Triton switch and FORCE_BUILD reach the build, then leave the installer's environment.
++    assert host.env_during_install == {
++        "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
++        "FLASH_ATTENTION_FORCE_BUILD": "TRUE",
++    }
++    assert host.removed == 0
++    assert not host.wheel_urls  # no CUDA wheel lookup on ROCm
++
++
++def test_spec_is_a_pinned_commit_archive():
++    assert rfa.FLASH_ATTN_TRITON_AMD_SPEC == (
++        "flash-attn @ https://github.com/Dao-AILab/flash-attention/archive/"
++        "bbe25bacff9f337568b66e69950e549df9839068.tar.gz"
++    )
++
++
++def test_stale_copy_is_reinstalled(ips, monkeypatch):
++    host = _Host(ips, monkeypatch, env = _ROCM_ENV, installed_version = "2.8.4")
++    ips._ensure_flash_attn()
++    assert "--force-reinstall" in host.fa_install_args[0]
++
++
++def test_build_env_restored_after_install(ips, monkeypatch):
++    monkeypatch.setenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE")
++    monkeypatch.delenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", raising = False)
++    _Host(ips, monkeypatch, env = _ROCM_ENV)
++    ips._ensure_flash_attn()
++    assert os.environ["FLASH_ATTENTION_FORCE_BUILD"] == "FALSE"
++    assert "FLASH_ATTENTION_TRITON_AMD_ENABLE" not in os.environ
++
++
++@pytest.mark.parametrize(
++    "case",
++    ["unsupported_gfx", "cdna", "no_gfx", "opt_out", "global_opt_out"],
++)
++def test_skipped(ips, monkeypatch, case):
++    gfx = {"unsupported_gfx": ("gfx1030",), "cdna": ("gfx942",), "no_gfx": ()}.get(
++        case, ("gfx1151",)
++    )
++    if case == "opt_out":
++        monkeypatch.setenv(rfa.SKIP_INSTALL_ENV, "1")
++    if case == "global_opt_out":
++        monkeypatch.setenv("UNSLOTH_STUDIO_SKIP_FLASHATTN_INSTALL", "1")
++    host = _Host(ips, monkeypatch, env = _ROCM_ENV, gfx = gfx)
++    ips._ensure_flash_attn()
++    assert host.calls == []
++    assert not host.wheel_urls
++
++
++def test_skipped_rocm_removes_an_unimportable_copy(ips, monkeypatch):
++    # As before: an installed flash-attn that does not import breaks diffusers / xformers imports.
++    host = _Host(ips, monkeypatch, env = _ROCM_ENV, gfx = ("gfx1030",), installed_version = "2.8.3")
++    ips._ensure_flash_attn()
++    assert host.calls == [] and host.removed == 1
++
++
++def test_nvidia_keeps_the_wheel_route(ips, monkeypatch):
++    host = _Host(ips, monkeypatch, env = _CUDA_ENV, gfx = ())
++    ips._ensure_flash_attn()
++    assert host.fa_install_args == []
++    assert host.wheel_urls  # the CUDA prebuilt-wheel lookup ran as before
++
++
++def test_cpu_torch_installs_nothing(ips, monkeypatch):
++    cpu = {**_ROCM_ENV, "hip_version": "", "cuda_major": "", "cuda_version": ""}
++    host = _Host(ips, monkeypatch, env = cpu)
++    ips._ensure_flash_attn()
++    assert host.fa_install_args == []
++
++
++def test_windows_rocm_never_builds(ips, monkeypatch):
++    host = _Host(ips, monkeypatch, env = {**_ROCM_ENV, "platform_tag": "win_amd64"}, windows = True)
++    ips._ensure_flash_attn()
++    assert host.fa_install_args == []
++
++
++def test_skip_reason_is_linux_only():
++    assert rfa.install_skip_reason(platform = "win32", hip_version = "7.1", gfx_codes = ["gfx1151"])
++    assert rfa.install_skip_reason(platform = "darwin", hip_version = "7.1", gfx_codes = ["gfx1151"])
++    assert (
++        rfa.install_skip_reason(platform = "linux", hip_version = "7.1", gfx_codes = ["gfx1151"])
++        is None
++    )
++    # A mixed host installs when any visible card is RDNA3/4.
++    assert (
++        rfa.install_skip_reason(
++            platform = "linux", hip_version = "7.1", gfx_codes = ["gfx942", "gfx1100"]
++        )
++        is None
++    )
++
++
++@pytest.mark.parametrize("failure", ["install_fails", "not_importable", "deps_fail"])
++def test_failure_is_not_fatal(ips, monkeypatch, failure):
++    host = _Host(
++        ips,
++        monkeypatch,
++        env = _ROCM_ENV,
++        install_ok = failure != "install_fails",
++        importable_after = failure != "not_importable",
++    )
++    if failure == "deps_fail":
++        monkeypatch.setattr(ips, "pip_install_try", lambda *a, **k: False)
++    ips._ensure_flash_attn()  # never raises or exits
++    assert any("Continuing without flash-attn" in step for step in host.steps)
++    if failure == "not_importable":
++        assert host.removed == 1  # an unimportable copy is never left behind
++
++
++def test_import_probe_enables_triton_only_on_rocm():
++    probe = rfa.IMPORT_PROBE
++    assert "flash_attn_2_cuda" in probe and "torch.version, 'hip'" in probe
++    assert "setdefault('FLASH_ATTENTION_TRITON_AMD_ENABLE', 'TRUE')" in probe
++    assert probe.rstrip().endswith("import flash_attn")
++    compile(probe, "<probe>", "exec")
++
++
++def test_installer_import_probe_uses_it(ips, monkeypatch):
++    seen = []
++    monkeypatch.setattr(
++        ips.subprocess,
++        "run",
++        lambda cmd, **kwargs: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0),
++    )
++    assert ips._flash_attn_importable() is True
++    assert seen[0][1:] == ["-c", rfa.IMPORT_PROBE]
++
++
++# --- runtime env default -------------------------------------------------------------------------
++
++
++def _fake_specs(monkeypatch, *, flash_attn = True, extension = False, hip = True):
++    specs = {
++        "flash_attn": flash_attn,
++        "flash_attn_2_cuda": extension,
++    }
++    real = rfa._find_spec
++
++    def find_spec(name):
++        if name in specs:
++            return importlib.machinery.ModuleSpec(name, None) if specs[name] else None
++        return real(name)
++
++    monkeypatch.setattr(rfa, "_find_spec", find_spec)
++    monkeypatch.setattr(rfa, "_torch_is_rocm", lambda: hip)
++    monkeypatch.setattr(rfa.sys, "platform", "linux")
++    monkeypatch.delitem(sys.modules, "flash_attn", raising = False)
++
++
++def test_env_default_set_on_rocm_triton_only_build(monkeypatch):
++    _fake_specs(monkeypatch)
++    env: dict = {}
++    assert rfa.default_triton_amd_env(env) is True
++    assert env == {"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE", rfa.DIFFUSION_ONLY_ENV: "1"}
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"hip": False},  # NVIDIA / CPU torch: would misroute a CUDA flash_attn
++        {"extension": True},  # CK or CUDA build: has its compiled extension
++        {"flash_attn": False},  # not installed
++    ],
++)
++def test_env_default_not_set_elsewhere(monkeypatch, kwargs):
++    _fake_specs(monkeypatch, **kwargs)
++    env: dict = {}
++    assert rfa.default_triton_amd_env(env) is False
++    assert env == {}
++
++
++def test_env_default_not_set_on_windows(monkeypatch):
++    _fake_specs(monkeypatch)
++    monkeypatch.setattr(rfa.sys, "platform", "win32")
++    env: dict = {}
++    assert rfa.default_triton_amd_env(env) is False and env == {}
++
++
++@pytest.mark.parametrize("value", ["TRUE", "FALSE"])
++def test_explicit_value_wins_and_opts_training_in(monkeypatch, value):
++    _fake_specs(monkeypatch)
++    env = {"FLASH_ATTENTION_TRITON_AMD_ENABLE": value}
++    assert rfa.default_triton_amd_env(env) is False
++    assert env == {"FLASH_ATTENTION_TRITON_AMD_ENABLE": value}  # no diffusion-only marker
++
++
++def test_explicit_diffusion_only_zero_is_kept(monkeypatch):
++    _fake_specs(monkeypatch)
++    env = {rfa.DIFFUSION_ONLY_ENV: "0"}
++    assert rfa.default_triton_amd_env(env) is True
++    assert env[rfa.DIFFUSION_ONLY_ENV] == "0"
++
++
++def test_torch_is_rocm_reads_version_file_without_importing(monkeypatch, tmp_path):
++    for hip_line, expected in (
++        ("hip: Optional[str] = '7.13.0-abc'", True),
++        ("hip: Optional[str] = None", False),
++    ):
++        pkg = tmp_path / ("rocm" if expected else "cuda") / "torch"
++        pkg.mkdir(parents = True)
++        (pkg / "version.py").write_text(f"__version__ = '2.11.0'\n{hip_line}\n")
++        spec = importlib.machinery.ModuleSpec("torch", None, is_package = True)
++        spec.submodule_search_locations = [str(pkg)]
++        monkeypatch.setattr(rfa, "_find_spec", lambda name, spec = spec: spec)
++        monkeypatch.delitem(sys.modules, "torch", raising = False)
++        assert rfa._torch_is_rocm() is expected
++
++
++def test_torch_is_rocm_prefers_imported_torch(monkeypatch):
++    fake = types.SimpleNamespace(version = types.SimpleNamespace(hip = "7.1"))
++    monkeypatch.setitem(sys.modules, "torch", fake)
++    assert rfa._torch_is_rocm() is True
++    fake.version.hip = None
++    assert rfa._torch_is_rocm() is False
++
++
++def test_unsloth_gates_llm_flash_attention_on_the_marker():
++    # The training side reads the marker in its hip branch, before probing flash_attn.
++    source = (Path(__file__).resolve().parents[3] / "unsloth" / "models" / "_utils.py").read_text()
++    hip_branch = source.split('elif DEVICE_TYPE == "hip":', 1)[1].split("elif DEVICE_TYPE ==", 1)[0]
++    gate = hip_branch.index(f'os.environ.get("{rfa.DIFFUSION_ONLY_ENV}") == "1"')
++    assert gate < hip_branch.index('_package_available("flash_attn")')
+diff --git a/studio/backend/utils/rocm_flash_attn.py b/studio/backend/utils/rocm_flash_attn.py
+new file mode 100644
+index 0000000000..f218ad72f9
+--- /dev/null
++++ b/studio/backend/utils/rocm_flash_attn.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""flash-attn on ROCm through its Triton AMD backend (pure Python, no CK compile).
++
++Studio's diffusion attention (core/inference/diffusion_attention.py) already routes to flash_attn on
++ROCm when it imports and wins a timing probe; this module is the install and import side. Stdlib
++only and no torch import: main.py imports it before torch, and the installer imports it as
++``backend.utils.rocm_flash_attn``.
++
++A Triton-only build has no ``flash_attn_2_cuda`` extension and imports only with
++``FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`` (flash_attn_interface reads it at import), so without the
++variable every importer (diffusers, xformers, unsloth) sees a broken install.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import re
++import sys
++from typing import Iterable, MutableMapping, Optional
++
++TRITON_AMD_ENV = "FLASH_ATTENTION_TRITON_AMD_ENABLE"
++# Set beside TRITON_AMD_ENV only when Studio supplied the default: unsloth then leaves LLM attention
++# on SDPA (as before this build was installed); a user who set TRITON_AMD_ENV themselves opted in.
++DIFFUSION_ONLY_ENV = "UNSLOTH_ROCM_FLASH_ATTN_DIFFUSION_ONLY"
++SKIP_INSTALL_ENV = "UNSLOTH_STUDIO_SKIP_ROCM_FLASHATTN_INSTALL"
++
++# Dao-AILab/flash-attention main (2.8.4 dev), the commit the gfx1151 CI runner builds. The GitHub
++# archive has no submodules, which the Triton backend does not need (setup.py skips the CK build).
++FLASH_ATTN_TRITON_AMD_SHA = "bbe25bacff9f337568b66e69950e549df9839068"
++FLASH_ATTN_TRITON_AMD_URL = (
++    f"https://github.com/Dao-AILab/flash-attention/archive/{FLASH_ATTN_TRITON_AMD_SHA}.tar.gz"
++)
++FLASH_ATTN_TRITON_AMD_SPEC = f"flash-attn @ {FLASH_ATTN_TRITON_AMD_URL}"
++# Imported by setup.py under --no-build-isolation (setuptools, wheel, packaging), named in its
++# setup_requires (psutil, ninja; setuptools would try to fetch them), and its one runtime dep (einops).
++FLASH_ATTN_TRITON_AMD_BUILD_DEPS = ("setuptools", "wheel", "packaging", "psutil", "ninja", "einops")
++# FORCE_BUILD skips setup.py's guessed prebuilt-wheel download, which could fetch a CK build.
++FLASH_ATTN_TRITON_AMD_BUILD_ENV = {TRITON_AMD_ENV: "TRUE", "FLASH_ATTENTION_FORCE_BUILD": "TRUE"}
++
++# RDNA3 / RDNA3.5 / RDNA4 (gfx11xx, gfx12xx), where the Triton AMD backend runs and no CK flash-attn
++# wheel exists. CDNA (gfx90a / gfx942 / gfx950) has CK and aiter routes and is left alone.
++_SUPPORTED_GFX = re.compile(r"^gfx1[12][0-9a-f]{2}$")
++
++# Child-process import probe that sees what a Studio process would: a Triton-only build on ROCm
++# torch gets the backend switch first. CUDA builds (flash_attn_2_cuda present) are probed as before.
++IMPORT_PROBE = (
++    "import importlib.util, os\n"
++    "if importlib.util.find_spec('flash_attn') is not None and "
++    "importlib.util.find_spec('flash_attn_2_cuda') is None:\n"
++    "    import torch\n"
++    "    if getattr(torch.version, 'hip', None):\n"
++    f"        os.environ.setdefault({TRITON_AMD_ENV!r}, 'TRUE')\n"
++    "import flash_attn\n"
++)
++
++
++def supported_gfx(gfx_codes: Iterable[str]) -> list[str]:
++    return [code for code in gfx_codes if _SUPPORTED_GFX.match(str(code).strip().lower())]
++
++
++def install_skip_reason(
++    *, platform: str, hip_version: Optional[str], gfx_codes: Iterable[str]
++) -> Optional[str]:
++    """Why the Triton AMD flash-attn is not installed here, or None to install it."""
++    if os.environ.get(SKIP_INSTALL_ENV) == "1":
++        return f"{SKIP_INSTALL_ENV}=1"
++    if not platform.startswith("linux"):
++        return "Linux only"
++    if not hip_version:
++        return "needs a ROCm build of torch"
++    codes = [str(code) for code in gfx_codes]
++    if not codes:
++        return "no AMD GPU architecture detected"
++    if not supported_gfx(codes):
++        return f"no RDNA3/RDNA4 GPU ({', '.join(sorted(set(codes)))})"
++    return None
++
++
++def _find_spec(name: str):
++    try:
++        return importlib.util.find_spec(name)
++    except Exception:  # noqa: BLE001 - a broken finder means "not determinable"
++        return None
++
++
++def _torch_is_rocm() -> bool:
++    """Whether the resident torch is a ROCm build, without importing torch (main.py defers it)."""
++    torch = sys.modules.get("torch")
++    if torch is not None:
++        return bool(getattr(getattr(torch, "version", None), "hip", None))
++    spec = _find_spec("torch")
++    locations = list(getattr(spec, "submodule_search_locations", None) or [])
++    for location in locations:
++        try:
++            with open(os.path.join(location, "version.py"), encoding = "utf-8") as fh:
++                text = fh.read()
++        except OSError:
++            continue
++        match = re.search(r"^hip\s*(?::[^=\n]*)?=\s*(.+)$", text, re.MULTILINE)
++        return bool(match) and match.group(1).strip() not in ("None", "''", '""')
++    return False
++
++
++def triton_only_flash_attn_installed() -> bool:
++    """flash_attn is installed without a compiled extension (it can only run on Triton)."""
++    return _find_spec("flash_attn") is not None and _find_spec("flash_attn_2_cuda") is None
++
++
++def default_triton_amd_env(environ: Optional[MutableMapping[str, str]] = None) -> bool:
++    """setdefault the Triton AMD backend switch for a Triton-only flash_attn on ROCm torch, before
++    anything imports flash_attn. Spawned workers inherit it. An explicit value (even FALSE) wins.
++    True when the default was applied."""
++    env = os.environ if environ is None else environ
++    if not sys.platform.startswith("linux"):
++        return False
++    if TRITON_AMD_ENV in env or "flash_attn" in sys.modules:
++        return False
++    if not triton_only_flash_attn_installed() or not _torch_is_rocm():
++        return False
++    env[TRITON_AMD_ENV] = "TRUE"
++    env.setdefault(DIFFUSION_ONLY_ENV, "1")
++    return True
+diff --git a/studio/install_python_stack.py b/studio/install_python_stack.py
+index e49886fa2e..a1fa2a2cd6 100644
+--- a/studio/install_python_stack.py
++++ b/studio/install_python_stack.py
+@@ -69,6 +69,7 @@ from backend.utils.wheel_utils import (
+     xformers_torch_requirement_unmet,
+ )
+ from backend.utils.uv_path_safety import uv_safe_path as _uv_safe_path
++from backend.utils import rocm_flash_attn as _rocm_flash_attn
+ 
+ IS_WINDOWS = sys.platform == "win32"
+ IS_MACOS = sys.platform == "darwin"
+@@ -8056,7 +8057,8 @@ def _flash_attn_importable() -> bool:
+     """
+     try:
+         result = subprocess.run(
+-            [sys.executable, "-c", "import flash_attn"],
++            # A Triton-only ROCm build imports only with its backend switch, as Studio sets it.
++            [sys.executable, "-c", _rocm_flash_attn.IMPORT_PROBE],
+             stdout = subprocess.DEVNULL,
+             stderr = subprocess.DEVNULL,
+             timeout = _FLASH_ATTN_IMPORT_PROBE_TIMEOUT,
+@@ -8111,6 +8113,10 @@ def _ensure_flash_attn() -> None:
+     )
+     # a failed flash-attn probe proves staleness only when torch still imports.
+     stale = env is not None and _installed_distribution_version("flash-attn") is not None
++    if env is not None and env.get("hip_version") and not IS_WINDOWS:
++        # No flash-attn wheel exists for ROCm; RDNA3/4 get its pure-Python Triton backend.
++        _ensure_rocm_triton_flash_attn(env, stale)
++        return
+     wheel_url = _build_flash_attn_wheel_url(env) if env else None
+     if wheel_url and not (env or {}).get("hip_version") and _flash_attn_gpu_below_floor():
+         # Unsloth only turns FlashAttention 2 on from sm80; a T4 would download it for nothing.
+@@ -8175,6 +8181,69 @@ def _ensure_flash_attn() -> None:
+         _remove_stale_flash_attn()
+ 
+ 
++def _rocm_gfx_codes() -> list[str]:
++    try:
++        return _detect_amd_gfx_codes()
++    except Exception:
++        return []
++
++
++@contextlib.contextmanager
++def _temporary_environ(values: dict[str, str]):
++    saved = {name: os.environ.get(name) for name in values}
++    os.environ.update(values)
++    try:
++        yield
++    finally:
++        for name, value in saved.items():
++            if value is None:
++                os.environ.pop(name, None)
++            else:
++                os.environ[name] = value
++
++
++def _ensure_rocm_triton_flash_attn(env: dict[str, str], stale: bool) -> None:
++    """flash-attn's Triton AMD backend on Linux ROCm RDNA3/4 (gfx11xx / gfx12xx): a pure-Python
++    build from a pinned commit, seconds to install. Best effort: any failure leaves the native
++    SDPA path, which is what Studio diffusion uses without it. Opt out with
++    UNSLOTH_STUDIO_SKIP_ROCM_FLASHATTN_INSTALL=1 (or UNSLOTH_STUDIO_SKIP_FLASHATTN_INSTALL=1)."""
++    reason = _rocm_flash_attn.install_skip_reason(
++        platform = sys.platform,
++        hip_version = env.get("hip_version"),
++        gfx_codes = _rocm_gfx_codes(),
++    )
++    if reason is not None:
++        _note(f"flash-attn (ROCm Triton backend) skipped: {reason}")
++        if stale:
++            _remove_stale_flash_attn()
++        return
++    with _install_heartbeat("flash-attn"):
++        deps_ok = pip_install_try(
++            "Installing flash-attn build dependencies",
++            "--no-cache-dir",
++            *_rocm_flash_attn.FLASH_ATTN_TRITON_AMD_BUILD_DEPS,
++        )
++        installed = False
++        if deps_ok:
++            with _temporary_environ(_rocm_flash_attn.FLASH_ATTN_TRITON_AMD_BUILD_ENV):
++                installed = pip_install_try(
++                    "Installing flash-attn (ROCm Triton backend)",
++                    "--no-build-isolation",
++                    "--no-deps",
++                    "--no-cache-dir",
++                    *(["--force-reinstall"] if stale else []),
++                    _rocm_flash_attn.FLASH_ATTN_TRITON_AMD_SPEC,
++                    constrain = False,
++                )
++    if installed and _flash_attn_importable():
++        _note("flash-attn installed (ROCm Triton backend)")
++        return
++    if _installed_distribution_version("flash-attn") is not None:
++        # An unimportable copy breaks diffusers and xformers imports: never leave one behind.
++        _remove_stale_flash_attn()
++    _step("warning", "Continuing without flash-attn (ROCm Triton backend did not install)", _warn)
++
++
+ # The compiled extension each SSM kernel loads (kernel_install.KERNELS checks the same import).
+ _SSM_KERNEL_EXTENSIONS = {"causal_conv1d": "causal_conv1d_cuda", "mamba_ssm": "selective_scan_cuda"}
+ # Exit code of the probe below when torch imported and the extension raised ImportError / OSError.
+diff --git a/unsloth/models/_utils.py b/unsloth/models/_utils.py
+index 1d3d159c24..1c9c9eade4 100644
+--- a/unsloth/models/_utils.py
++++ b/unsloth/models/_utils.py
+@@ -4763,7 +4763,17 @@ elif DEVICE_TYPE == "cuda":
+         HAS_FLASH_ATTENTION = False
+ elif DEVICE_TYPE == "hip":
+     SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
+-    if _package_available("flash_attn"):
++    if os.environ.get("UNSLOTH_ROCM_FLASH_ATTN_DIFFUSION_ONLY") == "1":
++        # Studio installed a Triton-backend flash-attn for diffusion and enabled it itself: LLM
++        # attention stays on SDPA, as without it. Setting FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
++        # explicitly opts training in (Studio then leaves this unset).
++        import transformers.utils.import_utils
++
++        transformers.utils.import_utils.is_flash_attn_2_available = lambda *args, **kwargs: False
++        import transformers.utils
++
++        transformers.utils.is_flash_attn_2_available = lambda *args, **kwargs: False
++    elif _package_available("flash_attn"):
+         # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl" and for softcapping; see #1437.
+         try:
+             try:
