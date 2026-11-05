@@ -137,7 +137,7 @@ jobs:
           & $py -m pip install -q -r (Join-Path $req "studio.txt") -r (Join-Path $req "diffusers-pin.txt") transformers accelerate numpy pillow huggingface_hub scikit-image
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -m pip install -q --no-deps "torchao==0.17.0" "unsloth_zoo" lpips
-          # The same library versions the Linux Studio venv resolved on main (install.sh --local, nov5 trial freeze):
+          # The same library versions the Linux Studio venv resolved on main (the Studio installer, nov5 trial freeze):
           # an unpinned transformers is newer than the peft / diffusers pins import against.
           & $py -m pip install -q --no-deps "transformers==5.5.0" "diffusers==0.42.1" "peft==0.18.1" "accelerate==1.15.0" "huggingface_hub==1.33.0" "tokenizers==0.22.2" "safetensors==0.8.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
