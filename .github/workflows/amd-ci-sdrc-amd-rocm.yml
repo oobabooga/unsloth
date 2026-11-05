@@ -1,0 +1,149 @@
+name: "AMD CI: sd.cpp PR 14 ROCm leg built and run on gfx1151"
+
+# PR #14's build-linux-rocm recipe (ROCm 7.14.0 TheRock wheels, its 20 GPU_TARGETS, bundled userspace,
+# rpath $ORIGIN) on current master (aba3a1c5), built ON the gfx1151 box (32 threads; the hosted 4-core build of the
+# same recipe ran >90 min), then the bundle is run with no ROCm on the loader path.
+# Deviations from the PR's job, no root here: ninja + patchelf from pip instead of apt; no ccache; no disk freeing.
+
+on:
+  push:
+    branches: [amd-ci-sdrc-amd-rocm]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rocm:
+    name: "gfx1151 Linux: build + run the ROCm bundle (PR 14 recipe)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    env:
+      ROCM_VERSION: "7.14.0"
+      GPU_TARGETS: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, path: tooling }
+      - name: Preamble
+        run: |
+          source tooling/amd_ci/lib/preamble.sh "sdrc-rocm-box"
+      - name: Host gate
+        run: |
+          set -euo pipefail
+          python3 tooling/amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host.json"
+          python3 tooling/amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          (rocminfo 2>&1 | grep -E "Marketing|gfx" | head -10) > "$AMD_CI_WORK/out/rocminfo.txt" || true
+          nproc; df -h "$RUNNER_TEMP" | tail -1; which objcopy strings || true
+      - name: Source (master + ggml-patches, as resolve)
+        run: |
+          set -euxo pipefail
+          cd "$AMD_CI_WORK/src"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp sd
+          git -C sd checkout -q aba3a1c1e0c61a20f3db0c41641704cda279d043
+          git -C sd submodule update --init --depth 1 ggml
+          cd sd && for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply --verbose "../$p"; done
+      - name: Install ROCm (TheRock wheels)
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK"
+          python3 -m venv .rocm
+          . .rocm/bin/activate
+          python -m pip install -q --upgrade pip
+          python -m pip install -q ninja patchelf pillow numpy
+          DEVICE="$(echo "$GPU_TARGETS" | sed 's/;/,device-/g; s/^/device-/')"
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,${DEVICE}]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          {
+            echo "ROCM_PATH=$ROCM_PATH"
+            echo "HIP_PATH=$ROCM_PATH"
+            echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"
+            echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$(rocm-sdk path --bin)" >> "$GITHUB_PATH"
+          echo "$AMD_CI_WORK/.rocm/bin" >> "$GITHUB_PATH"
+      - name: Build sd-cli + sd-server (ROCm)
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/src/sd"
+          T0=$(date +%s)
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600" \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_HIPBLAS=ON \
+            -DHIP_PLATFORM=amd \
+            -DGPU_TARGETS="$GPU_TARGETS" > "$AMD_CI_WORK/out/cmake.log" 2>&1 || { tail -60 "$AMD_CI_WORK/out/cmake.log"; exit 1; }
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server > "$AMD_CI_WORK/out/build.log" 2>&1 || { grep -E "error" "$AMD_CI_WORK/out/build.log" | head -40; exit 1; }
+          echo "rocm build took $(( $(date +%s) - T0 )) s" | tee "$AMD_CI_WORK/out/build_time.txt"
+      - name: Stage the bundle with the ROCm runtime (PR 14 step, verbatim)
+        run: |
+          set -euo pipefail
+          BIN="$AMD_CI_WORK/src/sd/build/bin"
+          STAGE="$AMD_CI_WORK/rocm-bundle"
+          rm -rf "$STAGE" && mkdir -p "$STAGE/lib" "$STAGE/.kpack"
+          cp "$BIN/sd-cli" "$BIN/sd-server" "$STAGE/"
+          ldd "$STAGE/sd-cli" "$STAGE/sd-server" \
+            | awk -v r="$ROCM_PATH/" 'index($3, r) == 1 { print $3 }' | sort -u > "$RUNNER_TEMP/rocm-libs.txt"
+          if [ ! -s "$RUNNER_TEMP/rocm-libs.txt" ]; then
+            echo "ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?" >&2
+            exit 1
+          fi
+          while read -r so; do cp -L "$so" "$STAGE/lib/"; done < "$RUNNER_TEMP/rocm-libs.txt"
+          for t in rocblas hipblaslt; do
+            compgen -G "$STAGE/lib/lib$t.so*" > /dev/null || continue
+            mkdir -p "$STAGE/lib/$t"
+            cp -rL "$ROCM_PATH/lib/$t/library" "$STAGE/lib/$t/"
+          done
+          for so in "$STAGE"/lib/*.so*; do
+            objcopy -O binary --only-section=.rocm_kpack_ref "$so" "$RUNNER_TEMP/kpack_ref.bin"
+            for name in $(strings "$RUNNER_TEMP/kpack_ref.bin" | grep -o '\.kpack/[A-Za-z0-9_]*_@GFXARCH@' \
+                | sed 's#^\.kpack/##; s#_@GFXARCH@$##' | sort -u); do
+              for gfx in ${GPU_TARGETS//;/ }; do
+                cp -L "$ROCM_PATH/.kpack/${name}_${gfx}.kpack" "$STAGE/.kpack/"
+              done
+            done
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "$STAGE/sd-cli" "$STAGE/sd-server"
+          for f in "$STAGE"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' "$f"; done
+          echo "bundled $(wc -l < "$RUNNER_TEMP/rocm-libs.txt") ROCm libraries, $( (ls "$STAGE/.kpack" | wc -l) || true) kpack archives" | tee "$AMD_CI_WORK/out/bundle.txt"
+          cat "$RUNNER_TEMP/rocm-libs.txt" | tee -a "$AMD_CI_WORK/out/bundle.txt"
+          du -sh "$STAGE" | tee -a "$AMD_CI_WORK/out/bundle.txt"
+          if LD_LIBRARY_PATH= ldd "$STAGE/sd-cli" "$STAGE/sd-server" | grep -i 'not found'; then
+            echo "ERROR: unresolved libraries after bundling" >&2
+            exit 1
+          fi
+      - name: Package bundle (KEEP_LAYOUT) and unpack it where nothing else is
+        env:
+          KEEP_LAYOUT: "1"
+          TAG: sdrc
+          LABEL: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          COMMIT: aba3a1c1e0c61a20f3db0c41641704cda279d043
+          SOURCE_REPO: unslothai/stable-diffusion.cpp
+        run: |
+          set -euo pipefail
+          BIN_DIR="$AMD_CI_WORK/rocm-bundle" OUT_DIR="$AMD_CI_WORK/dist" LICENSE_FILE="$AMD_CI_WORK/src/sd/LICENSE" \
+            python3 tooling/sdrc/package_bundle.py
+          ls -la "$AMD_CI_WORK/dist" | tee -a "$AMD_CI_WORK/out/bundle.txt"
+          mkdir -p "$AMD_CI_WORK/unz" && cd "$AMD_CI_WORK/unz"
+          python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')" "$AMD_CI_WORK"/dist/*.zip
+          D="$AMD_CI_WORK/unz/sd-sdrc-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0"
+          chmod +x "$D/sd-cli" "$D/sd-server"
+          echo "ROCM_BIN=$D" >> "$GITHUB_ENV"
+          ls "$D" | tee -a "$AMD_CI_WORK/out/bundle.txt"
+      - name: ROCm smoke, bundle alone with the ROCm venv off PATH and the loader path
+        timeout-minutes: 60
+        run: |
+          set +e
+          export PATH="/usr/local/bin:/usr/bin:/bin"
+          env -u LD_LIBRARY_PATH -u ROCM_PATH -u HIP_PATH ldd "$ROCM_BIN/sd-cli" | grep -E "not found|amdhip|rocblas|hipblas" | tee "$AMD_CI_WORK/out/ldd_bundle.txt"
+          env -u LD_LIBRARY_PATH -u ROCM_PATH -u HIP_PATH -u CMAKE_PREFIX_PATH "$AMD_CI_WORK/.rocm/bin/python" -u tooling/sdrc/run.py --plan rocm --bin rocm="$ROCM_BIN" \
+            --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/rocm" 2>&1 | tail -60
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdrc-rocm-box, path: "${{ env.AMD_CI_WORK }}/out", retention-days: 7, if-no-files-found: warn }
