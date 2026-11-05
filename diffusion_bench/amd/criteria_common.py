@@ -101,7 +101,12 @@ def host_gates(obs: dict, names: tuple = ("base", "head")) -> list:
     if measured(b) and measured(h):
         sb = (b.get("spec") or {}).get("selected") or []
         sh = (h.get("spec") or {}).get("selected") or []
-        out.append(("same cells selected at base and head", sb == sh, f"base {len(sb)}, head {len(sh)}"))
+        if (b.get("spec") or {}).get("per_state") or (h.get("spec") or {}).get("per_state"):
+            # --state-only: the head re-runs a declared subset (e.g. one reference cell as an extra A/A point).
+            out.append(("head cells are a subset of base cells (--state-only)", set(sh) <= set(sb) and bool(sh),
+                        f"base {len(sb)}, head {len(sh)}; head-only: {sorted(set(sh) - set(sb))}"))
+        else:
+            out.append(("same cells selected at base and head", sb == sh, f"base {len(sb)}, head {len(sh)}"))
         n_ok = sum(1 for c in cells(b).values() if ok(c))
         out.append(("base rendered at least one cell", n_ok > 0,
                     f"{n_ok}/{len(cells(b))} ok at base; with none, there is nothing to regress from"))
