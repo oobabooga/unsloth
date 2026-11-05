@@ -1,0 +1,86 @@
+name: AMD DevLab iGPU pageable load UI shots
+
+on:
+  push:
+    branches: [devlab-igpu-pageable-ui]
+
+permissions: {}
+
+env:
+  BASE_SHA: 0ab3f0773d
+  REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    steps:
+      - name: Host facts and checkouts
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/ig"; mkdir -p "$W"/{tmp,hf,out,q5}
+          { uname -a; free -g; for d in /sys/class/drm/card*/device; do [ -f "$d/mem_info_vram_total" ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total)"; done; } | tee "$W/out/host.txt"
+          for f in branch.patch tree.txt pr2_ui.py; do curl -sfL -o "$W/$f" "$RAW/$f"; done
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W/A"
+          git -C "$W/A" checkout -q "$BASE_SHA"
+          cp -a "$W/A" "$W/B"
+          git -C "$W/B" apply --whitespace=nowarn "$W/branch.patch"
+          git -C "$W/B" add -A
+          test "$(git -C "$W/B" write-tree)" = "$(cat "$W/tree.txt")"
+      - name: Start the Q5 download in the background
+        run: |
+          W="$RUNNER_TEMP/ig"
+          cat > "$W/dl.sh" <<'SH'
+          W="$1"; Q="$W/q5"; t0=$(date +%s); pids=""
+          for i in 1 2 3 4 5 6; do
+            f="Qwen3.8-Flash-Next-UD-Q5_K_XL-0000$i-of-00006.gguf"
+            curl -sSfL --retry 5 -o "$Q/$f" "https://huggingface.co/$REPO/resolve/main/UD-Q5_K_XL/$f" & pids="$pids $!"
+          done
+          rc=0; for p in $pids; do wait $p || rc=1; done
+          echo "UD-Q5_K_XL rc=$rc seconds=$(( $(date +%s) - t0 )) bytes=$(du -sb "$Q" | cut -f1)" >> "$W/out/dl-summary.txt"
+          touch "$W/dl.done"
+          SH
+          REPO="$REPO" setsid nohup bash "$W/dl.sh" "$W" > "$W/out/dl.log" 2>&1 &
+          echo started
+      - name: Install Studio from A, build B's frontend, set up Playwright
+        run: |
+          W="$RUNNER_TEMP/ig"
+          cd "$W/A"
+          export UNSLOTH_STUDIO_HOME="$W/home" UNSLOTH_SKIP_AUTOSTART=1 HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          ./install.sh --local > "$W/out/install.log" 2>&1; rc=$?
+          tail -5 "$W/out/install.log"; echo "install rc=$rc"; [ $rc = 0 ] || exit $rc
+          ls "$W/A/studio/frontend/dist/index.html"
+          NODE="$(dirname "$(find "$W/home" -path '*node/bin/node' -type f | head -1)")"
+          export PATH="$NODE:$PATH"
+          cd "$W/B/studio/frontend"
+          npm ci --no-audit --no-fund > "$W/out/B-npm.log" 2>&1 && npm run build >> "$W/out/B-npm.log" 2>&1 || { tail -20 "$W/out/B-npm.log"; exit 1; }
+          ls "$W/B/studio/frontend/dist/index.html"
+          python3 -m venv "$W/pw"
+          "$W/pw/bin/pip" -q install playwright==1.55.0 matplotlib
+          mkdir -p "$HOME/.local/share/fonts"
+          cp "$W"/pw/lib/python3*/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVu*.ttf "$HOME/.local/share/fonts/"
+          fc-cache -f "$HOME/.local/share/fonts" 2>/dev/null || true
+          PLAYWRIGHT_BROWSERS_PATH="$W/browsers" "$W/pw/bin/playwright" install chromium 2>&1 | tail -2
+      - name: Load from the chat picker, main then this PR
+        run: |
+          W="$RUNNER_TEMP/ig"
+          for i in $(seq 1 600); do [ -f "$W/dl.done" ] && break; sleep 10; done
+          cat "$W/out/dl-summary.txt"
+          for side in A B; do
+            port=$([ $side = A ] && echo 8931 || echo 8932)
+            cd "$W/$side/studio/backend"
+            # Own session: Studio's shutdown signals its process group, which would include this step's shell.
+            PATH="$HOME/.local/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" setsid nohup "$W/home/unsloth_studio/bin/python" run.py --host 127.0.0.1 --port $port --frontend "$W/$side/studio/frontend/dist" > "$W/out/$side-backend.log" 2>&1 &
+            bpid=$!
+            for i in $(seq 1 150); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+            env -u LD_LIBRARY_PATH PLAYWRIGHT_BROWSERS_PATH="$W/browsers" "$W/pw/bin/python" "$W/pr2_ui.py" http://127.0.0.1:$port "$W/home" "$W/pw.txt" "$W/q5" "$W/out/shots" "$side" || echo "$side ui rc=$?"
+            kill $bpid; sleep 5; pkill -9 -f "$W/home/.*llama-server" || true; sleep 10
+          done
+          exit 0
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-pageable-ui-linux
+          path: ${{ runner.temp }}/ig/out
