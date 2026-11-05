@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
-index 865e8783ad..3805005d47 100644
+index 865e8783ad..633dd751fd 100644
 --- a/studio/backend/core/inference/llama_cpp.py
 +++ b/studio/backend/core/inference/llama_cpp.py
 @@ -130,6 +130,7 @@ from core.inference.llama_server_args import (
@@ -34,7 +34,7 @@ index 865e8783ad..3805005d47 100644
 +    "memory mapping, llama.cpp's default on this integrated GPU, so Unsloth loaded it with "
 +    "memory mapping instead. The projector then failed to start and this session is "
 +    "text-only, which the weights alone would have fit. The running server keeps the "
-+    "memory mapping it started with; load the model again to load it without."
++    "memory mapping it started with."
 +)
  _CGROUP_ROOT = "/sys/fs/cgroup"
  _PROC_SELF_CGROUP = "/proc/self/cgroup"
@@ -416,10 +416,10 @@ index 6708b4d641..ea724272c1 100644
  
  def memory_state_satisfies_settings(
 diff --git a/studio/backend/tests/test_llama_cpp_placement.py b/studio/backend/tests/test_llama_cpp_placement.py
-index 9700da8541..40a832cfc4 100644
+index 9700da8541..7f501ce96f 100644
 --- a/studio/backend/tests/test_llama_cpp_placement.py
 +++ b/studio/backend/tests/test_llama_cpp_placement.py
-@@ -2679,6 +2679,121 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
+@@ -2679,6 +2679,126 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
      assert backend.last_load_warning is None
  
  
@@ -440,11 +440,16 @@ index 9700da8541..40a832cfc4 100644
 +):
 +    """An integrated CUDA SoC (RTX Spark N1X, DGX Spark): llama.cpp resolves both auto modes off,
 +    and the APU preflight prices the pool against system RAM."""
-+    backend, gguf = _apu_backend(tmp_path, gguf_gb = gguf_gb, avail_mib = avail_mib, monkeypatch = monkeypatch)
++    backend, gguf = _apu_backend(
++        tmp_path, gguf_gb = gguf_gb, avail_mib = avail_mib, monkeypatch = monkeypatch
++    )
 +    backend._lazy_auto_resolves_off = lambda **_kw: igpu
 +    backend._gguf_tensor_scan = lambda _path: (
 +        "deepseek41",
-+        {"per_layer_token_embd.weight": table, "blk.0.ffn_up_exps.weight": int(gguf_gb * _GiB) - table},
++        {
++            "per_layer_token_embd.weight": table,
++            "blk.0.ffn_up_exps.weight": int(gguf_gb * _GiB) - table,
++        },
 +        0,
 +    )
 +    caps = dict(LlamaCppBackend.probe_server_capabilities.__func__(LlamaCppBackend, None))
@@ -541,7 +546,7 @@ index 9700da8541..40a832cfc4 100644
  def _unmapped_tokens(cmd):
      """The tokens in ``cmd`` that select a mode llama.cpp does not mmap."""
      out = []
-@@ -5779,7 +5894,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
+@@ -5779,7 +5899,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
      assert src.index("_vulkan_igpu_ids = (") < src.index(
          "_gpu_mem = self._vulkan_auto_gpu_memory(_gpu_mem)"
      )
@@ -550,6 +555,40 @@ index 9700da8541..40a832cfc4 100644
  
  
  def test_the_oversized_readings_share_their_preflights_ram_snapshot():
+@@ -7075,3 +7195,33 @@ def test_the_checkpoint_discount_removes_only_the_checkpoints():
+         without = backend._slots_that_fit_on_gpu(*args, ctx_checkpoints = 0, **kw)
+         assert with_ckpts == without
+     assert without[1] is False and without[2] < 8
++
++
++@pytest.mark.parametrize(
++    "note, expected",
++    [
++        (
++            llama_cpp_module._PAGEABLE_AUTO_OVERRIDE_NOTE,
++            llama_cpp_module._PAGEABLE_AUTO_OVERRIDE_TEXT_ONLY_NOTICE,
++        ),
++        (
++            llama_cpp_module._PAGEABLE_OVERRIDE_NOTE,
++            llama_cpp_module._PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE,
++        ),
++    ],
++    ids = ["igpu-auto", "user-none"],
++)
++def test_the_text_only_notice_keeps_who_chose_the_unmapped_mode(note, expected):
++    """Dropping the pinned projector leaves only the override's note; the iGPU one must not claim
++    the user asked for an unmapped load."""
++    backend = LlamaCppBackend()
++    apu_msg = "This model needs about 70 GB but only about 60 GB of memory is available."
++    backend._last_load_warning = apu_msg + note
++    backend._reprice_after_dropping_pinned_projector(
++        apu_msg = apu_msg,
++        host_msg = None,
++        model_size = 50 * 1024**3,
++        pinned_bytes = 2 * 1024**3,
++        avail_mib = 60 * 1024,
++    )
++    assert backend._last_load_warning == expected
 diff --git a/studio/backend/tests/test_llama_server_args.py b/studio/backend/tests/test_llama_server_args.py
 index a3bf4865bc..267e3800b6 100644
 --- a/studio/backend/tests/test_llama_server_args.py
