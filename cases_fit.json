@@ -1,0 +1,5 @@
+{"lazy_on_fit8g": ["--lazy-mode", "on", "--fit-target", "8192"],
+ "lazy_on_fit16g": ["--lazy-mode", "on", "--fit-target", "16384"],
+ "mmap_lazy_on_fit8g": ["--load-mode", "mmap", "--lazy-mode", "on", "--fit-target", "8192"],
+ "mmap_lazy_on_fit16g": ["--load-mode", "mmap", "--lazy-mode", "on", "--fit-target", "16384"],
+ "auto_fit16g": ["--fit-target", "16384"]}

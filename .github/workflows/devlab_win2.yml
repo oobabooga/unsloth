@@ -1,0 +1,80 @@
+name: AMD DevLab iGPU fit headroom (Windows)
+
+on:
+  push:
+    branches: [devlab-igpu-pageable-win2]
+
+permissions: {}
+
+env:
+  BASE_SHA: 0ab3f0773d
+  REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    steps:
+      - name: Host facts and checkouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $W = Join-Path $env:RUNNER_TEMP ("igw-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+          New-Item -ItemType Directory -Force "$W\out", "$W\hf", "$W\tmp" | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "W=$W"
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List | Out-String | Tee-Object -FilePath "$W\out\host.txt"
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | Format-List | Out-String | Tee-Object -FilePath "$W\out\host.txt" -Append
+          foreach ($f in "branch.patch", "tree.txt", "studio_ab.py", "raw_matrix_win.py", "cases_fit.json") { Invoke-WebRequest -UseBasicParsing "$env:RAW/$f" -OutFile "$W\$f" }
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\A"
+          git -C "$W\A" checkout -q $env:BASE_SHA
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W\B"
+          git -C "$W\B" checkout -q $env:BASE_SHA
+          git -C "$W\B" apply --whitespace=nowarn "$W\branch.patch"
+          git -C "$W\B" add -A
+          $tree = git -C "$W\B" write-tree
+          $want = (Get-Content "$W\tree.txt").Trim()
+          if ($tree -ne $want) { throw "B tree $tree differs from $want" } else { "B tree matches the branch commit" }
+      - name: Install Studio from A
+        shell: powershell
+        run: |
+          $env:UNSLOTH_STUDIO_HOME = "$env:W\home"; $env:UNSLOTH_SKIP_AUTOSTART = "1"; $env:HF_HOME = "$env:W\hf"
+          # The runner kills a step's children when the step ends, so the download runs and finishes inside this step.
+          # hf on this runner reports hf_xet missing even with the extra installed, so fetch the shards over plain HTTPS.
+          python -m venv "$env:W\hfv"
+          & "$env:W\hfv\Scripts\pip.exe" -q install "huggingface_hub[hf_xet]>=0.34"
+          & "$env:W\hfv\Scripts\python.exe" -c "import hf_xet, sys; print('hf_xet', hf_xet.__file__)" *> "$env:W\out\hf_xet_import.txt"
+          & "$env:W\hfv\Scripts\pip.exe" show hf_xet *>> "$env:W\out\hf_xet_import.txt"
+          $Q = "$env:W\q5"; New-Item -ItemType Directory -Force $Q | Out-Null
+          $dls = foreach ($i in 1..6) {
+            $f = "Qwen3.8-Flash-Next-UD-Q5_K_XL-0000$i-of-00006.gguf"
+            Start-Process -PassThru -WindowStyle Hidden -FilePath curl.exe -ArgumentList "-sSfL", "--retry", "5", "-o", "$Q\$f", "https://huggingface.co/$env:REPO/resolve/main/UD-Q5_K_XL/$f"
+          }
+          $dl0 = Get-Date
+          Set-Location "$env:W\A"
+          $t0 = Get-Date
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 --local *> "$env:W\out\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:W\out\install.log" -Tail 30
+          "install rc=$rc seconds=$([int]((Get-Date) - $t0).TotalSeconds)"
+          $s = Get-ChildItem -Recurse -Filter llama-server.exe "$env:W\home" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $s.FullName | Set-Content "$env:W\server.txt"
+          Get-Content "$env:W\home\llama.cpp\BUILD_INFO.txt" -ErrorAction SilentlyContinue | Select-Object -First 8
+          foreach ($d in $dls) { $d.WaitForExit(); "curl pid $($d.Id) rc=$($d.ExitCode)" | Tee-Object -FilePath "$env:W\out\dl-summary.txt" -Append }
+          "download seconds=$([int]((Get-Date) - $dl0).TotalSeconds)" | Tee-Object -FilePath "$env:W\out\dl-summary.txt" -Append
+          Get-ChildItem $Q | Measure-Object -Sum Length | ForEach-Object { "Q5 bytes on disk: $($_.Sum)" } | Tee-Object -FilePath "$env:W\out\dl-summary.txt" -Append
+          exit $rc
+      - name: Raw matrix with GPU headroom (fit-target) and the lazy table
+        shell: powershell
+        run: |
+          $py = "$env:W\home\unsloth_studio\Scripts\python.exe"
+          $m = Get-Item "$env:W\q5\Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf"
+          New-Item -ItemType Directory -Force "$env:W\out\fit-raw" | Out-Null
+          & $py "$env:W\raw_matrix_win.py" --server (Get-Content "$env:W\server.txt") --model $m.FullName --out "$env:W\out\fit-raw.json" --logdir "$env:W\out\fit-raw" --cases "$env:W\cases_fit.json"
+          exit 0
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-pageable-windows-fit
+          path: ${{ env.W }}\out
