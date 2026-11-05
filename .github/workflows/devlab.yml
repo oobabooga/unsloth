@@ -38,21 +38,21 @@ jobs:
           git -C "$W/B" add -A
           test "$(git -C "$W/B" write-tree)" = "$(curl -sfL "$RAW/tree.txt")"
           echo "B tree matches the branch commit"
-      - name: Start model downloads in the background
+      - name: Start the Q5 download in the background
         run: |
-          W="$RUNNER_TEMP/ig"
-          python3 -m venv "$W/hfv"; "$W/hfv/bin/pip" -q install "huggingface_hub[hf_xet]>=0.34"
+          W="$RUNNER_TEMP/ig"; Q="$W/q5"; mkdir -p "$Q"
+          # The hub client refuses a plain-HTTP fallback for the >50 GB table shard when xet fails, so use curl.
           cat > "$W/dl.sh" <<'SH'
-          set -x
-          W="$1"; export HF_HOME="$W/hf"
-          for v in UD-IQ1_S UD-Q5_K_XL; do
-            t0=$(date +%s)
-            "$W/hfv/bin/hf" download "$REPO" --include "$v/*" > "$W/out/dl-$v.log" 2>&1
-            echo "$v rc=$? seconds=$(( $(date +%s) - t0 ))" >> "$W/out/dl-summary.txt"
-            touch "$W/dl-$v.done"
+          W="$1"; Q="$W/q5"; t0=$(date +%s); pids=""
+          for i in 1 2 3 4 5 6; do
+            f="Qwen3.8-Flash-Next-UD-Q5_K_XL-0000$i-of-00006.gguf"
+            curl -sSfL --retry 5 -o "$Q/$f" "https://huggingface.co/$REPO/resolve/main/UD-Q5_K_XL/$f" & pids="$pids $!"
           done
+          rc=0; for p in $pids; do wait $p || rc=1; done
+          echo "UD-Q5_K_XL rc=$rc seconds=$(( $(date +%s) - t0 )) bytes=$(du -sb "$Q" | cut -f1)" >> "$W/out/dl-summary.txt"
+          touch "$W/dl-UD-Q5_K_XL.done"
           SH
-          REPO="$REPO" nohup bash "$W/dl.sh" "$W" > "$W/out/dl.log" 2>&1 &
+          REPO="$REPO" setsid nohup bash "$W/dl.sh" "$W" > "$W/out/dl.log" 2>&1 &
           echo started
       - name: Install Studio from A
         run: |
@@ -66,11 +66,9 @@ jobs:
           S="$(head -1 "$W/server.txt")"
           "$S" --help 2>/dev/null | grep -A8 -E -- '--load-mode|--lazy-mode' | tee "$W/out/load-mode-help.txt"
           exit $rc
-      - name: T1 UD-IQ1_S, a load that fits (A then B, then raw matrix)
+      - name: T2 UD-Q5_K_XL (147 GiB) with nothing held back (A then B, then raw matrix)
         run: |
           W="$RUNNER_TEMP/ig"
-          for i in $(seq 1 360); do [ -f "$W/dl-UD-IQ1_S.done" ] && break; sleep 10; done
-          cat "$W/out/dl-summary.txt"
           run_side() {
             side=$1; port=$2; name=$3; variant=$4; leave=$5
             cd "$W/$side/studio/backend"
@@ -80,22 +78,16 @@ jobs:
             for i in $(seq 1 150); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
             if [ "$leave" != "none" ]; then python3 "$W/balloon.py" --leave "$leave" --out "$W/out/$name-balloon.json" & lpid=$!; for i in $(seq 1 120); do [ -s "$W/out/$name-balloon.json" ] && break; sleep 2; done; cat "$W/out/$name-balloon.json"; fi
             grep -E 'MemAvailable|SwapFree' /proc/meminfo
-            "$W/home/unsloth_studio/bin/python" "$W/studio_ab.py" --base http://127.0.0.1:$port --home "$W/home" --repo "$REPO" --variant "$variant" --out "$W/out/$name.json" --pwfile "$W/pw.txt"
+            "$W/home/unsloth_studio/bin/python" "$W/studio_ab.py" --base http://127.0.0.1:$port --home "$W/home" --repo "$REPO" --variant "$variant" ${M:+--model-path "$M"} --out "$W/out/$name.json" --pwfile "$W/pw.txt"
             [ -n "${lpid:-}" ] && { kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid; wait $lpid 2>/dev/null; }
             kill $bpid; sleep 5; pkill -9 -f "$W/home/.*llama-server" || true; sleep 5
             unset lpid
           }
-          run_side A 8911 t1-A UD-IQ1_S none
-          run_side B 8912 t1-B UD-IQ1_S none
-          declare -f run_side > "$W/run_side.sh"
-      - name: T2 UD-Q5_K_XL (147 GiB) with nothing held back (A then B, then raw matrix)
-        run: |
-          W="$RUNNER_TEMP/ig"; source "$W/run_side.sh"
           for i in $(seq 1 900); do [ -f "$W/dl-UD-Q5_K_XL.done" ] && break; sleep 10; done
           cat "$W/out/dl-summary.txt"
+          M="$W/q5/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf"; S="$(head -1 "$W/server.txt")"
           run_side A 8921 t2-A UD-Q5_K_XL none
           run_side B 8922 t2-B UD-Q5_K_XL none
-          M=$(find "$W/hf" -path '*UD-Q5_K_XL*00001-of-*.gguf' | head -1); S="$(head -1 "$W/server.txt")"
           mkdir -p "$W/out/t2-raw"; python3 "$W/raw_matrix.py" --server "$S" --model "$M" --out "$W/out/t2-raw.json" --logdir "$W/out/t2-raw"
       - name: Summary
         if: always()
