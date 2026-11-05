@@ -185,12 +185,37 @@ def visible_gpu() -> Optional[str]:
     return "0"
 
 
+def amdgpu_sysfs_mem() -> dict:
+    """{used_mib, total_mib, util, name} summed over VRAM + GTT of the first amdgpu card with mem_info files."""
+    import glob
+
+    for dev in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
+        try:
+            rd = lambda n: int(Path(dev, n).read_text(encoding = "utf-8").strip())  # noqa: E731
+            used = rd("mem_info_vram_used") + rd("mem_info_gtt_used")
+            total = rd("mem_info_vram_total") + rd("mem_info_gtt_total")
+            try:
+                util = rd("gpu_busy_percent")
+            except (OSError, ValueError):
+                util = 0
+            return {"used_mib": used >> 20, "total_mib": total >> 20, "util": util, "name": "amd (sysfs vram+gtt)"}
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
 def gpu_query(device: Optional[str] = None) -> dict:
     """{used_mib, total_mib, util, name} for one device, or {} when there is no SMI to ask."""
     device = device or visible_gpu()
     vendor = gpu_vendor()
     if device is None:
         return {}
+    if vendor == "amd" and os.environ.get("DBENCH_AMD_SYSFS_MEM", "1") != "0":
+        # amdgpu sysfs, VRAM + GTT: on a unified-memory APU (Strix Halo) most of what a model holds is GTT, which
+        # amd-smi's used_vram leaves out (it read 0 GiB on gfx1151). Device-wide, like nvidia-smi's figure.
+        q = amdgpu_sysfs_mem()
+        if q:
+            return q
     try:
         if vendor == "nvidia":
             out = smi(["-i", device, "--query-gpu=memory.used,memory.total,utilization.gpu,name",

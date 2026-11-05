@@ -137,6 +137,7 @@ JOB = """
             --target "$AMD_CI_WORK/fa_site" . > "$AMD_CI_WORK/out/fa_build.log" 2>&1
           echo "flash-attn --target rc=$?"
           tail -3 "$AMD_CI_WORK/out/fa_build.log"
+          cd "$AMD_CI_WORK"  # out of the source tree: python -c puts the cwd on sys.path
           "$AMD_CI_PY" -c "import importlib.util as u; print('flash_attn importable WITHOUT the dir (must be False):', u.find_spec('flash_attn') is not None)"
           FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTHONPATH="$AMD_CI_WORK/fa_site" \\
             "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
@@ -157,8 +158,10 @@ JOB = """
             P="$AMD_CI_WORK/comfy_venv_$arm/bin/python"
             "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
             if [ "$arm" = default ]; then
-              # README, "AMD GPUs (Linux)": the stable ROCm wheel, then the requirements.
-              "$P" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/comfy_${{arm}}_torch.log" 2>&1
+              # README, "AMD GPUs (Linux)": the stable ROCm wheel from download.pytorch.org/whl/rocm7.2, then the
+              # requirements. Pinned to that index's newest torch (2.14.1+rocm7.2): the runner's pip config adds a
+              # PyPI mirror as an extra index, where an unpinned "torch" resolves to a newer CUDA build.
+              PIP_CONFIG_FILE=/dev/null "$P" -m pip install "torch==2.14.1+rocm7.2" "torchvision==0.29.1+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/comfy_${{arm}}_torch.log" 2>&1
             else
               "$P" -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==$TV" "torchvision==$VV" > "$AMD_CI_WORK/out/comfy_${{arm}}_torch.log" 2>&1
             fi
@@ -282,6 +285,7 @@ def main() -> int:
     ap.add_argument("--jobs", default = "", help = "comma list of job ids to emit (default all)")
     args = ap.parse_args()
     want = [j for j in args.jobs.split(",") if j]
+    want_trial = not want or "t0_trial" in want
     text = HEADER.format(branch = BRANCH, main_sha = args.main_sha, comfy_sha = COMFY_SHA, fa_sha = FA_SHA)
     prev = None
     for jid, title, spec, only, head_only, groups in JOBS:
@@ -292,9 +296,15 @@ def main() -> int:
             pa += ["--only", o]
         pa += ["--state-only", f"head={head_only}"]
         # the measurement jobs run only after the trial (or the previous job) finished; a failed trial stops them
+        # strict on the trial (a failed trial measures nothing), always() between measurement jobs
         needs = ""
-        if prev:
-            needs = f"    needs: [{prev}]\n" + ("" if prev == "t0_trial" else "    if: ${{ always() }}\n")
+        if prev == "t0_trial":
+            needs = "    needs: [t0_trial]\n"
+        elif prev and want_trial:
+            needs = (f"    needs: [t0_trial, {prev}]\n"
+                     "    if: ${{ always() && needs.t0_trial.result == 'success' }}\n")
+        elif prev:
+            needs = f"    needs: [{prev}]\n    if: ${{{{ always() }}}}\n"
         prep = ""
         if groups:
             prep = PREP_STEP.format(groups = groups, wan_cmd = WAN_CMD if "wan" in groups else "")
