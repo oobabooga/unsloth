@@ -1,0 +1,120 @@
+name: AMD DevLab iGPU pageable load A/B
+
+on:
+  push:
+    branches: [devlab-igpu-pageable]
+
+permissions: {}
+
+env:
+  BASE_SHA: 0ab3f0773d
+  REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Host facts
+        run: |
+          W="$RUNNER_TEMP/ig"; mkdir -p "$W"/{tmp,hf,out}
+          {
+            uname -a; free -g; df -h "$RUNNER_TEMP" | tail -1
+            cat /opt/rocm/.info/version 2>/dev/null
+            for d in /sys/class/drm/card*/device; do [ -f "$d/mem_info_vram_total" ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total 2>/dev/null)"; done
+            rocminfo 2>/dev/null | grep -E 'Marketing Name|gfx1|Device Type' | head -8
+            swapon --show || true
+          } | tee "$W/out/host.txt"
+      - name: Checkouts (A = main, B = main + branch patch)
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/ig"
+          for f in branch.patch balloon.py studio_ab.py raw_matrix.py; do curl -sfL -o "$W/$f" "$RAW/$f"; done
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W/A"
+          git -C "$W/A" checkout -q "$BASE_SHA"
+          cp -a "$W/A" "$W/B"
+          git -C "$W/B" apply --whitespace=nowarn "$W/branch.patch"
+          git -C "$W/B" add -A
+          test "$(git -C "$W/B" write-tree)" = "$(curl -sfL "$RAW/tree.txt")"
+          echo "B tree matches the branch commit"
+      - name: Start model downloads in the background
+        run: |
+          W="$RUNNER_TEMP/ig"
+          python3 -m venv "$W/hfv"; "$W/hfv/bin/pip" -q install "huggingface_hub[hf_xet]>=0.34"
+          cat > "$W/dl.sh" <<'SH'
+          set -x
+          W="$1"; export HF_HOME="$W/hf"
+          for v in UD-IQ1_S UD-Q5_K_XL; do
+            t0=$(date +%s)
+            "$W/hfv/bin/hf" download "$REPO" --include "$v/*" > "$W/out/dl-$v.log" 2>&1
+            echo "$v rc=$? seconds=$(( $(date +%s) - t0 ))" >> "$W/out/dl-summary.txt"
+            touch "$W/dl-$v.done"
+          done
+          SH
+          REPO="$REPO" nohup bash "$W/dl.sh" "$W" > "$W/out/dl.log" 2>&1 &
+          echo started
+      - name: Install Studio from A
+        run: |
+          W="$RUNNER_TEMP/ig"
+          cd "$W/A"
+          export UNSLOTH_STUDIO_HOME="$W/home" UNSLOTH_SKIP_AUTOSTART=1 HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          t0=$(date +%s); ./install.sh --local > "$W/out/install.log" 2>&1; rc=$?
+          tail -30 "$W/out/install.log"; echo "install rc=$rc seconds=$(( $(date +%s) - t0 ))"
+          find "$W/home" -name 'llama-server' -type f | head -3 | tee "$W/server.txt"
+          cat "$W"/home/llama.cpp/BUILD_INFO.txt 2>/dev/null | head -8
+          S="$(head -1 "$W/server.txt")"
+          "$S" --help 2>/dev/null | grep -A8 -E -- '--load-mode|--lazy-mode' | tee "$W/out/load-mode-help.txt"
+          exit $rc
+      - name: T1 UD-IQ1_S with host memory held back (A then B, then raw matrix)
+        run: |
+          W="$RUNNER_TEMP/ig"
+          for i in $(seq 1 360); do [ -f "$W/dl-UD-IQ1_S.done" ] && break; sleep 10; done
+          cat "$W/out/dl-summary.txt"
+          VRAM=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -n | tail -1); VRAM_GIB=$(( ${VRAM:-0} / 1073741824 ))
+          # Large carve-out: the 35 GiB of weights fit the carve-out, so leave less RAM than the 26.8 GiB table.
+          # Small carve-out: GPU memory comes out of RAM, so leave more than the weights but less than the whole file.
+          if [ "$VRAM_GIB" -ge 32 ]; then LEAVE=16; else LEAVE=48; fi
+          echo "vram_gib=$VRAM_GIB leave_gib=$LEAVE" | tee "$W/out/t1-balloon.txt"
+          run_side() {
+            side=$1; port=$2; name=$3; variant=$4; leave=$5
+            cd "$W/$side/studio/backend"
+            PATH="$HOME/.local/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" nohup "$W/home/unsloth_studio/bin/python" run.py --api-only --host 127.0.0.1 --port $port > "$W/out/$name-backend.log" 2>&1 &
+            bpid=$!
+            for i in $(seq 1 150); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+            if [ "$leave" != "none" ]; then python3 "$W/balloon.py" --leave "$leave" --out "$W/out/$name-balloon.json" & lpid=$!; for i in $(seq 1 120); do [ -s "$W/out/$name-balloon.json" ] && break; sleep 2; done; cat "$W/out/$name-balloon.json"; fi
+            grep MemAvailable /proc/meminfo
+            "$W/home/unsloth_studio/bin/python" "$W/studio_ab.py" --base http://127.0.0.1:$port --home "$W/home" --repo "$REPO" --variant "$variant" --out "$W/out/$name.json" --pwfile "$W/pw.txt"
+            [ -n "${lpid:-}" ] && { kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid; wait $lpid 2>/dev/null; }
+            kill $bpid; sleep 5; pkill -9 -f "$W/home/.*llama-server" || true; sleep 5
+            unset lpid
+          }
+          run_side A 8911 t1-A UD-IQ1_S $LEAVE
+          run_side B 8912 t1-B UD-IQ1_S $LEAVE
+          M=$(find "$W/hf" -path '*UD-IQ1_S*00001-of-*.gguf' | head -1); S="$(head -1 "$W/server.txt")"
+          python3 "$W/balloon.py" --leave $LEAVE --out "$W/out/t1-raw-balloon.json" & lpid=$!
+          for i in $(seq 1 120); do [ -s "$W/out/t1-raw-balloon.json" ] && break; sleep 2; done
+          mkdir -p "$W/out/t1-raw"; python3 "$W/raw_matrix.py" --server "$S" --model "$M" --out "$W/out/t1-raw.json" --logdir "$W/out/t1-raw"
+          kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid
+          declare -f run_side > "$W/run_side.sh"; echo "LEAVE=$LEAVE" >> "$W/run_side.sh"
+      - name: T2 UD-Q5_K_XL (147 GiB) with nothing held back (A then B, then raw matrix)
+        run: |
+          W="$RUNNER_TEMP/ig"; source "$W/run_side.sh"
+          for i in $(seq 1 900); do [ -f "$W/dl-UD-Q5_K_XL.done" ] && break; sleep 10; done
+          cat "$W/out/dl-summary.txt"
+          run_side A 8921 t2-A UD-Q5_K_XL none
+          run_side B 8922 t2-B UD-Q5_K_XL none
+          M=$(find "$W/hf" -path '*UD-Q5_K_XL*00001-of-*.gguf' | head -1); S="$(head -1 "$W/server.txt")"
+          mkdir -p "$W/out/t2-raw"; python3 "$W/raw_matrix.py" --server "$S" --model "$M" --out "$W/out/t2-raw.json" --logdir "$W/out/t2-raw"
+      - name: Summary
+        if: always()
+        run: |
+          W="$RUNNER_TEMP/ig"; cd "$W/out"
+          for f in t1-A t1-B t2-A t2-B; do [ -f $f.json ] && python3 -c "import json;d=json.load(open('$f.json'));print('$f', d.get('load_status'), d.get('load_seconds'), str((d.get('load_response') or {}).get('memory_warning') if isinstance(d.get('load_response'),dict) else d.get('load_response'))[:600]); [print('  ',l) for g in d.get('llama_logs',[]) for l in g['lines'][:12]]; [print('  chat',k,d.get(k)) for k in ('chat0','chat1') if d.get(k)]"; done
+          for f in t1-raw t2-raw; do [ -f $f.json ] && python3 -c "import json;d=json.load(open('$f.json'));[print('$f',k,v.get('loaded'),v.get('load_seconds'),v.get('peak_rss_gib'),v.get('min_avail_gib'),(v.get('long') or {}).get('timings')) for k,v in d.items()]"; done
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-pageable-linux
+          path: ${{ runner.temp }}/ig/out
