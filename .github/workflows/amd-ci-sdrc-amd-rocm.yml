@@ -140,7 +140,11 @@ jobs:
         run: |
           set +e
           export PATH="/usr/local/bin:/usr/bin:/bin"
-          env -u LD_LIBRARY_PATH -u ROCM_PATH -u HIP_PATH ldd "$ROCM_BIN/sd-cli" | grep -E "not found|amdhip|rocblas|hipblas" | tee "$AMD_CI_WORK/out/ldd_bundle.txt"
+          env -u LD_LIBRARY_PATH -u ROCM_PATH -u HIP_PATH ldd "$ROCM_BIN/sd-cli" | grep -E "not found|amdhip|rocblas|hipblas|hsa" | tee "$AMD_CI_WORK/out/ldd_bundle.txt"
+          # the bundle must load its own ROCm userspace, never the host's /opt/rocm*
+          if grep -E "=> /opt/rocm|not found" "$AMD_CI_WORK/out/ldd_bundle.txt"; then echo "BUNDLE_NOT_SELF_CONTAINED" | tee -a "$AMD_CI_WORK/out/ldd_bundle.txt"; fi
+          ls -a "$ROCM_BIN" "$ROCM_BIN/lib" | head -60 > "$AMD_CI_WORK/out/bundle_tree.txt"
+          (cd "$ROCM_BIN" && find . -type d | head -20) >> "$AMD_CI_WORK/out/bundle_tree.txt"
           env -u LD_LIBRARY_PATH -u ROCM_PATH -u HIP_PATH -u CMAKE_PREFIX_PATH "$AMD_CI_WORK/.rocm/bin/python" -u tooling/sdrc/run.py --plan rocm --bin rocm="$ROCM_BIN" \
             --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/rocm" 2>&1 | tail -60
           exit 0
