@@ -130,7 +130,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$py"
           # Studio's Windows gfx1151 route (setup.ps1 / install_python_stack.py): AMD multi-arch index,
           # torch[device-gfx1151]==2.11.0+rocm7.14.0; diffusers pin + studio.txt; torchao / unsloth_zoo no-deps.
-          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1151]==2.11.0+rocm7.14.0" "torchvision[device-gfx1151]"
+          & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1151]==2.11.0+rocm7.14.0" "torchvision[device-gfx1151]==0.26.0+rocm7.14.0"
           if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: ROCm torch install failed"; exit $LASTEXITCODE }
           $states = Get-Content "$env:AMD_CI_WORK\out\states.json" -Raw -Encoding UTF8 | ConvertFrom-Json
           $req = Join-Path $states.paths.base "studio\backend\requirements"
