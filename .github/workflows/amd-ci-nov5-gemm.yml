@@ -100,12 +100,15 @@ jobs:
           exit 0
 
       - name: "A: HIP WMMA peak + GEMMs"
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           set +e
           O="$AMD_CI_WORK/out"
-          timeout 840 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section hip --lib-dir "$AMD_CI_WORK/wmma_libs" --out "$O/A_hip.json" > "$O/A_hip.log" 2>&1
-          echo "hip rc=$?"
+          # One process per kind: a fault in one kernel cannot poison the others' measurements.
+          for kd in f16 bf16 iu8 iu4 w4a16; do
+            timeout 400 "$PYA" amd_ci/probes/gemm_lowp/probe.py --section hip --kinds $kd --lib-dir "$AMD_CI_WORK/wmma_libs" --out "$O/A_hip_$kd.json" > "$O/A_hip_$kd.log" 2>&1
+            echo "hip $kd rc=$?"
+          done
           exit 0
 
       - name: "A: _int_mm + Studio eager W8A8"

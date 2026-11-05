@@ -566,7 +566,8 @@ def sec_compile(a):
                 r["compiled"] = bench(lambda: fn(xx, rh, wq, wsi, bias))
                 r["compiled"]["tops"] = tops(m, k, n, r["compiled"]["ms"])
                 r["err_vs_eager"] = relerr(out, eager)
-                r["bf16_ms"] = bench(lambda: F.linear(xx, (wq.float() * ws[:, None]).to(torch.bfloat16), bias))["ms"]
+                wdq = (wq.float() * ws[:, None]).to(torch.bfloat16)
+                r["bf16_ms"] = bench(lambda: F.linear(xx, wdq, bias))["ms"]
             except Exception as exc:  # noqa: BLE001
                 r.update(err(exc))
             res[label] = r
@@ -594,16 +595,20 @@ def sec_compile(a):
 
 
 # ------------------------------------------------------------------------------------------------------------ hip
-def load_libs(lib_dir):
+def load_libs(lib_dir, kinds):
     import ctypes
     libs = {}
-    for name in ("f16", "bf16", "iu8", "iu4", "w4a16"):
+    for name in kinds:
         p = os.path.join(lib_dir, f"libwm_{name}.so")
         if not os.path.exists(p):
             libs[name] = "missing"
             continue
         try:
-            lib = ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
+            # RTLD_LOCAL + hidden visibility: every libwm_*.so defines the same kernel names, and a global
+            # load lets the first library's kernels interpose on the others (run 1 launched f16 kernels for all).
+            lib = ctypes.CDLL(p, mode=ctypes.RTLD_LOCAL)
+            if lib.wm_kind() != {"f16": 0, "bf16": 1, "iu8": 2, "iu4": 3, "w4a16": 4}[name]:
+                raise RuntimeError(f"wm_kind mismatch for {name}")
             vp, ci = ctypes.c_void_p, ctypes.c_int
             lib.wm_gemm.argtypes = [ci, vp, vp, vp, vp, vp, ci, ci, ci, ci, vp]
             lib.wm_peak.argtypes = [ci, ci, vp, vp]
@@ -624,7 +629,8 @@ def pack_int4(q, lo_first=True):
 
 def sec_hip(a):
     res = {}
-    libs = load_libs(a.lib_dir)
+    kinds = [k for k in a.kinds.split(",") if k]
+    libs = load_libs(a.lib_dir, kinds)
     res["libs"] = {k: (v if isinstance(v, str) else "loaded") for k, v in libs.items()}
     stream = lambda: ctypes_stream()  # noqa: E731
     OUT["hip"] = res
@@ -634,7 +640,7 @@ def sec_hip(a):
     peak = {}
     for name in ("f16", "bf16", "iu8", "iu4"):
         lib = libs.get(name)
-        if isinstance(lib, str):
+        if lib is None or isinstance(lib, str):
             continue
         try:
             blocks, iters = cu * 16, 4000
@@ -656,7 +662,7 @@ def sec_hip(a):
     tile = {}
     for name in ("f16", "bf16", "iu8", "iu4"):
         lib = libs.get(name)
-        if isinstance(lib, str):
+        if lib is None or isinstance(lib, str):
             continue
         try:
             lo, hi = (-8, 8) if name == "iu4" else (-20, 21)
@@ -1100,6 +1106,7 @@ def sec_inline(a):
 __global__ void add1(float* x, int n){ int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += 1.0f; }
 void run(torch::Tensor x){ int n = x.numel(); add1<<<(n + 255) / 256, 256>>>(x.data_ptr<float>(), n); }
 """
+        os.makedirs(a.inline_dir, exist_ok=True)
         t0 = time.time()
         mod = cpp_extension.load_inline(name="gemm_lowp_inline_smoke", cpp_sources="void run(torch::Tensor x);",
                                         cuda_sources=src_cuda, functions=["run"], verbose=False,
@@ -1128,6 +1135,7 @@ def main():
     ap.add_argument("--lib-dir", default="")
     ap.add_argument("--work", default=os.environ.get("AMD_CI_WORK", "."))
     ap.add_argument("--inline-dir", default="")
+    ap.add_argument("--kinds", default="f16,bf16,iu8,iu4,w4a16")
     ap.add_argument("--shapes", default="", help="debug: comma list of MxKxN to restrict")
     a = ap.parse_args()
     OUT_PATH = a.out

@@ -103,7 +103,7 @@ def main():
         return
     res["clang_version"] = run([chosen["clang"], "--version"], timeout=60)
     common = [chosen["clang"], "--offload-arch=gfx1151", "-O3", "-std=c++17", f"--rocm-path={chosen['root']}",
-              f"--rocm-device-lib-path={chosen['bitcode']}", "-Wno-pass-failed"]
+              f"--rocm-device-lib-path={chosen['bitcode']}", "-Wno-pass-failed", "-fvisibility=hidden"]
     for k, name in KINDS.items():
         so = os.path.join(a.lib_dir, f"libwm_{name}.so")
         r = run(common + [f"-DKIND={k}", "-fPIC", "-shared", "-no-hip-rt", "-o", so, "-x", "hip", src,

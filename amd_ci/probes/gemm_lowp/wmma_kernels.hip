@@ -22,6 +22,11 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
+#define WM_NS_(k) wm_kind_##k
+#define WM_NS(k) WM_NS_(k)
+#define WM_API extern "C" __attribute__((visibility("default")))
+namespace WM_NS(KIND) {
+
 __device__ __forceinline__ unsigned short f2bf(float f) {
   unsigned int u = __float_as_uint(f);
   u += 0x7FFFu + ((u >> 16) & 1u);
@@ -181,17 +186,19 @@ static int launch(const void* A, const void* W, void* C, const float* sa, const 
   return (int)hipGetLastError();
 }
 
-extern "C" {
-int wm_kind() { return KIND; }
-int wm_ncfg() { return 4; }
-int wm_cfg(int cfg, int* tm, int* tn) {
+}  // namespace
+using namespace WM_NS(KIND);
+
+WM_API int wm_kind() { return KIND; }
+WM_API int wm_ncfg() { return 4; }
+WM_API int wm_cfg(int cfg, int* tm, int* tn) {
   static const int t[4][2] = {{2, 2}, {2, 4}, {4, 2}, {4, 4}};
   if (cfg < 0 || cfg > 3) return -1;
   *tm = t[cfg][0];
   *tn = t[cfg][1];
   return 0;
 }
-int wm_gemm(int cfg, const void* A, const void* W, void* C, const float* sa, const float* sw, int M, int N, int K,
+WM_API int wm_gemm(int cfg, const void* A, const void* W, void* C, const float* sa, const float* sw, int M, int N, int K,
             int G, void* stream) {
   hipStream_t s = (hipStream_t)stream;
   switch (cfg) {
@@ -202,12 +209,11 @@ int wm_gemm(int cfg, const void* A, const void* W, void* C, const float* sa, con
   }
   return -1;
 }
-int wm_peak(int blocks, int iters, float* out, void* stream) {
+WM_API int wm_peak(int blocks, int iters, float* out, void* stream) {
   hipLaunchKernelGGL(peak_kernel, dim3(blocks), dim3(128), 0, (hipStream_t)stream, iters, out);
   return (int)hipGetLastError();
 }
-int wm_tile(const void* A, const void* W, float* out, void* stream) {
+WM_API int wm_tile(const void* A, const void* W, float* out, void* stream) {
   hipLaunchKernelGGL(tile_kernel, dim3(1), dim3(32), 0, (hipStream_t)stream, A, W, out);
   return (int)hipGetLastError();
-}
 }

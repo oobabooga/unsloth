@@ -27,6 +27,18 @@ def f(v, nd=1):
 def arm_tables(d, arm):
     J = {s: load(os.path.join(d, f"{arm}_{s}.json")) for s in
          ("env", "dense", "intmm", "triton", "compile", "hip", "tunable", "accuracy", "block", "inline")}
+    parts = sorted(glob.glob(os.path.join(d, f"{arm}_hip_*.json")))
+    if parts:
+        hip = {"peak": {}, "tile": {}, "gemm": {}}
+        for pth in parts:
+            h = load(pth).get("hip", {})
+            hip["peak"].update(h.get("peak", {}))
+            hip["tile"].update(h.get("tile", {}))
+            for k, v in (h.get("gemm") or {}).items():
+                hip["gemm"].setdefault(k, {}).update(v)
+            if "iu4" in (h.get("tile") or {}):
+                hip["iu4_packing_used"] = h.get("iu4_packing_used")
+        J["hip"] = {"hip": hip, "status": "merged", "seconds": None}
     lines = [f"## arm {arm}: torch {g(J['env'], 'env', 'torch')} hip {g(J['env'], 'env', 'hip')} "
              f"triton {g(J['env'], 'env', 'triton')} on {g(J['env'], 'env', 'device')} {g(J['env'], 'env', 'arch')}", ""]
     for s, j in J.items():
