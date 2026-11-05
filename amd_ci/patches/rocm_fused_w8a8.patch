@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/diffusion_native_quant.py b/studio/backend/core/inference/diffusion_native_quant.py
-index 9d7104dac6..7720afa672 100644
+index 9d7104dac6..e5c792d6f0 100644
 --- a/studio/backend/core/inference/diffusion_native_quant.py
 +++ b/studio/backend/core/inference/diffusion_native_quant.py
 @@ -9,6 +9,7 @@ from __future__ import annotations
@@ -36,7 +36,7 @@ index 9d7104dac6..7720afa672 100644
      if _FUSED_STATE["failed"] is not None or int8_fused_disabled():
          return None
      fn = _FUSED_STATE["fn"]
-@@ -320,9 +337,24 @@ def _fused_w8a8() -> Optional[Callable[..., Any]]:
+@@ -320,9 +337,22 @@ def _fused_w8a8() -> Optional[Callable[..., Any]]:
          runtime = torch_compile_runtime_available()
      except Exception:  # noqa: BLE001 - unknown runtime: stay eager
          runtime = False
@@ -44,11 +44,9 @@ index 9d7104dac6..7720afa672 100644
 -        _FUSED_STATE["failed"] = "no inductor runtime" if not runtime else "ROCm"
 +    try:  # Studio's structured logger (the line lands in the server log), plain logging outside Studio
 +        from loggers import get_logger
-+
 +        log = get_logger(__name__)
 +    except Exception:  # noqa: BLE001
 +        import logging
-+
 +        log = logging.getLogger(__name__)
 +    if not runtime:
 +        _FUSED_STATE["failed"] = "no inductor runtime"
@@ -63,7 +61,7 @@ index 9d7104dac6..7720afa672 100644
      # Registered in eager, before any trace reads the handle.
      _FUSED_STATE["row_major"] = _row_major_op()
      # Every key exists before the first trace: older dynamo guards on len(_FUSED_STATE), so adding
-@@ -332,6 +364,7 @@ def _fused_w8a8() -> Optional[Callable[..., Any]]:
+@@ -332,6 +362,7 @@ def _fused_w8a8() -> Optional[Callable[..., Any]]:
      # One graph for every slice offset and chunk height (dynamic storage offset), written in place by inductor.
      _FUSED_STATE["into"] = torch.compile(_w8a8_rows_into, dynamic = True, fullgraph = True)
      _FUSED_STATE["fn"] = fn

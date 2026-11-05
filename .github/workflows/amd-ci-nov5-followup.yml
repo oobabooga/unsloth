@@ -20,8 +20,432 @@ env:
 
 jobs:
 
+  f5_fa_wan:
+    name: "Wan2.2-TI2V-5B, flash-attn auto under compile: main vs the traced-segments restart fix (gfx1151, exclusive GPU, nov5)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    # The shared GPU group (see templates/workflow.yml): one GPU measurement at a time across all branches.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "nov5-f5_fa_wan"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"
+          free -g
+          nproc
+          exit 0
+
+      - name: Resolve states (main, and main + a no-op marker so the head re-measures one reference cell)
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/rocm_flash_traced_restart.patch"
+          git -C "$AMD_CI_WORK/states/head" diff --cached --stat
+          python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK" \
+            --base-sha "$BASE_SHA" --patch rocm_flash_traced_restart.patch --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index is a PyPI mirror that lags; give uv pypi.org as an extra index (scaffold default).
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, transformers; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+
+      - name: flash-attention (DAO-AILab, Triton AMD backend) into its own --target dir (only the flash arms import it)
+        timeout-minutes: 30
+        run: |
+          set +e
+          git clone -q https://github.com/Dao-AILab/flash-attention "$AMD_CI_WORK/src/flash-attention"
+          git -C "$AMD_CI_WORK/src/flash-attention" checkout -q "$FA_SHA"
+          "$AMD_CI_PY" -m pip --version > /dev/null 2>&1 || "$AMD_CI_PY" -m ensurepip -q
+          "$AMD_CI_PY" -m pip install -q setuptools wheel packaging psutil ninja einops > "$AMD_CI_WORK/out/fa_deps.log" 2>&1
+          cd "$AMD_CI_WORK/src/flash-attention"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps \
+            --target "$AMD_CI_WORK/fa_site" . > "$AMD_CI_WORK/out/fa_build.log" 2>&1
+          echo "flash-attn --target rc=$?"
+          tail -3 "$AMD_CI_WORK/out/fa_build.log"
+          cd "$AMD_CI_WORK"  # out of the source tree: python -c puts the cwd on sys.path
+          "$AMD_CI_PY" -c "import importlib.util as u; print('flash_attn importable WITHOUT the dir (must be False):', u.find_spec('flash_attn') is not None)"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTHONPATH="$AMD_CI_WORK/fa_site" \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+          exit 0
+
+      - name: ComfyUI v0.44.0 (GitHub), README ROCm venv + a venv on Studio's gfx1151 torch
+        timeout-minutes: 60
+        run: |
+          set +e
+          git clone -q https://github.com/Comfy-Org/ComfyUI "$AMD_CI_WORK/ComfyUI"
+          git -C "$AMD_CI_WORK/ComfyUI" checkout -q "$COMFY_SHA"
+          git -C "$AMD_CI_WORK/ComfyUI" log -1 --format='ComfyUI %H %s'
+          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
+          TV=$("$AMD_CI_PY" -c "import torch; print(torch.__version__)")
+          VV=$("$AMD_CI_PY" -c "import torchvision; print(torchvision.__version__)")
+          for arm in default rock; do
+            "$BASEPY" -m venv "$AMD_CI_WORK/comfy_venv_$arm"
+            P="$AMD_CI_WORK/comfy_venv_$arm/bin/python"
+            "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
+            if [ "$arm" = default ]; then
+              # README, "AMD GPUs (Linux)": the stable ROCm wheel from download.pytorch.org/whl/rocm7.2, then the
+              # requirements. Pinned to that index's newest torch (2.14.1+rocm7.2): the runner's pip config adds a
+              # PyPI mirror as an extra index, where an unpinned "torch" resolves to a newer CUDA build.
+              PIP_CONFIG_FILE=/dev/null "$P" -m pip install "torch==2.14.1+rocm7.2" "torchvision==0.29.1+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
+            else
+              "$P" -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==$TV" "torchvision==$VV" > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
+            fi
+            echo "comfy $arm torch rc=$?"
+            "$P" -m pip install -r "$AMD_CI_WORK/ComfyUI/requirements.txt" > "$AMD_CI_WORK/out/comfy_${arm}_reqs.log" 2>&1
+            echo "comfy $arm requirements rc=$?"
+            "$P" -c "import torch, comfy_kitchen; print('comfy $arm torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), 'kitchen', getattr(comfy_kitchen, '__version__', '?'))"
+            (cd "$AMD_CI_WORK/ComfyUI" && timeout 600 "$P" main.py --quick-test-for-ci --disable-api-nodes > "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" 2>&1; echo "comfy $arm quick test rc=$?")
+            grep -E "Device:|pytorch version|comfy-kitchen|Using .* attention|Set vram state" "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" | head -8
+          done
+          exit 0
+
+      - name: Studio venv on download.pytorch.org torch 2.14.1+rocm7.2 (ComfyUI README torch)
+        timeout-minutes: 60
+        run: |
+          set +e
+          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
+          "$AMD_CI_PY" -m pip freeze > "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" 2>/dev/null
+          grep -viE '^(-e )?(torch|torchvision|torchaudio|triton|triton[-_]rocm|pytorch[-_]triton[-_a-z]*|rocm[-_a-z0-9]*|flash[-_]attn)( |=|@|$)' \
+            "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" > "$AMD_CI_WORK/out/pt72n_reqs.txt"
+          "$BASEPY" -m venv "$AMD_CI_WORK/studio_pt72n"
+          P="$AMD_CI_WORK/studio_pt72n/bin/python"
+          "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
+          "$P" -m pip install torch==2.14.1+rocm7.2 torchvision==0.29.1+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/pt72n_torch.log" 2>&1
+          echo "pt72n torch rc=$?"
+          "$P" -m pip install --no-deps -r "$AMD_CI_WORK/out/pt72n_reqs.txt" > "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1
+          rc=$?
+          echo "pt72n Studio packages (bulk) rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            while IFS= read -r line; do
+              "$P" -m pip install --no-deps "$line" >> "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1 || echo "pt72n skipped: $line"
+            done < "$AMD_CI_WORK/out/pt72n_reqs.txt"
+          fi
+          "$P" -c "import torch, diffusers, transformers; print('pt72n torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+          "$P" -m pip check 2>&1 | tail -5
+          exit 0
+
+      - name: ComfyUI files from the official repos (+ Studio's snapshots of the same repos, one download)
+        timeout-minutes: 150
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          mkdir -p "$AMD_CI_WORK/cm" "$AMD_CI_WORK/snap"
+          "$AMD_CI_PY" -m pip install -q safetensors huggingface_hub > /dev/null 2>&1
+          "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/diffusion_bench/amd/nov5_prep.py" --groups wan --snapshot-only \
+            --out "$AMD_CI_WORK/cm" --spec "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_nov5.json" \
+            --snap-root "$AMD_CI_WORK/snap" --env-file "$GITHUB_ENV" \
+            --comfy-python "$AMD_CI_WORK/comfy_venv_rock/bin/python" --comfy-dir "$AMD_CI_WORK/ComfyUI" \
+            2>&1 | tee "$AMD_CI_WORK/out/prep.log" | grep -vE "it/s|B/s" | tail -60
+          ls -la "$AMD_CI_WORK/cm"
+          df -h "$RUNNER_TEMP"
+          free -g
+          exit 0
+
+      - name: Clean GPU pool preflight (fail loudly on a co-tenant)
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
+            --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight.json"
+
+      - name: "Differential (Wan2.2-TI2V-5B, flash-attn auto under compile: main vs the traced-segments restart fix)"
+        run: |
+          set +e
+          export TORCH_HOME="$AMD_CI_WORK/torch_home"
+          export HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_differential.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_nov5.json --budget-min 420.0 --cell-timeout 3600.0 --only wan_s_def --only wan_s_flash --defect broken:wan_s_flash
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            [ "$pid" = "$$" ] && continue
+            cwd=$(readlink "$d/cwd" 2>/dev/null)
+            case "$cwd" in
+              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
+            esac
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov5-f5_fa_wan
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/cm/manifest*.json
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/record.json
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.png
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.mp4
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.log
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/scores.*
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/logs
+          retention-days: 14
+          if-no-files-found: warn
+
+  f3_w8a8:
+    name: "Native int8 W8A8 on ROCm: main vs compiled fused linear (studio/rocm-fused-w8a8) (gfx1151, exclusive GPU, nov5)"
+    needs: [f5_fa_wan]
+    if: ${{ always() }}
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 600
+    # The shared GPU group (see templates/workflow.yml): one GPU measurement at a time across all branches.
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "nov5-f3_w8a8"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json" || \
+          echo "note: gate ran before the venv exists; re-gated after install below"
+
+      - name: Disk, memory, cores
+        run: |
+          set +e
+          df -h "$RUNNER_TEMP"
+          free -g
+          nproc
+          exit 0
+
+      - name: Resolve states (main, and main + a no-op marker so the head re-measures one reference cell)
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
+          git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/rocm_fused_w8a8.patch"
+          git -C "$AMD_CI_WORK/states/head" diff --cached --stat
+          python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK" \
+            --base-sha "$BASE_SHA" --patch rocm_fused_w8a8.patch --out "$AMD_CI_WORK/out/states.json"
+
+      - name: Environment and real gate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cd "$AMD_CI_WORK/states/head"
+          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
+          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
+          # The runners' uv index is a PyPI mirror that lags; give uv pypi.org as an extra index (scaffold default).
+          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
+          set +e
+          bash install.sh --local 2>&1 | tail -15
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || exit "$rc"
+          V=""
+          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
+            [ -x "$c/bin/python" ] && { V="$c"; break; }
+          done
+          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
+          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
+          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
+          "$V/bin/python" -c "import torch, diffusers, transformers; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+
+      - name: flash-attention (DAO-AILab, Triton AMD backend) into its own --target dir (only the flash arms import it)
+        timeout-minutes: 30
+        run: |
+          set +e
+          git clone -q https://github.com/Dao-AILab/flash-attention "$AMD_CI_WORK/src/flash-attention"
+          git -C "$AMD_CI_WORK/src/flash-attention" checkout -q "$FA_SHA"
+          "$AMD_CI_PY" -m pip --version > /dev/null 2>&1 || "$AMD_CI_PY" -m ensurepip -q
+          "$AMD_CI_PY" -m pip install -q setuptools wheel packaging psutil ninja einops > "$AMD_CI_WORK/out/fa_deps.log" 2>&1
+          cd "$AMD_CI_WORK/src/flash-attention"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps \
+            --target "$AMD_CI_WORK/fa_site" . > "$AMD_CI_WORK/out/fa_build.log" 2>&1
+          echo "flash-attn --target rc=$?"
+          tail -3 "$AMD_CI_WORK/out/fa_build.log"
+          cd "$AMD_CI_WORK"  # out of the source tree: python -c puts the cwd on sys.path
+          "$AMD_CI_PY" -c "import importlib.util as u; print('flash_attn importable WITHOUT the dir (must be False):', u.find_spec('flash_attn') is not None)"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTHONPATH="$AMD_CI_WORK/fa_site" \
+            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
+          exit 0
+
+      - name: ComfyUI v0.44.0 (GitHub), README ROCm venv + a venv on Studio's gfx1151 torch
+        timeout-minutes: 60
+        run: |
+          set +e
+          git clone -q https://github.com/Comfy-Org/ComfyUI "$AMD_CI_WORK/ComfyUI"
+          git -C "$AMD_CI_WORK/ComfyUI" checkout -q "$COMFY_SHA"
+          git -C "$AMD_CI_WORK/ComfyUI" log -1 --format='ComfyUI %H %s'
+          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
+          TV=$("$AMD_CI_PY" -c "import torch; print(torch.__version__)")
+          VV=$("$AMD_CI_PY" -c "import torchvision; print(torchvision.__version__)")
+          for arm in default rock; do
+            "$BASEPY" -m venv "$AMD_CI_WORK/comfy_venv_$arm"
+            P="$AMD_CI_WORK/comfy_venv_$arm/bin/python"
+            "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
+            if [ "$arm" = default ]; then
+              # README, "AMD GPUs (Linux)": the stable ROCm wheel from download.pytorch.org/whl/rocm7.2, then the
+              # requirements. Pinned to that index's newest torch (2.14.1+rocm7.2): the runner's pip config adds a
+              # PyPI mirror as an extra index, where an unpinned "torch" resolves to a newer CUDA build.
+              PIP_CONFIG_FILE=/dev/null "$P" -m pip install "torch==2.14.1+rocm7.2" "torchvision==0.29.1+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
+            else
+              "$P" -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==$TV" "torchvision==$VV" > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
+            fi
+            echo "comfy $arm torch rc=$?"
+            "$P" -m pip install -r "$AMD_CI_WORK/ComfyUI/requirements.txt" > "$AMD_CI_WORK/out/comfy_${arm}_reqs.log" 2>&1
+            echo "comfy $arm requirements rc=$?"
+            "$P" -c "import torch, comfy_kitchen; print('comfy $arm torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), 'kitchen', getattr(comfy_kitchen, '__version__', '?'))"
+            (cd "$AMD_CI_WORK/ComfyUI" && timeout 600 "$P" main.py --quick-test-for-ci --disable-api-nodes > "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" 2>&1; echo "comfy $arm quick test rc=$?")
+            grep -E "Device:|pytorch version|comfy-kitchen|Using .* attention|Set vram state" "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" | head -8
+          done
+          exit 0
+
+      - name: Studio venv on download.pytorch.org torch 2.14.1+rocm7.2 (ComfyUI README torch)
+        timeout-minutes: 60
+        run: |
+          set +e
+          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
+          "$AMD_CI_PY" -m pip freeze > "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" 2>/dev/null
+          grep -viE '^(-e )?(torch|torchvision|torchaudio|triton|triton[-_]rocm|pytorch[-_]triton[-_a-z]*|rocm[-_a-z0-9]*|flash[-_]attn)( |=|@|$)' \
+            "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" > "$AMD_CI_WORK/out/pt72n_reqs.txt"
+          "$BASEPY" -m venv "$AMD_CI_WORK/studio_pt72n"
+          P="$AMD_CI_WORK/studio_pt72n/bin/python"
+          "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
+          "$P" -m pip install torch==2.14.1+rocm7.2 torchvision==0.29.1+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/pt72n_torch.log" 2>&1
+          echo "pt72n torch rc=$?"
+          "$P" -m pip install --no-deps -r "$AMD_CI_WORK/out/pt72n_reqs.txt" > "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1
+          rc=$?
+          echo "pt72n Studio packages (bulk) rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            while IFS= read -r line; do
+              "$P" -m pip install --no-deps "$line" >> "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1 || echo "pt72n skipped: $line"
+            done < "$AMD_CI_WORK/out/pt72n_reqs.txt"
+          fi
+          "$P" -c "import torch, diffusers, transformers; print('pt72n torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+          "$P" -m pip check 2>&1 | tail -5
+          exit 0
+
+      - name: ComfyUI files from the official repos (+ Studio's snapshots of the same repos, one download)
+        timeout-minutes: 150
+        run: |
+          set +e
+          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
+          mkdir -p "$AMD_CI_WORK/cm" "$AMD_CI_WORK/snap"
+          "$AMD_CI_PY" -m pip install -q safetensors huggingface_hub > /dev/null 2>&1
+          "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/diffusion_bench/amd/nov5_prep.py" --groups klein,q21,zimg --snapshot-only \
+            --out "$AMD_CI_WORK/cm" --spec "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_nov5.json" \
+            --snap-root "$AMD_CI_WORK/snap" --env-file "$GITHUB_ENV" \
+            --comfy-python "$AMD_CI_WORK/comfy_venv_rock/bin/python" --comfy-dir "$AMD_CI_WORK/ComfyUI" \
+            2>&1 | tee "$AMD_CI_WORK/out/prep.log" | grep -vE "it/s|B/s" | tail -60
+          ls -la "$AMD_CI_WORK/cm"
+          df -h "$RUNNER_TEMP"
+          free -g
+          exit 0
+
+      - name: Clean GPU pool preflight (fail loudly on a co-tenant)
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
+            --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight.json"
+
+      - name: "Differential (Native int8 W8A8 on ROCm: main vs compiled fused linear (studio/rocm-fused-w8a8))"
+        run: |
+          set +e
+          export TORCH_HOME="$AMD_CI_WORK/torch_home"
+          export HF_HOME="$AMD_CI_WORK/hf_home"
+          "$AMD_CI_PY" amd_ci/lib/differential.py \
+            --states "$AMD_CI_WORK/out/states.json" \
+            --probe diffusion_bench/amd/diffusion_probe.py \
+            --criteria diffusion_bench/amd/criteria_no_regression.py \
+            --out-dir "$AMD_CI_WORK/out/gpu" \
+            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_nov5.json --budget-min 420.0 --cell-timeout 3600.0 --only klein_s_def --only klein_s_int8 --only klein_s_int8act --only q21_s_def --only q21_s_int8 --only q21_s_int8act --only zimg_s_def --only zimg_s_int8act
+          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
+
+      - name: Stop anything this job started
+        if: always()
+        run: |
+          set +e
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            [ "$pid" = "$$" ] && continue
+            cwd=$(readlink "$d/cwd" 2>/dev/null)
+            case "$cwd" in
+              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
+            esac
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nov5-f3_w8a8
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            ${{ env.AMD_CI_WORK }}/cm/manifest*.json
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/record.json
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.png
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.mp4
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.log
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/scores.*
+            ${{ env.AMD_CI_WORK }}/dbench/states/*/logs
+          retention-days: 14
+          if-no-files-found: warn
+
   f1_q21:
     name: "Qwen-Image-2.1 (all arms) (gfx1151, exclusive GPU, nov5)"
+    needs: [f3_w8a8]
+    if: ${{ always() }}
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 600
     # The shared GPU group (see templates/workflow.yml): one GPU measurement at a time across all branches.
@@ -430,218 +854,6 @@ jobs:
         if: always()
         with:
           name: nov5-f2_small
-          path: |
-            ${{ env.AMD_CI_WORK }}/out
-            ${{ env.AMD_CI_WORK }}/cm/manifest*.json
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/record.json
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.png
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.mp4
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/**/*.log
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/runs/scores.*
-            ${{ env.AMD_CI_WORK }}/dbench/states/*/logs
-          retention-days: 14
-          if-no-files-found: warn
-
-  f3_w8a8:
-    name: "Native int8 W8A8 on ROCm: main vs compiled fused linear (studio/rocm-fused-w8a8) (gfx1151, exclusive GPU, nov5)"
-    needs: [f2_small]
-    if: ${{ always() }}
-    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
-    timeout-minutes: 600
-    # The shared GPU group (see templates/workflow.yml): one GPU measurement at a time across all branches.
-    concurrency:
-      group: amd-ci-gfx1151-gpu
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-
-      - name: Preamble
-        run: |
-          source amd_ci/lib/preamble.sh "nov5-f3_w8a8"
-
-      - name: Hardware gate
-        run: |
-          set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 \
-            --out "$AMD_CI_WORK/out/host.json" || \
-          echo "note: gate ran before the venv exists; re-gated after install below"
-
-      - name: Disk, memory, cores
-        run: |
-          set +e
-          df -h "$RUNNER_TEMP"
-          free -g
-          nproc
-          exit 0
-
-      - name: Resolve states (main, and main + a no-op marker so the head re-measures one reference cell)
-        run: |
-          set -euo pipefail
-          git clone -q --filter=blob:none "$UPSTREAM" "$AMD_CI_WORK/repo"
-          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/base" "$BASE_SHA"
-          git -C "$AMD_CI_WORK/repo" worktree add -q --detach "$AMD_CI_WORK/states/head" "$BASE_SHA"
-          git -C "$AMD_CI_WORK/states/head" apply --index "$GITHUB_WORKSPACE/amd_ci/patches/rocm_fused_w8a8.patch"
-          git -C "$AMD_CI_WORK/states/head" diff --cached --stat
-          python3 "$GITHUB_WORKSPACE/diffusion_bench/amd/write_states.py" --work "$AMD_CI_WORK" \
-            --base-sha "$BASE_SHA" --patch rocm_fused_w8a8.patch --out "$AMD_CI_WORK/out/states.json"
-
-      - name: Environment and real gate
-        timeout-minutes: 60
-        run: |
-          set -euo pipefail
-          cd "$AMD_CI_WORK/states/head"
-          export UNSLOTH_STUDIO_HOME="$AMD_CI_WORK/studio"
-          echo "UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME" >> "$GITHUB_ENV"
-          # The runners' uv index is a PyPI mirror that lags; give uv pypi.org as an extra index (scaffold default).
-          export UV_EXTRA_INDEX_URL="https://pypi.org/simple"
-          set +e
-          bash install.sh --local 2>&1 | tail -15
-          rc=${PIPESTATUS[0]}
-          set -e
-          [ "$rc" -eq 0 ] || exit "$rc"
-          V=""
-          for c in "$UNSLOTH_STUDIO_HOME"/unsloth_studio "$UNSLOTH_STUDIO_HOME"/.venv_t5_*; do
-            [ -x "$c/bin/python" ] && { V="$c"; break; }
-          done
-          [ -n "$V" ] || { echo "FATAL: no Studio venv"; exit 1; }
-          echo "AMD_CI_PY=$V/bin/python" >> "$GITHUB_ENV"
-          "$V/bin/python" "$GITHUB_WORKSPACE/amd_ci/lib/gate.py" --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 --out "$AMD_CI_WORK/out/host.json"
-          "$V/bin/python" -c "import torch, diffusers, transformers; print('studio torch', torch.__version__, 'hip', torch.version.hip, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
-
-      - name: flash-attention (DAO-AILab, Triton AMD backend) into its own --target dir (only the flash arms import it)
-        timeout-minutes: 30
-        run: |
-          set +e
-          git clone -q https://github.com/Dao-AILab/flash-attention "$AMD_CI_WORK/src/flash-attention"
-          git -C "$AMD_CI_WORK/src/flash-attention" checkout -q "$FA_SHA"
-          "$AMD_CI_PY" -m pip --version > /dev/null 2>&1 || "$AMD_CI_PY" -m ensurepip -q
-          "$AMD_CI_PY" -m pip install -q setuptools wheel packaging psutil ninja einops > "$AMD_CI_WORK/out/fa_deps.log" 2>&1
-          cd "$AMD_CI_WORK/src/flash-attention"
-          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE "$AMD_CI_PY" -m pip install --no-build-isolation --no-deps \
-            --target "$AMD_CI_WORK/fa_site" . > "$AMD_CI_WORK/out/fa_build.log" 2>&1
-          echo "flash-attn --target rc=$?"
-          tail -3 "$AMD_CI_WORK/out/fa_build.log"
-          cd "$AMD_CI_WORK"  # out of the source tree: python -c puts the cwd on sys.path
-          "$AMD_CI_PY" -c "import importlib.util as u; print('flash_attn importable WITHOUT the dir (must be False):', u.find_spec('flash_attn') is not None)"
-          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTHONPATH="$AMD_CI_WORK/fa_site" \
-            "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/fa_smoke.py" --out "$AMD_CI_WORK/out/fa_smoke_studio.json"
-          exit 0
-
-      - name: ComfyUI v0.44.0 (GitHub), README ROCm venv + a venv on Studio's gfx1151 torch
-        timeout-minutes: 60
-        run: |
-          set +e
-          git clone -q https://github.com/Comfy-Org/ComfyUI "$AMD_CI_WORK/ComfyUI"
-          git -C "$AMD_CI_WORK/ComfyUI" checkout -q "$COMFY_SHA"
-          git -C "$AMD_CI_WORK/ComfyUI" log -1 --format='ComfyUI %H %s'
-          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
-          TV=$("$AMD_CI_PY" -c "import torch; print(torch.__version__)")
-          VV=$("$AMD_CI_PY" -c "import torchvision; print(torchvision.__version__)")
-          for arm in default rock; do
-            "$BASEPY" -m venv "$AMD_CI_WORK/comfy_venv_$arm"
-            P="$AMD_CI_WORK/comfy_venv_$arm/bin/python"
-            "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
-            if [ "$arm" = default ]; then
-              # README, "AMD GPUs (Linux)": the stable ROCm wheel from download.pytorch.org/whl/rocm7.2, then the
-              # requirements. Pinned to that index's newest torch (2.14.1+rocm7.2): the runner's pip config adds a
-              # PyPI mirror as an extra index, where an unpinned "torch" resolves to a newer CUDA build.
-              PIP_CONFIG_FILE=/dev/null "$P" -m pip install "torch==2.14.1+rocm7.2" "torchvision==0.29.1+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
-            else
-              "$P" -m pip install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==$TV" "torchvision==$VV" > "$AMD_CI_WORK/out/comfy_${arm}_torch.log" 2>&1
-            fi
-            echo "comfy $arm torch rc=$?"
-            "$P" -m pip install -r "$AMD_CI_WORK/ComfyUI/requirements.txt" > "$AMD_CI_WORK/out/comfy_${arm}_reqs.log" 2>&1
-            echo "comfy $arm requirements rc=$?"
-            "$P" -c "import torch, comfy_kitchen; print('comfy $arm torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), 'kitchen', getattr(comfy_kitchen, '__version__', '?'))"
-            (cd "$AMD_CI_WORK/ComfyUI" && timeout 600 "$P" main.py --quick-test-for-ci --disable-api-nodes > "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" 2>&1; echo "comfy $arm quick test rc=$?")
-            grep -E "Device:|pytorch version|comfy-kitchen|Using .* attention|Set vram state" "$AMD_CI_WORK/out/comfy_${arm}_quicktest.log" | head -8
-          done
-          exit 0
-
-      - name: Studio venv on download.pytorch.org torch 2.14.1+rocm7.2 (ComfyUI README torch)
-        timeout-minutes: 60
-        run: |
-          set +e
-          BASEPY=$("$AMD_CI_PY" -c "import sys; print(sys._base_executable)")
-          "$AMD_CI_PY" -m pip freeze > "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" 2>/dev/null
-          grep -viE '^(-e )?(torch|torchvision|torchaudio|triton|triton[-_]rocm|pytorch[-_]triton[-_a-z]*|rocm[-_a-z0-9]*|flash[-_]attn)( |=|@|$)' \
-            "$AMD_CI_WORK/out/pt72n_studio_freeze.txt" > "$AMD_CI_WORK/out/pt72n_reqs.txt"
-          "$BASEPY" -m venv "$AMD_CI_WORK/studio_pt72n"
-          P="$AMD_CI_WORK/studio_pt72n/bin/python"
-          "$P" -m pip install -q --upgrade pip > /dev/null 2>&1
-          "$P" -m pip install torch==2.14.1+rocm7.2 torchvision==0.29.1+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2 > "$AMD_CI_WORK/out/pt72n_torch.log" 2>&1
-          echo "pt72n torch rc=$?"
-          "$P" -m pip install --no-deps -r "$AMD_CI_WORK/out/pt72n_reqs.txt" > "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1
-          rc=$?
-          echo "pt72n Studio packages (bulk) rc=$rc"
-          if [ "$rc" -ne 0 ]; then
-            while IFS= read -r line; do
-              "$P" -m pip install --no-deps "$line" >> "$AMD_CI_WORK/out/pt72n_reqs.log" 2>&1 || echo "pt72n skipped: $line"
-            done < "$AMD_CI_WORK/out/pt72n_reqs.txt"
-          fi
-          "$P" -c "import torch, diffusers, transformers; print('pt72n torch', torch.__version__, 'hip', torch.version.hip, 'gpu', torch.cuda.is_available(), torch.cuda.get_device_properties(0).gcnArchName, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
-          "$P" -m pip check 2>&1 | tail -5
-          exit 0
-
-      - name: ComfyUI files from the official repos (+ Studio's snapshots of the same repos, one download)
-        timeout-minutes: 150
-        run: |
-          set +e
-          export HF_HOME="$AMD_CI_WORK/hf_home" HF_HUB_DISABLE_TELEMETRY=1
-          mkdir -p "$AMD_CI_WORK/cm" "$AMD_CI_WORK/snap"
-          "$AMD_CI_PY" -m pip install -q safetensors huggingface_hub > /dev/null 2>&1
-          "$AMD_CI_PY" -u "$GITHUB_WORKSPACE/diffusion_bench/amd/nov5_prep.py" --groups klein,q21,zimg --snapshot-only \
-            --out "$AMD_CI_WORK/cm" --spec "$GITHUB_WORKSPACE/diffusion_bench/specs/amd_nov5.json" \
-            --snap-root "$AMD_CI_WORK/snap" --env-file "$GITHUB_ENV" \
-            --comfy-python "$AMD_CI_WORK/comfy_venv_rock/bin/python" --comfy-dir "$AMD_CI_WORK/ComfyUI" \
-            2>&1 | tee "$AMD_CI_WORK/out/prep.log" | grep -vE "it/s|B/s" | tail -60
-          ls -la "$AMD_CI_WORK/cm"
-          df -h "$RUNNER_TEMP"
-          free -g
-          exit 0
-
-      - name: Clean GPU pool preflight (fail loudly on a co-tenant)
-        timeout-minutes: 35
-        run: |
-          set -euo pipefail
-          "$AMD_CI_PY" "$GITHUB_WORKSPACE/diffusion_bench/amd/preflight_free.py" --min-free-gib 50 \
-            --timeout-s 1800 --out "$AMD_CI_WORK/out/preflight.json"
-
-      - name: "Differential (Native int8 W8A8 on ROCm: main vs compiled fused linear (studio/rocm-fused-w8a8))"
-        run: |
-          set +e
-          export TORCH_HOME="$AMD_CI_WORK/torch_home"
-          export HF_HOME="$AMD_CI_WORK/hf_home"
-          "$AMD_CI_PY" amd_ci/lib/differential.py \
-            --states "$AMD_CI_WORK/out/states.json" \
-            --probe diffusion_bench/amd/diffusion_probe.py \
-            --criteria diffusion_bench/amd/criteria_no_regression.py \
-            --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --spec diffusion_bench/specs/amd_nov5.json --budget-min 420.0 --cell-timeout 3600.0 --only klein_s_def --only klein_s_int8 --only klein_s_int8act --only q21_s_def --only q21_s_int8 --only q21_s_int8act --only zimg_s_def --only zimg_s_int8act
-          cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
-          python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
-
-      - name: Stop anything this job started
-        if: always()
-        run: |
-          set +e
-          for d in /proc/[0-9]*; do
-            pid=${d#/proc/}
-            [ "$pid" = "$$" ] && continue
-            cwd=$(readlink "$d/cwd" 2>/dev/null)
-            case "$cwd" in
-              "$AMD_CI_WORK"*) echo "stopping pid $pid (cwd $cwd)"; kill "$pid" 2>/dev/null ;;
-            esac
-          done
-          exit 0
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: nov5-f3_w8a8
           path: |
             ${{ env.AMD_CI_WORK }}/out
             ${{ env.AMD_CI_WORK }}/cm/manifest*.json

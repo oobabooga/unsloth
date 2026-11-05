@@ -41,6 +41,10 @@ FOLLOWUP = [
     ("f4_wan", "Wan2.2-TI2V-5B stacked Studio levers", "diffusion_bench/specs/amd_nov5.json",
      ["wan_s_def", "wan_s_flash", "wan_s_pt72n_flash", "wan_c_rock"], "wan_s_def", "wan", "nov5_marker.patch",
      "no_regression", None),
+    # main: auto flash under regional compile crashes Wan (SpeculationLogDivergence); head: the restart fix
+    ("f5_fa_wan", "Wan2.2-TI2V-5B, flash-attn auto under compile: main vs the traced-segments restart fix",
+     "diffusion_bench/specs/amd_nov5.json", ["wan_s_def", "wan_s_flash"], None, "wan",
+     "rocm_flash_traced_restart.patch", "differential", "broken:wan_s_flash"),
 ]
 
 JOBS = [
@@ -312,6 +316,8 @@ def main() -> int:
     text = HEADER.format(branch = args.branch, main_sha = args.main_sha, comfy_sha = COMFY_SHA, fa_sha = FA_SHA)
     prev = None
     jobs = FOLLOWUP if args.set == "followup" else [j + ("nov5_marker.patch", "no_regression", None) for j in JOBS]
+    if want:  # emit (and chain) in the order asked for
+        jobs = sorted((j for j in jobs if j[0] in want), key = lambda j: want.index(j[0]))
     for jid, title, spec, only, head_only, groups, patch, criteria, defect in jobs:
         if want and jid not in want:
             continue
