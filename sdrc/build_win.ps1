@@ -18,7 +18,10 @@ foreach ($p in (Get-ChildItem scripts/unsloth/ggml-patches -Filter *.patch | Sor
   if ($LASTEXITCODE -ne 0) { throw "patch $($p.Name) failed" }
 }
 if ($Patch -eq '1') {
-  git apply --verbose "$H/igpu_fit.patch"
+  # actions/checkout under core.autocrlf=true hands the patch over as CRLF; the source tree is LF
+  $lf = Join-Path $env:RUNNER_TEMP 'igpu_fit_lf.patch'
+  [IO.File]::WriteAllText($lf, ([IO.File]::ReadAllText("$H/igpu_fit.patch") -replace "`r`n", "`n"))
+  git apply --verbose $lf
   if ($LASTEXITCODE -ne 0) { throw 'igpu_fit.patch failed' }
 }
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS='/bigobj' -DSD_BUILD_EXAMPLES=ON `
