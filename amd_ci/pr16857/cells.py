@@ -79,11 +79,18 @@ def peak_mem_mib(proc: subprocess.Popen) -> float | None:
             psapi = ctypes.WinDLL("psapi")
             psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
             if psapi.GetProcessMemoryInfo(int(proc._handle), ctypes.byref(c), c.cb):
-                return round(c.PeakWorkingSetSize / 2**20, 1)
+                return {"peak_working_set": round(c.PeakWorkingSetSize / 2**20, 1),
+                        "working_set": round(c.WorkingSetSize / 2**20, 1),
+                        "private_commit": round(c.PagefileUsage / 2**20, 1),
+                        "peak_private_commit": round(c.PeakPagefileUsage / 2**20, 1)}
             return None
         txt = Path(f"/proc/{proc.pid}/status").read_text(encoding = "utf-8")
-        m = re.search(r"VmHWM:\s+(\d+) kB", txt)
-        return round(int(m.group(1)) / 1024, 1) if m else None
+        out = {}
+        for k in ("VmHWM", "VmRSS", "RssAnon", "RssFile", "RssShmem"):
+            m = re.search(rf"{k}:\s+(\d+) kB", txt)
+            if m:
+                out[k] = round(int(m.group(1)) / 1024, 1)
+        return out or None
     except Exception as e:  # noqa: BLE001
         return None
 

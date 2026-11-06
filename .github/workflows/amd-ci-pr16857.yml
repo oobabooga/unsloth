@@ -39,9 +39,13 @@ jobs:
       - name: Hardware gate
         run: |
           set -euo pipefail
-          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
-            --expect-arch gfx1151 --min-gpus 1 \
+          # rocm / gpu / arch are torch-derived in capability.py and this job has no torch, so the
+          # GPU is proven from KFD instead (gfx1151 = gfx_target_version 110501), and again by
+          # each bundle's --list-devices in the cells.
+          python3 amd_ci/lib/gate.py --no-torch --require linux amd_smi \
             --out "$AMD_CI_WORK/out/host.json"
+          grep -h gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties | tee "$AMD_CI_WORK/out/kfd.txt"
+          grep -q "gfx_target_version 110501" "$AMD_CI_WORK/out/kfd.txt"
 
       - name: Host gaps
         run: |
