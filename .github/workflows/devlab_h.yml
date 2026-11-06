@@ -1,0 +1,102 @@
+name: AMD DevLab iGPU headroom (Linux)
+
+on:
+  push:
+    branches: [devlab-igpu-headroom]
+
+permissions: {}
+
+env:
+  BASE_SHA: 0ab3f0773d
+  REPO: unsloth/Qwen3.8-Flash-Next-GGUF
+  RAW: https://raw.githubusercontent.com/oobabooga/unsloth/${{ github.sha }}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    steps:
+      - name: Host facts
+        run: |
+          W="$RUNNER_TEMP/ig"; mkdir -p "$W"/{tmp,hf,out}
+          {
+            uname -a; free -g; df -h "$RUNNER_TEMP" | tail -1
+            cat /opt/rocm/.info/version 2>/dev/null
+            for d in /sys/class/drm/card*/device; do [ -f "$d/mem_info_vram_total" ] && echo "$d vram_total=$(cat $d/mem_info_vram_total) gtt_total=$(cat $d/mem_info_gtt_total 2>/dev/null)"; done
+            rocminfo 2>/dev/null | grep -E 'Marketing Name|gfx1|Device Type' | head -8
+            swapon --show || true
+          } | tee "$W/out/host.txt"
+      - name: Checkouts (A = main, B = main + branch patch)
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/ig"
+          for f in branch.patch balloon.py studio_ab.py raw_matrix.py cases_head.json; do curl -sfL -o "$W/$f" "$RAW/$f"; done
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth "$W/A"
+          git -C "$W/A" checkout -q "$BASE_SHA"
+          cp -a "$W/A" "$W/B"
+          git -C "$W/B" apply --whitespace=nowarn "$W/branch.patch"
+          git -C "$W/B" add -A
+          test "$(git -C "$W/B" write-tree)" = "$(curl -sfL "$RAW/tree.txt")"
+          echo "B tree matches the branch commit"
+      - name: Start the Q5 download in the background
+        run: |
+          W="$RUNNER_TEMP/ig"; Q="$W/q5"; mkdir -p "$Q"
+          # The hub client refuses a plain-HTTP fallback for the >50 GB table shard when xet fails, so use curl.
+          cat > "$W/dl.sh" <<'SH'
+          W="$1"; Q="$W/q5"; t0=$(date +%s); pids=""
+          for i in 1 2 3 4 5 6; do
+            f="Qwen3.8-Flash-Next-UD-Q5_K_XL-0000$i-of-00006.gguf"
+            curl -sSfL --retry 5 -o "$Q/$f" "https://huggingface.co/$REPO/resolve/main/UD-Q5_K_XL/$f" & pids="$pids $!"
+          done
+          rc=0; for p in $pids; do wait $p || rc=1; done
+          echo "UD-Q5_K_XL rc=$rc seconds=$(( $(date +%s) - t0 )) bytes=$(du -sb "$Q" | cut -f1)" >> "$W/out/dl-summary.txt"
+          touch "$W/dl-UD-Q5_K_XL.done"
+          SH
+          REPO="$REPO" setsid nohup bash "$W/dl.sh" "$W" > "$W/out/dl.log" 2>&1 &
+          echo started
+      - name: Install Studio from A
+        run: |
+          W="$RUNNER_TEMP/ig"
+          cd "$W/A"
+          export UNSLOTH_STUDIO_HOME="$W/home" UNSLOTH_SKIP_AUTOSTART=1 HF_HOME="$W/hf" TMPDIR="$W/tmp"
+          t0=$(date +%s); ./install.sh --local > "$W/out/install.log" 2>&1; rc=$?
+          tail -30 "$W/out/install.log"; echo "install rc=$rc seconds=$(( $(date +%s) - t0 ))"
+          find "$W/home" -name 'llama-server' -type f | head -3 | tee "$W/server.txt"
+          cat "$W"/home/llama.cpp/BUILD_INFO.txt 2>/dev/null | head -8
+          S="$(head -1 "$W/server.txt")"
+          "$S" --help 2>/dev/null | grep -A8 -E -- '--load-mode|--lazy-mode' | tee "$W/out/load-mode-help.txt"
+          exit $rc
+      - name: T2 UD-Q5_K_XL (147 GiB) with nothing held back (A then B, then raw matrix)
+        run: |
+          W="$RUNNER_TEMP/ig"
+          run_side() {
+            side=$1; port=$2; name=$3; variant=$4; leave=$5
+            cd "$W/$side/studio/backend"
+            # Own session: Studio's shutdown signals its process group, which would include this step's shell.
+            PATH="$HOME/.local/bin:$PATH" UNSLOTH_STUDIO_HOME="$W/home" HF_HOME="$W/hf" TMPDIR="$W/tmp" setsid nohup "$W/home/unsloth_studio/bin/python" run.py --api-only --host 127.0.0.1 --port $port > "$W/out/$name-backend.log" 2>&1 &
+            bpid=$!
+            for i in $(seq 1 150); do curl -sf http://127.0.0.1:$port/api/health >/dev/null && break; sleep 2; done
+            if [ "$leave" != "none" ]; then python3 "$W/balloon.py" --leave "$leave" --out "$W/out/$name-balloon.json" & lpid=$!; for i in $(seq 1 120); do [ -s "$W/out/$name-balloon.json" ] && break; sleep 2; done; cat "$W/out/$name-balloon.json"; fi
+            grep -E 'MemAvailable|SwapFree' /proc/meminfo
+            "$W/home/unsloth_studio/bin/python" "$W/studio_ab.py" --base http://127.0.0.1:$port --home "$W/home" --repo "$REPO" --variant "$variant" ${M:+--model-path "$M"} --out "$W/out/$name.json" --pwfile "$W/pw.txt"
+            [ -n "${lpid:-}" ] && { kill -0 $lpid && echo "balloon alive" || echo "BALLOON DIED"; kill $lpid; wait $lpid 2>/dev/null; }
+            kill $bpid; sleep 5; pkill -9 -f "$W/home/.*llama-server" || true; sleep 5
+            unset lpid
+          }
+          for i in $(seq 1 900); do [ -f "$W/dl-UD-Q5_K_XL.done" ] && break; sleep 10; done
+          cat "$W/out/dl-summary.txt"
+          M="$W/q5/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf"; S="$(head -1 "$W/server.txt")"
+          run_side B 8922 t2-B UD-Q5_K_XL none
+          mkdir -p "$W/out/t2-raw"; python3 "$W/raw_matrix.py" --server "$S" --model "$M" --out "$W/out/t2-raw.json" --logdir "$W/out/t2-raw" --cases "$W/cases_head.json"
+      - name: Summary
+        if: always()
+        run: |
+          W="$RUNNER_TEMP/ig"; cd "$W/out"
+          for f in t1-A t1-B t2-A t2-B; do [ -f $f.json ] && python3 -c "import json;d=json.load(open('$f.json'));print('$f', d.get('load_status'), d.get('load_seconds'), str((d.get('load_response') or {}).get('memory_warning') if isinstance(d.get('load_response'),dict) else d.get('load_response'))[:600]); [print('  ',l) for g in d.get('llama_logs',[]) for l in g['lines'][:12]]; [print('  chat',k,d.get(k)) for k in ('chat0','chat1') if d.get(k)]"; done
+          for f in t1-raw t2-raw; do [ -f $f.json ] && python3 -c "import json;d=json.load(open('$f.json'));[print('$f',k,v.get('loaded'),v.get('load_seconds'),v.get('peak_rss_gib'),v.get('min_avail_gib'),(v.get('long') or {}).get('timings')) for k,v in d.items()]"; done
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-headroom-linux
+          path: ${{ runner.temp }}/ig/out

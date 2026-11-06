@@ -1,0 +1,2 @@
+{"mmap_lazy_on": ["--load-mode", "mmap", "--lazy-mode", "on"],
+ "mmap_lazy_on_fit16g": ["--load-mode", "mmap", "--lazy-mode", "on", "--fit-target", "16384"]}
