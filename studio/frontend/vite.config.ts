@@ -87,6 +87,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "react-style-singleton": path.resolve(__dirname, "./src/lib/style-singleton.ts"),
       "@dagrejs/dagre": path.resolve(
         __dirname,
         "./node_modules/@dagrejs/dagre/dist/dagre.cjs.js",
