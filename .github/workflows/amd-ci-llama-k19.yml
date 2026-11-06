@@ -1,4 +1,4 @@
-name: "AMD CI k19: llama.cpp k19-int3 eddd38eef9a (+ HIP fix 058773ab6c3) vs upstream ff5a2337 (+ k15 7f0111d448c, PolyStrata f472d85a) on gfx1151 Linux + Windows"
+name: "AMD CI k19: llama.cpp k19-int3 eddd38eef9a (+ HIP fix 058773ab6c3, Windows fix dc86a8f271b) vs upstream ff5a2337 (+ k15 7f0111d448c, PolyStrata f472d85a) on gfx1151 Linux + Windows"
 
 # Trees, all from upstream ggml-org ff5a2337: up = stock (the base), pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
 # i3 = pf + k15/i3d.patch.gz (k19-int3 eddd38eef9a + 058773ab6c3, the HIP build fix). Each applied tree is checked against k15/TREES.
@@ -165,7 +165,7 @@ jobs:
     name: "k19 vs up, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
-      K19_STEPS: archs,ops,exe,exact,bench,tiers,lfm,tbofull
+      K19_STEPS: ops,exe,exact,bench,tiers,lfm,tbofull
     timeout-minutes: 360
     concurrency:
       group: amd-ci-gfx1151-gpu

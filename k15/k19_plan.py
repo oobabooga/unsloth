@@ -18,12 +18,14 @@ STEPS = set((os.environ.get("K19_STEPS") or "archs,ops,exe,exact,bench,tiers,lfm
 HAS = lambda b: os.path.isdir(os.path.join(os.environ["K6P_DIR"], "bins", b))
 
 X = "LLAMA_MOE_CPU_MISS=0;LLAMA_MOE_CACHE_FETCH_OVERLAP=0;GGML_CUDA_VERIFY_REASSOC=0;LLAMA_MOE_ROUTE_TAIL_SKIP=0"
-NF = "K6P_NOFAKE=1"            # upstream: no GGML_CUDA_FAKE_FREE_MIB, so a cap cell gives it --fit-target free - N
+# upstream: no GGML_CUDA_FAKE_FREE_MIB, so a cap cell gives it --fit-target free - N; and its --moe-cache-mib takes an integer only
+# (default 0 = no cache; "auto" is a usage error there), so its Studio-argv arms run without the flag: upstream's own default
+NF = "K6P_NOFAKE=1;K6P_NO_MOE=1"
 ARMS = [
     "i3:i3", "i3b:i3", "up:up:" + NF, "upb:up:" + NF, "pf:pf",
     # exactness arms (pinned); the q36 cache cell adds a fixed 4096 MiB cache
     "xi3:i3:" + X, "xi3b:i3:" + X, "xup:up:%s;%s" % (X, NF), "xpf:pf:" + X,
-    "ci3:i3:%s;K6P_MOE=4096" % X, "ci3b:i3:%s;K6P_MOE=4096" % X, "cup:up:%s;%s;K6P_MOE=4096" % (X, NF), "cpf:pf:%s;K6P_MOE=4096" % X,
+    "ci3:i3:%s;K6P_MOE=4096" % X, "ci3b:i3:%s;K6P_MOE=4096" % X, "cup:up:%s;K6P_NOFAKE=1;K6P_MOE=4096" % X, "cpf:pf:%s;K6P_MOE=4096" % X,
     # kill switches of the int3 changes that run on this host: fit tiers, host-bound placement, AVX-512 K-quant / IQ3_S dots (Zen 5),
     # the blocking device wait of the host team (the HIP build fix's path), CPU misses
     "i3_p8o:i3:LLAMA_FIT_PLACE8=0", "i3_pmo:i3:LLAMA_FIT_PLACEMID=0", "i3_hbo:i3:LLAMA_FIT_HOSTBOUND=0",

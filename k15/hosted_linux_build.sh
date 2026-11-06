@@ -1,6 +1,6 @@
 #!/bin/bash
 # k19 (amd-ci-llama-k19): NAME = up (ff5a2337 stock, the base) | pf (k15 7f0111d448c = up + k10.patch + pfd.patch, md5 / tier reference)
-#   | i3 (k19-int3 eddd38eef9a + the HIP build fix 058773ab6c3 = pf + i3d.patch, the head). The k15cpu branch below is unused.
+#   | i3 (k19-int3 eddd38eef9a + the HIP build fix 058773ab6c3 + the Windows build fix dc86a8f271b = pf + i3d.patch, the head). The k15cpu branch below is unused.
 # hosted_linux_build.sh NAME: the release's Linux ROCm recipe (unsloth-prebuilt-rocm.yml linux leg) on a GitHub-hosted ubuntu-22.04, as in
 # the k9 / k10 / k10s runs: TheRock dist tarball (ROCM_VER, the weekly pin of b11734-mix-c208e5f), clang from /opt/rocm/llvm, release
 # cmake flags (GGML_HIP_GRAPHS at its default), the ROCm runtime libs + rocblas / hipblaslt kernels (kpack step) beside the binaries,
