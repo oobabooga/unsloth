@@ -1,0 +1,125 @@
+name: "AMD CI k19-uma: llama.cpp k19-uma 196eedf17cc (small-plan reserve + unified-memory MoE cache pricing) vs k19-int3 e18702b7f46 on gfx1151 Linux + Windows"
+
+# Trees, all from upstream ggml-org ff5a2337: up = stock, pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
+# i3 = pf + k15/i3d.patch.gz (k19-int3 e18702b7f46, the base), uma = i3 + k15/umad.patch.gz (k19-uma 196eedf17cc, the head). Each applied
+# tree is checked against k15/TREES. ROCm builds: the release recipe and the TheRock weekly pin 10.2.0a20261017, built on the box.
+# Matrix: k15/k19_plan.py; tables from the downloaded artifacts.
+# Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
+
+on:
+  push:
+    branches: [amd-ci-llama-k19uma]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+
+  linux-control:
+    name: "k19-uma linux control (selector diagnosis for the Windows leg)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "control leg: the same selector with Linux in place of Windows"
+          echo "machine: $(uname -n)"
+
+  gpu-linux:
+    name: "k19-uma vs k19-int3, Linux ROCm gfx1151 (exclusive)"
+    env:
+      K19_STEPS: archs,exact,tiers,bench
+      K19_NO_POLY: "1"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "k19uma-linux-gpu"
+      - name: Hardware gate
+        run: |
+          set +e
+          python3 amd_ci/lib/gate.py --no-torch --out "$AMD_CI_WORK/out/host.json" > /dev/null
+          ls -la /dev/kfd /dev/dri 2>&1 | head -5
+          R=$(command -v rocminfo || echo /opt/rocm/bin/rocminfo)
+          "$R" 2>&1 | grep -m3 -E "Marketing Name|gfx1151" | tee "$AMD_CI_WORK/out/rocminfo.txt"
+          if [ ! -e /dev/kfd ] || ! grep -q gfx1151 "$AMD_CI_WORK/out/rocminfo.txt"; then echo "GATE FAILED: no gfx1151 via KFD"; exit 1; fi
+          echo "gate ok"
+      - name: Cells
+        timeout-minutes: 345
+        run: |
+          set +e
+          bash k15/linux_gpu.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/bench/rows.jsonl"
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -u "$(id -u)" -x llama-server; pgrep -u "$(id -u)" -x test-backend-op; pgrep -u "$(id -u)" -x strata-poly; pgrep -u "$(id -u)" -f "test-llama-c[o]ntext"); do kill -9 "$p"; done
+          echo "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k19uma-linux-gpu
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  gpu-windows:
+    name: "k19-uma vs k19-int3, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    env:
+      K19_STEPS: exact,tiers,bench
+    timeout-minutes: 360
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "k19uma-windows"
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
+          & "C:\Program Files\Python312\python.exe" "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch --require windows --out "$env:AMD_CI_WORK\out\windows\host.json"
+          if ($LASTEXITCODE -ne 0) { Write-Host "GATE FAILED"; exit 1 }
+      - name: Build uma / i3 / up with the release's TheRock, cells
+        timeout-minutes: 350
+        run: |
+          $ErrorActionPreference = "Continue"
+          & "$env:GITHUB_WORKSPACE\k15\win_gpu.ps1"
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\bench\rows.jsonl")) { exit 1 }
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Process -Name llama-server, test-backend-ops, test-llama-context, test-llama-archs -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "cleanup done"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k19uma-windows-gpu
+          path: ${{ env.AMD_CI_WORK }}\out
+          retention-days: 7
+          if-no-files-found: warn
