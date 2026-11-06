@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 16853"
 
 on:
   push:
-    branches: [amd-ci-pr16853]
+    branches: [amd-ci-pr16853w]
   workflow_dispatch:
 
 permissions:
