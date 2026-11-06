@@ -84,7 +84,7 @@ def stop_child():
 
 T0 = time.time()
 step("dl", "dl", "--models", os.environ.get("K19_DL_MODELS", "q35,q36,lfm"), timeout=7200)
-step("devinfo", "devinfo", arms="uma,i3,pf,up")
+step("devinfo", "devinfo", arms="uma,i3,up")
 R3 = os.environ.get("K19_REPS", "3")
 
 # 1. test-llama-context on ROCm0 (GGML_SCHED_DEBUG_REALLOC=1 as the ctest): head, base (aborted in rf on model 1 in r3), k15 (attribution),
