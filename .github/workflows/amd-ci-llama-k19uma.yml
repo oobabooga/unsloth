@@ -1,4 +1,4 @@
-name: "AMD CI k19-uma r3 (Linux): llama.cpp k19-uma 66cfcdf5425 (small-plan reserve + unified-memory MoE cache pricing) vs k19-int3 e18702b7f46 on gfx1151 Linux + Windows"
+name: "AMD CI k19-uma r4 (Windows): llama.cpp k19-uma 66cfcdf5425 (small-plan reserve + unified-memory MoE cache pricing) vs k19-int3 e18702b7f46 on gfx1151 Linux + Windows"
 
 # Trees, all from upstream ggml-org ff5a2337: up = stock, pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
 # i3 = pf + k15/i3d.patch.gz (k19-int3 e18702b7f46, the base), uma = i3 + k15/umad.patch.gz (k19-uma 66cfcdf5425, the head). Each applied
@@ -35,6 +35,8 @@ jobs:
 
   gpu-linux:
     name: "k19-uma vs k19-int3, Linux ROCm gfx1151 (exclusive)"
+    # r4: off (r3 run 42167422209 measures Linux on the same head)
+    if: ${{ false }}
     env:
       K19_STEPS: archs,exact,tiers,bench
       K19_NO_POLY: "1"
@@ -82,11 +84,11 @@ jobs:
 
   gpu-windows:
     name: "k19-uma vs k19-int3, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
-    # r2: off; r1 (run 42152016399) measured Windows on 196eedf17cc (66cfcdf5425 differs in when the small-plan reserve runs: only where a small graph outgrows the small plan)
-    if: ${{ false }}
+    # r4: Windows only, no LFM2.5 (r1 run 42152016399 spent its budget downloading it, 9944 s, and measured nothing)
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
       K19_STEPS: exact,tiers,bench
+      K19_DL_MODELS: q35,q36
     timeout-minutes: 360
     concurrency:
       group: amd-ci-gfx1151-gpu
