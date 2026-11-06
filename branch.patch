@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/llama_cpp.py b/studio/backend/core/inference/llama_cpp.py
-index 865e8783ad..2ca0e70d00 100644
+index 865e8783ad..38cdcf91cb 100644
 --- a/studio/backend/core/inference/llama_cpp.py
 +++ b/studio/backend/core/inference/llama_cpp.py
 @@ -130,6 +130,7 @@ from core.inference.llama_server_args import (
@@ -10,22 +10,38 @@ index 865e8783ad..2ca0e70d00 100644
      memory_env_selects_load_mode,
      memory_state_satisfies_settings,
      fit_is_effectively_on,
-@@ -7779,6 +7780,14 @@ _PAGEABLE_OVERRIDE_NOTE = (
+@@ -4125,6 +4126,17 @@ _VRAM_FLOOR_RESERVE_MIB = 512.0
+ # llama-server's own --fit-target default ("target margin per device for --fit,
+ # ... default: 1024"): what the fallback fitter leaves when we pass nothing.
+ _LLAMA_FIT_TARGET_DEFAULT_MIB = 1024.0
++# Extra --fit-target an oversized load paged on a Windows iGPU keeps free: the GPU share and the pages
++# read from disk come out of one memory. On a 127 GiB Strix Halo (Windows, Vulkan) a 147 GiB GGUF
++# aborted at warm-up with llama.cpp's 1 GiB margin and with 8 GiB, and ran with 16 GiB. On Linux the
++# same load ran with 1 GiB, and 16 GiB cut generation from 22.4 to 13.4 tok/s, so it stays Windows only.
++_IGPU_PAGED_FIT_HEADROOM_MIB = 15360
++
++
++def _paged_load_needs_fit_headroom() -> bool:
++    """Whether a load paged on an iGPU needs ``_IGPU_PAGED_FIT_HEADROOM_MIB``; see there."""
++    return sys.platform == "win32"
++
+ 
+ # Windows + NVIDIA since driver 536.40: WDDM spills VRAM overflow to host RAM instead of failing, so the reserve matches llama.cpp fit margin.
+ _WINDOWS_SYSMEM_FALLBACK_RESERVE_MIB = _LLAMA_FIT_TARGET_DEFAULT_MIB
+@@ -7779,6 +7791,12 @@ _PAGEABLE_OVERRIDE_NOTE = (
      "RAM up front and cannot complete at this size, so Unsloth loaded it with memory "
      "mapping instead."
  )
-+# The same override where nobody chose the mode: llama.cpp's auto is none on an iGPU.
++# The same override where nobody chose the mode: llama.cpp's auto is none on an iGPU. The lazy
++# table and the fit headroom it may add are logged, not shown: the advisory already says it pages.
 +_PAGEABLE_AUTO_OVERRIDE_NOTE = (
-+    " On this integrated GPU llama.cpp loads without memory mapping by default, which reads "
-+    "every byte into memory up front and can run out of memory at this size, so Unsloth "
-+    "loaded it with memory mapping instead."
++    " Unsloth turned on memory mapping, which llama.cpp leaves off by default on this "
++    "integrated GPU."
 +)
-+# Appended when the override also reads the lookup tables lazily.
-+_PAGEABLE_LAZY_TABLE_NOTE = " Its lookup tables are read from disk as needed."
  # The override is reported, not undone: the running server is already memory-mapped.
  _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE = (
      "This model was set to load without memory mapping, and with its vision projector "
-@@ -7787,6 +7796,13 @@ _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE = (
+@@ -7787,6 +7805,13 @@ _PAGEABLE_OVERRIDE_TEXT_ONLY_NOTICE = (
      "which the weights alone would have fit. The running server keeps the memory "
      "mapping it started with; load the model again to run it as you asked."
  )
@@ -39,7 +55,7 @@ index 865e8783ad..2ca0e70d00 100644
  _CGROUP_ROOT = "/sys/fs/cgroup"
  _PROC_SELF_CGROUP = "/proc/self/cgroup"
  
-@@ -10366,6 +10382,7 @@ class LlamaCppBackend:
+@@ -10366,6 +10391,7 @@ class LlamaCppBackend:
                  "supports_video_timestamp_interval": False,
                  "supports_video_ffmpeg_dir": None,
                  "supports_load_mode": False,
@@ -47,7 +63,7 @@ index 865e8783ad..2ca0e70d00 100644
                  "supports_moe_cache": False,
                  "supports_moe_cache_auto": False,
                  "supports_lazy_mode": False,
-@@ -10437,6 +10454,7 @@ class LlamaCppBackend:
+@@ -10437,6 +10463,7 @@ class LlamaCppBackend:
          supports_video_timestamp_interval = False
          supports_video_ffmpeg_dir = None
          supports_load_mode = False
@@ -55,7 +71,7 @@ index 865e8783ad..2ca0e70d00 100644
          supports_moe_cache = False
          supports_moe_cache_auto = False
          supports_lazy_mode = False
-@@ -10651,6 +10669,14 @@ class LlamaCppBackend:
+@@ -10651,6 +10678,14 @@ class LlamaCppBackend:
              # --load-mode supersedes --mlock / --no-mmap, which are deprecated.
              # Pre-initialised above: a failed probe must fall back, not raise.
              supports_load_mode = _is_real("--load-mode")
@@ -70,7 +86,7 @@ index 865e8783ad..2ca0e70d00 100644
              # "auto" is a fork addition; upstream builds exit on it, so fail closed.
              supports_moe_cache = bool(probe_ok and _is_real("--moe-cache-mib"))
              supports_moe_cache_auto = bool(
-@@ -10764,6 +10790,7 @@ class LlamaCppBackend:
+@@ -10764,6 +10799,7 @@ class LlamaCppBackend:
              "supports_video_timestamp_interval": supports_video_timestamp_interval,
              "supports_video_ffmpeg_dir": supports_video_ffmpeg_dir,
              "supports_load_mode": supports_load_mode,
@@ -78,7 +94,7 @@ index 865e8783ad..2ca0e70d00 100644
              "supports_moe_cache": supports_moe_cache,
              "supports_moe_cache_auto": supports_moe_cache_auto,
              "supports_lazy_mode": supports_lazy_mode,
-@@ -15671,12 +15698,69 @@ class LlamaCppBackend:
+@@ -15671,12 +15707,94 @@ class LlamaCppBackend:
              "yes",
          )
  
@@ -127,6 +143,29 @@ index 865e8783ad..2ca0e70d00 100644
 +            return []
 +        return [flag, "on"]
 +
++    @staticmethod
++    def _paged_fit_headroom_flags(
++        argv: Iterable[str], env: Optional[Mapping[str, str]], user_args: Optional[Iterable[str]]
++    ) -> list[str]:
++        """``--fit-target`` raised by ``_IGPU_PAGED_FIT_HEADROOM_MIB`` over the margin the launch
++        already keeps, for a load paged on a Windows iGPU: without it llama.cpp's fitter fills the
++        shared memory with the GPU share and leaves nothing for the mapped pages. Empty off Windows,
++        when the fitter is off, the user set a margin, or the margin is a per-device list."""
++        args = [str(a) for a in argv or ()]
++        if not _paged_load_needs_fit_headroom():
++            return []
++        if not fit_is_effectively_on(args, env) or _fit_target_values(user_args or (), env):
++            return []
++        raw = _last_flag_value(args, {"-fitt", "--fit-target"})
++        if (
++            raw is not None
++            and len([p for p in str(raw).replace("/", ",").split(",") if p.strip()]) > 1
++        ):
++            return []
++        have = _single_device_fit_margin(args, None)
++        base = _LLAMA_FIT_TARGET_DEFAULT_MIB if have is None else have
++        return ["--fit-target", str(math.ceil(base + _IGPU_PAGED_FIT_HEADROOM_MIB))]
++
      def _page_an_oversized_unmapped_load(
 -        self, cmd: Iterable[str], env: Optional[dict], oversized
 +        self,
@@ -136,13 +175,15 @@ index 865e8783ad..2ca0e70d00 100644
 +        *,
 +        auto_unmapped: bool = False,
 +        lazy_table_flags: Optional[Callable[[list], list]] = None,
++        fit_headroom_flags: Optional[Callable[[list], list]] = None,
      ) -> tuple[list, Optional[str]]:
 -        """Returns (cmd, note); rewrites an oversized non-pageable load to mmap so it finishes; judges effective env state, not argv; never blocks."""
 +        """Returns (cmd, note); rewrites an oversized non-pageable load to mmap so it finishes; judges effective env state, not argv; never blocks.
 +
 +        ``auto_unmapped`` (``_auto_load_mode_unmapped``): llama.cpp loads this child unmapped by
-+        default, so a mode nothing selected is rewritten too, and ``lazy_table_flags(argv)``
-+        restores the lookup-table streaming that device turned off."""
++        default, so a mode nothing selected is rewritten too, ``lazy_table_flags(argv)``
++        restores the lookup-table streaming that device turned off, and
++        ``fit_headroom_flags(argv)`` keeps shared memory free for the mapped pages."""
          original = cmd if isinstance(cmd, list) else list(cmd or ())
 -        _mlock_now, _reserves_ram_now = resolve_effective_memory_state(original, env)
 +        _mlock_now, _reserves_ram_now = resolve_effective_memory_state(
@@ -151,7 +192,7 @@ index 865e8783ad..2ca0e70d00 100644
          if not _reserves_ram_now:
              return original, None
          try:
-@@ -15686,15 +15770,25 @@ class LlamaCppBackend:
+@@ -15686,15 +15804,33 @@ class LlamaCppBackend:
              # Advisory pricing: an unreadable host or GGUF leaves the launch alone.
              logger.debug("Could not price the load for a pageable override.", exc_info = True)
              return original, None
@@ -167,20 +208,28 @@ index 865e8783ad..2ca0e70d00 100644
 +            except Exception:  # noqa: BLE001 -- the mapping alone still lets the load finish
 +                logger.debug("Lookup tables: could not price lazy reads.", exc_info = True)
 +        paged = [*paged, *lazy]
++        headroom: list = []
++        if auto_unmapped and fit_headroom_flags is not None:
++            try:
++                headroom = list(fit_headroom_flags(paged) or [])
++            except Exception:  # noqa: BLE001 -- the mapping still applies without the margin
++                logger.debug("Fit headroom: could not read the launch's margin.", exc_info = True)
++        paged = [*paged, *headroom]
          logger.warning(
              "Overriding the unmapped load mode (%s) for an oversized model: it would "
 -            "allocate the whole model in host RAM instead of paging it in.",
-+            "allocate the whole model in host RAM instead of paging it in.%s",
++            "allocate the whole model in host RAM instead of paging it in.%s%s",
              ", ".join(overridden),
 +            f" Lookup tables: {' '.join(lazy)}." if lazy else "",
++            f" GPU headroom: {' '.join(headroom)}." if headroom else "",
          )
 -        return paged, _PAGEABLE_OVERRIDE_NOTE
 +        note = _PAGEABLE_AUTO_OVERRIDE_NOTE if from_auto else _PAGEABLE_OVERRIDE_NOTE
-+        return paged, note + (_PAGEABLE_LAZY_TABLE_NOTE if lazy else "")
++        return paged, note
  
      @property
      def last_load_warning(self) -> Optional[str]:
-@@ -15750,7 +15844,11 @@ class LlamaCppBackend:
+@@ -15750,7 +15886,11 @@ class LlamaCppBackend:
              # The discrete guard never charged the projector, so its verdict stands.
              self._last_load_warning = host_msg + suffix
          elif suffix.strip():
@@ -193,7 +242,7 @@ index 865e8783ad..2ca0e70d00 100644
          else:
              self._last_load_warning = None
          logger.info(
-@@ -30554,8 +30652,29 @@ class LlamaCppBackend:
+@@ -30554,8 +30694,32 @@ class LlamaCppBackend:
                          )
                      )
  
@@ -221,10 +270,13 @@ index 865e8783ad..2ca0e70d00 100644
 +                    lazy_table_flags = lambda argv: self._paged_lookup_table_flags(
 +                        model_path, server_caps, argv, env
 +                    ),
++                    fit_headroom_flags = lambda argv: self._paged_fit_headroom_flags(
++                        argv, env, extra_args
++                    ),
                  )
                  if _pageable_note:
                      # Record the argv that actually launches, and snapshot it too, since arch-crash retry restores it.
-@@ -32111,7 +32230,24 @@ class LlamaCppBackend:
+@@ -32111,7 +32275,27 @@ class LlamaCppBackend:
                              )
  
                          cmd, _retry_pageable_note = self._page_an_oversized_unmapped_load(
@@ -246,6 +298,9 @@ index 865e8783ad..2ca0e70d00 100644
 +                            ),
 +                            lazy_table_flags = lambda argv: self._paged_lookup_table_flags(
 +                                model_path, server_caps, argv, env
++                            ),
++                            fit_headroom_flags = lambda argv: self._paged_fit_headroom_flags(
++                                argv, env, extra_args
 +                            ),
                          )
                          if _retry_pageable_note:
@@ -426,10 +481,10 @@ index 6708b4d641..460b6c2003 100644
  
  def memory_state_satisfies_settings(
 diff --git a/studio/backend/tests/test_llama_cpp_placement.py b/studio/backend/tests/test_llama_cpp_placement.py
-index 9700da8541..4fe5621455 100644
+index 9700da8541..9249fef92d 100644
 --- a/studio/backend/tests/test_llama_cpp_placement.py
 +++ b/studio/backend/tests/test_llama_cpp_placement.py
-@@ -2679,6 +2679,154 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
+@@ -2679,6 +2679,209 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
      assert backend.last_load_warning is None
  
  
@@ -500,20 +555,37 @@ index 9700da8541..4fe5621455 100644
 +    return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == flag and i + 1 < len(cmd)]
 +
 +
-+def test_an_oversized_igpu_load_left_on_auto_is_mapped_and_streams_its_table(tmp_path, monkeypatch):
++@pytest.mark.parametrize("platform", ["win32", "linux"])
++def test_an_oversized_igpu_load_left_on_auto_is_mapped_and_streams_its_table(
++    tmp_path, monkeypatch, platform
++):
 +    """DC-060: on an iGPU llama.cpp's auto is none, so a 217 GB model nobody pinned to a mode read
 +    its whole 103 GiB Engram table into one host buffer. The override must apply to auto there."""
++    monkeypatch.setattr(
++        llama_cpp_module, "_paged_load_needs_fit_headroom", lambda: platform == "win32"
++    )
 +    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++    logged = _override_log(monkeypatch)
 +
 +    cmd = _launch(backend, gguf)["cmd"]
 +
 +    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
 +    assert _modes(cmd, "--lazy-mode") == ["on"], cmd
 +    assert resolve_effective_load_state(cmd, {}, auto_unmapped = True)[1] is False
++    # Windows: the fitter keeps shared memory free for the mapped pages, or it fills it with the GPU
++    # share. Linux pages fine without it, and the margin costs speed there.
++    windows = platform == "win32"
++    assert _modes(cmd, "--fit-target")[-1:] == (["16384"] if windows else []), cmd
 +    warning = backend.last_load_warning or ""
-+    assert "On this integrated GPU llama.cpp loads without memory mapping by default" in warning
-+    assert "lookup tables are read from disk as needed" in warning
++    assert warning.endswith(
++        " Unsloth turned on memory mapping, which llama.cpp leaves off by default on this "
++        "integrated GPU."
++    ), warning
 +    assert "was set to load without memory mapping" not in warning
++    # The lazy table and the headroom go to the log, not to the user's notice.
++    override = [line for line in logged if "Overriding the unmapped load mode" in line]
++    assert override and "Lookup tables: --lazy-mode on." in override[0], logged
++    assert ("GPU headroom: --fit-target 16384." in override[0]) is windows, override
 +    assert backend._memory_state == (False, False)
 +
 +
@@ -524,6 +596,7 @@ index 9700da8541..4fe5621455 100644
 +    cmd = _launch(backend, gguf)["cmd"]
 +
 +    assert "--load-mode" not in cmd and "--lazy-mode" not in cmd, cmd
++    assert "--fit-target" not in cmd, cmd
 +    assert backend.last_load_warning is None
 +
 +
@@ -542,6 +615,7 @@ index 9700da8541..4fe5621455 100644
 +    cmd = _launch(backend, gguf)["cmd"]
 +
 +    assert "--load-mode" not in cmd and "--lazy-mode" not in cmd, cmd
++    assert "--fit-target" not in cmd, cmd
 +    assert "memory mapping instead" not in (backend.last_load_warning or "")
 +
 +
@@ -553,7 +627,43 @@ index 9700da8541..4fe5621455 100644
 +
 +    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
 +    assert _modes(cmd, "--lazy-mode") == ["off"], cmd
-+    assert "lookup tables are read from disk" not in (backend.last_load_warning or "")
++
++
++def test_a_user_fit_target_survives_the_igpu_override(tmp_path, monkeypatch):
++    monkeypatch.setattr(llama_cpp_module, "_paged_load_needs_fit_headroom", lambda: True)
++    backend, gguf = _igpu_backend(tmp_path, monkeypatch, avail_mib = 17 * 1024)
++
++    cmd = _launch(backend, gguf, extra_args = ["--fit-target", "4096"])["cmd"]
++
++    assert _modes(cmd, "--load-mode") == ["mmap"], cmd
++    assert _modes(cmd, "--fit-target") == ["4096"], cmd
++
++
++@pytest.mark.parametrize(
++    "argv, env, user, expected",
++    [
++        (["--fit", "on"], {}, [], ["--fit-target", "16384"]),
++        # Studio's own margin (a drafter's reserve) is kept, and the headroom goes on top.
++        (["--fit", "on", "--fit-target", "3072"], {}, [], ["--fit-target", "18432"]),
++        (["--fit", "off"], {}, [], []),
++        (["--fit", "on", "--fit-target", "1024,2048"], {}, [], []),
++        (["--fit", "on", "--fit-target", "4096"], {}, ["--fit-target", "4096"], []),
++        (["--fit", "on"], {"LLAMA_ARG_FIT_TARGET": "2048"}, [], []),
++    ],
++    ids = [
++        "default",
++        "adds-to-studio-margin",
++        "fitter-off",
++        "per-device-list",
++        "user-argv",
++        "user-env",
++    ],
++)
++def test_the_igpu_fit_headroom(monkeypatch, argv, env, user, expected):
++    monkeypatch.setattr(llama_cpp_module, "_paged_load_needs_fit_headroom", lambda: True)
++    assert LlamaCppBackend._paged_fit_headroom_flags(argv, env, user) == expected
++    monkeypatch.setattr(llama_cpp_module, "_paged_load_needs_fit_headroom", lambda: False)
++    assert LlamaCppBackend._paged_fit_headroom_flags(argv, env, user) == []
 +
 +
 +def test_an_igpu_model_without_a_table_is_only_mapped(tmp_path, monkeypatch):
@@ -584,7 +694,7 @@ index 9700da8541..4fe5621455 100644
  def _unmapped_tokens(cmd):
      """The tokens in ``cmd`` that select a mode llama.cpp does not mmap."""
      out = []
-@@ -5779,7 +5927,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
+@@ -5779,7 +5982,7 @@ def test_a_device_list_still_sees_an_auto_filtered_vulkan_igpu(monkeypatch):
      assert src.index("_vulkan_igpu_ids = (") < src.index(
          "_gpu_mem = self._vulkan_auto_gpu_memory(_gpu_mem)"
      )
@@ -593,7 +703,7 @@ index 9700da8541..4fe5621455 100644
  
  
  def test_the_oversized_readings_share_their_preflights_ram_snapshot():
-@@ -7075,3 +7223,33 @@ def test_the_checkpoint_discount_removes_only_the_checkpoints():
+@@ -7075,3 +7278,33 @@ def test_the_checkpoint_discount_removes_only_the_checkpoints():
          without = backend._slots_that_fit_on_gpu(*args, ctx_checkpoints = 0, **kw)
          assert with_ckpts == without
      assert without[1] is False and without[2] < 8

@@ -67,7 +67,7 @@ jobs:
           W="$RUNNER_TEMP/ig"
           for i in $(seq 1 600); do [ -f "$W/dl.done" ] && break; sleep 10; done
           cat "$W/out/dl-summary.txt"
-          for side in A B; do
+          for side in B; do
             port=$([ $side = A ] && echo 8931 || echo 8932)
             cd "$W/$side/studio/backend"
             # Own session: Studio's shutdown signals its process group, which would include this step's shell.
