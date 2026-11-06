@@ -1,0 +1,154 @@
+name: "AMD CI: PR 16857 iGPU load-mode / lazy-mode argv cells (gfx1151, Linux + Windows)"
+
+# unslothai/unsloth#16857: for an oversized load on an integrated GPU, Studio appends
+# --load-mode mmap, --lazy-mode on (lazily-readable table > 4 GiB) and, on Windows only,
+# --fit-target <margin + 15360>. Cells per backend, same job, same machine, fresh llama-server each:
+#   A_base       no load / lazy flags (base argv)
+#   B_head       --load-mode mmap --lazy-mode on [+ --fit-target 16384 on Windows]
+#   C_mmap_only  --load-mode mmap
+# Published unslothai/llama.cpp bundles only (no rebuild). Correctness only, so the card is shared
+# (AMD_CI_SHARED_GPU=1; capability.py declares exclusive_gpu as a gap).
+
+on:
+  push:
+    branches: [amd-ci-pr16857]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TAG: "b12128-mix-2f23ac9"
+
+jobs:
+
+  gpu-linux:
+    name: "PR 16857 cells, Linux ROCm + Vulkan (shared)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "pr16857-linux"
+
+      - name: Hardware gate
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require rocm gpu \
+            --expect-arch gfx1151 --min-gpus 1 \
+            --out "$AMD_CI_WORK/out/host.json"
+
+      - name: Host gaps
+        run: |
+          set +e
+          python3 amd_ci/pr16857/gaps.py --out "$AMD_CI_WORK/out/GAPS.md"
+          cat "$AMD_CI_WORK/out/GAPS.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cells A / B / C (+ ballast)
+        timeout-minutes: 75
+        run: |
+          set +e
+          bash amd_ci/pr16857/linux_job.sh
+          rc=$?
+          echo "job rc=$rc"
+          test -s "$AMD_CI_WORK/out/cells.jsonl"
+
+      - name: Stop stray servers
+        if: always()
+        run: |
+          set +e
+          for p in $(pgrep -x llama-server); do kill -9 "$p"; done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr16857-linux
+          path: ${{ env.AMD_CI_WORK }}/out
+          retention-days: 7
+          if-no-files-found: warn
+
+  linux-control:
+    name: "PR 16857 linux control (selector diagnosis)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+          echo "If this job runs and the windows job stays queued, the Windows selector matched no runner."
+
+  gpu-windows:
+    name: "PR 16857 cells, Windows 11 Vulkan + ROCm (shared)"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      AMD_CI_SHARED_GPU: "1"
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "pr16857-windows"
+
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe",
+                           "C:\Program Files\Python311\python.exe",
+                           "C:\Program Files\Python310\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python found."; exit 1 }
+          & $found --version
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+
+      - name: Host gate
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\gate.py" --no-torch `
+            --require windows --out "$env:AMD_CI_WORK\out\host.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Host gaps
+        run: |
+          $ErrorActionPreference = "Continue"
+          & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\pr16857\gaps.py" --out "$env:AMD_CI_WORK\out\GAPS.md"
+          Get-Content -Encoding utf8 "$env:AMD_CI_WORK\out\GAPS.md" | Add-Content -Encoding utf8 -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Cells A / B / C
+        timeout-minutes: 75
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "RUNNER_OS='$env:RUNNER_OS' RUNNER_NAME='$env:RUNNER_NAME'"
+          & "$env:GITHUB_WORKSPACE\amd_ci\pr16857\windows_job.ps1"
+          if (-not (Test-Path "$env:AMD_CI_WORK\out\cells.jsonl")) { exit 1 }
+
+      - name: Stop stray servers
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr16857-windows
+          path: ${{ env.AMD_CI_WORK }}\out
+          retention-days: 7
+          if-no-files-found: warn
