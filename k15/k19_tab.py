@@ -32,7 +32,8 @@ for osn, rs in sorted(R.items()):
     cells = collections.OrderedDict()
     for r in rs:
         if r.get("kind") == "server":
-            cells.setdefault((r["model"], r["mode"], r.get("arm")), []).append(r)
+            mtp = "+mtp" if "draft-mtp" in " ".join(r.get("argv") or []) else ""
+            cells.setdefault((r["model"], r["mode"] + mtp, r.get("arm")), []).append(r)
     for (m, mode, arm), v in cells.items():
         g = lambda c, k: [x[c][k] for x in v if x.get(c) and x[c].get(k) is not None]
         md = lambda c: ",".join(sorted({(x.get(c) or {}).get("md5", "-")[:8] for x in v}))

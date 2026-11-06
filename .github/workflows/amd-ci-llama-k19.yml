@@ -3,7 +3,8 @@ name: "AMD CI k19: llama.cpp k19-int3 eddd38eef9a (+ HIP fix 058773ab6c3, Window
 # Trees, all from upstream ggml-org ff5a2337: up = stock (the base), pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
 # i3 = pf + k15/i3d.patch.gz (k19-int3 eddd38eef9a + 058773ab6c3, the HIP build fix). Each applied tree is checked against k15/TREES.
 # ROCm builds: the release recipe and the TheRock weekly pin 10.2.0a20261017, as every earlier llama run. PolyStrata: its own Strix Halo
-# recipe, no source change. Matrix: k15/k19_plan.py; tables: k15/k19_tab.py (summary job).
+# recipe, no source change. r3: all Linux bins are built on the gfx1151 box (k15/onbox_linux_build.sh; the fork's hosted runners were
+# saturated). Matrix: k15/k19_plan.py; tables: k15/k19_tab.py (run on the downloaded artifacts).
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
 
 on:
@@ -33,72 +34,8 @@ jobs:
           echo "control leg: the same selector with Linux in place of Windows"
           echo "machine: $(uname -n)"
 
-  hosted-build:
-    name: "Linux build ${{ matrix.n }} (hosted ubuntu-22.04, release recipe; HIP gfx1151 + CPU ctest)"
-    runs-on: ubuntu-22.04
-    timeout-minutes: 330
-    strategy:
-      fail-fast: false
-      matrix:
-        n: [i3, up, pf]
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Free disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
-      - name: Build
-        run: |
-          bash k15/hosted_linux_build.sh ${{ matrix.n }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bin_${{ matrix.n }}
-          path: ${{ runner.temp }}/art
-          if-no-files-found: ignore
-          retention-days: 3
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: info_${{ matrix.n }}
-          path: ${{ runner.temp }}/info
-          retention-days: 7
-          if-no-files-found: warn
-
-  hosted-poly:
-    name: "Linux build PolyStrata f472d85a (hosted ubuntu-22.04, its Strix Halo recipe, gfx1151)"
-    runs-on: ubuntu-22.04
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Free disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
-      - name: Build
-        run: |
-          bash k15/hosted_poly_build.sh
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bin_poly
-          path: ${{ runner.temp }}/art
-          if-no-files-found: ignore
-          retention-days: 3
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: info_poly
-          path: ${{ runner.temp }}/info
-          retention-days: 7
-          if-no-files-found: warn
-
   gpu-linux:
     name: "k19 vs up, Linux ROCm gfx1151 (exclusive)"
-    needs: [hosted-build, hosted-poly]
-    if: ${{ always() }}
     env:
       K19_STEPS: archs,ops,exe,exact,bench,tiers,lfm,poly,tbofull
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
@@ -121,24 +58,6 @@ jobs:
           "$R" 2>&1 | grep -m3 -E "Marketing Name|gfx1151" | tee "$AMD_CI_WORK/out/rocminfo.txt"
           if [ ! -e /dev/kfd ] || ! grep -q gfx1151 "$AMD_CI_WORK/out/rocminfo.txt"; then echo "GATE FAILED: no gfx1151 via KFD"; exit 1; fi
           echo "gate ok"
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin_i3
-          path: ${{ env.AMD_CI_WORK }}/art/bin_i3
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin_up
-          path: ${{ env.AMD_CI_WORK }}/art/bin_up
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: bin_pf
-          path: ${{ env.AMD_CI_WORK }}/art/bin_pf
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: bin_poly
-          path: ${{ env.AMD_CI_WORK }}/art/bin_poly
       - name: Cells
         timeout-minutes: 345
         run: |
@@ -163,6 +82,8 @@ jobs:
 
   gpu-windows:
     name: "k19 vs up, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    # r3: off; r2 (run 42134322799) measured Windows on the same head dc86a8f271b
+    if: ${{ false }}
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
       K19_STEPS: ops,exe,exact,bench,tiers,lfm,tbofull
@@ -202,39 +123,5 @@ jobs:
         with:
           name: k19-windows-gpu
           path: ${{ env.AMD_CI_WORK }}\out
-          retention-days: 7
-          if-no-files-found: warn
-
-  summary:
-    name: "k19 tables (md5 groups, speed medians, engagement; red only when no rows came back)"
-    needs: [hosted-build, hosted-poly, gpu-linux, gpu-windows]
-    if: ${{ always() }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: k19-*
-          path: ${{ runner.temp }}/in
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: info_*
-          path: ${{ runner.temp }}/in
-      - name: Tables
-        run: |
-          set +e
-          python3 k15/k19_tab.py "$RUNNER_TEMP/in" "$RUNNER_TEMP/verdict"
-          rc=$?
-          cat "$RUNNER_TEMP/verdict/TABLES.md" >> "$GITHUB_STEP_SUMMARY"
-          exit $rc
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: verdict
-          path: ${{ runner.temp }}/verdict
           retention-days: 7
           if-no-files-found: warn

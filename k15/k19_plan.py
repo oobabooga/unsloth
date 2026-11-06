@@ -32,6 +32,9 @@ ARMS = [
     "i3_kq0:i3:GGML_CPU_KQ_AVX512=0;GGML_CPU_IQ_AVX512=0", "i3_blk0:i3:LLAMA_MOE_SINGLE_WAIT_BLOCKING=0", "i3_cm0:i3:LLAMA_MOE_CPU_MISS=0",
     # test-backend-ops / exe arms
     "t_i3:i3", "t_up:up", "t_pf:pf",
+    # r3: the head with no MoE cache (--moe-cache-mib 0, upstream's own default): the 4 GiB rows of r2 (Windows) had the head 35% (q36)
+    # / 15% (LFM2.5) below upstream; this arm splits "cache + hybrid gate / CPU-miss path" from the rest of the head
+    "i3_nc:i3:K6P_MOE=0",
 ]
 MTP = "--spec-type draft-mtp --spec-draft-n-max 2"
 PLAN = []
@@ -114,13 +117,13 @@ if "bench" in STEPS:
 # 6. --fit tiers on an emulated device (GGML_CUDA_FAKE_FREE_MIB N, strict): 4 GiB small device, 8 GiB k19-place8, 12 / 16 GiB
 #    k19-placemid; head, head with the tier's kill switch, pf (k15, no tiers), up (fit-target free - N), Studio argv + MTP
 if "tiers" in STEPS:
-    step("tier_q36_4g", "time", "--cell", "q36:cap4096", "--reps", "1", arms="i3,i3_p8o,i3_blk0,pf,up", extra=MTP, p8k=7900, timeout=3600)
-    step("tier_q36_8g", "time", "--cell", "q36:cap8192", "--reps", "1", arms="i3,i3b,i3_p8o,i3_kq0,i3_cm0,pf,up", extra=MTP, p8k=7900, timeout=5400)
+    step("tier_q36_4g", "time", "--cell", "q36:cap4096", "--reps", "1", arms="i3,i3b,i3_nc,i3_p8o,i3_blk0,pf,up", extra=MTP, p8k=7900, timeout=3600)
+    step("tier_q36_8g", "time", "--cell", "q36:cap8192", "--reps", "1", arms="i3,i3b,i3_nc,i3_p8o,i3_kq0,i3_cm0,pf,up", extra=MTP, p8k=7900, timeout=5400)
     step("tier_q36_12g", "time", "--cell", "q36:cap12288", "--reps", "1", arms="i3,i3_pmo,pf,up", extra=MTP, p8k=7900, timeout=3600)
     step("tier_q36_16g", "time", "--cell", "q36:cap16384", "--reps", "1", arms="i3,i3b,i3_pmo,pf,up", extra=MTP, p8k=7900, timeout=3600)
 # 7. LFM2.5-24B-A2B (no drafter): host-bound small device + host team (blocking device wait) at 4 GiB, full card speed
 if "lfm" in STEPS:
-    step("lfm_4g", "time", "--cell", "lfm:cap4096", "--reps", "1", arms="i3,i3b,i3_hbo,i3_blk0,i3_kq0,pf,up", timeout=3600)
+    step("lfm_4g", "time", "--cell", "lfm:cap4096", "--reps", "1", arms="i3,i3b,i3_nc,i3_hbo,i3_blk0,i3_kq0,i3_cm0,pf,up", timeout=3600)
     step("lfm_full", "time", "--cell", "lfm:full", "--reps", "2", arms="up,i3", timeout=2400)
 # 8. PolyStrata f472d85a on the same Qwen3.6 GGUF (its defaults), full card
 if "poly" in STEPS and HAS("poly"):

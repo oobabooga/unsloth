@@ -12,11 +12,14 @@ cat "$OUT/gpu_diag.txt"
 export K6P_DIR="$R" K6P_DEV=ROCm0 K6P_OUT="$OUT/bench"
 ( python3 -u "$J/k15_bench.py" dl --models ${K19_DL_MODELS:-q35,q36,lfm} > "$OUT/dl.log" 2>&1 ) &
 DLP=$!
+# r3: bins built here (onbox_linux_build.sh); a hosted bin artifact, when one was downloaded, fills a tree the box failed to build
+bash "$J/onbox_linux_build.sh" 2>&1 | tee "$OUT/onbox_build.txt"
 for n in i3 up pf poly; do
+  [ -d "$R/bins/$n" ] && { echo "bin $n: $(cat "$R/bins/$n/TAG") $(ls "$R/bins/$n" | wc -l) files (on-box)" | tee -a "$OUT/gpu_diag.txt"; continue; }
   tar xzf "$W/art/bin_$n/bin_$n.tgz" -C "$R/bins" 2>/dev/null || tar xzf "$W/art/bin_$n.tgz" -C "$R/bins"
   # HARNESS-FAIL (coordinator 10-31, r7: a missing ig bin surfaced as 7 INCONCLUSIVEs after an hour): a bin the ticket names is required;
   # only up, and ig when the ticket carries no k15/IG_SHA, are optional
-  req=1; [ $n = poly ] && req=0
+  req=1; { [ $n = poly ] || [ $n = pf ]; } && req=0
   [ -d "$R/bins/bin_$n" ] || { echo "bin $n: missing" | tee -a "$OUT/gpu_diag.txt"; [ $req = 0 ] && continue; echo "HARNESS-FAIL: the ticket names bin $n but it is not here" | tee -a "$OUT/gpu_diag.txt"; exit 1; }
   mv "$R/bins/bin_$n" "$R/bins/$n"; echo "bin $n: $(cat "$R/bins/$n/TAG") $(ls "$R/bins/$n" | wc -l) files" | tee -a "$OUT/gpu_diag.txt"
 done
