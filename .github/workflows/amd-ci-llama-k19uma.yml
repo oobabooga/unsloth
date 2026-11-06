@@ -1,7 +1,7 @@
-name: "AMD CI k19-uma: llama.cpp k19-uma 196eedf17cc (small-plan reserve + unified-memory MoE cache pricing) vs k19-int3 e18702b7f46 on gfx1151 Linux + Windows"
+name: "AMD CI k19-uma r2 (Linux): llama.cpp k19-uma 0dfd49c8a57 (small-plan reserve + unified-memory MoE cache pricing) vs k19-int3 e18702b7f46 on gfx1151 Linux + Windows"
 
 # Trees, all from upstream ggml-org ff5a2337: up = stock, pf = + k15/k10.patch.gz + k15/pfd.patch.gz (k15 7f0111d448c),
-# i3 = pf + k15/i3d.patch.gz (k19-int3 e18702b7f46, the base), uma = i3 + k15/umad.patch.gz (k19-uma 196eedf17cc, the head). Each applied
+# i3 = pf + k15/i3d.patch.gz (k19-int3 e18702b7f46, the base), uma = i3 + k15/umad.patch.gz (k19-uma 0dfd49c8a57, the head). Each applied
 # tree is checked against k15/TREES. ROCm builds: the release recipe and the TheRock weekly pin 10.2.0a20261017, built on the box.
 # Matrix: k15/k19_plan.py; tables from the downloaded artifacts.
 # Patches only: no token, secret or credential is sent to the runners; models are public HF files at pinned revisions.
@@ -82,6 +82,8 @@ jobs:
 
   gpu-windows:
     name: "k19-uma vs k19-int3, Windows 11 ROCm gfx1151 (build + measure, exclusive)"
+    # r2: off; r1 (run 42152016399) measured Windows on 196eedf17cc (0dfd49c8a57 only skips single-token decodes in the small-plan reserve)
+    if: ${{ false }}
     runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
     env:
       K19_STEPS: exact,tiers,bench
