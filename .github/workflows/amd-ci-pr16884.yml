@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 16884"
 
 on:
   push:
-    branches: [amd-ci-pr16884]
+    branches: [amd-ci-retro16884]
   workflow_dispatch:
 
 permissions:
