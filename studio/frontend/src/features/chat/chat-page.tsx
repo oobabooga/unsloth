@@ -186,6 +186,8 @@ import { ContextUsageBar } from "./components/context-usage-bar";
 import { contextUsageRows } from "./lib/context-usage-bar-state";
 import { ModelLoadInlineStatus } from "./components/model-load-status";
 import { ProjectSwitcher } from "./components/project-switcher";
+import { CastChip, ChatViewMenu } from "@/features/characters/chat/chat-chrome";
+import { CharacterStage } from "@/features/characters/chat/character-stage";
 import { EditProjectDialog } from "./components/edit-project-dialog";
 import {
   buildExternalModelId,
@@ -909,11 +911,13 @@ const SingleContent = memo(function SingleContent({
         browserFullView && chatDock === "minimized" && "hidden",
       )}
     >
-      {/* A floating chat has no welcome screen, so its composer shows in a new chat too. */}
-      <Thread
-        hideWelcome={Boolean(threadId) || browserFullView}
-        targetThreadId={threadId}
-      />
+      <CharacterStage threadId={threadId}>
+        {/* A floating chat has no welcome screen, so its composer shows in a new chat too. */}
+        <Thread
+          hideWelcome={Boolean(threadId) || browserFullView}
+          targetThreadId={threadId}
+        />
+      </CharacterStage>
     </div>
   );
 
@@ -4812,6 +4816,15 @@ export function ChatPage({
                 ) : null}
               </nav>
             )}
+            {view.mode === "single" ? (
+              <CastChip
+                threadId={activeThreadId}
+                onOpen={() => {
+                  useResearchRunStore.getState().closePanel();
+                  setSettingsOpen(true);
+                }}
+              />
+            ) : null}
             {pendingNativeModelIntent && view.mode !== "compare" ? (
               <NativeModelChip
                 intent={pendingNativeModelIntent}
@@ -4890,6 +4903,7 @@ export function ChatPage({
                 onDiscard={toggleIncognito}
               />
             ) : null}
+            {view.mode === "single" ? <ChatViewMenu threadId={activeThreadId} /> : null}
             {view.mode === "single" && (
               <ChatHeaderMenu temporary={incognito} onToggleTemporary={toggleIncognito} />
             )}
