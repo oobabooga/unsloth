@@ -22,7 +22,7 @@ sys.path.insert(0, sys.argv[1])
 from core.inference import tools
 out = {"tools_file": tools.__file__, "bash": tools._windows_bash()}
 session = "nul-probe-16991"
-out["output"] = tools._bash_exec("echo hidden > nul 2>&1; echo shown", None, 120, session, disable_sandbox = True)
+out["output"] = tools._bash_exec("x=\"$(echo hidden > nul)\"; echo hidden > nul 2>&1; echo shown", None, 120, session, disable_sandbox = True)
 workdir = os.path.abspath(tools._get_workdir(session))
 out["workdir"] = workdir
 ext = "\\\\?\\" + workdir
