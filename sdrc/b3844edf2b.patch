@@ -1,0 +1,48 @@
+From b3844edf2b8d6072ca2a592d4c4f69f0e14b464a Mon Sep 17 00:00:00 2001
+From: WalterCool <waltercool@slash.cl>
+Date: Fri, 23 Oct 2026 18:31:28 -0300
+Subject: [PATCH] hip: fix bf16 WMMA operand vector type for gfx11/gfx12
+ (llama/30885)
+
+The __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32 (and _gfx12) builtins
+take their A/B operands as vectors of short (_ExtVector<16, short> /
+_ExtVector<8, short>), not __bf16. Declaring the fragments as
+ext_vector_type(N) __bf16 fails to compile:
+
+  error: cannot initialize a parameter of type 'short
+  __attribute__((ext_vector_type(16)))' with an lvalue of type 'const
+  bf16x16_t' (vector of 16 '__bf16' values)
+
+short and __bf16 are both 16-bit and the value is only ever passed to
+the builtin via reinterpret_cast over raw bytes, so changing the element
+type is bit-identical. The operand type has been short since the builtin
+was introduced, so this works across LLVM/ROCm versions without a
+version gate. Fixes HIP builds for RDNA3 (gfx1150/1151) and RDNA4
+(gfx1200/1201).
+
+Signed-off-by: Pablo Cholaky <waltercool@slash.cl>
+---
+ src/ggml-cuda/mma.cuh | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-cuda/mma.cuh b/src/ggml-cuda/mma.cuh
+index 1cec98b06e..c72f12131e 100644
+--- a/src/ggml-cuda/mma.cuh
++++ b/src/ggml-cuda/mma.cuh
+@@ -1409,14 +1409,14 @@ namespace ggml_cuda_mma {
+             tile<16, 16, float, dl_d> & D, const tile<16, 8, nv_bfloat162, dl_ab> & A, const tile<16, 8, nv_bfloat162, dl_ab> & B) {
+ #if defined(AMD_WMMA_AVAILABLE)
+ #if defined(RDNA4)
+-        using bf16x8_t = __attribute__((ext_vector_type(8))) __bf16;
++        using bf16x8_t = __attribute__((ext_vector_type(8))) short;
+         using floatx8_t = __attribute__((ext_vector_type(8))) float;
+         floatx8_t& acc_frag = reinterpret_cast<floatx8_t&>(D.x[0]);
+         const bf16x8_t& a_frag = reinterpret_cast<const bf16x8_t&>(A.x[0]);
+         const bf16x8_t& b_frag = reinterpret_cast<const bf16x8_t&>(B.x[0]);
+         acc_frag = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a_frag, b_frag, acc_frag);
+ #elif defined(RDNA3)
+-        using bf16x16_t = __attribute__((ext_vector_type(16))) __bf16;
++        using bf16x16_t = __attribute__((ext_vector_type(16))) short;
+         using floatx8_t = __attribute__((ext_vector_type(8))) float;
+         floatx8_t& acc_frag = reinterpret_cast<floatx8_t&>(D.x[0]);
+         const bf16x16_t& a_frag = reinterpret_cast<const bf16x16_t&>(A.x[0]);

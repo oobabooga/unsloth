@@ -1,0 +1,176 @@
+name: "AMD CI: gfx1151 audit items (HIP tile FA FP32 accumulators, bf16 WMMA build, HIP INT8 epilogue, Studio memory kind)"
+
+# base = unslothai/stable-diffusion.cpp master ba6ac303 (HIP gfx1151, TheRock 7.14 wheels, built on the box)
+# head = base + sdrc/0016-ggml-hip-fattn-tile-f32-accumulators.patch added to scripts/unsloth/ggml-patches
+# Both in ONE job on ONE machine, renders interleaved per rep.
+
+on:
+  push:
+    branches: [amd-ci-sdxp-b2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-linux:
+    name: "gfx1151 Linux: HIP FA fix base vs head + bf16 WMMA build + INT8 epilogue + torch props"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    env:
+      ROCM_VERSION: "7.14.0"
+      MASTER: ba6ac30346b0f174354419d820e6f11b3e9bc0f2
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdxp-b2-linux"
+      - name: Host gate + device strings
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          { echo "node: $(uname -n)  kernel: $(uname -r)"; cat /opt/rocm/.info/version 2>/dev/null || true;
+            (rocminfo 2>&1 | grep -E "Runtime Version|Marketing Name|Name:.*gfx|Compute Unit" | head -12) || true; } > "$AMD_CI_WORK/out/host_strings.txt" 2>&1
+          cat "$AMD_CI_WORK/out/host_strings.txt"
+      - name: "Builds: HIP gfx1151 base and head (TheRock wheels)"
+        timeout-minutes: 90
+        run: |
+          set +e
+          cd "$AMD_CI_WORK"
+          python3 -m venv .rocm && . .rocm/bin/activate
+          python -m pip install -q --upgrade pip && python -m pip install -q ninja cmake pillow numpy
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,device-gfx1151]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          export ROCM_PATH HIP_PATH="$ROCM_PATH" CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"
+          export PATH="$(rocm-sdk path --bin):$AMD_CI_WORK/.rocm/bin:$PATH"
+          echo "ROCM_LIB=$ROCM_PATH/lib" >> "$GITHUB_ENV"
+          echo "THEROCK_ROOT=$ROCM_PATH" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          bash sdrc/build_hip.sh hip_base "$MASTER" "$AMD_CI_WORK/bin/hip_base" 2>&1 | tail -6
+          bash sdrc/build_hip.sh hip_fa "$MASTER" "$AMD_CI_WORK/bin/hip_fa" "$GITHUB_WORKSPACE/sdrc/0016-ggml-hip-fattn-tile-f32-accumulators.patch" 2>&1 | tail -6
+          exit 0
+      - name: "ggml b3844edf2b: does the bf16 WMMA code compile for gfx1151 with the box's system ROCm (base, then patched)?"
+        timeout-minutes: 60
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/b3844"; mkdir -p "$O"
+          SRC="$RUNNER_TEMP/src_hip_hip_base"
+          CL=/opt/rocm/lib/llvm/bin/clang
+          "$CL" --version > "$O/system_clang.txt" 2>&1
+          "$THEROCK_ROOT/lib/llvm/bin/clang" --version > "$O/therock_clang.txt" 2>&1
+          for arm in base patched; do
+            if [ "$arm" = patched ]; then git -C "$SRC/ggml" apply "$GITHUB_WORKSPACE/sdrc/b3844edf2b.patch"; echo "apply rc=$?" >> "$O/summary.txt"; fi
+            B="$RUNNER_TEMP/bsys_$arm"
+            PATH="/opt/rocm/bin:$PATH" ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm cmake -S "$SRC" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DSD_HIPBLAS=ON -DHIP_PLATFORM=amd -DGPU_TARGETS=gfx1151 -DGGML_NATIVE=OFF -DCMAKE_PREFIX_PATH=/opt/rocm \
+              -DCMAKE_HIP_COMPILER="$CL" -DSD_BUILD_EXAMPLES=OFF > "$O/cmake_$arm.log" 2>&1
+            echo "$arm configure rc=$?" >> "$O/summary.txt"
+            T0=$(date +%s)
+            PATH="/opt/rocm/bin:$PATH" cmake --build "$B" -j "$(nproc)" --target ggml-hip > "$O/build_$arm.log" 2>&1
+            echo "$arm ggml-hip build rc=$? in $(( $(date +%s) - T0 )) s" >> "$O/summary.txt"
+            (grep -E "error:" "$O/build_$arm.log" | sort | uniq -c | head -20) >> "$O/summary.txt"
+          done
+          cat "$O/summary.txt"; head -3 "$O/system_clang.txt" "$O/therock_clang.txt"
+          exit 0
+      - name: "HIP INT8: hipblasGemmEx INT32 accumulator + separate epilogue (int8.cu fallback), timed"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/i8"; mkdir -p "$O"
+          "$THEROCK_ROOT/lib/llvm/bin/clang++" -x hip --offload-arch=gfx1151 -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ \
+            -I"$THEROCK_ROOT/include" sdrc/i8bench.cpp -L"$THEROCK_ROOT/lib" -lhipblas -lamdhip64 \
+            -Wl,-rpath,"$THEROCK_ROOT/lib" -o "$RUNNER_TEMP/i8bench" > "$O/compile.log" 2>&1
+          echo "compile rc=$?"; tail -5 "$O/compile.log"
+          "$RUNNER_TEMP/i8bench" "$O/i8bench.jsonl" > "$O/run.log" 2>&1
+          echo "run rc=$?"; cat "$O/i8bench.jsonl"
+          exit 0
+      - name: "Studio memory kind: raw torch props on Linux ROCm torch (repo.amd.com gfx1151)"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/torch"; mkdir -p "$O"
+          python3 -m venv "$AMD_CI_WORK/tv" && "$AMD_CI_WORK/tv/bin/pip" install -q --upgrade pip
+          "$AMD_CI_WORK/tv/bin/pip" install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ torch > "$O/pip.log" 2>&1
+          echo "pip rc=$?"; tail -3 "$O/pip.log"
+          "$AMD_CI_WORK/tv/bin/python" sdrc/torch_props.py "$O/torch_props_linux.json"
+          cat "$O/torch_props_linux.json"
+          exit 0
+      - name: "Measure: FA probe, test-backend-ops FLASH_ATTN_EXT, renders base vs head (3 reps interleaved)"
+        timeout-minutes: 150
+        run: |
+          set +e
+          B="$AMD_CI_WORK/bin"
+          "$AMD_CI_WORK/.rocm/bin/python" -u sdrc/run2.py --bin hip_base=$B/hip_base --bin hip_fa=$B/hip_fa \
+            --rocm-lib "${ROCM_LIB:-}" --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/runs" --reps 3 2>&1 | tail -80
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdxp-b2-linux
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdxp-b2-linux-png, path: "${{ env.AMD_CI_WORK }}/out/**/*_r0.png", retention-days: 7, if-no-files-found: warn }
+
+  linux-control:
+    name: "linux control (selector diagnosis for the Windows job)"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 10
+    env:
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+    steps:
+      - name: Report which machine answered
+        run: |
+          set +e
+          echo "machine: $(uname -n)"
+
+  windows-torch-props:
+    name: "gfx1151 Windows 11: raw torch props (Studio memory kind), no timing"
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          .\amd_ci\lib\preamble.ps1 -Name "sdxp-b2-windows"
+      - name: Locate the system Python
+        run: |
+          $ErrorActionPreference = "Continue"
+          $found = $null
+          foreach ($c in @("C:\Program Files\Python312\python.exe", "C:\Program Files\Python311\python.exe")) {
+            if (Test-Path -LiteralPath $c) { $found = $c; break }
+          }
+          if ($null -eq $found) { Write-Host "FATAL: no system Python"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "AMD_CI_PY=$found"
+      - name: Torch props
+        run: |
+          $ErrorActionPreference = "Continue"
+          $o = "$env:AMD_CI_WORK\out"
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List | Out-File -Encoding ascii "$o\gpu.txt"
+          Get-Content "$o\gpu.txt"
+          & $env:AMD_CI_PY -m venv "$env:AMD_CI_WORK\tv"
+          & "$env:AMD_CI_WORK\tv\Scripts\python.exe" -m pip install -q --upgrade pip
+          & "$env:AMD_CI_WORK\tv\Scripts\python.exe" -m pip install -q --index-url https://repo.amd.com/rocm/whl/gfx1151/ torch 2>&1 | Out-File -Encoding ascii "$o\pip.log"
+          Write-Host "pip exit $LASTEXITCODE"
+          Get-Content "$o\pip.log" -Tail 5
+          & "$env:AMD_CI_WORK\tv\Scripts\python.exe" "$env:GITHUB_WORKSPACE\sdrc\torch_props.py" "$o\torch_props_windows.json"
+          Get-Content "$o\torch_props_windows.json"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdxp-b2-windows, path: "${{ env.AMD_CI_WORK }}/out", retention-days: 7, if-no-files-found: warn }
