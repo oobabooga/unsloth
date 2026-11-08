@@ -12,7 +12,7 @@ rm -rf "${SRC:?}"
 mkdir -p "$SRC"
 cd "$SRC"
 git init -q .
-git remote add origin https://github.com/unslothai/stable-diffusion.cpp
+git remote add origin "${SRC_REPO:-https://github.com/unslothai/stable-diffusion.cpp}"
 git fetch -q --depth 1 origin "$SHA"
 git checkout -q FETCH_HEAD
 git submodule update --init --depth 1 ggml
