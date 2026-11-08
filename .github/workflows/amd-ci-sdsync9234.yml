@@ -5,7 +5,7 @@ name: "AMD CI: sd.cpp Vulkan image s/step on RADV, master ba6ac30 vs sync e7f483
 
 on:
   push:
-    branches: [amd-ci-sdsync9234]
+    branches: [amd-ci-sdsync9234b]
   workflow_dispatch:
 
 permissions:
