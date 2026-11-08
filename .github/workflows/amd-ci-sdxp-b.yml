@@ -1,0 +1,176 @@
+name: "AMD CI: sd.cpp master ba6ac303 vs #14 (ROCm bundle) / #37 / #38 / #51 on gfx1151 Linux"
+
+# Builds: Vulkan + CPU legs on GitHub-hosted runners with the unsloth-sd-prebuilt.yml leg flags.
+# #14: the ROCm bundle staging built from master ba6ac303 + #14 (danielhanchen/sd-cpp-staging run 42357029610).
+# #51: also a HIP+Vulkan (gfx1151) build of master and #51 on the box, the two-backend case #51 guards.
+# Every arm runs in ONE job on ONE machine, interleaved per rep.
+
+on:
+  push:
+    branches: [amd-ci-sdxp-b]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-linux:
+    name: "build ${{ matrix.kind }} ${{ matrix.label }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: vk_master, kind: vk, sha: ba6ac30346b0f174354419d820e6f11b3e9bc0f2}
+          - {label: vk_h37, kind: vk, sha: 725579a932fc38ba2c34dd605f92185fe7287964}
+          - {label: vk_h38, kind: vk, sha: db0b9d446007791fd195b4feade662df9930974e}
+          - {label: vk_h51, kind: vk, sha: 192306d914969cff61e96d38afd5687e9ded4fdc}
+          - {label: cpu_master, kind: cpu, sha: ba6ac30346b0f174354419d820e6f11b3e9bc0f2}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Build deps (as the prebuilt leg)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev xz-utils ninja-build
+          if [ "${{ matrix.kind }}" = vk ]; then
+            archive="$RUNNER_TEMP/vulkansdk.tar.xz"; sdk_root="$RUNNER_TEMP/vulkansdk"
+            curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+            echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+            mkdir -p "$sdk_root" && tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+            echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
+            echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build
+        run: bash sdrc/build.sh ${{ matrix.label }} ${{ matrix.sha }} ${{ matrix.kind }} "$RUNNER_TEMP/out/${{ matrix.label }}"
+      - name: Pack (tar keeps the exec bits)
+        run: tar -C "$RUNNER_TEMP/out" -cf "$RUNNER_TEMP/b-${{ matrix.label }}.tar" ${{ matrix.label }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "b-${{ matrix.label }}", path: "${{ runner.temp }}/b-${{ matrix.label }}.tar", retention-days: 5 }
+
+  gpu-linux:
+    name: "gfx1151 Linux: RADV + ROCm + Zen 5 CPU, master vs #14/#37/#38/#51"
+    needs: [build-linux]
+    if: ${{ !cancelled() }}
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    env:
+      ROCM_VERSION: "7.14.0"
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+      MASTER: ba6ac30346b0f174354419d820e6f11b3e9bc0f2
+      H51: 192306d914969cff61e96d38afd5687e9ded4fdc
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdxp-b-linux"
+      - name: Host gate + device strings
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          {
+            echo "node: $(uname -n)  kernel: $(uname -r)"
+            echo "amdgpu module: $(cat /sys/module/amdgpu/version 2>/dev/null || echo n/a)"
+            ls -d /opt/rocm* 2>/dev/null || echo "no /opt/rocm"
+            cat /opt/rocm/.info/version 2>/dev/null || true
+            ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true
+            dpkg-query -W -f='${Package} ${Version}\n' 'mesa-vulkan-drivers' 'libvulkan1' 'libdrm-amdgpu1' 'linux-firmware' 2>/dev/null || true
+            free -m
+            lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|MHz" || true
+          } > "$AMD_CI_WORK/out/host_strings.txt" 2>&1
+          (rocminfo 2>&1 | grep -E "Runtime Version|Marketing Name|Name:.*gfx|Compute Unit|Max Clock" | head -20) > "$AMD_CI_WORK/out/rocminfo.txt" || true
+          cat "$AMD_CI_WORK/out/host_strings.txt" "$AMD_CI_WORK/out/rocminfo.txt"
+      - uses: actions/download-artifact@v4
+        with: { path: "${{ runner.temp }}/dl", pattern: "b-*" }
+      - name: "#14 ROCm bundle from staging (master ba6ac303 + #14)"
+        id: dl14
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: sd-master-982-0518b34-u4a393ca-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          path: ${{ runner.temp }}/dl14
+          repository: danielhanchen/sd-cpp-staging
+          run-id: 42357029610
+          github-token: ${{ github.token }}
+      - name: Unpack builds
+        run: |
+          set -euo pipefail
+          mkdir -p "$AMD_CI_WORK/bin"
+          for t in "$RUNNER_TEMP"/dl/b-*/b-*.tar; do tar -C "$AMD_CI_WORK/bin" -xf "$t"; done
+          cat "$AMD_CI_WORK"/bin/*/srcinfo.txt | grep label=
+          if [ -d "$RUNNER_TEMP/dl14" ]; then
+            mkdir -p "$AMD_CI_WORK/bin/rocm14x"
+            Z="$(find "$RUNNER_TEMP/dl14" -name '*.zip' | head -1 || true)"
+            if [ -n "$Z" ]; then
+              python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" "$AMD_CI_WORK/bin/rocm14x"
+            else
+              cp -a "$RUNNER_TEMP/dl14/." "$AMD_CI_WORK/bin/rocm14x/"
+            fi
+            S="$(find "$AMD_CI_WORK/bin/rocm14x" -name sd-cli -type f | head -1 || true)"
+            if [ -n "$S" ]; then
+              D="$(dirname "$S")"; chmod +x "$D/sd-cli" "$D/sd-server" || true
+              ln -s "$D" "$AMD_CI_WORK/bin/rocm14"
+              echo "label=rocm14 kind=rocm-bundle source=staging run 42357029610 (ae3540f = master ba6ac303 + #14 bea56a30)" > "$D/srcinfo.txt"
+              du -sh "$D" || true; ls "$D" || true; (cd "$D" && env -u LD_LIBRARY_PATH ldd ./sd-cli | grep -E "not found|hip|rocblas|hsa" || true)
+            fi
+          fi
+          ls -la "$AMD_CI_WORK/bin"
+          python3 -m venv "$AMD_CI_WORK/pyv" && "$AMD_CI_WORK/pyv/bin/pip" install -q pillow numpy
+      - name: "Box builds: HIP+Vulkan gfx1151, master and #51 (TheRock wheels + LunarG SDK)"
+        timeout-minutes: 90
+        run: |
+          set +e
+          cd "$AMD_CI_WORK"
+          python3 -m venv .rocm && . .rocm/bin/activate
+          python -m pip install -q --upgrade pip && python -m pip install -q ninja cmake
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,device-gfx1151]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          export ROCM_PATH HIP_PATH="$ROCM_PATH" CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"
+          export PATH="$(rocm-sdk path --bin):$AMD_CI_WORK/.rocm/bin:$PATH"
+          echo "ROCM_LIB=$ROCM_PATH/lib" >> "$GITHUB_ENV"
+          archive="$RUNNER_TEMP/vulkansdk.tar.xz"; sdk_root="$RUNNER_TEMP/vulkansdk"
+          curl -s --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root" && tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          export VULKAN_SDK="$sdk_root/x86_64" PATH="$sdk_root/x86_64/bin:$PATH"
+          (LD_LIBRARY_PATH= "$sdk_root/x86_64/bin/vulkaninfo" --summary 2>&1 | head -80) > "$AMD_CI_WORK/out/vulkaninfo.txt"
+          cat "$AMD_CI_WORK/out/vulkaninfo.txt"
+          cd "$GITHUB_WORKSPACE"
+          bash sdrc/build.sh hv_master "$MASTER" hipvk "$AMD_CI_WORK/bin/hv_master" 2>&1 | tail -6
+          bash sdrc/build.sh hv_h51 "$H51" hipvk "$AMD_CI_WORK/bin/hv_h51" 2>&1 | tail -6
+          exit 0
+      - name: "Measure (all arms interleaved, 3 reps)"
+        timeout-minutes: 180
+        run: |
+          set +e
+          B="$AMD_CI_WORK/bin"
+          "$AMD_CI_WORK/pyv/bin/python" -u sdrc/run.py \
+            --bin vk_master=$B/vk_master --bin vk_h37=$B/vk_h37 --bin vk_h38=$B/vk_h38 --bin vk_h51=$B/vk_h51 \
+            --bin cpu_master=$B/cpu_master --bin rocm14=$B/rocm14 --bin hv_master=$B/hv_master --bin hv_h51=$B/hv_h51 \
+            --rocm-lib "${ROCM_LIB:-}" --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/runs" --reps 3 --zimage 2>&1 | tail -150
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdxp-b-linux
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdxp-b-linux-png, path: "${{ env.AMD_CI_WORK }}/out/**/*_r0.png", retention-days: 7, if-no-files-found: warn }
