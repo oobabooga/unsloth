@@ -1,0 +1,38 @@
+From 06db896e3b9bb27fb9884852caa0071baa7ef82a Mon Sep 17 00:00:00 2001
+From: uvos <carl@uvos.xyz>
+Date: Tue, 27 Oct 2026 19:42:04 +0100
+Subject: [PATCH] HIP/CUDA: remove pragma unroll from loops in conv2d where
+ itteration count cant be infered at compile time (llama/31255)
+
+---
+ src/ggml-cuda/conv2d.cu | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/src/ggml-cuda/conv2d.cu b/src/ggml-cuda/conv2d.cu
+index 9636db2371..c5e1836fff 100644
+--- a/src/ggml-cuda/conv2d.cu
++++ b/src/ggml-cuda/conv2d.cu
+@@ -180,7 +180,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
+     const int                  end            = int(int64_t(tiles) * (split + 1) / split_k) * BK;
+     for (int k0 = begin; k0 < end; k0 += BK) {
+         if (k_total % 8 == 0 && uintptr_t(weight) % 16 == 0) {
+-#pragma unroll
+             for (int i = tid; i < BM * BK / 8; i += nthreads) {
+                 const int  row = i / (BK / 8), col = 8 * (i % (BK / 8));
+                 const int4 v                 = m0 + row < oc && k0 + col < k_total ?
+@@ -189,7 +188,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
+                 *(int4 *) &a_s[row][col / 2] = v;
+             }
+         } else {
+-#pragma unroll
+             for (int i = tid; i < BM * BK / 2; i += nthreads) {
+                 const int row = i / (BK / 2), col = 2 * (i % (BK / 2));
+                 half      lo = __float2half(0.0f), hi = lo;
+@@ -202,7 +200,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
+                 a_s[row][col / 2] = __halves2half2(lo, hi);
+             }
+         }
+-#pragma unroll
+         for (int k = load_row; k < BK; k += nthreads / (BN / 2)) {
+             const int ki = k0 + k;
+             const int ci = ki / (kw * kh), ky = ki / kw % kh, kx = ki % kw;

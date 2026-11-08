@@ -98,17 +98,16 @@ def sd(arm, argv, out, tag, timeout=3600):
             env[k] = v
     cmd = [exe, *argv, *arm.get("argv", []), "-o", str(png), "-v"]
     t = time.time()
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=timeout,
-                           text=True, errors="replace")
-        rc, text = p.returncode, p.stdout
-    except subprocess.TimeoutExpired as e:
-        rc = "timeout"
-        text = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+    # Popen + os.wait4 so the child's own peak RSS (ru_maxrss, KiB on Linux) is recorded
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    text = p.stdout.read().decode(errors="replace")
+    _, status, ru = os.wait4(p.pid, 0)
+    p.returncode = os.waitstatus_to_exitcode(status)
+    rc = p.returncode
     wall = time.time() - t
     log.write_text(" ".join(cmd) + "\n" + text, encoding="utf-8")
     r = {"arm": arm["label"], "tag": tag, "rc": rc, "wall": round(wall, 2), "argv_extra": arm.get("argv", []),
-         "env": arm.get("env", {})}
+         "env": arm.get("env", {}), "peak_rss_mib": round(ru.ru_maxrss / 1024, 1)}
     for k, pat in PAT.items():
         m = re.findall(pat, text)
         if m:
