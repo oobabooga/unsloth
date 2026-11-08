@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""Probe: what the real sd.cpp ROCm and Vulkan prebuilts do on THIS card, what
+they DEPEND on, and what each checkout's sd.cpp backend reads from them.
+
+Extends probes/sd_cpp_accelerator_reality_probe.py with the dependency half. The
+question that half exists for: when the generic ROCm prebuilt fails on an AMD
+card, is that because the build carries no kernels for that gfx target, or
+because the machine has no ROCm runtime for the build to link against? Those have
+different fixes, and only one of them is a Vulkan fallback. So this probe records,
+alongside the renders:
+
+  * the host's ROCm version, amd-smi and the loader's view of the three sonames
+    the ROCm archive lists as NEEDED while bundling none of them;
+  * `ldd` and `readelf -d` over every shared object IN the archive, so a missing
+    dependency is named rather than inferred from an exit status;
+  * the gfx targets actually present in the archive's HIP fatbinary, read from the
+    offload-bundle entry names, so "this build has no kernels for your card" is
+    checkable against the build the runner itself downloaded.
+
+Observes only. Every judgement -- "did the ROCm build run", "is the dependency the
+host's or the archive's", "did the head divert a working host" -- belongs to
+criteria/sd_cpp_prebuilt_runtime.py.
+
+Two halves.
+
+**Shared, state-independent.** The prebuilt archives, the model, `--list-devices`
+and the real generations are facts about the HOST, not about the checkout, and
+`studio/install_sd_cpp_prebuilt.py` is byte-identical across the states of
+unsloth#11068. So that work is done once into `--shared`, and every state records
+the sha256 of its own copy of the installer so a reader can check the sameness
+claim rather than take it.
+
+**Per state.** Each checkout's own `core.inference.sd_cpp_backend` is imported and
+asked what it reads FROM those real binaries and that real error text: the
+`--list-devices` verdict, the marker tiers, the fallback rung, the preference, the
+fingerprint, and whether a record written on this machine retires when the bundle
+changes. Functions absent at the base are recorded as None, never emulated.
+
+Nothing here raises for an unwelcome answer: a ROCm build that cannot run is the
+observation, not an error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The pinned tag `studio/install_sd_cpp_prebuilt.py` installs is the FIRST bundle;
+# the retirement check needs a genuinely DIFFERENT one, so it installs the cheap
+# Vulkan asset of another release over the managed tree and re-reads the record.
+RETIREMENT_TAG = os.environ.get("AMD_CI_SD_CPP_OTHER_TAG", "master-869-07a85c7")
+
+MODELS = {
+    # fp16 single-file SD1.5: the dense hipBLAS matmul path, which is where #9278's
+    # `CUBLAS_STATUS_INVALID_VALUE at hipblasSetStream` comes from.
+    "sd15_fp16": (
+        "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/"
+        "v1-5-pruned-emaonly-fp16.safetensors"
+    ),
+    # Q4_0 GGUF: the quantized matmul path (`ggml_cuda_mul_mat_q`), which is where
+    # the same report's second shape, `unspecified launch failure`, comes from.
+    "sd15_q4_0": (
+        "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/"
+        "stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf"
+    ),
+}
+
+GEN_TIMEOUT = int(os.environ.get("AMD_CI_SD_CPP_GEN_TIMEOUT", "1800"))
+
+# Harness smoke switch: skip the model download and the renders, so the plumbing
+# (install, --list-devices, every per-state read, the fingerprint and the
+# retirement) can be exercised off the runner. It is RECORDED in the observations
+# and it makes the criteria's "something rendered" gate fail, so a smoke run lands
+# on INCONCLUSIVE and can never be mistaken for a measurement.
+SMOKE = os.environ.get("AMD_CI_SD_CPP_SMOKE", "") == "1"
+
+
+# --------------------------------------------------------------------------- utils
+
+def _sha256(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _run(cmd: list[str], *, timeout: int, cwd: Path | None = None, env: dict | None = None) -> dict:
+    """Run and record. Output is captured whole; the tail is what the markers read."""
+    started = time.time()
+    try:
+        p = subprocess.run(cmd, capture_output = True, text = True, errors = "replace",
+                           timeout = timeout, cwd = str(cwd) if cwd else None, env = env)
+        out = (p.stdout or "") + (p.stderr or "")
+        return {"cmd": cmd, "rc": p.returncode, "seconds": round(time.time() - started, 2),
+                "output": out[-20000:], "stdout": (p.stdout or "")[-20000:],
+                "output_chars": len(out), "timed_out": False}
+    except subprocess.TimeoutExpired as e:  # noqa: BLE001
+        out = ""
+        for part in (e.stdout, e.stderr):
+            if part:
+                out += part.decode("utf-8", "replace") if isinstance(part, bytes) else part
+        return {"cmd": cmd, "rc": None, "seconds": round(time.time() - started, 2),
+                "output": out[-20000:], "output_chars": len(out), "timed_out": True}
+    except Exception as e:  # noqa: BLE001
+        return {"cmd": cmd, "rc": None, "seconds": round(time.time() - started, 2),
+                "output": f"{type(e).__name__}: {e}", "output_chars": 0, "timed_out": False,
+                "spawn_error": True}
+
+
+def _download(url: str, dest: Path, timeout: int = 3600) -> dict:
+    """curl if present, else urllib. Recorded either way; a failed fetch is data."""
+    if dest.is_file() and dest.stat().st_size > 0:
+        return {"path": str(dest), "bytes": dest.stat().st_size, "cached": True, "ok": True}
+    dest.parent.mkdir(parents = True, exist_ok = True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    curl = shutil.which("curl")
+    if curl:
+        r = _run([curl, "-sSL", "--fail", "--retry", "3", "-o", str(tmp), url], timeout = timeout)
+        ok = r["rc"] == 0 and tmp.is_file() and tmp.stat().st_size > 0
+        detail = r["output"][-2000:]
+    else:
+        ok, detail = True, ""
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout = timeout) as src, open(tmp, "wb") as fh:
+                shutil.copyfileobj(src, fh)
+        except Exception as e:  # noqa: BLE001
+            ok, detail = False, f"{type(e).__name__}: {e}"
+    if ok:
+        tmp.replace(dest)
+        return {"path": str(dest), "bytes": dest.stat().st_size, "cached": False, "ok": True}
+    return {"path": str(dest), "ok": False, "error": detail}
+
+
+def _locate(root: Path, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        for found in sorted(root.rglob(name)):
+            if found.is_file():
+                return str(found)
+    return None
+
+
+def _png_bytes(path: Path) -> dict:
+    """Is the output a real image, and is it not a flat field? Read without PIL."""
+    info: dict = {"path": str(path), "exists": path.is_file()}
+    if not info["exists"]:
+        return info
+    data = path.read_bytes()
+    info["bytes"] = len(data)
+    info["png_magic"] = data[:8] == b"\x89PNG\r\n\x1a\n"
+    # An all-one-colour PNG compresses to almost nothing; a real render does not.
+    # This is a crude non-vacuity signal, deliberately not a quality judgement.
+    info["distinct_byte_values"] = len(set(data[:200000]))
+    return info
+
+
+# ------------------------------------------------------------------ the shared half
+
+def _install_bundle(installer: Path, python: str, accelerator: str, target: Path,
+                    tag: str | None = None) -> dict:
+    env = dict(os.environ)
+    if tag is not None:
+        env["UNSLOTH_SD_CPP_TAG"] = tag
+    asset = _run([python, str(installer), "--print-asset", "--accelerator", accelerator],
+                 timeout = 300, env = env)
+    r = _run([python, str(installer), "--accelerator", accelerator,
+              "--install-dir", str(target)], timeout = 3600, env = env)
+    cli = _locate(target, ("sd-cli", "sd-cli.exe", "sd", "sd.exe"))
+    server = _locate(target, ("sd-server", "sd-server.exe"))
+    # The name the installer itself uses; read it rather than guessing, since the
+    # bundle TAG in here is what the PR's fingerprint calls `bundle`.
+    record = None
+    for found in sorted(target.rglob(".unsloth-sd-cpp-install.json")):
+        try:
+            record = json.loads(found.read_text(encoding = "utf-8"))
+        except Exception:  # noqa: BLE001
+            record = {"unreadable": str(found)}
+        break
+    # stdout only: the warning about the mirror lacking the pinned tag goes to
+    # stderr, and concatenating the two made the warning look like the asset name.
+    stdout_lines = [ln for ln in (asset.get("stdout") or "").splitlines() if ln.strip()]
+    # `--print-asset` also narrates its repo fallback on stdout, so take the line
+    # that is an asset name when there is one rather than simply the last line.
+    zips = [ln for ln in stdout_lines if ln.strip().lower().endswith(".zip")]
+    stdout_lines = zips or stdout_lines
+    out = {"accelerator": accelerator, "tag_requested": tag,
+           "asset_resolved": stdout_lines[-1].strip() if stdout_lines else None,
+           "asset_stderr": (asset.get("output") or "")[-1500:],
+           "install_rc": r["rc"], "install_tail": r["output"][-4000:],
+           "cli": cli, "server": server, "install_record": record,
+           "cli_bytes": (Path(cli).stat().st_size if cli else None)}
+    if cli and os.name == "nt":
+        out["windows_loader"] = _windows_loader_report(Path(cli), python)
+    if cli and shutil.which("ldd"):
+        ldd = _run(["ldd", cli], timeout = 120)
+        missing = [ln.strip() for ln in ldd["output"].splitlines() if "not found" in ln]
+        out["ldd_missing"] = missing
+        out["ldd_tail"] = ldd["output"][-3000:]
+    return out
+
+
+# The sonames the Linux ROCm archive lists as NEEDED. Kept here as well as in
+# capability.py because this probe reports the per-FILE answer (which object in
+# the bundle wants them) and capability.py reports the host-level one.
+ROCM_SONAMES = ("libamdhip64.so.7", "libhipblas.so.3", "librocblas.so.5")
+
+# How a HIP offload bundle names its per-architecture code objects inside a
+# fatbinary: `hipv4-amdgcn-amd-amdhsa--gfx1151`. Scanning the raw bytes for that
+# prefix is enough to enumerate the targets without llvm-objdump, which is not on
+# every runner.
+_OFFLOAD_PREFIX = b"hipv4-amdgcn-amd-amdhsa--"
+
+
+def _gfx_targets_in(path: Path, limit_bytes: int = 1 << 31) -> dict:
+    """Which gfx targets this object carries code objects for.
+
+    A count of bundle entries, not merely a list of names: a target that appears
+    once in a string table and a target with hundreds of real code objects look
+    the same to `strings`, and the difference is exactly the claim being checked.
+    """
+    info: dict = {"file": str(path), "bytes": None, "targets": [], "entries": 0}
+    try:
+        info["bytes"] = path.stat().st_size
+        data = path.read_bytes()[:limit_bytes]
+    except Exception as e:  # noqa: BLE001
+        info["error"] = f"{type(e).__name__}: {e}"
+        return info
+    counts: dict[str, int] = {}
+    pattern = re.escape(_OFFLOAD_PREFIX) + rb"(gfx[0-9a-z]+)"
+    for m in re.finditer(pattern, data):
+        # The feature suffixes (`:xnack-`, `:sramecc+`) are dropped on purpose: the
+        # question is which CARD the build targets, not which feature variant.
+        name = m.group(1).decode("ascii", "replace")
+        counts[name] = counts.get(name, 0) + 1
+        info["entries"] += 1
+    info["targets"] = sorted(counts)
+    info["entries_per_target"] = dict(sorted(counts.items()))
+    return info
+
+
+def _elf_dependency_report(root: Path, python: str) -> dict:
+    """`ldd` and `readelf -d` over every ELF in the bundle, plus the gfx targets.
+
+    Run over the whole directory rather than just the CLI: the archive's HIP
+    dependency sits on `libggml-hip.so`, and an `ldd` of `sd-cli` alone would
+    report it only transitively if the loader can reach it at all.
+    """
+    report: dict = {"root": str(root), "files": {}}
+    if not root.is_dir():
+        report["error"] = "no such directory"
+        return report
+    ldd, readelf = shutil.which("ldd"), shutil.which("readelf")
+    report["have_ldd"], report["have_readelf"] = bool(ldd), bool(readelf)
+    objects = [p for p in sorted(root.rglob("*"))
+               if p.is_file() and (p.suffix in (".so",) or ".so." in p.name
+                                   or p.name.startswith("sd-"))]
+    report["object_count"] = len(objects)
+    for obj in objects[:40]:
+        entry: dict = {"bytes": obj.stat().st_size}
+        if ldd:
+            r = _run([ldd, str(obj)], timeout = 180)
+            entry["ldd_rc"] = r["rc"]
+            entry["ldd_missing"] = [ln.strip() for ln in r["output"].splitlines()
+                                    if "not found" in ln]
+            entry["ldd"] = r["output"][-4000:]
+        if readelf:
+            r = _run([readelf, "-d", str(obj)], timeout = 180)
+            text = r["output"]
+            entry["needed"] = [ln.split("[", 1)[1].rstrip("]").strip()
+                               for ln in text.splitlines()
+                               if "(NEEDED)" in ln and "[" in ln]
+            entry["runpath"] = [ln.split("[", 1)[1].rstrip("]").strip()
+                                for ln in text.splitlines()
+                                if ("(RUNPATH)" in ln or "(RPATH)" in ln) and "[" in ln]
+        if "ggml-hip" in obj.name or "ggml-cuda" in obj.name or "stable-diffusion" in obj.name:
+            entry["gfx"] = _gfx_targets_in(obj)
+            if ldd:
+                # The same question with LD_LIBRARY_PATH removed. A CI job inherits a
+                # prepared environment; a user double-clicking Studio does not, and
+                # "resolves only because this shell was set up for ROCm development"
+                # is a different answer from "resolves on this machine".
+                clean = dict(os.environ)
+                clean.pop("LD_LIBRARY_PATH", None)
+                r = _run([ldd, str(obj)], timeout = 180, env = clean)
+                entry["ldd_clean_env"] = r["output"][-4000:]
+                entry["ldd_clean_env_missing"] = [
+                    ln.strip() for ln in r["output"].splitlines() if "not found" in ln]
+        report["files"][str(obj.relative_to(root))] = entry
+
+    # The bundle-wide summary a reader wants first: which of the ROCm sonames any
+    # object in here needs, and which of those the loader could not find.
+    needed_any: dict[str, list[str]] = {}
+    missing_any: dict[str, list[str]] = {}
+    for name, entry in report["files"].items():
+        for soname in entry.get("needed") or []:
+            needed_any.setdefault(soname, []).append(name)
+        for line in entry.get("ldd_missing") or []:
+            missing_any.setdefault(line.split("=>")[0].strip(), []).append(name)
+    report["needed_by"] = {k: v for k, v in sorted(needed_any.items())}
+    report["unresolved_by"] = {k: v for k, v in sorted(missing_any.items())}
+    report["rocm_sonames_needed"] = {s: needed_any.get(s, []) for s in ROCM_SONAMES}
+    report["rocm_sonames_unresolved"] = {s: missing_any.get(s, []) for s in ROCM_SONAMES}
+    report["bundles_any_rocm_runtime"] = sorted(
+        n for n in report["files"] if any(s.split(".so")[0] in n for s in ROCM_SONAMES))
+    return report
+
+
+def _host_rocm_facts() -> dict:
+    """What ROCm this machine has, in the terms the archive's NEEDED list uses."""
+    facts: dict = {}
+    for path in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
+        try:
+            facts[path] = Path(path).read_text(encoding = "utf-8").strip()
+        except Exception as e:  # noqa: BLE001
+            facts[path] = f"unreadable: {type(e).__name__}"
+    for tool, args in (("hipconfig", ["--version"]), ("amd-smi", ["version"]),
+                       ("amd-smi", ["list"]), ("amd-smi", ["static"]),
+                       ("rocm-smi", ["--showdriverversion"]), ("vulkaninfo", ["--summary"])):
+        exe = shutil.which(tool)
+        key = f"{tool} {' '.join(args)}".strip()
+        facts[key] = _run([exe, *args], timeout = 300)["output"][:8000] if exe else None
+
+    # The loader's own answer, which is what the sd-cli process gets.
+    ldconfig = shutil.which("ldconfig") or next(
+        (c for c in ("/sbin/ldconfig", "/usr/sbin/ldconfig") if os.path.exists(c)), None)
+    facts["ldconfig"] = ldconfig
+    cache = _run([ldconfig, "-p"], timeout = 120)["output"] if ldconfig else ""
+    resolved: dict[str, str | None] = {}
+    for soname in ROCM_SONAMES:
+        hit = next((ln.strip() for ln in cache.splitlines()
+                    if ln.strip().startswith(soname + " ")), None)
+        resolved[soname] = hit
+    facts["soname_resolution"] = resolved
+    facts["soname_resolved_all"] = all(v for v in resolved.values())
+    # Why a soname can resolve for a process while the ldconfig CACHE does not list
+    # it: an LD_LIBRARY_PATH in the environment, or a search path the cache was
+    # never rebuilt for. Both are recorded so the two readings can be reconciled
+    # instead of one of them being declared the wrong one.
+    facts["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
+    facts["ldconfig_rocm_lines"] = [ln.strip() for ln in cache.splitlines()
+                                    if "rocm" in ln.lower()][:80]
+    confs: dict[str, str] = {}
+    for conf in sorted(Path("/etc/ld.so.conf.d").glob("*.conf")
+                       ) if Path("/etc/ld.so.conf.d").is_dir() else []:
+        try:
+            confs[conf.name] = conf.read_text(encoding = "utf-8").strip()[:500]
+        except Exception as e:  # noqa: BLE001
+            confs[conf.name] = f"unreadable: {type(e).__name__}"
+    facts["ld_so_conf_d"] = confs
+    facts["kfd_gfx_target_version"] = None
+    for node in sorted(Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties")
+                       ) if Path("/sys/class/kfd/kfd/topology/nodes").is_dir() else []:
+        try:
+            for line in node.read_text(encoding = "utf-8").splitlines():
+                if line.startswith("gfx_target_version") and not line.endswith(" 0"):
+                    facts["kfd_gfx_target_version"] = line.split()[-1]
+        except Exception:  # noqa: BLE001
+            pass
+    return facts
+
+
+_WINDOWS_STATUS = {
+    3221225781: "0xC0000135 STATUS_DLL_NOT_FOUND (a DLL the image imports is missing)",
+    3221225595: "0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND",
+    3221225477: "0xC0000005 STATUS_ACCESS_VIOLATION",
+    3221225785: "0xC0000139/0x135 family: image could not be initialised",
+}
+
+_ROCM_RUNTIME_DLLS = ("amdhip64_6.dll", "amdhip64.dll", "hipblas.dll", "rocblas.dll",
+                      "amd_comgr_2.dll", "amd_comgr.dll", "hiprtc0604.dll")
+
+
+def _windows_loader_report(cli: Path, python: str) -> dict:
+    """Which DLL the Windows loader could not find.
+
+    A bundle that exits 0xC0000135 before printing a byte says nothing about the
+    CARD; it says the image never started. Separating "this build has no kernels
+    for your gfx target" from "this machine has no HIP runtime" is the difference
+    between a fallback that is the right answer and one that is papering over a
+    packaging problem, so the specific missing library is worth one subprocess.
+
+    Run in a CHILD interpreter: loading a half-satisfied DLL can take the process
+    with it, and this probe has other observations to deliver.
+    """
+    report: dict = {"exit_status_meanings": _WINDOWS_STATUS}
+    root = cli.parent
+    report["bundle_files"] = sorted(p.name for p in root.iterdir())[:200]
+    report["bundle_dll_count"] = sum(1 for p in root.iterdir() if p.suffix.lower() == ".dll")
+    script = (
+        "import ctypes, json, os, sys\n"
+        "root = sys.argv[1]\n"
+        "os.add_dll_directory(root)\n"
+        "out = {'bundled': {}, 'by_name': {}}\n"
+        "for name in sorted(os.listdir(root)):\n"
+        "    if not name.lower().endswith('.dll'):\n"
+        "        continue\n"
+        "    try:\n"
+        "        ctypes.WinDLL(os.path.join(root, name))\n"
+        "        out['bundled'][name] = 'loaded'\n"
+        "    except OSError as e:\n"
+        "        out['bundled'][name] = f'{type(e).__name__}: {e}'\n"
+        "for name in " + repr(list(_ROCM_RUNTIME_DLLS)) + ":\n"
+        "    try:\n"
+        "        ctypes.WinDLL(name)\n"
+        "        out['by_name'][name] = 'loaded from PATH or system'\n"
+        "    except OSError as e:\n"
+        "        out['by_name'][name] = f'{type(e).__name__}: {e}'\n"
+        "print(json.dumps(out))\n")
+    r = _run([python, "-c", script, str(root)], timeout = 600)
+    report["child_rc"] = r["rc"]
+    try:
+        report.update(json.loads((r.get("stdout") or "").strip().splitlines()[-1]))
+    except Exception as e:  # noqa: BLE001
+        report["parse_error"] = f"{type(e).__name__}: {e}"
+        report["child_output"] = (r.get("output") or "")[-3000:]
+    return report
+
+
+def _generate(cli: str, model: Path, out_png: Path, *, steps: int, size: int,
+              offload: bool) -> dict:
+    """One real txt2img. Explicit --cfg-scale and --sampling-method because an
+    UNPATCHED upstream build (which the ROCm and Vulkan assets are) aborts on some
+    defaults; that abort is an argument bug, not the card."""
+    # `img_gen`, not `txt2img`: sd-cli's modes are [img_gen, adetailer, vid_gen,
+    # upscale, convert, metadata], and an unknown mode fails before any backend is
+    # touched, which would have looked exactly like a card that cannot run.
+    cmd = [cli, "--mode", "img_gen", "--model", str(model),
+           "--prompt", "a red apple on a wooden table",
+           "--width", str(size), "--height", str(size),
+           "--steps", str(steps), "--cfg-scale", "7.0",
+           "--sampling-method", "euler", "--seed", "42",
+           "--output", str(out_png)]
+    if offload:
+        # #9278's second shape needs the offloading path; the flag name differs by
+        # build, so it is tried and its rejection recorded rather than assumed.
+        cmd += ["--offload-to-cpu"]
+    r = _run(cmd, timeout = GEN_TIMEOUT)
+    low = (r.get("output") or "").lower()
+    # An argument this build does not know is a harness fault, not a card fault, and
+    # must be legible as such next to a real backend failure.
+    r["arg_rejected"] = any(s in low for s in (
+        "unknown argument", "unknown option", "invalid option", "unrecognized",
+        "error: invalid mode", "usage:"))
+    r["image"] = _png_bytes(out_png)
+    r["model"] = str(model)
+    r["offload"] = offload
+    return r
+
+
+def _device_lines(text: str) -> list[str]:
+    """The lines that say which device actually held the weights. `system_info`
+    names ROCm but never Vulkan, so a detector keyed on it calls a working Vulkan
+    run cpu-only; `load_tensors: <dev> model buffer size` is the honest one."""
+    keys = ("model buffer size", "load_tensors", "ggml_vulkan", "ggml_cuda", "using ",
+            "backend", "device")
+    out = []
+    for line in text.splitlines():
+        low = line.lower()
+        if any(k in low for k in keys):
+            out.append(line.strip()[:300])
+    return out[:80]
+
+
+def shared_hardware_facts(shared: Path, installer: Path, python: str,
+                          accelerators: tuple[str, ...] = ("rocm", "vulkan"),
+                          host_accelerator: str = "rocm") -> dict:
+    """Done ONCE, by whichever state probes first. Everything here is a fact about
+    the machine, so repeating it per state would only add download time and the
+    chance of two states disagreeing about one card."""
+    done = shared / "hardware.json"
+    if done.is_file():
+        try:
+            doc = json.loads(done.read_text(encoding = "utf-8"))
+            doc["reused"] = True
+            return doc
+        except Exception:  # noqa: BLE001
+            pass
+
+    facts: dict = {"reused": False, "run_id": f"{os.getpid()}-{time.time():.3f}",
+                   "installer_sha256": _sha256(installer),
+                   "python": python, "platform": {
+                       "system": platform.system(), "machine": platform.machine(),
+                       "release": platform.release(), "node": platform.node()}}
+
+    for tool, args in (("amd-smi", ["static"]), ("rocminfo", []), ("vulkaninfo", ["--summary"])):
+        exe = shutil.which(tool)
+        if exe:
+            facts[f"{tool}"] = _run([exe, *args], timeout = 300)["output"][:8000]
+        else:
+            facts[f"{tool}"] = None
+
+    facts["host_rocm"] = _host_rocm_facts()
+
+    facts["accelerators"] = list(accelerators)
+    facts["host_accelerator"] = host_accelerator
+    facts["bundles"] = {}
+    facts["dependencies"] = {}
+    for accel in accelerators:
+        facts["bundles"][accel] = _install_bundle(
+            installer, python, accel, shared / f"bundle_{accel}")
+        # After the install, before anything is run: what the archive actually
+        # depends on, and which gfx targets it carries. Recorded for BOTH
+        # accelerators so "the ROCm one needs a host runtime and the Vulkan one
+        # does not" is a comparison rather than an assertion.
+        facts["dependencies"][accel] = _elf_dependency_report(
+            shared / f"bundle_{accel}", python)
+
+    # --list-devices on each real binary, which is the probe Studio itself runs.
+    facts["list_devices"] = {}
+    for accel, b in facts["bundles"].items():
+        if b.get("cli"):
+            facts["list_devices"][accel] = _run([b["cli"], "--list-devices"], timeout = 600)
+        else:
+            facts["list_devices"][accel] = None
+
+    facts["models"] = {}
+    facts["smoke"] = SMOKE
+    for name, url in ({} if SMOKE else MODELS).items():
+        facts["models"][name] = _download(url, shared / "models" / url.rsplit("/", 1)[-1])
+
+    facts["generations"] = {}
+    for accel, b in facts["bundles"].items():
+        cli = b.get("cli")
+        if not cli:
+            continue
+        for mname, m in facts["models"].items():
+            if not m.get("ok"):
+                continue
+            for offload in (False, True) if accel == host_accelerator else (False,):
+                key = f"{accel}:{mname}:{'offload' if offload else 'plain'}"
+                png = shared / "renders" / f"{key.replace(':', '_')}.png"
+                png.parent.mkdir(parents = True, exist_ok = True)
+                g = _generate(cli, Path(m["path"]), png,
+                              steps = 4, size = 256, offload = offload)
+                g["device_lines"] = _device_lines(g["output"])
+                facts["generations"][key] = g
+
+    done.parent.mkdir(parents = True, exist_ok = True)
+    done.write_text(json.dumps(facts, indent = 2), encoding = "utf-8")
+    return facts
+
+
+# ------------------------------------------------------------------- the state half
+
+def import_backend(checkout: Path):
+    backend = checkout / "studio" / "backend"
+    if not backend.is_dir():
+        raise RuntimeError(f"no studio/backend at {backend}")
+    sys.path.insert(0, str(backend))
+    for stale in [m for m in sys.modules
+                  if m.split(".")[0] in ("core", "utils", "storage", "loggers", "routes")]:
+        del sys.modules[stale]
+    import core.inference.sd_cpp_backend as mod  # noqa: PLC0415
+    return mod
+
+
+def _call(mod, name, *a, **kw):
+    """Call a function if this checkout has it. Absent is None, never emulated:
+    the base genuinely has no fallback rung and pretending otherwise would be the
+    easiest way to fake this comparison."""
+    fn = getattr(mod, name, None)
+    if fn is None:
+        return {"present": False, "value": None}
+    try:
+        return {"present": True, "value": fn(*a, **kw)}
+    except Exception as e:  # noqa: BLE001
+        return {"present": True, "error": f"{type(e).__name__}: {e}"}
+
+
+def _marker_scan(mod, text: str) -> dict:
+    """Which of the checkout's own marker strings the REAL error text contains.
+    Reading the constants is observation; whether the list is adequate is the
+    criteria's call."""
+    low = (text or "").lower()
+    out: dict = {}
+    for tier in ("_ACCELERATOR_DECISIVE_FAILURE_MARKERS",
+                 "_ACCELERATOR_AMBIGUOUS_FAILURE_MARKERS",
+                 "_ACCELERATOR_CAPACITY_FAILURE_MARKERS"):
+        markers = getattr(mod, tier, None)
+        if markers is None:
+            out[tier] = None
+            continue
+        out[tier] = {"markers": list(markers),
+                     "matched": [m for m in markers if m.lower() in low]}
+    return out
+
+
+def _isolation_observations(mod, host_accelerator: str) -> dict:
+    """What the selection path COSTS and TOUCHES for this host's own accelerator.
+
+    The claim being measured is "a non-AMD host is untouched": not merely that it
+    still selects its own accelerator, but that reaching that answer reads no
+    settings row and builds no fingerprint. Counting the calls is the only way to
+    tell "returned cuda" from "returned cuda after consulting the store", and the
+    second one is a new database read on every diffusion load.
+
+    The wrappers are removed again before returning, so nothing later in this probe
+    observes an instrumented module.
+    """
+    obs: dict = {"host_accelerator": host_accelerator}
+    if getattr(mod, "preferred_accelerator", None) is None:
+        return {"present": False}
+    obs["present"] = True
+    counts = {"fingerprint": 0, "stored": 0, "inventory": 0}
+    originals = {}
+    for name, key in (("_accelerator_fingerprint", "fingerprint"),
+                      ("_stored_accelerator_runtime_failures", "stored"),
+                      ("_host_fingerprint", "inventory")):
+        fn = getattr(mod, name, None)
+        if fn is None:
+            continue
+        originals[name] = fn
+
+        def wrap(f = fn, k = key):
+            def inner(*a, **kw):
+                counts[k] += 1
+                return f(*a, **kw)
+            return inner
+
+        setattr(mod, name, wrap())
+    try:
+        obs["selected"] = _call(mod, "preferred_accelerator", host_accelerator)
+        obs["calls_for_own_accelerator"] = dict(counts)
+        counts.update({k: 0 for k in counts})
+        obs["selected_rocm"] = _call(mod, "preferred_accelerator", "rocm")
+        obs["calls_for_rocm"] = dict(counts)
+    finally:
+        for name, fn in originals.items():
+            setattr(mod, name, fn)
+
+    # A note about ROCm must not move a CUDA host, and noting an accelerator with
+    # no rung below it must write nothing at all.
+    obs["note_own"] = _call(mod, "note_accelerator_runtime_failure",
+                            host_accelerator, proven = True)
+    obs["stored_after_noting_own"] = _call(mod, "_stored_accelerator_runtime_failures")
+    obs["failed_own_after_noting_own"] = _call(mod, "accelerator_runtime_failed",
+                                               host_accelerator)
+    obs["note_rocm"] = _call(mod, "note_accelerator_runtime_failure", "rocm", proven = True)
+    obs["selected_own_after_rocm_note"] = _call(mod, "preferred_accelerator", host_accelerator)
+    obs["state"] = _call(mod, "accelerator_runtime_failure_state")
+    _call(mod, "clear_accelerator_runtime_failures")
+    return obs
+
+
+def _fingerprint_observations(mod, shared: Path, installer: Path, python: str,
+                              studio_home: Path, host_accelerator: str = "rocm") -> dict:
+    """The fingerprint, on real hardware, plus a real retirement.
+
+    The managed tree is a COPY of the shared ROCm bundle, so the record the
+    fingerprint reads is the one a real install wrote. The retirement half then
+    installs a different release over that same tree and re-asks, which is the
+    claim "a record retires when the bundle changes" measured rather than argued.
+    """
+    obs: dict = {}
+    fn = getattr(mod, "_accelerator_fingerprint", None)
+    if fn is None:
+        return {"present": False}
+    obs["present"] = True
+
+    try:
+        import core.inference.sd_cpp_engine as engine  # noqa: PLC0415
+        root = Path(engine.managed_install_root())
+        obs["managed_install_root"] = str(root)
+        src = next((p for p in (shared / f"bundle_{host_accelerator}", shared / "bundle_rocm",
+                                shared / "bundle_vulkan") if p.is_dir()), shared / "bundle_rocm")
+        if src.is_dir() and not root.exists():
+            shutil.copytree(src, root)
+        obs["managed_tree_seeded"] = root.is_dir()
+    except Exception as e:  # noqa: BLE001
+        obs["managed_root_error"] = f"{type(e).__name__}: {e}"
+
+    # Cold, then warm: D1 in this PR's own review was that the cards component was
+    # memoised as the cold sentinel, so both readings belong in the record.
+    obs["fingerprint_cold"] = _call(mod, "_accelerator_fingerprint")["value"]
+    time.sleep(8)
+    obs["fingerprint_warm"] = _call(mod, "_accelerator_fingerprint")["value"]
+    obs["host_fingerprint"] = _call(mod, "_host_fingerprint")["value"]
+
+    try:
+        import torch  # noqa: PLC0415
+        obs["torch_version"] = torch.__version__
+        obs["torch_version_hip"] = getattr(torch.version, "hip", None)
+        obs["torch_version_cuda"] = getattr(torch.version, "cuda", None)
+    except Exception as e:  # noqa: BLE001
+        obs["torch_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        from utils.hardware.hardware import get_physical_gpu_inventory  # noqa: PLC0415
+        def _read(inv):
+            # It answers with a mapping, so getattr would silently record None for
+            # every field and the "cards, not the unknown sentinel" claim would be
+            # unfalsifiable.
+            get = inv.get if isinstance(inv, dict) else (lambda k, d = None: getattr(inv, k, d))
+            return {"unknown": get("unknown", None), "available": get("available", None),
+                    "names": [d.get("name") for d in (get("devices", None) or [])
+                              if isinstance(d, dict)],
+                    "vendors": sorted({d.get("vendor") for d in (get("devices", None) or [])
+                                       if isinstance(d, dict)}),
+                    "sources": get("sources", None), "repr": str(inv)[:2000]}
+
+        obs["inventory_nonblocking"] = _read(get_physical_gpu_inventory(block = False))
+        obs["inventory_blocking"] = _read(get_physical_gpu_inventory(block = True))
+    except Exception as e:  # noqa: BLE001
+        obs["inventory_error"] = f"{type(e).__name__}: {e}"
+
+    # A real record, written on this machine, then a real bundle change.
+    obs["note"] = _call(mod, "note_accelerator_runtime_failure", "rocm", proven = True)
+    obs["failed_after_note"] = _call(mod, "accelerator_runtime_failed", "rocm")
+    # Read the PERSISTED half on its own. Without this, an in-process mirror hit is
+    # indistinguishable from a record that would survive a restart, which is the
+    # whole point of storing it.
+    obs["stored_after_note"] = _call(mod, "_stored_accelerator_runtime_failures")
+    obs["state_after_note"] = _call(mod, "accelerator_runtime_failure_state")
+    obs["preferred_after_note"] = _call(mod, "preferred_accelerator", "rocm")
+
+    root = obs.get("managed_install_root")
+    if root:
+        obs["retirement_install"] = _install_bundle(
+            installer, python, "vulkan", Path(root), tag = RETIREMENT_TAG)
+        obs["fingerprint_after_bundle_change"] = _call(mod, "_accelerator_fingerprint")["value"]
+        obs["failed_after_bundle_change"] = _call(mod, "accelerator_runtime_failed", "rocm")
+        obs["state_after_bundle_change"] = _call(mod, "accelerator_runtime_failure_state")
+        obs["preferred_after_bundle_change"] = _call(mod, "preferred_accelerator", "rocm")
+
+    obs["cleared"] = _call(mod, "clear_accelerator_runtime_failures")
+    obs["failed_after_clear"] = _call(mod, "accelerator_runtime_failed", "rocm")
+    obs["studio_home"] = str(studio_home)
+    return obs
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--state", required = True)
+    ap.add_argument("--checkout", required = True, type = Path)
+    ap.add_argument("--out", required = True, type = Path)
+    ap.add_argument("--shared", required = True, type = Path,
+                    help = "cache for the host-level facts: bundles, model, renders")
+    ap.add_argument("--accelerators", default = "rocm,vulkan",
+                    help = "which prebuilt bundles to install and run here")
+    ap.add_argument("--host-accelerator", default = "rocm",
+                    help = "the accelerator THIS host's vendor would be handed; the one the "
+                           "fallback is entitled to move away from")
+    args = ap.parse_args()
+    accelerators = tuple(a.strip() for a in args.accelerators.split(",") if a.strip())
+
+    obs: dict = {"state": args.state, "checkout": str(args.checkout),
+                 "platform": {"system": platform.system(), "machine": platform.machine(),
+                              "node": platform.node()},
+                 "python": sys.executable}
+    args.shared.mkdir(parents = True, exist_ok = True)
+
+    installer = args.checkout / "studio" / "install_sd_cpp_prebuilt.py"
+    obs["installer_sha256"] = _sha256(installer)
+    obs["installer_default_tag"] = None
+    try:
+        for line in installer.read_text(encoding = "utf-8").splitlines():
+            if line.startswith("DEFAULT_TAG"):
+                obs["installer_default_tag"] = line.split("=", 1)[1].strip().strip('"')
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        obs["shared"] = shared_hardware_facts(args.shared, installer, sys.executable,
+                                              accelerators, args.host_accelerator)
+    except Exception as e:  # noqa: BLE001
+        obs["shared_error"] = f"{type(e).__name__}: {e}"
+        obs["shared"] = {}
+
+    # Each state gets its own Studio home so one state's record cannot be read by
+    # the next, and so the managed tree the fingerprint reads is this state's.
+    home = args.shared / "homes" / args.state
+    home.mkdir(parents = True, exist_ok = True)
+    os.environ["UNSLOTH_STUDIO_HOME"] = str(home)
+
+    try:
+        mod = import_backend(args.checkout)
+        obs["module"] = {"imported": True, "file": getattr(mod, "__file__", None)}
+    except Exception as e:  # noqa: BLE001
+        obs["module"] = {"imported": False, "error": f"{type(e).__name__}: {e}"}
+        args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
+        return 0
+
+    bundles = (obs.get("shared") or {}).get("bundles") or {}
+    obs["reads"] = {}
+    for accel, b in bundles.items():
+        cli = b.get("cli")
+        obs["reads"][accel] = {
+            "cli": cli,
+            "verdict": _call(mod, "sd_cpp_accelerator_device_verdict", cli),
+            "lists_accelerator": _call(mod, "sd_cpp_lists_accelerator_device", cli),
+            "installed_accelerator": _call(mod, "_installed_accelerator_of", cli),
+        }
+
+    gens = (obs.get("shared") or {}).get("generations") or {}
+    obs["error_reading"] = {}
+    for key, g in gens.items():
+        if not key.startswith(args.host_accelerator + ":"):
+            continue
+        text = g.get("output") or ""
+        # What the production caller actually receives. `video.py` notes a failure from
+        # `str(exc)` of the RuntimeError `sd_cpp_engine.generate` raises, and that text is
+        # "sd-cli exited <rc>. Last output:\n<tail>" -- not the raw stream. Feeding the
+        # markers the raw stream measured a string the code never sees, and on a build that
+        # dies before printing anything the difference is the whole observation.
+        tail = [ln for ln in text.splitlines() if ln.strip()][-12:]
+        engine_message = f"sd-cli exited {g.get('rc')}. Last output:\n" + "\n".join(tail)
+        obs["error_reading"][key] = {
+            "rc": g.get("rc"),
+            "raw_output_chars": len(text),
+            "engine_message": engine_message[:2000],
+            "markers": _marker_scan(mod, text),
+            "markers_engine_message": _marker_scan(mod, engine_message),
+            "output_shows_accelerator_failure": _call(
+                mod, "output_shows_accelerator_failure", text),
+            "engine_message_shows_accelerator_failure": _call(
+                mod, "output_shows_accelerator_failure", engine_message),
+            "engine_message_shows_decisive_failure": _call(
+                mod, "output_shows_decisive_accelerator_failure", engine_message),
+            "engine_message_shows_image_load_failure": _call(
+                mod, "output_shows_image_load_failure", engine_message),
+        }
+
+    obs["fallback_for"] = {a: _call(mod, "fallback_accelerator_for", a)
+                           for a in ("rocm", "vulkan", "cuda", "auto", "cpu")}
+    obs["vulkan_fallback_enabled"] = _call(mod, "sd_cpp_vulkan_fallback_enabled")
+    # A CLEAN host: no record written yet. This is what a machine whose ROCm build
+    # works must keep selecting.
+    obs["preferred_clean"] = {a: _call(mod, "preferred_accelerator", a)
+                              for a in ("rocm", "vulkan", "cuda", "auto")}
+    obs["failed_clean"] = _call(mod, "accelerator_runtime_failed", "rocm")
+
+    try:
+        obs["isolation"] = _isolation_observations(mod, args.host_accelerator)
+    except Exception as e:  # noqa: BLE001
+        obs["isolation"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        obs["fingerprint"] = _fingerprint_observations(
+            mod, args.shared, installer, sys.executable, home, args.host_accelerator)
+    except Exception as e:  # noqa: BLE001
+        obs["fingerprint"] = {"error": f"{type(e).__name__}: {e}"}
+
+    args.out.write_text(json.dumps(obs, indent = 2, default = str), encoding = "utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
