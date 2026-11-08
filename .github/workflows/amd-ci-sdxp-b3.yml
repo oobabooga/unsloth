@@ -1,0 +1,90 @@
+name: "AMD CI: gfx1151 HIP tile FA FP32 accumulators vs a no-FA reference; Linux torch props"
+
+# base = unslothai/stable-diffusion.cpp master ba6ac303 (HIP gfx1151, TheRock 7.14 wheels, built on the box)
+# head = base + sdrc/0016-ggml-hip-fattn-tile-f32-accumulators.patch added to scripts/unsloth/ggml-patches
+# Both in ONE job on ONE machine, renders interleaved per rep.
+
+on:
+  push:
+    branches: [amd-ci-sdxp-b3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-linux:
+    name: "gfx1151 Linux: HIP FA fix accuracy vs no-FA reference + torch props"
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    concurrency:
+      group: amd-ci-gfx1151-gpu
+      cancel-in-progress: false
+    env:
+      ROCM_VERSION: "7.14.0"
+      MASTER: ba6ac30346b0f174354419d820e6f11b3e9bc0f2
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Preamble
+        run: |
+          source amd_ci/lib/preamble.sh "sdxp-b3-linux"
+      - name: Host gate + device strings
+        run: |
+          set -euo pipefail
+          python3 amd_ci/lib/gate.py --no-torch --require linux --out "$AMD_CI_WORK/out/host.json"
+          python3 amd_ci/lib/capability.py > "$AMD_CI_WORK/out/capability.json" 2>&1 || true
+          { echo "node: $(uname -n)  kernel: $(uname -r)"; cat /opt/rocm/.info/version 2>/dev/null || true;
+            (rocminfo 2>&1 | grep -E "Runtime Version|Marketing Name|Name:.*gfx|Compute Unit" | head -12) || true; } > "$AMD_CI_WORK/out/host_strings.txt" 2>&1
+          cat "$AMD_CI_WORK/out/host_strings.txt"
+      - name: "Builds: HIP gfx1151 base and head (TheRock wheels)"
+        timeout-minutes: 90
+        run: |
+          set +e
+          cd "$AMD_CI_WORK"
+          python3 -m venv .rocm && . .rocm/bin/activate
+          python -m pip install -q --upgrade pip && python -m pip install -q ninja cmake pillow numpy
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "rocm[libraries,devel,device-gfx1151]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          export ROCM_PATH HIP_PATH="$ROCM_PATH" CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"
+          export PATH="$(rocm-sdk path --bin):$AMD_CI_WORK/.rocm/bin:$PATH"
+          echo "ROCM_LIB=$ROCM_PATH/lib" >> "$GITHUB_ENV"
+          echo "THEROCK_ROOT=$ROCM_PATH" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          bash sdrc/build_hip.sh hip_base "$MASTER" "$AMD_CI_WORK/bin/hip_base" 2>&1 | tail -6
+          bash sdrc/build_hip.sh hip_fa "$MASTER" "$AMD_CI_WORK/bin/hip_fa" "$GITHUB_WORKSPACE/sdrc/0016-ggml-hip-fattn-tile-f32-accumulators.patch" 2>&1 | tail -6
+          exit 0
+      - name: "Studio memory kind: raw torch props on Linux ROCm torch (repo.amd.com gfx1151)"
+        timeout-minutes: 30
+        run: |
+          set +e
+          O="$AMD_CI_WORK/out/torch"; mkdir -p "$O"
+          python3 -m venv "$AMD_CI_WORK/tv" && "$AMD_CI_WORK/tv/bin/pip" install -q --upgrade pip
+          "$AMD_CI_WORK/tv/bin/pip" install --index-url https://repo.amd.com/rocm/whl/gfx1151/ "torch==2.11.0+rocm7.13.0" > "$O/pip.log" 2>&1 \
+            || "$AMD_CI_WORK/tv/bin/pip" install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch >> "$O/pip.log" 2>&1
+          echo "pip rc=$?"; tail -3 "$O/pip.log"
+          "$AMD_CI_WORK/tv/bin/python" sdrc/torch_props.py "$O/torch_props_linux.json"
+          cat "$O/torch_props_linux.json"
+          exit 0
+      - name: "Accuracy: base, head and base with --flash-attn off (reference)"
+        timeout-minutes: 150
+        run: |
+          set +e
+          B="$AMD_CI_WORK/bin"
+          "$AMD_CI_WORK/.rocm/bin/python" -u sdrc/run2.py --bin hip_base=$B/hip_base --bin hip_fa=$B/hip_fa \
+            --rocm-lib "${ROCM_LIB:-}" --models "$AMD_CI_WORK/models" --out "$AMD_CI_WORK/out/runs" --reps 1 --ref 2>&1 | tail -80
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdxp-b3-linux
+          path: |
+            ${{ env.AMD_CI_WORK }}/out
+            !${{ env.AMD_CI_WORK }}/out/**/*.png
+          retention-days: 7
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sdxp-b3-linux-png, path: "${{ env.AMD_CI_WORK }}/out/**/*_r0.png", retention-days: 7, if-no-files-found: warn }
+

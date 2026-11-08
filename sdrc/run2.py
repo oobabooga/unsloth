@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--models", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--ref", action="store_true", help="accuracy pass: skip probe/tbo, add hip_base with --flash-attn off as reference")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -31,6 +32,8 @@ def main():
     def env_for(arm):
         return {**os.environ, "LD_LIBRARY_PATH": ":".join([arm["bin"]] + arm["ldpath"])}
 
+    if a.ref:
+        return ref_pass(a, arms, res, out, save)
     # 1. FA overflow probe (exact expected output), base and head
     for lab, arm in arms.items():
         exe = Path(arm["bin"]) / "sdxp-fa-probe"
@@ -87,6 +90,32 @@ def main():
         case = r["tag"].split("_")[0]
         if "png" in r and case in ref:
             r["vs_hip_base"] = run.diff(ref[case], r["png"])
+    save()
+    print("done", flush=True)
+
+
+def ref_pass(a, arms, res, out, save):
+    """Pixels vs a non-FA reference on the same backend: which arm is closer to unfused FP32-softmax attention."""
+    M = run.fetch(a.models, ["sd15", "zdit", "qwen3", "ae"])
+    P = run.PROMPT
+    cases = {}
+    for seed in ("42", "7"):
+        cases[f"zimg1024s{seed}"] = ["--diffusion-model", M["zdit"], "--llm", M["qwen3"], "--vae", M["ae"], "-p", P,
+                                     "--cfg-scale", "1", "--steps", "8", "-W", "1024", "-H", "1024", "--seed", seed,
+                                     "--sampling-method", "euler"]
+    cases["sd15f16"] = ["-m", M["sd15"], "-p", P, "--steps", "20", "-W", "512", "-H", "512", "--seed", "42",
+                        "--sampling-method", "euler", "--type", "f16"]
+    allarms = dict(arms)
+    allarms["hip_base_faoff"] = {**arms["hip_base"], "label": "hip_base_faoff", "argv": ["--flash-attn", "off"]}
+    for case, argv in cases.items():
+        for lab, arm in allarms.items():
+            res["runs"].append(run.sd(arm, argv, out, f"{case}_{lab}_r0"))
+            save()
+    ref = {r["tag"].split("_")[0]: r["png"] for r in res["runs"] if r["arm"] == "hip_base_faoff" and "png" in r}
+    for r in res["runs"]:
+        case = r["tag"].split("_")[0]
+        if "png" in r and case in ref:
+            r["vs_faoff"] = run.diff(ref[case], r["png"])
     save()
     print("done", flush=True)
 
