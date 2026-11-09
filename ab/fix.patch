@@ -1,0 +1,988 @@
+diff --git a/studio/backend/core/chat_pdf.py b/studio/backend/core/chat_pdf.py
+index 729af7f97c..e9b26df442 100644
+--- a/studio/backend/core/chat_pdf.py
++++ b/studio/backend/core/chat_pdf.py
+@@ -10,7 +10,10 @@ import json
+ import sys
+ from datetime import datetime, timezone
+ 
++from utils.optional_pdf import PDFDependencyUnavailable, load_pdf_module
++
+ TOO_LONG_EXIT_CODE = 3
++MISSING_PDF_SUPPORT_EXIT_CODE = 4
+ MAX_EXPORT_PAGES = 5000
+ _PAGE_MARGIN_PT = 54
+ 
+@@ -44,7 +47,8 @@ class ChatPdfTooLong(Exception):
+ 
+ def render_chat_pdf(title: str, body_html: str) -> bytes:
+     """No archive is passed to the Story, so markup can only embed data: images, never local files or URLs."""
+-    import pymupdf
++    # Installs PyMuPDF on first use; the server's import path does not reach this child.
++    pymupdf = load_pdf_module("pymupdf")
+ 
+     heading = html.escape(" ".join(title.split()) or "Conversation")
+     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+@@ -84,6 +88,9 @@ def main() -> int:
+     except ChatPdfTooLong as error:
+         print(error, file = sys.stderr)
+         return TOO_LONG_EXIT_CODE
++    except PDFDependencyUnavailable as error:
++        print(error, file = sys.stderr)
++        return MISSING_PDF_SUPPORT_EXIT_CODE
+     sys.stdout.buffer.write(pdf)
+     sys.stdout.buffer.flush()
+     return 0
+diff --git a/studio/backend/core/inference/tools.py b/studio/backend/core/inference/tools.py
+index 913f02c9c4..51ebffa832 100644
+--- a/studio/backend/core/inference/tools.py
++++ b/studio/backend/core/inference/tools.py
+@@ -113,6 +113,7 @@ from utils.account_context import (
+ )
+ from utils.current_date_prompt_settings import strip_current_date_update_note
+ from utils.host_policy import _literal_ip_address
++from utils.optional_pdf import PDFDependencyUnavailable, ensure_pdf_support
+ from core.inference.providers import _metadata_host as _provider_metadata_host
+ from utils import sandbox_memory_limit, tool_result_limit
+ from core.inference import tool_facts
+@@ -15918,10 +15919,14 @@ def _fetch_url_raw(
+             try:
+                 queued_at = time.monotonic()
+                 with _WEB_PDF_LOCK:
+-                    # Time queued behind another read's PDF is not spent on this read.
++                    # Time queued behind another read's PDF, or spent installing PDF support on
++                    # first use, is not spent on this read.
++                    ensure_pdf_support()
+                     if deadline is not None:
+                         deadline += time.monotonic() - queued_at
+                     pdf_text = _extract_pdf_text(raw_bytes)
++            except PDFDependencyUnavailable as exc:
++                return f"(PDF content could not be read as text: {exc})", "", content_type
+             except Exception as exc:
+                 logger.debug("web PDF text extraction failed (%s)", type(exc).__name__)
+                 return "(PDF content could not be read as text)", "", content_type
+@@ -22273,6 +22278,27 @@ def _timed_out_result(
+     return result
+ 
+ 
++_PDF_PARSER_MODULES = frozenset({"fitz", "pymupdf", "pymupdf4llm"})
++
++
++def _imports_pdf_parser(code: str) -> bool:
++    """Whether the code imports PyMuPDF, which attachment notes suggest via fitz.open(path)."""
++    try:
++        tree = ast.parse(code)
++    except (SyntaxError, ValueError):
++        return False
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            names = [alias.name for alias in node.names]
++        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
++            names = [node.module]
++        else:
++            continue
++        if any(name.partition(".")[0] in _PDF_PARSER_MODULES for name in names):
++            return True
++    return False
++
++
+ def _python_exec(
+     code: str,
+     cancel_event = None,
+@@ -22314,6 +22340,13 @@ def _python_exec(
+             "/proc environment reads; refusing bypass execution."
+         )
+ 
++    # PDF support installs on first use here, outside the sandbox, which cannot write this environment.
++    if _imports_pdf_parser(code):
++        try:
++            ensure_pdf_support()
++        except PDFDependencyUnavailable as exc:
++            return _truncate(f"Execution error: {exc}")
++
+     tmp_path = None
+     _scratch_name = None
+     # Bound before the try so the finally can release even when prepare raised.
+diff --git a/studio/backend/routes/chat_export.py b/studio/backend/routes/chat_export.py
+index 60f9ca051a..c96a7c07bb 100644
+--- a/studio/backend/routes/chat_export.py
++++ b/studio/backend/routes/chat_export.py
+@@ -13,7 +13,7 @@ from fastapi.responses import Response
+ from pydantic import BaseModel, Field
+ 
+ from auth.authentication import get_current_subject
+-from core.chat_pdf import TOO_LONG_EXIT_CODE
++from core.chat_pdf import MISSING_PDF_SUPPORT_EXIT_CODE, TOO_LONG_EXIT_CODE
+ from loggers import get_logger
+ from utils.utils import log_and_http_error
+ 
+@@ -32,6 +32,10 @@ class ChatPdfTooLong(Exception):
+     pass
+ 
+ 
++class ChatPdfSupportMissing(Exception):
++    pass
++
++
+ class ChatPdfRequest(BaseModel):
+     title: str = Field("", max_length = 2000)
+     html: str = Field(..., min_length = 1, max_length = MAX_EXPORT_HTML_CHARS)
+@@ -50,6 +54,9 @@ def render_chat_pdf_in_child(title: str, body_html: str) -> bytes:
+         )
+     if result.returncode == TOO_LONG_EXIT_CODE:
+         raise ChatPdfTooLong(result.stderr.decode("utf-8", "replace").strip())
++    if result.returncode == MISSING_PDF_SUPPORT_EXIT_CODE:
++        lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
++        raise ChatPdfSupportMissing(lines[-1] if lines else "PDF support is not installed")
+     if result.returncode != 0 or not result.stdout.startswith(b"%PDF"):
+         tail = result.stderr.decode("utf-8", "replace").strip()[-2000:]
+         raise RuntimeError(f"PDF renderer exited with {result.returncode}: {tail}")
+@@ -66,6 +73,9 @@ async def export_chat_pdf(
+         raise log_and_http_error(
+             error, 413, "This export is too long for one PDF.", log = logger
+         ) from error
++    except ChatPdfSupportMissing as error:
++        # The child's message is our own installation guidance, never installer output.
++        raise log_and_http_error(error, 503, str(error), log = logger) from error
+     except Exception as error:
+         raise log_and_http_error(error, 500, "Could not render the PDF.", log = logger) from error
+     return Response(content = content, media_type = "application/pdf")
+diff --git a/studio/backend/tests/test_optional_pdf.py b/studio/backend/tests/test_optional_pdf.py
+index d5e028c556..238a53de73 100644
+--- a/studio/backend/tests/test_optional_pdf.py
++++ b/studio/backend/tests/test_optional_pdf.py
+@@ -1,13 +1,10 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+-"""First-use PDF installation is isolated, bounded, and never downloads in unit tests."""
++"""First-use PDF installation targets this environment, is bounded, and never downloads in unit tests."""
+ 
+ from concurrent.futures import ThreadPoolExecutor
+-import importlib
+-import json
+ import os
+-from pathlib import Path
+ import subprocess
+ import sys
+ from types import ModuleType
+@@ -17,21 +14,13 @@ import pytest
+ from utils import optional_pdf as pdf
+ 
+ 
+-def _write_wheel(stage: Path) -> None:
+-    """Small wheel-shaped fixture; real-wheel integration is checked separately."""
+-    info = stage / "pymupdf-1.27.2.3.dist-info"
+-    (info / "licenses").mkdir(parents = True)
+-    files = {
+-        "pymupdf.py": "answer = 42\n",
+-        f"{info.name}/METADATA": "Metadata-Version: 2.1\nName: PyMuPDF\nVersion: 1.27.2.3\n",
+-        f"{info.name}/licenses/COPYING": "upstream license\n",
+-        "should-not-execute.pth": "import os; os.environ['PDF_PTH_EXECUTED'] = '1'\n",
+-    }
+-    for name, content in files.items():
+-        (stage / name).write_text(content, encoding = "utf-8")
+-    (info / "RECORD").write_text(
+-        "".join(f"{name},,\n" for name in [*files, f"{info.name}/RECORD"]), encoding = "utf-8"
+-    )
++class _Environment:
++    """PDF modules become importable once the fake installer has run."""
++
++    def __init__(self):
++        self.installed = False
++        self.calls = []
++        self.modules = {}
+ 
+ 
+ @pytest.fixture
+@@ -45,37 +34,33 @@ def missing_pdf(monkeypatch, tmp_path):
+         "PIP_NO_INDEX",
+     ):
+         monkeypatch.delenv(name, raising = False)
+-    monkeypatch.setattr(pdf, "cache_root", lambda: tmp_path)
++    monkeypatch.setattr(pdf, "_lock_path", lambda: tmp_path / "install.lock")
+     monkeypatch.setattr(pdf, "_missing_requirements", lambda: ["pymupdf==1.27.2.3"])
+     monkeypatch.setattr(pdf, "_find_uv", lambda: None)
+-    monkeypatch.setattr(sys, "path", list(sys.path))
+-    for name in pdf._MODULES:
+-        monkeypatch.setitem(sys.modules, name, None)
+-    real_import = importlib.import_module
++    environment = _Environment()
++    real_import = pdf.importlib.import_module
++    real_find_spec = pdf.importlib.util.find_spec
+ 
+     def import_module(name):
+         if name not in pdf._MODULES:
+             return real_import(name)
+-        target = pdf._target()
+-        if str(target) not in sys.path or not (target / f"{name}.py").is_file():
++        if not environment.installed:
+             raise ModuleNotFoundError("PDF dependency absent", name = name)
+-        if sys.modules.get(name) is None:
+-            spec = importlib.util.spec_from_file_location(name, target / f"{name}.py")
+-            module = importlib.util.module_from_spec(spec)
+-            spec.loader.exec_module(module)
+-            monkeypatch.setitem(sys.modules, name, module)
+-        return sys.modules[name]
++        return environment.modules.setdefault(name, ModuleType(name))
+ 
+-    monkeypatch.setattr(pdf.importlib, "import_module", import_module)
+-    calls = []
++    def find_spec(name, *args):
++        if name not in pdf._MODULES | {"tabulate"}:
++            return real_find_spec(name, *args)
++        return object() if environment.installed else None
+ 
+     def install(command, **kwargs):
+-        calls.append((command, kwargs))
+-        stage = Path(command[command.index("--target") + 1])
+-        _write_wheel(stage)
++        environment.calls.append((command, kwargs))
++        environment.installed = True
+ 
++    monkeypatch.setattr(pdf.importlib, "import_module", import_module)
++    monkeypatch.setattr(pdf.importlib.util, "find_spec", find_spec)
+     monkeypatch.setattr(pdf.subprocess, "run", install)
+-    return calls
++    return environment
+ 
+ 
+ @pytest.mark.parametrize("name", sorted(pdf._MODULES))
+@@ -84,7 +69,9 @@ def test_installed_parser_wins_even_when_downloads_disabled(monkeypatch, name):
+     monkeypatch.setitem(sys.modules, name, installed)
+     monkeypatch.setenv("UNSLOTH_PDF_AUTO_INSTALL", "0")
+     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+-    monkeypatch.setattr(pdf, "_target", lambda: pytest.fail("installed module needs no cache"))
++    monkeypatch.setattr(
++        pdf, "_install", lambda *a: pytest.fail("installed module needs no install")
++    )
+     assert pdf.load_pdf_module(name) is installed
+ 
+ 
+@@ -96,22 +83,34 @@ def test_only_pdf_modules_are_allowed(monkeypatch, name):
+ 
+ 
+ @pytest.mark.parametrize("installer", ["uv", "pip"])
+-def test_parallel_requests_publish_one_complete_install(missing_pdf, monkeypatch, installer):
++def test_parallel_requests_install_once_into_this_environment(missing_pdf, monkeypatch, installer):
+     monkeypatch.setattr(pdf, "_find_uv", lambda: "/tools/uv" if installer == "uv" else None)
+     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-for-installer")
+     monkeypatch.setenv("HF_TOKEN", "not-for-installer")
+     monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://unwanted.invalid")
+     monkeypatch.setenv("UV_TARGET", "/unwanted-target")
+     monkeypatch.setenv("SSL_CERT_FILE", "/transport/cert.pem")
+-    monkeypatch.delenv("PDF_PTH_EXECUTED", raising = False)
+     original_path = list(sys.path)
+     with ThreadPoolExecutor(max_workers = 4) as pool:
+         modules = list(pool.map(pdf.load_pdf_module, ["pymupdf"] * 4))
+-    assert all(module.answer == 42 for module in modules)
+-    assert len(missing_pdf) == 1
+-    command, options = missing_pdf[0]
+-    assert command[0] == ("/tools/uv" if installer == "uv" else sys.executable)
++    assert len({id(module) for module in modules}) == 1
++    assert len(missing_pdf.calls) == 1
++    command, options = missing_pdf.calls[0]
++    if installer == "uv":
++        assert command[:6] == [
++            "/tools/uv",
++            "pip",
++            "install",
++            "--python",
++            sys.executable,
++            "--no-config",
++        ]
++    else:
++        assert command[:3] == [sys.executable, "-m", "pip"]
++    # Installs into this interpreter's environment, so child interpreters see it too.
++    assert "--target" not in command and "--prefix" not in command
+     assert "--no-deps" in command and command[command.index("--only-binary") + 1] == ":all:"
++    assert command[-1] == "pymupdf==1.27.2.3"
+     assert options["timeout"] <= pdf._INSTALL_TIMEOUT
+     assert (
+         not {"AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "PIP_EXTRA_INDEX_URL", "UV_TARGET"}
+@@ -119,47 +118,22 @@ def test_parallel_requests_publish_one_complete_install(missing_pdf, monkeypatch
+     )
+     assert options["env"]["SSL_CERT_FILE"] == "/transport/cert.pem"
+     assert options["env"]["PIP_CONFIG_FILE"] == os.devnull
+-    target = pdf._target()
+-    assert (target / ".complete").is_file()
+-    assert (
+-        target / "pymupdf-1.27.2.3.dist-info/licenses/COPYING"
+-    ).read_text() == "upstream license\n"
+-    assert sys.path[:-1] == original_path and sys.path[-1] == str(target)
+-    assert "PDF_PTH_EXECUTED" not in os.environ
+-    assert not list(target.parent.glob(".pdf-*"))
+-
+-
+-def test_cache_reuse_after_clearing_import_state_offline_and_disabled(missing_pdf, monkeypatch):
+-    pdf.load_pdf_module("pymupdf")
+-    target = pdf._target()
+-    # Simulate a fresh interpreter's import state, retaining the actual wheel cache.
+-    monkeypatch.setitem(sys.modules, "pymupdf", None)
+-    sys.path.remove(str(target))
+-    monkeypatch.setenv("UNSLOTH_PDF_AUTO_INSTALL", "0")
+-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+-    assert pdf.load_pdf_module("pymupdf").answer == 42
+-    assert len(missing_pdf) == 1
++    assert sys.path == original_path
+ 
+ 
+-def test_failed_uv_attempt_falls_back_to_pip_in_a_fresh_stage(missing_pdf, monkeypatch):
++def test_failed_uv_attempt_falls_back_to_pip(missing_pdf, monkeypatch):
+     monkeypatch.setattr(pdf, "_find_uv", lambda: "/tools/uv")
+-    stages = []
++    attempts = []
+ 
+     def install(command, **kwargs):
+-        stage = Path(command[command.index("--target") + 1])
+-        stages.append(stage)
++        attempts.append(command[0])
+         if command[0] == "/tools/uv":
+-            (stage / "partial-file").write_text("incomplete")
+             raise subprocess.CalledProcessError(1, command)
+-        assert command[:3] == [sys.executable, "-m", "pip"]
+-        assert not (stage / "partial-file").exists()
+-        _write_wheel(stage)
++        missing_pdf.installed = True
+ 
+     monkeypatch.setattr(pdf.subprocess, "run", install)
+-    assert pdf.load_pdf_module("pymupdf").answer == 42
+-    assert len(stages) == 2 and stages[0] != stages[1]
+-    assert not stages[0].exists()
+-    assert not (pdf._target() / "partial-file").exists()
++    assert pdf.load_pdf_module("pymupdf").__name__ == "pymupdf"
++    assert attempts == ["/tools/uv", sys.executable]
+ 
+ 
+ @pytest.mark.parametrize("value", ["0", "false", "off"])
+@@ -168,7 +142,7 @@ def test_disabled_downloads_are_actionable(missing_pdf, monkeypatch, value):
+     with pytest.raises(pdf.PDFDependencyUnavailable, match = "downloads are disabled") as error:
+         pdf.load_pdf_module("pymupdf")
+     assert pdf.INSTALL_COMMAND in str(error.value)
+-    assert not missing_pdf and not pdf._target().exists()
++    assert not missing_pdf.calls
+ 
+ 
+ @pytest.mark.parametrize("setting", ["HF_HUB_OFFLINE", "UV_OFFLINE", "PIP_NO_INDEX"])
+@@ -176,7 +150,7 @@ def test_offline_requests_do_not_attempt_downloads(missing_pdf, monkeypatch, set
+     monkeypatch.setenv(setting, "1")
+     with pytest.raises(pdf.PDFDependencyUnavailable, match = "offline mode"):
+         pdf.load_pdf_module("pymupdf")
+-    assert not missing_pdf
++    assert not missing_pdf.calls
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -187,10 +161,8 @@ def test_offline_requests_do_not_attempt_downloads(missing_pdf, monkeypatch, set
+         OSError("installer unavailable"),
+     ],
+ )
+-def test_failed_installs_do_not_publish_partial_caches(missing_pdf, monkeypatch, failure):
++def test_failed_installs_give_guidance_without_installer_output(missing_pdf, monkeypatch, failure):
+     def install(command, **kwargs):
+-        stage = Path(command[command.index("--target") + 1])
+-        (stage / "partial").write_text("unfinished")
+         raise failure
+ 
+     monkeypatch.setattr(pdf.subprocess, "run", install)
+@@ -198,36 +170,54 @@ def test_failed_installs_do_not_publish_partial_caches(missing_pdf, monkeypatch,
+         pdf.load_pdf_module("pymupdf")
+     assert pdf.INSTALL_COMMAND in str(error.value)
+     assert "private proxy credential" not in str(error.value)
+-    assert not pdf._target().exists()
+-    assert not list(pdf._target().parent.glob(".pdf-*"))
+ 
+ 
+-def test_success_without_complete_wheel_files_is_not_published(missing_pdf, monkeypatch):
++def test_success_that_leaves_the_module_missing_is_actionable(missing_pdf, monkeypatch):
+     monkeypatch.setattr(pdf.subprocess, "run", lambda *a, **kw: None)
+-    with pytest.raises(pdf.PDFDependencyUnavailable, match = "incomplete or damaged"):
++    with pytest.raises(pdf.PDFDependencyUnavailable, match = "could not be imported"):
+         pdf.load_pdf_module("pymupdf")
+-    assert not pdf._target().exists()
+ 
+ 
+-@pytest.mark.parametrize("damage", ["marker", "file", "unfinished"])
+-def test_damaged_cache_is_actionable_and_not_overwritten(missing_pdf, damage):
+-    target = pdf._target()
+-    target.mkdir(parents = True)
+-    _write_wheel(target)
+-    marker = target / ".complete"
+-    marker.write_text(
+-        json.dumps({"version": pdf._CACHE_VERSION, "packages": ["pymupdf==1.27.2.3"]})
+-    )
+-    if damage == "marker":
+-        marker.write_text("not JSON")
+-    elif damage == "file":
+-        (target / "pymupdf.py").unlink()
+-    else:
+-        marker.unlink()
+-    with pytest.raises(pdf.PDFDependencyUnavailable, match = "cache is incomplete") as error:
+-        pdf.load_pdf_module("pymupdf")
+-    assert pdf.INSTALL_COMMAND in str(error.value)
+-    assert not missing_pdf
++def test_a_concurrent_install_by_another_process_is_reused(missing_pdf, monkeypatch):
++    class OtherProcessInstalled:
++        def __init__(self, path, timeout):
++            pass
++
++        def __enter__(self):
++            missing_pdf.installed = True
++
++        def __exit__(self, *args):
++            pass
++
++    monkeypatch.setattr(pdf, "FileLock", OtherProcessInstalled)
++    assert pdf.load_pdf_module("fitz").__name__ == "fitz"
++    assert not missing_pdf.calls
++
++
++def test_ensure_installs_for_children_without_importing(missing_pdf, monkeypatch):
++    imported = []
++    monkeypatch.setattr(pdf, "_import", lambda name: imported.append(name))
++    pdf.ensure_pdf_support()
++    pdf.ensure_pdf_support()
++    assert len(missing_pdf.calls) == 1
++    assert not imported
++
++
++def test_ensure_is_free_when_already_installed(missing_pdf, monkeypatch):
++    missing_pdf.installed = True
++    monkeypatch.setenv("UNSLOTH_PDF_AUTO_INSTALL", "0")
++    pdf.ensure_pdf_support()
++    assert not missing_pdf.calls
++
++
++def test_ensure_reports_disabled_downloads(missing_pdf, monkeypatch):
++    monkeypatch.setenv("UNSLOTH_PDF_AUTO_INSTALL", "0")
++    with pytest.raises(pdf.PDFDependencyUnavailable, match = "downloads are disabled"):
++        pdf.ensure_pdf_support()
++
++
++def test_install_lock_is_scoped_to_this_environment():
++    assert pdf._lock_path().parent == pdf.Path(sys.prefix)
+ 
+ 
+ @pytest.mark.parametrize("installed", ["0.8.0", "0.9.0", "0.10.0"])
+@@ -265,33 +255,8 @@ def test_broken_installed_native_packages_get_repair_guidance(monkeypatch, failu
+         pdf.load_pdf_module("pymupdf")
+ 
+ 
+-@pytest.mark.parametrize(
+-    "component", ["requirements", "prefix", "executable", "platform", "abi", "gil"]
+-)
+-def test_incompatible_interpreters_and_requirements_do_not_share_a_cache(
+-    monkeypatch, tmp_path, component
+-):
+-    before = pdf._target()
+-    if component == "requirements":
+-        path = tmp_path / "pdf.txt"
+-        path.write_text(
+-            pdf._REQUIREMENTS.read_text(encoding = "utf-8") + "\n# changed pins\n",
+-            encoding = "utf-8",
+-        )
+-        monkeypatch.setattr(pdf, "_REQUIREMENTS", path)
+-    elif component in {"prefix", "executable"}:
+-        monkeypatch.setattr(pdf.sys, component, str(tmp_path / component))
+-    elif component == "platform":
+-        monkeypatch.setattr(pdf.sysconfig, "get_platform", lambda: "another-platform")
+-    else:
+-        original = pdf.sysconfig.get_config_var
+-        key = "SOABI" if component == "abi" else "Py_GIL_DISABLED"
+-        monkeypatch.setattr(
+-            pdf.sysconfig,
+-            "get_config_var",
+-            lambda name: "changed" if name == key else original(name),
+-        )
+-    assert pdf._target() != before
++def test_requirements_file_reads_as_utf8():
++    assert "pymupdf4llm==0.3.4" in pdf._REQUIREMENTS.read_text(encoding = "utf-8")
+ 
+ 
+ def test_thread_lock_wait_is_bounded(missing_pdf, monkeypatch):
+@@ -303,7 +268,7 @@ def test_thread_lock_wait_is_bounded(missing_pdf, monkeypatch):
+     monkeypatch.setattr(pdf, "_LOCK", Busy())
+     with pytest.raises(pdf.PDFDependencyUnavailable, match = "timed out"):
+         pdf.load_pdf_module("pymupdf")
+-    assert not missing_pdf
++    assert not missing_pdf.calls
+ 
+ 
+ def test_process_lock_wait_is_bounded(missing_pdf, monkeypatch):
+@@ -320,4 +285,4 @@ def test_process_lock_wait_is_bounded(missing_pdf, monkeypatch):
+     monkeypatch.setattr(pdf, "FileLock", Busy)
+     with pytest.raises(pdf.PDFDependencyUnavailable, match = "timed out"):
+         pdf.load_pdf_module("pymupdf")
+-    assert not missing_pdf
++    assert not missing_pdf.calls
+diff --git a/studio/backend/tests/test_optional_pdf_consumers.py b/studio/backend/tests/test_optional_pdf_consumers.py
+new file mode 100644
+index 0000000000..8ec3a83420
+--- /dev/null
++++ b/studio/backend/tests/test_optional_pdf_consumers.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Consumers outside RAG parsing reach PDF support through the first-use installer, not a bare import."""
++
++from email.message import Message
++import io
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from auth.authentication import get_current_subject
++import core.chat_pdf as chat_pdf
++from core.inference import tools
++import routes.chat_export as chat_export
++from utils.optional_pdf import INSTALL_COMMAND, PDFDependencyUnavailable
++
++_GUIDANCE = f"PDF support is not installed and automatic downloads are disabled. Install it with: {INSTALL_COMMAND}"
++
++
++def _missing(*_args, **_kwargs):
++    raise PDFDependencyUnavailable(_GUIDANCE)
++
++
++def test_chat_pdf_child_reports_missing_support_with_its_own_exit_code(monkeypatch, capsys):
++    monkeypatch.setattr(chat_pdf, "load_pdf_module", _missing)
++    monkeypatch.setattr(
++        chat_pdf.sys, "stdin", SimpleNamespace(buffer = io.BytesIO(b'{"html": "<p>x</p>"}'))
++    )
++    assert chat_pdf.main() == chat_pdf.MISSING_PDF_SUPPORT_EXIT_CODE
++    assert INSTALL_COMMAND in capsys.readouterr().err
++
++
++def test_chat_export_returns_install_guidance_as_503(monkeypatch):
++    def child(*_args, **_kwargs):
++        return subprocess.CompletedProcess(
++            [], chat_pdf.MISSING_PDF_SUPPORT_EXIT_CODE, b"", f"log line\n{_GUIDANCE}\n".encode()
++        )
++
++    monkeypatch.setattr(chat_export.subprocess, "run", child)
++    app = FastAPI()
++    app.include_router(chat_export.router, prefix = "/api/chat-export")
++    app.dependency_overrides[get_current_subject] = lambda: "unsloth"
++    response = TestClient(app).post("/api/chat-export/pdf", json = {"title": "x", "html": "<p>x</p>"})
++    assert response.status_code == 503
++    assert response.json()["detail"] == _GUIDANCE
++
++
++@pytest.mark.parametrize(
++    "code, expected",
++    [
++        ("import fitz\nprint(fitz.open('a.pdf').page_count)", True),
++        ("import os, pymupdf", True),
++        ("from pymupdf4llm import to_markdown", True),
++        ("from fitz.utils import getColor", True),
++        ("import pandas as pd\nprint(pd.__version__)", False),
++        ("fitz = 1\nprint('import fitz')", False),
++        ("from . import fitz", False),
++        ("import fitz(", False),
++    ],
++)
++def test_python_tool_detects_pdf_parser_imports(code, expected):
++    assert tools._imports_pdf_parser(code) is expected
++
++
++def test_python_tool_returns_install_guidance_before_spawning(monkeypatch):
++    monkeypatch.setattr(tools, "ensure_pdf_support", _missing)
++    monkeypatch.setattr(
++        tools,
++        "_get_workdir",
++        lambda *_a: pytest.fail("must not start the sandbox without PDF support"),
++    )
++    result = tools._python_exec("import fitz\nprint(fitz.__doc__)", session_id = "pdf-check")
++    assert result.startswith("Execution error: ")
++    assert INSTALL_COMMAND in result
++
++
++def test_python_tool_skips_the_installer_for_other_code(monkeypatch):
++    monkeypatch.setattr(tools, "ensure_pdf_support", lambda: pytest.fail("no PDF import"))
++
++    class Stop(Exception):
++        pass
++
++    def stop(*_args):
++        raise Stop
++
++    monkeypatch.setattr(tools, "_get_workdir", stop)
++    with pytest.raises(Stop):
++        tools._python_exec("print(1 + 1)", session_id = "pdf-check")
++
++
++class _PdfResponse:
++    def __init__(self):
++        self._body = b"%PDF-1.4\n%%EOF\n"
++        self.headers = Message()
++        self.headers["Content-Type"] = "application/pdf"
++
++    def read(self, n = None):
++        chunk, self._body = (self._body, b"") if n is None else (self._body[:n], self._body[n:])
++        return chunk
++
++
++def _fetch_pdf(monkeypatch):
++    monkeypatch.setattr(
++        tools, "_validate_and_resolve_host", lambda host, port: (True, "", ["93.184.216.34"])
++    )
++    opener = type("Opener", (), {"open": lambda self, req, timeout = None: _PdfResponse()})()
++    monkeypatch.setattr(tools.urllib.request, "build_opener", lambda *a, **k: opener)
++    return tools._fetch_page_text("https://example.com/paper.pdf", timeout = 60)
++
++
++def test_web_pdf_read_keeps_install_guidance(monkeypatch):
++    monkeypatch.setattr(tools, "ensure_pdf_support", _missing)
++    out = _fetch_pdf(monkeypatch)
++    assert out.startswith("(PDF content could not be read as text: ")
++    assert INSTALL_COMMAND in out
++
++
++def test_web_pdf_first_use_install_is_not_charged_to_the_read(monkeypatch):
++    clock = {"time": 1000.0}
++    monkeypatch.setattr(tools.time, "monotonic", lambda: clock["time"])
++
++    def slow_install():
++        clock["time"] += 90.0
++
++    monkeypatch.setattr(tools, "ensure_pdf_support", slow_install)
++    monkeypatch.setattr(tools, "_extract_pdf_text", lambda data: "## Page 1\n\nreadable")
++    out = _fetch_pdf(monkeypatch)
++    assert "readable" in out
++    assert "timed out" not in out
+diff --git a/studio/backend/utils/optional_pdf.py b/studio/backend/utils/optional_pdf.py
+index 25bce05b40..43369ee249 100644
+--- a/studio/backend/utils/optional_pdf.py
++++ b/studio/backend/utils/optional_pdf.py
+@@ -1,46 +1,39 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+ # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+ 
+-"""Load PDF parsers on first use, keeping downloaded wheels outside the running environment.
++"""Install the PDF parsers into this environment the first time a PDF or MuPDF e-book is read.
+ 
+-Call from a document worker. Existing imports take precedence; cached wheels are appended to
+-sys.path without processing .pth files. A published cache contains complete upstream wheels,
+-including their metadata and licenses, and never replaces an installed native package.
++Only missing pinned wheels are installed, with --no-deps, so nothing already installed is replaced.
++They land in this interpreter's site-packages, like the S3 SDK, so every interpreter Studio starts
++(document workers, the chat PDF export, the Python tool under its OS sandbox) can import them.
+ """
+ 
+ from __future__ import annotations
+ 
+-import csv
+-import hashlib
+ import importlib
+-from importlib.metadata import PackageNotFoundError, distributions, version
+-import json
+-import io
++import importlib.util
++from importlib.metadata import PackageNotFoundError, version
+ import logging
+ import os
+ from pathlib import Path
+-import platform
+ import shutil
+ import subprocess
+ import sys
+-import sysconfig
+-import tempfile
+ import threading
+ import time
+ from types import ModuleType
++from typing import Callable
+ 
+ from filelock import FileLock
+ from packaging.requirements import Requirement
+ from packaging.utils import canonicalize_name
+ 
+-from utils.paths.storage_roots import cache_root
+ from utils.subprocess_compat import windows_hidden_subprocess_kwargs
+ 
+ _REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements" / "pdf.txt"
+ _MODULES = frozenset({"fitz", "pymupdf", "pymupdf4llm"})
+ _LOCK = threading.RLock()
+ _INSTALL_TIMEOUT = 120
+-_CACHE_VERSION = 1
+ INSTALL_COMMAND = 'python -m pip install "unsloth[pdf]"'
+ logger = logging.getLogger(__name__)
+ 
+@@ -100,65 +93,6 @@ def _requirements() -> list[Requirement]:
+     ]
+ 
+ 
+-def _target() -> Path:
+-    identity = {
+-        "cache_version": _CACHE_VERSION,
+-        "requirements": _REQUIREMENTS.read_text(encoding = "utf-8"),
+-        "prefix": str(Path(sys.prefix).resolve()),
+-        "executable": str(Path(sys.executable).resolve()),
+-        "python": list(sys.version_info[:3]),
+-        "implementation": sys.implementation.name,
+-        "cache_tag": sys.implementation.cache_tag,
+-        "platform": sysconfig.get_platform(),
+-        "machine": platform.machine(),
+-        "soabi": sysconfig.get_config_var("SOABI"),
+-        "gil_disabled": sysconfig.get_config_var("Py_GIL_DISABLED"),
+-    }
+-    digest = hashlib.sha256(json.dumps(identity, sort_keys = True).encode()).hexdigest()[:24]
+-    return cache_root() / "optional-pdf" / digest
+-
+-
+-def _validate_target(target: Path, packages: list[str]) -> None:
+-    installed = {
+-        canonicalize_name(dist.metadata["Name"]): dist for dist in distributions(path = [str(target)])
+-    }
+-    for entry in packages:
+-        requirement = Requirement(entry)
+-        dist = installed.get(canonicalize_name(requirement.name))
+-        if dist is None or dist.version not in requirement.specifier:
+-            raise _unavailable("The PDF wheel cache is incomplete or damaged")
+-        record = dist.read_text("RECORD")
+-        if not record:
+-            raise _unavailable("The PDF wheel cache is incomplete or damaged")
+-        # Distribution.files can omit missing entries; read RECORD directly to detect damage.
+-        for row in csv.reader(io.StringIO(record)):
+-            if not row:
+-                continue
+-            path = Path(dist.locate_file(row[0])).resolve()
+-            if path.is_relative_to(target.resolve()) and not path.is_file():
+-                raise _unavailable("The PDF wheel cache is incomplete or damaged")
+-
+-
+-def _activate(target: Path) -> bool:
+-    marker = target / ".complete"
+-    if not marker.is_file():
+-        return False
+-    try:
+-        record = json.loads(marker.read_text(encoding = "utf-8"))
+-        if record["version"] != _CACHE_VERSION or not record["packages"]:
+-            raise ValueError("Invalid completion marker")
+-        _validate_target(target, record["packages"])
+-    except PDFDependencyUnavailable:
+-        raise
+-    except (OSError, ValueError, TypeError, KeyError, csv.Error) as exc:
+-        raise _unavailable("The PDF wheel cache is incomplete or damaged") from exc
+-    path = str(target)
+-    if path not in sys.path:
+-        sys.path.append(path)
+-    importlib.invalidate_caches()
+-    return True
+-
+-
+ def _missing_requirements() -> list[str]:
+     missing = []
+     for requirement in _requirements():
+@@ -195,7 +129,29 @@ def _find_uv() -> str | None:
+         return shutil.which("uv")
+ 
+ 
+-def _install(target: Path, deadline: float) -> None:
++def _downloads_blocked() -> str | None:
++    if os.environ.get("UNSLOTH_PDF_AUTO_INSTALL", "1").strip().lower() in {
++        "0",
++        "false",
++        "no",
++        "off",
++    }:
++        return "PDF support is not installed and automatic downloads are disabled"
++    if any(
++        os.environ.get(key, "").strip().lower() in {"1", "true", "yes", "on"}
++        for key in (
++            "HF_HUB_OFFLINE",
++            "TRANSFORMERS_OFFLINE",
++            "UV_OFFLINE",
++            "UV_NO_INDEX",
++            "PIP_NO_INDEX",
++        )
++    ):
++        return "PDF support is not installed and offline mode is enabled"
++    return None
++
++
++def _install(deadline: float) -> None:
+     packages = _missing_requirements()
+     if not packages:
+         raise _unavailable(
+@@ -210,38 +166,62 @@ def _install(target: Path, deadline: float) -> None:
+     env["PIP_CONFIG_FILE"] = os.devnull
+     logger.info("Installing optional PDF support on first use")
+     for index, installer in enumerate(commands):
+-        with tempfile.TemporaryDirectory(prefix = ".pdf-", dir = target.parent) as staging:
+-            stage = Path(staging)
+-            command = installer + [
+-                "--target",
+-                str(stage),
+-                "--no-deps",
+-                "--only-binary",
+-                ":all:",
+-                "--index-url",
+-                "https://pypi.org/simple",
+-                *packages,
+-            ]
+-            try:
+-                subprocess.run(
+-                    command,
+-                    check = True,
+-                    capture_output = True,
+-                    timeout = _remaining(deadline),
+-                    env = env,
+-                    **windows_hidden_subprocess_kwargs(),
+-                )
+-            except (OSError, subprocess.CalledProcessError):
+-                if index == len(commands) - 1:
+-                    raise
+-                logger.info("PDF wheel installation with uv failed; trying this interpreter's pip")
+-                continue
+-            _validate_target(stage, packages)
+-            (stage / ".complete").write_text(
+-                json.dumps({"version": _CACHE_VERSION, "packages": packages}), encoding = "utf-8"
++        command = installer + [
++            "--no-deps",
++            "--only-binary",
++            ":all:",
++            "--index-url",
++            "https://pypi.org/simple",
++            *packages,
++        ]
++        try:
++            subprocess.run(
++                command,
++                check = True,
++                capture_output = True,
++                timeout = _remaining(deadline),
++                env = env,
++                **windows_hidden_subprocess_kwargs(),
+             )
+-            os.replace(stage, target)
++        except (OSError, subprocess.CalledProcessError):
++            if index == len(commands) - 1:
++                raise
++            logger.info("PDF wheel installation with uv failed; trying this interpreter's pip")
++            continue
++        importlib.invalidate_caches()
++        return
++
++
++def _lock_path() -> Path:
++    return Path(sys.prefix) / ".unsloth-pdf-install.lock"
++
++
++def _install_unless(present: Callable[[], bool]) -> None:
++    """Install missing PDF wheels once per environment; ``present`` is re-checked after each lock wait."""
++    deadline = time.monotonic() + _INSTALL_TIMEOUT
++    acquired = False
++    try:
++        acquired = _LOCK.acquire(timeout = _remaining(deadline))
++        if not acquired:
++            raise TimeoutError("Waiting for PDF dependency installation timed out")
++        if present():
+             return
++        blocked = _downloads_blocked()
++        if blocked:
++            raise _unavailable(blocked)
++        # Another process (a recipe worker, a chat export) may be installing into the same environment.
++        with FileLock(str(_lock_path()), timeout = _remaining(deadline)):
++            importlib.invalidate_caches()
++            if not present():
++                _install(deadline)
++    except PDFDependencyUnavailable:
++        raise
++    except Exception as exc:
++        # Package-manager output can contain proxy credentials; only expose our own guidance.
++        raise _unavailable("Automatic PDF installation failed or timed out") from exc
++    finally:
++        if acquired:
++            _LOCK.release()
+ 
+ 
+ def _import(name: str) -> ModuleType | None:
+@@ -267,61 +247,30 @@ def _import(name: str) -> ModuleType | None:
+ 
+ 
+ def load_pdf_module(name: str) -> ModuleType:
+-    """Reuse installed/cached parsers or install missing wheels once, within a bounded wait."""
++    """Import a PDF parser, installing the missing wheels once within a bounded wait."""
+     if name not in _MODULES:
+         raise ValueError(f"Not an optional PDF module: {name}")
+     module = _import(name)
+     if module is not None:
+         return module
+-    deadline = time.monotonic() + _INSTALL_TIMEOUT
+-    acquired = False
+-    try:
+-        acquired = _LOCK.acquire(timeout = _remaining(deadline))
+-        if not acquired:
+-            raise TimeoutError("Waiting for PDF dependency installation timed out")
+-        module = _import(name)
+-        if module is not None:
+-            return module
+-        target = _target()
+-        if not _activate(target):
+-            if os.environ.get("UNSLOTH_PDF_AUTO_INSTALL", "1").strip().lower() in {
+-                "0",
+-                "false",
+-                "no",
+-                "off",
+-            }:
+-                raise _unavailable(
+-                    "PDF support is not installed and automatic downloads are disabled"
+-                )
+-            if any(
+-                os.environ.get(key, "").strip().lower() in {"1", "true", "yes", "on"}
+-                for key in (
+-                    "HF_HUB_OFFLINE",
+-                    "TRANSFORMERS_OFFLINE",
+-                    "UV_OFFLINE",
+-                    "UV_NO_INDEX",
+-                    "PIP_NO_INDEX",
+-                )
+-            ):
+-                raise _unavailable("PDF support is not installed and offline mode is enabled")
+-            target.parent.mkdir(parents = True, exist_ok = True)
+-            with FileLock(str(target) + ".lock", timeout = _remaining(deadline)):
+-                if not _activate(target):
+-                    if target.exists():
+-                        raise _unavailable(
+-                            "The PDF wheel cache is incomplete; repair the installation"
+-                        )
+-                    _install(target, deadline)
+-                    _activate(target)
+-        module = _import(name)
+-        if module is None:
+-            raise _unavailable("Cached PDF support could not be imported; repair the installation")
+-        return module
+-    except PDFDependencyUnavailable:
+-        raise
+-    except Exception as exc:
+-        # Package-manager output can contain proxy credentials; only expose our own guidance.
+-        raise _unavailable("Automatic PDF installation failed or timed out") from exc
+-    finally:
+-        if acquired:
+-            _LOCK.release()
++    _install_unless(lambda: _import(name) is not None)
++    module = _import(name)
++    if module is None:
++        raise _unavailable("Installed PDF support could not be imported; repair the installation")
++    return module
++
++
++def _all_present() -> bool:
++    # tabulate too: pymupdf4llm imports it, and find_spec does not run that import.
++    return all(
++        importlib.util.find_spec(name) is not None for name in sorted(_MODULES | {"tabulate"})
++    )
++
++
++def ensure_pdf_support() -> None:
++    """Install PDF support for a child interpreter without importing it into this process."""
++    if _all_present():
++        return
++    _install_unless(_all_present)
++    if not _all_present():
++        raise _unavailable("Installed PDF support could not be found; repair the installation")

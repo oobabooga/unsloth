@@ -1,0 +1,32 @@
+name: PDF on-demand A/B (unslothai/unsloth#17206 mirror, throwaway)
+
+on:
+  push:
+    branches: [pr17206-pdf-ab]
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      MAIN_SHA: d071aff4c8894be8cddad9cba0fd200725615607
+      PR_SHA: 734bb4cf8ea66de8a0cb383eb41624b62f922ab2
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        shell: bash
+        run: python -m pip install -q uv && uv --version
+      - name: A/B
+        shell: bash
+        run: python ab/driver.py
