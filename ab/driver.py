@@ -38,7 +38,7 @@ def tree(side):
         sh("git", "-C", root, "-c", "user.name=ab", "-c", "user.email=ab@example.invalid", "merge", "-q", "--no-edit", PR)
     else:
         shutil.copytree(tree("A"), root, ignore = shutil.ignore_patterns(".git"))
-        sh("git", "apply", HERE / "fix.patch", cwd = root)
+        sh("git", "apply", "--verbose", HERE / "fix.patch", cwd = root)
     return root
 
 
