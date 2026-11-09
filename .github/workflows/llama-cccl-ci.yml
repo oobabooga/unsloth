@@ -75,14 +75,14 @@ jobs:
       CUDA_VERSION: ${{ matrix.cuda }}
       TARGET_ARCH: ${{ matrix.arch }}
       CUDA_ARCHS: ${{ matrix.archs }}
-      SOURCE_HEAD: 777b7dc95b498928f3f1661861248c40104cbda8
+      SOURCE_HEAD: bfbc020cf6d0c56ef41dde1af041372557f2226f
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: unslothai/llama.cpp
-          ref: 777b7dc95b498928f3f1661861248c40104cbda8
+          ref: bfbc020cf6d0c56ef41dde1af041372557f2226f
           path: src
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
@@ -111,9 +111,11 @@ jobs:
               'windows-arm64': '.github/workflows/unsloth-prebuilt-cuda-windows-arm64.yml',
           }
           for rel in paths.values():
-              before = subprocess.check_output(['git', '-C', str(root), 'show', f'HEAD^:{rel}'], text=True)
+              before = subprocess.check_output(['git', '-C', str(root), 'show', f'a96365d1a:{rel}'], text=True)
               after = (root / rel).read_text(encoding='utf-8')
-              assert before.replace('-DGGML_CUDA_CUB_3DOT2=ON', '-DGGML_CUDA_CCCL_VERSION=v3.4.3') == after, rel
+              flag = '-DGGML_CUDA_CCCL_VERSION=v3.4.3'
+              replacement = repr(flag) if 'windows' in rel else flag
+              assert before.replace('-DGGML_CUDA_CUB_3DOT2=ON', replacement) == after, rel
           recipe = os.environ['RECIPE']
           doc = yaml.safe_load((root / paths[recipe]).read_text(encoding='utf-8'))
           steps = doc['runs']['steps'] if 'runs' in doc else doc['jobs']['build']['steps']
