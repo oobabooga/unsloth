@@ -27,7 +27,6 @@ jobs:
             cuda: '12.8.0'
             archs: '61 75 86'
             recipe: linux
-            shell: bash
             msvc: x64
           - name: Linux x64 CUDA 13.3
             os: ubuntu-22.04
@@ -35,7 +34,6 @@ jobs:
             cuda: '13.3'
             archs: '75 86 120'
             recipe: linux
-            shell: bash
             msvc: x64
           - name: Linux ARM64 CUDA 12.8
             os: ubuntu-24.04-arm
@@ -43,7 +41,6 @@ jobs:
             cuda: '12.8.0'
             archs: '75 90'
             recipe: linux
-            shell: bash
             msvc: x64
           - name: Linux ARM64 CUDA 13.3
             os: ubuntu-24.04-arm
@@ -51,7 +48,6 @@ jobs:
             cuda: '13.3'
             archs: '90 120'
             recipe: linux
-            shell: bash
             msvc: x64
           - name: Windows x64 CUDA 12.8
             os: windows-2022
@@ -59,7 +55,6 @@ jobs:
             cuda: '12.8.0'
             archs: '61 75 86'
             recipe: windows
-            shell: pwsh
             msvc: x64
           - name: Windows x64 CUDA 13.3
             os: windows-2022
@@ -67,7 +62,6 @@ jobs:
             cuda: '13.3'
             archs: '75 86 120'
             recipe: windows
-            shell: pwsh
             msvc: x64
           - name: Windows ARM64 CUDA 13.4
             os: windows-2022
@@ -75,7 +69,6 @@ jobs:
             cuda: '13.4'
             archs: '120 121'
             recipe: windows-arm64
-            shell: pwsh
             msvc: amd64_arm64
     env:
       RECIPE: ${{ matrix.recipe }}
@@ -153,16 +146,26 @@ jobs:
           (scripts / f'install.{suffix}').write_text('\n'.join(install), encoding='utf-8')
           (scripts / f'configure.{suffix}').write_text(configure, encoding='utf-8')
           print(f'Checked all three substitutions; extracted {recipe} install/configure scripts.')
-      - name: Install exact CUDA components
-        shell: ${{ matrix.shell }}
+      - name: Install exact CUDA components (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         working-directory: ${{ runner.temp }}/cccl-downloads
-        run: |
-          ${{ matrix.shell == 'bash' && 'bash "$RUNNER_TEMP/cccl-scripts/install.sh"' || '& "$env:RUNNER_TEMP/cccl-scripts/install.ps1"' }}
-      - name: Configure with the changed recipe
-        shell: ${{ matrix.shell }}
+        run: bash "$RUNNER_TEMP/cccl-scripts/install.sh"
+      - name: Install exact CUDA components (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}/cccl-downloads
+        run: '& "$env:RUNNER_TEMP/cccl-scripts/install.ps1"'
+      - name: Configure with the changed recipe (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         working-directory: src
-        run: |
-          ${{ matrix.shell == 'bash' && 'bash "$RUNNER_TEMP/cccl-scripts/configure.sh"' || '& "$env:RUNNER_TEMP/cccl-scripts/configure.ps1"' }}
+        run: bash "$RUNNER_TEMP/cccl-scripts/configure.sh"
+      - name: Configure with the changed recipe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: src
+        run: '& "$env:RUNNER_TEMP/cccl-scripts/configure.ps1"'
       - name: Compile CCCL consumers and verify selected headers
         shell: python
         run: |
