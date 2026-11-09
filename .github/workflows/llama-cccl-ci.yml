@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: llama.cpp CCCL pin verification
+
+on:
+  pull_request:
+    branches: [llama-pr359-ci-base]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llama-cccl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 CUDA 12.8
+            os: ubuntu-22.04
+            arch: x64
+            cuda: '12.8.0'
+            archs: '61 75 86'
+            recipe: linux
+            shell: bash
+            msvc: x64
+          - name: Linux x64 CUDA 13.3
+            os: ubuntu-22.04
+            arch: x64
+            cuda: '13.3'
+            archs: '75 86 120'
+            recipe: linux
+            shell: bash
+            msvc: x64
+          - name: Linux ARM64 CUDA 12.8
+            os: ubuntu-24.04-arm
+            arch: arm64
+            cuda: '12.8.0'
+            archs: '75 90'
+            recipe: linux
+            shell: bash
+            msvc: x64
+          - name: Linux ARM64 CUDA 13.3
+            os: ubuntu-24.04-arm
+            arch: arm64
+            cuda: '13.3'
+            archs: '90 120'
+            recipe: linux
+            shell: bash
+            msvc: x64
+          - name: Windows x64 CUDA 12.8
+            os: windows-2022
+            arch: x64
+            cuda: '12.8.0'
+            archs: '61 75 86'
+            recipe: windows
+            shell: pwsh
+            msvc: x64
+          - name: Windows x64 CUDA 13.3
+            os: windows-2022
+            arch: x64
+            cuda: '13.3'
+            archs: '75 86 120'
+            recipe: windows
+            shell: pwsh
+            msvc: x64
+          - name: Windows ARM64 CUDA 13.4
+            os: windows-2022
+            arch: arm64
+            cuda: '13.4'
+            archs: '120 121'
+            recipe: windows-arm64
+            shell: pwsh
+            msvc: amd64_arm64
+    env:
+      RECIPE: ${{ matrix.recipe }}
+      CUDA_VERSION: ${{ matrix.cuda }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      CUDA_ARCHS: ${{ matrix.archs }}
+      SOURCE_HEAD: 777b7dc95b498928f3f1661861248c40104cbda8
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: unslothai/llama.cpp
+          ref: 777b7dc95b498928f3f1661861248c40104cbda8
+          path: src
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Install validation dependencies
+        run: python -m pip install PyYAML ninja
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: ${{ matrix.msvc }}
+      - name: Extract exact setup recipes
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import yaml
+
+          root = Path('src').resolve()
+          assert subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip() == os.environ['SOURCE_HEAD']
+          paths = {
+              'linux': '.github/actions/unsloth-cuda-linux-setup/action.yml',
+              'windows': '.github/actions/unsloth-cuda-windows-setup/action.yml',
+              'windows-arm64': '.github/workflows/unsloth-prebuilt-cuda-windows-arm64.yml',
+          }
+          for rel in paths.values():
+              before = subprocess.check_output(['git', '-C', str(root), 'show', f'HEAD^:{rel}'], text=True)
+              after = (root / rel).read_text(encoding='utf-8')
+              assert before.replace('-DGGML_CUDA_CUB_3DOT2=ON', '-DGGML_CUDA_CCCL_VERSION=v3.4.3') == after, rel
+          recipe = os.environ['RECIPE']
+          doc = yaml.safe_load((root / paths[recipe]).read_text(encoding='utf-8'))
+          steps = doc['runs']['steps'] if 'runs' in doc else doc['jobs']['build']['steps']
+          values = {
+              'inputs.cuda': os.environ['CUDA_VERSION'],
+              'inputs.arch': os.environ['TARGET_ARCH'],
+              'inputs.archs': os.environ['CUDA_ARCHS'],
+              'env.CUDA': os.environ['CUDA_VERSION'],
+              'env.ARCHS': os.environ['CUDA_ARCHS'],
+              'env.CCACHE_LAUNCHER': '',
+          }
+          def expand(text):
+              return re.sub(r'\$\{\{\s*(.*?)\s*\}\}', lambda m: values[m[1]], text)
+          install = []
+          for step in steps:
+              name = step.get('name', '')
+              if name == 'Install build dependencies' or name.startswith('Install CUDA toolkit'):
+                  install.append(expand(step['run']))
+              if name == 'Install ARM64 host compiler (gcc-14)' and os.environ['TARGET_ARCH'] == 'arm64':
+                  install.append(expand(step['run']))
+          configure = expand(next(s['run'] for s in steps if s.get('name') == 'Configure'))
+          assert configure.count('-DGGML_CUDA_CCCL_VERSION=v3.4.3') == 1
+          configure = configure.replace('cmake -S . -B build -G Ninja', 'cmake -S . -B build -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON')
+          configure = re.sub(r'(-DCMAKE_(?:C|CXX|CUDA)_COMPILER_LAUNCHER=)ccache', r'\1', configure)
+          scripts = Path(os.environ['RUNNER_TEMP']) / 'cccl-scripts'
+          scripts.mkdir()
+          downloads = Path(os.environ['RUNNER_TEMP']) / 'cccl-downloads'
+          downloads.mkdir()
+          suffix = 'sh' if recipe == 'linux' else 'ps1'
+          (scripts / f'install.{suffix}').write_text('\n'.join(install), encoding='utf-8')
+          (scripts / f'configure.{suffix}').write_text(configure, encoding='utf-8')
+          print(f'Checked all three substitutions; extracted {recipe} install/configure scripts.')
+      - name: Install exact CUDA components
+        shell: ${{ matrix.shell }}
+        working-directory: ${{ runner.temp }}/cccl-downloads
+        run: |
+          ${{ matrix.shell == 'bash' && 'bash "$RUNNER_TEMP/cccl-scripts/install.sh"' || '& "$env:RUNNER_TEMP/cccl-scripts/install.ps1"' }}
+      - name: Configure with the changed recipe
+        shell: ${{ matrix.shell }}
+        working-directory: src
+        run: |
+          ${{ matrix.shell == 'bash' && 'bash "$RUNNER_TEMP/cccl-scripts/configure.sh"' || '& "$env:RUNNER_TEMP/cccl-scripts/configure.ps1"' }}
+      - name: Compile CCCL consumers and verify selected headers
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          build = Path('src/build').resolve()
+          cache = (build / 'CMakeCache.txt').read_text(encoding='utf-8')
+          assert 'GGML_CUDA_CCCL_VERSION:STRING=v3.4.3' in cache
+          fetched = build / '_deps/cccl-src'
+          assert subprocess.check_output(['git', '-C', str(fetched), 'describe', '--tags', '--exact-match'], text=True).strip() == 'v3.4.3'
+          commands = json.loads((build / 'compile_commands.json').read_text(encoding='utf-8'))
+          selected = [x for x in commands if Path(x['file']).name in ('top-k.cu', 'argsort.cu')]
+          assert len(selected) == 2
+          for item in selected:
+              assert 'cccl-src' in item['command'], item['command']
+          listing = subprocess.check_output(['ninja', '-C', str(build), '-t', 'targets', 'all'], text=True)
+          targets = []
+          for line in listing.splitlines():
+              target = line.split(': ', 1)[0]
+              if re.search(r'/(top-k|argsort)\.cu\.(o|obj)$', target):
+                  targets.append(target)
+          assert len(targets) == 2, targets
+          subprocess.run(['ninja', '-C', str(build), '-j', '2', *targets], check=True)
+          if os.name != 'nt':
+              obj = build / next(t for t in targets if '/top-k.cu.' in t)
+              symbols = subprocess.check_output(['nm', '-C', str(obj)], text=True)
+              assert 'DeviceTopK' in symbols
+          print('PASS: both consumers compile with fetched CCCL v3.4.3.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('Compiled top-k.cu and argsort.cu with the approved PR setup recipe and CCCL v3.4.3. Cache launchers were disabled. No runtime GPU test or full release build was performed.\n')
