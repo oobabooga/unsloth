@@ -29,6 +29,8 @@ def tree(side):
         return root
     if side == "A":
         sh("git", "init", "-q", root)
+        # Keep LF so ab/fix.patch applies on Windows too.
+        sh("git", "-C", root, "config", "core.autocrlf", "false")
         sh("git", "-C", root, "remote", "add", "origin", "https://github.com/unslothai/unsloth")
         sh("git", "-C", root, "sparse-checkout", "set", "studio/backend")
         sh("git", "-C", root, "fetch", "-q", "--filter=blob:none", "origin", MAIN, PR)
