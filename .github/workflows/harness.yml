@@ -73,6 +73,7 @@ jobs:
             --new new/app-b12209-mix-b84c2bf-linux-x64-rocm-gfx1151.tar.gz \
             --old https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-linux-x64-rocm-gfx1151.tar.gz \
             --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf \
+            --model2 https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-BF16.gguf \
             --work "$RUNNER_TEMP/bt"
 
   test-rocm-linux-static:
@@ -125,6 +126,7 @@ jobs:
             --new new\app-b12209-mix-b84c2bf-windows-x64-rocm-gfx1151.zip `
             --old https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-x64-rocm-gfx1151.zip `
             --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf `
+            --model2 https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-BF16.gguf `
             --work "$env:RUNNER_TEMP\bt-rocm-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           exit $LASTEXITCODE
 
