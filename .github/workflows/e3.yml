@@ -1,0 +1,33 @@
+name: llama.cpp drift E3 (Windows CPU-side speed per bundle)
+
+on:
+  push:
+    branches: [llamacpp-drift-e3]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+      - name: Hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          python --version
+      - name: Bench
+        run: |
+          $rel = "https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf"
+          $t = "app-b12209-mix-b84c2bf-windows-x64"
+          python tooling\e3\bench_cpu.py --work "$env:RUNNER_TEMP\e3-$env:GITHUB_RUN_ID" `
+            --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf `
+            "cpu=$rel/$t-cpu.zip" "vulkan=$rel/$t-vulkan.zip" "cuda12-legacy=$rel/$t-cuda12-legacy.zip" "rocm-gfx1151=$rel/$t-rocm-gfx1151.zip"
+          exit $LASTEXITCODE
