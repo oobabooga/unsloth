@@ -1,0 +1,221 @@
+name: llama.cpp drift E1 (ROCm ccache staleness)
+
+on:
+  push:
+    branches: [llamacpp-drift-e1]
+
+permissions:
+  contents: read
+
+env:
+  ROCM_VERSION: 10.3.0a20261107
+  SRC_TAG: b12209-mix-b84c2bf
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.mode }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [fork, depend]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Free disk space
+        run: curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 https://raw.githubusercontent.com/kou/arrow/e49d8ae15583ceff03237571569099a6ad62be32/ci/scripts/util_free_space.sh | bash
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake ninja-build unzip curl
+
+      - name: ROCm to /opt/rocm
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /opt/rocm
+          curl -fsSL --retry 5 "https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-${ROCM_VERSION}.tar.gz" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+          /opt/rocm/llvm/bin/clang --version
+
+      - name: Set ROCm environment variables
+        run: |
+          echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+          echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
+          echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
+          echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+          echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: e1-linux-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          append-timestamp: false
+          variant: ccache
+          install: binary
+          max-size: 2G
+          save: false
+
+      - name: Configure ccache
+        run: |
+          ccache --version | head -1
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
+          if [ "${{ matrix.mode }}" = "depend" ]; then ccache --set-config=depend_mode=true; fi
+
+      - name: Source
+        run: |
+          set -euo pipefail
+          mkdir -p llama.cpp
+          curl -fsSL --retry 5 "https://github.com/unslothai/llama.cpp/releases/download/${SRC_TAG}/llama.cpp-source-${SRC_TAG}.tar.gz" | tar -xzf - -C llama.cpp --strip-components=1
+
+      - name: Configure
+        run: |
+          cd llama.cpp && mkdir build && cd build
+          cmake .. -G Ninja \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DCMAKE_CXX_FLAGS="-I/opt/rocm/include" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGPU_TARGETS="gfx1151" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DGGML_HIP=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CUDA_FORCE_CUBLAS=OFF \
+            -DGGML_RPC=ON \
+            -DGGML_HIP_ROCWMMA_FATTN=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git \
+            -DGGML_NATIVE=OFF \
+            -DGGML_STATIC=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
+
+      - name: Experiment
+        run: bash tooling/e1/experiment.sh llama.cpp llama.cpp/build
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats -v
+
+  windows:
+    name: windows / ${{ matrix.mode }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [fork, depend]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Ninja
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\ninja | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip" -OutFile "$env:TEMP\ninja-win.zip"
+          Expand-Archive -Path "$env:TEMP\ninja-win.zip" -DestinationPath C:\ninja -Force
+          "C:\ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: ROCm to C:\opt\rocm
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o rocm.tar.gz "https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-${ROCM_VERSION}.tar.gz"
+          mkdir -p /c/opt/rocm
+          tar -xzf rocm.tar.gz -C /c/opt/rocm --strip-components=1
+          rm -f rocm.tar.gz
+          /c/opt/rocm/lib/llvm/bin/clang.exe --version
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: e1-windows-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - name: Configure ccache
+        run: |
+          ccache --version | Select-Object -First 1
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
+          if ("${{ matrix.mode }}" -eq "depend") { ccache --set-config=depend_mode=true }
+
+      - name: Source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p llama.cpp
+          curl -fsSL --retry 5 -o src.tar.gz "https://github.com/unslothai/llama.cpp/releases/download/${SRC_TAG}/llama.cpp-source-${SRC_TAG}.tar.gz"
+          tar -xzf src.tar.gz -C llama.cpp --strip-components=1
+
+      - name: Configure
+        shell: cmd
+        run: |
+          set HIP_PATH=C:\opt\rocm
+          set HIP_PLATFORM=amd
+          set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;%PATH%
+          call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+          set /p VS_PATH=<vs_path.txt
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+          > "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PATH=C:\opt\rocm
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PLATFORM=amd
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo set PATH=C:\opt\rocm\lib\llvm\bin;C:\opt\rocm\bin;%%PATH%%
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+          cd llama.cpp
+          mkdir build
+          cd build
+          cmake .. -G Ninja ^
+            -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" ^
+            -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGPU_TARGETS="gfx1151" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DGGML_HIP=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+            -DGGML_RPC=ON ^
+            -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_STATIC=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          if errorlevel 1 exit /b 1
+
+      - name: Experiment
+        shell: cmd
+        run: |
+          call "%RUNNER_TEMP%\rocm-env.cmd"
+          "C:\Program Files\Git\bin\bash.exe" tooling/e1/experiment.sh llama.cpp llama.cpp/build
+          if errorlevel 1 exit /b 1
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats -v
