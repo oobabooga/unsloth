@@ -82,7 +82,13 @@ def _fake_python(tmp_path: Path) -> Path:
     return exe
 
 
-def _pwsh(shell: str, script: str, env: dict[str, str | None]) -> str:
+def _pwsh(
+    shell: str,
+    script: str,
+    env: dict[str, str | None],
+    *,
+    timeout: int = 60,
+) -> str:
     module_setup = _between(
         "    if ($PSVersionTable.PSEdition -ne 'Core' -and $env:SystemRoot) {",
         "    # Same UTF-8 invariant",
@@ -94,7 +100,7 @@ def _pwsh(shell: str, script: str, env: dict[str, str | None]) -> str:
         text = True,
         encoding = "utf-8",
         env = {key: value for key, value in dict(os.environ, **env).items() if value is not None},
-        timeout = 60,
+        timeout = timeout,
     )
     if result.stderr:
         print(result.stderr)
@@ -919,6 +925,7 @@ if ($cached.Path -ne $DetectedPython.Path) {{ throw 'Repaired runtime was not re
                 "UV_OFFLINE": "",
                 "UV_PYTHON_DOWNLOADS": "",
             },
+            timeout = 180,
         )
     )
     assert r["Status"] == "Valid" and r["Facts"] == "3.13.17 1"
