@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Signed Python native Windows validation
+
+on:
+  push:
+    branches: [pr-17330-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-python-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regressions:
+    name: Python selection regressions (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - run: python -m pip install pytest packaging uv==0.13.5
+      - name: Prepare the official package integration fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP ('psf-package-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          # The existing optional integration test explicitly exercises the x64 package.
+          # The enforcing job below additionally exercises native ARM64 recovery.
+          $package = Join-Path $dir 'python.3.13.17.nupkg'
+          Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/python/3.13.17/python.3.13.17.nupkg' -OutFile $package
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne 'dce409744b088f94c6e37ba41f8100c384c27e029e843237364c602d30d475e5') {
+            throw 'Official package checksum mismatch'
+          }
+          "UNSLOTH_TEST_PSF_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Run both PowerShell shells and native package tests
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $env:PYTHONPATH = Join-Path $PWD 'tests/_shared'
+          Get-Command pwsh, powershell | Format-Table Name, Source
+          python -m pytest --noconftest -p no:cacheprovider `
+            tests/python/test_windows_uv_managed_python.py `
+            tests/python/test_windows_python_venv_hardening.py `
+            tests/python/test_windows_on_arm_python_arch.py `
+            tests/python/test_installer_helper_declaration_order.py `
+            tests/python/test_windows_rollback_background_delete.py `
+            tests/python/test_windows_installer_resolver_fallback.py `
+            tests/python/test_cross_platform_parity.py `
+            tests/python/test_pwsh_runner_encoding.py `
+            tests/test_installer_skip_autostart.py `
+            -q -rs --tb=short --junitxml=native-regressions.xml
+          exit $LASTEXITCODE
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-python-regressions-${{ matrix.arch }}
+          path: native-regressions.xml
+          if-no-files-found: warn
+
+  enforced-recovery:
+    name: Enforced runtime denial and repair (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: x64
+            arch: x86_64
+          - os: windows-11-arm
+            python: arm64
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python }}
+      - run: python -m pip install uv==0.13.5
+      - name: Exercise real denial, signed recovery, repair, and offline reuse
+        shell: powershell
+        run: |
+          & .\tests\studio\test_signed_python_application_control.ps1 -Arch '${{ matrix.arch }}'
+          exit $LASTEXITCODE
+      - name: Upload enforcement and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-python-enforcement-${{ matrix.arch }}
+          path: ${{ runner.temp }}/signed-python-*/logs/
+          if-no-files-found: warn
