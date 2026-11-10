@@ -1,0 +1,91 @@
+name: llama.cpp drift E1 DevLab (ROCm ccache staleness)
+
+on:
+  push:
+    branches: [llamacpp-drift-e1-devlab]
+
+permissions:
+  contents: read
+
+env:
+  ROCM_VERSION: 10.3.0a20261107
+  SRC_TAG: b12209-mix-b84c2bf
+  CCACHE_VERSION: 4.13.3
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/e1"; mkdir -p "$W/bin" "$W/tmp"
+          python3 -m venv "$W/venv"
+          "$W/venv/bin/pip" install --quiet cmake ninja
+          cd "$W/tmp"
+          curl -fsSL --retry 5 -o ccache.tar.xz "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.xz" \
+            || curl -fsSL --retry 5 -o ccache.tar.xz "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-x86_64.tar.xz"
+          tar -xJf ccache.tar.xz
+          cp "$(find . -type f -name ccache | head -1)" "$W/bin/ccache"
+          echo "$W/bin" >> "$GITHUB_PATH"
+          echo "$W/venv/bin" >> "$GITHUB_PATH"
+          "$W/bin/ccache" --version | head -1
+
+      - name: ROCm
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/e1/rocm"; mkdir -p "$R"
+          curl -fsSL --retry 5 "https://nightly.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-${ROCM_VERSION}.tar.gz" | tar --use-compress-program=gzip -xf - -C "$R" --strip-components=1
+          "$R/llvm/bin/clang" --version
+          echo "ROCM=$R" >> "$GITHUB_ENV"
+
+      - name: Experiment (fork settings, then depend_mode)
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/e1"
+          export HIP_PATH="$ROCM" ROCM_PATH="$ROCM" HIP_PLATFORM=amd HIP_CLANG_PATH="$ROCM/llvm/bin" HIP_INCLUDE_PATH="$ROCM/include" HIP_LIB_PATH="$ROCM/lib" HIP_DEVICE_LIB_PATH="$ROCM/lib/llvm/amdgcn/bitcode"
+          export PATH="$ROCM/bin:$ROCM/llvm/bin:$PATH"
+          export LD_LIBRARY_PATH="$ROCM/lib:$ROCM/lib64:$ROCM/llvm/lib:${LD_LIBRARY_PATH:-}" LIBRARY_PATH="$ROCM/lib:$ROCM/lib64" CPATH="$ROCM/include"
+          curl -fsSL --retry 5 -o "$W/src.tar.gz" "https://github.com/unslothai/llama.cpp/releases/download/${SRC_TAG}/llama.cpp-source-${SRC_TAG}.tar.gz"
+          for mode in fork depend; do
+            echo "::group::mode=$mode"
+            export CCACHE_DIR="$W/ccache-$mode"; mkdir -p "$CCACHE_DIR"
+            ccache --set-config=max_size=2G
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            [ "$mode" = depend ] && ccache --set-config=depend_mode=true
+            S="$W/src-$mode"; mkdir -p "$S"; tar -xzf "$W/src.tar.gz" -C "$S" --strip-components=1
+            cmake -S "$S" -B "$S/build" -G Ninja \
+              -DCMAKE_C_COMPILER="$ROCM/llvm/bin/clang" \
+              -DCMAKE_CXX_COMPILER="$ROCM/llvm/bin/clang++" \
+              -DCMAKE_CXX_FLAGS="-I$ROCM/include" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGPU_TARGETS="gfx1151" \
+              -DBUILD_SHARED_LIBS=ON \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DGGML_HIP=ON \
+              -DGGML_OPENMP=OFF \
+              -DGGML_CUDA_FORCE_CUBLAS=OFF \
+              -DGGML_RPC=ON \
+              -DGGML_HIP_ROCWMMA_FATTN=OFF \
+              -DLLAMA_BUILD_BORINGSSL=ON \
+              -DBORINGSSL_GIT=https://github.com/google/boringssl.git \
+              -DGGML_NATIVE=OFF \
+              -DGGML_STATIC=OFF \
+              -DGGML_BACKEND_DL=ON \
+              -DGGML_CPU_ALL_VARIANTS=ON \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_HIP_COMPILER_LAUNCHER=ccache > "$W/configure-$mode.log" 2>&1 || { tail -50 "$W/configure-$mode.log"; exit 1; }
+            echo "::endgroup::"
+            echo "######## mode=$mode"
+            bash tooling/e1/experiment.sh "$S" "$S/build"
+            ccache --show-stats -v | head -40
+          done
