@@ -107,7 +107,7 @@ jobs:
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
 
       - name: Experiment
-        run: bash tooling/e1/experiment.sh llama.cpp llama.cpp/build
+        run: bash tooling/e1/experiment2.sh llama.cpp llama.cpp/build "mmvq|sum"
 
       - name: ccache stats
         if: always()
@@ -213,7 +213,7 @@ jobs:
         shell: cmd
         run: |
           call "%RUNNER_TEMP%\rocm-env.cmd"
-          "C:\Program Files\Git\bin\bash.exe" tooling/e1/experiment.sh llama.cpp llama.cpp/build
+          "C:\Program Files\Git\bin\bash.exe" tooling/e1/experiment2.sh llama.cpp llama.cpp/build "mmvq|sum"
           if errorlevel 1 exit /b 1
 
       - name: ccache stats
