@@ -57,17 +57,11 @@ jobs:
         run: |
           $env:PYTHONPATH = Join-Path $PWD 'tests/_shared'
           Get-Command pwsh, powershell | Format-Table Name, Source
+          Write-Host "PSModulePath=$env:PSModulePath"
+          powershell -NoProfile -Command 'Get-Module -ListAvailable Microsoft.PowerShell.Archive | Format-List Path,Version'
           python -m pytest --noconftest -p no:cacheprovider `
             tests/python/test_windows_uv_managed_python.py `
-            tests/python/test_windows_python_venv_hardening.py `
-            tests/python/test_windows_on_arm_python_arch.py `
-            tests/python/test_installer_helper_declaration_order.py `
-            tests/python/test_windows_rollback_background_delete.py `
-            tests/python/test_windows_installer_resolver_fallback.py `
-            tests/python/test_cross_platform_parity.py `
-            tests/python/test_pwsh_runner_encoding.py `
-            tests/test_installer_skip_autostart.py `
-            -q -rs --tb=short --junitxml=native-regressions.xml
+            -q -rs --tb=short -o junit_logging=all --junitxml=native-regressions.xml
           exit $LASTEXITCODE
       - name: Upload test results
         if: always()

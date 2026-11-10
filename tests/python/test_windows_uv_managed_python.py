@@ -83,15 +83,21 @@ def _fake_python(tmp_path: Path) -> Path:
 
 
 def _pwsh(shell: str, script: str, env: dict[str, str | None]) -> str:
-    return run_pwsh(
+    result = run_pwsh(
         [shell, "-NoProfile", "-NonInteractive", "-Command", script],
-        check = True,
+        check = False,
         capture_output = True,
         text = True,
         encoding = "utf-8",
         env = {key: value for key, value in dict(os.environ, **env).items() if value is not None},
         timeout = 60,
-    ).stdout.strip()
+    )
+    if result.stderr:
+        print(result.stderr)
+    if result.returncode:
+        print(result.stdout)
+    result.check_returncode()
+    return result.stdout.strip()
 
 
 def _resolve(
@@ -833,7 +839,7 @@ $ErrorActionPreference = 'Stop'
 $PythonSkip = @('3.13.8'); $StudioHome = $env:TEST_HOME
 $script:UvExe = $env:BLOCKED_UV; $script:Downloads=0
 function Write-StudioLine {{ param($Message,$ForegroundColor) }}
-function substep {{ param($Name,$Message) }}
+function substep {{ param($Name,$Message) [Console]::Error.WriteLine("$Name $Message") }}
 function step {{ param($Name,$Message) }}
 function Exit-InstallFailure {{ param($Message) throw $Message }}
 function Invoke-InstallCommand {{
@@ -1128,7 +1134,7 @@ $ErrorActionPreference = 'Stop'
 $StudioHome = $env:TEST_HOME
 $script:Downloads = 0
 $script:Blocked = ${str(blocked).lower()}
-function substep {{ param($Message, $Color) }}
+function substep {{ param($Message, $Color) [Console]::Error.WriteLine($Message) }}
 function step {{ param($Name, $Message) }}
 function Write-StudioLine {{ param($Message, $ForegroundColor) }}
 function Redact-InstallOutput {{ param($Text) return $Text }}

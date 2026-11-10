@@ -185,6 +185,11 @@ $key = "cpython-3.13-windows-$uvArch-none"
 if ($LASTEXITCODE -ne 0) { throw 'Could not provision the uv-managed control runtime' }
 $BlockedPython = (& $script:UvExe python find --system --managed-python $key).Trim()
 if (-not (Test-Path -LiteralPath $BlockedPython -PathType Leaf)) { throw 'Control runtime was not found' }
+# uv's minor-version directory is a junction. AppLocker evaluates the physical image path.
+$alias = $BlockedPython
+$BlockedPython = (& $alias -I -c 'import os,sys; print(os.path.realpath(sys.executable))').Trim()
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $BlockedPython -PathType Leaf)) { throw 'Could not resolve the physical control image' }
+Write-Host "uv path: $alias; policy image: $BlockedPython"
 $user = 'SignedPythonProbe'
 $password = 'Pr17330!' + [guid]::NewGuid().ToString('N').Substring(0, 6)
 $policyBackup = Join-Path $logs 'original-applocker.xml'
@@ -246,6 +251,10 @@ try {
     Restart-Service AppIDSvc -Force
     (Get-Service AppIDSvc).WaitForStatus('Running', [timespan]::FromSeconds(60))
     Get-AppLockerPolicy -Effective -Xml | Set-Content -LiteralPath (Join-Path $logs 'effective-applocker.xml') -Encoding UTF8
+    $decision = Test-AppLockerPolicy -XmlPolicy $policyFile -Path $BlockedPython -User "$env:COMPUTERNAME\$user" | Format-List * | Out-String
+    $decision | Set-Content -LiteralPath (Join-Path $logs 'policy-decision.txt') -Encoding UTF8
+    Write-Host $decision
+    if ($decision -notmatch 'Denied') { throw 'The configured policy does not deny the control image' }
     foreach ($shell in $shells) {
         $exitCode = 90
         foreach ($attempt in 1..12) {
@@ -263,6 +272,10 @@ try {
     if ($events.Count -eq 0) { throw 'No AppLocker 8004 event corroborates the runtime denial' }
     Write-Host "PASS: $Arch signed recovery, immutable repair, and offline reuse in both PowerShell shells. Recorded $($events.Count) denial events."
 } finally {
+    if ($started) {
+        Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-AppLocker/EXE and DLL'; StartTime=$started } -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, Id, Message | Out-File -LiteralPath (Join-Path $logs 'applocker-all-events.txt') -Width 300 -Encoding utf8
+    }
     Set-AppLockerPolicy -XmlPolicy $policyBackup
     if ($createdUser) { & net.exe user $user /delete | Out-Null }
     $global:LASTEXITCODE = 0
