@@ -1,0 +1,30 @@
+name: Windows runtime A/B
+
+on:
+  push:
+    branches: [rd966-win-runtime-ab]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Host
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          [System.Text.Encoding]::Default.CodePage
+          (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
+          python --version
+      - name: Bench
+        shell: pwsh
+        env:
+          STRIP_TAG: b12189-mix-725acdc
+          ROUNDS: "2"
+        run: python bench_win.py
