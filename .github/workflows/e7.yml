@@ -1,0 +1,34 @@
+name: forks drift E7 (VC redist layout on Windows images)
+
+on:
+  push:
+    branches: [forks-drift-e7]
+
+permissions: {}
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025-vs2026, windows-2022, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: VC redist layout
+        shell: pwsh
+        run: |
+          "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          & $vswhere -all -products * -format json | ConvertFrom-Json | ForEach-Object { "vs: $($_.installationVersion) $($_.installationPath)" }
+          $vs = & $vswhere -latest -property installationPath
+          "latest: $vs"
+          Get-ChildItem "$vs/VC/Redist/MSVC" -Directory | ForEach-Object {
+            "redist dir: $($_.Name)"
+            foreach ($arch in 'arm64', 'x64', 'onecore/arm64', 'debug_nonredist/arm64', 'debug_nonredist/x64') {
+              $p = Join-Path $_.FullName $arch
+              if (Test-Path $p) { Get-ChildItem $p -Directory | ForEach-Object { "  $arch/$($_.Name): $((Get-ChildItem $_.FullName -File | Select-Object -ExpandProperty Name) -join ' ')" } }
+            }
+          }
+          Get-ChildItem "$vs/VC/Tools/MSVC" -Directory | ForEach-Object { "toolset: $($_.Name)" }
+          "clang: $((Get-Command clang -ErrorAction SilentlyContinue).Source)"; clang --version 2>$null | Select-Object -First 1
