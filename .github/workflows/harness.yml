@@ -1,0 +1,72 @@
+name: audio.cpp drift harness
+
+on:
+  push:
+    branches: [audio-drift-harness]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04-arm
+    outputs:
+      commit: ${{ steps.r.outputs.commit }}
+      espeak_commit: ${{ steps.r.outputs.espeak_commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UT: v0.9.4
+      TAG: v0.9.4-unsloth.1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+      - name: Self-test the packaging + validation scripts
+        run: |
+          python3 tooling/scripts/unsloth/test_prebuilt_scripts.py
+          python3 tooling/scripts/unsloth/test_windows_arm64_prebuilts.py
+          python3 tooling/scripts/unsloth/test_cuda_attention_probe.py
+      - name: Resolve immutable commit + stamp source tree
+        id: r
+        run: |
+          set -euo pipefail
+          REF_JSON="$(gh api "repos/0xShug0/audio.cpp/git/ref/tags/${UT}")"
+          OBJ_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          OBJ_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            COMMIT="$(gh api "repos/0xShug0/audio.cpp/git/tags/${OBJ_SHA}" --jq '.object.sha')"
+          else
+            COMMIT="$OBJ_SHA"
+          fi
+          echo "resolved ${UT} -> ${COMMIT}"
+          git init -q audio-src
+          git -C audio-src remote add origin https://github.com/0xShug0/audio.cpp.git
+          git -C audio-src fetch -q --depth 1 origin "$COMMIT"
+          git -C audio-src checkout -q --detach FETCH_HEAD
+          DATE="$(git -C audio-src show -s --format=%cs HEAD)"
+          bash tooling/scripts/unsloth/stamp_source.sh audio-src "$COMMIT" "$DATE"
+          ESPEAK_TAG="$(sed -nE 's|^[[:space:]]*URL[[:space:]]+https://codeload.github.com/espeak-ng/espeak-ng/tar.gz/refs/tags/([^[:space:]]+)$|\1|p' audio-src/tools/cmake/espeak_static.cmake)"
+          ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}^{}" | cut -f1)"
+          [ -n "$ESPEAK_COMMIT" ] || ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}" | cut -f1)"
+          tar -czf "${RUNNER_TEMP}/audio.cpp-source-${TAG}.tar.gz" --exclude-vcs --transform "s,^audio-src,audio.cpp-${TAG}," audio-src
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "espeak_commit=$ESPEAK_COMMIT" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-source-v0.9.4-unsloth.1
+          path: ${{ runner.temp }}/audio.cpp-source-v0.9.4-unsloth.1.tar.gz
+          if-no-files-found: error
+          retention-days: 2
+
+  build:
+    name: Build
+    needs: resolve
+    uses: ./.github/workflows/unsloth-prebuilt-build.yml
+    with:
+      tag: v0.9.4-unsloth.1
+      upstream_tag: v0.9.4
+      repo: unslothai/audio.cpp
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: audio-source-v0.9.4-unsloth.1
+      espeak_commit: ${{ needs.resolve.outputs.espeak_commit }}
+      sign_windows: false
