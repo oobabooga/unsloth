@@ -83,8 +83,12 @@ def _fake_python(tmp_path: Path) -> Path:
 
 
 def _pwsh(shell: str, script: str, env: dict[str, str | None]) -> str:
+    module_setup = _between(
+        "    if ($PSVersionTable.PSEdition -ne 'Core' -and $env:SystemRoot) {",
+        "    # Same UTF-8 invariant",
+    )
     result = run_pwsh(
-        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+        [shell, "-NoProfile", "-NonInteractive", "-Command", module_setup + script],
         check = False,
         capture_output = True,
         text = True,
@@ -834,8 +838,29 @@ def test_policy_block_installs_private_signed_runtime_and_reuses_it_offline(shel
             "Test-LegacyVenvReusable",
         )
     )
+    # Diagnostic retries never turn an initial publication failure into a passing test.
+    helpers = helpers.replace(
+        "[System.IO.Directory]::Move($staged, $destination)",
+        "Invoke-TestRuntimeMove -From $staged -To $destination",
+    )
     script = f"""
 $ErrorActionPreference = 'Stop'
+function Invoke-TestRuntimeMove {{
+    param($From, $To)
+    try {{ [IO.Directory]::Move($From, $To) }} catch {{
+        $original = $_
+        [Console]::Error.WriteLine("Initial publication failure: $($_.Exception.ToString())")
+        foreach ($delay in @(250, 1000, 2000)) {{
+            Start-Sleep -Milliseconds $delay
+            try {{
+                [IO.Directory]::Move($From, $To)
+                [Console]::Error.WriteLine("Diagnostic move succeeded after a $delay ms wait")
+                break
+            }} catch {{ [Console]::Error.WriteLine("Diagnostic move failed after $delay ms: $($_.Exception.ToString())") }}
+        }}
+        throw $original
+    }}
+}}
 $PythonSkip = @('3.13.8'); $StudioHome = $env:TEST_HOME
 $script:UvExe = $env:BLOCKED_UV; $script:Downloads=0
 function Write-StudioLine {{ param($Message,$ForegroundColor) }}

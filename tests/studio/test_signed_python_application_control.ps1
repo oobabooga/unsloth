@@ -19,6 +19,16 @@ if (-not $Source) { $Source = Join-Path (Split-Path (Split-Path $PSScriptRoot -P
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'Installer has parse errors' }
+$sourceText = [IO.File]::ReadAllText($Source)
+function Get-InstallerSection([string]$Start, [string]$End) {
+    $a = $sourceText.IndexOf($Start, [StringComparison]::Ordinal)
+    if ($a -lt 0) { throw "Missing installer section: $Start" }
+    $b = $sourceText.IndexOf($End, $a, [StringComparison]::Ordinal)
+    if ($b -le $a) { throw "Missing installer section end: $End" }
+    return [scriptblock]::Create($sourceText.Substring($a, $b - $a))
+}
+$moduleSetup = Get-InstallerSection '    if ($PSVersionTable.PSEdition -ne ''Core'' -and $env:SystemRoot) {' '    # Same UTF-8 invariant'
+. $moduleSetup
 function Get-InstallerFunction([string]$Name) {
     $matches = @($ast.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
@@ -31,6 +41,10 @@ foreach ($name in @('Test-ApplicationControlBlock', 'Invoke-PythonSelectionProbe
 }
 
 if ($Mode -eq 'Control') {
+    if ($env:OS -eq 'Windows_NT') {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        Write-Host "Control identity=$($identity.Name) SID=$($identity.User.Value) session=$([Diagnostics.Process]::GetCurrentProcess().SessionId)"
+    }
     $denied = $false
     try {
         & $BlockedPython -I -c "print('native interpreter control')"
@@ -93,13 +107,6 @@ if ($Mode -eq 'Recover') {
         $script:Downloads++
         if ($script:ForbidDownload) { throw 'Unexpected signed-runtime download' }
         Microsoft.PowerShell.Utility\Invoke-WebRequest @PSBoundParameters | Out-Null
-    }
-    $sourceText = [IO.File]::ReadAllText($Source)
-    function Get-InstallerSection([string]$Start, [string]$End) {
-        $a = $sourceText.IndexOf($Start, [StringComparison]::Ordinal)
-        $b = $sourceText.IndexOf($End, $a, [StringComparison]::Ordinal)
-        if ($a -lt 0 -or $b -le $a) { throw "Missing installer section: $Start" }
-        return [scriptblock]::Create($sourceText.Substring($a, $b - $a))
     }
     # Both executable sections come from the PR rather than a second implementation.
     $selection = Get-InstallerSection '    $DetectedPython = Resolve-UvManagedPython -Minor $PythonVersion' '    # '
@@ -236,6 +243,10 @@ try {
     <FilePathRule Id="$([guid]::NewGuid())" Name="Deny uv Python for recovery test" Description="Exercise policy-refused managed Python" UserOrGroupSid="$sid" Action="Deny">
       <Conditions><FilePathCondition Path="$escaped" /></Conditions>
     </FilePathRule>
+    <RuleCollectionExtensions>
+      <ThresholdExtensions><Services EnforcementMode="Enabled" /></ThresholdExtensions>
+      <RedstoneExtensions><SystemApps Allow="Enabled" /></RedstoneExtensions>
+    </RuleCollectionExtensions>
   </RuleCollection>
 </AppLockerPolicy>
 "@
