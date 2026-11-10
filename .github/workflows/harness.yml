@@ -528,13 +528,13 @@ jobs:
           # keeps what it compiled.
           save: false
 
-      # With several target architectures, `nvcc -E` prints no code under a __CUDA_ARCH__ guard.
-      # ccache's preprocessor fallback compares that output, so a change that only touches such
-      # code and keeps the line count gets the old object back. Depend mode never preprocesses:
-      # a result is reused only when the source and every file the compiler read are unchanged.
+      # With several target architectures, `nvcc -E` preprocesses for the first one only. ccache's
+      # preprocessor fallback compares that output, so a change to code that a __CUDA_ARCH__ guard
+      # keeps from the first architecture, and that keeps the line count, gets the old object
+      # back. Depend mode never preprocesses: a result is reused only when the source and every
+      # file the compiler read are unchanged.
       - name: Configure ccache
         run: ccache --set-config=depend_mode=true
-
 
       - name: cuDNN headers (build time only)
         run: |
