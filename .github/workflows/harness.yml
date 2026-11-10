@@ -1,0 +1,192 @@
+name: whisper.cpp drift harness
+
+on:
+  push:
+    branches: [whisper-drift-harness]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04-arm
+    outputs:
+      commit: ${{ steps.r.outputs.commit }}
+    steps:
+      - name: Stamp v1.9.5 twice (one source artifact per paired llama release)
+        id: r
+        run: |
+          set -euo pipefail
+          git init -q whisper-src
+          cd whisper-src
+          git remote add origin https://github.com/ggml-org/whisper.cpp.git
+          git fetch -q --depth 1 origin refs/tags/v1.9.5
+          git checkout -q --detach FETCH_HEAD
+          COMMIT="$(git rev-parse HEAD)"
+          COUNT="$(git rev-list --count HEAD)"
+          SHORT="$(git rev-parse --short HEAD)"
+          sed -i "s/^set(BUILD_NUMBER 0)$/set(BUILD_NUMBER ${COUNT})/" cmake/build-info.cmake
+          sed -i "s/^set(BUILD_COMMIT \"unknown\")$/set(BUILD_COMMIT \"${SHORT}\")/" cmake/build-info.cmake
+          cd ..
+          for TAG in v1.9.5-unsloth.98 v1.9.5-unsloth.99; do
+            tar -czf "${RUNNER_TEMP}/whisper.cpp-source-${TAG}.tar.gz" --exclude-vcs --transform "s,^whisper-src,whisper.cpp-${TAG}," whisper-src
+          done
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "v1.9.5 -> $COMMIT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: whisper-source-v1.9.5-unsloth.98
+          path: ${{ runner.temp }}/whisper.cpp-source-v1.9.5-unsloth.98.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: whisper-source-v1.9.5-unsloth.99
+          path: ${{ runner.temp }}/whisper.cpp-source-v1.9.5-unsloth.99.tar.gz
+          if-no-files-found: error
+
+  slim-current:
+    name: Slim (paired with b12233, today's llama release)
+    needs: resolve
+    uses: ./.github/workflows/unsloth-prebuilt-slim.yml
+    with:
+      tag: v1.9.5-unsloth.98
+      upstream_tag: v1.9.5
+      repo: unslothai/whisper.cpp
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: whisper-source-v1.9.5-unsloth.98
+      llama_tag: b12233-mix-7c77012
+      llama_ggml_tree: 8fb28eafa7e4728cee273692c0cec45dae8e7c91
+
+  slim-b12209:
+    name: Slim (paired with b12209)
+    needs: resolve
+    uses: ./.github/workflows/unsloth-prebuilt-slim.yml
+    with:
+      tag: v1.9.5-unsloth.99
+      upstream_tag: v1.9.5
+      repo: unslothai/whisper.cpp
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: whisper-source-v1.9.5-unsloth.99
+      llama_tag: b12209-mix-b84c2bf
+      llama_ggml_tree: 9856285f801aa6c2eecd47b9e65bf4bcd2851b03
+
+  report:
+    name: Compare manifests with the published release
+    needs: [slim-current]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { path: dist, pattern: 'whisper-v1.9.5-unsloth.98-*-slim', merge-multiple: true }
+      - name: Compare
+        run: |
+          set -euo pipefail
+          mkdir -p pub && cd pub
+          gh release download v1.9.5-unsloth.21 --repo unslothai/whisper.cpp -p 'whisper-*-slim.*'
+          cd ..
+          python3 - <<'PY'
+          import json, re, subprocess, sys, tarfile, zipfile
+          from pathlib import Path
+          INFO = "UNSLOTH_WHISPER_PREBUILT_INFO.json"
+          def info(p):
+              if p.name.endswith(".zip"):
+                  with zipfile.ZipFile(p) as z:
+                      n = next(x for x in z.namelist() if x.endswith(INFO)); return json.loads(z.read(n))
+              with tarfile.open(p) as t:
+                  m = next(x for x in t.getmembers() if x.name.endswith(INFO)); return json.loads(t.extractfile(m).read())
+          bad = 0
+          for new in sorted(Path("dist").glob("whisper-*-slim.*")):
+              plat = re.search(r"-(linux|windows|macos)-(x64|arm64)-slim", new.name).group(0)
+              old = next(Path("pub").glob(f"whisper-*{plat}.*"))
+              a, b = info(old), info(new)
+              same = a["requires_ggml_sonames"] == b["requires_ggml_sonames"]
+              print(f"{plat[1:-5]:14s} published min_os={a.get('min_os')} sonames={a['requires_ggml_sonames']}")
+              print(f"{'':14s} this run  min_os={b.get('min_os')} sonames={b['requires_ggml_sonames']} {'SAME' if same else 'DIFFERENT'}")
+              bad += not same
+          sys.exit(1 if bad else 0)
+          PY
+      - name: Version string in the Linux x64 library
+        run: |
+          mkdir -p x && tar -xzf dist/whisper-v1.9.5-unsloth.98-linux-x64-slim.tar.gz -C x
+          strings x/libwhisper.so* | grep -E '^1\.9\.5' | sort -u
+
+  post361:
+    name: Pair with a llama cpu bundle that ships libomp.dll (${{ matrix.arch }})
+    needs: [resolve, slim-b12209]
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: windows-2022 }
+          - { arch: arm64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: "whisper-v1.9.5-unsloth.99-windows-${{ matrix.arch }}-slim", path: slimzip }
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: whisper-source-v1.9.5-unsloth.99, path: srcpkg }
+      - name: llama cpu bundle built by unslothai/llama.cpp#361's workflow (libomp.dll)
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: app-b12209-mix-b84c2bf-windows-${{ matrix.arch }}-cpu
+          path: llamazip
+          run-id: 42766703033
+          github-token: ${{ github.token }}
+      - name: Unpack
+        run: |
+          set -eux
+          mkdir -p src old llama_new model
+          tar -xzf srcpkg/whisper.cpp-source-v1.9.5-unsloth.99.tar.gz -C src --strip-components=1
+          python -m zipfile -e slimzip/whisper-v1.9.5-unsloth.99-windows-${{ matrix.arch }}-slim.zip old
+          python -m zipfile -e llamazip/app-b12209-mix-b84c2bf-windows-${{ matrix.arch }}-cpu.zip llama_new
+          ls llama_new | grep -i omp
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python -c "import json; print('packaged against the published b12209 bundle:', json.load(open('old/UNSLOTH_WHISPER_PREBUILT_INFO.json'))['requires_ggml_sonames'])"
+      - name: A bundle that names libomp140 must be rejected against the libomp.dll bundle
+        run: |
+          set -ux
+          cp -r old old_wired
+          if python tooling/scripts/validate_bundle.py --bundle old_wired --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav --ggml-dir llama_new > neg.log 2>&1; then
+            cat neg.log; echo "::error::the old manifest passed against the libomp.dll bundle"; exit 1
+          fi
+          grep -n "does not require them" neg.log
+      - name: Repackage against the libomp.dll bundle
+        env:
+          SLIM: "1"
+          LLAMA_TAG: b12209-mix-b84c2bf
+          LLAMA_GGML_TREE: 9856285f801aa6c2eecd47b9e65bf4bcd2851b03
+          LLAMA_CPU_DIR: ${{ github.workspace }}/llama_new
+          GGML_VERSION: "0.29.0"
+          OS: windows
+          ARCH: ${{ matrix.arch }}
+          ACCEL: slim
+          BACKEND: slim
+          STATIC: "false"
+          MIN_OS: "windows-10"
+          BIN_DIR: ${{ github.workspace }}/old
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist2
+          TAG: v1.9.5-unsloth.99
+          UPSTREAM_TAG: v1.9.5
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: unslothai/whisper.cpp
+        run: python tooling/scripts/package_bundle.py
+      - name: The repackaged bundle passes the wiring contract and transcribes with libomp.dll
+        run: |
+          set -eux
+          mkdir -p new
+          python -m zipfile -e dist2/whisper-v1.9.5-unsloth.99-windows-${{ matrix.arch }}-slim.zip new
+          python -c "import json; print('repackaged:', json.load(open('new/UNSLOTH_WHISPER_PREBUILT_INFO.json'))['requires_ggml_sonames'])"
+          python tooling/scripts/validate_bundle.py --bundle new --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav --ggml-dir llama_new
