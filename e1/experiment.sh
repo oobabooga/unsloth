@@ -3,8 +3,8 @@
 # Builds three ggml-hip objects, edits GPU-only code, rebuilds with ccache and without, compares.
 set -euo pipefail
 SRC="$1"; BUILD="$2"
-objs() { ninja -C "$BUILD" -t targets all | grep -E 'ggml-hip\.dir/(mmvq|mmq|sum)\.cu\.(o|obj):' | cut -d: -f1 | sort; }
-OBJS="$(objs)"
+objs() { ninja -C "$BUILD" -t targets all | grep -E 'ggml-hip\.dir/(.*/)?(mmvq|mmq|sum)\.cu\.(o|obj):' | cut -d: -f1 | sort; }
+OBJS="$(objs || true)"; echo "object targets: $OBJS"
 [ "$(echo "$OBJS" | wc -l)" -eq 3 ] || { echo "expected 3 object targets, got: $OBJS"; exit 1; }
 build() { ninja -C "$BUILD" $OBJS; }
 wipe()  { (cd "$BUILD" && rm -f $OBJS); }
