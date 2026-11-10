@@ -233,16 +233,20 @@ try {
     foreach ($shell in $shells) {
         if ((Invoke-ProbeUser $shell 'Control' "baseline-$($shell.Tag)") -ne 0) { throw 'Standard user cannot run the baseline interpreter' }
     }
-    $escaped = [System.Security.SecurityElement]::Escape($BlockedPython)
+    $fileInfo = Get-AppLockerFileInformation -Path $BlockedPython
+    $hashPolicy = [xml](New-AppLockerPolicy -FileInformation $fileInfo -RuleType Hash -User "$env:COMPUTERNAME\$user" -Xml)
+    $denyRule = $hashPolicy.AppLockerPolicy.RuleCollection.FileHashRule
+    if (-not $denyRule -or $denyRule.UserOrGroupSid -ne $sid) { throw 'Could not generate the control image hash rule' }
+    $denyRule.Action = 'Deny'
+    $denyRule.Name = 'Deny uv Python for recovery test'
+    $denyXml = $denyRule.OuterXml
     $policy = @"
 <AppLockerPolicy Version="1">
   <RuleCollection Type="Exe" EnforcementMode="Enabled">
     <FilePathRule Id="$([guid]::NewGuid())" Name="Allow other executables" Description="Keep the disposable runner usable" UserOrGroupSid="S-1-1-0" Action="Allow">
       <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
-    <FilePathRule Id="$([guid]::NewGuid())" Name="Deny uv Python for recovery test" Description="Exercise policy-refused managed Python" UserOrGroupSid="$sid" Action="Deny">
-      <Conditions><FilePathCondition Path="$escaped" /></Conditions>
-    </FilePathRule>
+    $denyXml
     <RuleCollectionExtensions>
       <ThresholdExtensions><Services EnforcementMode="Enabled" /></ThresholdExtensions>
       <RedstoneExtensions><SystemApps Allow="Enabled" /></RedstoneExtensions>
@@ -261,6 +265,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not apply AppLocker policy' }
     Restart-Service AppIDSvc -Force
     (Get-Service AppIDSvc).WaitForStatus('Running', [timespan]::FromSeconds(60))
+    Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version, OperatingSystemSKU | Out-Host
+    & sc.exe query AppID
+    & sc.exe qc AppID
+    & sc.exe query AppIDSvc
+    Get-WinEvent -ListLog 'Microsoft-Windows-AppLocker/EXE and DLL' | Format-List LogName, IsEnabled, RecordCount | Out-Host
     Get-AppLockerPolicy -Effective -Xml | Set-Content -LiteralPath (Join-Path $logs 'effective-applocker.xml') -Encoding UTF8
     $decision = Test-AppLockerPolicy -XmlPolicy $policyFile -Path $BlockedPython -User "$env:COMPUTERNAME\$user" | Format-List * | Out-String
     $decision | Set-Content -LiteralPath (Join-Path $logs 'policy-decision.txt') -Encoding UTF8

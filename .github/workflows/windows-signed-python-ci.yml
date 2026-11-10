@@ -42,14 +42,22 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $dir = Join-Path $env:RUNNER_TEMP ('psf-package-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Path $dir | Out-Null
-          # The existing optional integration test explicitly exercises the x64 package.
-          # The enforcing job below additionally exercises native ARM64 recovery.
           $package = Join-Path $dir 'python.3.13.17.nupkg'
           Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/python/3.13.17/python.3.13.17.nupkg' -OutFile $package
           if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne 'dce409744b088f94c6e37ba41f8100c384c27e029e843237364c602d30d475e5') {
             throw 'Official package checksum mismatch'
           }
           "UNSLOTH_TEST_PSF_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ('${{ matrix.arch }}' -eq 'arm64') {
+            $armDir = Join-Path $env:RUNNER_TEMP ('psf-arm-package-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $armDir | Out-Null
+            $armPackage = Join-Path $armDir 'pythonarm64.3.13.17.nupkg'
+            Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/pythonarm64/3.13.17/pythonarm64.3.13.17.nupkg' -OutFile $armPackage
+            if ((Get-FileHash -LiteralPath $armPackage -Algorithm SHA256).Hash -ne 'aaa8c60c0adffde214ebd13e19bd79289aedb6452b4883eb08a59592c008456b') {
+              throw 'Official ARM64 package checksum mismatch'
+            }
+            "UNSLOTH_TEST_PSF_ARM64_PACKAGE=$armPackage" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
       - name: Run both PowerShell shells and native package tests
         shell: pwsh
         env:
