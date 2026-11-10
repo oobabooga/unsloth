@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from utils.optional_pdf import PDFDependencyUnavailable, ensure_pdf_support
+
 from core.training.account_jobs import account_path, managed_account
 import base64
 import binascii
@@ -1171,6 +1173,9 @@ _document_extraction_limiter = CapacityLimiter(2)
 
 
 async def _extract_text_from_file_async(file_path: Path, ext: str) -> str:
+    if ext == ".pdf" or ext in _MUPDF_EBOOK_EXTS:
+        # Install here, not in the worker: a cancelled upload kills the worker but not its installer.
+        await to_thread.run_sync(ensure_pdf_support)
     if ext in _MUPDF_EBOOK_EXTS:
         from core.rag import parsers
 
@@ -1343,7 +1348,9 @@ async def upload_unstructured_file(
             **dict.fromkeys((".docx", ".docm", ".dotx", ".dotm"), "docx"),
             **dict.fromkeys(_MUPDF_EBOOK_EXTS, "pymupdf"),
         }.get(ext)
-        if isinstance(e, ModuleNotFoundError) and missing == expected_missing:
+        if isinstance(e, PDFDependencyUnavailable) or (
+            isinstance(e, ModuleNotFoundError) and missing == expected_missing
+        ):
             # Name what to install: python-docx imports as docx, and PyPI's "docx" is another package.
             package = {"docx": "python-docx"}.get(missing, missing)
             logger.error(
@@ -1357,7 +1364,11 @@ async def upload_unstructured_file(
                 filename = original_filename,
                 size_bytes = size_bytes,
                 status = "error",
-                error = f"Cannot read {ext} files: the '{package}' package is not installed.",
+                error = (
+                    str(e)
+                    if isinstance(e, PDFDependencyUnavailable)
+                    else f"Cannot read {ext} files: the '{package}' package is not installed."
+                ),
             )
         logger.error(
             "data_recipe.seed.text_extraction_failed",

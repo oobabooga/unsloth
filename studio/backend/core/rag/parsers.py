@@ -6,6 +6,8 @@ deps are lazy so importing never fails on a missing one."""
 
 from __future__ import annotations
 
+from utils.optional_pdf import load_pdf_module
+
 import codecs
 import logging
 import os
@@ -493,7 +495,7 @@ _SCAN_IMAGE_MIN_PIXELS = 1_000_000
 def _image_covers_a_corner(doc, number: int) -> bool:
     """True when a scan-sized image covers a corner pymupdf4llm samples, since that render holds the GIL."""
     try:
-        import fitz
+        fitz = load_pdf_module("fitz")
 
         page = doc[number]
         r = page.rect
@@ -525,7 +527,7 @@ def _table_guard_enabled(pymupdf4llm) -> bool:
     try:
         import inspect
 
-        import fitz
+        fitz = load_pdf_module("fitz")
 
         to_markdown = pymupdf4llm.to_markdown
         params = inspect.signature(to_markdown).parameters
@@ -542,7 +544,7 @@ def _table_guard_enabled(pymupdf4llm) -> bool:
 
 def _graphics_bboxes(rects: list) -> list:
     """make_edges' clean_graphics clusters (before its has-text check), copied verbatim."""
-    import fitz
+    fitz = load_pdf_module("fitz")
 
     snap_x = snap_y = _TABLE_SNAP
 
@@ -671,7 +673,7 @@ def _pdf_markdown(doc, pages: range | None = None) -> list[str] | None:
     """Per-page Markdown via pymupdf4llm (index i is page i+1); None when unavailable or misaligned,
     so the caller falls back to plain PyMuPDF text."""
     try:
-        import pymupdf4llm
+        pymupdf4llm = load_pdf_module("pymupdf4llm")
     except Exception:
         return None
     try:
@@ -717,7 +719,7 @@ def _pdf_markdown(doc, pages: range | None = None) -> list[str] | None:
 
 
 def _pdf_form_field_lines(page) -> list[str]:
-    import fitz
+    fitz = load_pdf_module("fitz")
 
     try:
         widgets = list(page.widgets())
@@ -766,7 +768,7 @@ def _pdf(
     want_images: bool,
     max_pages: int | None = None,
 ) -> tuple[list[Page], list[ParsedImage], int]:
-    import fitz
+    fitz = load_pdf_module("fitz")
 
     pages: list[Page] = []
     images: list[ParsedImage] = []
@@ -852,7 +854,7 @@ def parse_pdf_bytes(data: bytes, *, max_pages: int | None = None) -> tuple[list[
 
 def mupdf_document_text(path: str) -> str:
     """Paragraph text of a reflowable e-book only MuPDF reads (.mobi, .fb2)."""
-    import pymupdf
+    pymupdf = load_pdf_module("pymupdf")
 
     with pymupdf.open(path) as doc:
         # A tall page keeps paragraphs from splitting at page breaks.
@@ -868,7 +870,7 @@ def mupdf_document_text(path: str) -> str:
 
 def _merge_rects(boxes: list) -> list:
     """Union overlapping rectangles (largest-first) into figure regions."""
-    import pymupdf
+    pymupdf = load_pdf_module("pymupdf")
 
     rects = [pymupdf.Rect(b) for b in boxes]
     rects = [r for r in rects if r.width > 5 and r.height > 5]
@@ -927,7 +929,7 @@ def pages_with_figures(
     """1-based pages with a figure region, for tiling; exclude_pages, already OCR'd whole, are skipped."""
     exclude = exclude_pages or set()
     try:
-        import pymupdf
+        pymupdf = load_pdf_module("pymupdf")
     except Exception:
         return []
     try:
@@ -966,7 +968,7 @@ def render_pdf_figure_tiles(
         return []
     rows, cols = max(1, int(rows)), max(1, int(cols))
     try:
-        import pymupdf
+        pymupdf = load_pdf_module("pymupdf")
     except Exception:
         return []
     try:
@@ -1028,7 +1030,7 @@ def render_pdf_pages(
     if not wanted:
         return {}
     try:
-        import pymupdf
+        pymupdf = load_pdf_module("pymupdf")
     except Exception:
         return {}
     try:
