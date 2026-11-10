@@ -1,0 +1,24 @@
+diff --git a/unsloth_zoo/merged_rollout_exact.py b/unsloth_zoo/merged_rollout_exact.py
+index df979c9f..a75df4ee 100644
+--- a/unsloth_zoo/merged_rollout_exact.py
++++ b/unsloth_zoo/merged_rollout_exact.py
+@@ -767,7 +767,7 @@ def _restore_escapes(s, group, idx, val, after):
+         E, N, K = t.w.shape
+         delta = t.w.data_ptr() - base.data_ptr()
+         table.append((delta // 2, t.w.stride(0), t.w.stride(1), t.w.stride(2), N, K))
+-    # Pinned or synchronous: a non_blocking copy from a pageable temporary can read it after it is freed (ROCm).
++    # Pinned (async) or synchronous: never a non_blocking copy from a pageable temporary.
+     table = _status(table, s.device)
+     counts = _status([n for _, n in s.escs], s.device)
+     slots = torch.repeat_interleave(torch.arange(len(group), device = s.device), counts, output_size = n_esc)
+@@ -817,7 +817,9 @@ def exact_unfold(targets, stream = None):
+                 if s.tiles[t.slot]: _launch(t, _UNFOLD, woff = woff, wcnt = wcnt, words = words, checksum = after)
+                 t.restoring = True
+             group = members[id(s)]
+-            if len(group) == len(s.tiles) and len(group) > 1:
++            # One launch addresses every target from the first one's pointer: ROCm's Triton (buffer ops) cannot
++            # reach other allocations that way, so HIP restores each target's escapes on its own.
++            if len(group) == len(s.tiles) and len(group) > 1 and torch.version.hip is None:
+                 _restore_escapes(s, group, idx, val, after)
+             else:
+                 # One target (one op per weight) or part of a store: the escapes of these targets only.
