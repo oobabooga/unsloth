@@ -1,0 +1,57 @@
+name: llama.cpp drift E4 (published ROCm bundles on DevLab hardware)
+
+on:
+  push:
+    branches: [llamacpp-drift-e4]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+      - name: Hardware
+        run: |
+          uname -r; python3 --version
+          ls -l /dev/kfd /dev/dri 2>/dev/null || true
+          ls -d /opt/rocm* 2>/dev/null || echo "no system ROCm under /opt"
+          id
+      - name: Test the published bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/bt"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/bt/pub.tar.gz" https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-linux-x64-rocm-gfx1151.tar.gz
+          python3 tooling/harness/bundle_test.py --kind rocm --new "$RUNNER_TEMP/bt/pub.tar.gz" \
+            --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf \
+            --model2 https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-BF16.gguf \
+            --work "$RUNNER_TEMP/bt" || echo "bundle_test exit $?"
+          echo "----- head of the generation log"; head -60 "$RUNNER_TEMP/bt/new-completion.log" | cut -c1-220
+  windows:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+      - name: Test the published bundle
+        run: |
+          $w = "$env:RUNNER_TEMP\bt-e4-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path $w | Out-Null
+          curl.exe -fsSL --retry 5 -o "$w\pub.zip" https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-x64-rocm-gfx1151.zip
+          python tooling\harness\bundle_test.py --kind rocm --new "$w\pub.zip" `
+            --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf `
+            --model2 https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-BF16.gguf `
+            --work $w
+          "bundle_test exit $LASTEXITCODE"
+          "----- head of the generation log"
+          Get-Content "$w\new-completion.log" -TotalCount 60 | ForEach-Object { if ($_.Length -gt 220) { $_.Substring(0,220) } else { $_ } }
+          exit 0
