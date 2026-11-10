@@ -41,6 +41,9 @@ h() { sha256sum "build/$obj" | cut -c1-16; }
 ccache -z >/dev/null; ninja -C build "$obj" >/dev/null; h1="$(h)"; s1="$(stats)"
 sleep 2; write 2
 ccache -z >/dev/null; ninja -C build "$obj" >/dev/null; h2="$(h)"; s2="$(stats)"
+sleep 2; write 1
+ccache -z >/dev/null; ninja -C build "$obj" >/dev/null; h3="$(h)"; s3="$(stats)"
 echo "RESULT mode=$mode build1 $h1 [$s1]"
 echo "RESULT mode=$mode build2 $h2 [$s2]"
+echo "RESULT mode=$mode build3 (source restored) $h3 [$s3] $([ "$h3" = "$h1" ] && echo same-as-build1 || echo DIFFERENT-from-build1)"
 if [ "$h1" = "$h2" ]; then echo "RESULT mode=$mode VERDICT: STALE (ccache returned the pre-edit object)"; else echo "RESULT mode=$mode VERDICT: rebuilt"; fi
