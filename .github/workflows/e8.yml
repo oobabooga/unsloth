@@ -1,0 +1,104 @@
+name: forks drift E8 (nvcc ccache staleness)
+
+on:
+  push:
+    branches: [forks-drift-e8]
+
+permissions:
+  contents: read
+
+env:
+  CUDA_ARCHS: '75-real;80-real;86-real;89-real;90-real'
+
+jobs:
+  linux:
+    name: linux / ccache ${{ matrix.ccache }} / ${{ matrix.mode }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ccache: [apt, binary]
+        mode: [plain, depend]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+      - name: CUDA 12.8.1 nvcc (NVIDIA redist)
+        run: |
+          set -euo pipefail
+          PREFIX="$HOME/cuda"; mkdir -p "$PREFIX"
+          for cv in cuda_cudart:12.8.90 cuda_nvcc:12.8.93 cuda_cccl:12.8.90; do
+            comp="${cv%:*}"; ver="${cv#*:}"; name="${comp}-linux-x86_64-${ver}-archive"
+            curl -fsSL --retry 3 -o comp.tar.xz "https://developer.download.nvidia.com/compute/cuda/redist/${comp}/linux-x86_64/${name}.tar.xz"
+            tar -xf comp.tar.xz; cp -a "${name}/." "$PREFIX"/; rm -rf comp.tar.xz "${name}"
+          done
+          ln -sfn lib "$PREFIX/lib64"
+          echo "CUDA_PATH=$PREFIX" >> "$GITHUB_ENV"; echo "$PREFIX/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: e8-linux-${{ matrix.ccache }}-${{ matrix.mode }}-${{ github.run_id }}
+          append-timestamp: false
+          variant: ccache
+          install: ${{ matrix.ccache == 'binary' && 'binary' || 'detect' }}
+          save: false
+      - name: Experiment
+        run: nvcc --version | tail -2 && bash tooling/e8/experiment.sh ${{ matrix.mode }}
+
+  windows:
+    name: windows / ccache ${{ matrix.ccache }} / ${{ matrix.mode }}
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { ccache: action, mode: plain }
+          - { ccache: action, mode: depend }
+          - { ccache: '4.14.3', mode: plain }
+          - { ccache: '4.14.3', mode: depend }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+      - name: CUDA 12.8.0 nvcc (NVIDIA redist)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+          foreach ($cv in 'cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55') {
+            $comp, $ver = $cv.Split(':')
+            $name = "$comp-windows-x86_64-$ver-archive"
+            $zip = Join-Path $stage "$name.zip"
+            curl.exe -fsSL --retry 3 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
+            if ($LASTEXITCODE -ne 0) { Write-Host "skip $name (download failed)"; continue }
+            tar.exe -xf $zip -C $stage
+            robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          }
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+      - name: ccache (action)
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: e8-windows-${{ matrix.ccache }}-${{ matrix.mode }}-${{ github.run_id }}
+          append-timestamp: false
+          variant: ccache
+          save: false
+      - name: ccache 4.14.3
+        if: matrix.ccache == '4.14.3'
+        shell: pwsh
+        run: |
+          curl.exe -fsSL --retry 3 -o ccache.zip https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-windows-x86_64.zip
+          Expand-Archive ccache.zip -DestinationPath C:\ccache-new
+          $dir = (Get-ChildItem C:\ccache-new -Recurse -Filter ccache.exe | Select-Object -First 1).DirectoryName
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Experiment
+        shell: bash
+        run: |
+          which ccache; nvcc --version | tail -2
+          bash tooling/e8/experiment.sh ${{ matrix.mode }}
