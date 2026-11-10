@@ -23,7 +23,7 @@ name: "AMD CI: validate PR 2464"
 
 on:
   push:
-    branches: [amd-ci-pr2464]
+    branches: [amd-ci-r2-zoo2464]
   workflow_dispatch:
 
 permissions:
