@@ -1,0 +1,43 @@
+name: whisper.cpp resolve step (HARNESS ONLY)
+
+on:
+  push:
+    branches: [whisper-resolve-harness]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+      - name: Scheduled run against the real releases
+        run: |
+          set -euo pipefail
+          python3 --version; gh --version | head -1
+          GITHUB_REPOSITORY=unslothai/whisper.cpp GITHUB_OUTPUT=/dev/null bash h/resolve_head.sh 2>&1 | tee real.log
+          grep -q '^RESULT .*EXISTS=true PAIRED=true' real.log
+      - name: The llama Windows bundles ship libomp.dll
+        run: |
+          set -euo pipefail
+          LT="$(sed -n 's/^RESULT .* LT=//p' real.log)"
+          mkdir -p renamed shim
+          for a in x64 arm64; do
+            gh release download "$LT" --repo unslothai/llama.cpp --pattern "app-$LT-windows-$a-cpu.zip" --dir orig
+            python3 h/rename.py "orig/app-$LT-windows-$a-cpu.zip" "renamed/app-$LT-windows-$a-cpu.zip"
+          done
+          cp h/gh-shim.sh shim/gh && chmod +x shim/gh
+          export REAL_GH="$(command -v gh)" RENAMED_DIR="$PWD/renamed"
+          PATH="$PWD/shim:$PATH" GITHUB_REPOSITORY=unslothai/whisper.cpp GITHUB_OUTPUT=/dev/null bash h/resolve_head.sh 2>&1 | tee renamed.log
+          grep -q 'windows-x64: libomp140.x86_64.dll' renamed.log
+          grep -q 'windows-arm64: libomp140.aarch64.dll' renamed.log
+          grep -q '^RESULT .*EXISTS=false PAIRED=false' renamed.log
+          echo "--- the two Windows downloads fail"
+          FAKE_MODE=fail PATH="$PWD/shim:$PATH" GITHUB_REPOSITORY=unslothai/whisper.cpp GITHUB_OUTPUT=/dev/null bash h/resolve_head.sh 2>&1 | tee fail.log
+          grep -c 'not comparing its libraries' fail.log
+          grep -q '^RESULT .*EXISTS=true PAIRED=true' fail.log
