@@ -154,7 +154,7 @@ def check(label: str, kind: str, archive: Path, model: Path, work: Path, elsewhe
 
     ngl = "99" if kind == "rocm" else "0"
     cmd = [str(root / f"llama-completion{EXE}"), "-m", str(model), "-p", PROMPT, "-n", "48", "-no-cnv",
-           "--temp", "0", "--seed", "1", "-ngl", ngl, "--simple-io", "--no-display-prompt"]
+           "--temp", "0", "--seed", "1", "-ngl", ngl, "--simple-io", "--no-display-prompt", "-lv", "4"]
     rc, out = run(cmd, elsewhere)
     (work / f"{label}-completion.log").write_text(out, encoding="utf-8")
     off = re.search(r"offloaded (\d+)/(\d+) layers to GPU", out)
@@ -190,7 +190,7 @@ def check(label: str, kind: str, archive: Path, model: Path, work: Path, elsewhe
         pf = work / "long-prompt.txt"
         pf.write_text(("The quick brown fox jumps over the lazy dog. " * 40) + "\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,", encoding="utf-8")
         cmd = [str(root / f"llama-completion{EXE}"), "-m", str(model2), "-f", str(pf), "-n", "24", "-no-cnv",
-               "--temp", "0", "--seed", "1", "-ngl", "99", "--simple-io", "--no-display-prompt"]
+               "--temp", "0", "--seed", "1", "-ngl", "99", "--simple-io", "--no-display-prompt", "-lv", "4"]
         rc, out = run(cmd, elsewhere)
         (work / f"{label}-completion-bf16.log").write_text(out, encoding="utf-8")
         tps = re.findall(r"eval time\s*=.*?([\d.]+) tokens per second", out)
