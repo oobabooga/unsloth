@@ -1,0 +1,61 @@
+name: llama.cpp drift E5 (Windows CPU bundle speed, old vs new OpenMP runtime)
+
+on:
+  push:
+    branches: [llamacpp-drift-e5]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: app-b12209-mix-b84c2bf-windows-arm64-cpu
+          path: new
+          run-id: 42766703033
+          github-token: ${{ github.token }}
+      - name: Bench
+        shell: pwsh
+        run: |
+          python tooling\e5\bench_cpu.py --work "$env:RUNNER_TEMP\e5" `
+            --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf `
+            "old=https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-arm64-cpu.zip" `
+            "new=new\app-b12209-mix-b84c2bf-windows-arm64-cpu.zip" `
+            "old2=https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-arm64-cpu.zip" `
+            "new2=new\app-b12209-mix-b84c2bf-windows-arm64-cpu.zip"
+          exit $LASTEXITCODE
+  x64:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: app-b12209-mix-b84c2bf-windows-x64-cpu
+          path: new
+          run-id: 42766703033
+          github-token: ${{ github.token }}
+      - name: Bench
+        run: |
+          python tooling\e5\bench_cpu.py --work "$env:RUNNER_TEMP\e5-$env:GITHUB_RUN_ID" `
+            --model https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf `
+            "old=https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-x64-cpu.zip" `
+            "new=new\app-b12209-mix-b84c2bf-windows-x64-cpu.zip" `
+            "old2=https://github.com/unslothai/llama.cpp/releases/download/b12209-mix-b84c2bf/app-b12209-mix-b84c2bf-windows-x64-cpu.zip" `
+            "new2=new\app-b12209-mix-b84c2bf-windows-x64-cpu.zip"
+          exit $LASTEXITCODE
