@@ -1,8 +1,8 @@
-name: unsloth PR 17463 wheel step test (HARNESS ONLY)
+name: unsloth PR 17463 Windows install test (HARNESS ONLY)
 
-# Lays out a chat-only Windows install (published CUDA bundle, no PyTorch, no CUDA toolkit), runs
-# PR 17463's ensure_cuda_runtime_wheels, and checks whether ggml-cuda.dll loads through the
-# search dirs Studio builds, before and after. Nothing published.
+# Runs Studio's real llama.cpp installer on Windows as a chat-only NVIDIA host would, with only host
+# detection replaced: once with the PR as pushed (ddcecd7579) and once with the follow-up applied.
+# Then checks whether ggml-cuda.dll loads through the search dirs Studio builds. Nothing published.
 
 on:
   push:
@@ -11,24 +11,20 @@ on:
 permissions:
   contents: read
 
-env:
-  LLAMA_TAG: b12246-mix-7c77012
-  PR_SHA: ddcecd7579
-
 jobs:
-  wheels:
-    name: ${{ matrix.profile }} / ${{ matrix.installer }}
+  install:
+    name: ${{ matrix.line }}
     runs-on: windows-2022
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { profile: cuda12-newer, installer: uv }
-          - { profile: cuda13-newer, installer: uv }
-          - { profile: cuda13-newer, installer: pip }
+          - { line: cuda13, driver: '13.1', cap: '120' }
+          - { line: cuda12, driver: '12.8', cap: '86' }
     env:
       GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
     defaults:
       run:
         shell: pwsh
@@ -40,32 +36,32 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
-      - name: Fetch the PR's studio code
+      - name: Fetch the PR's studio code, as pushed and with the follow-up
         run: |
           $ErrorActionPreference = 'Stop'
-          git init -q pr
-          git -C pr fetch -q --depth 1 https://github.com/unslothai/unsloth refs/pull/17463/head
-          git -C pr checkout -q FETCH_HEAD
-          git -C pr log -1 --format='%H %s'
-          if (-not (git -C pr rev-parse HEAD).StartsWith($env:PR_SHA)) { throw 'PR head moved' }
+          foreach ($d in 'pr_orig', 'pr_fix') {
+            git init -q $d
+            git -C $d fetch -q --depth 1 https://github.com/unslothai/unsloth ddcecd75797a8f8f0e2bb1e4b0e9b3c8f3f0c0a0 2>$null
+            if ($LASTEXITCODE -ne 0) { git -C $d fetch -q --depth 1 https://github.com/unslothai/unsloth refs/pull/17463/head }
+            git -C $d checkout -q FETCH_HEAD
+          }
+          git -C pr_orig log -1 --format='%H %s'
+          Copy-Item fix/install_llama_prebuilt.py pr_fix/studio/install_llama_prebuilt.py -Force
+          New-Item -ItemType Directory -Force -Path driver | Out-Null
+          foreach ($e in 'env_orig', 'env_fix') { python -m venv $e; & "$e\Scripts\python.exe" -m pip install -q uv }
 
-      - name: Lay out a chat-only install
+      - name: PR as pushed, real installer
         run: |
-          $ErrorActionPreference = 'Stop'
-          $zip = "app-$env:LLAMA_TAG-windows-x64-${{ matrix.profile }}.zip"
-          gh release download $env:LLAMA_TAG --repo unslothai/llama.cpp --pattern $zip
-          if ($LASTEXITCODE -ne 0) { throw 'download failed' }
-          Expand-Archive -Path $zip -DestinationPath install/build/bin/Release -Force
-          @{ install_kind = 'windows-cuda'; asset = $zip } | ConvertTo-Json | Set-Content -Encoding utf8 install/UNSLOTH_PREBUILT_INFO.json
-          python -m venv env
-          if ('${{ matrix.installer }}' -eq 'uv') { & env\Scripts\python.exe -m pip install -q uv }
-          & env\Scripts\python.exe -c "import sys; print(sys.prefix)"
+          $env:PATH = "$PWD\env_orig\Scripts;$env:PATH"
+          & env_orig\Scripts\python.exe -B h/win_e2e.py pr_orig/studio install_orig ${{ matrix.driver }} ${{ matrix.cap }} driver ORIGINAL install 2>&1 | Tee-Object -FilePath orig_install.log | Select-String -Pattern 'RESULT|selected|no CUDA runtime|wheel|validated|PrebuiltFallback|Traceback|Error' | ForEach-Object { $_.Line }
+          exit 0
 
       - name: Build the nvcuda.dll stand-in (the runner has no NVIDIA driver)
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path driver | Out-Null
-          python -B h/probe.py gen-stub install/build/bin/Release/ggml-cuda.dll driver/stub.c
+          $dll = Get-ChildItem -Path install_orig -Recurse -Filter ggml-cuda.dll | Select-Object -First 1
+          if (-not $dll) { throw 'the original install has no ggml-cuda.dll' }
+          python -B h/probe.py gen-stub $dll.FullName driver/stub.c
           if (Test-Path driver/stub.c) {
             Push-Location driver
             cl /nologo /LD stub.c /Fe:nvcuda.dll
@@ -73,18 +69,42 @@ jobs:
             Pop-Location
           }
 
-      - name: Run the PR's wheel step
+      - name: PR as pushed, result
         run: |
-          $env:PATH = "$PWD\env\Scripts;$env:PATH"
-          Get-Command uv -ErrorAction SilentlyContinue | ForEach-Object { "uv on PATH: $($_.Source)" }
-          & env\Scripts\python.exe -B h/wheels_test.py pr/studio install driver 2>&1 | Tee-Object -FilePath out.log
+          $env:PATH = "$PWD\env_orig\Scripts;$env:PATH"
+          & env_orig\Scripts\python.exe -B h/win_e2e.py pr_orig/studio install_orig ${{ matrix.driver }} ${{ matrix.cap }} driver ORIGINAL probe 2>&1 | Tee-Object -FilePath orig.log
+          & env_orig\Scripts\python.exe -B h/win_e2e.py pr_orig/studio install_orig ${{ matrix.driver }} ${{ matrix.cap }} driver ORIGINAL check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath orig.log -Append
+
+      - name: With the follow-up, real installer
+        run: |
+          $env:PATH = "$PWD\env_fix\Scripts;$env:PATH"
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver FIXED install 2>&1 | Tee-Object -FilePath fix_install.log | Select-String -Pattern 'RESULT|selected|no CUDA runtime|wheel|validated|PrebuiltFallback|Traceback|Error' | ForEach-Object { $_.Line }
+          exit 0
+
+      - name: With the follow-up, result
+        run: |
+          $env:PATH = "$PWD\env_fix\Scripts;$env:PATH"
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver FIXED probe 2>&1 | Tee-Object -FilePath fix.log
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver FIXED check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath fix.log -Append
+
+      - name: With the follow-up, the wheels are removed and the installer runs again
+        run: |
+          $env:PATH = "$PWD\env_fix\Scripts;$env:PATH"
+          $pkgs = (& env_fix\Scripts\python.exe -m pip list --disable-pip-version-check --format=freeze) | Where-Object { $_ -match '^nvidia' } | ForEach-Object { ($_ -split '==')[0] }
+          & env_fix\Scripts\python.exe -m pip uninstall -y -q @pkgs
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver REMOVED check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath removed.log
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver RERUN install 2>&1 | Select-String -Pattern 'RESULT|no CUDA runtime|skipping download|already matches' | ForEach-Object { $_.Line } | Tee-Object -FilePath removed.log -Append
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver RERUN probe 2>&1 | Tee-Object -FilePath removed.log -Append
+          & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver RERUN check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath removed.log -Append
 
       - name: Verdict
         shell: bash
         run: |
-          set -euo pipefail
-          grep -a '^RESULT' out.log | grep -v 'list-devices' | cut -c1-300
-          grep -aq 'RESULT BEFORE LoadLibrary(ggml-cuda.dll): FAILED' out.log
-          grep -aq 'RESULT AFTER wheels the PR considers missing: none' out.log
-          grep -aq 'RESULT AFTER LoadLibrary(ggml-cuda.dll): loaded' out.log
-          echo "RESULT VERDICT: the chat-only layout cannot load ggml-cuda.dll; after the PR's wheel step it can"
+          set -uo pipefail
+          grep -ah '^RESULT' orig.log fix.log removed.log | grep -v 'list-devices' | cut -c1-260
+          set -e
+          grep -aq 'RESULT FIXED nvidia wheels in the env: \[' fix.log
+          grep -aq 'RESULT FIXED LoadLibrary(ggml-cuda.dll): loaded' fix.log
+          grep -aq 'RESULT FIXED --check-installed exit code: 0' fix.log
+          grep -aq 'RESULT RERUN LoadLibrary(ggml-cuda.dll): loaded' removed.log
+          echo "RESULT VERDICT: with the follow-up a real chat-only style install gets the wheels and ggml-cuda.dll loads"
