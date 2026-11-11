@@ -1,0 +1,137 @@
+name: llama.cpp PR 362 Linux runtime test (HARNESS ONLY)
+
+# Takes the published Linux CUDA bundle (what master ships), installs the CUDA toolkit with the
+# real leg's step, runs the new copy step and the packager on the same binaries, and compares
+# how libggml-cuda.so resolves in a clean container before and after. No compile, nothing published.
+
+on:
+  push:
+    branches: [pr362-linux-harness]
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: b12246-mix-7c77012
+
+jobs:
+  loader:
+    name: ${{ matrix.arch }} ${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: cuda12-newer,    arch: x64,   runner: ubuntu-22.04,     image: 'ubuntu:22.04', cuda: '12.8.0', line: cuda12, toolkit_line: '12.8', klass: newer,    rank: 20, archs: '86 89 90 100 120' }
+          - { profile: cuda13-newer,    arch: x64,   runner: ubuntu-22.04,     image: 'ubuntu:22.04', cuda: '13.3',   line: cuda13, toolkit_line: '13.3', klass: newer,    rank: 50, archs: '86 89 90 100 120' }
+          - { profile: cuda13-portable, arch: arm64, runner: ubuntu-24.04-arm, image: 'ubuntu:24.04', cuda: '13.3',   line: cuda13, toolkit_line: '13.3', klass: portable, rank: 60, archs: '90 100 120 121' }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLATFORM: linux
+      ARCH: ${{ matrix.arch }}
+      BIN_DIR: ${{ github.workspace }}/src/build/bin
+      SRC_DIR: ${{ github.workspace }}/src
+      TAG: b12246-mix-7c77012
+      SOURCE_REPO: unslothai/llama.cpp
+      SOURCE_REF_KIND: mix
+      PROFILE: ${{ matrix.profile }}
+      LINE: ${{ matrix.line }}
+      KLASS: ${{ matrix.klass }}
+      RANK: ${{ matrix.rank }}
+      TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+      DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }}
+      ARCHS: ${{ matrix.archs }}
+      SMS: ''
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (the real leg's step)
+        env:
+          ARCH_INPUT: ${{ matrix.arch }}
+          CUDA_INPUT: ${{ matrix.cuda }}
+        run: bash h/install_toolkit.sh
+
+      - name: Fetch the published bundle and its source
+        run: |
+          set -euo pipefail
+          bundle="app-$LLAMA_TAG-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz"
+          gh release download "$LLAMA_TAG" --repo unslothai/llama.cpp --pattern "$bundle" --pattern "llama.cpp-source-$LLAMA_TAG.tar.gz" --pattern llama-prebuilt-manifest.json
+          mkdir -p main_bundle src/build/bin
+          tar -xzf "$bundle" -C main_bundle
+          tar -xzf "llama.cpp-source-$LLAMA_TAG.tar.gz" -C src --strip-components=1
+          echo "SOURCE_COMMIT=$(python3 -c 'import json; print(json.load(open("llama-prebuilt-manifest.json"))["source_commit"])')" >> "$GITHUB_ENV"
+          ( cd main_bundle && for f in *; do case "$f" in BUILD_INFO.txt|THIRD_PARTY_LICENSES.txt|UNSLOTH_PREBUILT_INFO.json) ;; *) cp -a "$f" ../src/build/bin/ ;; esac; done )
+          echo "CUDA_PATH=$CUDA_PATH"
+          ls -l "$CUDA_PATH"/lib/libcudart.so* "$CUDA_PATH"/lib/libcublas.so* "$CUDA_PATH"/lib/libcublasLt.so*
+
+      - name: Package as master does (control)
+        env:
+          OUT_DIR: ${{ github.workspace }}/dist_master
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: New step, copy the CUDA runtime into the bundle (verbatim)
+        env:
+          CUDA_INPUT: ${{ matrix.cuda }}
+        run: bash h/copy_runtime.sh
+
+      - name: Package bundle with the runtime
+        env:
+          OUT_DIR: ${{ github.workspace }}/dist
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Compare the archives and the manifest entries
+        run: |
+          python3 - <<'PY'
+          import os, sys, tarfile
+          sys.path.insert(0, "tooling/scripts/unsloth")
+          sys.dont_write_bytecode = True
+          import assemble_metadata as am
+          tag, arch, prof = os.environ["LLAMA_TAG"], os.environ["ARCH"], os.environ["PROFILE"]
+          name = f"app-{tag}-linux-{arch}-{prof}.tar.gz"
+          skip = {"BUILD_INFO.txt", "THIRD_PARTY_LICENSES.txt", "UNSLOTH_PREBUILT_INFO.json"}
+          def files(path):
+              with tarfile.open(path) as t:
+                  return {m.name.removeprefix("./") for m in t.getmembers() if not m.isdir()} - skip
+          pub, ctl, pr = files(name), files(f"dist_master/{name}"), files(f"dist/{name}")
+          for label, path in (("published", name), ("master packaging", f"dist_master/{name}"), ("with the runtime", f"dist/{name}")):
+              print(f"RESULT size {label}: {os.path.getsize(path) / 1048576:.1f} MiB, {len(files(path))} files")
+          print("RESULT master packaging vs published, files differ:", sorted(pub ^ ctl) or "none")
+          print("RESULT the change adds:", sorted(pr - pub), "removes:", sorted(pub - pr) or "none")
+          for label, path in (("published", name), ("master packaging", f"dist_master/{name}"), ("with the runtime", f"dist/{name}")):
+              entry = am.build_artifacts([(name, "linux", arch, am.read_bundle_info(__import__("pathlib").Path(path)))], [], [], [], [])[0]
+              print(f"RESULT manifest entry, {label}: bundles_cuda_runtime={entry['bundles_cuda_runtime']} install_kind={entry['install_kind']}")
+          assert pub == ctl, "harness packaging does not reproduce the published file list"
+          added = sorted(pr - pub)
+          assert len(added) == 3 and [a.split(".so.")[0] for a in added] == ["libcublas", "libcublasLt", "libcudart"], added
+          assert not (pub - pr)
+          PY
+
+      - name: Build the libcuda.so.1 stand-in (the runner has no NVIDIA driver)
+        run: |
+          set -euo pipefail
+          mkdir -p driver x_main x_cand
+          nm -D --undefined-only main_bundle/libggml-cuda.so | awk '{print $NF}' | grep -E '^cu[A-Z]' | sort -u > driver/syms.txt
+          echo "driver API symbols libggml-cuda.so needs: $(tr '\n' ' ' < driver/syms.txt)"
+          sed 's/.*/int &(void) { return 999; }/' driver/syms.txt > driver/stub.c
+          gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o driver/libcuda.so.1 driver/stub.c
+          tar -xzf "app-$LLAMA_TAG-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz" -C x_main
+          tar -xzf "dist/app-$LLAMA_TAG-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz" -C x_cand
+
+      - name: MAIN, the published bundle in a clean container
+        run: docker run --rm -v "$PWD/x_main:/b:ro" -v "$PWD/driver:/driver:ro" -v "$PWD/h:/h:ro" ${{ matrix.image }} bash /h/probe.sh MAIN | tee main.log
+
+      - name: CANDIDATE, the bundle with the runtime in a clean container
+        run: docker run --rm -v "$PWD/x_cand:/b:ro" -v "$PWD/driver:/driver:ro" -v "$PWD/h:/h:ro" ${{ matrix.image }} bash /h/probe.sh CANDIDATE | tee cand.log
+
+      - name: Verdict
+        run: |
+          set -euo pipefail
+          grep -h '^RESULT' main.log cand.log | grep -v 'list-devices'
+          grep -q 'RESULT MAIN CUDA runtime libs on the system: 0' main.log
+          grep -q 'RESULT MAIN ldd libggml-cuda.so not found (driver stand-in): \[.*libcublas' main.log
+          grep -q 'RESULT CANDIDATE ldd libggml-cuda.so not found (driver stand-in): \[\]' cand.log
+          ! grep -q 'ggml_cuda_init' main.log
+          grep -q 'ggml_cuda_init' cand.log
+          echo "RESULT VERDICT: the published bundle cannot load libggml-cuda.so; with the runtime it loads and reaches ggml_cuda_init"
