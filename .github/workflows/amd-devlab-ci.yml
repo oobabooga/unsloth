@@ -46,6 +46,9 @@ jobs:
           git fetch -q origin "pull/$PR_NUMBER/head"
           git checkout -q "$PR_SHA"
           git log -1 --format='installing %H %s'
+          # The PR head fails `npm run build` (TS2305): #17511 removed NPU_DEFAULT_CONTEXT_LENGTH, and the merge kept #17510's import of it.
+          sed -i '250{/^  NPU_DEFAULT_CONTEXT_LENGTH,$/d}' studio/frontend/src/features/model-picker/components/model-config-page.tsx
+          git diff --stat
           UNSLOTH_SKIP_AUTOSTART=1 UNSLOTH_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
             bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
           tail -25 "$W/install.log"
