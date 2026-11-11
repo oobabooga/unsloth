@@ -24,7 +24,9 @@ jobs:
         run: |
           set -euo pipefail
           W="$RUNNER_TEMP/npu-fix-$GITHUB_RUN_ID"; mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
-          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; echo "PW=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"; } >> "$GITHUB_ENV"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          # Kept in a file, never in the job environment: Actions prints step env in the public log.
+          python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > "$W/pw"; chmod 600 "$W/pw"
           export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
           git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
           cd "$W/src"; git fetch -q origin pull/17519/head; git checkout -q "$STACK_SHA"
@@ -34,8 +36,8 @@ jobs:
         shell: bash {0}
         run: |
           bash harness/serve.sh 18871 || exit 1
-          python3 harness/npu_check.py http://127.0.0.1:18871 "$PW" "$W/out/a-stack.json" stack
-          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -v "$PW" | tail -30 > "$W/out/a-lemonade.txt"; cat "$W/out/a-lemonade.txt"
+          python3 harness/npu_check.py http://127.0.0.1:18871 "$(cat $W/pw)" "$W/out/a-stack.json" stack
+          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -vF "$(cat $W/pw)" | tail -30 > "$W/out/a-lemonade.txt"; cat "$W/out/a-lemonade.txt"
           kill -TERM "$(cat $W/studio.pid)"; for i in $(seq 1 60); do kill -0 "$(cat $W/studio.pid)" 2>/dev/null || break; sleep 1; done
           pkill -f "$W/studio/lemonade" || true; sleep 3
       - name: B - stack with the review fixes
@@ -44,8 +46,8 @@ jobs:
           cd "$W/src" && git apply "$GITHUB_WORKSPACE/harness/stackfix.patch" && git diff --stat | tail -1
           cd "$GITHUB_WORKSPACE"
           bash harness/serve.sh 18872 || exit 1
-          python3 harness/npu_check.py http://127.0.0.1:18872 "$PW" "$W/out/b-fixed.json" fixed
-          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -v "$PW" | tail -30 > "$W/out/b-lemonade.txt"; cat "$W/out/b-lemonade.txt"
+          python3 harness/npu_check.py http://127.0.0.1:18872 "$(cat $W/pw)" "$W/out/b-fixed.json" fixed
+          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -vF "$(cat $W/pw)" | tail -30 > "$W/out/b-lemonade.txt"; cat "$W/out/b-lemonade.txt"
           kill -TERM "$(cat $W/studio.pid)"; sleep 5; pkill -f "$W/studio/lemonade" || true
       - uses: actions/upload-artifact@v4
         if: always()

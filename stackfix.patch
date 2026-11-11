@@ -1,5 +1,5 @@
 diff --git a/studio/backend/core/inference/flm_files.py b/studio/backend/core/inference/flm_files.py
-index 63b0c8170b..7082d9a876 100644
+index 63b0c8170b5..7082d9a876c 100644
 --- a/studio/backend/core/inference/flm_files.py
 +++ b/studio/backend/core/inference/flm_files.py
 @@ -13,7 +13,6 @@ import os
@@ -11,7 +11,7 @@ index 63b0c8170b..7082d9a876 100644
  from functools import lru_cache
  from pathlib import Path
 diff --git a/studio/backend/core/inference/npu_backend.py b/studio/backend/core/inference/npu_backend.py
-index b302233926..af2719fb29 100644
+index b302233926e..af2719fb29c 100644
 --- a/studio/backend/core/inference/npu_backend.py
 +++ b/studio/backend/core/inference/npu_backend.py
 @@ -30,6 +30,7 @@ from core.inference.flm_files import (
@@ -56,7 +56,7 @@ index b302233926..af2719fb29 100644
                  if flm_args:
                      json_body["flm_args"] = flm_args
 diff --git a/studio/backend/core/inference/npu_flm_args.py b/studio/backend/core/inference/npu_flm_args.py
-index 2ff8a7bc3e..732713408d 100644
+index 2ff8a7bc3ec..732713408de 100644
 --- a/studio/backend/core/inference/npu_flm_args.py
 +++ b/studio/backend/core/inference/npu_flm_args.py
 @@ -25,13 +25,10 @@ def _int(value: Any) -> Optional[int]:
@@ -105,7 +105,7 @@ index 2ff8a7bc3e..732713408d 100644
      """The status fields for a resident load's ``flm_args``."""
      tokens = (flm_args or "").split()
 diff --git a/studio/backend/routes/inference.py b/studio/backend/routes/inference.py
-index 82464dab48..b0efc6b40b 100644
+index 82464dab48a..b0efc6b40b1 100644
 --- a/studio/backend/routes/inference.py
 +++ b/studio/backend/routes/inference.py
 @@ -18845,7 +18845,11 @@ async def _managed_engine_options(request, config, hf_token) -> dict:
@@ -166,8 +166,20 @@ index 82464dab48..b0efc6b40b 100644
      ):
          account_access.join_resident("chat")
          return _npu_load_response(resident, "already_loaded", _npu_loaded_flm_args(npu))
+diff --git a/studio/backend/tests/multi_account/factories_media.py b/studio/backend/tests/multi_account/factories_media.py
+index 784ae2c770c..75115f0a944 100644
+--- a/studio/backend/tests/multi_account/factories_media.py
++++ b/studio/backend/tests/multi_account/factories_media.py
+@@ -518,6 +518,7 @@ SKIPPED = {
+         "launches the backend host's default app for the file and is owner-only "
+         "(require_installation_owner), so no account other than the installation's own reaches it"
+     ),
++    "routes.npu:DELETE:/checkpoints/{checkpoint}": _NPU_INSTALLATION_MODEL,
+     "routes.npu:DELETE:/models/{model_id}": _NPU_INSTALLATION_MODEL,
+     "routes.npu:POST:/models/{model_id}/download": _NPU_INSTALLATION_MODEL,
+     "routes.npu:GET:/models/{model_id}/download": _NPU_INSTALLATION_MODEL,
 diff --git a/studio/backend/tests/test_native_context_length.py b/studio/backend/tests/test_native_context_length.py
-index 3fe189cabe..f5e2850aee 100644
+index 3fe189cabe9..f5e2850aee5 100644
 --- a/studio/backend/tests/test_native_context_length.py
 +++ b/studio/backend/tests/test_native_context_length.py
 @@ -395,8 +395,12 @@ class TestRouteCompleteness:
@@ -186,7 +198,7 @@ index 3fe189cabe..f5e2850aee 100644
      def test_non_gguf_load_responses_set_runtime_context_length(self):
          """Non-GGUF LoadResponse blocks report runtime context_length."""
 diff --git a/studio/backend/tests/test_npu_backend.py b/studio/backend/tests/test_npu_backend.py
-index fff0b94441..240b6ab86f 100644
+index fff0b94441b..240b6ab86f0 100644
 --- a/studio/backend/tests/test_npu_backend.py
 +++ b/studio/backend/tests/test_npu_backend.py
 @@ -297,7 +297,8 @@ def test_a_cancelled_download_keeps_its_partial_and_never_registers(npu, flm_man
@@ -200,7 +212,7 @@ index fff0b94441..240b6ab86f 100644
      folder = npu.root / "flm" / "models" / "Qwen3-0.6B-NPU2"
      assert (folder / "model.q4nx.partial").stat().st_size > 0
 diff --git a/studio/backend/tests/test_npu_flm_args.py b/studio/backend/tests/test_npu_flm_args.py
-index 40cda952ab..4865efe333 100644
+index 40cda952ab5..4865efe333a 100644
 --- a/studio/backend/tests/test_npu_flm_args.py
 +++ b/studio/backend/tests/test_npu_flm_args.py
 @@ -11,7 +11,7 @@ import pytest
@@ -275,7 +287,7 @@ index 40cda952ab..4865efe333 100644
  
  def test_image_pre_resize_reaches_vision_models_only(monkeypatch):
 diff --git a/studio/backend/tests/test_npu_load_percent.py b/studio/backend/tests/test_npu_load_percent.py
-index 6c8a8c8ead..c9f2d3365a 100644
+index 6c8a8c8ead3..c9f2d3365af 100644
 --- a/studio/backend/tests/test_npu_load_percent.py
 +++ b/studio/backend/tests/test_npu_load_percent.py
 @@ -88,6 +88,17 @@ def test_no_luid_for_the_npu_is_unknown(host):
@@ -297,7 +309,7 @@ index 6c8a8c8ead..c9f2d3365a 100644
      host["counters"] = "pid_10_luid_0x00000000_0x0001a5c9_phys_0_eng_0_engtype_Compute|0\n"
      assert hw.npu_load_percent() == 0.0
 diff --git a/studio/backend/tests/test_npu_storage.py b/studio/backend/tests/test_npu_storage.py
-index 6bb2f2f212..d897005874 100644
+index 6bb2f2f212e..d8970058746 100644
 --- a/studio/backend/tests/test_npu_storage.py
 +++ b/studio/backend/tests/test_npu_storage.py
 @@ -144,6 +144,13 @@ def test_the_breakdown_names_each_model_folder_by_checkpoint(npu_home):
@@ -328,7 +340,7 @@ index 6bb2f2f212..d897005874 100644
              return iter(())
  
 diff --git a/studio/backend/utils/hardware/hardware.py b/studio/backend/utils/hardware/hardware.py
-index 3a45e08f99..2f35984160 100644
+index 3a45e08f99f..2f359841606 100644
 --- a/studio/backend/utils/hardware/hardware.py
 +++ b/studio/backend/utils/hardware/hardware.py
 @@ -3851,7 +3851,8 @@ def npu_load_percent() -> Optional[float]:
@@ -350,7 +362,7 @@ index 3a45e08f99..2f35984160 100644
              if load is None and now - _npu_luid_at >= _NPU_LUID_TTL_S:
                  _npu_luid = None
 diff --git a/studio/frontend/tests/slider-draft.test.ts b/studio/frontend/tests/slider-draft.test.ts
-index af6bdac593..9095379529 100644
+index af6bdac5936..90953795299 100644
 --- a/studio/frontend/tests/slider-draft.test.ts
 +++ b/studio/frontend/tests/slider-draft.test.ts
 @@ -251,7 +251,7 @@ test("what an owner shows beside its slider follows the drag", () => {
@@ -362,3 +374,35 @@ index af6bdac593..9095379529 100644
    assert.match(picker, /\{renderWarning\(shown\)\}/);
    const music = readSrc("features/audio/components/music-edit-inputs.tsx");
    assert.match(music, /onDraft=\{setDraggedExtendS\}/);
+diff --git a/tests/studio/test_model_picker_contracts.py b/tests/studio/test_model_picker_contracts.py
+index c9060d2187a..5d61b7767e5 100644
+--- a/tests/studio/test_model_picker_contracts.py
++++ b/tests/studio/test_model_picker_contracts.py
+@@ -1120,7 +1120,7 @@ def test_same_click_commit_covers_all_numeric_inputs():
+     assert "const effectiveMaxSeqLengthValue =" in page
+     assert "maxSeqLength: effectiveMaxSeqLengthValue" in page
+     assert (
+-        "Object.assign(pendingPatch, contextPinPatch(committedMaxSeqLength, pinsContextLength));"
++        "contextPinPatch(committedMaxSeqLength, pinsContextLength, config.npuPrefillChunkLen),"
+         in page
+     )
+ 
+@@ -1207,7 +1207,8 @@ def test_an_mlx_target_is_offered_a_context_length_not_a_sequence_length():
+     page = _read("features/model-picker/components/model-config-page.tsx")
+     assert 'const label = isMlx ? "Context Length" : "Max Seq Length";' in page
+     # A number, not a word: the placeholder is only for a window nobody has read.
+-    assert 'displayValue={isMlx && windowUnknown && !dragging ? "—" : undefined}' in page
++    assert "displayValue={isMlx && windowUnknown && !dragging ? unknownLabel : undefined}" in page
++    assert 'unknownLabel = "—",' in page
+     assert (
+         "savedContextPin(config) == null &&\n                mlxServedWindow == null &&\n"
+         "                npuServedWindow == null\n" in page
+@@ -1238,7 +1239,7 @@ def test_an_mlx_target_is_offered_a_context_length_not_a_sequence_length():
+     assert "final !== value || displayValue != null || derived;" in numeric
+     assert "if (isEdit(final)) {\n      onChange(final);\n    }\n    return final;" in numeric
+     assert "lastBlurCommittedRef.current = isEdit(final) ? final : null;" in numeric
+-    assert "update(contextPinPatch(value, pinsContextLength))" in page
++    assert "update(contextPinPatch(value, pinsContextLength, config.npuPrefillChunkLen))" in page
+     # "Anything not GGUF" would relabel CUDA; the platform decides.
+     assert (
+         "isServedByMlx(\n    target.isGguf,\n    platformDeviceType,\n    platformChatOnlyReason,\n  )"
