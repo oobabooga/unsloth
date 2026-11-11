@@ -1,0 +1,180 @@
+name: llama.cpp PR 362 loader test (HARNESS ONLY)
+
+# Takes the published Windows x64 CUDA bundle (what master ships), runs PR 362's copy step and
+# packaging on the same binaries with the same toolkit install as the real leg, and compares how
+# the Windows loader resolves ggml-cuda.dll before and after. No compile, nothing published.
+
+on:
+  push:
+    branches: [pr362-harness]
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: b12246-mix-7c77012
+
+jobs:
+  loader:
+    name: ${{ matrix.profile }}
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: cuda12-newer, cuda: '12.8.0', line: cuda12, toolkit_line: '12.8', klass: newer, rank: 20, archs: '86 89 90 100 120' }
+          - { profile: cuda13-newer, cuda: '13.3',   line: cuda13, toolkit_line: '13.3', klass: newer, rank: 50, archs: '86 89 90 100 120' }
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.11' }
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (the real leg's step)
+        env:
+          CUDA_INPUT: ${{ matrix.cuda }}
+        run: ./h/install_toolkit.ps1
+
+      - name: Fetch the published bundle and its source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "app-$env:LLAMA_TAG-windows-x64-${{ matrix.profile }}.zip"
+          gh release download $env:LLAMA_TAG --repo unslothai/llama.cpp --pattern $zip --pattern "llama.cpp-source-$env:LLAMA_TAG.tar.gz" --pattern llama-prebuilt-manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'download failed' }
+          Expand-Archive -Path $zip -DestinationPath main_bundle -Force
+          New-Item -ItemType Directory -Force -Path src | Out-Null
+          tar.exe -xzf "llama.cpp-source-$env:LLAMA_TAG.tar.gz" -C src --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'extract failed' }
+          $commit = (Get-Content llama-prebuilt-manifest.json | ConvertFrom-Json).source_commit
+          "SOURCE_COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "published zip: {0:N1} MiB" -f ((Get-Item $zip).Length / 1MB)
+          "CUDA_PATH=$env:CUDA_PATH"
+          Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -Recurse -Include 'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll' | ForEach-Object { '{0}  {1:N1} MiB' -f $_.FullName, ($_.Length / 1MB) }
+
+      - name: Build the nvcuda.dll stand-in (the runner has no NVIDIA driver)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Test-Path "$env:SystemRoot\System32\nvcuda.dll"
+          New-Item -ItemType Directory -Force -Path driver | Out-Null
+          python -B h/probe.py gen-stub main_bundle/ggml-cuda.dll driver/stub.c
+          if ($LASTEXITCODE -ne 0) { throw 'gen-stub failed' }
+          Push-Location driver
+          cl /nologo /LD stub.c /Fe:nvcuda.dll
+          if ($LASTEXITCODE -ne 0) { throw 'stub build failed' }
+          Pop-Location
+
+      - name: MAIN, the published bundle
+        run: python -B h/probe.py probe main_bundle driver MAIN | Tee-Object -FilePath main.log
+
+      - name: Stage the published binaries as the build tree
+        run: |
+          New-Item -ItemType Directory -Force -Path src/build/bin | Out-Null
+          Copy-Item main_bundle/*.dll, main_bundle/*.exe src/build/bin/ -Force
+          (Get-ChildItem src/build/bin).Count
+
+      - name: Package as master does (control)
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist_master
+          TAG: ${{ env.LLAMA_TAG }}
+          SOURCE_REPO: unslothai/llama.cpp
+          SOURCE_REF_KIND: mix
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted windows-2022, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+          SMS: ''
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: PR 362, copy the CUDA runtime into the bundle (verbatim step)
+        run: ./h/copy_runtime.ps1
+
+      - name: PR 362, package bundle (BUNDLE_CUDA_RUNTIME=1)
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ env.LLAMA_TAG }}
+          SOURCE_REPO: unslothai/llama.cpp
+          SOURCE_REF_KIND: mix
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          BUNDLE_CUDA_RUNTIME: '1'
+          DOCKER_IMAGE: github-hosted windows-2022, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+          SMS: ''
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Runtime copied but packaged without the flag (shows the flag is needed)
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist_noflag
+          TAG: ${{ env.LLAMA_TAG }}
+          SOURCE_REPO: unslothai/llama.cpp
+          SOURCE_REF_KIND: mix
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted windows-2022, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+          SMS: ''
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Compare the three archives
+        shell: python
+        run: |
+          import os, zipfile
+          tag, prof = os.environ["LLAMA_TAG"], "${{ matrix.profile }}"
+          name = f"app-{tag}-windows-x64-{prof}.zip"
+          def bins(path):
+              return {n for n in zipfile.ZipFile(path).namelist() if n.lower().endswith((".dll", ".exe"))}
+          pub, ctl, pr, noflag = bins(name), bins(f"dist_master/{name}"), bins(f"dist/{name}"), bins(f"dist_noflag/{name}")
+          for label, path in (("published", name), ("master packaging", f"dist_master/{name}"), ("PR 362", f"dist/{name}")):
+              print(f"RESULT size {label}: {os.path.getsize(path) / 1048576:.1f} MiB, {len(bins(path))} binaries")
+          print("RESULT master packaging vs published, binaries differ:", sorted(pub ^ ctl) or "none")
+          print("RESULT PR 362 adds:", sorted(pr - pub), "removes:", sorted(pub - pr) or "none")
+          print("RESULT runtime copied but no flag, extra binaries:", sorted(noflag - pub) or "none")
+          assert pub == ctl, "harness packaging does not reproduce the published file list"
+          added = sorted(n.lower() for n in pr - pub)
+          assert len(added) == 3 and [a.split("64_")[0] for a in added] == ["cublas", "cublaslt", "cudart"], added
+          assert not (pub - pr) and not (noflag - pub)
+
+      - name: CANDIDATE, the PR 362 bundle
+        run: |
+          Expand-Archive -Path "dist/app-$env:LLAMA_TAG-windows-x64-${{ matrix.profile }}.zip" -DestinationPath cand_bundle -Force
+          python -B h/probe.py probe cand_bundle driver CANDIDATE | Tee-Object -FilePath cand.log
+
+      - name: Verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -h '^RESULT' main.log cand.log | grep -v 'list-devices'
+          grep -q 'RESULT MAIN LoadLibrary(ggml-cuda.dll): FAILED' main.log
+          grep -q 'RESULT MAIN unresolved with nvcuda.dll present:  \[.*cudart64_' main.log
+          grep -q 'RESULT CANDIDATE unresolved with nvcuda.dll present:  none' cand.log
+          grep -q 'RESULT CANDIDATE LoadLibrary(ggml-cuda.dll): loaded' cand.log
+          echo "RESULT VERDICT: master bundle cannot load ggml-cuda.dll, PR 362 bundle can"
