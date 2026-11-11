@@ -1,0 +1,119 @@
+name: AMD DevLab NPU live session
+
+on:
+  push:
+    branches: [amd-devlab-npu-17519-live]
+
+permissions: {}
+
+jobs:
+  live:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 345
+    env:
+      PR_NUMBER: "17519"
+      PR_SHA: 395985bfeaed0fcdc8a0d3cebcc07882f5082a44
+      HOLD_MINUTES: "300"
+    steps:
+      - name: Hardware
+        run: |
+          uname -a
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          free -h
+          df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+          cat /sys/module/amdxdna/version 2>/dev/null || true
+          for c in /sys/class/drm/card*/device; do
+            [ -r "$c/mem_info_vram_total" ] && echo "$c vram=$(( $(cat "$c/mem_info_vram_total") >> 20 )) MiB gtt=$(( $(cat "$c/mem_info_gtt_total") >> 20 )) MiB"
+          done
+          true
+
+      - name: Install Studio from the PR
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-live-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          {
+            echo "W=$W"
+            echo "TMPDIR=$W/tmp"
+            echo "HF_HOME=$W/hf"
+            echo "UV_CACHE_DIR=$W/uv"
+            echo "UNSLOTH_STUDIO_HOME=$W/studio"
+          } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git fetch -q origin "pull/$PR_NUMBER/head"
+          git checkout -q "$PR_SHA"
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 UNSLOTH_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+            bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -25 "$W/install.log"
+          ls "$W/src/studio/frontend/dist/index.html" "$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+
+      - name: Serve Studio over a Cloudflare link
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          cat > "$W/pub.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAnLqo2J2fJzm+Ap72AzzU
+          NFNlh/MEwiZvTwYQdZxoiNQ93X5RjiikSVoBJJkWT2SmxCwkiMxr0XzoS6cHPON1
+          mtpybMLXErd6jxoB72QnwWuXYNDcLCKW9JTMD7RP1kTbh2Cpkn6/MY285EZZyYyW
+          hoih22D4boKSUKfmvNyCRMJHg5ezEPmSC/spc+pXipwxnl6oV1ramD7/UftTWtdr
+          eOobYQ27xugJ8chxPeOi4ohPauidzZuBF2kS2oEGTSBUIjUnmU8SkuAxN8RbK63E
+          8YH+CWIA9CXOJeh3xXJk4a4P+L+RVgE1LwNNiC2Pw+rdsJxhXzifsTlLxUzYSYZf
+          T0n2uStNJ1yQWeb+CnIrLHYeXm6li7KVFQnKpX85W2+pxtDVxsTPIbzsBaMIlSdT
+          HMb7SAa7hx/9+xHT/MS0GHrYKnI/7SIWRSB0CbSjaj63ZWVRi2V8Fr92yx/5GQtq
+          ffUw70SSKgfEqREgc8mhimsyRyz+FlQ5BeKraiozvor3kUIBUBXVS3Cz0y47qaaC
+          URsv4MuJmKkCOd4L97RWqIGYldkFw21MWJL5wSiEE1UBf2wihPYFDIX3j2Tojfot
+          11JclB2yBSmr1TvwkiUUhpta7+Jx8m6l8iyA/KwSca7DRdIIZAW5u7cao+9/8AI5
+          iWEXA+EvVj1XZU8pMZlO07MCAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          export PATH="$HOME/.local/bin:$PATH"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18800-18899 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          # The Actions log of this repository is public: never print the link or the password in clear.
+          redact() { grep -vF "$PW" | sed -E 's#https://[A-Za-z0-9-]+\.trycloudflare\.com#https://<redacted>.trycloudflare.com#g'; }
+          seal() { printf '%s\n%s\n' "$1" "$PW" | openssl pkeyutl -encrypt -pubin -inkey "$W/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | base64 -w0; }
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --secure --port "$PORT" > "$W/studio.log" 2>&1 &
+          SPID=$!
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" > /dev/null && break; kill -0 "$SPID" 2>/dev/null || break; sleep 1; done
+          if ! curl -sf "http://127.0.0.1:$PORT/api/health" > /dev/null; then echo "Studio did not start"; tail -120 "$W/studio.log" | redact; exit 1; fi
+          echo "Studio is up (pid $SPID)"
+          curl -s "http://127.0.0.1:$PORT/api/health" | head -c 600; echo
+          LAST=""; N=0
+          END=$(( $(date +%s) + HOLD_MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if ! kill -0 "$SPID" 2>/dev/null; then echo "Studio exited"; tail -120 "$W/studio.log" | redact; exit 1; fi
+            URL=$(grep -aoE 'https://[A-Za-z0-9-]+\.trycloudflare\.com' "$W/studio.log" | grep -v '//api\.' | tail -1)
+            if [ -n "$URL" ] && [ "$URL" != "$LAST" ]; then
+              LAST="$URL"
+              sleep 8
+              echo "public link status: $(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/api/health")"
+              echo "ACCESS-BLOB $(seal "$URL")"
+            fi
+            if [ -z "$LAST" ] && [ "$N" = 6 ]; then echo "no Cloudflare link after 3 minutes"; tail -60 "$W/studio.log" | redact; fi
+            N=$(( N + 1 ))
+            if [ $(( N % 20 )) = 0 ]; then
+              echo "alive, $(( (END - $(date +%s)) / 60 )) min left; $(free -g | awk '/Mem:/ {print "ram used " $3 "G of " $2 "G"}'); $(pgrep -fc 'lemond|flm' || true) lemond/flm procs"
+              grep -aiE 'npu|lemonade|fastflowlm|traceback|error' "$W/studio.log" | tail -5 | redact
+            fi
+            sleep 30
+          done
+          echo "hold time over, stopping"
+          kill -TERM "$SPID" 2>/dev/null
+          for i in $(seq 1 60); do kill -0 "$SPID" 2>/dev/null || break; sleep 1; done
+          pkill -KILL -f "$W/studio" 2>/dev/null || true
+          echo "======== NPU lines from the session"
+          grep -aiE 'npu|lemonade|fastflowlm|traceback' "$W/studio.log" | tail -200 | redact
+          exit 0
+
+      - name: Clean up
+        if: always()
+        run: |
+          pkill -KILL -f "$RUNNER_TEMP/npu-live-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-live-$GITHUB_RUN_ID"
