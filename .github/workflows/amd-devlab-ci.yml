@@ -85,31 +85,44 @@ jobs:
           if ! curl -sf "http://127.0.0.1:$PORT/api/health" > /dev/null; then echo "Studio did not start"; tail -120 "$W/studio.log" | redact; exit 1; fi
           echo "Studio is up (pid $SPID)"
           curl -s "http://127.0.0.1:$PORT/api/health" | head -c 600; echo
-          LAST=""; N=0
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -aoE 'https://[A-Za-z0-9-]+\.trycloudflare\.com' "$W/studio.log" | grep -v '//api\.' | tail -1)
+            [ -n "$URL" ] && break
+            sleep 3
+          done
+          if [ -z "$URL" ]; then echo "no Cloudflare link after 3 minutes"; tail -80 "$W/studio.log" | redact; exit 1; fi
+          sleep 8
+          echo "public link status: $(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/api/health")"
+          mkdir -p "$GITHUB_WORKSPACE/access"
+          seal "$URL" > "$GITHUB_WORKSPACE/access/blob.txt"
+          echo "$SPID" > "$W/studio.pid"
+          echo "sealed access blob written"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: access-blob
+          path: access/blob.txt
+
+      - name: Hold the session open
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          SPID=$(cat "$W/studio.pid")
+          redact() { sed -E 's#https://[A-Za-z0-9-]+\.trycloudflare\.com#https://<redacted>.trycloudflare.com#g'; }
+          N=0
           END=$(( $(date +%s) + HOLD_MINUTES * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            if ! kill -0 "$SPID" 2>/dev/null; then echo "Studio exited"; tail -120 "$W/studio.log" | redact; exit 1; fi
-            URL=$(grep -aoE 'https://[A-Za-z0-9-]+\.trycloudflare\.com' "$W/studio.log" | grep -v '//api\.' | tail -1)
-            if [ -n "$URL" ] && [ "$URL" != "$LAST" ]; then
-              LAST="$URL"
-              sleep 8
-              echo "public link status: $(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/api/health")"
-              echo "ACCESS-BLOB $(seal "$URL")"
-            fi
-            if [ -z "$LAST" ] && [ "$N" = 6 ]; then echo "no Cloudflare link after 3 minutes"; tail -60 "$W/studio.log" | redact; fi
+            if ! kill -0 "$SPID" 2>/dev/null; then echo "Studio exited"; grep -aiE 'traceback|error|npu|lemonade' "$W/studio.log" | tail -80 | redact; exit 1; fi
             N=$(( N + 1 ))
             if [ $(( N % 20 )) = 0 ]; then
-              echo "alive, $(( (END - $(date +%s)) / 60 )) min left; $(free -g | awk '/Mem:/ {print "ram used " $3 "G of " $2 "G"}'); $(pgrep -fc 'lemond|flm' || true) lemond/flm procs"
-              grep -aiE 'npu|lemonade|fastflowlm|traceback|error' "$W/studio.log" | tail -5 | redact
+              echo "alive, $(( (END - $(date +%s)) / 60 )) min left; $(free -g | awk '/Mem:/ {print "ram used " $3 "G of " $2 "G"}')"
             fi
             sleep 30
           done
           echo "hold time over, stopping"
           kill -TERM "$SPID" 2>/dev/null
           for i in $(seq 1 60); do kill -0 "$SPID" 2>/dev/null || break; sleep 1; done
-          pkill -KILL -f "$W/studio" 2>/dev/null || true
-          echo "======== NPU lines from the session"
-          grep -aiE 'npu|lemonade|fastflowlm|traceback' "$W/studio.log" | tail -200 | redact
           exit 0
 
       - name: Clean up
