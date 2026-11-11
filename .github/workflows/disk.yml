@@ -1,0 +1,13 @@
+name: assemble runner disk (HARNESS ONLY)
+on:
+  push:
+    branches: [pr362-disk]
+permissions: {}
+jobs:
+  disk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | sed 's/^/RESULT /'
+          df -BG --output=avail "$GITHUB_WORKSPACE" | tail -1 | sed 's/^/RESULT workspace avail: /'
