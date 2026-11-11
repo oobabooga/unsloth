@@ -1,0 +1,57 @@
+name: NPU stack fix check
+
+on:
+  push:
+    branches: [amd-devlab-npu-fixcheck]
+
+permissions:
+  contents: read
+
+jobs:
+  npu:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      STACK_SHA: 0b27683dc5e26c1b866b1b162a15810db40a820a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Hardware
+        run: |
+          uname -r; free -g | head -2; ls -l /dev/accel* || true; cat /sys/module/amdxdna/version || true
+      - name: Install Studio from the stack head
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-fix-$GITHUB_RUN_ID"; mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; echo "PW=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"; git fetch -q origin pull/17519/head; git checkout -q "$STACK_SHA"
+          UNSLOTH_SKIP_AUTOSTART=1 UNSLOTH_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -120 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+      - name: A - stack head as pushed
+        shell: bash {0}
+        run: |
+          bash harness/serve.sh 18871 || exit 1
+          python3 harness/npu_check.py http://127.0.0.1:18871 "$PW" "$W/out/a-stack.json" stack
+          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -v "$PW" | tail -30 > "$W/out/a-lemonade.txt"; cat "$W/out/a-lemonade.txt"
+          kill -TERM "$(cat $W/studio.pid)"; for i in $(seq 1 60); do kill -0 "$(cat $W/studio.pid)" 2>/dev/null || break; sleep 1; done
+          pkill -f "$W/studio/lemonade" || true; sleep 3
+      - name: B - stack with the review fixes
+        shell: bash {0}
+        run: |
+          cd "$W/src" && git apply "$GITHUB_WORKSPACE/harness/stackfix.patch" && git diff --stat | tail -1
+          cd "$GITHUB_WORKSPACE"
+          bash harness/serve.sh 18872 || exit 1
+          python3 harness/npu_check.py http://127.0.0.1:18872 "$PW" "$W/out/b-fixed.json" fixed
+          grep -ahE "prefill|ctx-len|flm_args|Failed" "$W"/studio/logs/lemonade/*.log | grep -v "$PW" | tail -30 > "$W/out/b-lemonade.txt"; cat "$W/out/b-lemonade.txt"
+          kill -TERM "$(cat $W/studio.pid)"; sleep 5; pkill -f "$W/studio/lemonade" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-fixcheck
+          path: ${{ env.W }}/out/
+      - name: Clean up
+        if: always()
+        run: pkill -KILL -f "$RUNNER_TEMP/npu-fix-$GITHUB_RUN_ID" || true; rm -rf "$RUNNER_TEMP/npu-fix-$GITHUB_RUN_ID"
