@@ -1,0 +1,152 @@
+name: AMD DevLab NPU live session (Windows)
+
+on:
+  push:
+    branches: [amd-devlab-npu-17519-live-win]
+
+permissions: {}
+
+jobs:
+  live:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 200
+    env:
+      PR_NUMBER: "17519"
+      PR_SHA: 395985bfeaed0fcdc8a0d3cebcc07882f5082a44
+      HOLD_MINUTES: "120"
+    steps:
+      - name: Install Studio from the PR
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP "npu-live-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path "$W\tmp","$W\hf","$W\uv" | Out-Null
+          "W=$W" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HF_HOME=$W\hf" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_CACHE_DIR=$W\uv" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UNSLOTH_STUDIO_HOME=$W\studio" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:HF_HOME = "$W\hf"; $env:UV_CACHE_DIR = "$W\uv"; $env:UNSLOTH_STUDIO_HOME = "$W\studio"
+          git clone -q --no-checkout --filter=blob:none https://github.com/unslothai/unsloth.git "$W\src"
+          Set-Location "$W\src"
+          git config core.autocrlf false
+          git fetch -q origin "pull/$env:PR_NUMBER/head"
+          git checkout -q $env:PR_SHA
+          git log -1 --format='installing %H %s'
+          # The PR head fails `npm run build` (TS2305): #17511 removed NPU_DEFAULT_CONTEXT_LENGTH, and the merge kept #17510's import of it.
+          $f = Join-Path "$W\src" 'studio\frontend\src\features\model-picker\components\model-config-page.tsx'
+          $lines = [System.IO.File]::ReadAllLines($f)
+          if ($lines[249].Trim() -ne 'NPU_DEFAULT_CONTEXT_LENGTH,') { throw "unexpected line 250: $($lines[249])" }
+          [System.IO.File]::WriteAllLines($f, [string[]]($lines[0..248] + $lines[250..($lines.Length - 1)]))
+          git diff --stat
+          $env:UNSLOTH_SKIP_AUTOSTART = '1'
+          $ErrorActionPreference = 'Continue'
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --local --no-torch --no-rollback *> "$W\install.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\install.log" -Tail 60
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+          if (-not (Test-Path "$W\src\studio\frontend\dist\index.html")) { throw "no frontend build" }
+
+      - name: Serve Studio over a Cloudflare link
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = $env:W
+          $PY = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          $PORT = Get-Random -Minimum 18800 -Maximum 18899
+          $bytes = New-Object byte[] 18
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $PW = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
+          # The Actions log of this repository is public: never print the link or the password in clear.
+          function Redact($lines) { $lines | Where-Object { $_ -notlike "*$PW*" } | ForEach-Object { $_ -replace 'https://[A-Za-z0-9-]+\.trycloudflare\.com', 'https://<redacted>.trycloudflare.com' } }
+          $env:UNSLOTH_STUDIO_PASSWORD = $PW
+          $env:PYTHONUTF8 = '1'
+          $env:PYTHONIOENCODING = 'utf-8'
+          $proc = Start-Process -FilePath $PY -ArgumentList @('run.py', '--secure', '--port', "$PORT") -WorkingDirectory "$W\src\studio\backend" -RedirectStandardOutput "$W\studio.out" -RedirectStandardError "$W\studio.err" -PassThru -WindowStyle Hidden
+          Remove-Item Env:UNSLOTH_STUDIO_PASSWORD
+          $up = $false
+          for ($i = 0; $i -lt 300; $i++) {
+            try { Invoke-RestMethod "http://127.0.0.1:$PORT/api/health" | Out-Null; $up = $true; break } catch { Start-Sleep 1 }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $up) { Write-Host "Studio did not start"; Redact (Get-Content "$W\studio.out", "$W\studio.err" -Tail 120 -ErrorAction SilentlyContinue); exit 1 }
+          Write-Host "Studio is up (pid $($proc.Id))"
+          $URL = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $m = Select-String -Path "$W\studio.out", "$W\studio.err" -Pattern 'https://(?!api\.)[A-Za-z0-9-]+\.trycloudflare\.com' -AllMatches -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($m) { $URL = $m.Matches[$m.Matches.Count - 1].Value; break }
+            Start-Sleep 3
+          }
+          if (-not $URL) { Write-Host "no Cloudflare link after 3 minutes"; Redact (Get-Content "$W\studio.out", "$W\studio.err" -Tail 80 -ErrorAction SilentlyContinue); exit 1 }
+          Start-Sleep 8
+          try { $code = (Invoke-WebRequest "$URL/api/health" -UseBasicParsing -TimeoutSec 20).StatusCode } catch { $code = "error: $($_.Exception.Message)" }
+          Write-Host "public link status: $code"
+          @'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAnLqo2J2fJzm+Ap72AzzU
+          NFNlh/MEwiZvTwYQdZxoiNQ93X5RjiikSVoBJJkWT2SmxCwkiMxr0XzoS6cHPON1
+          mtpybMLXErd6jxoB72QnwWuXYNDcLCKW9JTMD7RP1kTbh2Cpkn6/MY285EZZyYyW
+          hoih22D4boKSUKfmvNyCRMJHg5ezEPmSC/spc+pXipwxnl6oV1ramD7/UftTWtdr
+          eOobYQ27xugJ8chxPeOi4ohPauidzZuBF2kS2oEGTSBUIjUnmU8SkuAxN8RbK63E
+          8YH+CWIA9CXOJeh3xXJk4a4P+L+RVgE1LwNNiC2Pw+rdsJxhXzifsTlLxUzYSYZf
+          T0n2uStNJ1yQWeb+CnIrLHYeXm6li7KVFQnKpX85W2+pxtDVxsTPIbzsBaMIlSdT
+          HMb7SAa7hx/9+xHT/MS0GHrYKnI/7SIWRSB0CbSjaj63ZWVRi2V8Fr92yx/5GQtq
+          ffUw70SSKgfEqREgc8mhimsyRyz+FlQ5BeKraiozvor3kUIBUBXVS3Cz0y47qaaC
+          URsv4MuJmKkCOd4L97RWqIGYldkFw21MWJL5wSiEE1UBf2wihPYFDIX3j2Tojfot
+          11JclB2yBSmr1TvwkiUUhpta7+Jx8m6l8iyA/KwSca7DRdIIZAW5u7cao+9/8AI5
+          iWEXA+EvVj1XZU8pMZlO07MCAwEAAQ==
+          -----END PUBLIC KEY-----
+          '@ | Out-File -Encoding ascii "$W\pub.pem"
+          @'
+          import base64, sys
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          key = serialization.load_pem_public_key(open(sys.argv[1], "rb").read())
+          msg = (sys.argv[2] + "\n" + sys.argv[3] + "\n").encode()
+          pad = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+          open(sys.argv[4], "w").write(base64.b64encode(key.encrypt(msg, pad)).decode())
+          '@ | Out-File -Encoding ascii "$W\seal.py"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\access" | Out-Null
+          & $PY "$W\seal.py" "$W\pub.pem" $URL $PW "$env:GITHUB_WORKSPACE\access\blob.txt"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$env:GITHUB_WORKSPACE\access\blob.txt")) { Write-Host "sealing failed"; exit 1 }
+          "$($proc.Id)" | Out-File -Encoding ascii "$W\studio.pid"
+          Write-Host "sealed access blob written"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: access-blob
+          path: access/blob.txt
+
+      - name: Hold the session open
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = $env:W
+          $spid = [int](Get-Content "$W\studio.pid")
+          $end = (Get-Date).AddMinutes([int]$env:HOLD_MINUTES)
+          $n = 0
+          while ((Get-Date) -lt $end) {
+            if (-not (Get-Process -Id $spid -ErrorAction SilentlyContinue)) {
+              Write-Host "Studio exited"
+              Select-String -Path "$W\studio.out", "$W\studio.err" -Pattern 'traceback|error|npu|lemonade' | Select-Object -Last 80 | ForEach-Object { $_.Line -replace 'https://[A-Za-z0-9-]+\.trycloudflare\.com', 'https://<redacted>.trycloudflare.com' }
+              exit 1
+            }
+            $n++
+            if ($n % 20 -eq 0) { Write-Host "alive, $([int]($end - (Get-Date)).TotalMinutes) min left" }
+            Start-Sleep 30
+          }
+          Write-Host "hold time over, stopping"
+          Stop-Process -Id $spid -Force -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Clean up
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $W = Join-Path $env:RUNNER_TEMP "npu-live-$env:GITHUB_RUN_ID"
+          Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$W*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Get-Process | Where-Object { $_.ProcessName -match '^(lemond|flm|cloudflared)$' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 3
+          Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue
+          exit 0
