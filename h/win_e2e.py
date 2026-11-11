@@ -13,6 +13,12 @@ sys.dont_write_bytecode = True
 studio, install_dir = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
 driver_ver = tuple(int(x) for x in sys.argv[3].split("."))
 cap, driver, label, mode = sys.argv[4], Path(sys.argv[5]).resolve(), sys.argv[6], sys.argv[7]
+# A dir the host has on PATH (a CUDA toolkit's bin); the installer and the launch both see it.
+extra = [d for d in os.environ.get("E2E_EXTRA_PATH", "").split(os.pathsep) if d]
+for name in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_RUNTIME_DLL_DIR"):
+    os.environ.pop(name, None)
+if extra:
+    os.environ["PATH"] = os.pathsep.join([*extra, os.environ["PATH"]])
 sys.path.insert(0, str(studio))
 spec = importlib.util.spec_from_file_location("ilp", studio / "install_llama_prebuilt.py")
 m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m; spec.loader.exec_module(m)
@@ -65,7 +71,9 @@ else:
     bundle = hits[0].parent
     system32 = Path(os.environ["SystemRoot"]) / "System32"
     env = {k: v for k, v in os.environ.items() if k.upper() not in ("PATH", "CUDA_PATH", "CUDA_HOME")}
-    env["PATH"] = os.pathsep.join([str(bundle), *dirs, str(system32), str(system32.parent), str(driver)])
+    # What llama_cpp.py puts on llama-server's PATH: the binary dir, the pip nvidia dirs, CUDA_PATH's
+    # bin (unset here), then the inherited PATH (reduced to the test's extra dir and System32).
+    env["PATH"] = os.pathsep.join([str(bundle), *dirs, *extra, str(system32), str(system32.parent), str(driver)])
     load = ("import ctypes, sys\nk = ctypes.WinDLL('kernel32', use_last_error=True)\nk.LoadLibraryExW.restype = ctypes.c_void_p\n"
             "k.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]\nk.SetErrorMode(0x8003)\n"
             "h = k.LoadLibraryExW(sys.argv[1], None, 0x8)\nprint('loaded' if h else f'FAILED WinError {ctypes.get_last_error()}')\n")

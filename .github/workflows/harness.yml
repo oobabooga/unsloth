@@ -1,7 +1,7 @@
 name: unsloth PR 17463 Windows install test (HARNESS ONLY)
 
 # Runs Studio's real llama.cpp installer on Windows as a chat-only NVIDIA host would, with only host
-# detection replaced: once at ddcecd7579 (before the follow-up) and once at 0f9265c15f (the pushed follow-up commit).
+# detection replaced: once at 0f9265c15f (ORIGINAL here: the head reviewed earlier) and once at 907e50f558 (FIXED here: the current PR head).
 # Then checks whether ggml-cuda.dll loads through the search dirs Studio builds. Nothing published.
 
 on:
@@ -39,7 +39,7 @@ jobs:
       - name: Fetch the PR's studio code, before and after the follow-up commit
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($pair in @(@('pr_orig', 'ddcecd7579edd09d1c0aa7ac6128e80cea045353'), @('pr_fix', '0f9265c15f055e4a4746e1ca04b730420e12b6b3'))) {
+          foreach ($pair in @(@('pr_orig', '0f9265c15f055e4a4746e1ca04b730420e12b6b3'), @('pr_fix', '907e50f558211ec5145b77c2b2bcc24f13a8b58b'))) {
             git init -q $pair[0]
             git -C $pair[0] fetch -q --depth 1 https://github.com/LeoBorcherding/unsloth $pair[1]
             if ($LASTEXITCODE -ne 0) { throw "could not fetch $($pair[1])" }
@@ -96,14 +96,56 @@ jobs:
           & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver RERUN probe 2>&1 | Tee-Object -FilePath removed.log -Append
           & env_fix\Scripts\python.exe -B h/win_e2e.py pr_fix/studio install_fix ${{ matrix.driver }} ${{ matrix.cap }} driver RERUN check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath removed.log -Append
 
+      - name: Current head, a CUDA toolkit instead of the wheels
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = "$PWD\env_fix\Scripts\python.exe"
+          $env:PATH = "$PWD\env_fix\Scripts;$env:PATH"
+          $major = '${{ matrix.line }}'.Replace('cuda', '')
+          $site = "$PWD\env_fix\Lib\site-packages\nvidia"
+          New-Item -ItemType Directory -Force -Path tk_all\bin, tk_cudart\bin | Out-Null
+          foreach ($lib in 'cudart', 'cublas', 'cublasLt') {
+            $dll = Get-ChildItem -Path $site -Recurse -Filter "${lib}64_$major.dll" | Select-Object -First 1
+            if (-not $dll) { throw "no ${lib}64_$major.dll in the wheels" }
+            Copy-Item $dll.FullName tk_all\bin\
+            if ($lib -eq 'cudart') { Copy-Item $dll.FullName tk_cudart\bin\ }
+          }
+          $pf = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v$major.9\bin"
+          New-Item -ItemType Directory -Force -Path $pf | Out-Null
+          $pkgs = (& $py -m pip list --disable-pip-version-check --format=freeze) | Where-Object { $_ -match '^nvidia' } | ForEach-Object { ($_ -split '==')[0] }
+          & $py -m pip uninstall -y -q @pkgs
+          $a = @('pr_fix/studio', 'install_fix', '${{ matrix.driver }}', '${{ matrix.cap }}', 'driver')
+
+          'A toolkit on PATH with all three DLLs, CUDA_PATH unset'
+          $env:E2E_EXTRA_PATH = "$PWD\tk_all\bin"
+          & $py -B h/win_e2e.py @a ONPATH check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath toolkit.log
+          & $py -B h/win_e2e.py @a ONPATH probe 2>&1 | Tee-Object -FilePath toolkit.log -Append
+
+          'A runtime-only toolkit on PATH: cudart, no cublas'
+          $env:E2E_EXTRA_PATH = "$PWD\tk_cudart\bin"
+          & $py -B h/win_e2e.py @a CUDARTONLY check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath toolkit.log -Append
+          & $py -B h/win_e2e.py @a CUDARTONLY probe 2>&1 | Tee-Object -FilePath toolkit.log -Append
+
+          'A toolkit under Program Files that is not on PATH, CUDA_PATH unset'
+          Remove-Item Env:E2E_EXTRA_PATH
+          Copy-Item tk_all\bin\*.dll $pf
+          & $py -B h/win_e2e.py @a PROGFILES check 2>&1 | Select-String -Pattern 'RESULT' | ForEach-Object { $_.Line } | Tee-Object -FilePath toolkit.log -Append
+          & $py -B h/win_e2e.py @a PROGFILES probe 2>&1 | Tee-Object -FilePath toolkit.log -Append
+          Remove-Item -Recurse -Force (Split-Path $pf)
+
       - name: Verdict
         shell: bash
         run: |
           set -uo pipefail
-          grep -ah '^RESULT' orig.log fix.log removed.log | grep -v 'list-devices' | cut -c1-260
+          grep -ah '^RESULT' orig.log fix.log removed.log toolkit.log | grep -v 'list-devices' | cut -c1-260
           set -e
           grep -aq 'RESULT FIXED nvidia wheels in the env: \[' fix.log
           grep -aq 'RESULT FIXED LoadLibrary(ggml-cuda.dll): loaded' fix.log
           grep -aq 'RESULT FIXED --check-installed exit code: 0' fix.log
           grep -aq 'RESULT RERUN LoadLibrary(ggml-cuda.dll): loaded' removed.log
-          echo "RESULT VERDICT: with the follow-up a real chat-only style install gets the wheels and ggml-cuda.dll loads"
+          grep -aq 'RESULT ONPATH --check-installed exit code: 0' toolkit.log
+          grep -aq 'RESULT ONPATH LoadLibrary(ggml-cuda.dll): loaded' toolkit.log
+          grep -aq 'RESULT CUDARTONLY --check-installed exit code: 2' toolkit.log
+          echo "RESULT VERDICT: the current head installs the wheels, counts a toolkit on PATH, and still asks for the wheels when cublas is missing"
+          # Reported, not asserted either way:
+          grep -a 'RESULT PROGFILES' toolkit.log | grep -v 'list-devices' | sed 's/^/GAP CHECK: /'
