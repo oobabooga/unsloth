@@ -1,0 +1,124 @@
+name: NPU stack suite A/B
+
+on:
+  push:
+    branches: [amd-devlab-npu-suites]
+
+permissions:
+  contents: read
+
+env:
+  MAIN_SHA: 5d5c1381b01c92ef2a538ad5d7b356a5b896f3da
+  STACK_SHA: 0b27683dc5e26c1b866b1b162a15810db40a820a
+
+jobs:
+  suites:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Environment
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-suites-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/out" "$W/cache/uv" "$W/cache/pip" "$W/hf"
+          {
+            echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "UV_CACHE_DIR=$W/cache/uv"; echo "PIP_CACHE_DIR=$W/cache/pip"
+            echo "HF_HOME=$W/hf"; echo "CUDA_VISIBLE_DEVICES="; echo "HIP_VISIBLE_DEVICES="
+          } >> "$GITHUB_ENV"
+          nproc; free -g | head -2; df -h "$RUNNER_TEMP" | tail -1
+      - name: Trees
+        run: |
+          set -euo pipefail
+          cd "$W"
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git src
+          cd src
+          git config user.name ci; git config user.email ci@example.invalid
+          PRS="17505 17506 17507 17508 17509 17510 17511 17512 17513 17514 17515 17520 17521 17522 17523 17525 17526 17530 17531 17532 17533 17534 17535 17539"
+          git fetch -q origin "$MAIN_SHA" pull/17519/head $(for n in $PRS; do echo "pull/$n/head:refs/pr/$n"; done)
+          git worktree add -q --detach "$W/main" "$MAIN_SHA"
+          git worktree add -q --detach "$W/int" "$STACK_SHA"
+          (cd "$W/int" && git merge -q --no-edit "$MAIN_SHA" && for p in "$GITHUB_WORKSPACE"/harness/patches/int/*.patch; do [ -e "$p" ] && git am -q "$p"; done; git log --oneline -3)
+          for n in $PRS; do
+            git worktree add -q --detach "$W/pr$n" "refs/pr/$n"
+            (cd "$W/pr$n" && for p in "$GITHUB_WORKSPACE"/harness/patches/$n/*.patch; do [ -e "$p" ] && git am -q "$p" && echo "patched $n with $(basename $p)"; done; true)
+          done
+          echo "PRS=$PRS" >> "$GITHUB_ENV"
+      - name: Python 3.13 test venv (Backend CI's CPU dependency set)
+        run: |
+          set -euo pipefail
+          python3 -m pip install -q --user uv
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install 3.13 >/dev/null
+          uv venv -q -p 3.13 "$W/venv"
+          . "$W/venv/bin/activate"
+          cd "$W/int"
+          uv pip install -q -r studio/backend/requirements/studio.txt
+          uv pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' 'pytest<9.2' pytest-asyncio pytest-xdist pytest-timeout httpx soundfile librosa
+          uv pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+            'torch>=2.4,<2.11' 'torchaudio<2.11'
+          uv pip install -q 'transformers>=4.51,<=5.17.0' sentence-transformers 'bitsandbytes>=0.45' torchao
+          uv pip install -q "$(grep -m1 -E '^peft==' studio/backend/requirements/extras-no-deps.txt)"
+          uv pip install -q "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" || echo "unsloth_zoo install failed"
+          uv pip install -q -e . --no-deps
+          python -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+      - name: Backend + Repo(studio) suites, main vs integration
+        shell: bash {0}
+        run: |
+          . "$W/venv/bin/activate"
+          IGN="--ignore=tests/test_studio_api.py --ignore=tests/test_streaming_stripper.py --ignore=tests/test_llama_cpp_wait_for_vram_settle.py --ignore=tests/test_tool_xml_strip.py --ignore=tests/test_diffusion_checkpoint_resume.py --ignore=tests/test_tool_output_streaming.py --ignore=tests/test_web_fetch_extraction.py --ignore=tests/test_tool_call_parser_strict.py --ignore=tests/test_tunnel_safe_long_post.py --ignore=tests/test_scan_loras_off_event_loop.py --ignore=tests/test_anthropic_messages.py --ignore=tests/test_profile_stats.py --ignore=tests/test_media_auto_switch.py --ignore=tests/test_pr5624_regressions.py --ignore=tests/test_web_tools_overlap.py"
+          ids() { grep -aE '^(FAILED|ERROR) ' "$1" | sed -E 's/^(FAILED|ERROR) //; s/ - .*//' | sort -u; }
+          for t in int main; do
+            export HOME_T="$W/home-$t"; mkdir -p "$HOME_T"
+            (cd "$W/$t/studio/backend" && HOME="$HOME_T" timeout 3000 python -m pytest tests/ -q -rfE --tb=short -n 16 --dist loadgroup --timeout=330 -p no:cacheprovider $IGN -k 'not llama_cpp_load_progress_live' > "$W/out/backend-$t.log" 2>&1; echo "rc=$?" >> "$W/out/backend-$t.log")
+            tail -3 "$W/out/backend-$t.log"
+            (cd "$W/$t" && HOME="$HOME_T" PYTHONPATH="$W/$t/studio:$W/$t" UNSLOTH_COMPILE_DISABLE=1 timeout 3000 python -m pytest tests/studio tests/python --ignore=tests/studio/install --ignore=tests/studio/studiobench --ignore=tests/studio/load_freeze --ignore=tests/studio/test_hardware_dispatch_matrix.py --ignore=tests/studio/test_is_mlx_dispatch_gate.py --ignore=tests/studio/test_xpu_spoof_pipeline.py --ignore=tests/studio/test_mlx_context_platform_matrix.py -q -rfE --tb=short -n 16 --dist loadgroup --timeout=330 -p no:cacheprovider -m 'not server and not e2e' > "$W/out/repo-$t.log" 2>&1; echo "rc=$?" >> "$W/out/repo-$t.log")
+            tail -3 "$W/out/repo-$t.log"
+            (cd "$W/$t" && HOME="$HOME_T" PYTHONPATH="$W/$t/studio" timeout 1500 python -m pytest tests/studio/install -q -rfE --tb=short -n 16 --timeout=330 -p no:cacheprovider -m 'not server and not e2e' > "$W/out/install-$t.log" 2>&1; echo "rc=$?" >> "$W/out/install-$t.log")
+            tail -3 "$W/out/install-$t.log"
+            for s in backend repo install; do ids "$W/out/$s-$t.log" > "$W/out/$s-$t.ids"; done
+          done
+          for s in backend repo install; do
+            echo "== $s: failing only on integration"; comm -13 "$W/out/$s-main.ids" "$W/out/$s-int.ids"
+            echo "== $s: failing only on main"; comm -23 "$W/out/$s-main.ids" "$W/out/$s-int.ids"
+          done
+          # Serial re-run of integration-only ids, to drop xdist ordering artifacts.
+          for s in backend repo; do
+            comm -13 "$W/out/$s-main.ids" "$W/out/$s-int.ids" > "$W/out/$s-new.ids"
+            if [ -s "$W/out/$s-new.ids" ]; then
+              if [ $s = backend ]; then cd "$W/int/studio/backend"; else cd "$W/int"; fi
+              HOME="$W/home-int" PYTHONPATH="$W/int/studio:$W/int" UNSLOTH_COMPILE_DISABLE=1 timeout 1500 python -m pytest -q -rfE --tb=short -p no:cacheprovider $(sed 's/\[.*//' "$W/out/$s-new.ids" | sort -u) > "$W/out/$s-new-serial.log" 2>&1
+              echo "== $s integration-only, serial re-run:"; grep -aE '^(FAILED|ERROR) |passed|failed' "$W/out/$s-new-serial.log" | tail -40
+            fi
+          done
+          true
+      - name: Per-PR NPU-related backend tests (each PR alone)
+        shell: bash {0}
+        run: |
+          . "$W/venv/bin/activate"
+          for n in $PRS; do
+            cd "$W/pr$n/studio/backend"
+            base=$(git merge-base "$MAIN_SHA" HEAD)
+            T=$( { ls tests/test_npu*.py tests/test_flm_files.py tests/test_export_npu_q4nx.py tests/test_export_q4nx*.py tests/test_rocm_windows_gpu_util_locale.py tests/test_log_bounds.py tests/test_loaded_model_resident_mib.py tests/test_gguf_load_cache_reuse.py tests/test_openai_auto_switch*.py tests/test_cache_inventory*.py tests/test_debug_log*.py 2>/dev/null; git diff --name-only "$base" HEAD -- tests | sed 's#^studio/backend/##' | grep '^tests/test_.*\.py$'; } | sort -u | while read f; do [ -f "$f" ] && echo "$f"; done)
+            HOME="$W/home-pr" timeout 900 python -m pytest $T -q -rfE --tb=short -n 8 --timeout=330 -p no:cacheprovider > "$W/out/pr$n.log" 2>&1
+            echo "#$n: $(tail -1 "$W/out/pr$n.log")"
+            grep -aE '^(FAILED|ERROR) ' "$W/out/pr$n.log" | head -12
+            # Same files on main where they exist
+            M=$(for f in $T; do [ -f "$W/main/studio/backend/$f" ] && echo "$f"; done)
+            if grep -aqE '^(FAILED|ERROR) ' "$W/out/pr$n.log" && [ -n "$M" ]; then
+              (cd "$W/main/studio/backend" && HOME="$W/home-pr" timeout 900 python -m pytest $M -q -rfE --tb=short -n 8 --timeout=330 -p no:cacheprovider > "$W/out/pr$n-main.log" 2>&1)
+              echo "   same files on main: $(tail -1 "$W/out/pr$n-main.log")"; grep -aE '^(FAILED|ERROR) ' "$W/out/pr$n-main.log" | head -12 | sed 's/^/   main: /'
+            fi
+          done
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suite-logs
+          path: ${{ env.W }}/out/
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/npu-suites-$GITHUB_RUN_ID"
