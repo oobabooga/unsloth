@@ -1,0 +1,90 @@
+name: unsloth PR 17463 wheel step test (HARNESS ONLY)
+
+# Lays out a chat-only Windows install (published CUDA bundle, no PyTorch, no CUDA toolkit), runs
+# PR 17463's ensure_cuda_runtime_wheels, and checks whether ggml-cuda.dll loads through the
+# search dirs Studio builds, before and after. Nothing published.
+
+on:
+  push:
+    branches: [pr17463-harness]
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: b12246-mix-7c77012
+  PR_SHA: ddcecd7579
+
+jobs:
+  wheels:
+    name: ${{ matrix.profile }} / ${{ matrix.installer }}
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: cuda12-newer, installer: uv }
+          - { profile: cuda13-newer, installer: uv }
+          - { profile: cuda13-newer, installer: pip }
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+
+      - name: Fetch the PR's studio code
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init -q pr
+          git -C pr fetch -q --depth 1 https://github.com/unslothai/unsloth refs/pull/17463/head
+          git -C pr checkout -q FETCH_HEAD
+          git -C pr log -1 --format='%H %s'
+          if (-not (git -C pr rev-parse HEAD).StartsWith($env:PR_SHA)) { throw 'PR head moved' }
+
+      - name: Lay out a chat-only install
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "app-$env:LLAMA_TAG-windows-x64-${{ matrix.profile }}.zip"
+          gh release download $env:LLAMA_TAG --repo unslothai/llama.cpp --pattern $zip
+          if ($LASTEXITCODE -ne 0) { throw 'download failed' }
+          Expand-Archive -Path $zip -DestinationPath install/build/bin/Release -Force
+          @{ install_kind = 'windows-cuda'; asset = $zip } | ConvertTo-Json | Set-Content -Encoding utf8 install/UNSLOTH_PREBUILT_INFO.json
+          python -m venv env
+          if ('${{ matrix.installer }}' -eq 'uv') { & env\Scripts\python.exe -m pip install -q uv }
+          & env\Scripts\python.exe -c "import sys; print(sys.prefix)"
+
+      - name: Build the nvcuda.dll stand-in (the runner has no NVIDIA driver)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path driver | Out-Null
+          python -B h/probe.py gen-stub install/build/bin/Release/ggml-cuda.dll driver/stub.c
+          if (Test-Path driver/stub.c) {
+            Push-Location driver
+            cl /nologo /LD stub.c /Fe:nvcuda.dll
+            if ($LASTEXITCODE -ne 0) { throw 'stub build failed' }
+            Pop-Location
+          }
+
+      - name: Run the PR's wheel step
+        run: |
+          $env:PATH = "$PWD\env\Scripts;$env:PATH"
+          Get-Command uv -ErrorAction SilentlyContinue | ForEach-Object { "uv on PATH: $($_.Source)" }
+          & env\Scripts\python.exe -B h/wheels_test.py pr/studio install driver 2>&1 | Tee-Object -FilePath out.log
+
+      - name: Verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -a '^RESULT' out.log | grep -v 'list-devices' | cut -c1-300
+          grep -aq 'RESULT BEFORE LoadLibrary(ggml-cuda.dll): FAILED' out.log
+          grep -aq 'RESULT AFTER wheels the PR considers missing: none' out.log
+          grep -aq 'RESULT AFTER LoadLibrary(ggml-cuda.dll): loaded' out.log
+          echo "RESULT VERDICT: the chat-only layout cannot load ggml-cuda.dll; after the PR's wheel step it can"
