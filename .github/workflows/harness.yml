@@ -66,10 +66,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path driver | Out-Null
           python -B h/probe.py gen-stub main_bundle/ggml-cuda.dll driver/stub.c
           if ($LASTEXITCODE -ne 0) { throw 'gen-stub failed' }
-          Push-Location driver
-          cl /nologo /LD stub.c /Fe:nvcuda.dll
-          if ($LASTEXITCODE -ne 0) { throw 'stub build failed' }
-          Pop-Location
+          if (Test-Path driver/stub.c) {
+            Push-Location driver
+            cl /nologo /LD stub.c /Fe:nvcuda.dll
+            if ($LASTEXITCODE -ne 0) { throw 'stub build failed' }
+            Pop-Location
+          }
 
       - name: MAIN, the published bundle
         run: python -B h/probe.py probe main_bundle driver MAIN | Tee-Object -FilePath main.log

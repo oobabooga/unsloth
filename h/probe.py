@@ -99,7 +99,10 @@ def unresolved(root: Path, dirs: list[Path]) -> list[str]:
 def main() -> int:
     if sys.argv[1] == "gen-stub":
         syms = pe_imports(Path(sys.argv[2])).get("nvcuda.dll", [])
-        assert syms and not any(s.startswith("#") for s in syms), syms
+        if not syms:
+            print("ggml-cuda.dll imports nothing from nvcuda.dll; no stand-in needed")
+            return 0
+        assert not any(s.startswith("#") for s in syms), syms
         Path(sys.argv[3]).write_text("".join(f"__declspec(dllexport) int {s}(void) {{ return 999; }}\n" for s in syms))
         print("nvcuda.dll symbols imported by ggml-cuda.dll:", ", ".join(syms))
         return 0
