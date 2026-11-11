@@ -1,7 +1,7 @@
 name: unsloth PR 17463 Windows install test (HARNESS ONLY)
 
 # Runs Studio's real llama.cpp installer on Windows as a chat-only NVIDIA host would, with only host
-# detection replaced: once with the PR as pushed (ddcecd7579) and once with the follow-up applied.
+# detection replaced: once at ddcecd7579 (before the follow-up) and once at 0f9265c15f (the pushed follow-up commit).
 # Then checks whether ggml-cuda.dll loads through the search dirs Studio builds. Nothing published.
 
 on:
@@ -36,17 +36,16 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
-      - name: Fetch the PR's studio code, as pushed and with the follow-up
+      - name: Fetch the PR's studio code, before and after the follow-up commit
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($d in 'pr_orig', 'pr_fix') {
-            git init -q $d
-            git -C $d fetch -q --depth 1 https://github.com/unslothai/unsloth ddcecd75797a8f8f0e2bb1e4b0e9b3c8f3f0c0a0 2>$null
-            if ($LASTEXITCODE -ne 0) { git -C $d fetch -q --depth 1 https://github.com/unslothai/unsloth refs/pull/17463/head }
-            git -C $d checkout -q FETCH_HEAD
+          foreach ($pair in @(@('pr_orig', 'ddcecd7579edd09d1c0aa7ac6128e80cea045353'), @('pr_fix', '0f9265c15f055e4a4746e1ca04b730420e12b6b3'))) {
+            git init -q $pair[0]
+            git -C $pair[0] fetch -q --depth 1 https://github.com/LeoBorcherding/unsloth $pair[1]
+            if ($LASTEXITCODE -ne 0) { throw "could not fetch $($pair[1])" }
+            git -C $pair[0] checkout -q FETCH_HEAD
+            git -C $pair[0] log -1 --format='%H %s'
           }
-          git -C pr_orig log -1 --format='%H %s'
-          Copy-Item fix/install_llama_prebuilt.py pr_fix/studio/install_llama_prebuilt.py -Force
           New-Item -ItemType Directory -Force -Path driver | Out-Null
           foreach ($e in 'env_orig', 'env_fix') { python -m venv $e; & "$e\Scripts\python.exe" -m pip install -q uv }
 
