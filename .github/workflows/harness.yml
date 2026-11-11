@@ -23,6 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { profile: cuda12-legacy, cuda: '12.8.0', line: cuda12, toolkit_line: '12.8', klass: legacy, rank: 5, archs: '50-virtual 61-virtual' }
           - { profile: cuda12-newer, cuda: '12.8.0', line: cuda12, toolkit_line: '12.8', klass: newer, rank: 20, archs: '86 89 90 100 120' }
           - { profile: cuda13-newer, cuda: '13.3',   line: cuda13, toolkit_line: '13.3', klass: newer, rank: 50, archs: '86 89 90 100 120' }
     env:
@@ -176,7 +177,7 @@ jobs:
           set -euo pipefail
           grep -h '^RESULT' main.log cand.log | grep -v 'list-devices'
           grep -q 'RESULT MAIN LoadLibrary(ggml-cuda.dll): FAILED' main.log
-          grep -q 'RESULT MAIN unresolved with nvcuda.dll present:  \[.*cudart64_' main.log
+          grep -q 'RESULT MAIN unresolved with nvcuda.dll present:  \[.*cublas64_' main.log
           grep -q 'RESULT CANDIDATE unresolved with nvcuda.dll present:  none' cand.log
           grep -q 'RESULT CANDIDATE LoadLibrary(ggml-cuda.dll): loaded' cand.log
           echo "RESULT VERDICT: master bundle cannot load ggml-cuda.dll, PR 362 bundle can"
