@@ -71,13 +71,9 @@ jobs:
           for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cloudflared.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
           [ -n "$URL" ] || { echo "no tunnel URL"; exit 1; }
           echo "::add-mask::$URL"
-          sleep 8; curl -s -o /dev/null -w "tunnel check: HTTP %{http_code}
-" "$URL/api/health" || true
+          sleep 8; curl -s -o /dev/null -w "tunnel check: HTTP %{http_code}\n" "$URL/api/health" || true
           mkdir -p "$GITHUB_WORKSPACE/share"
-          printf 'url: %s
-user: unsloth
-password: %s
-' "$URL" "$PW" | ./age -a -r "$RECIPIENT" > "$GITHUB_WORKSPACE/share/link.age"
+          printf 'url: %s\nuser: unsloth\npassword: %s\n' "$URL" "$PW" | ./age -a -r "$RECIPIENT" > "$GITHUB_WORKSPACE/share/link.age"
           head -1 "$GITHUB_WORKSPACE/share/link.age"
 
       - uses: actions/upload-artifact@v4
