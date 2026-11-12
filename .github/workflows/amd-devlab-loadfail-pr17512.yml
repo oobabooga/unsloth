@@ -1,0 +1,151 @@
+name: AMD DevLab NPU load failure, PR 17512
+
+on:
+  push:
+    branches: [amd-devlab-npu-loadfail-pr17512]
+
+permissions: {}
+
+jobs:
+  loadfail:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 60
+    env:
+      PR_NUMBER: "17512"
+      MODEL: qwen3.6-moe-35b-a3b-FLM
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-loadfail-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q origin "pull/$PR_NUMBER/head" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18800-18899 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Fail a load two ways
+        shell: bash {0}
+        run: |
+          cat > "$W/t.py" <<'PY'
+          import glob, json, os, signal, subprocess, threading, time, urllib.request, urllib.error
+          W, B, MODEL = os.environ["W"], f"http://127.0.0.1:{os.environ['PORT']}", os.environ["MODEL"]
+          PW = os.environ["PW"]
+
+          def call(method, path, body=None, tok=None, timeout=1200):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+
+          def say(*a): print(*[str(x).replace(PW, "***") for x in a], flush=True)
+          def lem(): 
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/lemonade/lemonade-*.log")): out += open(f, errors="replace").read().splitlines()
+              return out
+          def srv():
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/server/server-*.log")): out += open(f, errors="replace").read().splitlines()
+              return out
+          def flm_serve():
+              r = subprocess.run(["pgrep", "-f", f"{W}/.*flm.*serve"], capture_output=True, text=True)
+              return [int(x) for x in r.stdout.split()]
+          def status(tok):
+              s = json.loads(call("GET", "/api/npu/status", tok=tok)[1])
+              return {k: s.get(k) for k in ("state", "error", "loaded_model", "context_length", "runtime_running")}
+          def report(title, res, l0, s0, tok):
+              time.sleep(2)
+              say(f"\n===== {title} =====")
+              say("LOAD RESPONSE:", res.get("code"), res.get("body", "")[:1500])
+              say("NPU STATUS:", status(tok))
+              say("--- lemonade log since the load started")
+              for x in lem()[l0:]: say(x[:600])
+              say("--- server log warnings/errors since the load started")
+              for x in srv()[s0:]:
+                  if '"level": "warning"' in x or '"level": "error"' in x or "Lemonade output" in x or "inference/load" in x: say(x[:3000])
+
+          tok = json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          say("enable:", call("POST", "/api/npu/enable", {}, tok)[0])
+          c, b = call("POST", f"/api/npu/models/{MODEL}/download", {}, tok, timeout=3000)
+          say("download:", c, b[-200:])
+          body = {"model_path": "lemonade:" + MODEL, "force_reload": True}
+
+          l0, s0 = len(lem()), len(srv())
+          c, b = call("POST", "/api/inference/load", body, tok)
+          report("0. baseline load (should succeed)", {"code": c, "body": b[:200]}, l0, s0, tok)
+
+          # 1. kill flm serve while lemond waits for it
+          old = set(flm_serve())
+          l0, s0 = len(lem()), len(srv()); res = {}
+          def go(ctx):
+              res["code"], res["body"] = call("POST", "/api/inference/load", dict(body, max_seq_length=ctx), tok)
+          t = threading.Thread(target=go, args=(4096,)); t.start()
+          killed = None
+          for _ in range(600):
+              new = [p for p in flm_serve() if p not in old]
+              if new:
+                  time.sleep(2)
+                  for p in new:
+                      try: os.kill(p, signal.SIGKILL); killed = p
+                      except OSError: pass
+                  break
+              if not t.is_alive(): break
+              time.sleep(0.1)
+          say("killed flm serve pid:", killed)
+          t.join(1000)
+          report("1. flm serve killed mid-load", res, l0, s0, tok)
+
+          # 2. truncated weight file (a bad download)
+          call("POST", "/api/inference/unload", {"model_path": "lemonade:" + MODEL}, tok)
+          time.sleep(3)
+          files = [f for f in glob.glob(f"{W}/studio/**/*", recursive=True) if os.path.isfile(f) and not os.path.islink(f) and "/bin/" not in f and "/unsloth_studio/" not in f and os.path.getsize(f) > 200 * 2**20]
+          files.sort(key=os.path.getsize, reverse=True)
+          say("big model files:", [(f.replace(W, ""), os.path.getsize(f) >> 20) for f in files[:8]])
+          if files:
+              victim = files[0]; aside = victim + ".aside"
+              os.rename(victim, aside)
+              with open(aside, "rb") as src, open(victim, "wb") as dst: dst.write(src.read(1 << 20))
+              try:
+                  l0, s0 = len(lem()), len(srv()); res = {}
+                  t = threading.Thread(target=go, args=(8192,)); t.start(); t.join(600)
+                  if t.is_alive(): res = {"code": "still loading after 600s", "body": ""}
+                  report("2. truncated weight file", res, l0, s0, tok)
+              finally:
+                  os.replace(aside, victim)
+              if not t.is_alive():
+                  l0, s0 = len(lem()), len(srv())
+                  c, b = call("POST", "/api/inference/load", body, tok)
+                  report("3. load after restoring the file (should succeed)", {"code": c, "body": b[:200]}, l0, s0, tok)
+          PY
+          python3 "$W/t.py"
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-loadfail-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-loadfail-$GITHUB_RUN_ID"
