@@ -102,20 +102,17 @@ jobs:
           def go(ctx):
               res["code"], res["body"] = call("POST", "/api/inference/load", dict(body, max_seq_length=ctx), tok)
           t = threading.Thread(target=go, args=(4096,)); t.start()
-          killed = None
-          for _ in range(600):
-              new = [p for p in flm_serve() if p not in old]
-              if new:
-                  time.sleep(2)
-                  for p in new:
-                      try: os.kill(p, signal.SIGKILL); killed = p
+          killed = []
+          while t.is_alive():
+              for p in flm_serve():
+                  if p not in old and p not in killed:
+                      time.sleep(2)
+                      try: os.kill(p, signal.SIGKILL); killed.append(p)
                       except OSError: pass
-                  break
-              if not t.is_alive(): break
               time.sleep(0.1)
           say("killed flm serve pid:", killed)
           t.join(1000)
-          report("1. flm serve killed mid-load", res, l0, s0, tok)
+          report("1. flm serve killed on every attempt", res, l0, s0, tok)
 
           # 2. truncated weight file (a bad download)
           call("POST", "/api/inference/unload", {"model_path": "lemonade:" + MODEL}, tok)
@@ -132,6 +129,8 @@ jobs:
                   t = threading.Thread(target=go, args=(8192,)); t.start(); t.join(600)
                   if t.is_alive(): res = {"code": "still loading after 600s", "body": ""}
                   report("2. truncated weight file", res, l0, s0, tok)
+                  c, b = call("POST", "/v1/chat/completions", {"model": "lemonade:" + MODEL, "stream": True, "max_tokens": 20, "messages": [{"role": "user", "content": "say hi"}]}, tok, timeout=300)
+                  report("2b. chat on the truncated model", {"code": c, "body": b[-900:]}, l0, s0, tok)
               finally:
                   os.replace(aside, victim)
               if not t.is_alive():
