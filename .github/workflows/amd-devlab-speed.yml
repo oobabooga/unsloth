@@ -1,0 +1,140 @@
+name: AMD DevLab NPU speed settings A/B (phase 5 build, no tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-speed]
+
+permissions: {}
+
+jobs:
+  speed:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    env:
+      BRANCH: studio/npu-phase-5-monitor-engines
+      CHECKPOINTS: "qwen3.5:9b qwen3.6-moe:35b-a3b qwen3.8-dflash2:27b"
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-speed-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q https://github.com/LeoBorcherding/unsloth.git "$BRANCH" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          free -g | head -2
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Speed A/B
+        shell: bash {0}
+        run: |
+          cat > "$W/speed.py" <<'PY'
+          import glob, json, os, re, time, urllib.request, urllib.error, uuid
+          W, B, PW = os.environ["W"], f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"]
+          SHORT = "Explain how a bicycle stays upright while moving, in about 200 words."
+          FILLER = " ".join(f"Fact {i}: the warehouse on street {i} stores {i * 7} crates of item {i % 13}." for i in range(1, 121))
+          def long_prompt(): return f"Session {uuid.uuid4().hex}. Read these notes.\n{FILLER}\nNow answer: how many crates does the warehouse on street 50 store? Then describe the pattern."
+          def call(method, path, body=None, tok=None, timeout=3000):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+          def telemetry():
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/lemonade/lemonade-*.log")):
+                  for l in open(f, errors="replace"):
+                      m = re.search(r"Inference completed: model=(\S+), tokens=(\d+) \(in=(\d+), out=(\d+)\), ttft=([\d.]+)s, tps=([\d.]+)", l)
+                      if m: out.append({"in": int(m.group(3)), "out": int(m.group(4)), "ttft": float(m.group(5)), "tps": float(m.group(6))})
+              return out
+          def login(): return json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          def chat(mid, messages, max_tokens, **extra):
+              n = len(telemetry())
+              body = {"model": "lemonade:" + mid, "max_tokens": max_tokens, "stream": False, "messages": messages}; body.update(extra)
+              t0 = time.time(); c, b = call("POST", "/v1/chat/completions", body, login(), 2400); wall = round(time.time() - t0, 1)
+              time.sleep(0.7); t = telemetry()[n:]
+              r = dict(t[-1]) if t else {}
+              r.update(code=c, wall=wall)
+              if c != 200: r["err"] = b[:200].replace(PW, "***")
+              return r
+          def load(mid, **extra):
+              body = {"model_path": "lemonade:" + mid, "force_reload": True}; body.update(extra)
+              t0 = time.time(); c, b = call("POST", "/api/inference/load", body, login())
+              try: d = json.loads(b)
+              except ValueError: d = {}
+              ok = c == 200 and not d.get("_deferred_error") and d.get("is_npu")
+              print("  load", extra, "->", c, "ok" if ok else b[:300], "ctx", d.get("context_length"), "pmode", d.get("npu_power_mode"), "chunk", d.get("npu_prefill_chunk_len"), f"{time.time() - t0:.1f}s", flush=True)
+              return ok
+          def u(text): return [{"role": "user", "content": text}]
+          tok = login()
+          print("enable:", call("POST", "/api/npu/enable", {}, tok)[0], flush=True)
+          models = {m["checkpoint"]: m for m in json.loads(call("GET", "/api/npu/models", tok=tok)[1])["models"]}
+          for cp in os.environ["CHECKPOINTS"].split():
+              mid = models[cp]["id"]; big = "27b" in mid; N = 128 if big else 256
+              c, b = call("POST", f"/api/npu/models/{mid}/download", {}, login())
+              print(f"\n##### {mid} (download {c})", flush=True)
+              print("== A. power mode (#17510): 2 short-prompt runs + 1 long-prompt run each")
+              for pm in (None, "powersaver", "balanced", "performance", "turbo"):
+                  if not load(mid, **({"npu_power_mode": pm} if pm else {})): continue
+                  chat(mid, u("Hi"), 8)
+                  a = chat(mid, u(SHORT), N); b2 = chat(mid, u(SHORT), N); l = chat(mid, u(long_prompt()), 48)
+                  print("RESULT power", mid, pm or "default", "| decode tps", a.get("tps"), b2.get("tps"), "| long prompt in", l.get("in"), "ttft", l.get("ttft"), "prefill tok/s", round(l["in"] / l["ttft"], 1) if l.get("ttft") else None, flush=True)
+              print("== B. prefill chunk length (#17510): long-prompt time to first token")
+              for ch in (None, 256, 1024, 4096):
+                  if not load(mid, **({"npu_prefill_chunk_len": ch} if ch else {})): continue
+                  chat(mid, u("Hi"), 8)
+                  l = chat(mid, u(long_prompt()), 48)
+                  print("RESULT chunk", mid, ch or "default", "| long prompt in", l.get("in"), "ttft", l.get("ttft"), "prefill tok/s", round(l["in"] / l["ttft"], 1) if l.get("ttft") else None, "| tps", l.get("tps"), flush=True)
+              load(mid); chat(mid, u("Hi"), 8)
+              print("== C. sampling: default temperature vs 0")
+              for label, extra in (("default", {}), ("temperature=0", {"temperature": 0}), ("default again", {})):
+                  r = chat(mid, u(SHORT), N, **extra)
+                  print("RESULT temp", mid, label, "| tps", r.get("tps"), "out", r.get("out"), "ttft", r.get("ttft"), flush=True)
+              print("== D. tool catalog in the request (#17530)")
+              tools = [{"type": "function", "function": {"name": "web_search", "description": "Search the web.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+              for label, extra in (("no tools", {}), ("tools sent", {"tools": tools}), ("tools + tool_choice none", {"tools": tools, "tool_choice": "none"}), ("no tools again", {})):
+                  r = chat(mid, u(SHORT), 48 if big else 128, **extra)
+                  print("RESULT tools", mid, label, "| code", r.get("code"), "tps", r.get("tps"), "out", r.get("out"), "ttft", r.get("ttft"), "wall", r.get("wall"), r.get("err", ""), flush=True)
+              print("== E. a title-style request between two turns (#17532)")
+              for label, interrupt in (("no title request", False), ("title request in between", True)):
+                  p = long_prompt()
+                  t1 = chat(mid, u(p), 48)
+                  hist = u(p) + [{"role": "assistant", "content": "The warehouse on street 50 stores 350 crates."}, {"role": "user", "content": "And street 60?"}]
+                  if interrupt: chat(mid, u("Write a 4-word title for a chat about warehouses."), 16)
+                  t2 = chat(mid, hist, 48)
+                  print("RESULT title", mid, label, "| turn1 in", t1.get("in"), "ttft", t1.get("ttft"), "| turn2 in", t2.get("in"), "ttft", t2.get("ttft"), flush=True)
+              call("POST", "/api/inference/unload", {"model_path": "lemonade:" + mid}, login()); time.sleep(3)
+              print("delete", call("DELETE", f"/api/npu/models/{mid}", tok=login())[0], flush=True)
+          PY
+          python3 "$W/speed.py"
+          echo "--- flm serve command lines used"
+          grep -ahoE '"serve" .*' "$W"/studio/logs/lemonade/*.log | sort | uniq -c | cut -c1-200
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-speed-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-speed-$GITHUB_RUN_ID"
