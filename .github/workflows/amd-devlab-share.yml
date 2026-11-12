@@ -58,23 +58,36 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/776c87ef15/rec.py" -o "$W/rec.py"
           BASE="http://127.0.0.1:$PORT" OUT="$W/out" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tail -20
 
-      - name: Open the tunnel and hold it
+      - name: Open the tunnel
         shell: bash {0}
         run: |
           set -uo pipefail
           cd "$W/bin"
           curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared
           curl -fsSL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar xz --strip-components=1
-          ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" > "$W/cloudflared.log" 2>&1 &
+          nohup ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" > "$W/cloudflared.log" 2>&1 &
           echo $! > "$W/cloudflared.pid"
           URL=""
           for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cloudflared.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
-          [ -n "$URL" ] || { echo "no tunnel URL"; tail -30 "$W/cloudflared.log" | grep -v trycloudflare; exit 1; }
+          [ -n "$URL" ] || { echo "no tunnel URL"; exit 1; }
           echo "::add-mask::$URL"
-          sleep 5; curl -s -o /dev/null -w "tunnel check: HTTP %{http_code}\n" "$URL/api/health" || true
-          echo "----- link and password, encrypted to Leo's SSH key -----"
-          printf 'url: %s\nuser: unsloth\npassword: %s\n' "$URL" "$PW" | ./age -a -r "$RECIPIENT"
-          echo "----- end -----"
+          sleep 8; curl -s -o /dev/null -w "tunnel check: HTTP %{http_code}
+" "$URL/api/health" || true
+          mkdir -p "$GITHUB_WORKSPACE/share"
+          printf 'url: %s
+user: unsloth
+password: %s
+' "$URL" "$PW" | ./age -a -r "$RECIPIENT" > "$GITHUB_WORKSPACE/share/link.age"
+          head -1 "$GITHUB_WORKSPACE/share/link.age"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: share-link
+          path: share/link.age
+
+      - name: Hold the link open
+        shell: bash {0}
+        run: |
           echo "Holding for $HOLD_MINUTES min. Cancel the run to close the link early."
           END=$(( $(date +%s) + HOLD_MINUTES*60 ))
           while [ $(date +%s) -lt $END ]; do
