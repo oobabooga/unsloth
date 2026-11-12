@@ -9,7 +9,8 @@ Regression mode. Head is WORSE than base when any of:
   * a test that ran at the base fails at the head, or a test only the head has fails there
 
 Gates (non-vacuity): each state imported unsloth_zoo from its own checkout and ran on a GPU; every base case
-finished with finite losses.
+finished with finite losses. gpt-oss uses hf-internal-testing/tiny-random-GptOssForCausalLM (bf16): the trl tiny
+checkpoint is MXFP4, which this ROCm stack does not dequantize (it fails at base and head alike).
 """
 
 from __future__ import annotations
