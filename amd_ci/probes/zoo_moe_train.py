@@ -17,7 +17,7 @@ def dump():
         json.dump(rec, f, indent = 1, default = str)
 
 
-MODELS = {"qwen3moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM", "gptoss": "trl-internal-testing/tiny-GptOssForCausalLM"}
+MODELS = {"qwen3moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM", "gptoss": "hf-internal-testing/tiny-random-GptOssForCausalLM"}
 
 
 def counters():
