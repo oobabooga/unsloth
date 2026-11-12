@@ -11,8 +11,9 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     env:
-      PR_NUMBER: "17511"
-      MODEL: qwen3.6-moe-35b-a3b-FLM
+      PR_NUMBER: ""
+      FORK_SHA: e9467740d623efddf461a57243701781a1791877
+      MODEL: qwen3.5-4b-FLM
       HOLD_MINUTES: "200"
       # Leo's public SSH key: the link and password are printed only encrypted to it
       RECIPIENT: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDyrvVJnH1mEtd8olk8hgeijGjSzC1M73ySJcYaXOpgo"
@@ -30,7 +31,7 @@ jobs:
           { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
           export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
           git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
-          cd "$W/src" && git fetch -q origin "pull/$PR_NUMBER/head" && git checkout -q FETCH_HEAD
+          cd "$W/src" && if [ -n "$PR_NUMBER" ]; then git fetch -q origin "pull/$PR_NUMBER/head"; else git fetch -q https://github.com/LeoBorcherding/unsloth.git "$FORK_SHA"; fi && git checkout -q FETCH_HEAD
           git log -1 --format='installing %H %s'
           UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
           tail -5 "$W/install.log"
