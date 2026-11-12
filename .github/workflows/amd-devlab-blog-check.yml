@@ -1,0 +1,171 @@
+name: AMD DevLab NPU blog claims check (phase 5 build, no tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-blog-check]
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 75
+    env:
+      BRANCH: studio/npu-phase-5-monitor-engines
+      CHECKPOINTS: "qwen3.5:4b qwen3.5:9b qwen3.6-moe:35b-a3b"
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-blogcheck-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q https://github.com/LeoBorcherding/unsloth.git "$BRANCH" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          free -g | head -2
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Catalog and Auto context
+        shell: bash {0}
+        run: |
+          cat > "$W/api.py" <<'PY'
+          import json, os, urllib.request, urllib.error
+          B, PW = f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"]
+          def call(method, path, body=None, tok=None, timeout=3000):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+          def free_gb():
+              for l in open("/proc/meminfo"):
+                  if l.startswith("MemAvailable"): return round(int(l.split()[1]) / 2**20, 1)
+          tok = json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          print("enable:", call("POST", "/api/npu/enable", {}, tok)[0], flush=True)
+          st = json.loads(call("GET", "/api/npu/status", tok=tok)[1])
+          print("STATUS:", {k: st.get(k) for k in ("supported", "state", "versions", "memory_window_gb")}, flush=True)
+          models = json.loads(call("GET", "/api/npu/models", tok=tok)[1])["models"]
+          print("CATALOG:", len(models), "models")
+          for m in models:
+              print("  ", m["id"], "|", m["checkpoint"], "|", m.get("size_gb"), "|", ",".join(m.get("labels") or []), "| needs", m.get("memory_needed_gb"), "fits", m.get("fits_memory"), "| max_ctx", m.get("max_context_length"))
+          print("GEMMA:", [m["id"] for m in models if "gemma" in m["id"].lower()], flush=True)
+          for cp in os.environ["CHECKPOINTS"].split():
+              for m in models:
+                  if m["checkpoint"] == cp:
+                      c, b = call("POST", f"/api/npu/models/{m['id']}/download", {}, tok)
+                      print("download", m["id"], c, flush=True)
+                      free = free_gb()
+                      c, b = call("POST", "/api/inference/load", {"model_path": "lemonade:" + m["id"]}, tok)
+                      try:
+                          d = json.loads(b)
+                          print("AUTO LOAD", m["id"], c, "free_gb_before", free, {k: d.get(k) for k in ("context_length", "max_context_length", "native_context_length", "supports_tools", "is_npu")}, d.get("_deferred_error"), flush=True)
+                      except ValueError:
+                          print("AUTO LOAD", m["id"], c, b[:400], flush=True)
+          c, b = call("POST", "/v1/chat/completions", {"model": "lemonade:qwen3.6-moe-35b-a3b-FLM", "max_tokens": 300, "stream": False, "messages": [{"role": "user", "content": "Write three sentences about sloths."}]}, tok, 600)
+          print("CHAT:", c, b[:300].replace(PW, "***"), flush=True)
+          PY
+          python3 "$W/api.py"
+          echo "--- lemonade log: loads and speeds"
+          grep -hE "Unsloth Studio\) Loading|ctx-len|Inference completed|Request failed" "$W"/studio/logs/lemonade/*.log | sed "s#$W#\$W#g" | cut -c1-300
+
+      - name: UI defaults in a browser (tools pills, context)
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          python3 -m venv "$W/pwenv" && "$W/pwenv/bin/pip" -q install playwright > "$W/pw-install.log" 2>&1
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw" "$W/pwenv/bin/playwright" install chromium >> "$W/pw-install.log" 2>&1 || tail -5 "$W/pw-install.log"
+          cat > "$W/ui.py" <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+          B, PW, OUT = f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"], os.environ["W"] + "/out"
+          with sync_playwright() as p:
+              b = p.chromium.launch(); pg = b.new_page(viewport={"width": 1440, "height": 900})
+              pg.goto(B, wait_until="networkidle")
+              pw = pg.locator("input[type=password]").first
+              if pw.count(): pw.fill(PW); pw.press("Enter"); pg.wait_for_load_state("networkidle")
+              pg.wait_for_timeout(6000)
+              pg.screenshot(path=OUT + "/chat-default.png")
+              txt = pg.locator("body").inner_text()
+              i = txt.find("Context Length"); print("RUN SETTINGS TEXT:", repr(txt[max(0, i - 80): i + 200]))
+              for name in ("Search", "Tools", "Thinking"):
+                  for el in pg.get_by_role("button", name=name, exact=True).all()[:2]:
+                      html = el.evaluate("e => e.outerHTML")
+                      print("PILL", name, "| aria-pressed=", el.get_attribute("aria-pressed"), "| data-state=", el.get_attribute("data-state"), "|", html[:260].replace("\n", " "))
+              ta = pg.locator("textarea, [contenteditable=true]").first
+              ta.click(); pg.keyboard.type("Say hi in five words."); pg.keyboard.press("Enter")
+              pg.wait_for_timeout(45000)
+              pg.screenshot(path=OUT + "/chat-reply.png")
+              t2 = pg.locator("body").inner_text(); j = t2.find("Say hi in five words."); print("CHAT TEXT:", repr(t2[j: j + 400]))
+              b.close()
+          PY
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw" "$W/pwenv/bin/python" "$W/ui.py" 2>&1 | grep -vF "$PW" | cut -c1-900
+          echo "--- tools sent by the UI chat?"
+          grep -hE "tool|Proxying chat" "$W"/studio/logs/server/*.log | tail -8 | cut -c1-400
+          mkdir -p "$GITHUB_WORKSPACE/shots" && cp "$W"/out/*.png "$GITHUB_WORKSPACE/shots/" 2>/dev/null; ls "$GITHUB_WORKSPACE/shots"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: shots
+          path: shots/
+          if-no-files-found: ignore
+
+      - name: unsloth run and unsloth chat from the terminal
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          red() { sed -E "s#$W#\$W#g; s/[A-Za-z0-9_-]{24,}/<redacted>/g" | cut -c1-400; }
+          kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null; sleep 8
+          CLI=$(find "$UNSLOTH_STUDIO_HOME" -type f -name unsloth -path "*/bin/*" | head -1)
+          echo "cli: ${CLI/$W/\$W}"
+          [ -n "$CLI" ] || exit 0
+          echo "--- unsloth run --help (flags)"; "$CLI" run --help 2>&1 | grep -E -- "--model|--context-length|--port|--api-key|--host" | red
+          echo "--- unsloth chat --help (flags)"; "$CLI" chat --help 2>&1 | grep -E -- "--max-new-tokens|--system-prompt|--model|MODEL" | red
+          echo "--- unsloth run --model qwen3.6-moe-35b-a3b-FLM --context-length 16384"
+          nohup "$CLI" run --model qwen3.6-moe-35b-a3b-FLM --context-length 16384 > "$W/run.out" 2>&1 &
+          echo $! > "$W/run.pid"
+          for i in $(seq 1 180); do grep -qiE "api key|base url|error|traceback|usage:" "$W/run.out" && sleep 5 && break; sleep 2; done
+          red < "$W/run.out" | tail -40
+          echo "--- lemonade: what unsloth run loaded"
+          grep -hE "Unsloth Studio\) Loading|ctx-len" "$W"/studio/logs/lemonade/*.log | tail -3 | red
+          KEY=$(grep -oE "sk-[A-Za-z0-9_-]{16,}" "$W/run.out" | head -1)
+          URL=$(grep -oE "http://(127\.0\.0\.1|localhost):[0-9]+(/v1)?" "$W/run.out" | head -1)
+          echo "base url printed: $URL ; key printed: $([ -n "$KEY" ] && echo yes || echo no)"
+          if [ -n "$URL" ]; then
+            curl -s -m 300 "${URL%/v1}/v1/chat/completions" -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+              -d '{"model":"qwen3.6-moe-35b-a3b-FLM","max_tokens":40,"messages":[{"role":"user","content":"Say hi in five words."}]}' | red
+            echo
+          fi
+          echo "--- unsloth chat qwen3.6-moe-35b-a3b-FLM"
+          printf 'Say hi in five words.\n/exit\n' | timeout 240 "$CLI" chat qwen3.6-moe-35b-a3b-FLM --max-new-tokens 60 --system-prompt "Answer briefly." 2>&1 | red | tail -25
+          echo "exit code of unsloth chat pipeline: ${PIPESTATUS[1]}"
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          for f in run.pid studio.pid; do [ -f "$W/$f" ] && kill -TERM "$(cat "$W/$f")" 2>/dev/null; done
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-blogcheck-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-blogcheck-$GITHUB_RUN_ID"
