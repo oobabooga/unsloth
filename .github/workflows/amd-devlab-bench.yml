@@ -1,0 +1,113 @@
+name: AMD DevLab NPU tokens per second for the blog table (phase 5 build, no tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-bench]
+
+permissions: {}
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    env:
+      BRANCH: studio/npu-phase-5-monitor-engines
+      CHECKPOINTS: "lfm3:1.7b qwen3.5:4b qwen3vl-it:4b qwen3.5:9b gemma4-it:e4b gemma4-it:12b gpt-oss:20b qwen3.8-mtp:27b qwen3.8-dflash2:27b qwen3.6-moe:35b-a3b"
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-bench-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q https://github.com/LeoBorcherding/unsloth.git "$BRANCH" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          free -g | head -2
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Benchmark
+        shell: bash {0}
+        run: |
+          cat > "$W/bench.py" <<'PY'
+          import glob, json, os, re, statistics, time, urllib.request, urllib.error
+          W, B, PW = os.environ["W"], f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"]
+          PROMPT = "Explain how a bicycle stays upright while moving, in about 200 words."
+          def call(method, path, body=None, tok=None, timeout=3000):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+          def telemetry():
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/lemonade/lemonade-*.log")):
+                  for l in open(f, errors="replace"):
+                      m = re.search(r"Inference completed: model=(\S+), tokens=(\d+) \(in=(\d+), out=(\d+)\), ttft=([\d.]+)s, tps=([\d.]+)", l)
+                      if m: out.append((m.group(1), int(m.group(3)), int(m.group(4)), float(m.group(5)), float(m.group(6))))
+              return out
+          def login(): return json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          tok = login()
+          print("enable:", call("POST", "/api/npu/enable", {}, tok)[0], flush=True)
+          st = json.loads(call("GET", "/api/npu/status", tok=tok)[1])
+          print("VERSIONS:", st.get("versions"), "hardware:", (st.get("hardware") or {}).get("name"), flush=True)
+          models = {m["checkpoint"]: m for m in json.loads(call("GET", "/api/npu/models", tok=tok)[1])["models"]}
+          rows = []
+          for cp in os.environ["CHECKPOINTS"].split():
+              m = models.get(cp)
+              if not m: print("NOT IN CATALOG:", cp, flush=True); continue
+              mid = m["id"]; tok = login()
+              t0 = time.time(); c, b = call("POST", f"/api/npu/models/{mid}/download", {}, tok); dl = time.time() - t0
+              if c != 200 or '"complete"' not in b[-400:]: print("DOWNLOAD FAILED", mid, c, b[-200:], flush=True); continue
+              t0 = time.time(); c, b = call("POST", "/api/inference/load", {"model_path": "lemonade:" + mid}, tok); load = time.time() - t0
+              try: d = json.loads(b)
+              except ValueError: d = {}
+              if c != 200 or d.get("_deferred_error") or not d.get("is_npu"):
+                  print("LOAD FAILED", mid, c, b[:300], flush=True); call("DELETE", f"/api/npu/models/{mid}", tok=tok); continue
+              ctx = d.get("context_length")
+              n0 = len(telemetry()); runs = []
+              for i in range(4):
+                  c, b = call("POST", "/v1/chat/completions", {"model": "lemonade:" + mid, "max_tokens": 16 if i == 0 else 256, "stream": False, "temperature": 0, "messages": [{"role": "user", "content": "Hi" if i == 0 else PROMPT}]}, tok, 1500)
+                  if c != 200: print("CHAT FAILED", mid, c, b[:200].replace(PW, "***"), flush=True)
+              time.sleep(1)
+              t = telemetry()[n0:]
+              real = [x for x in t if x[2] >= 100]
+              tps = [x[4] for x in real]; ttft = [x[3] for x in real]
+              row = {"id": mid, "size_gb": m.get("size_gb"), "ctx": ctx, "load_s": round(load, 1), "download_s": round(dl), "runs": [(x[1], x[2], x[3], x[4]) for x in t],
+                     "tps_median": round(statistics.median(tps), 1) if tps else None, "ttft_median": round(statistics.median(ttft), 2) if ttft else None}
+              rows.append(row); print("ROW", json.dumps(row), flush=True)
+              call("POST", "/api/inference/unload", {"model_path": "lemonade:" + mid}, tok); time.sleep(3)
+              print("delete", mid, call("DELETE", f"/api/npu/models/{mid}", tok=tok)[0], flush=True)
+          print("\n| Model | Download | Context | Load | First token | Tokens/s |\n|---|---|---|---|---|---|")
+          for r in rows: print(f"| {r['id']} | {r['size_gb']} GB | {r['ctx']} | {r['load_s']} s | {r['ttft_median']} s | {r['tps_median']} |")
+          PY
+          python3 "$W/bench.py"
+          df -h "$RUNNER_TEMP" | tail -1
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-bench-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-bench-$GITHUB_RUN_ID"
