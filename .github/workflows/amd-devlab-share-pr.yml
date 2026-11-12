@@ -11,7 +11,7 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     env:
-      PR_NUMBER: "17512"
+      PR_NUMBER: "17511"
       MODEL: qwen3.6-moe-35b-a3b-FLM
       HOLD_MINUTES: "200"
       # Leo's public SSH key: the link and password are printed only encrypted to it
