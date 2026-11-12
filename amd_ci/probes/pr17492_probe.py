@@ -31,11 +31,20 @@ try:
     obs["cell"]["stderr_tail"] = p.stderr[-2000:]
 except subprocess.TimeoutExpired:
     obs["cell"] = {"stage": "timeout"}
+a.out.write_text(json.dumps(obs, indent = 1))
 tests = [t for t in ("tests/test_strict_dynamo_flag.py", "tests/test_block_compile.py") if (Path(ck) / t).exists()]
 obs["tests_present"] = tests
 if tests:
-    p = subprocess.run([a.python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-o", "addopts=", *tests],
-                       cwd = ck, env = env, capture_output = True, text = True, timeout = a.timeout)
+    try:
+        p = subprocess.run([a.python, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-o", "addopts=",
+                            "--durations=15", *tests], cwd = ck, env = env, capture_output = True, text = True,
+                           timeout = a.timeout)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        obs["pytest"] = {"rc": "timeout", "n_passed": 0, "n_failed": 0, "n_skipped": 0, "n_errors": 0, "failed": [],
+                         "tail": out[-2500:]}
+        a.out.write_text(json.dumps(obs, indent = 1))
+        sys.exit(0)
     tail = p.stdout[-6000:]
     cnt = lambda w: int(m.group(1)) if (m := re.search(rf"(\d+) {w}", tail.splitlines()[-1] if tail.strip() else "")) else 0
     obs["pytest"] = {"rc": p.returncode, "n_passed": cnt("passed"), "n_failed": cnt("failed"), "n_skipped": cnt("skipped"),
