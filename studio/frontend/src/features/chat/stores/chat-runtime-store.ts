@@ -1280,6 +1280,35 @@ function isSameThreadScopedValue(next: unknown, current: unknown): boolean {
   return false;
 }
 
+/** Puts the chat's own values back where the store shows the loaded model's or a provider's. */
+function restoreChatOwnedValues(
+  threadId: string,
+  settings: ThreadScopedSettings,
+): void {
+  // A model that cannot stop thinking forces thinking on: that true is the model's, so
+  // persisting it would erase a chat's stored false.
+  if (
+    threadId === threadScopedSettingsThreadId &&
+    !explicitlyEditedThreadFields.has("reasoningEnabled") &&
+    activeThreadScopedSettings?.reasoningEnabled === false &&
+    settings.reasoningEnabled !== false &&
+    useChatRuntimeStore.getState().reasoningAlwaysOn
+  ) {
+    settings.reasoningEnabled = false;
+  }
+  if (threadId === threadScopedSettingsThreadId && pinHoldsLiveEffort()) {
+    const onRecord = reasoningEffortOnRecord();
+    if (onRecord !== undefined) settings.reasoningEffort = onRecord;
+  }
+  // A provider constraint moves pills without persisting: the chat keeps its stored value.
+  if (keepsStoredValueUnderConstraint("reasoningEnabled", threadId, settings)) {
+    settings.reasoningEnabled = activeThreadScopedSettings?.reasoningEnabled;
+  }
+  if (keepsStoredValueUnderConstraint("toolsEnabled", threadId, settings)) {
+    settings.toolsEnabled = activeThreadScopedSettings?.toolsEnabled;
+  }
+}
+
 function buildThreadScopedSnapshot(
   threadId: string,
   snapshot: ThreadScopedSettings | null,
@@ -1294,29 +1323,7 @@ function buildThreadScopedSnapshot(
   ) {
     settings.permissionMode = activeThreadScopedSettings.permissionMode;
   }
-  // And for thinking, which a model that cannot stop thinking forces on: that true is the
-  // model's, so persisting it would erase a chat's stored false.
-  if (
-    threadId === threadScopedSettingsThreadId &&
-    !explicitlyEditedThreadFields.has("reasoningEnabled") &&
-    activeThreadScopedSettings?.reasoningEnabled === false &&
-    settings.reasoningEnabled !== false &&
-    useChatRuntimeStore.getState().reasoningAlwaysOn
-  ) {
-    settings.reasoningEnabled = false;
-  }
-  if (threadId === threadScopedSettingsThreadId && pinHoldsLiveEffort()) {
-    const onRecord = reasoningEffortOnRecord();
-    if (onRecord !== undefined) settings.reasoningEffort = onRecord;
-  }
-  // And for pills a provider constraint moved without persisting: the store holds the
-  // provider's value, so the chat keeps the one it was stored with.
-  if (keepsStoredValueUnderConstraint("reasoningEnabled", threadId, settings)) {
-    settings.reasoningEnabled = activeThreadScopedSettings?.reasoningEnabled;
-  }
-  if (keepsStoredValueUnderConstraint("toolsEnabled", threadId, settings)) {
-    settings.toolsEnabled = activeThreadScopedSettings?.toolsEnabled;
-  }
+  restoreChatOwnedValues(threadId, settings);
   if (threadId === threadScopedSettingsThreadId) {
     activeThreadScopedSettings = settings;
   }
@@ -1979,6 +1986,33 @@ function codeDeclinedOnEnteringFullAccess(state: ChatRuntimeStore): boolean {
   return state.permissionMode === "full"
     ? state.codeToolsDeclinedUnderFullAccess
     : false;
+}
+
+/** `state` with the paired chat's own values where the store shows its model's (pill clamps, a pin). */
+export function withChatOwnedSettings<T extends ChatRuntimeStore>(state: T): T {
+  const owned: ThreadScopedSettings = {
+    reasoningEnabled: state.reasoningEnabled,
+    reasoningEffort: state.reasoningEffort,
+  };
+  for (const key of CLAMPED_PILL_KEYS) {
+    owned[key] = readThreadScopedValue(state, key) === true;
+  }
+  if (threadScopedSettingsThreadId !== null) {
+    restoreChatOwnedValues(threadScopedSettingsThreadId, owned);
+  }
+  return { ...state, ...owned };
+}
+
+/** `run`, which carries the model `live` just loaded, with what that load sets: pill clamps, its effort pin, Think. */
+export function withLoadedModelOverrides<T extends ChatRuntimeStore>(run: T, live: T): T {
+  const next: Record<string, unknown> = { ...run };
+  for (const key of CLAMPED_PILL_KEYS) {
+    next[key] = run[key] === true && !isPillClampedOff(run, key);
+  }
+  if (pinOwnsLiveReasoningEffort(run)) next.reasoningEffort = live.reasoningEffort;
+  // Every load writes Think from the model (pin, forced gates, default), not from the chat.
+  next.reasoningEnabled = live.reasoningEnabled;
+  return next as T;
 }
 
 /** Read the level live: Full access outlives a chat switch but codeToolsEnabled does not. */
