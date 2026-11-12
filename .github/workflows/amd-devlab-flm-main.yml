@@ -1,4 +1,4 @@
-name: AMD DevLab NPU Qwen3.8 27B on FastFlowLM 1.0.12 vs FastFlowLM main with PR 1029 (no tunnel)
+name: AMD DevLab NPU Qwen3.8 27B on FastFlowLM main with PR 1029 (keep version.txt) (no tunnel)
 
 on:
   push:
@@ -96,6 +96,7 @@ jobs:
                   print(f"\n[{label}] LOAD {mid}: http {c} {'ok' if ok else b[:300]}", flush=True)
                   for l in lem()[n:]:
                       if re.search(r"Installing|version|drafter|Draft|Error|Warn|serve", l): print("    ", l[:300])
+                  print("     flm version after load:", flm_version(), flush=True)
                   if not ok: continue
                   body = {"model": "lemonade:" + mid, "max_tokens": 8, "stream": False, "messages": [{"role": "user", "content": "Hi"}]}
                   call("POST", "/v1/chat/completions", body, login(), 600)
@@ -118,13 +119,14 @@ jobs:
           for cp in os.environ["CHECKPOINTS"].split():
               mid = models[cp]["id"]; c, _ = call("POST", f"/api/npu/models/{mid}/download", {}, login()); print("download", mid, c, flush=True); mids.append(mid)
           print("flm version (release):", flm_version(), flush=True)
-          run("FLM 1.0.12", mids)
           okf = f"{W}/flmmain/OK"
           if not os.path.exists(okf):
               print("\nFastFlowLM main build not available, stopping after the 1.0.12 runs.", flush=True); sys.exit(0)
           tar = f"{W}/flmmain/" + open(okf).read().strip()
           shutil.move(FLMDIR, FLMDIR + ".release"); os.makedirs(FLMDIR)
           with tarfile.open(tar) as t: t.extractall(FLMDIR)
+          for f in os.listdir(FLMDIR + ".release"):
+              if f.lower().startswith("version"): shutil.copy2(os.path.join(FLMDIR + ".release", f), FLMDIR); print("kept", f, "=", open(os.path.join(FLMDIR, f)).read().strip()[:80], flush=True)
           print("\nswapped in", os.path.basename(tar), "| flm version now:", flm_version(), flush=True)
           run("FLM main 9a1fac54", mids)
           print("\nflm version at the end:", flm_version(), "| lemonade reinstall lines:", [l[:200] for l in lem() if "Installing flm" in l][-3:], flush=True)
