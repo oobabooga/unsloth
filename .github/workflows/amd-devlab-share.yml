@@ -1,0 +1,93 @@
+name: AMD DevLab NPU share link (Unsloth Studio over a Cloudflare quick tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-share]
+
+permissions: {}
+
+jobs:
+  share:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    env:
+      SRC_REPO: https://github.com/LeoBorcherding/unsloth.git
+      SRC_SHA: db8d4503848a028123f2cab7fbddf52b3955bee7
+      MODEL: qwen3.6-moe-35b-a3b-FLM
+      HOLD_MINUTES: "200"
+      # Leo's public SSH key: the link and password are printed only encrypted to it
+      RECIPIENT: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDyrvVJnH1mEtd8olk8hgeijGjSzC1M73ySJcYaXOpgo"
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-share-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out" "$W/bin"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout "$SRC_REPO" "$W/src"
+          cd "$W/src" && git fetch -q origin "$SRC_SHA" && git checkout -q "$SRC_SHA"
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18900-18999 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Enable the NPU and download the model
+        continue-on-error: true
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/776c87ef15/rec.py" -o "$W/rec.py"
+          BASE="http://127.0.0.1:$PORT" OUT="$W/out" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tail -20
+
+      - name: Open the tunnel and hold it
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          cd "$W/bin"
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared
+          curl -fsSL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar xz --strip-components=1
+          ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" > "$W/cloudflared.log" 2>&1 &
+          echo $! > "$W/cloudflared.pid"
+          URL=""
+          for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cloudflared.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
+          [ -n "$URL" ] || { echo "no tunnel URL"; tail -30 "$W/cloudflared.log" | grep -v trycloudflare; exit 1; }
+          echo "::add-mask::$URL"
+          sleep 5; curl -s -o /dev/null -w "tunnel check: HTTP %{http_code}\n" "$URL/api/health" || true
+          echo "----- link and password, encrypted to Leo's SSH key -----"
+          printf 'url: %s\nuser: unsloth\npassword: %s\n' "$URL" "$PW" | ./age -a -r "$RECIPIENT"
+          echo "----- end -----"
+          echo "Holding for $HOLD_MINUTES min. Cancel the run to close the link early."
+          END=$(( $(date +%s) + HOLD_MINUTES*60 ))
+          while [ $(date +%s) -lt $END ]; do
+            kill -0 "$(cat "$W/studio.pid")" 2>/dev/null || { echo "Unsloth Studio exited"; break; }
+            kill -0 "$(cat "$W/cloudflared.pid")" 2>/dev/null || { echo "tunnel exited"; break; }
+            sleep 60
+          done
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          for f in cloudflared.pid studio.pid; do [ -f "$W/$f" ] && kill -TERM "$(cat "$W/$f")" 2>/dev/null; done
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-share-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-share-$GITHUB_RUN_ID"
