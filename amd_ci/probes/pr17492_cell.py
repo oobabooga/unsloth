@@ -5,7 +5,7 @@ import argparse, contextlib, io, json, os, sys, traceback
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required = True)
-ap.add_argument("--model", default = "trl-internal-testing/tiny-LlamaForCausalLM-3.2")
+ap.add_argument("--model", default = "trl-internal-testing/tiny-Qwen3ForCausalLM")
 a = ap.parse_args()
 res = {"stage": "start"}
 buf = io.StringIO()
