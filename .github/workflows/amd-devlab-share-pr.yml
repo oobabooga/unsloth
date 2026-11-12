@@ -11,9 +11,9 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     env:
-      PR_NUMBER: ""
+      PR_NUMBER: "17512"
       FORK_SHA: e9467740d623efddf461a57243701781a1791877
-      MODEL: qwen3.5-4b-FLM
+      MODEL: qwen3.6-moe-35b-a3b-FLM
       HOLD_MINUTES: "200"
       # Leo's public SSH key: the link and password are printed only encrypted to it
       RECIPIENT: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDyrvVJnH1mEtd8olk8hgeijGjSzC1M73ySJcYaXOpgo"
