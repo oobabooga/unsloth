@@ -1,0 +1,142 @@
+name: AMD DevLab NPU Qwen3.8 27B on FastFlowLM 1.0.12 vs FastFlowLM main with PR 1029 (no tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-flm-main]
+
+permissions:
+  actions: read
+
+jobs:
+  flm:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      BRANCH: studio/npu-phase-5-monitor-engines
+      CHECKPOINTS: "qwen3.8-dflash2:27b qwen3.8-mtp:27b"
+      FLM_ARTIFACT_ID: "13973940491"
+      FLM_TAR_SHA256: "b7b4c4bbbaf606977046340f233eea7176619385bd0f3c2a2d6b35eab6f1d5df"
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-flmmain-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q https://github.com/LeoBorcherding/unsloth.git "$BRANCH" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          free -g | head -2
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Fetch the FastFlowLM main build (CI run 43280197332, commit 9a1fac54)
+        continue-on-error: true
+        shell: bash {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$W/flmmain" && cd "$W/flmmain"
+          code=$(curl -sSL -w "%{http_code}" -o art.zip -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/ROCm/FastFlowLM/actions/artifacts/$FLM_ARTIFACT_ID/zip")
+          echo "artifact download: HTTP $code, $(stat -c %s art.zip 2>/dev/null) bytes"
+          [ "$code" = "200" ] || { head -c 300 art.zip; echo; exit 0; }
+          python3 -c "import zipfile; zipfile.ZipFile('art.zip').extractall('.')"
+          T=$(ls fastflowlm_*_linux.tar.gz | head -1); echo "tar: $T"
+          echo "$FLM_TAR_SHA256  $T" | sha256sum -c - && echo "$T" > "$W/flmmain/OK"
+
+      - name: Qwen3.8 27B, FastFlowLM 1.0.12 then main
+        shell: bash {0}
+        run: |
+          cat > "$W/q.py" <<'PY'
+          import glob, json, os, re, shutil, subprocess, sys, tarfile, time, urllib.request, urllib.error
+          W, B, PW = os.environ["W"], f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"]
+          SHORT = "Explain how a bicycle stays upright while moving, in about 200 words."
+          FLMDIR = f"{W}/studio/lemonade/cache/bin/flm/npu"
+          def call(method, path, body=None, tok=None, timeout=3000):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+          def lem():
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/lemonade/lemonade-*.log")): out += open(f, errors="replace").read().replace("\0", "").splitlines()
+              return out
+          def login(): return json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          def flm_version():
+              r = subprocess.run([f"{FLMDIR}/flm", "version", "--json"], capture_output=True, text=True, timeout=30, env=dict(os.environ, FLM_DISABLE_UPDATE_CHECK="1"))
+              return (r.stdout.strip() or r.stderr.strip())[:200]
+          tools = [{"type": "function", "function": {"name": "web_search", "description": "Search the web.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+          CASES = [("no tools, default sampling", 128, {}), ("no tools, temperature 0", 128, {"temperature": 0}),
+                   ("tools, default sampling", 32, {"tools": tools}), ("tools, temperature 0", 32, {"tools": tools, "temperature": 0})]
+          def run(label, mids):
+              for mid in mids:
+                  n = len(lem())
+                  c, b = call("POST", "/api/inference/load", {"model_path": "lemonade:" + mid, "force_reload": True}, login())
+                  ok = c == 200 and '"_deferred_error"' not in b[:200]
+                  print(f"\n[{label}] LOAD {mid}: http {c} {'ok' if ok else b[:300]}", flush=True)
+                  for l in lem()[n:]:
+                      if re.search(r"Installing|version|drafter|Draft|Error|Warn|serve", l): print("    ", l[:300])
+                  if not ok: continue
+                  body = {"model": "lemonade:" + mid, "max_tokens": 8, "stream": False, "messages": [{"role": "user", "content": "Hi"}]}
+                  call("POST", "/v1/chat/completions", body, login(), 600)
+                  for name, mt, extra in CASES:
+                      n = len(lem())
+                      body = {"model": "lemonade:" + mid, "max_tokens": mt, "stream": False, "messages": [{"role": "user", "content": SHORT}]}; body.update(extra)
+                      t0 = time.time(); c, b = call("POST", "/v1/chat/completions", body, login(), 2400); wall = time.time() - t0
+                      time.sleep(0.7)
+                      tel = [l for l in lem()[n:] if "Inference completed" in l]
+                      m = re.search(r"tokens=\d+ \(in=(\d+), out=(\d+)\), ttft=([\d.]+)s, tps=([\d.]+)", tel[-1]) if tel else None
+                      finish = ""
+                      try: finish = json.loads(b)["choices"][0].get("finish_reason")
+                      except Exception: pass
+                      print(f"RESULT | {label} | {mid} | {name} | http {c} | in {m.group(1) if m else '?'} out {m.group(2) if m else '?'} | ttft {m.group(3) if m else '?'} | tps {m.group(4) if m else '?'} | wall {wall:.1f}s | finish {finish}", flush=True)
+                      if c != 200: print("    body:", b[:300])
+                  call("POST", "/api/inference/unload", {"model_path": "lemonade:" + mid}, login()); time.sleep(3)
+          print("enable:", call("POST", "/api/npu/enable", {}, login())[0], flush=True)
+          models = {m["checkpoint"]: m for m in json.loads(call("GET", "/api/npu/models", tok=login())[1])["models"]}
+          mids = []
+          for cp in os.environ["CHECKPOINTS"].split():
+              mid = models[cp]["id"]; c, _ = call("POST", f"/api/npu/models/{mid}/download", {}, login()); print("download", mid, c, flush=True); mids.append(mid)
+          print("flm version (release):", flm_version(), flush=True)
+          run("FLM 1.0.12", mids)
+          okf = f"{W}/flmmain/OK"
+          if not os.path.exists(okf):
+              print("\nFastFlowLM main build not available, stopping after the 1.0.12 runs.", flush=True); sys.exit(0)
+          tar = f"{W}/flmmain/" + open(okf).read().strip()
+          shutil.move(FLMDIR, FLMDIR + ".release"); os.makedirs(FLMDIR)
+          with tarfile.open(tar) as t: t.extractall(FLMDIR)
+          print("\nswapped in", os.path.basename(tar), "| flm version now:", flm_version(), flush=True)
+          run("FLM main 9a1fac54", mids)
+          print("\nflm version at the end:", flm_version(), "| lemonade reinstall lines:", [l[:200] for l in lem() if "Installing flm" in l][-3:], flush=True)
+          for mid in mids: call("DELETE", f"/api/npu/models/{mid}", tok=login())
+          PY
+          python3 "$W/q.py" 2>&1 | sed "s#$W#\$W#g"
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-flmmain-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-flmmain-$GITHUB_RUN_ID"
