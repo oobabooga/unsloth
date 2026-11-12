@@ -1,0 +1,100 @@
+name: NPU per-PR suites
+
+on:
+  push:
+    branches: [amd-devlab-npu-perpr]
+
+permissions:
+  contents: read
+
+env:
+  MAIN_SHA: dad5c73a4879dd2724b84a75c7ef968d629a795b
+
+jobs:
+  suites:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # name:ref:kinds, space separated. Each ref is merged onto MAIN_SHA.
+          - group: base
+            trees: "main:main:be,repo,inst,fe stack:patch:be,repo,inst,fe"
+          - group: frontend-only
+            trees: "pr17505:038b1c1cf6727c2d4f48424f4ad7be31c65e0c87:repo,fe pr17506:9de15437f89ac4c1f2014578615b3c68d9f0e875:repo,fe pr17507:9f5370038f6687129cd1a6b005e9535e73c115ee:repo,fe pr17509:ab8488f0deecbdf098ac25868d1e90871028b2f0:repo,fe pr17522:12ac9863a68737db2f586d06c106d10d30ec8267:repo,fe"
+          - group: backend-a
+            trees: "pr17512:dddfe691390790e166a1fc9f05cd30c6a5699767:be,repo pr17514:0b152298b6ff464ea0eec830c99b5367edd68335:be,repo,fe"
+          - group: backend-b
+            trees: "pr17520:707300ac447c504936871e8821e1e8654c388ceb:be,repo pr17521:3a9000e51f3946a9e4bd6b6d2b174c1f2a3074b6:repo,inst pr17525:ba683c6fc46f1b2c8ebf94256c88e1589465dc79:be,repo,fe"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Environment
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-perpr-$GITHUB_RUN_ID-${{ matrix.group }}"
+          mkdir -p "$W/tmp" "$W/out" "$W/cache/uv" "$W/cache/npm" "$W/hf"
+          {
+            echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "UV_CACHE_DIR=$W/cache/uv"; echo "npm_config_cache=$W/cache/npm"
+            echo "HF_HOME=$W/hf"; echo "CUDA_VISIBLE_DEVICES="; echo "HIP_VISIBLE_DEVICES="
+          } >> "$GITHUB_ENV"
+          nproc; free -g | head -2; df -h "$RUNNER_TEMP" | tail -1
+      - name: Sources
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git fetch -q origin "$MAIN_SHA"
+          for t in ${{ matrix.trees }}; do
+            ref=$(echo "$t" | cut -d: -f2)
+            case "$ref" in main|patch) ;; *) git fetch -q origin "$ref";; esac
+          done
+          git log -1 --format='main %h %s' "$MAIN_SHA"
+      - name: Python 3.13 test venv (Backend CI's CPU dependency set)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$W/uvenv" && "$W/uvenv/bin/pip" install -q uv
+          export PATH="$W/uvenv/bin:$PATH"
+          uv python install 3.13 >/dev/null
+          uv venv -q -p 3.13 "$W/venv"
+          export VIRTUAL_ENV="$W/venv"
+          cd "$W/src" && git checkout -q "$MAIN_SHA"
+          uv pip install -q -r studio/backend/requirements/studio.txt
+          uv pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' 'pytest<9.2' pytest-asyncio pytest-xdist pytest-timeout httpx soundfile librosa
+          uv pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+            'torch>=2.4,<2.11' 'torchaudio<2.11'
+          uv pip install -q 'transformers>=4.51,<=5.17.0' sentence-transformers 'bitsandbytes>=0.45' torchao
+          uv pip install -q "$(grep -m1 -E '^peft==' studio/backend/requirements/extras-no-deps.txt)"
+          uv pip install -q "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" || echo "unsloth_zoo install failed"
+          "$W/venv/bin/python" -c "import torch, transformers, pytest; print(torch.__version__, transformers.__version__, pytest.__version__)"
+      - name: Node 22 and the frontend dependencies
+        if: contains(matrix.trees, 'fe')
+        run: |
+          set -euo pipefail
+          cd "$W"
+          F=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk '/linux-x64.tar.xz$/ {print $2}')
+          curl -fsSL "https://nodejs.org/dist/latest-v22.x/$F" -o node.tar.xz
+          grep " $F\$" <(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt) | sed "s# $F# node.tar.xz#" | sha256sum -c -
+          mkdir node && tar -xJf node.tar.xz -C node --strip-components=1 && rm node.tar.xz
+          export PATH="$W/node/bin:$PATH"; node --version
+          cd "$W/src/studio/frontend" && npm ci --no-fund --no-audit > "$W/npm-ci.log" 2>&1 || { tail -40 "$W/npm-ci.log"; exit 1; }
+          mv node_modules "$W/node_modules"
+      - name: Suites
+        shell: bash {0}
+        run: |
+          for t in ${{ matrix.trees }}; do
+            name=$(echo "$t" | cut -d: -f1); ref=$(echo "$t" | cut -d: -f2); kinds=$(echo "$t" | cut -d: -f3 | tr ',' ' ')
+            bash "$GITHUB_WORKSPACE/harness/run_tree.sh" "$name" "$ref" "$kinds"
+          done
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perpr-${{ matrix.group }}
+          path: ${{ env.W }}/out/
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/npu-perpr-$GITHUB_RUN_ID-${{ matrix.group }}"
