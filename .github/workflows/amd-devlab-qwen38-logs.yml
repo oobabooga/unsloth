@@ -1,0 +1,119 @@
+name: AMD DevLab NPU Qwen3.8 27B logs, tools on and off (phase 5 build, no tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-qwen38-logs]
+
+permissions: {}
+
+jobs:
+  logs:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    env:
+      BRANCH: studio/npu-phase-5-monitor-engines
+      CHECKPOINTS: "qwen3.8-dflash2:27b qwen3.8-mtp:27b"
+    steps:
+      - name: Install Unsloth Studio
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-q38-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git fetch -q https://github.com/LeoBorcherding/unsloth.git "$BRANCH" && git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          free -g | head -2
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Qwen3.8 27B with and without tools
+        shell: bash {0}
+        run: |
+          cat > "$W/q.py" <<'PY'
+          import glob, json, os, re, time, urllib.request, urllib.error
+          W, B, PW = os.environ["W"], f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"]
+          SHORT = "Explain how a bicycle stays upright while moving, in about 200 words."
+          def call(method, path, body=None, tok=None, timeout=3000):
+              req = urllib.request.Request(B + path, method=method, data=json.dumps(body).encode() if body is not None else None)
+              req.add_header("content-type", "application/json")
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+              except Exception as e: return 0, repr(e)
+          def lem():
+              out = []
+              for f in sorted(glob.glob(f"{W}/studio/logs/lemonade/lemonade-*.log")): out += open(f, errors="replace").read().splitlines()
+              return out
+          def login(): return json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          def chat(mid, label, max_tokens, **extra):
+              n = len(lem())
+              lem_note = f"=== {label}"
+              body = {"model": "lemonade:" + mid, "max_tokens": max_tokens, "stream": False, "messages": [{"role": "user", "content": SHORT}]}; body.update(extra)
+              t0 = time.time(); c, b = call("POST", "/v1/chat/completions", body, login(), 2400); wall = time.time() - t0
+              time.sleep(0.7)
+              print(f"\n{lem_note} | http {c} | wall {wall:.1f}s", flush=True)
+              for l in lem()[n:]: print("   ", l[:400])
+              if c != 200: print("    body:", b[:300].replace(PW, "***"))
+          print("enable:", call("POST", "/api/npu/enable", {}, login())[0], flush=True)
+          models = {m["checkpoint"]: m for m in json.loads(call("GET", "/api/npu/models", tok=login())[1])["models"]}
+          tools = [{"type": "function", "function": {"name": "web_search", "description": "Search the web.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+          for cp in os.environ["CHECKPOINTS"].split():
+              mid = models[cp]["id"]
+              c, b = call("POST", f"/api/npu/models/{mid}/download", {}, login())
+              print(f"\n########## {mid} (download {c})", flush=True)
+              n = len(lem())
+              c, b = call("POST", "/api/inference/load", {"model_path": "lemonade:" + mid}, login())
+              print("LOAD", c, "| lemonade log for the load:")
+              for l in lem()[n:]: print("   ", l[:400])
+              chat(mid, "warm-up, 8 tokens", 8)
+              chat(mid, "no tools, 16 tokens", 16)
+              chat(mid, "no tools, 128 tokens", 128)
+              chat(mid, "no tools, 128 tokens, temperature 0", 128, temperature=0)
+              chat(mid, "no tools, 128 tokens, again", 128)
+              chat(mid, "tools sent, 32 tokens", 32, tools=tools)
+              chat(mid, "tools sent + tool_choice none, 32 tokens", 32, tools=tools, tool_choice="none")
+              chat(mid, "no tools after the tool requests, 128 tokens", 128)
+              call("POST", "/api/inference/unload", {"model_path": "lemonade:" + mid}, login()); time.sleep(3)
+              print("delete", call("DELETE", f"/api/npu/models/{mid}", tok=login())[0], flush=True)
+          PY
+          python3 "$W/q.py" 2>&1 | sed "s#$W#\$W#g"
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          for f in "$W"/studio/logs/lemonade/*.log "$W"/studio/logs/server/*.log; do
+            [ -f "$f" ] && tr -d '\000' < "$f" | grep -vF "$PW" | sed -E "s#$W#\$W#g; s/[A-Za-z0-9_-]{32,}/<redacted>/g" > "$GITHUB_WORKSPACE/logs/$(basename "$f")"
+          done
+          ls -la "$GITHUB_WORKSPACE/logs"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: qwen38-logs
+          path: logs/
+          if-no-files-found: ignore
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-q38-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-q38-$GITHUB_RUN_ID"
