@@ -1,0 +1,114 @@
+name: AMD DevLab NPU auto compaction, PR 17616 base vs head
+
+on:
+  push:
+    branches: [amd-devlab-npu-17616-ui]
+
+permissions: {}
+
+jobs:
+  shots:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    env:
+      BEFORE: 3de707fc815be530f3506316ee5918a17368ab55
+      AFTER: 9fb4e5b75c839c5f60739ba2268885ad2be26f60
+      CHECKPOINT: "qwen3.5:4b"
+      CTX: "2048"
+    steps:
+      - name: Hardware
+        run: |
+          uname -r; lscpu | grep -m1 "Model name"; free -g | head -2
+          ls /dev/accel* 2>/dev/null || echo "no /dev/accel"
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-compact-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; } >> "$GITHUB_ENV"
+          python3 -m venv "$W/pwenv" && "$W/pwenv/bin/pip" -q install playwright > "$W/pw-install.log" 2>&1
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw" "$W/pwenv/bin/playwright" install chromium >> "$W/pw-install.log" 2>&1 || tail -5 "$W/pw-install.log"
+          cat > "$W/leg.sh" <<'SH'
+          # leg.sh <label> <sha>: install, start, load with a small context, drive the chat, stop
+          set -uo pipefail
+          L=$1; SHA=$2; H="$W/studio-$L"; export UNSLOTH_STUDIO_HOME="$H"
+          rm -rf "$W/src"; git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && { git fetch -q origin "$SHA" || git fetch -q https://github.com/LeoBorcherding/unsloth.git "$SHA"; } && git checkout -q FETCH_HEAD || { echo "[$L] cannot fetch $SHA"; exit 1; }
+          git log -1 --format="[$L] installing %H %s"
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install-$L.log" 2>&1 || { tail -80 "$W/install-$L.log"; exit 1; }
+          PY="$H/unsloth_studio/bin/python"; PORT=$(shuf -i 18600-18699 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"; echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio-$L.log" 2>&1 & SP=$!
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          PORT=$PORT PW=$PW LABEL=$L PLAYWRIGHT_BROWSERS_PATH="$W/pw" "$W/pwenv/bin/python" "$W/drive.py" 2>&1 | grep -vF "$PW" | cut -c1-600
+          echo "--- [$L] server lines about compaction / context"
+          grep -hiE "compact|truncat|dropped|fit_external|context window" "$H"/logs/server/*.log 2>/dev/null | tail -15 | cut -c1-300
+          echo "--- [$L] lemonade loads"
+          grep -hE "Loading|ctx-len|Request failed" "$H"/logs/lemonade/*.log 2>/dev/null | tail -6 | cut -c1-300
+          kill $SP; sleep 5; pkill -KILL -f "$H" 2>/dev/null || true; sleep 3
+          SH
+          cat > "$W/drive.py" <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          from playwright.sync_api import sync_playwright
+          B, PW, L, OUT = f"http://127.0.0.1:{os.environ['PORT']}", os.environ["PW"], os.environ["LABEL"], os.environ["W"] + "/out"
+          def call(m, path, body=None, tok=None, timeout=3000):
+              r = urllib.request.Request(B + path, method=m, data=json.dumps(body).encode() if body is not None else None)
+              r.add_header("content-type", "application/json")
+              if tok: r.add_header("Authorization", "Bearer " + tok)
+              try:
+                  with urllib.request.urlopen(r, timeout=timeout) as x: return x.status, x.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace")
+          tok = json.loads(call("POST", "/api/auth/login", {"username": "unsloth", "password": PW})[1])["access_token"]
+          call("POST", "/api/npu/enable", {}, tok)
+          m = next(x for x in json.loads(call("GET", "/api/npu/models", tok=tok)[1])["models"] if x["checkpoint"] == os.environ["CHECKPOINT"])
+          print(L, "download", call("POST", f"/api/npu/models/{m['id']}/download", {}, tok)[0], flush=True)
+          c, b = call("POST", "/api/inference/load", {"model_path": "lemonade:" + m["id"], "max_seq_length": int(os.environ["CTX"])}, tok)
+          d = json.loads(b) if c == 200 else {}
+          print(L, "load", c, {k: d.get(k) for k in ("context_length", "is_npu")} if d else b[:300], flush=True)
+          words = "sloth canopy river moss leaf branch night slow green rain".split()
+          long = " ".join(f"{words[i % 10]}{i}" for i in range(250))
+          with sync_playwright() as p:
+              br = p.chromium.launch(); pg = br.new_page(viewport={"width": 1440, "height": 900})
+              pg.goto(B, wait_until="networkidle")
+              pw = pg.locator("input[type=password]").first
+              if pw.count(): pw.fill(PW); pw.press("Enter"); pg.wait_for_load_state("networkidle")
+              pg.wait_for_timeout(6000)
+              for turn in range(1, 7):
+                  ta = pg.locator("textarea, [contenteditable=true]").first
+                  ta.click(); ta.fill(f"Turn {turn}. Here are some notes: {long}. Reply with only the word OK.")
+                  pg.keyboard.press("Enter"); pg.wait_for_timeout(40000)
+                  pg.screenshot(path=f"{OUT}/{L}-turn{turn}.png")
+                  toasts = [t.inner_text()[:300] for t in pg.locator("[data-sonner-toast]").all()]
+                  print(L, "turn", turn, "toasts:", toasts, flush=True)
+              ta = pg.locator("textarea, [contenteditable=true]").first
+              ta.click(); ta.fill("/compact"); pg.keyboard.press("Enter"); pg.wait_for_timeout(40000)
+              pg.screenshot(path=f"{OUT}/{L}-compact.png")
+              print(L, "/compact toasts:", [t.inner_text()[:300] for t in pg.locator("[data-sonner-toast]").all()], flush=True)
+              br.close()
+          PY
+
+      - name: Before (merge base)
+        shell: bash {0}
+        run: bash "$W/leg.sh" before "$BEFORE"
+
+      - name: After (PR head)
+        shell: bash {0}
+        run: bash "$W/leg.sh" after "$AFTER"
+
+      - name: Collect
+        if: always()
+        run: mkdir -p "$GITHUB_WORKSPACE/shots" && cp "$W"/out/*.png "$GITHUB_WORKSPACE/shots/" 2>/dev/null; ls "$GITHUB_WORKSPACE/shots" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: shots
+          path: shots/
+          if-no-files-found: ignore
+
+      - name: Clean up
+        if: always()
+        run: pkill -KILL -f "$RUNNER_TEMP/npu-compact-$GITHUB_RUN_ID" 2>/dev/null || true; rm -rf "$RUNNER_TEMP/npu-compact-$GITHUB_RUN_ID"
