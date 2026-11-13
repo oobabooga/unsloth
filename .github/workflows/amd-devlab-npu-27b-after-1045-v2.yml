@@ -1,0 +1,138 @@
+name: AMD DevLab NPU Qwen3.8 27B speed, FLM #1045 dc0f9d2 (greedy fix) vs FLM main vs 1.0.12
+
+on:
+  push:
+    branches: [amd-devlab-npu-27b-after-1045-v2]
+
+permissions: {}
+
+env:
+  FLM_SPEC_COMMIT: dc0f9d245b9ac4e41c966441c0a5efc24886c61d
+  FLM_MAIN_COMMIT: 25ba44eee2d95c52a02f70fd3da02f093ee80ea7
+  FLM_1012_COMMIT: cce7e5bb7d56af182b5051c12253175a86957b73
+
+jobs:
+  # Built on a hosted runner in FastFlowLM's own public build image, the same recipe as run 43463155869.
+  build-flm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: ghcr.io/rocm/fastflowlm/build-environment:debian13
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: main
+            repo: https://github.com/ROCm/FastFlowLM.git
+            commit: 25ba44eee2d95c52a02f70fd3da02f093ee80ea7
+          - name: pr1045
+            repo: https://github.com/LeoBorcherding/FastFlowLM.git
+            commit: dc0f9d245b9ac4e41c966441c0a5efc24886c61d
+    steps:
+      - name: Build FLM ${{ matrix.name }} (XRT portable)
+        shell: bash
+        env:
+          REPO: ${{ matrix.repo }}
+          COMMIT: ${{ matrix.commit }}
+          NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/cargo/bin:$PATH
+          git config --global --add safe.directory '*'
+          git clone -q --filter=blob:none "$REPO" flm
+          cd flm && git checkout -q "$COMMIT"
+          git log -1 --format='building %H %ci %s'
+          git submodule update --init --recursive --depth 1 --jobs 4
+          cd src
+          cmake --preset linux-portable
+          cmake --build build -j"$(nproc)"
+          cd build && rm -rf install && DESTDIR="$PWD/install" cmake --install .
+          R=install/opt/fastflowlm
+          mv "$R/flm" "$R/flm-real" && mv "$R/flm-wrapper.sh" "$R/flm" && chmod +x "$R/flm"
+          strip --strip-debug "$R/flm-real"
+          tar czf "$GITHUB_WORKSPACE/flm-$NAME-portable.tar.gz" -C "$R" .
+          ls -la "$GITHUB_WORKSPACE/flm-$NAME-portable.tar.gz"; sha256sum "$GITHUB_WORKSPACE/flm-$NAME-portable.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flm-${{ matrix.name }}-portable
+          path: flm-${{ matrix.name }}-portable.tar.gz
+          retention-days: 3
+
+  npu:
+    needs: build-flm
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ["qwen3.8-mtp:27b", "qwen3.8-dflash2:27b"]
+        tools: ["off"]
+    env:
+      MODEL: ${{ matrix.model }}
+      TOOLS: ${{ matrix.tools }}
+    steps:
+      - name: Hardware
+        run: |
+          echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+          hostname; uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          lspci -nn | grep -iE 'vga|display|processing accelerator|signal processing' || true
+          ls -l /dev/accel* 2>/dev/null || true
+          cat /sys/module/amdxdna/version 2>/dev/null || modinfo amdxdna 2>/dev/null | grep -E '^version|^vermagic' || true
+          cat /opt/rocm/.info/version 2>/dev/null || true
+
+      - name: Fetch FLM 1.0.12 and the script
+        shell: bash
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu27b-$GITHUB_RUN_ID-${{ strategy.job-index }}"
+          mkdir -p "$W/tmp" "$W/hf" "$W/flm1012" "$W/flmmain" "$W/flmspec" "$GITHUB_WORKSPACE/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "OUT=$GITHUB_WORKSPACE/out"; } >> "$GITHUB_ENV"
+          curl -fsSL -o "$W/flm1012.tar.gz" https://github.com/ROCm/FastFlowLM/releases/download/v1.0.12/fastflowlm_1.0.12_linux.tar.gz
+          tar xzf "$W/flm1012.tar.gz" -C "$W/flm1012"
+          sha256sum "$W/flm1012.tar.gz"; ls "$W/flm1012"
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/$GITHUB_SHA/.github/workflows/npu27b_direct.py" -o "$W/npu27b_direct.py"
+      - uses: actions/download-artifact@v4
+        with:
+          name: flm-main-portable
+          path: ${{ runner.temp }}/flm-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: flm-pr1045-portable
+          path: ${{ runner.temp }}/flm-artifacts
+      - name: Unpack FLM main and #1045
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum "$RUNNER_TEMP"/flm-artifacts/*.tar.gz
+          tar xzf "$RUNNER_TEMP/flm-artifacts/flm-main-portable.tar.gz" -C "$W/flmmain"
+          tar xzf "$RUNNER_TEMP/flm-artifacts/flm-pr1045-portable.tar.gz" -C "$W/flmspec"
+          { echo "FLM_1012=$W/flm1012/flm"; echo "FLM_MAIN=$W/flmmain/flm"; echo "FLM_SPEC=$W/flmspec/flm"; } >> "$GITHUB_ENV"
+          for b in flm1012 flmmain flmspec; do "$W/$b/flm" --version || true; done
+
+      - name: Pull the model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/models"
+          FLM_MODEL_PATH="$W/models" "$FLM_1012" pull "$MODEL" 2>&1 | tail -20
+
+      - name: flm serve A/B/C (#1045 vs main vs 1.0.12)
+        shell: bash {0}
+        run: |
+          export FLM_MODEL_PATH="$W/models"
+          "$FLM_1012" list 2>&1 | grep -i qwen3.8 || true
+          # Matrix stops 15 minutes before the job timeout so the artifact always uploads.
+          DEADLINE=$(( JOB_T0 + 285*60 )) python3 "$W/npu27b_direct.py"
+          ls "$OUT"; df -h "$RUNNER_TEMP" | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu27b-${{ strategy.job-index }}-${{ matrix.tools }}
+          path: out/
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          pkill -KILL -f "$RUNNER_TEMP/npu27b-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu27b-$GITHUB_RUN_ID-"* "$RUNNER_TEMP/flm-artifacts"
