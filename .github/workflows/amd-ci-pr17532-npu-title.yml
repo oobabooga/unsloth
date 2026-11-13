@@ -1,0 +1,73 @@
+name: PR 17532 NPU title request vs conversation cache (FastFlowLM pin)
+
+on:
+  push:
+    branches: [amd-ci-pr17532-npu-title]
+
+permissions: {}
+
+jobs:
+  optab:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    concurrency: {group: amd-ci-gfx1151-gpu, cancel-in-progress: false}
+    env:
+      BRANCH_SHA: fcae4586055b87a74dd2e4115cb4cad469e02ceb
+      CHECKPOINTS: "qwen3.8-dflash2:27b qwen3.8-mtp:27b qwen3.5:9b"
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+
+      - name: Install Unsloth Studio (PR 17532 merge base)
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-title-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q --filter=blob:none --no-checkout https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src" && git checkout -q "$BRANCH_SHA"
+          git log -1 --format='installing %H %s'
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18700-18799 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: A/B
+        shell: bash {0}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/$GITHUB_SHA/.github/workflows/npu_title.py" -o "$W/npu_title.py"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          OUT="$GITHUB_WORKSPACE/out/results.json" python3 "$W/npu_title.py"
+          cp "$W"/studio/logs/lemonade/lemonade-*.log "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          df -h "$RUNNER_TEMP" | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npu-title-17532
+          path: out/
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-title-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-title-$GITHUB_RUN_ID"
