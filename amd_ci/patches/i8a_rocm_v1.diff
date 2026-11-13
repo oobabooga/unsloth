@@ -1,0 +1,3717 @@
+diff --git a/studio/backend/core/inference/diffusion.py b/studio/backend/core/inference/diffusion.py
+index 38de51c120..e41ba2446b 100644
+--- a/studio/backend/core/inference/diffusion.py
++++ b/studio/backend/core/inference/diffusion.py
+@@ -11014,6 +11014,7 @@ class DiffusionBackend:
+                         ),
+                         logger = logger,
+                         target = target,
++                        requested = attention_backend,
+                     )
+                     self._raise_if_load_cancelled(_load_token)
+                     # Step cache drops compile fullgraph; off/fbcache pin it, auto only on max by FBCACHE_MIN_STEPS.
+@@ -14587,6 +14588,7 @@ class DiffusionBackend:
+             ),
+             logger = logger,
+             target = target,
++            requested = state.attention_request,
+         )
+         object.__setattr__(state, "attention_backend", attention_engaged)
+         identity = getattr(state.pipe, "_unsloth_peak_identity", None)
+diff --git a/studio/backend/core/inference/diffusion_attention.py b/studio/backend/core/inference/diffusion_attention.py
+index 9a00d45c1b..44f7f80ad8 100644
+--- a/studio/backend/core/inference/diffusion_attention.py
++++ b/studio/backend/core/inference/diffusion_attention.py
+@@ -32,6 +32,8 @@ _ALIASES: dict[str, str] = {
+     "sage": "sage",
+     "xformers": "xformers",
+     "aiter": "aiter",
++    # Studio's INT8 attention kernel: the automatic native pick, with the strided processors routed to the kernel
++    "unsloth_int8": "unsloth_int8",
+ }
+ ATTN_ALIASES = (ATTN_AUTO,) + tuple(dict.fromkeys(_ALIASES))
+ 
+@@ -618,6 +620,10 @@ def select_attention_backend(
+     bit-identical), and on ROCm with verified flash_attn to ``ROCM_FLASH_CANDIDATE`` (resolved by timing in
+     ``apply_attention_backend``) unless speed is explicitly ``off``; elsewhere returns None (native)."""
+     alias = normalize_attention_backend(requested)
++    if alias == "unsloth_int8":
++        # an overlay on native attention (apply_attention_backend engages it): pick native as a speed profile would
++        alias = ATTN_AUTO
++        speed_active = True
+     if alias != ATTN_AUTO:
+         backend = _ALIASES[alias]
+         if backend == "native":
+@@ -3561,8 +3567,30 @@ def apply_attention_backend(
+     *,
+     logger: Any = None,
+     target: Any = None,
++    requested: Optional[str] = None,
++) -> Optional[str]:
++    """Sets the backend on every DiT (None means native, set explicitly so an earlier pin cannot leak).
++
++    ``requested`` is the load's own attention request: ``unsloth_int8`` (or its env switch) then routes the strided
++    processors of a native pick to the INT8 kernel, and that name is returned."""
++    engaged = _apply_attention_backend(pipe, backend, logger = logger, target = target)
++    if target is not None and (engaged is None or str(engaged).startswith("_native")):
++        try:
++            from .diffusion_int8_attention import BACKEND, install_requested
++            if install_requested(pipe, requested, target, logger = logger):
++                return BACKEND
++        except Exception as exc:  # noqa: BLE001 - an optimisation: the engaged backend stays
++            _warn(logger, "unsloth_int8", exc)
++    return engaged
++
++
++def _apply_attention_backend(
++    pipe: Any,
++    backend: Optional[str],
++    *,
++    logger: Any = None,
++    target: Any = None,
+ ) -> Optional[str]:
+-    """Sets the backend on every DiT (None means native, set explicitly so an earlier pin cannot leak)."""
+     if target is not None:
+         try:
+             guard_rocm_fused_sdpa(target, logger)
+diff --git a/studio/backend/core/inference/diffusion_flux3_attn.py b/studio/backend/core/inference/diffusion_flux3_attn.py
+index 6de4dcfb84..8fe7657618 100644
+--- a/studio/backend/core/inference/diffusion_flux3_attn.py
++++ b/studio/backend/core/inference/diffusion_flux3_attn.py
+@@ -39,6 +39,7 @@ def _backend_value(backend: Any) -> Optional[str]:
+ @lru_cache(maxsize = None)
+ def strided_processor_class() -> Any:
+     """Built once: dynamo guards on the class. Masks, context parallelism and non-cuDNN backends use the stock call."""
++    import torch
+     import torch.nn.functional as F
+     from diffusers.models.transformers import transformer_flux3 as tf3
+     from torch.nn.attention import SDPBackend, sdpa_kernel
+@@ -46,6 +47,11 @@ def strided_processor_class() -> Any:
+     from .diffusion_flux3_qk_rope import qk_norm_rope
+ 
+     class UnslothFlux3StridedAttnProcessor(tf3.Flux3AttnProcessor):
++        # set by diffusion_int8_attention.install_int8_attention: unmasked calls of at least this many tokens run the
++        # INT8 kernel instead of the native one
++        _unsloth_int8 = False
++        _unsloth_int8_min_tokens = 0
++
+         def __call__(
+             self,
+             attn: Any,
+@@ -53,10 +59,11 @@ def strided_processor_class() -> Any:
+             attention_mask: Any = None,
+             image_rotary_emb: Any = None,
+         ) -> Any:
++            cudnn = _backend_value(self._attention_backend) == _CUDNN
+             if (
+                 attention_mask is not None
+                 or self._parallel_config is not None
+-                or _backend_value(self._attention_backend) != _CUDNN
++                or not (cudnn or self._unsloth_int8)
+             ):
+                 return super().__call__(attn, hidden_states, attention_mask, image_rotary_emb)
+             query, key, value = tf3._get_qkv_projections(attn, hidden_states)
+@@ -69,20 +76,32 @@ def strided_processor_class() -> Any:
+             query, key = qk_norm_rope(
+                 attn, query, key, value.dtype, image_rotary_emb, tf3.apply_rotary_emb
+             )
+-
+-            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+-                out = F.scaled_dot_product_attention(
+-                    query.permute(0, 2, 1, 3),
+-                    key.permute(0, 2, 1, 3),
+-                    value.permute(0, 2, 1, 3),
+-                    attn_mask = None,
+-                    dropout_p = 0.0,
+-                    is_causal = False,
+-                    scale = None,
+-                    enable_gqa = False,
+-                )
+-            hidden_states = out.permute(0, 2, 1, 3).flatten(2, 3)
+-            hidden_states = hidden_states.to(query.dtype)
++            if self._unsloth_int8 and query.shape[1] >= self._unsloth_int8_min_tokens:
++                # NHD in and out, q / k in value's dtype (the quantisers read any float dtype), the output in value's dtype;
++                # the op itself runs native attention for a call the kernel cannot take
++                out = torch.ops.unsloth_studio.int8_attention_nhd(query, key, value)
++                hidden_states = out.flatten(2, 3)
++            else:
++                if cudnn:
++                    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
++                        out = F.scaled_dot_product_attention(
++                            query.permute(0, 2, 1, 3),
++                            key.permute(0, 2, 1, 3),
++                            value.permute(0, 2, 1, 3),
++                            attn_mask = None,
++                            dropout_p = 0.0,
++                            is_causal = False,
++                            scale = None,
++                            enable_gqa = False,
++                        )
++                else:
++                    out = F.scaled_dot_product_attention(
++                        query.permute(0, 2, 1, 3),
++                        key.permute(0, 2, 1, 3),
++                        value.permute(0, 2, 1, 3),
++                    )
++                hidden_states = out.permute(0, 2, 1, 3).flatten(2, 3)
++                hidden_states = hidden_states.to(query.dtype)
+ 
+             hidden_states = attn.to_out[0](hidden_states)
+             hidden_states = attn.to_out[1](hidden_states)
+@@ -91,6 +110,65 @@ def strided_processor_class() -> Any:
+     return UnslothFlux3StridedAttnProcessor
+ 
+ 
++def ensure_strided_processors(
++    pipe: Any,
++    target: Any,
++    logger: Any = None,
++) -> int:
++    """Stock FLUX.3 processors -> the strided class with their backend kept, so the INT8 kernel has a processor to
++    run in where the cuDNN strided install did not apply (a native pick). A cuDNN processor is swapped only if the
++    strided cuDNN call passed its bitwise probe. Returns the number of strided processors; never raises."""
++    try:
++        return _ensure_strided(pipe, target, logger)
++    except Exception as exc:  # noqa: BLE001 - the stock processors stay
++        if logger is not None:
++            logger.info("diffusion.flux3_attn: strided processors skipped (%s)", exc)
++        return 0
++
++
++def _ensure_strided(pipe: Any, target: Any, logger: Any) -> int:
++    transformer = getattr(pipe, "transformer", None)
++    if not enabled() or transformer is None or type(transformer).__module__ != _MODULE:
++        return 0
++    import torch
++
++    if is_rocm_torch(torch) or not torch.cuda.is_available():
++        return 0
++    from .diffusion_autoopt.patches import source_digest
++    from diffusers.models.transformers import transformer_flux3 as tf3
++
++    if source_digest(tf3.Flux3AttnProcessor.__call__) not in _PROCESSOR_DIGESTS or not callable(
++        getattr(tf3, "_get_qkv_projections", None)
++    ):
++        return 0
++    device = _device(target)
++    if device.type != "cuda":
++        return 0
++    cls = strided_processor_class()
++    dtype = getattr(target, "dtype", None)
++    if dtype not in (torch.bfloat16, torch.float16):
++        dtype = torch.bfloat16
++    count = 0
++    for attn in _attention_modules(transformer):
++        proc = getattr(attn, "processor", None)
++        if type(proc) is cls:
++            count += 1
++            continue
++        if type(proc) is not tf3.Flux3AttnProcessor:
++            continue
++        if _backend_value(
++            getattr(proc, "_attention_backend", None)
++        ) == _CUDNN and not strided_matches(device, dtype, int(attn.heads), int(attn.head_dim)):
++            continue
++        new = cls()
++        new._attention_backend = proc._attention_backend
++        new._parallel_config = proc._parallel_config
++        new._unsloth_probe_dtype = dtype
++        attn.set_processor(new)
++        count += 1
++    return count
++
++
+ def _attention_modules(transformer: Any) -> list:
+     try:
+         from diffusers.models.transformers.transformer_flux3 import Flux3Attention
+diff --git a/studio/backend/core/inference/diffusion_int8_attention.py b/studio/backend/core/inference/diffusion_int8_attention.py
+new file mode 100644
+index 0000000000..72f3e65c36
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_int8_attention.py
+@@ -0,0 +1,936 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""INT8 attention for DiT inference (backend ``unsloth_int8``): Q.K^T and P.V on the int8 tensor cores.
++
++One call is four small Triton passes (per-channel statistics of K and V, then the Q, K and V quantisers) and one CUDA
++kernel (``diffusion_int8_attention_cuda``). It takes the strided ``[B, S, H, D]`` views the strided processors already
++hold and returns ``[B, S, H, D]``; nothing is copied to a heads-first layout.
++
++How the values are quantised (ideas from the cited papers, written from scratch here):
++
++* Q and K are rotated by one fixed orthogonal map (signs, then a 16-point Hadamard transform per 16 channels) before
++  rounding, which leaves Q.K^T unchanged and evens out each row's use of the int8 range (QuaRot, arXiv 2404.00456).
++* K is first shifted by a per-channel mean over a sub-sample of the keys: the softmax does not see a shift common to
++  all keys (SageAttention, arXiv 2410.02367). Q has one scale per row; K has one scale per group of keys that share
++  a tensor-core accumulator lane (SageAttention2, arXiv 2411.10958), so scores are rescaled without a per-key load.
++* The probabilities are 8-bit integers too, rescaled per key tile so every tile uses the full range, and the softmax
++  denominator is summed over the rounded values (INT-FlashAttention, arXiv 2409.16997).
++* V is centred and divided by a per-channel gain (both undone on the output), with one scale per key tile.
++
++The kernel never replaces attention on its own: a strided processor runs it only after ``install_int8_attention``
++found the kernel accurate on this card and, unless it was asked for by name, more than 2% faster than what the
++processor ran before. Calls it cannot take (masks, other head dims, other devices) run native attention.
++
++``UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL``: ``0`` never engages it, ``1`` engages it wherever it is accurate without
++the race, unset races it where INT8 attention is already wanted (an INT8 checkpoint) or it was requested by name.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import math
++import os
++import threading
++import types
++from functools import lru_cache
++from typing import Any, Callable, Optional
++
++INT8_ATTENTION_ENV = "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL"
++BACKEND = "unsloth_int8"
++_OP = "unsloth_studio::int8_attention_nhd"
++HEAD_DIMS = (64, 128)
++# engaged only when it beats the incumbent by more than this margin on the timed probe (a tie keeps the incumbent)
++RACE_MARGIN = 0.98
++RACE_TOKENS = (4096, 1024)
++# the accuracy every card must reach against fp32 attention on the probe before the kernel may run at all
++MIN_COSINE = 0.999
++MAX_REL_L1 = 0.05
++# the same probe with q and k scaled up, as the sharp attention of late DiT blocks is: every output finite and close
++SHARP_GAIN = 5.0
++MIN_SHARP_COSINE = 0.99
++LOG2E = 1.4426950408889634
++
++# Per CUDA capability and head dim: keys per tile (bn), warps per block (wpc), 16-row query tiles per warp (nq),
++# shared-memory tile buffers (stages) and, where the assembler's own register choice costs a block per SM, a register
++# cap. Measured per card (see the PR); a card missing here keeps native attention.
++KERNEL_CONFIGS: dict = {
++    (8, 0): {
++        128: {"bn": 64, "wpc": 4, "nq": 1, "stages": 1, "max_registers": 168},
++        64: {"bn": 64, "wpc": 4, "nq": 1, "stages": 2},
++    },
++    (8, 6): {
++        128: {"bn": 64, "wpc": 4, "nq": 1, "stages": 1, "max_registers": 168},
++        64: {"bn": 64, "wpc": 4, "nq": 1, "stages": 2},
++    },
++    (8, 9): {
++        128: {"bn": 64, "wpc": 6, "nq": 1, "stages": 1, "max_registers": 168},
++        64: {"bn": 64, "wpc": 4, "nq": 1, "stages": 1},
++    },
++    (12, 0): {
++        128: {"bn": 64, "wpc": 12, "nq": 1, "stages": 2},
++        64: {"bn": 64, "wpc": 8, "nq": 1, "stages": 2},
++    },
++}
++QUANT_ROWS = 64  # rows per quantiser block
++STATS_STEP = 8  # the K mean and the V range are taken over every 8th key
++
++_LOCK = threading.Lock()
++_VERDICTS: dict = {}
++_BROKEN: set = set()
++_VERIFIED: set = set()
++STATS = {"int8": 0, "native": 0}
++_OUT_KIND = {"torch.float16": 0, "torch.bfloat16": 1, "torch.float32": 2}
++
++
++def mode() -> str:
++    """``off`` | ``auto`` | ``force`` from ``UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL``."""
++    raw = (os.environ.get(INT8_ATTENTION_ENV) or "auto").strip().lower()
++    if raw in ("0", "off", "false", "no"):
++        return "off"
++    if raw in ("1", "on", "true", "yes", "force"):
++        return "force"
++    return "auto"
++
++
++def requested(value: Any) -> bool:
++    """Whether a load's attention request names this backend."""
++    return isinstance(value, str) and value.strip().lower() == BACKEND
++
++
++def kernel_config(capability: Any, head_dim: int) -> Optional[dict]:
++    try:
++        table = KERNEL_CONFIGS.get((int(capability[0]), int(capability[1])))
++    except Exception:  # noqa: BLE001
++        return None
++    found = (table or {}).get(int(head_dim))
++    return dict(found) if found else None
++
++
++def kernel_defines(head_dim: int, config: dict) -> dict:
++    return {
++        "HD": int(head_dim),
++        "BN": int(config["bn"]),
++        "NQ": int(config["nq"]),
++        "WPC": int(config["wpc"]),
++        "STAGES": int(config["stages"]),
++    }
++
++
++def shared_bytes(head_dim: int, config: dict) -> int:
++    bn, wpc, nq = int(config["bn"]), int(config["wpc"]), int(config["nq"])
++    stage = bn * (head_dim + 16) + head_dim * (bn + 16)
++    return int(config["stages"]) * stage + wpc * 16 * nq * (head_dim + 16)
++
++
++def _pad(n: int, multiple: int) -> int:
++    return (n + multiple - 1) // multiple * multiple
++
++
++@lru_cache(maxsize = None)
++def _quantisers() -> Any:
++    import triton
++    import triton.language as tl
++
++    try:
++        from triton.language.extra import libdevice
++    except Exception:  # noqa: BLE001 -- older Triton layout
++        from triton.language.extra.cuda import libdevice
++
++    @triton.jit
++    def _rint(x):
++        return libdevice.float2int_rn(x)
++
++    @triton.jit
++    def _rotate(x, R: tl.constexpr, D: tl.constexpr):
++        # [R, D]: fixed signs, then an unnormalised 16-point Hadamard transform inside every 16 channels (a factor 4
++        # in norm, taken out of the Q scale)
++        cols = tl.arange(0, D)
++        flip = (((cols * 7919 + 13) * (cols + 3)) >> 7) & 1
++        x = x * (1.0 - 2.0 * flip.to(tl.float32))[None, :]
++        for _ in tl.static_range(4):
++            a, b = tl.split(tl.reshape(x, (R, D // 2, 2)))
++            z = tl.reshape(tl.join(a + b, a - b), (R, D // 16, 8, 2))
++            x = tl.reshape(tl.permute(z, (0, 1, 3, 2)), (R, D))
++        return x
++
++    @triton.jit
++    def stats_kernel(
++        x_ptr,
++        c_ptr,
++        g_ptr,
++        n_rows,
++        n_heads,
++        x_stride_b,
++        x_stride_s,
++        x_stride_h,
++        STEP: tl.constexpr,
++        R: tl.constexpr,
++        D: tl.constexpr,
++        MODE: tl.constexpr,
++    ):
++        # per (batch, head, channel) over every STEP-th token: MODE 0 = mean -> c; MODE 1 = mid-range -> c and half
++        # range (>= 1e-12) -> g
++        bh = tl.program_id(0)
++        b = bh // n_heads
++        h = bh % n_heads
++        cols = tl.arange(0, D)
++        n_sub = (n_rows + STEP - 1) // STEP
++        if MODE == 0:
++            acc = tl.zeros([D], tl.float32)
++        else:
++            lo = tl.full([D], 3.0e38, tl.float32)
++            hi = tl.full([D], -3.0e38, tl.float32)
++        for blk in range(0, tl.cdiv(n_sub, R)):
++            rows = (blk * R + tl.arange(0, R)) * STEP
++            live = rows < n_rows
++            x = tl.load(
++                x_ptr
++                + b * x_stride_b
++                + h * x_stride_h
++                + rows[:, None].to(tl.int64) * x_stride_s
++                + cols[None, :],
++                mask = live[:, None],
++                other = 0.0,
++            ).to(tl.float32)
++            if MODE == 0:
++                acc += tl.sum(x, axis = 0)
++            else:
++                lo = tl.minimum(lo, tl.min(tl.where(live[:, None], x, 3.0e38), axis = 0))
++                hi = tl.maximum(hi, tl.max(tl.where(live[:, None], x, -3.0e38), axis = 0))
++        if MODE == 0:
++            tl.store(c_ptr + bh * D + cols, acc / n_sub)
++        else:
++            tl.store(c_ptr + bh * D + cols, 0.5 * (hi + lo))
++            tl.store(g_ptr + bh * D + cols, tl.maximum(0.5 * (hi - lo), 1e-12))
++
++    @triton.jit
++    def quant_q_kernel(
++        x_ptr,
++        q_ptr,
++        s_ptr,
++        n_rows,
++        n_pad,
++        n_heads,
++        x_stride_b,
++        x_stride_s,
++        x_stride_h,
++        mul,
++        R: tl.constexpr,
++        D: tl.constexpr,
++    ):
++        # R rows of one (batch, head): int8 = rint(rotated x * 127 / amax(row)), scale[row] = amax / 127 * mul;
++        # padded rows are zeros with scale 0
++        bh = tl.program_id(0)
++        blk = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        rows = blk * R + tl.arange(0, R)
++        cols = tl.arange(0, D)
++        live = rows < n_rows
++        x = tl.load(
++            x_ptr
++            + b * x_stride_b
++            + h * x_stride_h
++            + rows[:, None].to(tl.int64) * x_stride_s
++            + cols[None, :],
++            mask = live[:, None],
++            other = 0.0,
++        ).to(tl.float32)
++        x = _rotate(x, R, D)
++        amax = tl.maximum(tl.max(tl.abs(x), axis = 1), 1e-20)
++        base = bh.to(tl.int64) * n_pad
++        tl.store(s_ptr + base + rows, tl.where(live, amax * (mul / 127.0), 0.0))
++        tl.store(
++            q_ptr + (base + rows[:, None]) * D + cols[None, :],
++            _rint(x * (127.0 / amax)[:, None]).to(tl.int8),
++        )
++
++    @triton.jit
++    def quant_k_kernel(
++        x_ptr,
++        c_ptr,
++        q_ptr,
++        s_ptr,
++        n_rows,
++        n_pad,
++        n_heads,
++        x_stride_b,
++        x_stride_s,
++        x_stride_h,
++        T: tl.constexpr,
++        D: tl.constexpr,
++    ):
++        # one tile of T keys of one (batch, head), centred and rotated: the keys with the same (key % 8) // 2 share a
++        # scale (the lanes of one tensor-core accumulator register). scale [BH, n_pad / T, 4]
++        bh = tl.program_id(0)
++        blk = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        rows = blk * T + tl.arange(0, T)
++        cols = tl.arange(0, D)
++        live = rows < n_rows
++        x = tl.load(
++            x_ptr
++            + b * x_stride_b
++            + h * x_stride_h
++            + rows[:, None].to(tl.int64) * x_stride_s
++            + cols[None, :],
++            mask = live[:, None],
++            other = 0.0,
++        ).to(tl.float32)
++        c = tl.load(c_ptr + bh * D + cols)
++        x = _rotate(tl.where(live[:, None], x - c[None, :], 0.0), T, D)
++        amax = tl.max(tl.abs(x), axis = 1)
++        grp = tl.maximum(tl.max(tl.max(tl.reshape(amax, (T // 8, 4, 2)), axis = 2), axis = 0), 1e-20)
++        per_row = tl.reshape(tl.broadcast_to(grp[None, :, None], (T // 8, 4, 2)), (T,))
++        base = bh.to(tl.int64) * n_pad
++        tl.store(s_ptr + (bh.to(tl.int64) * (n_pad // T) + blk) * 4 + tl.arange(0, 4), grp / 127.0)
++        tl.store(
++            q_ptr + (base + rows[:, None]) * D + cols[None, :],
++            _rint(x * (127.0 / per_row)[:, None]).to(tl.int8),
++        )
++
++    @triton.jit
++    def quant_v_kernel(
++        x_ptr,
++        c_ptr,
++        g_ptr,
++        q_ptr,
++        s_ptr,
++        n_rows,
++        n_pad,
++        n_heads,
++        x_stride_b,
++        x_stride_s,
++        x_stride_h,
++        T: tl.constexpr,
++        D: tl.constexpr,
++    ):
++        # one tile of T keys of one (batch, head): (x - centre) / gain per channel, one scale for the tile, stored
++        # channel-major [BH, n_pad / T, D, T] in the key order the kernel's operand registers want: position
++        # 4 * t + c of every 16 keys holds key 8 * (c >> 1) + 2 * t + (c & 1)
++        bh = tl.program_id(0)
++        blk = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        pos = tl.arange(0, T)
++        rows = blk * T + (pos & -16) + 8 * ((pos & 3) >> 1) + 2 * ((pos >> 2) & 3) + (pos & 1)
++        cols = tl.arange(0, D)
++        live = rows < n_rows
++        x = tl.load(
++            x_ptr
++            + b * x_stride_b
++            + h * x_stride_h
++            + rows[:, None].to(tl.int64) * x_stride_s
++            + cols[None, :],
++            mask = live[:, None],
++            other = 0.0,
++        ).to(tl.float32)
++        c = tl.load(c_ptr + bh * D + cols)
++        g = tl.load(g_ptr + bh * D + cols)
++        x = tl.where(live[:, None], (x - c[None, :]) / g[None, :], 0.0)
++        amax = tl.maximum(tl.max(tl.max(tl.abs(x), axis = 1), axis = 0), 1e-20)
++        tile = bh.to(tl.int64) * (n_pad // T) + blk
++        tl.store(s_ptr + tile, amax / 127.0)
++        tl.store(
++            q_ptr + (tile * D + cols[:, None]) * T + pos[None, :],
++            tl.trans(_rint(x * (127.0 / amax)).to(tl.int8)),
++        )
++
++    return types.SimpleNamespace(
++        stats = stats_kernel, quant_q = quant_q_kernel, quant_k = quant_k_kernel, quant_v = quant_v_kernel
++    )
++
++
++def quantise(
++    q: Any,
++    k: Any,
++    v: Any,
++    config: dict,
++    scale: Optional[float] = None,
++) -> dict:
++    """The kernel's inputs from ``[B, S, H, D]`` q / k / v (any strides on the first three dims)."""
++    import torch
++
++    kernels = _quantisers()
++    B, Sq, H, D = q.shape
++    Sk = k.shape[1]
++    bn, wpc, nq = int(config["bn"]), int(config["wpc"]), int(config["nq"])
++    dev = q.device
++    # log2(e) turns the kernel's 2^x into e^x; 16 is the norm the rotation adds to Q and to K
++    mul = (1.0 / math.sqrt(D) if scale is None else float(scale)) * LOG2E / 16.0
++    n_qpad = _pad(Sq, math.lcm(QUANT_ROWS, 16 * nq * wpc))
++    n_kpad = _pad(Sk, bn)
++    tiles = n_kpad // bn
++    BH = B * H
++
++    def strides(x):
++        return x.stride(0), x.stride(1), x.stride(2)
++
++    qi = torch.empty((BH, n_qpad, D), dtype = torch.int8, device = dev)
++    qs = torch.empty((BH, n_qpad), dtype = torch.float32, device = dev)
++    kernels.quant_q[(BH, n_qpad // QUANT_ROWS)](
++        q, qi, qs, Sq, n_qpad, H, *strides(q), mul, R = QUANT_ROWS, D = D
++    )
++    kc = torch.empty((BH, D), dtype = torch.float32, device = dev)
++    kernels.stats[(BH,)](k, kc, kc, Sk, H, *strides(k), STEP = STATS_STEP, R = 32, D = D, MODE = 0)
++    ki = torch.empty((BH, n_kpad, D), dtype = torch.int8, device = dev)
++    ks = torch.empty((BH, tiles, 4), dtype = torch.float32, device = dev)
++    kernels.quant_k[(BH, tiles)](k, kc, ki, ks, Sk, n_kpad, H, *strides(k), T = bn, D = D)
++    vc = torch.empty((BH, D), dtype = torch.float32, device = dev)
++    vg = torch.empty((BH, D), dtype = torch.float32, device = dev)
++    kernels.stats[(BH,)](v, vc, vg, Sk, H, *strides(v), STEP = STATS_STEP, R = 32, D = D, MODE = 1)
++    vt = torch.empty((BH, tiles, D, bn), dtype = torch.int8, device = dev)
++    vs = torch.empty((BH, tiles), dtype = torch.float32, device = dev)
++    kernels.quant_v[(BH, tiles)](v, vc, vg, vt, vs, Sk, n_kpad, H, *strides(v), T = bn, D = D)
++    return {
++        "qi": qi,
++        "qs": qs,
++        "ki": ki,
++        "ks": ks,
++        "kc": kc,
++        "vt": vt,
++        "vs": vs,
++        "vc": vc,
++        "vg": vg,
++        "shape": (B, Sq, Sk, H, D),
++        "dtype": v.dtype,
++        "config": config,
++    }
++
++
++def kernel_function(device: Any, head_dim: int, config: dict) -> Any:
++    """The loaded CUDA kernel for this device and config (compiled on first use)."""
++    import torch
++
++    from . import diffusion_int8_attention_cuda as cuda_kernel
++
++    dev = torch.device(device)
++    index = dev.index if dev.index is not None else torch.cuda.current_device()
++    return cuda_kernel.load(
++        index,
++        tuple(torch.cuda.get_device_capability(index)),
++        kernel_defines(head_dim, config),
++        config.get("max_registers"),
++        shared_bytes(head_dim, config),
++    )
++
++
++def attend(p: dict) -> Any:
++    """Launch the kernel on ``quantise``'s output; ``[B, Sq, H, D]`` in the dtype of V."""
++    import torch
++
++    config = p["config"]
++    B, Sq, Sk, H, D = p["shape"]
++    dev = p["qi"].device
++    out = torch.empty((B, Sq, H, D), dtype = p["dtype"], device = dev)
++    fn = kernel_function(dev, D, config)
++    n_qpad, n_kpad = p["qi"].shape[1], p["ki"].shape[1]
++    wpc, nq = int(config["wpc"]), int(config["nq"])
++    P, I, L = ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong
++    args = [
++        P(p["qi"].data_ptr()),
++        P(p["ki"].data_ptr()),
++        P(p["vt"].data_ptr()),
++        P(p["qs"].data_ptr()),
++        P(p["ks"].data_ptr()),
++        P(p["vs"].data_ptr()),
++        P(p["vg"].data_ptr()),
++        P(p["vc"].data_ptr()),
++        P(out.data_ptr()),
++        I(Sq),
++        I(n_qpad),
++        I(Sk),
++        I(n_kpad),
++        I(H),
++        L(out.stride(0)),
++        L(out.stride(1)),
++        L(out.stride(2)),
++        I(_OUT_KIND[str(out.dtype)]),
++    ]
++    with torch.cuda.device(dev):
++        fn(
++            (n_qpad // (16 * nq * wpc), B * H),
++            32 * wpc,
++            args,
++            shared_bytes(D, config),
++            torch.cuda.current_stream().cuda_stream,
++        )
++    return out
++
++
++def unsupported_reason(q: Any, k: Any, v: Any) -> Optional[str]:
++    """Why this call cannot run the kernel (it then runs native attention), or None."""
++    import torch
++
++    if not (q.is_cuda and k.is_cuda and v.is_cuda) or not (q.device == k.device == v.device):
++        return "not on one CUDA device"
++    if q.dim() != 4 or k.dim() != 4 or v.shape != k.shape:
++        return "not [B, S, H, D]"
++    B, Sq, H, D = q.shape
++    if k.shape[0] != B or k.shape[2] != H or k.shape[3] != D or Sq < 1 or k.shape[1] < 1:
++        return "q / k / v shapes differ"
++    if D not in HEAD_DIMS:
++        return f"head dim {D}"
++    if (
++        str(v.dtype) not in _OUT_KIND
++        or str(q.dtype) not in _OUT_KIND
++        or str(k.dtype) not in _OUT_KIND
++    ):
++        return "dtype"
++    if B * H > 65535:
++        return "batch * heads"
++    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
++        return "needs gradients"
++    index = q.device.index if q.device.index is not None else torch.cuda.current_device()
++    if kernel_config(torch.cuda.get_device_capability(index), D) is None:
++        return "no kernel config for this card"
++    if (index, D) in _BROKEN:
++        return "kernel failed on this card"
++    return None
++
++
++def _verified(q: Any) -> bool:
++    """Whether the accuracy check passed for this call's card and head dim (the op runs the kernel only then)."""
++    import torch
++
++    index = q.device.index if q.device.index is not None else torch.cuda.current_device()
++    return (index, int(q.shape[-1])) in _VERIFIED
++
++
++def int8_attention(
++    q: Any,
++    k: Any,
++    v: Any,
++    scale: Optional[float] = None,
++    config: Optional[dict] = None,
++) -> Any:
++    """``softmax(q k^T * scale) v`` with int8 products. ``[B, Sq, H, D]``, ``[B, Sk, H, D]`` x 2 -> ``[B, Sq, H, D]``
++    in the dtype of V. Raises where ``unsupported_reason`` says so; ``int8_attention_impl`` is the guarded form."""
++    import torch
++
++    reason = unsupported_reason(q, k, v)
++    if reason is not None:
++        raise ValueError(f"INT8 attention cannot take this call: {reason}")
++    index = q.device.index if q.device.index is not None else torch.cuda.current_device()
++    config = config or kernel_config(torch.cuda.get_device_capability(index), q.shape[-1])
++    # the quantisers address the last dim with stride 1
++    q, k, v = (x if x.stride(3) == 1 else x.contiguous() for x in (q, k, v))
++    with torch.no_grad():
++        return attend(quantise(q, k, v, config, scale))
++
++
++def native_attention(q: Any, k: Any, v: Any) -> Any:
++    """torch's attention on the same ``[B, S, H, D]`` views."""
++    import torch.nn.functional as F
++
++    out = F.scaled_dot_product_attention(
++        q.to(v.dtype).permute(0, 2, 1, 3), k.to(v.dtype).permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
++    )
++    return out.permute(0, 2, 1, 3)
++
++
++def int8_attention_impl(q: Any, k: Any, v: Any) -> Any:
++    """The kernel where it can run, native attention elsewhere and after any failure."""
++    import torch
++
++    if unsupported_reason(q, k, v) is None and _verified(q):
++        try:
++            out = int8_attention(q, k, v)
++            STATS["int8"] += 1
++            return out
++        except torch.OutOfMemoryError:
++            raise
++        except Exception as exc:  # noqa: BLE001 -- a JIT / launch failure keeps native attention on this card
++            index = q.device.index if q.device.index is not None else torch.cuda.current_device()
++            _BROKEN.add((index, int(q.shape[-1])))
++            _log().warning(
++                "diffusion.int8_attention: kernel failed, native attention from here on: %s", exc
++            )
++    STATS["native"] += 1
++    return native_attention(q, k, v)
++
++
++def _log() -> Any:
++    import logging
++    return logging.getLogger(__name__)
++
++
++@lru_cache(maxsize = None)
++def int8_attention_op() -> Any:
++    """Registered once per process: opaque to torch.compile, with a fake for shape propagation."""
++    import torch
++
++    # explicit schema: the annotations here are strings
++    @torch.library.custom_op(
++        _OP, mutates_args = (), schema = "(Tensor q, Tensor k, Tensor v) -> Tensor"
++    )
++    def int8_attention_nhd(q, k, v):
++        return int8_attention_impl(q, k, v)
++
++    @int8_attention_nhd.register_fake
++    def _(q, k, v):
++        return v.new_empty(q.shape)
++
++    return int8_attention_nhd
++
++
++def reference_attention(q: Any, k: Any, v: Any) -> Any:
++    """fp32 attention on ``[B, S, H, D]``: what the kernel is checked against."""
++    import torch.nn.functional as F
++
++    out = F.scaled_dot_product_attention(
++        q.float().permute(0, 2, 1, 3), k.float().permute(0, 2, 1, 3), v.float().permute(0, 2, 1, 3)
++    )
++    return out.permute(0, 2, 1, 3)
++
++
++def probe_inputs(
++    device: Any,
++    dtype: Any,
++    tokens: int,
++    heads: int,
++    head_dim: int,
++    seed: int = 0,
++) -> tuple:
++    """q / k like RMS-normalised projections with a learned gain, v with per-channel spread and offset."""
++    import torch
++
++    g = torch.Generator(device = "cpu").manual_seed(1000 + seed)
++    shape = (1, tokens, heads, head_dim)
++    q = torch.randn(shape, generator = g) * 1.6
++    k = torch.randn(shape, generator = g) * 1.6 + 0.4 * torch.randn(
++        (1, 1, heads, head_dim), generator = g
++    )
++    v = torch.randn(shape, generator = g) * (0.5 + torch.rand((1, 1, heads, head_dim), generator = g))
++    v = v + 0.5 * torch.randn((1, 1, heads, head_dim), generator = g)
++    return tuple(x.to(device = device, dtype = dtype) for x in (q, k, v))
++
++
++def accuracy(got: Any, ref: Any) -> dict:
++    import torch.nn.functional as F
++    got, ref = got.float(), ref.float()
++    return {
++        "cos": float(F.cosine_similarity(got.flatten(), ref.flatten(), dim = 0)),
++        "rel_l1": float((got - ref).abs().mean() / ref.abs().mean().clamp_min(1e-30)),
++        "max_abs": float((got - ref).abs().max()),
++        "mean_abs": float((got - ref).abs().mean()),
++    }
++
++
++def _median_ms(fns: dict, rounds: int = 5) -> dict:
++    """Median milliseconds per callable, timed with CUDA events in interleaved rounds after two warm calls each."""
++    import torch
++
++    for fn in fns.values():
++        fn()
++        fn()
++    times: dict = {name: [] for name in fns}
++    for _ in range(rounds):
++        for name, fn in fns.items():
++            a, b = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
++            a.record()
++            fn()
++            b.record()
++            b.synchronize()
++            times[name].append(a.elapsed_time(b))
++    return {name: sorted(ts)[len(ts) // 2] for name, ts in times.items()}
++
++
++def _check(
++    device: Any, dtype: Any, heads: int, head_dim: int, incumbent: Optional[Callable], timed: bool
++) -> dict:
++    """``ok``: the kernel runs here and matches fp32 attention on the probe, also with q and k scaled up. ``ms``: int8 and incumbent milliseconds
++    per call at each RACE_TOKENS size (when ``timed``). ``min_tokens``: the sequence length from which the kernel
++    is more than 2% faster than the incumbent, or None when it is not at the larger size."""
++    import torch
++
++    out: dict = {"ok": False, "ms": {}, "min_tokens": None}
++    try:
++        with torch.no_grad():
++            q, k, v = probe_inputs(device, dtype, 1000, min(int(heads), 4), head_dim)
++            acc = accuracy(int8_attention(q, k, v), reference_attention(q, k, v))
++            q, k = q * SHARP_GAIN, k * SHARP_GAIN
++            sharp = int8_attention(q, k, v)
++            finite = bool(torch.isfinite(sharp).all())
++            sharp_cos = accuracy(sharp, reference_attention(q, k, v))["cos"] if finite else 0.0
++    except torch.OutOfMemoryError:
++        raise
++    except Exception as exc:  # noqa: BLE001 -- no kernel on this card
++        out["error"] = repr(exc)[:300]
++        return out
++    out.update(acc)
++    out["sharp_cos"] = sharp_cos
++    out["ok"] = bool(
++        acc["cos"] >= MIN_COSINE and acc["rel_l1"] <= MAX_REL_L1 and sharp_cos >= MIN_SHARP_COSINE
++    )
++    if out["ok"]:
++        dev = torch.device(device)
++        _VERIFIED.add(
++            (dev.index if dev.index is not None else torch.cuda.current_device(), int(head_dim))
++        )
++    if not out["ok"] or not timed:
++        return out
++    wins = {}
++    for tokens in RACE_TOKENS:
++        with torch.no_grad():
++            q, k, v = probe_inputs(device, dtype, tokens, heads, head_dim, seed = tokens)
++            fns = {
++                "incumbent": (lambda: incumbent(q, k, v))
++                if incumbent
++                else (lambda: native_attention(q, k, v)),
++                "int8": lambda: int8_attention(q, k, v),
++            }
++            try:
++                ms = _median_ms(fns)
++            except torch.OutOfMemoryError:
++                raise
++            except Exception as exc:  # noqa: BLE001 -- an incumbent that cannot be timed is kept
++                out["error"] = repr(exc)[:300]
++                return out
++        out["ms"][tokens] = {name: round(value, 4) for name, value in ms.items()}
++        wins[tokens] = ms["int8"] < RACE_MARGIN * ms["incumbent"]
++    large, small = RACE_TOKENS
++    if wins[large]:
++        out["min_tokens"] = 0 if wins[small] else (large + small) // 2
++    return out
++
++
++def verdict(
++    device: Any,
++    dtype: Any,
++    heads: int,
++    head_dim: int,
++    incumbent: Optional[Callable] = None,
++    incumbent_name: str = "native",
++    timed: bool = True,
++) -> dict:
++    """``_check`` cached per (device, dtype, heads, head dim, incumbent, timed)."""
++    import torch
++
++    dev = torch.device(device)
++    index = dev.index if dev.index is not None else torch.cuda.current_device()
++    key = (index, str(dtype), int(heads), int(head_dim), incumbent_name, bool(timed))
++    found = _VERDICTS.get(key)
++    if found is not None:
++        return found
++    with _LOCK:
++        if key not in _VERDICTS:
++            with torch.cuda.device(index):
++                _VERDICTS[key] = _check(
++                    torch.device("cuda", index), dtype, int(heads), int(head_dim), incumbent, timed
++                )
++    return _VERDICTS[key]
++
++
++def _head_dim(attn: Any) -> Optional[int]:
++    value = getattr(attn, "head_dim", None)
++    if isinstance(value, int):
++        return value
++    try:
++        return int(attn.to_out[0].in_features) // int(attn.heads)
++    except Exception:  # noqa: BLE001
++        return None
++
++
++def int8_processors(transformer: Any) -> list:
++    """The attention modules whose processor can route to the kernel (the strided processors)."""
++    return [
++        m
++        for m in transformer.modules()
++        if hasattr(type(getattr(m, "processor", None)), "_unsloth_int8") and hasattr(m, "heads")
++    ]
++
++
++def _sdpa_incumbent(backend: Any) -> tuple:
++    """(name, callable) for a processor's native backend: torch attention pinned the way the processor pins it."""
++    import torch.nn.functional as F
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    value = str(getattr(backend, "value", backend)) if backend is not None else "native"
++    kernel = {
++        "_native_cudnn": SDPBackend.CUDNN_ATTENTION,
++        "_native_flash": SDPBackend.FLASH_ATTENTION,
++    }.get(value)
++    if kernel is None:
++        return "native", native_attention
++
++    def run(q: Any, k: Any, v: Any) -> Any:
++        with sdpa_kernel(kernel):
++            out = F.scaled_dot_product_attention(
++                q.to(v.dtype).permute(0, 2, 1, 3),
++                k.to(v.dtype).permute(0, 2, 1, 3),
++                v.permute(0, 2, 1, 3),
++            )
++        return out.permute(0, 2, 1, 3)
++
++    return value, run
++
++
++def install_int8_attention(
++    transformer: Any,
++    *,
++    device: Any,
++    dtype: Any,
++    modules: Optional[list] = None,
++    incumbent: Optional[tuple] = None,
++    force: bool = False,
++    logger: Any = None,
++) -> int:
++    """Route strided attention processors to the INT8 kernel. Returns how many now run it.
++
++    ``modules`` limits the attention modules considered (default: every one with a strided processor).
++    ``incumbent`` is ``(name, callable(q, k, v))`` for what those modules run now (default: their native backend).
++    The kernel must match fp32 attention on this card; unless ``force`` (or the env switch is ``1``) it must also be
++    more than 2% faster than the incumbent on the timed probe. Never raises."""
++    try:
++        return _install(transformer, device, dtype, modules, incumbent, force, logger)
++    except Exception as exc:  # noqa: BLE001 -- an optimisation: the processors stay as they were
++        if logger is not None:
++            logger.info("diffusion.int8_attention: skipped (%s)", exc)
++        return 0
++
++
++def _install(
++    transformer: Any,
++    device: Any,
++    dtype: Any,
++    modules: Optional[list],
++    incumbent: Optional[tuple],
++    force: bool,
++    logger: Any,
++) -> int:
++    import torch
++
++    from .rocm_bf16 import is_rocm_torch
++
++    setting = mode()
++    if transformer is None or setting == "off":
++        return 0
++    dev = torch.device(device)
++    if dev.type != "cuda" or not torch.cuda.is_available() or is_rocm_torch(torch):
++        return 0
++    index = dev.index if dev.index is not None else torch.cuda.current_device()
++    capability = torch.cuda.get_device_capability(index)
++    if str(dtype) not in _OUT_KIND:
++        return 0
++    candidates = [
++        m for m in int8_processors(transformer) if modules is None or any(m is x for x in modules)
++    ]
++    if not candidates:
++        return 0
++    force = force or setting == "force"
++    int8_attention_op()
++    engaged = 0
++    report: dict = {}
++    for m in candidates:
++        proc = m.processor
++        head_dim = _head_dim(m)
++        if head_dim is None or kernel_config(capability, head_dim) is None:
++            continue
++        if getattr(proc, "_parallel_config", None) is not None:
++            continue
++        name, fn = (
++            incumbent
++            if incumbent is not None
++            else _sdpa_incumbent(getattr(proc, "_attention_backend", None))
++        )
++        found = verdict(dev, dtype, int(m.heads), head_dim, fn, name, timed = not force)
++        report[(int(m.heads), head_dim, name)] = found
++        if not found.get("ok"):
++            continue
++        if force:
++            minimum = 0
++        elif found.get("min_tokens") is None:
++            continue
++        else:
++            minimum = int(found["min_tokens"])
++        proc._unsloth_int8 = True
++        proc._unsloth_int8_min_tokens = minimum
++        engaged += 1
++    if logger is not None:
++        for (heads, head_dim, name), found in report.items():
++            logger.info(
++                "diffusion.int8_attention: heads=%d head_dim=%d vs %s: ok=%s cos=%s ms=%s min_tokens=%s%s",
++                heads,
++                head_dim,
++                name,
++                found.get("ok"),
++                found.get("cos"),
++                found.get("ms"),
++                found.get("min_tokens"),
++                " (forced)" if force else "",
++            )
++        if engaged:
++            logger.info("diffusion.int8_attention: %s on %d attention modules", BACKEND, engaged)
++    return engaged
++
++
++def install_requested(
++    pipe: Any,
++    request: Any,
++    target: Any,
++    logger: Any = None,
++) -> int:
++    """For ``apply_attention_backend``: engage on the pipeline's DiT when the load asked for ``unsloth_int8`` by name
++    or the env switch forces it (no race either way: the accuracy check still gates it). Returns the count."""
++    import torch
++
++    setting = mode()
++    if setting == "off" or not (setting == "force" or requested(request)):
++        return 0
++    transformer = getattr(pipe, "transformer", None)
++    if transformer is None:
++        return 0
++    device = str(getattr(target, "torch_device", None) or getattr(target, "device", "") or "")
++    if not device.startswith("cuda"):
++        return 0
++    dtype = getattr(target, "dtype", None)
++    if str(dtype) not in _OUT_KIND:
++        dtype = torch.bfloat16
++    try:
++        from .diffusion_flux3_attn import ensure_strided_processors
++        ensure_strided_processors(pipe, target, logger)
++    except Exception:  # noqa: BLE001 -- other families bring their own strided processors
++        pass
++    return install_int8_attention(
++        transformer, device = device, dtype = dtype, force = True, logger = logger
++    )
++
++
++def remove_int8_attention(transformer: Any) -> int:
++    """Every processor back to the attention it ran before ``install_int8_attention``."""
++    count = 0
++    for m in int8_processors(transformer) if transformer is not None else ():
++        if getattr(m.processor, "_unsloth_int8", False):
++            m.processor._unsloth_int8 = False
++            count += 1
++    return count
++
++
++def int8_attention_count(transformer: Any) -> int:
++    """Engagement census: attention modules whose processor routes to the kernel."""
++    if transformer is None:
++        return 0
++    return sum(
++        1 for m in int8_processors(transformer) if getattr(m.processor, "_unsloth_int8", False)
++    )
++
++
++def status(transformer: Any = None) -> dict:
++    """What the status panel and the logs report."""
++    return {
++        "backend": BACKEND,
++        "mode": mode(),
++        "modules": int8_attention_count(transformer),
++        "calls": dict(STATS),
++        "verdicts": {
++            f"cuda:{k[0]} {k[1]} heads={k[2]} head_dim={k[3]} vs {k[4]}": {
++                x: v.get(x)
++                for x in ("ok", "cos", "rel_l1", "sharp_cos", "ms", "min_tokens", "error")
++                if x in v
++            }
++            for k, v in _VERDICTS.items()
++        },
++    }
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_cuda.py b/studio/backend/core/inference/diffusion_int8_attention_cuda.py
+new file mode 100644
+index 0000000000..4d3e0ac2dd
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_int8_attention_cuda.py
+@@ -0,0 +1,699 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""The INT8 attention kernel's CUDA source and its loader.
++
++The kernel is compiled at first use with NVRTC, the runtime compiler the CUDA builds of torch already depend on, and
++launched through the CUDA driver on torch's context and current stream. Nothing is built at install time and no
++compiler toolchain is needed. ``diffusion_int8_attention`` owns everything around it (quantisers, configs, the
++dispatch).
++"""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import hashlib
++import os
++import sys
++import threading
++from typing import Any, Optional
++
++KERNEL_NAME = "unsloth_i8attn"
++
++KERNEL_SOURCE = r"""
++// INT8 scaled dot-product attention for DiT inference (no mask). One warp owns 16 * NQ query rows.
++//
++// Q.K^T and P.V both run on the int8 tensor cores (mma.sync m16n8k32, int32 accumulate); the online softmax state is
++// fp32 and stays in registers. The block's warps share one K tile and one V tile in shared memory (copied ahead with
++// cp.async while the previous tile is computed, one barrier per tile); each warp keeps its Q rows in shared memory
++// too. The probabilities go from the Q.K^T accumulators straight into the P.V operand registers.
++//
++// No int <-> float conversion instruction runs in the tile loop: the int32 accumulators start at the bit pattern of
++// MAGIC_F = 2^23 + 2^22, so their bits read as a float are that constant plus the integer sum, and probabilities are
++// rounded by adding the same constant. The output accumulators take the P.V sums with the constant still in them
++// (one fused multiply-add per element); the constant times the sum of the tile weights comes off once at the end.
++// The rounding this adds is a few units of the last place of MAGIC_F per row, against int8 rounding noise of
++// hundreds of units.
++//
++// Method notes (ideas, not code): int8 Q/K with a softmax-invariant K shift and block scales follows SageAttention
++// (arXiv 2410.02367); one K scale per accumulator lane group follows SageAttention2 (arXiv 2411.10958); integer
++// probabilities with the denominator summed over the rounded values follow INT-FlashAttention (arXiv 2409.16997),
++// here rescaled per key tile so each tile uses the full 8-bit range.
++//
++// Compile-time: HD (head dim, 64 or 128), BN (keys per tile, 64 or 128), NQ (16-row query tiles per warp),
++// WPC (warps per block), STAGES (1 or 2 shared-memory tile buffers; 2 = the next tile is copied while this one is
++// computed).
++// Launch: blockDim.x = 32 * WPC, grid.x = n_qpad / (16 * NQ * WPC), grid.y = batch * heads,
++// dynamic shared memory = STAGES * STAGE_BYTES + WPC * 16 * NQ * KROW bytes.
++
++typedef unsigned int u32;
++typedef int i32;
++typedef signed char s8;
++typedef long long i64;
++
++#ifndef HD
++#define HD 128
++#endif
++#ifndef BN
++#define BN 64
++#endif
++#ifndef STAGES
++#define STAGES 2
++#endif
++#ifndef NQ
++#define NQ 1
++#endif
++#ifndef WPC
++#define WPC 4
++#endif
++#define NT (32 * WPC)   // threads per block
++#define KK (HD / 32)    // k steps of Q.K^T
++#define NBK (BN / 8)    // 8-key column blocks per tile
++#define NBD (HD / 8)    // 8-channel column blocks of the output
++#define KB32 (BN / 32)  // k steps of P.V
++// Shared-memory rows carry 16 bytes of padding: the 32 lanes of a fragment load then hit 32 different banks.
++#define KROW (HD + 16)
++#define VROW (BN + 16)
++#define STAGE_BYTES (BN * KROW + HD * VROW)
++// A tile is copied in 16-byte chunks, thread tid taking chunks tid, tid + NT, ...: with NT a multiple of the chunks
++// per row, its destinations are a fixed stride apart.
++#define TILE_CHUNKS (BN * HD / 16)
++#define COPIES ((TILE_CHUNKS + NT - 1) / NT)
++#define KSTEP ((NT / (HD / 16)) * KROW)
++#define VSTEP ((NT / (BN / 16)) * VROW)
++#define LOG2_255 7.99435343685886f
++#define GUARD 64.0f
++// bits of MAGIC_F; for an integer |x| < 2^22 the float with bits MAGIC_I + x is MAGIC_F + x exactly, and
++// MAGIC_F + v rounds v in [0, 2^22) to the nearest integer (ties to even) in its low mantissa bits.
++#define MAGIC_I 0x4b400000
++#define MAGIC_F 12582912.0f
++#define MASKED_I ((i32)0xff61b1e6)  // bits of -3.0e38f: a padded key, below every score as an int and as a float
++
++__device__ __forceinline__ u32 ld32(const s8* p) { return *reinterpret_cast<const u32*>(p); }
++
++__device__ __forceinline__ u32 smem_addr(const void* p) {
++  u32 a;
++  asm("{ .reg .u64 s; cvta.to.shared.u64 s, %1; cvt.u32.u64 %0, s; }" : "=r"(a) : "l"(p));
++  return a;
++}
++
++__device__ __forceinline__ void cp_async16(u32 dst, const s8* src) {
++  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
++}
++
++// Four 8 x 16-byte matrices from shared memory: lane L passes the address of row L % 8 of matrix L / 8, and thread
++// (g, t) receives bytes 4 * t .. 4 * t + 3 of row g of each matrix: the int8 B fragments of two k steps.
++__device__ __forceinline__ void ldmatrix4(u32* r, u32 addr) {
++  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
++               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++               : "r"(addr));
++}
++
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
++
++__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
++
++// Copy this thread's share of one K tile ([BN][HD], contiguous) and one V tile ([HD][BN], contiguous) into a stage.
++// kdst / vdst / ksrc / vsrc: the thread's first chunk; last: whether its last chunk exists.
++__device__ __forceinline__ void load_tile(u32 kdst, u32 vdst, const s8* ksrc, const s8* vsrc, bool last) {
++#pragma unroll
++  for (int i = 0; i < COPIES; ++i) {
++    if (i + 1 < COPIES || TILE_CHUNKS % NT == 0 || last) {
++      cp_async16(kdst + i * KSTEP, ksrc + i * NT * 16);
++      cp_async16(vdst + i * VSTEP, vsrc + i * NT * 16);
++    }
++  }
++  cp_async_commit();
++}
++
++__device__ __forceinline__ float ex2(float x) {
++  float y;
++  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return y;
++}
++
++// D = A (16x32 s8, row) * B (32x8 s8, col) + D
++__device__ __forceinline__ void mma_s8s8(i32* d, const u32* a, u32 b0, u32 b1) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %11, %12, %13};"
++      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
++}
++
++// D = A (16x32 s8, row) * B (32x8 s8, col) + c in every element: the first product of an accumulator
++__device__ __forceinline__ void mma_s8s8_c(i32* d, const u32* a, u32 b0, u32 b1, i32 c) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %10, %10, %10};"
++      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c));
++}
++
++__device__ __forceinline__ void mma_u8s8_c(i32* d, const u32* a, u32 b0, u32 b1, i32 c) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %10, %10, %10};"
++      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c));
++}
++
++// D = A (16x32 u8, row) * B (32x8 s8, col) + D
++__device__ __forceinline__ void mma_u8s8(i32* d, const u32* a, u32 b0, u32 b1) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %11, %12, %13};"
++      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
++}
++
++// A probability before rounding, never above 255. The exponent is rounded in the frame of MAGIC_F * scale, so for
++// large scores (sharp attention: late DiT blocks) the largest key of a tile can come out above 255.5; unclamped it
++// would round to 256, which pack4 stores as 0 with a carry into the next key.
++__device__ __forceinline__ float prob(float x) { return fminf(ex2(x), 255.0f); }
++
++// Four floats MAGIC_F + p (p an integer in [0, 255]) -> the four p packed low byte first.
++__device__ __forceinline__ u32 pack4(float a, float b, float c, float d) {
++  return (__float_as_uint(a) + (__float_as_uint(b) << 8) + (__float_as_uint(c) << 16) + (__float_as_uint(d) << 24)) -
++         (u32)MAGIC_I * 0x01010101u;
++}
++
++__device__ __forceinline__ u32 bytesum(u32 w, u32 acc) {
++  u32 y;
++  asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(y) : "r"(w), "r"(0x01010101u), "r"(acc));
++  return y;
++}
++
++__device__ __forceinline__ u32 f2bf16(float x) {
++  u32 u = __float_as_uint(x);
++  u += 0x7fffu + ((u >> 16) & 1u);
++  return u >> 16;
++}
++
++__device__ __forceinline__ u32 f2h(float x) {
++  unsigned short y;
++  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(y) : "f"(x));
++  return (u32)y;
++}
++
++// q   [BH, n_qpad, HD] int8, rows padded with zeros to a multiple of 16 * NQ * warps
++// k   [BH, n_kpad, HD] int8, n_kpad a multiple of BN
++// vt  [BH, n_kpad / BN, HD, BN] int8: per key tile, channel-major V; inside every 16 keys, position 4*t + c holds
++//     key 8*(c>>1) + 2*t + (c&1)
++// qs  [BH, n_qpad] per-row Q scale (softmax scale * log2(e) folded in)
++// ks  [BH, n_kpad / BN, 4] K scale of the keys with (key % 8) / 2 == t in a tile
++// vs  [BH, n_kpad / BN] V scale of a tile; vg / vc [BH, HD] per-channel gain and centre of V
++// out [B, n_q, H, HD] (strides in elements); out_kind 0 = fp16, 1 = bf16, 2 = fp32
++extern "C" __global__ void unsloth_i8attn(
++    const s8* __restrict__ q, const s8* __restrict__ k, const s8* __restrict__ vt, const float* __restrict__ qs,
++    const float* __restrict__ ks, const float* __restrict__ vs, const float* __restrict__ vg,
++    const float* __restrict__ vc, void* __restrict__ out, int n_q, int n_qpad, int n_k, int n_kpad, int n_heads,
++    i64 o_stride_b, i64 o_stride_s, i64 o_stride_h, int out_kind) {
++  extern __shared__ __align__(16) s8 smem[];
++  const u32 lane = threadIdx.x & 31u;
++  const u32 g = lane >> 2, t = lane & 3u;
++  const u32 tid = threadIdx.x, warp = tid >> 5;
++  const i64 bh = blockIdx.y;
++  // first of this warp's 16 * NQ rows; thread (g, t) holds rows g and g + 8 of each of its NQ tiles
++  const u32 rowbase = (blockIdx.x * WPC + warp) * (16u * NQ);
++  const int n_tiles = n_kpad / BN;
++  // this thread's first chunk of tile 0 in K and V, and where its chunks go inside a stage
++  const s8* ksrc = k + bh * n_kpad * HD + tid * 16u;
++  const s8* vsrc = vt + bh * n_kpad * HD + tid * 16u;
++  const u32 kdst = (tid / (HD / 16)) * KROW + (tid % (HD / 16)) * 16u;
++  const u32 vdst = BN * KROW + (tid / (BN / 16)) * VROW + (tid % (BN / 16)) * 16u;
++  const bool last = tid + (COPIES - 1) * NT < TILE_CHUNKS;
++  i32 magic;  // MAGIC_I in one register for the whole loop: the start value of every accumulator
++  asm volatile("mov.b32 %0, 0x4b400000;" : "=r"(magic));
++  const float* kst = ks + bh * n_tiles * 4 + t;
++  const float* vst = vs + bh * n_tiles;
++  const u32 sbase = smem_addr(smem);
++
++  // this warp's Q rows, padded like the K rows
++  const u32 qsm = sbase + STAGES * STAGE_BYTES + warp * (16u * NQ * KROW);
++  {
++    const s8* qrows = q + (bh * n_qpad + rowbase) * HD;
++    for (u32 c = lane; c < 16u * NQ * HD / 16u; c += 32u)
++      cp_async16(qsm + (c / (HD / 16)) * KROW + (c % (HD / 16)) * 16, qrows + c * 16);
++    cp_async_commit();
++  }
++  // A fragments of rows (g, g + 8): matrices (rows 0-7, bytes 0-15), (rows 8-15, 0-15), (0-7, 16-31), (8-15, 16-31)
++  const u32 qofs = qsm + ((lane & 7u) + ((lane >> 3) & 1u) * 8u) * KROW + (lane >> 4) * 16u;
++  // B fragments: this lane's row / matrix offsets
++  const u32 kofs = (lane & 7u) * KROW + 16u * (lane >> 3), vofs = BN * KROW + (lane & 7u) * VROW + 16u * (lane >> 3);
++
++  float sc[NQ][2], mref[NQ][2], l[NQ][2], wsum[NQ][2];
++  float acc[NQ][NBD][4];
++#pragma unroll
++  for (int qt = 0; qt < NQ; ++qt) {
++    const float* p = qs + bh * n_qpad + rowbase + 16 * qt + g;
++    sc[qt][0] = p[0];
++    sc[qt][1] = p[8];
++    mref[qt][0] = mref[qt][1] = l[qt][0] = l[qt][1] = wsum[qt][0] = wsum[qt][1] = 0.f;
++#pragma unroll
++    for (int nb = 0; nb < NBD; ++nb) acc[qt][nb][0] = acc[qt][nb][1] = acc[qt][nb][2] = acc[qt][nb][3] = 0.f;
++  }
++
++#if STAGES == 2
++  load_tile(sbase + kdst, sbase + vdst, ksrc, vsrc, last);
++#endif
++  for (int j = 0; j < n_tiles; ++j) {
++#if STAGES == 2
++    // tile j is in stage j & 1 once every thread's copies landed; the other stage is free for tile j + 1
++    cp_async_wait_all();
++    __syncthreads();
++    if (j + 1 < n_tiles) {
++      const u32 next = sbase + ((j + 1) & 1) * STAGE_BYTES;
++      const i64 off = (i64)(j + 1) * BN * HD;
++      load_tile(next + kdst, next + vdst, ksrc + off, vsrc + off, last);
++    }
++    const u32 stage = sbase + (j & 1) * STAGE_BYTES;
++#else
++    __syncthreads();  // every warp is done with the previous tile
++    load_tile(sbase + kdst, sbase + vdst, ksrc + (i64)j * BN * HD, vsrc + (i64)j * BN * HD, last);
++    cp_async_wait_all();
++    __syncthreads();
++    const u32 stage = sbase;
++#endif
++    const float ksc = kst[4 * j], vsc = vst[j];
++    const bool tail = (j == n_tiles - 1) && (n_k < n_kpad);  // only the last tile can hold padded keys
++    // the u8 A fragments of P.V: register (2 * h + row) of k step kb holds keys
++    // 32 * kb + 16 * h + 8 * (c >> 1) + 2 * t + (c & 1), c = 0..3
++    u32 pa[NQ][KB32][4];
++    float w[NQ][2];
++#pragma unroll
++    for (int qt = 0; qt < NQ; ++qt) {
++      // c[nb] read as floats: MAGIC_F + score of rows (g, g + 8) against keys 8 * nb + 2 * t + {0, 1}
++      i32 c[NBK][4];
++#pragma unroll
++      for (int kk = 0; kk < KK; kk += 2) {
++        u32 a0[4], a1[4];
++        ldmatrix4(a0, qofs + qt * 16 * KROW + 32 * kk);
++        ldmatrix4(a1, qofs + qt * 16 * KROW + 32 * kk + 32);
++#pragma unroll
++        for (int nb = 0; nb < NBK; ++nb) {
++          u32 b[4];
++          ldmatrix4(b, stage + kofs + nb * 8 * KROW + 32 * kk);
++          if (kk == 0) mma_s8s8_c(c[nb], a0, b[0], b[1], magic);
++          else mma_s8s8(c[nb], a0, b[0], b[1]);
++          mma_s8s8(c[nb], a1, b[2], b[3]);
++        }
++      }
++      if (tail) {
++        asm volatile("// padded keys");  // keeps this a branch: no selects on the other tiles
++#pragma unroll
++        for (int nb = 0; nb < NBK; ++nb) {
++          const int key = j * BN + 8 * nb + 2 * (int)t;
++          if (key >= n_k) c[nb][0] = c[nb][2] = MASKED_I;
++          if (key + 1 >= n_k) c[nb][1] = c[nb][3] = MASKED_I;
++        }
++      }
++      i32 mx0 = max(c[0][0], c[0][1]), mx1 = max(c[0][2], c[0][3]);
++#pragma unroll
++      for (int nb = 1; nb < NBK; ++nb) {
++        mx0 = max(mx0, max(c[nb][0], c[nb][1]));
++        mx1 = max(mx1, max(c[nb][2], c[nb][3]));
++      }
++      const float f0 = sc[qt][0] * ksc, f1 = sc[qt][1] * ksc;
++      const float g0 = -MAGIC_F * f0, g1 = -MAGIC_F * f1;  // score = fma(bits as float, f, g)
++      float mt0 = fmaf(__int_as_float(mx0), f0, g0), mt1 = fmaf(__int_as_float(mx1), f1, g1);
++      mt0 = fmaxf(mt0, __shfl_xor_sync(0xffffffffu, mt0, 1));
++      mt1 = fmaxf(mt1, __shfl_xor_sync(0xffffffffu, mt1, 1));
++      mt0 = fmaxf(mt0, __shfl_xor_sync(0xffffffffu, mt0, 2));
++      mt1 = fmaxf(mt1, __shfl_xor_sync(0xffffffffu, mt1, 2));
++      if (j == 0) {
++        mref[qt][0] = mt0;
++        mref[qt][1] = mt1;
++      }
++      // The running state stays in the frame of a fixed reference maximum; it is rebased only when a tile maximum
++      // rises far above it (rare), so the output accumulators are not rescaled per tile.
++      float d0 = mt0 - mref[qt][0], d1 = mt1 - mref[qt][1];
++      if (__any_sync(0xffffffffu, (d0 > GUARD) | (d1 > GUARD))) {
++        if (d0 > GUARD) {
++          const float r = ex2(-d0);
++          l[qt][0] *= r;
++          wsum[qt][0] *= r;
++#pragma unroll
++          for (int nb = 0; nb < NBD; ++nb) {
++            acc[qt][nb][0] *= r;
++            acc[qt][nb][1] *= r;
++          }
++          mref[qt][0] = mt0;
++          d0 = 0.f;
++        }
++        if (d1 > GUARD) {
++          const float r = ex2(-d1);
++          l[qt][1] *= r;
++          wsum[qt][1] *= r;
++#pragma unroll
++          for (int nb = 0; nb < NBD; ++nb) {
++            acc[qt][nb][2] *= r;
++            acc[qt][nb][3] *= r;
++          }
++          mref[qt][1] = mt1;
++          d1 = 0.f;
++        }
++      }
++      const float b0 = ex2(d0), b1 = ex2(d1);
++      const float o0 = g0 + (LOG2_255 - mt0), o1 = g1 + (LOG2_255 - mt1);
++      // probabilities min(255, 255 * 2^(score - tile max)), rounded by the MAGIC_F addition
++      u32 sum0 = 0u, sum1 = 0u;
++#pragma unroll
++      for (int kb = 0; kb < KB32; ++kb) {
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++          const int na = 4 * kb + 2 * h, nb = na + 1;
++          const u32 p0 = pack4(prob(fmaf(__int_as_float(c[na][0]), f0, o0)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[na][1]), f0, o0)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[nb][0]), f0, o0)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[nb][1]), f0, o0)) + MAGIC_F);
++          const u32 p1 = pack4(prob(fmaf(__int_as_float(c[na][2]), f1, o1)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[na][3]), f1, o1)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[nb][2]), f1, o1)) + MAGIC_F,
++                                prob(fmaf(__int_as_float(c[nb][3]), f1, o1)) + MAGIC_F);
++          pa[qt][kb][2 * h] = p0;
++          pa[qt][kb][2 * h + 1] = p1;
++          sum0 = bytesum(p0, sum0);
++          sum1 = bytesum(p1, sum1);
++        }
++      }
++      sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
++      sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
++      sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
++      sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
++      l[qt][0] = fmaf((float)sum0, b0, l[qt][0]);
++      l[qt][1] = fmaf((float)sum1, b1, l[qt][1]);
++      w[qt][0] = b0 * vsc;
++      w[qt][1] = b1 * vsc;
++      wsum[qt][0] += w[qt][0];
++      wsum[qt][1] += w[qt][1];
++    }
++    // P.V: every V fragment load serves the warp's NQ query tiles
++#pragma unroll
++    for (int nb = 0; nb < NBD; ++nb) {
++      i32 d[NQ][4];
++#pragma unroll
++      for (int kb = 0; kb < KB32; kb += 2) {
++        u32 b[4];
++        ldmatrix4(b, stage + vofs + nb * 8 * VROW + 32 * kb);
++#pragma unroll
++        for (int qt = 0; qt < NQ; ++qt) {
++          if (kb == 0) mma_u8s8_c(d[qt], pa[qt][kb], b[0], b[1], magic);
++          else mma_u8s8(d[qt], pa[qt][kb], b[0], b[1]);
++        }
++#pragma unroll
++        for (int qt = 0; qt < NQ; ++qt) mma_u8s8(d[qt], pa[qt][kb + 1], b[2], b[3]);
++      }
++#pragma unroll
++      for (int qt = 0; qt < NQ; ++qt) {
++        acc[qt][nb][0] = fmaf(__int_as_float(d[qt][0]), w[qt][0], acc[qt][nb][0]);
++        acc[qt][nb][1] = fmaf(__int_as_float(d[qt][1]), w[qt][0], acc[qt][nb][1]);
++        acc[qt][nb][2] = fmaf(__int_as_float(d[qt][2]), w[qt][1], acc[qt][nb][2]);
++        acc[qt][nb][3] = fmaf(__int_as_float(d[qt][3]), w[qt][1], acc[qt][nb][3]);
++      }
++    }
++  }
++
++  const float* gp = vg + bh * HD + 2 * t;
++  const float* cp = vc + bh * HD + 2 * t;
++  const i64 base = (bh / n_heads) * o_stride_b + (bh % n_heads) * o_stride_h + 2 * t;
++#pragma unroll
++  for (int qt = 0; qt < NQ; ++qt) {
++    const u32 row0 = rowbase + 16 * qt + g, row1 = row0 + 8u;
++    const float i0 = 1.f / l[qt][0], i1 = 1.f / l[qt][1];
++    const float m0 = MAGIC_F * wsum[qt][0], m1 = MAGIC_F * wsum[qt][1];
++    const bool live0 = row0 < (u32)n_q, live1 = row1 < (u32)n_q;
++#pragma unroll
++    for (int nb = 0; nb < NBD; ++nb) {
++      const float ga = gp[8 * nb], gb = gp[8 * nb + 1], ca = cp[8 * nb], cb = cp[8 * nb + 1];
++      const float x00 = fmaf((acc[qt][nb][0] - m0) * i0, ga, ca), x01 = fmaf((acc[qt][nb][1] - m0) * i0, gb, cb);
++      const float x10 = fmaf((acc[qt][nb][2] - m1) * i1, ga, ca), x11 = fmaf((acc[qt][nb][3] - m1) * i1, gb, cb);
++      const i64 e0 = base + (i64)row0 * o_stride_s + 8 * nb, e1 = base + (i64)row1 * o_stride_s + 8 * nb;
++      if (out_kind == 2) {
++        float* o = reinterpret_cast<float*>(out);
++        if (live0) {
++          o[e0] = x00;
++          o[e0 + 1] = x01;
++        }
++        if (live1) {
++          o[e1] = x10;
++          o[e1 + 1] = x11;
++        }
++      } else {
++        u32* o = reinterpret_cast<u32*>(out);
++        const u32 y0 = out_kind == 1 ? (f2bf16(x00) | (f2bf16(x01) << 16)) : (f2h(x00) | (f2h(x01) << 16));
++        const u32 y1 = out_kind == 1 ? (f2bf16(x10) | (f2bf16(x11) << 16)) : (f2h(x10) | (f2h(x11) << 16));
++        if (live0) o[e0 >> 1] = y0;
++        if (live1) o[e1 >> 1] = y1;
++      }
++    }
++  }
++}
++"""
++
++_LOCK = threading.Lock()
++_NVRTC: Any = None
++_DRIVER: Any = None
++_FUNCTIONS: dict = {}
++
++_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3
++_CU_FUNC_ATTRIBUTE_NUM_REGS = 4
++_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
++
++
++def _library_dirs() -> list:
++    dirs = [p for p in sys.path if p and os.path.isdir(p)]
++    try:
++        import torch
++        dirs.insert(0, os.path.join(os.path.dirname(torch.__file__), "lib"))
++    except Exception:  # noqa: BLE001
++        pass
++    return dirs
++
++
++def _nvrtc_candidates() -> list:
++    if os.name == "nt":
++        patterns = ("nvrtc64_*.dll",)
++        subdirs = (
++            "",
++            os.path.join("nvidia", "cuda_nvrtc", "bin"),
++            os.path.join("nvidia", "cu13", "bin"),
++            os.path.join("nvidia", "cu12", "bin"),
++        )
++        fallbacks: tuple = ()
++    else:
++        patterns = ("libnvrtc.so.*", "libnvrtc.so")
++        subdirs = (
++            "",
++            os.path.join("nvidia", "cu13", "lib"),
++            os.path.join("nvidia", "cuda_nvrtc", "lib"),
++            os.path.join("nvidia", "cu12", "lib"),
++        )
++        fallbacks = ("libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so")
++    found = []
++    for d in _library_dirs():
++        for sub in subdirs:
++            for pattern in patterns:
++                for path in sorted(glob.glob(os.path.join(d, sub, pattern)), reverse = True):
++                    base = os.path.basename(path)
++                    # the builtins / alt libraries are loaded by NVRTC itself
++                    if "builtins" in base or ".alt." in base:
++                        continue
++                    found.append(path)
++    return found + list(fallbacks)
++
++
++def nvrtc() -> Any:
++    """The NVRTC library, loaded once. Raises RuntimeError when no copy can be loaded."""
++    global _NVRTC
++    if _NVRTC is not None:
++        return _NVRTC
++    errors = []
++    for name in _nvrtc_candidates():
++        try:
++            lib = ctypes.CDLL(name)
++            lib.nvrtcGetErrorString.restype = ctypes.c_char_p
++            _NVRTC = lib
++            return lib
++        except OSError as exc:
++            errors.append(f"{name}: {exc}")
++    raise RuntimeError("NVRTC not found: " + "; ".join(errors[:3]))
++
++
++def nvrtc_version() -> tuple:
++    lib = nvrtc()
++    major, minor = ctypes.c_int(), ctypes.c_int()
++    lib.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor))
++    return major.value, minor.value
++
++
++def compile_ptx(
++    source: str,
++    arch: str,
++    defines: Optional[dict] = None,
++) -> bytes:
++    """PTX (NUL-terminated) of ``source`` for ``arch`` such as "sm_89". Raises RuntimeError with the compiler log."""
++    lib = nvrtc()
++    program = ctypes.c_void_p()
++    rc = lib.nvrtcCreateProgram(
++        ctypes.byref(program), source.encode(), b"unsloth_int8_attention.cu", 0, None, None
++    )
++    if rc != 0:
++        raise RuntimeError(f"nvrtcCreateProgram: {lib.nvrtcGetErrorString(rc).decode()}")
++    try:
++        options = [f"--gpu-architecture={arch}", "--std=c++17", "-default-device"]
++        options += [f"-D{k}={v}" for k, v in (defines or {}).items()]
++        argv = (ctypes.c_char_p * len(options))(*[o.encode() for o in options])
++        rc = lib.nvrtcCompileProgram(program, len(options), argv)
++        size = ctypes.c_size_t()
++        if rc != 0:
++            lib.nvrtcGetProgramLogSize(program, ctypes.byref(size))
++            log = ctypes.create_string_buffer(size.value)
++            lib.nvrtcGetProgramLog(program, log)
++            raise RuntimeError(
++                f"NVRTC compile failed ({lib.nvrtcGetErrorString(rc).decode()}): "
++                + log.value.decode(errors = "replace")[-2000:]
++            )
++        lib.nvrtcGetPTXSize(program, ctypes.byref(size))
++        ptx = ctypes.create_string_buffer(size.value)
++        lib.nvrtcGetPTX(program, ptx)
++        return ptx.raw
++    finally:
++        lib.nvrtcDestroyProgram(ctypes.byref(program))
++
++
++def cap_registers(ptx: bytes, max_registers: int) -> bytes:
++    """``.maxnreg`` on every entry function: registers per thread decide how many blocks an SM holds at once."""
++    text = ptx.rstrip(b"\0").decode()
++    out, pos = [], 0
++    while True:
++        i = text.find(".entry ", pos)
++        if i < 0:
++            break
++        j = text.index("{", i)
++        out.append(text[pos:j] + f".maxnreg {int(max_registers)}\n")
++        pos = j
++    out.append(text[pos:])
++    return "".join(out).encode() + b"\0"
++
++
++def driver() -> Any:
++    global _DRIVER
++    if _DRIVER is None:
++        _DRIVER = ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
++    return _DRIVER
++
++
++def _check(rc: int, what: str) -> None:
++    if rc != 0:
++        raise RuntimeError(f"{what} failed with CUDA error {rc}")
++
++
++class Function:
++    """One loaded kernel. ``fn(grid, block, args, shared, stream)`` launches it; ``args`` are ctypes values."""
++
++    def __init__(self, handle: ctypes.c_void_p, name: str):
++        self.handle = handle
++        self.name = name
++        self._shared_limit = 48 * 1024  # the driver's default cap on dynamic shared memory
++
++    def _attribute(self, attribute: int) -> int:
++        out = ctypes.c_int()
++        _check(
++            driver().cuFuncGetAttribute(ctypes.byref(out), attribute, self.handle),
++            "cuFuncGetAttribute",
++        )
++        return out.value
++
++    @property
++    def registers(self) -> int:
++        """Registers per thread."""
++        return self._attribute(_CU_FUNC_ATTRIBUTE_NUM_REGS)
++
++    @property
++    def local_bytes(self) -> int:
++        """Per-thread stack frame: 0 means nothing was spilled out of registers."""
++        return self._attribute(_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)
++
++    def allow_shared(self, nbytes: int) -> None:
++        if nbytes > self._shared_limit:
++            _check(
++                driver().cuFuncSetAttribute(
++                    self.handle, _CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, int(nbytes)
++                ),
++                "cuFuncSetAttribute(max dynamic shared memory)",
++            )
++            self._shared_limit = int(nbytes)
++
++    def __call__(self, grid: tuple, block: int, args: list, shared: int, stream: int) -> None:
++        n = len(args)
++        pointers = (ctypes.c_void_p * n)(
++            *[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args]
++        )
++        _check(
++            driver().cuLaunchKernel(
++                self.handle,
++                grid[0],
++                grid[1],
++                1,
++                block,
++                1,
++                1,
++                shared,
++                ctypes.c_void_p(stream),
++                pointers,
++                None,
++            ),
++            f"cuLaunchKernel({self.name})",
++        )
++
++
++def loaded(key: tuple) -> Optional[Function]:
++    return _FUNCTIONS.get(key)
++
++
++def load(
++    device_index: int,
++    capability: tuple,
++    defines: dict,
++    max_registers: Optional[int] = None,
++    shared: int = 0,
++) -> Function:
++    """The kernel compiled with ``defines`` and loaded on torch's context of ``device_index``; cached per process.
++    Not to be called while a CUDA graph is being captured (compiling is not a stream operation)."""
++    import torch
++
++    key = (int(device_index), tuple(sorted(defines.items())), max_registers)
++    found = _FUNCTIONS.get(key)
++    if found is not None:
++        return found
++    with _LOCK:
++        found = _FUNCTIONS.get(key)
++        if found is not None:
++            return found
++        ptx = compile_ptx(KERNEL_SOURCE, f"sm_{capability[0]}{capability[1]}", defines)
++        if max_registers:
++            ptx = cap_registers(ptx, max_registers)
++        with torch.cuda.device(device_index):
++            torch.zeros(
++                1, device = f"cuda:{device_index}"
++            )  # torch's context exists and is current on this thread
++            module = ctypes.c_void_p()
++            _check(
++                driver().cuModuleLoadData(ctypes.byref(module), ctypes.c_char_p(ptx)),
++                "cuModuleLoadData",
++            )
++            handle = ctypes.c_void_p()
++            _check(
++                driver().cuModuleGetFunction(ctypes.byref(handle), module, KERNEL_NAME.encode()),
++                "cuModuleGetFunction",
++            )
++            fn = Function(handle, KERNEL_NAME)
++            fn.allow_shared(shared)
++        _FUNCTIONS[key] = fn
++        return fn
++
++
++def source_digest() -> str:
++    return hashlib.sha256(KERNEL_SOURCE.encode()).hexdigest()[:16]
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_triton.py b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+new file mode 100644
+index 0000000000..3d51082ed4
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+@@ -0,0 +1,339 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""INT8 attention in Triton, for cards the CUDA kernel cannot reach (ROCm: RDNA3 / RDNA4 WMMA, CDNA MFMA).
++
++Same quantisation as ``diffusion_int8_attention`` (written from scratch, ideas from QuaRot arXiv 2404.00456,
++SageAttention arXiv 2410.02367 / 2411.10958, INT-FlashAttention arXiv 2409.16997):
++
++* Q and K rotated by fixed signs and a 16-point Hadamard transform per 16 channels, K shifted by its per-channel mean
++  over every 8th key, one scale per query row and one per key (the CUDA kernel groups keys by accumulator lane; a
++  Triton tile can apply a per-key vector at no cost).
++* ``pv = "int8"``: P rounded to 0..127 per (query row, key tile), V centred, divided by a per-channel gain and
++  rounded with one scale per key tile; the softmax denominator is summed over the rounded P.
++  ``pv = "half"``: P and V in the inputs' 16-bit type (V read in place, no quantiser).
++
++Rounding is round-half-even through the fp32 1.5 * 2**23 constant, so nothing depends on a libdevice
++``float2int_rn`` (ROCm's libdevice has none).
++
++Inputs are the strided ``[B, S, H, D]`` views; the output is ``[B, S, H, D]`` in V's dtype.
++"""
++
++from __future__ import annotations
++
++import math
++import types
++from typing import Any, Optional
++
++LOG2E = 1.4426950408889634
++QUANT_ROWS = 64
++STATS_STEP = 8
++HEAD_DIMS = (64, 128)
++# (BM, BN, warps, stages) per head dim; measured on gfx1151 (see the PR)
++DEFAULT_CONFIGS: dict = {
++    128: {"bm": 64, "bn": 64, "warps": 4, "stages": 1},
++    64: {"bm": 64, "bn": 64, "warps": 4, "stages": 1},
++}
++
++
++try:
++    import triton
++    import triton.language as tl
++except Exception:  # noqa: BLE001 -- no Triton: the module imports, nothing here runs
++    triton = None
++
++if triton is not None:
++
++
++    @triton.jit
++    def _rint(x):
++        # round half to even in fp32 for |x| < 2**22: adding then removing 1.5 * 2**23 drops the fraction
++        return (x + 12582912.0) - 12582912.0
++
++    @triton.jit
++    def _rotate(x, R: tl.constexpr, D: tl.constexpr):
++        cols = tl.arange(0, D)
++        flip = (((cols * 7919 + 13) * (cols + 3)) >> 7) & 1
++        x = x * (1.0 - 2.0 * flip.to(tl.float32))[None, :]
++        for _ in tl.static_range(4):
++            a, b = tl.split(tl.reshape(x, (R, D // 2, 2)))
++            z = tl.reshape(tl.join(a + b, a - b), (R, D // 16, 8, 2))
++            x = tl.reshape(tl.permute(z, (0, 1, 3, 2)), (R, D))
++        return x
++
++    @triton.jit
++    def stats_kernel(
++        x_ptr, c_ptr, g_ptr, n_rows, n_heads, x_stride_b, x_stride_s, x_stride_h,
++        STEP: tl.constexpr, R: tl.constexpr, D: tl.constexpr, MODE: tl.constexpr,
++    ):
++        # per (batch, head, channel) over every STEP-th token: MODE 0 mean -> c; MODE 1 mid-range -> c, half range -> g
++        bh = tl.program_id(0)
++        b = bh // n_heads
++        h = bh % n_heads
++        cols = tl.arange(0, D)
++        n_sub = (n_rows + STEP - 1) // STEP
++        acc = tl.zeros([D], tl.float32)
++        lo = tl.full([D], 3.0e38, tl.float32)
++        hi = tl.full([D], -3.0e38, tl.float32)
++        for blk in range(0, tl.cdiv(n_sub, R)):
++            rows = (blk * R + tl.arange(0, R)) * STEP
++            live = rows < n_rows
++            x = tl.load(
++                x_ptr + b * x_stride_b + h * x_stride_h + rows[:, None].to(tl.int64) * x_stride_s + cols[None, :],
++                mask = live[:, None], other = 0.0,
++            ).to(tl.float32)
++            if MODE == 0:
++                acc += tl.sum(x, axis = 0)
++            else:
++                lo = tl.minimum(lo, tl.min(tl.where(live[:, None], x, 3.0e38), axis = 0))
++                hi = tl.maximum(hi, tl.max(tl.where(live[:, None], x, -3.0e38), axis = 0))
++        if MODE == 0:
++            tl.store(c_ptr + bh * D + cols, acc / n_sub)
++        else:
++            tl.store(c_ptr + bh * D + cols, 0.5 * (hi + lo))
++            tl.store(g_ptr + bh * D + cols, tl.maximum(0.5 * (hi - lo), 1e-12))
++
++    @triton.jit
++    def quant_rows_kernel(
++        x_ptr, c_ptr, q_ptr, s_ptr, n_rows, n_pad, n_heads, x_stride_b, x_stride_s, x_stride_h, mul,
++        R: tl.constexpr, D: tl.constexpr, CENTRE: tl.constexpr,
++    ):
++        # R rows of one (batch, head), optionally centred, rotated: int8 = rint(x * 127 / amax(row)),
++        # scale[row] = amax / 127 * mul; padded rows are zeros with scale 0
++        bh = tl.program_id(0)
++        blk = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        rows = blk * R + tl.arange(0, R)
++        cols = tl.arange(0, D)
++        live = rows < n_rows
++        x = tl.load(
++            x_ptr + b * x_stride_b + h * x_stride_h + rows[:, None].to(tl.int64) * x_stride_s + cols[None, :],
++            mask = live[:, None], other = 0.0,
++        ).to(tl.float32)
++        if CENTRE:
++            c = tl.load(c_ptr + bh * D + cols)
++            x = tl.where(live[:, None], x - c[None, :], 0.0)
++        x = _rotate(x, R, D)
++        amax = tl.maximum(tl.max(tl.abs(x), axis = 1), 1e-20)
++        base = bh.to(tl.int64) * n_pad
++        tl.store(s_ptr + base + rows, tl.where(live, amax * (mul / 127.0), 0.0))
++        tl.store(q_ptr + (base + rows[:, None]) * D + cols[None, :], _rint(x * (127.0 / amax)[:, None]).to(tl.int8))
++
++    @triton.jit
++    def quant_v_kernel(
++        x_ptr, c_ptr, g_ptr, q_ptr, s_ptr, n_rows, n_pad, n_heads, x_stride_b, x_stride_s, x_stride_h,
++        T: tl.constexpr, D: tl.constexpr,
++    ):
++        # one tile of T keys of one (batch, head): (x - centre) / gain per channel, one scale for the tile,
++        # stored key-major [BH, n_pad, D]
++        bh = tl.program_id(0)
++        blk = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        rows = blk * T + tl.arange(0, T)
++        cols = tl.arange(0, D)
++        live = rows < n_rows
++        x = tl.load(
++            x_ptr + b * x_stride_b + h * x_stride_h + rows[:, None].to(tl.int64) * x_stride_s + cols[None, :],
++            mask = live[:, None], other = 0.0,
++        ).to(tl.float32)
++        c = tl.load(c_ptr + bh * D + cols)
++        g = tl.load(g_ptr + bh * D + cols)
++        x = tl.where(live[:, None], (x - c[None, :]) / g[None, :], 0.0)
++        amax = tl.maximum(tl.max(tl.max(tl.abs(x), axis = 1), axis = 0), 1e-20)
++        tile = bh.to(tl.int64) * (n_pad // T) + blk
++        tl.store(s_ptr + tile, amax / 127.0)
++        base = bh.to(tl.int64) * n_pad
++        tl.store(q_ptr + (base + rows[:, None]) * D + cols[None, :], _rint(x * (127.0 / amax)).to(tl.int8))
++
++    @triton.jit
++    def attn_kernel(
++        q_ptr, qs_ptr, k_ptr, ks_ptr, v_ptr, vs_ptr, vc_ptr, vg_ptr, o_ptr,
++        sq, sk, n_qpad, n_kpad, n_heads, qk_mul,
++        q_sb, q_ss, q_sh, k_sb, k_ss, k_sh, v_sb, v_ss, v_sh, o_sb, o_ss, o_sh,
++        BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr,
++        QK_INT8: tl.constexpr, PV_INT8: tl.constexpr, EVEN_K: tl.constexpr,
++    ):
++        pid_m = tl.program_id(0)
++        bh = tl.program_id(1)
++        b = bh // n_heads
++        h = bh % n_heads
++        rows = pid_m * BM + tl.arange(0, BM)
++        offs_n = tl.arange(0, BN)
++        cols = tl.arange(0, D)
++        qbase = bh.to(tl.int64) * n_qpad
++        kbase = bh.to(tl.int64) * n_kpad
++        if QK_INT8:
++            q = tl.load(q_ptr + (qbase + rows[:, None]) * D + cols[None, :])
++            qs = tl.load(qs_ptr + qbase + rows)
++        else:
++            q = tl.load(
++                q_ptr + b * q_sb + h * q_sh + rows[:, None].to(tl.int64) * q_ss + cols[None, :],
++                mask = (rows < sq)[:, None], other = 0.0,
++            )
++        m_i = tl.full([BM], -float("inf"), tl.float32)
++        l_i = tl.zeros([BM], tl.float32)
++        acc = tl.zeros([BM, D], tl.float32)
++        n_tiles = tl.cdiv(sk, BN)
++        for t in range(0, n_tiles):
++            keys = t * BN + offs_n
++            if QK_INT8:
++                k = tl.load(k_ptr + (kbase + keys[:, None]) * D + cols[None, :])
++                ks = tl.load(ks_ptr + kbase + keys)
++                s = tl.dot(q, tl.trans(k), out_dtype = tl.int32).to(tl.float32) * qs[:, None] * ks[None, :]
++            else:
++                k = tl.load(
++                    k_ptr + b * k_sb + h * k_sh + keys[:, None].to(tl.int64) * k_ss + cols[None, :],
++                    mask = (keys < sk)[:, None], other = 0.0,
++                )
++                s = tl.dot(q, tl.trans(k)) * qk_mul
++            if not EVEN_K:
++                s = tl.where((keys < sk)[None, :], s, -float("inf"))
++            m_tile = tl.max(s, axis = 1)
++            m_new = tl.maximum(m_i, m_tile)
++            alpha = tl.math.exp2(m_i - m_new)
++            p = tl.math.exp2(s - m_new[:, None])
++            acc = acc * alpha[:, None]
++            if PV_INT8:
++                pm = tl.maximum(tl.math.exp2(m_tile - m_new), 1e-30)
++                pq = _rint(p * (127.0 / pm)[:, None])
++                v = tl.load(v_ptr + (kbase + keys[:, None]) * D + cols[None, :])
++                vs = tl.load(vs_ptr + bh.to(tl.int64) * (n_kpad // BN) + t)
++                pv = tl.dot(pq.to(tl.int8), v, out_dtype = tl.int32).to(tl.float32)
++                w = pm * (1.0 / 127.0)
++                acc += pv * (w * vs)[:, None]
++                l_i = l_i * alpha + tl.sum(pq, axis = 1) * w
++            else:
++                v = tl.load(
++                    v_ptr + b * v_sb + h * v_sh + keys[:, None].to(tl.int64) * v_ss + cols[None, :],
++                    mask = (keys < sk)[:, None], other = 0.0,
++                )
++                acc += tl.dot(p.to(v.dtype), v)
++                l_i = l_i * alpha + tl.sum(p, axis = 1)
++            m_i = m_new
++        out = acc / l_i[:, None]
++        if PV_INT8:
++            vg = tl.load(vg_ptr + bh * D + cols)
++            vc = tl.load(vc_ptr + bh * D + cols)
++            out = out * vg[None, :] + vc[None, :]
++        tl.store(
++            o_ptr + b * o_sb + h * o_sh + rows[:, None].to(tl.int64) * o_ss + cols[None, :],
++            out.to(o_ptr.dtype.element_ty),
++            mask = (rows < sq)[:, None],
++        )
++
++
++
++def kernels() -> Any:
++    if triton is None:
++        raise RuntimeError("Triton is not installed")
++    return types.SimpleNamespace(
++        stats = stats_kernel, quant_rows = quant_rows_kernel, quant_v = quant_v_kernel, attn = attn_kernel
++    )
++
++
++def _pad(n: int, multiple: int) -> int:
++    return (n + multiple - 1) // multiple * multiple
++
++
++def quantise(q: Any, k: Any, v: Any, config: dict, pv: str = "int8", scale: Optional[float] = None) -> dict:
++    """Quantised operands for ``attend`` from ``[B, S, H, D]`` q / k / v (last dim stride 1)."""
++    import torch
++
++    kk = kernels()
++    B, Sq, H, D = q.shape
++    Sk = k.shape[1]
++    bm, bn = int(config["bm"]), int(config["bn"])
++    dev = q.device
++    # log2(e) turns 2^x into e^x; 16 is the norm the rotation adds to Q and to K
++    mul = (1.0 / math.sqrt(D) if scale is None else float(scale)) * LOG2E / 16.0
++    n_qpad = _pad(Sq, math.lcm(QUANT_ROWS, bm))
++    n_kpad = _pad(Sk, math.lcm(QUANT_ROWS, bn))
++    BH = B * H
++
++    def st(x):
++        return x.stride(0), x.stride(1), x.stride(2)
++
++    qi = torch.empty((BH, n_qpad, D), dtype = torch.int8, device = dev)
++    qs = torch.empty((BH, n_qpad), dtype = torch.float32, device = dev)
++    kk.quant_rows[(BH, n_qpad // QUANT_ROWS)](q, q, qi, qs, Sq, n_qpad, H, *st(q), mul, R = QUANT_ROWS, D = D,
++                                               CENTRE = False)
++    kc = torch.empty((BH, D), dtype = torch.float32, device = dev)
++    kk.stats[(BH,)](k, kc, kc, Sk, H, *st(k), STEP = STATS_STEP, R = 32, D = D, MODE = 0)
++    ki = torch.empty((BH, n_kpad, D), dtype = torch.int8, device = dev)
++    ks = torch.empty((BH, n_kpad), dtype = torch.float32, device = dev)
++    kk.quant_rows[(BH, n_kpad // QUANT_ROWS)](k, kc, ki, ks, Sk, n_kpad, H, *st(k), 1.0, R = QUANT_ROWS, D = D,
++                                               CENTRE = True)
++    out = {"qi": qi, "qs": qs, "ki": ki, "ks": ks, "n_qpad": n_qpad, "n_kpad": n_kpad, "v": v, "pv": pv,
++           "shape": (B, Sq, Sk, H, D), "config": config}
++    if pv == "int8":
++        vc = torch.empty((BH, D), dtype = torch.float32, device = dev)
++        vg = torch.empty((BH, D), dtype = torch.float32, device = dev)
++        kk.stats[(BH,)](v, vc, vg, Sk, H, *st(v), STEP = STATS_STEP, R = 32, D = D, MODE = 1)
++        vi = torch.empty((BH, n_kpad, D), dtype = torch.int8, device = dev)
++        vs = torch.empty((BH, n_kpad // bn), dtype = torch.float32, device = dev)
++        kk.quant_v[(BH, n_kpad // bn)](v, vc, vg, vi, vs, Sk, n_kpad, H, *st(v), T = bn, D = D)
++        out.update(vi = vi, vs = vs, vc = vc, vg = vg)
++    return out
++
++
++def attend(p: dict) -> Any:
++    import torch
++
++    kk = kernels()
++    B, Sq, Sk, H, D = p["shape"]
++    cfg = p["config"]
++    bm, bn = int(cfg["bm"]), int(cfg["bn"])
++    v = p["v"]
++    out = torch.empty((B, Sq, H, D), dtype = v.dtype, device = v.device)
++    pv8 = p["pv"] == "int8"
++    vv = p["vi"] if pv8 else v
++    dummy = p["qs"]
++    kk.attn[(p["n_qpad"] // bm, B * H)](
++        p["qi"], p["qs"], p["ki"], p["ks"], vv, p.get("vs", dummy), p.get("vc", dummy), p.get("vg", dummy), out,
++        Sq, Sk, p["n_qpad"], p["n_kpad"], H, 1.0,
++        0, 0, 0, 0, 0, 0, v.stride(0), v.stride(1), v.stride(2), out.stride(0), out.stride(1), out.stride(2),
++        BM = bm, BN = bn, D = D, QK_INT8 = True, PV_INT8 = pv8, EVEN_K = Sk % bn == 0,
++        num_warps = int(cfg["warps"]), num_stages = int(cfg["stages"]),
++    )
++    return out
++
++
++def int8_attention(q: Any, k: Any, v: Any, config: Optional[dict] = None, pv: str = "int8",
++                   scale: Optional[float] = None) -> Any:
++    """``softmax(q k^T * scale) v`` with int8 Q.K^T (and int8 P.V for ``pv="int8"``) on ``[B, S, H, D]``."""
++    import torch
++
++    config = config or DEFAULT_CONFIGS[int(q.shape[-1])]
++    q, k, v = (x if x.stride(3) == 1 else x.contiguous() for x in (q, k, v))
++    with torch.no_grad():
++        return attend(quantise(q, k, v, config, pv, scale))
++
++
++def half_attention(q: Any, k: Any, v: Any, config: Optional[dict] = None, scale: Optional[float] = None) -> Any:
++    """The same kernel without quantisation (16-bit Q.K^T and P.V): the Triton baseline on this card."""
++    import torch
++
++    kk = kernels()
++    config = config or DEFAULT_CONFIGS[int(q.shape[-1])]
++    B, Sq, H, D = q.shape
++    Sk = k.shape[1]
++    bm, bn = int(config["bm"]), int(config["bn"])
++    mul = (1.0 / math.sqrt(D) if scale is None else float(scale)) * LOG2E
++    out = torch.empty((B, Sq, H, D), dtype = v.dtype, device = v.device)
++    k = k.to(q.dtype)
++    v2 = v.to(q.dtype)
++    kk.attn[(triton_cdiv(Sq, bm), B * H)](
++        q, q, k, k, v2, q, q, q, out,
++        Sq, Sk, 0, 0, H, mul,
++        q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
++        v2.stride(0), v2.stride(1), v2.stride(2), out.stride(0), out.stride(1), out.stride(2),
++        BM = bm, BN = bn, D = D, QK_INT8 = False, PV_INT8 = False, EVEN_K = Sk % bn == 0,
++        num_warps = int(config["warps"]), num_stages = int(config["stages"]),
++    )
++    return out
++
++
++def triton_cdiv(a: int, b: int) -> int:
++    return (a + b - 1) // b
+diff --git a/studio/backend/core/inference/diffusion_minimax_h3_image.py b/studio/backend/core/inference/diffusion_minimax_h3_image.py
+index 55226012c4..c6737da8c1 100644
+--- a/studio/backend/core/inference/diffusion_minimax_h3_image.py
++++ b/studio/backend/core/inference/diffusion_minimax_h3_image.py
+@@ -2721,18 +2721,40 @@ def install_checkpoint_attention(
+     except Exception as exc:  # noqa: BLE001 - native attention stays
+         engaged = None
+         log.warning("diffusion.minimax_h3_image: INT8 attention unavailable (%s)", exc)
+-    if not engaged or "sage" not in str(engaged):
++    blocks = {id(m) for b in getattr(transformer, "transformer_blocks", ()) for m in b.modules()}
++    block_modules = [m for m in modules if id(m) in blocks]
++    sage_on = bool(engaged) and "sage" in str(engaged)
++    if not sage_on:
+         restore()
+         setattr(transformer, ATTENTION_BACKEND_ATTR, tag)
+-        return None
+     forced = (os.environ.get(INT8_ATTENTION_ENV) or "").strip().lower() in (
+         "1",
+         "on",
+         "true",
+         "yes",
+     )
+-    race = None if forced else race_checkpoint_attention(transformer, saved, dtype)
+-    if race is not None and not race["keep"]:
++    race = race_checkpoint_attention(transformer, saved, dtype) if sage_on and not forced else None
++    sage_kept = sage_on and (race is None or race["keep"])
++    # Studio's own INT8 kernel takes the DiT blocks from whichever backend won so far (SageAttention where it was
++    # kept, the native backend otherwise) only when it is more than 2% faster on the same block; a tie keeps that one
++    kernel_blocks = _race_int8_kernel(
++        transformer, block_modules, saved, dev, dtype, sage_kept, forced, log
++    )
++    if kernel_blocks:
++        from .diffusion_int8_attention import BACKEND as INT8_KERNEL
++
++        restore()
++        setattr(transformer, ATTENTION_BACKEND_ATTR, tag)
++        setattr(pipe, ATTENTION_SAVED_ATTR, (saved, tag))
++        log.info(
++            "diffusion.minimax_h3_image: INT8 attention (%s) on %d DiT blocks, as the checkpoint declares",
++            INT8_KERNEL,
++            kernel_blocks,
++        )
++        return INT8_KERNEL
++    if not sage_on:
++        return None
++    if not sage_kept:
+         restore()
+         setattr(transformer, ATTENTION_BACKEND_ATTR, tag)
+         log.info(
+@@ -2744,25 +2766,38 @@ def install_checkpoint_attention(
+             race["native"],
+         )
+         return None
+-    blocks = {id(m) for b in getattr(transformer, "transformer_blocks", ()) for m in b.modules()}
+     restore(only = [m for m in modules if id(m) not in blocks])
+     setattr(pipe, ATTENTION_SAVED_ATTR, (saved, tag))
+     log.info(
+         "diffusion.minimax_h3_image: INT8 attention (%s) on %d DiT blocks, as the checkpoint declares",
+         engaged,
+-        sum(1 for m in modules if id(m) in blocks),
++        len(block_modules),
+     )
+     return engaged
+ 
+ 
+ # Rows of the race's packed sequence: a 2048x2048 canvas (64 x 64 latent patches) plus a prompt.
+ _RACE_ROWS = (4096, 300)
++# Studio's INT8 kernel is also timed on a 1024x1024 canvas: it can win the large one only
++_KERNEL_RACE_IMAGES = (4096, 1024)
++# sequences shorter than this keep the native backend when the kernel wins only the large canvas
++_KERNEL_LARGE_ROWS = 2560
++ATTENTION_RACE_ATTR = "_unsloth_h3_attention_race"
+ 
+ 
+-def race_checkpoint_attention(transformer: Any, saved: dict, dtype: Any) -> Optional[dict]:
++def race_checkpoint_attention(
++    transformer: Any,
++    saved: dict,
++    dtype: Any,
++    *,
++    kernel: bool = False,
++) -> Optional[dict]:
+     """Time one resident DiT block's attention module with the engaged INT8 backend against the backend it had
+     (which keeps Studio's strided layout and fused q/k norm + RoPE); ``keep`` when INT8 is more than 2% faster.
+-    None when no block's attention is on the card (nothing to time: the caller keeps the INT8 route)."""
++    None when no block's attention is on the card (nothing to time: the caller keeps the INT8 route).
++
++    ``kernel`` adds Studio's INT8 attention kernel on the backend the block had: ``kernel`` maps each image row
++    count of ``_KERNEL_RACE_IMAGES`` to the [native, engaged, kernel] medians in ms."""
+     import torch
+ 
+     attn = None
+@@ -2776,44 +2811,201 @@ def race_checkpoint_attention(transformer: Any, saved: dict, dtype: Any) -> Opti
+     rope = getattr(transformer, "rope", None)
+     if attn is None or norm is None or rope is None:
+         return None
+-    engaged = attn.processor._attention_backend
++    proc = attn.processor
++    engaged = proc._attention_backend
+     native = saved[attn]
++    kernel = kernel and hasattr(type(proc), "_unsloth_int8")
++    routed = (getattr(proc, "_unsloth_int8", False), getattr(proc, "_unsloth_int8_min_tokens", 0))
+     device = next(attn.parameters()).device
+     width = int(norm.normalized_shape[0])
+-    image, text = _RACE_ROWS
+-    side = int(math.isqrt(image))
+-    try:
+-        with torch.no_grad(), torch.cuda.device(device):
+-            g = torch.Generator(device = "cpu").manual_seed(7)
+-            x = torch.randn(1, image + text, width, generator = g).to(device = device, dtype = dtype)
+-            idx = torch.arange(image)
+-            pos = torch.zeros(image + text, 3, dtype = torch.float64)
+-            pos[text:, 1] = (idx // side).double()
+-            pos[text:, 2] = (idx % side).double()
+-            pos[:text, 0] = torch.arange(text).double()
+-            rotary = rope(pos.to(device))
+-            ms = []
+-            for backend in (native, engaged):
+-                attn.processor._attention_backend = backend
++    text = _RACE_ROWS[1]
++
++    def timed(image: int, variants: tuple) -> list:
++        side = int(math.isqrt(image))
++        g = torch.Generator(device = "cpu").manual_seed(7)
++        x = torch.randn(1, image + text, width, generator = g).to(device = device, dtype = dtype)
++        idx = torch.arange(image)
++        pos = torch.zeros(image + text, 3, dtype = torch.float64)
++        pos[text:, 1] = (idx // side).double()
++        pos[text:, 2] = (idx % side).double()
++        pos[:text, 0] = torch.arange(text).double()
++        rotary = rope(pos.to(device))
++
++        def select(variant: tuple) -> None:
++            proc._attention_backend = variant[0]
++            if kernel:
++                proc._unsloth_int8, proc._unsloth_int8_min_tokens = variant[1], 0
++
++        def once() -> float:
++            a = torch.cuda.Event(enable_timing = True)
++            b = torch.cuda.Event(enable_timing = True)
++            a.record()
++            attn(x, rotary, None)
++            b.record()
++            b.synchronize()
++            return a.elapsed_time(b)
++
++        times: list = [[] for _ in variants]
++        if kernel:
++            # interleaved rounds: a card that changes speed while it is being timed (an A100 does, about a second
++            # into a load) then slows or speeds every variant alike instead of the one timed last
++            for variant in variants:
++                select(variant)
+                 for _ in range(2):
+                     attn(x, rotary, None)
+-                times = []
+-                for _ in range(5):
+-                    a = torch.cuda.Event(enable_timing = True)
+-                    b = torch.cuda.Event(enable_timing = True)
+-                    a.record()
++            for _ in range(5):
++                for i, variant in enumerate(variants):
++                    select(variant)
++                    times[i].append(once())
++        else:
++            for i, variant in enumerate(variants):
++                select(variant)
++                for _ in range(2):
+                     attn(x, rotary, None)
+-                    b.record()
+-                    b.synchronize()
+-                    times.append(a.elapsed_time(b))
+-                ms.append(sorted(times)[len(times) // 2])
++                times[i] = [once() for _ in range(5)]
++        return [sorted(t)[len(t) // 2] for t in times]
++
++    variants = ((native, False), (engaged, False)) + (((native, True),) if kernel else ())
++    try:
++        with torch.no_grad(), torch.cuda.device(device):
++            rows = {
++                image: timed(image, variants)
++                for image in (_KERNEL_RACE_IMAGES if kernel else _RACE_ROWS[:1])
++            }
+     except torch.OutOfMemoryError:
+         raise
+     except Exception:  # noqa: BLE001 - untimed: the caller keeps the INT8 route it already engaged
+         return None
+     finally:
+-        attn.processor._attention_backend = engaged
+-    return {"keep": ms[1] < 0.98 * ms[0], "ms": ms, "native": str(native)}
++        proc._attention_backend = engaged
++        if kernel:
++            proc._unsloth_int8, proc._unsloth_int8_min_tokens = routed
++    ms = rows[_RACE_ROWS[0]][:2]
++    found = {"keep": ms[1] < 0.98 * ms[0], "ms": ms, "native": str(native)}
++    if kernel:
++        found["kernel"] = rows
++    return found
++
++
++def _race_int8_kernel(
++    transformer: Any,
++    block_modules: list,
++    saved: dict,
++    dev: Any,
++    dtype: Any,
++    sage: bool,
++    forced: bool,
++    log: Any,
++) -> int:
++    """Route the DiT blocks to Studio's INT8 attention kernel when it matches fp32 attention on this card and is more
++    than 2% faster than what they would run (``sage``: SageAttention, else their native backend) on a resident block.
++    ``forced`` (the env switch pinned SageAttention) leaves it alone unless the kernel's own switch forces it.
++    Returns the number of blocks routed (0 keeps the incumbent)."""
++    import torch
++
++    from . import diffusion_int8_attention as int8_attention
++
++    setting = int8_attention.mode()
++    if not block_modules or setting == "off" or (forced and setting != "force"):
++        return 0
++    started = time.perf_counter()
++    record: dict = {"mode": setting, "incumbent": "sage" if sage else "native"}
++    setattr(transformer, ATTENTION_RACE_ATTR, record)
++    try:
++        # the accuracy check on this card (compiles the kernel), no timing yet
++        ready = int8_attention.install_int8_attention(
++            transformer, device = dev, dtype = dtype, modules = block_modules, force = True, logger = log
++        )
++        record["checked_s"] = round(time.perf_counter() - started, 3)
++        if not ready or setting == "force":
++            record["blocks"] = ready
++            return ready
++        for m in block_modules:
++            m.processor._unsloth_int8 = False
++        race = race_checkpoint_attention(transformer, saved, dtype, kernel = True)
++        if race is None or "kernel" not in race:
++            # no block on the card to time (a streamed DiT): the attention-only race on synthetic q, k, v decides
++            routed = int8_attention.install_int8_attention(
++                transformer,
++                device = dev,
++                dtype = dtype,
++                modules = block_modules,
++                incumbent = _sage_incumbent(block_modules[0])
++                if sage
++                else int8_attention._sdpa_incumbent(saved.get(block_modules[0])),
++                logger = log,
++            )
++            record.update(blocks = routed, timed = "attention")
++            return routed
++        rows = race["kernel"]
++        large, small = (rows[n] for n in _KERNEL_RACE_IMAGES)
++        margin = int8_attention.RACE_MARGIN
++        wins = large[2] < margin * large[1 if sage else 0]
++        # short sequences fall back to the native backend, so the kernel must beat it and SageAttention there
++        everywhere = wins and small[2] < margin * min(small[0], small[1] if sage else small[0])
++        record.update(
++            timed = "block",
++            ms = {str(n): [round(v, 3) for v in rows[n]] for n in rows},
++            blocks = len(block_modules) if wins else 0,
++        )
++        log.info(
++            "diffusion.minimax_h3_image: INT8 attention kernel race on a DiT block: %.2f ms against %.2f ms with %s "
++            "(%d + %d rows), %.2f ms against %.2f ms (%d + %d rows): %s",
++            large[2],
++            large[1 if sage else 0],
++            "SageAttention" if sage else race["native"],
++            _KERNEL_RACE_IMAGES[0],
++            _RACE_ROWS[1],
++            small[2],
++            small[0],
++            _KERNEL_RACE_IMAGES[1],
++            _RACE_ROWS[1],
++            "engaged" if wins else "kept off",
++        )
++        if not wins:
++            return 0
++        for m in block_modules:
++            m.processor._unsloth_int8 = True
++            m.processor._unsloth_int8_min_tokens = 0 if everywhere else _KERNEL_LARGE_ROWS
++        record["min_tokens"] = 0 if everywhere else _KERNEL_LARGE_ROWS
++        return len(block_modules)
++    except Exception as exc:  # noqa: BLE001 - the incumbent stays
++        for m in block_modules:
++            if hasattr(type(m.processor), "_unsloth_int8"):
++                m.processor._unsloth_int8 = False
++        if isinstance(exc, torch.OutOfMemoryError):
++            raise
++        record.update(blocks = 0, error = repr(exc)[:200])
++        log.info("diffusion.minimax_h3_image: INT8 attention kernel skipped (%s)", exc)
++        return 0
++    finally:
++        record["seconds"] = round(time.perf_counter() - started, 3)
++
++
++def _sage_incumbent(attn: Any) -> tuple:
++    """(name, callable(q, k, v)) making the SageAttention call the strided processor makes."""
++    from .video_minimax_h3_attn import h3_processor_base
++
++    backend = attn.processor._attention_backend
++    dispatch = getattr(
++        sys.modules.get(h3_processor_base(attn).__module__), "dispatch_attention_fn", None
++    )
++    if not callable(dispatch):
++        raise RuntimeError("no attention dispatcher to time SageAttention with")
++
++    def sage(q: Any, k: Any, v: Any) -> Any:
++        return dispatch(
++            q,
++            k,
++            v,
++            attn_mask = None,
++            dropout_p = 0.0,
++            is_causal = False,
++            backend = backend,
++            parallel_config = None,
++        )
++
++    return str(getattr(backend, "value", backend)), sage
+ 
+ 
+ def remove_checkpoint_attention(pipe: Any) -> int:
+@@ -2822,6 +3014,9 @@ def remove_checkpoint_attention(pipe: Any) -> int:
+     if not entry:
+         return 0
+     from .diffusion_attention import ATTENTION_BACKEND_ATTR
++    from .diffusion_int8_attention import remove_int8_attention
++
++    remove_int8_attention(getattr(pipe, "transformer", None))
+ 
+     saved, tag = entry
+     for m, backend in saved.items():
+diff --git a/studio/backend/core/inference/diffusion_minimax_h3_image_speed.py b/studio/backend/core/inference/diffusion_minimax_h3_image_speed.py
+index 8049ace9bf..bd139d4a58 100644
+--- a/studio/backend/core/inference/diffusion_minimax_h3_image_speed.py
++++ b/studio/backend/core/inference/diffusion_minimax_h3_image_speed.py
+@@ -200,6 +200,14 @@ def _install(pipe: Any, plan: Any, device: Any, logger: Any) -> list:
+             levers.append("h3_qk_rope")
+         if shared_qkv_count(transformer):
+             levers.append("h3_shared_qkv_quant")
++        from . import diffusion_int8_attention as int8_attention
++
++        # the env switch engages the INT8 kernel on every strided processor; an INT8 checkpoint races it on its DiT
++        # blocks later (install_checkpoint_attention)
++        if int8_attention.mode() == "force" and int8_attention.install_int8_attention(
++            transformer, device = dev, dtype = dtype, force = True, logger = logger
++        ):
++            levers.append("h3_int8_attention")
+     if not compile_enabled():
+         from .video_minimax_h3_rowmod import install as install_row_mod
+         if install_row_mod(transformer, logger = logger):
+diff --git a/studio/backend/core/inference/video.py b/studio/backend/core/inference/video.py
+index 38e9ce7fd8..4994802606 100644
+--- a/studio/backend/core/inference/video.py
++++ b/studio/backend/core/inference/video.py
+@@ -12739,6 +12739,20 @@ class VideoBackend:
+                         getattr(pipe, denoiser_component, None), logger = logger
+                     ):
+                         h3_attn_levers += ("h3_strided_attn",)
++                        from . import diffusion_int8_attention as int8_attention
++
++                        # by name or by its env switch: the strided processors run Studio's INT8 attention kernel
++                        if (
++                            int8_attention.requested(attention_backend)
++                            or int8_attention.mode() == "force"
++                        ) and int8_attention.install_int8_attention(
++                            getattr(pipe, denoiser_component, None),
++                            device = device,
++                            dtype = dtype,
++                            force = True,
++                            logger = logger,
++                        ):
++                            h3_attn_levers += ("h3_int8_attention",)
+                 except Exception as exc:  # noqa: BLE001 -- stock processor stays
+                     logger.warning("video.h3_attn: strided attention skipped: %s", exc)
+             # FlashInfer SM120 H3 block kernels (opt-in, UNSLOTH_H3_FLASHINFER=1): resident fp8 / nvfp4 blocks, before
+diff --git a/studio/backend/core/inference/video_minimax_h3_attn.py b/studio/backend/core/inference/video_minimax_h3_attn.py
+index d6d62ac80e..ba83ab9398 100644
+--- a/studio/backend/core/inference/video_minimax_h3_attn.py
++++ b/studio/backend/core/inference/video_minimax_h3_attn.py
+@@ -86,7 +86,9 @@ def h3_attention_backend(
+         return selected
+     try:
+         from .diffusion_attention import ATTN_AUTO, normalize_attention_backend
+-        if normalize_attention_backend(requested) != ATTN_AUTO:
++
++        # unsloth_int8 is an overlay on the automatic native pick
++        if normalize_attention_backend(requested) not in (ATTN_AUTO, "unsloth_int8"):
+             return selected
+     except Exception:  # noqa: BLE001 -- unparseable request: leave it alone
+         return selected
+@@ -156,6 +158,10 @@ def _strided_processor_for(base: Any) -> Any:
+         _unsloth_shared_qkv = False
+         # set from UNSLOTH_H3_STRIDED_SAGE at install: a sage backend runs here, not in the stock processor
+         _unsloth_sage = False
++        # set by diffusion_int8_attention.install_int8_attention: unmasked calls of at least this many tokens run the
++        # INT8 kernel instead of the native one
++        _unsloth_int8 = False
++        _unsloth_int8_min_tokens = 0
+ 
+         def __call__(
+             self,
+@@ -213,7 +219,15 @@ def _strided_processor_for(base: Any) -> Any:
+                     query = _apply_rotary_emb(query, *rotary_emb)
+                     key = _apply_rotary_emb(key, *rotary_emb)
+ 
+-            if sage:
++            if (
++                kernel is not None
++                and self._unsloth_int8
++                and query.shape[1] >= self._unsloth_int8_min_tokens
++            ):
++                # NHD in and out; the op itself runs native attention for a call the kernel cannot take
++                hidden_states = torch.ops.unsloth_studio.int8_attention_nhd(query, key, value)
++                hidden_states = hidden_states.flatten(2, 3).type_as(query)
++            elif sage:
+                 # NHD in and out, through the same guarded dispatch the stock processor uses (calls Sage cannot
+                 # take still run native there)
+                 hidden_states = dispatch(
+diff --git a/studio/backend/models/inference.py b/studio/backend/models/inference.py
+index 3ec62a4f42..e8b817420e 100644
+--- a/studio/backend/models/inference.py
++++ b/studio/backend/models/inference.py
+@@ -4956,6 +4956,7 @@ class DiffusionLoadRequest(BaseModel):
+             "sage",
+             "xformers",
+             "aiter",
++            "unsloth_int8",
+         ]
+     ] = Field(
+         None,
+@@ -4964,7 +4965,8 @@ class DiffusionLoadRequest(BaseModel):
+         "near-lossless, when a speed profile is active; native SDPA elsewhere and when "
+         "speed=off). native (alias sdpa) forces default SDPA; cudnn/flash/flash3/flash4 are exact "
+         "(kernel/arch-gated); sage is INT8 attention (a small quality cost, consumer "
+-        "friendly); xformers/aiter are memory-efficient (NVIDIA) / AMD ROCm. An "
++        "friendly); unsloth_int8 is Studio's own INT8 attention kernel on the families with "
++        "strided attention processors; xformers/aiter are memory-efficient (NVIDIA) / AMD ROCm. An "
+         "unavailable kernel falls back to the default.",
+     )
+     transformer_cache: Optional[Literal["off", "fbcache", "static"]] = Field(
+@@ -7479,6 +7481,7 @@ class VideoLoadRequest(BaseModel):
+             "sage",
+             "xformers",
+             "aiter",
++            "unsloth_int8",
+         ]
+     ] = Field(
+         None,
+@@ -7486,7 +7489,8 @@ class VideoLoadRequest(BaseModel):
+         "exact backend for the device (cuDNN fused attention on NVIDIA when a speed profile "
+         "is active; native SDPA elsewhere and when speed=off). native (alias sdpa) forces "
+         "default SDPA; cudnn/flash/flash3/flash4 are exact (kernel/arch-gated); sage is INT8 "
+-        "attention; xformers/aiter are memory-efficient (NVIDIA) / AMD ROCm. An unavailable "
++        "attention; unsloth_int8 is Studio's own INT8 attention kernel on the families with strided "
++        "attention processors; xformers/aiter are memory-efficient (NVIDIA) / AMD ROCm. An unavailable "
+         "kernel falls back to the default.",
+     )
+     transformer_cache: Optional[Literal["off", "fbcache", "static"]] = Field(
+diff --git a/studio/backend/tests/test_diffusion_attention_rocm_flash.py b/studio/backend/tests/test_diffusion_attention_rocm_flash.py
+index d26e235cd5..303df19222 100644
+--- a/studio/backend/tests/test_diffusion_attention_rocm_flash.py
++++ b/studio/backend/tests/test_diffusion_attention_rocm_flash.py
+@@ -151,6 +151,8 @@ _NVIDIA_EXPECTED = {
+     "sage": ("sage", "sage"),
+     "xformers": ("xformers", "xformers"),
+     "aiter": (None, None),
++    # the automatic native pick whatever the speed setting; the INT8 kernel is an overlay on it
++    "unsloth_int8": ("_native_cudnn", "_native_cudnn"),
+ }
+ 
+ 
+diff --git a/studio/backend/tests/test_diffusion_int8_attention.py b/studio/backend/tests/test_diffusion_int8_attention.py
+new file mode 100644
+index 0000000000..f26b9c4113
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_int8_attention.py
+@@ -0,0 +1,938 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Studio's INT8 attention kernel (``unsloth_int8``): switches, per-card configs, the processor route and its
++fallbacks on CPU; the kernel against a plain-torch model of itself, spills, CUDA graphs and torch.compile on CUDA."""
++
++from __future__ import annotations
++
++import copy
++import math
++import types
++
++import pytest
++import torch
++import torch._dynamo
++import torch.nn.functional as F
++
++from core.inference import diffusion_int8_attention as I
++from core.inference import diffusion_int8_attention_cuda as K
++
++# dynamic shared memory one block may ask for, and registers per SM, per capability
++SHARED_LIMIT = {(8, 0): 163 * 1024, (8, 6): 99 * 1024, (8, 9): 99 * 1024, (12, 0): 99 * 1024}
++SM_REGISTERS = 65536
++
++
++def _cuda_config(head_dim: int = 128):
++    if not torch.cuda.is_available():
++        return None
++    return I.kernel_config(torch.cuda.get_device_capability(), head_dim)
++
++
++needs_kernel = pytest.mark.skipif(
++    _cuda_config() is None, reason = "needs a CUDA card with an INT8 kernel config"
++)
++
++
++@pytest.fixture(autouse = True)
++def _clean(monkeypatch):
++    monkeypatch.delenv(I.INT8_ATTENTION_ENV, raising = False)
++    stats = dict(I.STATS)
++    yield
++    I.STATS.update(stats)
++
++
++# ---------------------------------------------------------------- a plain-torch model of the quantisers and kernel
++
++
++def rotate_ref(x):
++    """The quantisers' rotation on the last dim: fixed signs, then a 16-point Hadamard transform per 16 channels."""
++    D = x.shape[-1]
++    cols = torch.arange(D, device = x.device)
++    flip = (((cols * 7919 + 13) * (cols + 3)) >> 7) & 1
++    x = x * (1.0 - 2.0 * flip.to(x.dtype))
++    for _ in range(4):
++        y = x.reshape(*x.shape[:-1], D // 2, 2)
++        z = torch.stack((y[..., 0] + y[..., 1], y[..., 0] - y[..., 1]), dim = -1)
++        x = z.reshape(*x.shape[:-1], D // 16, 8, 2).transpose(-1, -2).reshape(*x.shape[:-1], D)
++    return x
++
++
++def key_of_position(n: int, device = None):
++    """Key stored at each position of the V tiles (n a multiple of 16)."""
++    pos = torch.arange(n, device = device)
++    return (pos & -16) + 8 * ((pos & 3) >> 1) + 2 * ((pos >> 2) & 3) + (pos & 1)
++
++
++def reference_quantise(
++    q,
++    k,
++    v,
++    config,
++    kc = None,
++    vc = None,
++    vg = None,
++):
++    """The quantisers' math in fp64. The per-channel K mean and V centre / gain are taken over every STATS_STEP-th
++    key, or passed in (what the kernels computed) to compare the rounding alone."""
++    B, Sq, H, D = q.shape
++    Sk = k.shape[1]
++    bn = config["bn"]
++    BH = B * H
++    mul = 1.0 / math.sqrt(D) * I.LOG2E / 16.0
++
++    def heads_first(t):
++        return t.permute(0, 2, 1, 3).reshape(BH, t.shape[1], D).double()
++
++    kh, vh = heads_first(k), heads_first(v)
++    if kc is None:
++        kc = kh[:, :: I.STATS_STEP].mean(1)
++        lo, hi = vh[:, :: I.STATS_STEP].amin(1), vh[:, :: I.STATS_STEP].amax(1)
++        vc, vg = 0.5 * (hi + lo), (0.5 * (hi - lo)).clamp_min(1e-12)
++    kc, vc, vg = kc.double(), vc.double(), vg.double()
++    qr = rotate_ref(heads_first(q))
++    qa = qr.abs().amax(-1).clamp_min(1e-20)
++    n_kpad = (Sk + bn - 1) // bn * bn
++    kr = F.pad(rotate_ref(kh - kc[:, None, :]), (0, 0, 0, n_kpad - Sk))
++    ka = kr.abs().amax(-1).view(BH, n_kpad // bn, bn // 8, 4, 2).amax((2, 4)).clamp_min(1e-20)
++    per_key = ka[:, :, None, :, None].expand(-1, -1, bn // 8, -1, 2).reshape(BH, n_kpad)
++    vr = F.pad((vh - vc[:, None, :]) / vg[:, None, :], (0, 0, 0, n_kpad - Sk)).view(
++        BH, n_kpad // bn, bn, D
++    )
++    va = vr.abs().amax((2, 3)).clamp_min(1e-20)
++    vt = torch.round(vr * (127.0 / va[:, :, None, None]))[
++        :, :, key_of_position(bn, q.device)
++    ].transpose(2, 3)
++    return {
++        "qi": torch.round(qr * (127.0 / qa[..., None])),
++        "qs": (qa / 127.0 * mul).float(),
++        "ki": torch.round(kr * (127.0 / per_key[..., None])),
++        "ks": (ka / 127.0).float(),
++        "kc": kc.float(),
++        "vt": vt,
++        "vs": (va / 127.0).float(),
++        "vc": vc.float(),
++        "vg": vg.float(),
++        "shape": (B, Sq, Sk, H, D),
++        "dtype": v.dtype,
++        "config": config,
++    }
++
++
++def emulate(p):
++    """What the CUDA kernel computes from ``quantise``'s output, in plain torch."""
++    config = p["config"]
++    B, Sq, Sk, H, D = p["shape"]
++    bn = config["bn"]
++    BH = B * H
++    n_kpad = p["ki"].shape[1]
++    tiles = n_kpad // bn
++    dev = p["qi"].device
++    scores = p["qi"][:, :Sq].double() @ p["ki"].double().transpose(1, 2)  # exact integers
++    keys = torch.arange(n_kpad, device = dev)
++    k_scale = p["ks"].reshape(BH, tiles * 4)[:, (keys // bn) * 4 + ((keys % 8) >> 1)]
++    s = (scores.float() * (p["qs"][:, :Sq, None] * k_scale[:, None, :]).float()).view(
++        BH, Sq, tiles, bn
++    )
++    s = torch.where((keys < Sk).view(1, 1, tiles, bn), s, torch.full_like(s, -1e30))
++    tile_max = s.amax(dim = -1, keepdim = True)
++    probs = torch.round(torch.exp2(s - tile_max + 7.99435343685886)).double()
++    inverse = torch.empty(bn, dtype = torch.long, device = dev)
++    inverse[key_of_position(bn, dev)] = torch.arange(bn, device = dev)
++    v_int = p["vt"][:, :, :, inverse].double().transpose(2, 3)  # [BH, tiles, bn, D] by key
++    weight = torch.exp2(
++        (tile_max - tile_max[:, :, :1]).double()
++    )  # relative to the first tile's maximum
++    denom = (probs.sum(-1, keepdim = True) * weight).sum(2)
++    pv = torch.einsum("bqtn,btnd->bqtd", probs, v_int)
++    num = (pv * weight * p["vs"].double()[:, None, :, None]).sum(2)
++    out = num / denom * p["vg"].double()[:, None, :] + p["vc"].double()[:, None, :]
++    return out.view(B, H, Sq, D).permute(0, 2, 1, 3).float()
++
++
++# ---------------------------------------------------------------- switches, configs, aliases (CPU)
++
++
++@pytest.mark.parametrize(
++    "raw,expected",
++    [
++        (None, "auto"),
++        ("", "auto"),
++        ("auto", "auto"),
++        ("0", "off"),
++        ("off", "off"),
++        ("1", "force"),
++        ("force", "force"),
++    ],
++)
++def test_env_switch(monkeypatch, raw, expected):
++    if raw is None:
++        monkeypatch.delenv(I.INT8_ATTENTION_ENV, raising = False)
++    else:
++        monkeypatch.setenv(I.INT8_ATTENTION_ENV, raw)
++    assert I.mode() == expected
++
++
++def test_request_by_name():
++    assert I.requested("unsloth_int8") and I.requested(" Unsloth_INT8 ")
++    assert not I.requested("sage") and not I.requested(None)
++
++
++def test_alias_is_a_native_pick_with_the_overlay(monkeypatch):
++    from core.inference import diffusion_attention as DA
++
++    assert DA.normalize_attention_backend("unsloth_int8") == "unsloth_int8"
++    monkeypatch.setattr(DA, "_is_cuda_nvidia", lambda target: True)
++    monkeypatch.setattr(DA, "_cudnn_attention_supported", lambda: True)
++    target = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16)
++    # the same native pick an active speed profile makes, whatever the speed setting
++    assert (
++        DA.select_attention_backend(target, "unsloth_int8", speed_active = False) == "_native_cudnn"
++    )
++    monkeypatch.setattr(DA, "_is_cuda_nvidia", lambda target: False)
++    monkeypatch.setattr(DA, "_rocm_auto_flash", lambda target, family = None: False)
++    assert DA.select_attention_backend(target, "unsloth_int8", speed_active = False) is None
++
++
++def test_every_config_fits_its_card():
++    assert set(I.KERNEL_CONFIGS) == set(SHARED_LIMIT)
++    for capability, table in I.KERNEL_CONFIGS.items():
++        assert set(table) == set(I.HEAD_DIMS)
++        for head_dim, config in table.items():
++            assert config["bn"] in (64, 128) and config["nq"] >= 1 and config["stages"] in (1, 2)
++            assert I.shared_bytes(head_dim, config) <= SHARED_LIMIT[capability]
++            cap = config.get("max_registers")
++            if cap is not None:
++                # a capped config is there to fit this many blocks: the cap must allow at least one
++                assert 32 * config["wpc"] * cap <= SM_REGISTERS
++            assert I.kernel_config(capability, head_dim) == config
++    assert I.kernel_config((9, 0), 128) is None and I.kernel_config((12, 0), 96) is None
++    assert I.kernel_config(None, 128) is None
++
++
++def test_register_cap_goes_on_the_entry_function():
++    ptx = b".version 8.5\n.visible .entry unsloth_i8attn(\n\t.param .u64 a\n)\n{\n\tret;\n}\n\x00"
++    capped = K.cap_registers(ptx, 168).decode()
++    assert (
++        ")\n.maxnreg 168\n{" in capped and capped.endswith("\x00") and capped.count(".maxnreg") == 1
++    )
++
++
++def _nvrtc_ok() -> bool:
++    try:
++        K.nvrtc()
++        return True
++    except Exception:  # noqa: BLE001
++        return False
++
++
++@pytest.mark.skipif(not _nvrtc_ok(), reason = "NVRTC ships with the CUDA builds of torch")
++def test_kernel_compiles_for_every_config():
++    for capability, table in I.KERNEL_CONFIGS.items():
++        for head_dim, config in table.items():
++            ptx = K.compile_ptx(
++                K.KERNEL_SOURCE,
++                f"sm_{capability[0]}{capability[1]}",
++                I.kernel_defines(head_dim, config),
++            ).decode(errors = "replace")
++            # Q.K^T: (head_dim / 32) k steps per 8-key block; P.V: (bn / 32) k steps per 8-channel block
++            products = config["nq"] * (
++                (head_dim // 32) * (config["bn"] // 8) + (config["bn"] // 32) * (head_dim // 8)
++            )
++            assert ptx.count("mma.sync.aligned.m16n8k32") == products
++            # the accumulators are read as floats through their bit pattern: no signed int -> float conversion
++            assert "cvt.rn.f32.s32" not in ptx
++
++
++def test_op_off_cuda_is_native_attention():
++    g = torch.Generator().manual_seed(0)
++    q, k, v = (torch.randn(1, 40, 2, 64, generator = g) for _ in range(3))
++    assert I.unsupported_reason(q, k, v) == "not on one CUDA device"
++    with pytest.raises(ValueError):
++        I.int8_attention(q, k, v)
++    before = dict(I.STATS)
++    I.int8_attention_op()
++    got = torch.ops.unsloth_studio.int8_attention_nhd(q, k, v)
++    assert torch.equal(got, I.native_attention(q, k, v))
++    assert I.STATS["native"] == before["native"] + 1 and I.STATS["int8"] == before["int8"]
++
++
++class _Processor:
++    _unsloth_int8 = False
++    _unsloth_int8_min_tokens = 0
++    _parallel_config = None
++    _attention_backend = "_native_cudnn"
++
++
++class _Attention(torch.nn.Module):
++    def __init__(self, heads: int, head_dim: int):
++        super().__init__()
++        self.heads = heads
++        self.to_out = torch.nn.ModuleList([torch.nn.Linear(heads * head_dim, heads * head_dim)])
++        self.processor = _Processor()
++
++
++def _fake_dit(head_dims = (128, 128, 64, 96)):
++    dit = torch.nn.Module()
++    dit.blocks = torch.nn.ModuleList([_Attention(2, d) for d in head_dims])
++    return dit
++
++
++def _fake_cuda(
++    monkeypatch,
++    capability = (8, 9),
++    found = None,
++):
++    from core.inference import rocm_bf16
++
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
++    monkeypatch.setattr(rocm_bf16, "is_rocm_torch", lambda *a, **k: False)
++    monkeypatch.setattr(I, "int8_attention_op", lambda: None)
++    seen = []
++
++    def verdict(
++        device,
++        dtype,
++        heads,
++        head_dim,
++        incumbent = None,
++        incumbent_name = "native",
++        timed = True,
++    ):
++        seen.append((heads, head_dim, incumbent_name, timed))
++        return found(head_dim) if callable(found) else found
++
++    monkeypatch.setattr(I, "verdict", verdict)
++    return seen
++
++
++def test_the_card_check_also_probes_sharp_attention(monkeypatch):
++    """The on-card check runs the probe a second time with q and k scaled up (the scores of late DiT blocks) and
++    refuses a kernel whose output there is not finite or not close to fp32 attention."""
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    sharp_q = 1.6 * I.SHARP_GAIN / 2
++
++    def kernel(broken):
++        def run(
++            q,
++            k,
++            v,
++            scale = None,
++            config = None,
++        ):
++            out = I.reference_attention(q, k, v).to(v.dtype)
++            if q.float().std() > sharp_q:
++                if broken == "nan":
++                    out[0, 3, 0, 0] = float("nan")
++                elif broken == "far":
++                    out = out.flip(1)
++            return out
++
++        return run
++
++    for broken, ok in ((None, True), ("nan", False), ("far", False)):
++        monkeypatch.setattr(I, "int8_attention", kernel(broken))
++        monkeypatch.setattr(I, "_VERIFIED", set())
++        found = I._check("cpu", torch.float32, 4, 64, None, timed = False)
++        assert found["ok"] is ok and found["cos"] >= I.MIN_COSINE
++        assert (found["sharp_cos"] >= I.MIN_SHARP_COSINE) is ok
++        assert bool(I._VERIFIED) is ok
++
++
++def test_no_probability_is_packed_unclamped():
++    """Every probability goes through the clamp to 255 before it is rounded and packed into a byte."""
++    source = K.KERNEL_SOURCE
++    assert "fminf(ex2(x), 255.0f)" in source
++    assert (
++        source.count("prob(fmaf(") == 8
++        and "pack4(ex2(" not in source
++        and " ex2(fmaf(" not in source
++    )
++
++
++def test_install_off_cuda_and_kill_switch(monkeypatch):
++    dit = _fake_dit()
++    assert I.install_int8_attention(dit, device = "cpu", dtype = torch.bfloat16) == 0
++    _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": 0})
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "0")
++    assert I.install_int8_attention(dit, device = "cuda", dtype = torch.bfloat16, force = True) == 0
++    assert I.int8_attention_count(dit) == 0
++
++
++def test_install_follows_the_race(monkeypatch):
++    # head dim 128 wins from 2560 tokens, head dim 64 loses the race, head dim 96 has no kernel
++    seen = _fake_cuda(
++        monkeypatch,
++        found = lambda head_dim: {"ok": True, "min_tokens": 2560 if head_dim == 128 else None},
++    )
++    dit = _fake_dit()
++    assert I.install_int8_attention(dit, device = "cuda", dtype = torch.bfloat16) == 2
++    flags = [(m.processor._unsloth_int8, m.processor._unsloth_int8_min_tokens) for m in dit.blocks]
++    assert flags == [(True, 2560), (True, 2560), (False, 0), (False, 0)]
++    assert {s[1] for s in seen} == {128, 64} and all(s[2] == "_native_cudnn" and s[3] for s in seen)
++    assert I.int8_attention_count(dit) == 2 and I.status(dit)["modules"] == 2
++    assert I.remove_int8_attention(dit) == 2 and I.int8_attention_count(dit) == 0
++
++
++def test_install_needs_the_accuracy_check_even_when_forced(monkeypatch):
++    _fake_cuda(monkeypatch, found = lambda head_dim: {"ok": head_dim == 64, "min_tokens": None})
++    dit = _fake_dit()
++    assert I.install_int8_attention(dit, device = "cuda", dtype = torch.bfloat16, force = True) == 1
++    assert [m.processor._unsloth_int8 for m in dit.blocks] == [False, False, True, False]
++    # the env switch forces the same way
++    dit = _fake_dit()
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "1")
++    assert I.install_int8_attention(dit, device = "cuda", dtype = torch.bfloat16) == 1
++
++
++def test_install_scope_incumbent_and_refusals(monkeypatch):
++    seen = _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": 0})
++    dit = _fake_dit()
++    dit.blocks[1].processor._parallel_config = object()
++    sage = ("sage_hub", lambda q, k, v: q)
++    n = I.install_int8_attention(
++        dit,
++        device = "cuda",
++        dtype = torch.bfloat16,
++        modules = [dit.blocks[0], dit.blocks[1]],
++        incumbent = sage,
++    )
++    assert n == 1 and [m.processor._unsloth_int8 for m in dit.blocks] == [True, False, False, False]
++    assert seen == [(2, 128, "sage_hub", True)]
++    # a card without a config, a dtype the kernel does not write
++    _fake_cuda(monkeypatch, capability = (9, 0), found = {"ok": True, "min_tokens": 0})
++    assert I.install_int8_attention(_fake_dit(), device = "cuda", dtype = torch.bfloat16) == 0
++    _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": 0})
++    assert I.install_int8_attention(_fake_dit(), device = "cuda", dtype = torch.float64) == 0
++
++
++def test_request_hook_needs_the_name_or_the_switch(monkeypatch):
++    _fake_cuda(monkeypatch, found = {"ok": True, "min_tokens": 0})
++    target = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16)
++    pipe = types.SimpleNamespace(transformer = _fake_dit())
++    assert I.install_requested(pipe, None, target) == 0
++    assert I.install_requested(pipe, "sage", target) == 0
++    assert I.install_requested(pipe, "unsloth_int8", types.SimpleNamespace(device = "cpu")) == 0
++    assert I.install_requested(pipe, "unsloth_int8", target) == 3
++    pipe = types.SimpleNamespace(transformer = _fake_dit())
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "1")
++    assert I.install_requested(pipe, None, target) == 3
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "0")
++    assert (
++        I.install_requested(types.SimpleNamespace(transformer = _fake_dit()), "unsloth_int8", target)
++        == 0
++    )
++
++
++@pytest.mark.parametrize(
++    "shape,bn", [((1, 300, 2, 64), 64), ((1, 200, 2, 128), 64), ((1, 260, 1, 128), 128)]
++)
++def test_the_method_stays_close_to_fp32_attention(shape, bn):
++    # no GPU involved: the quantisers' and the kernel's math in plain torch against fp32 attention
++    q, k, v = I.probe_inputs("cpu", torch.float32, *shape[1:])
++    p = reference_quantise(q, k, v, {"bn": bn, "wpc": 1, "nq": 1, "stages": 1})
++    for name in ("qi", "ki", "vt"):
++        assert p[name].abs().max() <= 127 and torch.equal(p[name], p[name].round())
++    # the rotation is orthogonal up to its factor 4, so Q.K^T is unchanged
++    eye = torch.eye(shape[-1], dtype = torch.float64)
++    rot = rotate_ref(eye)
++    assert torch.equal(rot @ rot.T, 16.0 * eye)
++    acc = I.accuracy(emulate(p), I.reference_attention(q, k, v))
++    assert acc["cos"] > 0.9995 and acc["rel_l1"] < 0.03, acc
++
++
++# ---------------------------------------------------------------- the H3 strided processor route (tiny real model)
++
++
++def _h3():
++    h3 = pytest.importorskip("diffusers.models.transformers.transformer_minimax_h3")
++    from core.inference import video_minimax_h3_attn as A
++    return h3, A
++
++
++def _tiny_h3(h3, head_dim: int = 32):
++    torch.manual_seed(0)
++    return h3.MiniMaxH3Transformer3DModel(
++        num_attention_heads = 2,
++        attention_head_dim = head_dim,
++        hidden_size = 2 * head_dim,
++        num_layers = 2,
++        num_refiner_layers = 1,
++        ffn_dim = 128,
++        in_channels = 4,
++        audio_in_channels = 4,
++        patch_size = (1, 2, 2),
++        text_dim = 32,
++        freq_dim = 32,
++        time_embed_hidden_dim = 64,
++        time_embed_dim = 32,
++        rope_freq_dim = 4,
++    ).eval()
++
++
++def _h3_inputs(
++    n_text: int = 5,
++    n_video: int = 8,
++    n_audio: int = 3,
++) -> dict:
++    g = torch.Generator().manual_seed(1)
++    seq = n_text + n_video + n_audio
++    tags = torch.zeros(seq, dtype = torch.long)
++    tags[:n_text] = 1
++    tags[n_text + n_video :] = 2
++    return dict(
++        hidden_states = torch.randn(1, n_video, 16, generator = g),
++        audio_hidden_states = torch.randn(1, n_audio, 4, generator = g),
++        encoder_hidden_states = torch.randn(1, n_text, 32, generator = g),
++        timestep = torch.tensor([0.7, 0.2]),
++        timestep_indices = torch.randint(0, 2, (seq,), generator = g),
++        token_tags = tags,
++        position_ids = torch.randint(0, 6, (seq, 3), generator = g),
++        video_indices = torch.arange(n_text, n_text + n_video),
++        audio_indices = torch.arange(n_text + n_video, seq),
++        text_indices = torch.arange(0, n_text),
++        return_dict = False,
++    )
++
++
++@pytest.fixture
++def _active_backend():
++    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
++
++    active = _AttentionBackendRegistry._active_backend
++    yield
++    _AttentionBackendRegistry.set_active_backend(active)
++
++
++def test_strided_processor_routes_flagged_calls_to_the_op(monkeypatch, _active_backend):
++    h3, A = _h3()
++    model = _tiny_h3(h3)
++    model.set_attention_backend("_native_math")
++    stock = copy.deepcopy(model)
++    assert A.install_strided_attention(model) == 3
++    calls = []
++    monkeypatch.setattr(
++        I,
++        "int8_attention_impl",
++        lambda q, k, v: (calls.append(tuple(q.shape)), I.native_attention(q, k, v))[1],
++    )
++    I.int8_attention_op()
++    with torch.no_grad():
++        want = stock(**_h3_inputs())
++        assert all(torch.equal(a, b) for a, b in zip(want, model(**_h3_inputs()))) and not calls
++        procs = [m.processor for m in I.int8_processors(model)]
++        assert len(procs) == 3
++        for proc in procs:
++            proc._unsloth_int8 = True
++        got = model(**_h3_inputs())
++        # every unmasked call of a flagged processor went through the op, NHD in and out
++        assert calls and all(
++            len(shape) == 4 and shape[2] == 2 and shape[3] == 32 for shape in calls
++        )
++        assert all(torch.allclose(a, b, atol = 1e-5, rtol = 1e-5) for a, b in zip(want, got))
++        # below the raced sequence length the native kernel stays
++        calls.clear()
++        for proc in procs:
++            proc._unsloth_int8_min_tokens = 10**6
++        assert all(torch.equal(a, b) for a, b in zip(want, model(**_h3_inputs()))) and not calls
++        # a processor whose backend is not a native kernel never takes the route
++        for proc in procs:
++            proc._unsloth_int8_min_tokens = 0
++            proc._attention_backend = None
++        model(**_h3_inputs())
++        assert not calls
++
++
++def test_strided_processor_with_the_op_adds_no_graph_break(_active_backend):
++    h3, A = _h3()
++
++    def breaks(model) -> int:
++        torch._dynamo.reset()
++        with torch.no_grad():
++            explained = torch._dynamo.explain(model)(**_h3_inputs())
++        torch._dynamo.reset()
++        return explained.graph_break_count
++
++    model = _tiny_h3(h3)
++    model.set_attention_backend("_native_math")
++    assert A.install_strided_attention(model) == 3
++    base = breaks(model)
++    I.int8_attention_op()
++    for m in I.int8_processors(model):
++        m.processor._unsloth_int8 = True
++    assert breaks(model) == base
++
++
++def _h3_image():
++    try:
++        from core.inference import diffusion_minimax_h3_image as H
++    except Exception as exc:  # noqa: BLE001 - the module needs diffusers' pipelines
++        pytest.skip(f"the H3-Image module does not import here: {exc!r}"[:200])
++    return H
++
++
++def test_checkpoint_race_times_the_kernel_on_a_block(monkeypatch, _active_backend):
++    import logging
++    import sys
++
++    h3, A = _h3()
++    H = _h3_image()
++    model = _tiny_h3(h3)
++    model.set_attention_backend("_native_math")
++    assert A.install_strided_attention(model) == 3
++    mods = I.int8_processors(model)
++    blocks = mods[:2]
++    saved = {m: m.processor._attention_backend for m in mods}
++    installs: list = []
++
++    def fake_install(transformer, **kw):
++        installs.append(kw)
++        if kw.get("force"):
++            for m in kw["modules"]:
++                m.processor._unsloth_int8 = True
++        return len(kw["modules"])
++
++    race: dict = {}
++    monkeypatch.setattr(I, "install_int8_attention", fake_install)
++    monkeypatch.setattr(
++        H,
++        "race_checkpoint_attention",
++        lambda *a, kernel = False: race.get("found") if kernel else 1 / 0,
++    )
++    log = logging.getLogger(__name__)
++
++    def run(
++        sage = False,
++        forced = False,
++        mods = blocks,
++    ):
++        installs.clear()
++        for m in blocks:
++            m.processor._unsloth_int8 = False
++            m.processor._unsloth_int8_min_tokens = 0
++        return H._race_int8_kernel(model, mods, saved, "cuda", torch.bfloat16, sage, forced, log)
++
++    def routed():
++        return [(m.processor._unsloth_int8, m.processor._unsloth_int8_min_tokens) for m in blocks]
++
++    # [native, engaged, kernel] ms per image row count. Faster than native on both canvases: every length
++    race["found"] = {
++        "native": "_native_math",
++        "kernel": {4096: [10.0, 10.0, 9.0], 1024: [3.0, 3.0, 2.5]},
++    }
++    assert run() == 2 and routed() == [(True, 0)] * 2
++    assert len(installs) == 1 and installs[0]["force"] and installs[0]["modules"] == blocks
++    record = getattr(model, H.ATTENTION_RACE_ATTR)
++    assert record["timed"] == "block" and record["blocks"] == 2 and record["min_tokens"] == 0
++    assert record["ms"]["4096"] == [10.0, 10.0, 9.0] and record["seconds"] >= 0
++    # only the large canvas: short sequences keep the native backend
++    race["found"]["kernel"][1024] = [3.0, 3.0, 2.99]
++    assert run() == 2 and routed() == [(True, H._KERNEL_LARGE_ROWS)] * 2
++    # inside the 2% margin: the incumbent stays
++    race["found"]["kernel"][4096] = [10.0, 10.0, 9.9]
++    assert run() == 0 and routed() == [(False, 0)] * 2
++    # SageAttention kept by its own race is the one to beat
++    race["found"]["kernel"] = {4096: [10.0, 8.0, 9.0], 1024: [3.0, 2.0, 2.5]}
++    assert run(sage = True) == 0 and routed() == [(False, 0)] * 2
++    assert run(sage = False) == 2
++    race["found"]["kernel"] = {4096: [10.0, 8.0, 7.0], 1024: [3.0, 2.0, 2.5]}
++    assert run(sage = True) == 2 and routed() == [(True, H._KERNEL_LARGE_ROWS)] * 2
++    # no block on the card: the attention-only race decides, against the call the blocks make
++    race["found"] = None
++    assert run() == 2 and len(installs) == 2
++    assert installs[1]["incumbent"][0] == "native" and "force" not in installs[1]
++    assert getattr(model, H.ATTENTION_RACE_ATTR)["timed"] == "attention"
++    calls = []
++    base_module = sys.modules[A.h3_processor_base(mods[0]).__module__]
++    monkeypatch.setattr(
++        base_module,
++        "dispatch_attention_fn",
++        lambda q, k, v, **kw: (calls.append(kw), q)[1],
++        raising = False,
++    )
++    mods[0].processor._attention_backend = "sage"
++    assert run(sage = True) == 2
++    name, fn = installs[1]["incumbent"]
++    assert name == "sage" and fn(1, 2, 3) == 1
++    assert calls[0]["backend"] == "sage" and calls[0]["attn_mask"] is None
++    mods[0].processor._attention_backend = saved[mods[0]]
++    # a broken race leaves the blocks as they were
++    race["found"] = {"native": "_native_math", "kernel": {4096: [1.0]}}
++    assert run() == 0 and routed() == [(False, 0)] * 2
++    assert "error" in getattr(model, H.ATTENTION_RACE_ATTR)
++    # SageAttention pinned by its switch, nothing to race, the kill switch
++    assert run(forced = True) == 0 and not installs
++    assert run(mods = []) == 0 and not installs
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "0")
++    assert run() == 0 and not installs
++    # the kernel's own switch forces it past the race, SageAttention pinned or not
++    monkeypatch.setenv(I.INT8_ATTENTION_ENV, "1")
++    assert run(forced = True) == 2 and len(installs) == 1 and routed() == [(True, 0)] * 2
++
++
++# ---------------------------------------------------------------- the kernel itself (CUDA)
++
++
++def _case(
++    shape,
++    dtype,
++    seed = 0,
++    strided = False,
++):
++    B, S, H, D = shape
++    g = torch.Generator(device = "cuda").manual_seed(seed)
++    q = torch.randn(B, S, H, D, generator = g, device = "cuda") * 1.5
++    k = torch.randn(B, S, H, D, generator = g, device = "cuda") * 1.5 + 0.7
++    v = (
++        torch.randn(B, S, H, D, generator = g, device = "cuda")
++        * (torch.rand(1, 1, H, D, generator = g, device = "cuda") * 2)
++        + 0.5
++    )
++    q, k, v = (x.to(dtype) for x in (q, k, v))
++    if strided:
++        # the layout the strided processors pass: a [B, S, H * D] projection unflattened, here sliced out of QKV
++        qkv = torch.cat([x.flatten(2) for x in (q, k, v)], dim = -1)
++        q, k, v = (x.unflatten(-1, (H, D)) for x in qkv.chunk(3, dim = -1))
++    return q, k, v
++
++
++@needs_kernel
++@pytest.mark.parametrize(
++    "shape,dtype,config",
++    [
++        ((1, 64, 1, 128), torch.bfloat16, None),
++        ((1, 150, 2, 64), torch.bfloat16, None),
++        ((2, 333, 3, 128), torch.bfloat16, {"bn": 64, "wpc": 3, "nq": 1, "stages": 2}),
++        ((1, 700, 4, 128), torch.float16, {"bn": 128, "wpc": 2, "nq": 1, "stages": 1}),
++        ((1, 513, 2, 64), torch.float32, {"bn": 128, "wpc": 4, "nq": 1, "stages": 2}),
++        ((1, 1025, 4, 128), torch.bfloat16, None),
++        ((1, 777, 2, 64), torch.bfloat16, {"bn": 64, "wpc": 2, "nq": 2, "stages": 2}),
++        ((1, 1300, 3, 64), torch.float16, {"bn": 64, "wpc": 5, "nq": 2, "stages": 1}),
++        ((1, 2000, 2, 128), torch.bfloat16, None),
++    ],
++)
++@pytest.mark.parametrize("strided", [False, True])
++def test_kernel_matches_its_torch_model(shape, dtype, config, strided):
++    q, k, v = _case(shape, dtype, seed = shape[1], strided = strided)
++    config = config or _cuda_config(shape[-1])
++    p = I.quantise(q, k, v, config)
++    ref = reference_quantise(q, k, v, config, p["kc"], p["vc"], p["vg"])
++    for name in ("qi", "ki", "vt"):
++        got = p[name].double()[:, : shape[1]] if name == "qi" else p[name].double()
++        diff = (got - ref[name]).abs()
++        # the reference rounds in fp64, the quantiser in fp32: never more than one step, and rarely that
++        assert diff.max() <= 1 and (diff > 0).double().mean() < 2e-3, name
++    for name in ("qs", "ks", "vs"):
++        got = p[name].double()[:, : shape[1]] if name == "qs" else p[name].double()
++        assert (
++            (got - ref[name].double()).abs() / ref[name].double().abs().clamp_min(1e-30)
++        ).max() < 1e-5, name
++    # the sub-sampled statistics themselves
++    own = reference_quantise(q, k, v, config)
++    for name in ("kc", "vc", "vg"):
++        assert torch.allclose(p[name], own[name].to(p[name].device), rtol = 1e-4, atol = 1e-4), name
++    out = I.attend(p)
++    assert out.dtype == dtype and out.shape == q.shape and torch.isfinite(out.float()).all()
++    want = emulate(p)
++    rel = ((out.float() - want).abs().mean() / want.abs().mean()).item()
++    # the gap is the output dtype's rounding step plus fp32 accumulation order
++    assert rel < (2e-3 if dtype == torch.float32 else 4e-3), rel
++    assert torch.equal(I.int8_attention(q, k, v, config = config), out)
++
++
++@needs_kernel
++@pytest.mark.parametrize("head_dim", I.HEAD_DIMS)
++def test_shipped_config_is_spill_free_and_fits(head_dim):
++    capability = torch.cuda.get_device_capability()
++    config = _cuda_config(head_dim)
++    fn = I.kernel_function("cuda", head_dim, config)
++    assert fn.local_bytes == 0, "the kernel spilled registers to the stack"
++    cap = config.get("max_registers")
++    assert cap is None or fn.registers <= cap
++    # at least one block of this config is resident per SM (registers are granted in multiples of 8 per thread)
++    assert 32 * config["wpc"] * ((fn.registers + 7) // 8 * 8) <= SM_REGISTERS
++    assert I.shared_bytes(head_dim, config) <= SHARED_LIMIT[tuple(capability)]
++
++
++@needs_kernel
++@pytest.mark.parametrize("shape", [(1, 2048, 8, 128), (1, 2048, 8, 64)])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_accuracy_against_fp32_attention(shape, dtype):
++    q, k, v = I.probe_inputs("cuda", dtype, *shape[1:])
++    ref = I.reference_attention(q, k, v)
++    acc = I.accuracy(I.int8_attention(q, k, v), ref)
++    assert acc["cos"] > 0.9995 and acc["rel_l1"] < 0.03, acc
++    # a different softmax scale than 1 / sqrt(head dim)
++    got = I.int8_attention(q, k, v, scale = 0.05)
++    want = F.scaled_dot_product_attention(
++        *(x.float().permute(0, 2, 1, 3) for x in (q, k, v)), scale = 0.05
++    ).permute(0, 2, 1, 3)
++    assert I.accuracy(got, want)["cos"] > 0.9995
++
++
++@needs_kernel
++def test_peaked_and_flat_rows_stay_accurate():
++    # one key dominates half the rows by a wide margin (the online softmax rebases there); the other rows are flat
++    q, k, v = I.probe_inputs("cuda", torch.bfloat16, 1500, 4, 128)
++    q = q.clone()
++    q[:, ::2] = k[:, 700:701] * 6.0
++    q[:, 1::2] *= 0.02
++    acc = I.accuracy(I.int8_attention(q, k, v), I.reference_attention(q, k, v))
++    assert acc["cos"] > 0.999, acc
++
++
++@needs_kernel
++def test_op_runs_the_kernel_only_where_it_was_verified(monkeypatch):
++    q, k, v = I.probe_inputs("cuda", torch.bfloat16, 512, 2, 128)
++    I.int8_attention_op()
++    monkeypatch.setattr(I, "_VERIFIED", set())
++    monkeypatch.setattr(I, "_VERDICTS", {})
++    before = dict(I.STATS)
++    assert torch.equal(
++        torch.ops.unsloth_studio.int8_attention_nhd(q, k, v), I.native_attention(q, k, v)
++    )
++    assert I.STATS["native"] == before["native"] + 1
++    found = I.verdict("cuda", torch.bfloat16, 2, 128, timed = False)
++    assert found["ok"] and found["cos"] >= I.MIN_COSINE
++    got = torch.ops.unsloth_studio.int8_attention_nhd(q, k, v)
++    assert I.STATS["int8"] == before["int8"] + 1
++    assert I.accuracy(got, I.reference_attention(q, k, v))["cos"] > 0.999
++    # a failing launch falls back to native attention and stays there
++    monkeypatch.setattr(I, "_BROKEN", set())
++    monkeypatch.setattr(I, "attend", lambda p: (_ for _ in ()).throw(RuntimeError("launch failed")))
++    assert torch.equal(
++        torch.ops.unsloth_studio.int8_attention_nhd(q, k, v), I.native_attention(q, k, v)
++    )
++    assert I.unsupported_reason(q, k, v) == "kernel failed on this card"
++
++
++@needs_kernel
++@pytest.mark.parametrize("head_dim", I.HEAD_DIMS)
++@pytest.mark.parametrize("gain", [8.0, 16.0])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_large_scores_stay_finite_and_accurate(head_dim, gain, dtype):
++    """q and k as large as a late DiT block's: the score scale times 2^23 is past 2^16, where a tile's largest
++    probability used to round to 256 and wrap to 0 (rows of garbage and non-finite values)."""
++    g = torch.Generator().manual_seed(int(gain) + head_dim)
++    shape = (1, 1100, 8, head_dim)
++    q = (torch.randn(shape, generator = g) * gain).to("cuda", dtype)
++    k = (torch.randn(shape, generator = g) * gain).to("cuda", dtype)
++    v = torch.randn(shape, generator = g).to("cuda", dtype)
++    p = I.quantise(q, k, v, _cuda_config(head_dim))
++    assert float((12582912.0 * p["qs"][:, :1100] * p["ks"].amax((1, 2))[:, None]).max()) > 2**16
++    out = I.int8_attention(q, k, v)
++    assert bool(torch.isfinite(out).all())
++    assert I.accuracy(out, I.reference_attention(q, k, v))["cos"] >= 0.98
++
++
++@needs_kernel
++def test_timed_verdict_reports_both_sides():
++    found = I.verdict("cuda", torch.bfloat16, 8, 128)
++    assert found["ok"] and set(found["ms"]) == set(I.RACE_TOKENS)
++    for ms in found["ms"].values():
++        assert ms["int8"] > 0 and ms["incumbent"] > 0
++    assert found["min_tokens"] in (None, 0, sum(I.RACE_TOKENS) // 2)
++
++
++@needs_kernel
++def test_cuda_graph_replay_matches_eager():
++    I.verdict("cuda", torch.bfloat16, 4, 128, timed = False)
++    I.int8_attention_op()
++    op = torch.ops.unsloth_studio.int8_attention_nhd
++    q, k, v = (x.clone() for x in I.probe_inputs("cuda", torch.bfloat16, 1100, 4, 128))
++    for _ in range(3):  # allocator and JIT warm, as before any capture
++        op(q, k, v)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = op(q, k, v)
++    for seed in (5, 6):
++        fresh = I.probe_inputs("cuda", torch.bfloat16, 1100, 4, 128, seed = seed)
++        for dst, src in zip((q, k, v), fresh):
++            dst.copy_(src)
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(out, op(*fresh))
++
++
++@needs_kernel
++def test_torch_compile_keeps_the_op_opaque():
++    I.verdict("cuda", torch.bfloat16, 4, 64, timed = False)
++    I.int8_attention_op()
++
++    def block(q, k, v):
++        return torch.ops.unsloth_studio.int8_attention_nhd(q * 1.0, k, v).flatten(2, 3) + 1.0
++
++    q, k, v = I.probe_inputs("cuda", torch.bfloat16, 900, 4, 64)
++    torch._dynamo.reset()
++    assert torch._dynamo.explain(block)(q, k, v).graph_break_count == 0
++    compiled = torch.compile(block, fullgraph = True)
++    with torch.no_grad():
++        assert torch.equal(compiled(q, k, v), block(q, k, v))
++    torch._dynamo.reset()
++
++
++@needs_kernel
++def test_h3_strided_processor_runs_the_kernel_on_cuda(_active_backend):
++    h3, A = _h3()
++    model = _tiny_h3(h3, head_dim = 64).to("cuda", torch.bfloat16)
++    model.set_attention_backend("_native_cudnn")
++    stock = copy.deepcopy(model)
++    assert A.install_strided_attention(model) == 3
++    kw = {
++        k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in _h3_inputs(n_video = 256).items()
++    }
++    for name in ("hidden_states", "audio_hidden_states", "encoder_hidden_states"):
++        kw[name] = kw[name].to(torch.bfloat16)
++    assert I.install_int8_attention(model, device = "cuda", dtype = torch.bfloat16, force = True) == 3
++    before = I.STATS["int8"]
++    with torch.no_grad():
++        want, got = stock(**kw), model(**kw)
++    assert I.STATS["int8"] >= before + 2
++    for a, b in zip(want, got):
++        assert F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim = 0) > 0.98
++    assert I.remove_int8_attention(model) == 3
++    with torch.no_grad():
++        assert all(torch.equal(a, b) for a, b in zip(want, model(**kw)))
++
++
++@needs_kernel
++def test_checkpoint_race_runs_the_kernel_on_a_resident_block(_active_backend):
++    h3, A = _h3()
++    H = _h3_image()
++    model = _tiny_h3(h3, head_dim = 64).to("cuda", torch.bfloat16)
++    model.set_attention_backend("_native_cudnn")
++    assert A.install_strided_attention(model) == 3
++    mods = I.int8_processors(model)
++    blocks = [m for m in mods if any(m is b.attn for b in model.transformer_blocks)]
++    saved = {m: m.processor._attention_backend for m in mods}
++    assert len(blocks) == 2
++    assert (
++        I.install_int8_attention(
++            model, device = "cuda", dtype = torch.bfloat16, modules = blocks, force = True
++        )
++        == 2
++    )
++    I.remove_int8_attention(model)
++    before = I.STATS["int8"]
++    found = H.race_checkpoint_attention(model, saved, torch.bfloat16, kernel = True)
++    # 2 warm-ups + 5 timed calls of the kernel per canvas, and the processor is left as it was
++    assert I.STATS["int8"] == before + 14
++    assert sorted(found["kernel"]) == [1024, 4096]
++    assert all(len(v) == 3 and min(v) > 0 for v in found["kernel"].values())
++    assert found["ms"] == found["kernel"][4096][:2]
++    proc = blocks[0].processor
++    assert not proc._unsloth_int8 and proc._attention_backend == saved[blocks[0]]
++    # without the kernel the race is the two-way one
++    plain = H.race_checkpoint_attention(model, saved, torch.bfloat16)
++    assert "kernel" not in plain and len(plain["ms"]) == 2 and I.STATS["int8"] == before + 14
++    import logging
++
++    routed = H._race_int8_kernel(
++        model, blocks, saved, "cuda", torch.bfloat16, False, False, logging.getLogger(__name__)
++    )
++    record = getattr(model, H.ATTENTION_RACE_ATTR)
++    assert record["timed"] == "block" and record["blocks"] == routed and routed in (0, 2)
++    assert I.int8_attention_count(model) == routed
+diff --git a/studio/backend/tests/test_diffusion_minimax_h3_image.py b/studio/backend/tests/test_diffusion_minimax_h3_image.py
+index 6c9ca3651f..c8dfb5d1d1 100644
+--- a/studio/backend/tests/test_diffusion_minimax_h3_image.py
++++ b/studio/backend/tests/test_diffusion_minimax_h3_image.py
+@@ -1516,6 +1516,79 @@ def test_int8_attention_stays_off_where_it_loses_the_race(h3i, release, monkeypa
+     assert h3i.remove_checkpoint_attention(p) == len(mods)
+ 
+ 
++def test_int8_kernel_takes_the_blocks_only_from_the_backend_it_beats(h3i, release, monkeypatch):
++    """Studio's INT8 kernel is raced after SageAttention's own race, against whichever backend that left on the
++    blocks; where it wins every processor keeps its native backend and the kernel is the engaged route."""
++    from core.inference import diffusion_attention as da
++    from core.inference import diffusion_int8_attention as int8
++
++    root, _ref, te = release
++    p = h3i.load_minimax_h3_image_pipeline(str(root), device = "cpu", text_encoder = te)
++    mods = h3i._attention_processors(p.transformer)
++    blocks = {id(m) for b in p.transformer.transformer_blocks for m in b.modules()}
++    before = {id(m): m.processor._attention_backend for m in mods}
++    world = {"sage": True, "keep": True, "kernel": 0}
++    seen: list = []
++
++    def fake_apply(
++        pipe,
++        backend,
++        logger = None,
++        target = None,
++    ):
++        if not world["sage"]:
++            return None
++        for m in h3i._attention_processors(pipe.transformer):
++            m.processor._attention_backend = backend
++        return backend
++
++    def fake_kernel(transformer, block_modules, saved, dev, dtype, sage, forced, log):
++        seen.append({"sage": sage, "forced": forced, "blocks": {id(m) for m in block_modules}})
++        return world["kernel"] and len(block_modules)
++
++    monkeypatch.setattr(da, "apply_attention_backend", fake_apply)
++    monkeypatch.setattr(
++        h3i,
++        "race_checkpoint_attention",
++        lambda *a, **k: {"keep": world["keep"], "ms": [1.0, 1.2], "native": "_native_flash"},
++    )
++    monkeypatch.setattr(h3i, "_race_int8_kernel", fake_kernel)
++    removed: list = []
++    monkeypatch.setattr(int8, "remove_int8_attention", lambda t: removed.append(t) or 0)
++    monkeypatch.delenv(h3i.INT8_ATTENTION_ENV, raising = False)
++
++    def backends():
++        return {id(m): m.processor._attention_backend for m in mods}
++
++    def install():
++        seen.clear()
++        return h3i.install_checkpoint_attention(p, "cuda", scheme = "int8")
++
++    for sage, keep, incumbent_is_sage in ((True, True, True), (True, False, False), (False, True, False)):
++        world.update(sage = sage, keep = keep, kernel = 1)
++        assert install() == int8.BACKEND
++        assert seen == [{"sage": incumbent_is_sage, "forced": False, "blocks": blocks & set(before)}]
++        # the kernel is an overlay on the native backends: no processor is left on SageAttention
++        assert backends() == before
++        assert install() is None and not seen
++        assert h3i.remove_checkpoint_attention(p) == len(mods) and removed.pop() is p.transformer
++        assert backends() == before
++    # the kernel loses: SageAttention where it was kept, native attention elsewhere
++    world.update(sage = True, keep = True, kernel = 0)
++    assert install() == "sage" and seen[0]["sage"]
++    assert all((m.processor._attention_backend == "sage") == (id(m) in blocks) for m in mods)
++    assert h3i.remove_checkpoint_attention(p) == len(mods)
++    for sage, keep in ((True, False), (False, True)):
++        world.update(sage = sage, keep = keep)
++        assert install() is None and not seen[0]["sage"]
++        assert backends() == before and not getattr(p, h3i.ATTENTION_SAVED_ATTR, None)
++    # SageAttention pinned by its switch: the kernel is told so
++    world.update(sage = True, keep = False)
++    monkeypatch.setenv(h3i.INT8_ATTENTION_ENV, "1")
++    assert install() == "sage" and seen == [{"sage": True, "forced": True, "blocks": blocks & set(before)}]
++    assert h3i.remove_checkpoint_attention(p) == len(mods)
++
++
+ def test_hosted_metadata_attention_is_recorded(h3i):
+     import types
+ 
