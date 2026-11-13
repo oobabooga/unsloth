@@ -30,7 +30,7 @@ name: "AMD CI (Windows): validate PR 17508"
 
 on:
   push:
-    branches: [amd-ci-pr17508-npu-e2e]
+    branches: [amd-ci-pr17508-npu-e2e2]
   workflow_dispatch:
 
 permissions:
