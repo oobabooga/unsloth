@@ -46,24 +46,35 @@ def login():
 
 
 def chat(tok, mid, messages, max_tokens, tools=None):
-    n0 = len(telemetry())
-    body = {"model": "lemonade:" + mid, "max_tokens": max_tokens, "stream": False, "temperature": 0, "messages": messages}
-    if tools:
-        body["tools"] = tools
+    body = {"model": "lemonade:" + mid, "max_tokens": max_tokens, "stream": True, "temperature": 0, "messages": messages}
+    req = urllib.request.Request(B + "/v1/chat/completions", method="POST", data=json.dumps(body).encode())
+    req.add_header("content-type", "application/json")
+    req.add_header("Authorization", "Bearer " + tok)
     t0 = time.time()
-    c, b = call("POST", "/v1/chat/completions", body, tok, 1800)
-    wall = time.time() - t0
-    time.sleep(1)
-    t = telemetry()[n0:]
-    reply = ""
+    ttft, parts, status = None, [], 0
     try:
-        msg = json.loads(b)["choices"][0]["message"]
-        reply = msg.get("content") or json.dumps(msg.get("tool_calls"))[:200]
-    except Exception:
-        pass
-    if c != 200:
-        print("CHAT FAILED", mid, c, b[:200].replace(PW, "***"), flush=True)
-    return {"status": c, "wall": round(wall, 2), "tele": t[-1] if t else None, "reply": reply}
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            status = r.status
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:") or line == "data: [DONE]":
+                    continue
+                try:
+                    delta = json.loads(line[5:])["choices"][0].get("delta") or {}
+                except (ValueError, KeyError, IndexError):
+                    continue
+                piece = delta.get("content") or delta.get("reasoning_content") or ""
+                if piece and ttft is None:
+                    ttft = time.time() - t0
+                parts.append(delta.get("content") or "")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        print("CHAT FAILED", mid, e.code, e.read()[:200], flush=True)
+    except Exception as e:
+        print("CHAT FAILED", mid, repr(e)[:200], flush=True)
+    wall = time.time() - t0
+    return {"status": status, "wall": round(wall, 2), "tele": {"ttft": round(ttft, 3)} if ttft else None,
+            "reply": "".join(parts)}
 
 
 def load(tok, mid, **extra):
@@ -113,7 +124,7 @@ for cp in os.environ["CHECKPOINTS"].split():
     if not ok:
         continue
     chat_fresh(mid, [{"role": "user", "content": "Hi"}], 8)
-    for rep in range(int(os.environ.get("REPS", "3"))):
+    for rep in range(int(os.environ.get("REPS", "4"))):
         for variant in ("no request", "title request", "other long chat"):
             nonce = f"[chat {rep}-{variant[:5]}-{time.time():.0f}] "
             long_msg = nonce + PARA * 40 + "\nSummarize the history above in three bullet points."
