@@ -28,7 +28,7 @@ from pathlib import Path
 LLAMA_TAG = "b12340"
 REPO = "unsloth/Qwen3.5-0.8B"
 DEPS = ["torch", "safetensors", "einops", "numpy", "mpmath", "huggingface_hub", "transformers",
-        "sentencepiece", "protobuf", "structlog", "pyjwt", "psutil", "fastapi", "pydantic", "pyyaml"]
+        "sentencepiece", "protobuf", "structlog", "pyjwt", "psutil", "fastapi", "pydantic", "pyyaml", "httpx"]
 
 
 def sh(cmd, **kw):
