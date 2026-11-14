@@ -80,6 +80,25 @@ rc=$?
 "$L/build-tls/bin/llama-server" --help 2>&1 | grep -q -- --pipeline-groups || { echo "FATAL: no --pipeline-groups"; exit 1; }
 if [ "$PR" = 191 ]; then "$L/build-tls/bin/ggml-rpc-server" --help 2>&1 | grep -q -- --trace || { echo "FATAL: no --trace"; exit 1; }; fi
 
+if [ "${PP_TAILCAT:-0}" = 1 ]; then
+  # tailcat (userspace WireGuard over Tailscale's data plane, no control plane) at a pinned main commit: v0.7.0
+  # predates --allow. Official Go tarball checked against its published sha256; static build, upstream tags.
+  echo "== tailcat"
+  GO_V=go1.27.2; GO_SHA=ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5
+  TC_SHA="${PP_TAILCAT_SHA:-e00cdde6ff787f801361ff85ed085775c775d4c5}"
+  G="$W/go"; rm -rf "${G:?}"; mkdir -p "$G"
+  curl -fsSL -o "$G/go.tgz" "https://go.dev/dl/$GO_V.linux-amd64.tar.gz" || { echo "FATAL: go download"; exit 1; }
+  echo "$GO_SHA  $G/go.tgz" | sha256sum -c - || { echo "FATAL: go sha256"; exit 1; }
+  tar -C "$G" -xzf "$G/go.tgz" && rm -f "$G/go.tgz"
+  TC="$W/tailcat"; rm -rf "${TC:?}"
+  git clone -q https://github.com/tailscale/tailcat "$TC/src" && git -C "$TC/src" checkout -q "$TC_SHA" \
+    || { echo "FATAL: tailcat clone $TC_SHA"; exit 1; }
+  ( cd "$TC/src" && GOROOT="$G/go" GOPATH="$W/gopath" GOCACHE="$W/gocache" GOTOOLCHAIN=local CGO_ENABLED=0 \
+      "$G/go/bin/go" build -trimpath -tags "$(cat build-tags.txt)" -ldflags '-s -w' -o "$TC/tailcat" ./cmd/tailcat ) \
+    > "$W/out/tailcat_build.log" 2>&1 || { echo "FATAL: tailcat build"; tail -20 "$W/out/tailcat_build.log"; exit 1; }
+  "$TC/tailcat" version | tee "$W/out/tailcat_version.txt" || { echo "FATAL: tailcat version"; exit 1; }
+fi
+
 if [ "$ROLE" = master ]; then
   echo "== model"
   python3 - "$W/model.txt" <<'EOF'

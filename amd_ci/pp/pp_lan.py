@@ -125,6 +125,7 @@ class Worker:
         self.tls.mkdir(exist_ok = True)
         self.nonce = secrets.token_hex(16)
         self.proc, self.events, self.done = None, [], False
+        self.tc = None  # tailcat serve (diag23)
         self.samples, self.sampling = [], False
         self.lock = threading.Lock()
 
@@ -204,6 +205,32 @@ class Worker:
         if cmd == "stop_rpc":
             self.stop_rpc()
             return {"ok": True}
+        if cmd == "tc_serve":
+            # tailcat serve: the rpc port (LAN host) and perf, only for the master's client keys; the secret address
+            # goes to a 0600 file and back over the HMAC'd control channel (lab only: an ephemeral per-run key)
+            kill_group(self.tc)
+            d = self.out / "tc"
+            d.mkdir(exist_ok = True)
+            key, addr_file = d / "server.private.json", d / "addr.txt"
+            addr_file.unlink(missing_ok = True)
+            if not key.exists():
+                subprocess.run([self.a.tailcat, "genkey", f"--key={key}"], capture_output = True, timeout = 60, check = True)
+            host, port = args["host"], int(args["port"])
+            argv = [self.a.tailcat, "serve", f"--key={key}", "--allow=" + ",".join(args["allow"]), f"{port}:{host}:{port}", "perf"]
+            env = dict(os.environ, HOME = str(self.out / "home"), TAILCAT_ADDR_FILE = str(addr_file))
+            self.tc = subprocess.Popen(argv, stdout = open(d / "serve.log", "w"), stderr = subprocess.STDOUT, env = env,
+                                       start_new_session = True)
+            end = time.time() + 60
+            while time.time() < end and self.tc.poll() is None and not (addr_file.exists() and addr_file.stat().st_size):
+                time.sleep(0.2)
+            ok = addr_file.exists() and addr_file.stat().st_size > 0
+            self.ev(cmd = "tc_serve", port = port, up = ok)
+            return {"ok": ok, "addr": addr_file.read_text().strip() if ok else "",
+                    "tail": (d / "serve.log").read_text(errors = "replace")[-800:]}
+        if cmd == "tc_stop":
+            kill_group(self.tc)
+            self.tc = None
+            return {"ok": True}
         if cmd == "window_begin":
             with self.lock:
                 self.samples = []
@@ -221,6 +248,7 @@ class Worker:
             return {"ok": True, "tail": logs[-1].read_text(errors = "replace")[-3000:] if logs else ""}
         if cmd == "done":
             self.stop_rpc()
+            kill_group(self.tc)
             self.done = True
             return {"ok": True}
         return {"ok": False, "error": "unknown command"}
@@ -262,6 +290,7 @@ class Worker:
         finally:
             self.done = True
             self.stop_rpc()
+            kill_group(self.tc)
             lp.write_json(str(self.out / "worker_result.json"), {"self": me, "events": self.events,
                                                                   "timed_out": not self.done})
         return 0
@@ -390,6 +419,7 @@ class Master:
         self.out = Path(a.out_dir)
         self.out.mkdir(parents = True, exist_ok = True)
         self.R = {"cases": [], "steps": [], "args": vars(a)}
+        self.tc_procs = []
 
     def step(self, name, ok, detail = ""):
         self.R["steps"].append({"step": name, "ok": bool(ok), "detail": str(detail)[-1500:]})
@@ -496,11 +526,77 @@ class Master:
         try:
             return self.flow(ctls, addrs)
         finally:
+            for p in self.tc_procs:
+                kill_group(p)
             for c in ctls:
                 try:
                     c("done", timeout = 60)
                 except Exception as exc:
                     print("done not delivered:", repr(exc), flush = True)
+
+    def tailcat_up(self, ctls, addrs, endpoints):
+        """Each worker serves its TLS rpc port (and perf) over tailcat for this run's two client keys; this box
+        forwards a local port to each. Direct LAN paths only: a worker whose probe never leaves DERP voids the run."""
+        a, R = self.a, self.R
+        d = self.out / "tc"
+        d.mkdir(exist_ok = True)
+        env = dict(os.environ, HOME = str(d / "home"))
+        keys, pubs = {n: d / f"{n}.private.json" for n in ("fwd", "probe")}, {}
+        for n, k in keys.items():
+            r = subprocess.run([a.tailcat, "genkey", "--client", f"--key={k}"], capture_output = True, text = True,
+                               timeout = 60, env = env)
+            pubs[n] = next((x.strip() for x in r.stdout.splitlines() if x.startswith("nodekey:")), "")
+        if not self.step("tailcat client keys", all(pubs.values()), str(pubs)):
+            return None
+        tc_eps, info = [], []
+        for i, (c, (host, port), ep) in enumerate(zip(ctls, addrs, endpoints)):
+            r = c("tc_serve", allow = [pubs["fwd"], pubs["probe"]], host = host, port = port)
+            if not self.step(f"worker {i + 1} serves its rpc port over tailcat", r.get("ok"), r.get("tail", "")):
+                return None
+            addr = r["addr"]
+            pr = subprocess.run([a.tailcat, f"--key={keys['probe']}", "ping", "--until-direct", "--timeout", "60s", addr],
+                                capture_output = True, text = True, timeout = 120, env = env)
+            perf = {}
+            for name, extra in (("up", []), ("down", ["--reverse"])):
+                q = subprocess.run([a.tailcat, f"--key={keys['probe']}", "--json", "perf", "--time", "5s", "--interval", "0",
+                                    "--timeout", "30s", *extra, addr], capture_output = True, text = True, timeout = 120, env = env)
+                try:
+                    j = json.loads(q.stdout)
+                    sent = j.get("serverReceived" if name == "up" else "clientReceived") or j.get("clientSent") or {}
+                    perf[name] = {"mbit_s": round(8 * sent.get("bytes", 0) / max(sent.get("duration", 1) / 1e9, 1e-9) / 1e6, 1),
+                                  "path": j.get("path"), "rtt_under_load_ns": j.get("rtt"), "raw": j}
+                except ValueError:
+                    perf[name] = {"error": (q.stdout + q.stderr)[-400:]}
+            lport = free_port()
+            log = d / f"forward_{i + 1}.log"
+            p = subprocess.Popen([a.tailcat, "--verbose", f"--key={keys['fwd']}", "forward", addr, f"{lport}:{port}"],
+                                 stdout = open(log, "w"), stderr = subprocess.STDOUT, env = env, start_new_session = True)
+            self.tc_procs.append(p)
+            end = time.time() + 60
+            while time.time() < end and p.poll() is None and "# forwarding" not in log.read_text(errors = "replace"):
+                time.sleep(0.2)
+            fp = ep.split("://", 1)[1].split("@", 1)[0]
+            tc_eps.append(f"tls://{fp}@127.0.0.1:{lport}")
+            info.append({"worker": i + 1, "lan": f"{host}:{port}", "direct_ping": pr.returncode == 0,
+                         "ping": (pr.stdout + pr.stderr)[-400:], "perf": perf, "local_port": lport,
+                         "forward_up": p.poll() is None})
+            print("TAILCAT", json.dumps({k: v for k, v in info[-1].items() if k != "perf"}), 
+                  {k: v.get("mbit_s") for k, v in perf.items()}, flush = True)
+        R["tailcat"] = info
+        if not self.step("every worker reached over a direct (non-DERP) tailcat path, forwards up",
+                         all(x["direct_ping"] and x["forward_up"] for x in info), [x["ping"] for x in info]):
+            return None
+        return tc_eps
+
+    def tailcat_paths(self):
+        """The forwarders' own path: magicsock's 'now using <ip:port>' lines (a DERP-only forward has none)."""
+        out = []
+        for i in range(len(self.tc_procs)):
+            text = (self.out / "tc" / f"forward_{i + 1}.log").read_text(errors = "replace")
+            using = [ln.split("now using ", 1)[1].split()[0] for ln in text.splitlines() if "now using " in ln]
+            out.append({"worker": i + 1, "now_using": using[-5:], "derp_lines": text.count("via=derp"),
+                        "alive": self.tc_procs[i].poll() is None})
+        return out
 
     def flow(self, ctls, addrs):
         a, R = self.a, self.R
@@ -544,11 +640,11 @@ class Master:
             rest = (n_remote - last) / (n_workers - 1)
             return ",".join([f"{rest:.3f}"] * (n_workers - 1) + [f"{last:.3f}"])
 
-        def split(s, g, head_local = True, bs = False, master_layers = None, head_discount = 0):
+        def split(s, g, head_local = True, bs = False, master_layers = None, head_discount = 0, via = None):
             # s stages: the master (first k layers + output, on its CPU) and s - 1 workers. -ngl counts the
             # output layer first (i_gpu_start = n_layer + 1 - ngl), so -ngl alone would put it on the last
             # worker and ship vocab x rows x 4 bytes of logits per step; OUTPUT_ON_CPU keeps it here.
-            eps = endpoints[:s - 1]
+            eps = (via or endpoints)[:s - 1]
             # the master holds k + 1 layers when the head is remote (-ngl counts the head first)
             k = (master_layers - 1) if master_layers else round(a.n_layer / s)
             p = g * B
@@ -606,6 +702,21 @@ class Master:
                      (3, "bs_p0q4h0", 8), (3, "bs_p1q4h0", 8), (3, "bs_p1q4h2", 8),
                      (4, "bs_p0q2h0", 8), (4, "bs_p1q2h0", 8), (4, "bs_p1q2h2", 8),
                      (5, "bs_p0q4h0", 8), (5, "bs_p1q4h0", 8), (5, "bs_p1q4h2", 8)]
+            plan = [("x1", 1, 1, B)]
+            plan += [(k, s_, g, g * B) for s_, k, g in cases]
+            plan += [(k, s_, g, g * B) for s_, k, g in reversed(cases)]
+            plan = [c for c in plan if c[1] <= a.workers + 1]
+        tc_eps = None
+        if a.diag23:
+            # ggml RPC (mutual TLS) over a tailcat tunnel vs straight over the LAN, at each stage count's diag22 best.
+            # Arms: '' = LAN with worker-to-worker copies (the lab's best path), '_n' = LAN without them (GGML_RPC_P2P=0),
+            # '_t' = tailcat without them (a worker cannot dial the master's 127.0.0.1 forward of another worker)
+            tc_eps = self.tailcat_up(ctls, addrs, endpoints)
+            if tc_eps is None:
+                R["verdict"] = "TAILCAT_DOWN"
+                return 1
+            best = [(2, "bs_p1q0h0", 6), (3, "bs_p1q4h2", 8), (4, "bs_p1q2h2", 8), (5, "bs_p1q4h2", 8)]
+            cases = [(s_, k + arm, g) for s_, k, g in best for arm in ("", "_n", "_t")]
             plan = [("x1", 1, 1, B)]
             plan += [(k, s_, g, g * B) for s_, k, g in cases]
             plan += [(k, s_, g, g * B) for s_, k, g in reversed(cases)]
@@ -774,6 +885,10 @@ class Master:
                     plan.append((f"bs_{variant}", 2, g, g * B))
         repacked = False
         for rnd_i, (kind, s, g, p) in enumerate(plan):
+            arm = None
+            kind_full = kind
+            if kind.startswith("bs_") and kind.endswith(("_n", "_t")):
+                arm, kind = kind[-1], kind[:-2]
             if kind.startswith("bs_"):
                 want = kind == "bs_repack"
                 if want != repacked:
@@ -803,7 +918,7 @@ class Master:
                 if kind.startswith("bs_x"):
                     hd = 0
                     ml = (round(a.n_layer / s) + 1 - 3) if kind[5] == "1" else None
-                args, p = split(s, g, False, True, ml, hd)
+                args, p = split(s, g, False, True, ml, hd, via = tc_eps if arm == "t" else None)
                 # after split(), which builds args afresh (diag8 appended this before it, so its c0 arm kept the cache)
                 if (kind.startswith("bs_c") and kind[4] == "0") or kind.startswith(("bs_l", "bs_h", "bs_v", "bs_w", "bs_x", "bs_z", "bs_y", "bs_q", "bs_p")):
                     args += ["--cache-ram", "0"]
@@ -831,6 +946,8 @@ class Master:
                     env["LLAMA_BS_BATCH_READBACK"] = "1"
                 if kind.startswith("bs_p"):
                     env["LLAMA_PIN_LAYER_OUT"] = kind[4]
+                if arm in ("n", "t"):
+                    env["GGML_RPC_P2P"] = "0"
                 if kind.startswith("bs_v_"):
                     env["GGML_RPC_SYNC_ALL"] = "1" if "_all_" in kind else "0"
                     env["LLAMA_GROUP_SUBMIT_SERIAL"] = "0" if kind.endswith("_conc") else "1"
@@ -840,9 +957,20 @@ class Master:
                     args[args.index("-t") + 1] = str(max(1, a.threads // int(kind[4])))
                 if kind == "bs_tsplit":
                     args[args.index("-t") + 1] = str(max(1, a.threads // g))
-                tag = f"{kind}_s{s}_g{g}_{rnd_i}"
+                tag = f"{kind_full}_s{s}_g{g}_{rnd_i}"
                 res = self.measure(tag, args, p, ctls[:s - 1], env)
-                res.update({"kind": kind, "stages": s, "groups": g, "slots": p})
+                res.update({"kind": kind_full, "stages": s, "groups": g, "slots": p})
+                if arm == "t":
+                    res["tailcat_paths"] = self.tailcat_paths()
+                if a.diag23:
+                    # engagement: '_t' points --rpc at this box's tailcat forwards (127.0.0.1); a peer link that fails
+                    # logs a warning and relays through this process
+                    res["rpc"] = args[args.index("--rpc") + 1]
+                    try:
+                        slog = (self.out / f"server_{tag}.log").read_text(errors = "replace")
+                        res["p2p_link_failed_lines"] = slog.count("could not open a peer link") + slog.count("no P2P support")
+                    except OSError:
+                        pass
                 # engagement: the RAM prompt cache must be silent when --cache-ram 0 was passed
                 try:
                     slog = (self.out / f"server_{tag}.log").read_text(errors = "replace")
@@ -970,6 +1098,7 @@ def main():
     w.add_argument("--index", type = int, default = 1)
     w.add_argument("--window-s", type = float, default = 5400)
     w.add_argument("--threads", type = int, default = 16)
+    w.add_argument("--tailcat", default = "", help = "tailcat binary (diag23: serve the rpc port over tailcat)")
     m = sub.add_parser("master")
     m.add_argument("--bin", required = True)
     m.add_argument("--gguf", required = True)
@@ -978,6 +1107,8 @@ def main():
     m.add_argument("--head-local", default = "on", choices = ["on", "off", "both"],
                    help = "output head on the master CPU (-ot) in the rpc cases; 'both' adds rpc_hr cases with it on the last worker")
     m.add_argument("--peer-allow", action = "store_true", help = "workers admit each other for direct activation copies (rpc_p2p.patch)")
+    m.add_argument("--diag23", action = "store_true", help = "Qwen3-4B S=2..5 at the diag22 best: RPC over the LAN vs over tailcat (needs --tailcat)")
+    m.add_argument("--tailcat", default = "", help = "tailcat binary (diag23)")
     m.add_argument("--diag22", action = "store_true", help = "Qwen3-4B S=2..5: sched_pin_l_out off / on + head discount (use with --peer-allow)")
     m.add_argument("--diag21", action = "store_true", help = "sched_pin_l_out off / on at S=5 G=8 (use with --peer-allow)")
     m.add_argument("--diag20", action = "store_true", help = "MoE S=5: layers off the master x pipeline groups (use with --peer-allow)")

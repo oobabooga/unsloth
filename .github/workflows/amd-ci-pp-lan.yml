@@ -25,6 +25,8 @@ env:
   # diagnostic run: #191 (tracer, on #187) + TLS, traces from the master and every rpc-server
   PP_LLAMA_PR: "191"
   PP_TRACE: "1"
+  # diag23: also build tailcat (pinned main commit) and run the RPC over tailcat tunnels
+  PP_TAILCAT: "1"
 
 jobs:
   worker:
@@ -57,7 +59,7 @@ jobs:
           . "$AMD_CI_WORK/venv/bin/activate"
           D="$AMD_CI_WORK/out/worker"; mkdir -p "$D"
           setsid python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" worker --bin "$AMD_CI_WORK/llama/build-tls/bin" \
-            --out-dir "$D" --index ${{ matrix.index }} --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" --window-s 6000 \
+            --out-dir "$D" --index ${{ matrix.index }} --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" --window-s 6000 --tailcat "$AMD_CI_WORK/tailcat/tailcat" \
             > "$D/control.log" 2>&1 < /dev/null &
           echo $! > "$D/control.pid"
           for i in $(seq 60); do [ -s "$D/self.json" ] && break; sleep 0.5; done
@@ -99,6 +101,7 @@ jobs:
             ${{ env.AMD_CI_WORK }}/out/worker/*.json
             ${{ env.AMD_CI_WORK }}/out/worker/*.log
             ${{ env.AMD_CI_WORK }}/out/worker/*.jsonl
+            ${{ env.AMD_CI_WORK }}/out/worker/tc/*.log
             ${{ env.AMD_CI_WORK }}/out/*.log
             ${{ env.AMD_CI_WORK }}/out/*.txt
           retention-days: 7
@@ -135,7 +138,7 @@ jobs:
           D="$AMD_CI_WORK/out/master"; mkdir -p "$D"
           echo "runner: ${RUNNER_NAME:-?} host: $(hostname)"; ip -br addr
           python3 -u "$GITHUB_WORKSPACE/amd_ci/pp/pp_lan.py" master --bin "$AMD_CI_WORK/llama/build-tls/bin" \
-            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --min-workers 4 --peer-allow --diag22 --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
+            --gguf "$(cat "$AMD_CI_WORK/model.txt")" --workers 4 --min-workers 4 --peer-allow --diag23 --tailcat "$AMD_CI_WORK/tailcat/tailcat" --out-dir "$D" --threads "$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)" \
             --n-layer 36 --slots-per-group 16 --n-predict 64 --waves 8 --rounds 1 --wait-s 5400 2>&1 | tee "$D/master.log"
           echo "master rc=${PIPESTATUS[0]}"
           test -s "$D/master_result.json"
@@ -154,6 +157,7 @@ jobs:
             ${{ env.AMD_CI_WORK }}/out/master/*.json
             ${{ env.AMD_CI_WORK }}/out/master/*.log
             ${{ env.AMD_CI_WORK }}/out/master/*.jsonl
+            ${{ env.AMD_CI_WORK }}/out/master/tc/*.log
             ${{ env.AMD_CI_WORK }}/out/*.log
             ${{ env.AMD_CI_WORK }}/out/*.txt
           retention-days: 7
