@@ -53,6 +53,7 @@ MODELS = {
     "st_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "hd512_llama": "built:llama-hd512",
     "hd512_gemma4": "built:gemma4-global-hd512",
+    "hd512_gemma4_nc": "built:gemma4-global-hd512 (UNSLOTH_COMPILE_DISABLE=1)",
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "tok_save": "built:llama",
     "grpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
