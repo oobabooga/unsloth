@@ -279,7 +279,7 @@ def main() -> int:
     if any(c in args.cells.split(",") for c in ("ctnvfp4", "ctmxfp8")):
         # Same bytes for every state: quantized with the PAIRED zoo head's packed_experts (base zoo may lack it).
         builder = companion(args, work, "head") if args.state_repo == "unsloth" else args.checkout
-        obs["ct_build"] = {k: v for k, v in run_cell(py, "build_ct", f"{args.state}_build_ct", [builder], out_dir, 900,
+        obs["ct_build"] = {k: v for k, v in run_cell(py, "build_ct", f"{args.state}_build_ct", [builder, unsloth_ck], out_dir, 900,
                                                      model_dir).items()
                            if k in ("rc", "stage", "error", "ct_dirs", "builder_zoo", "log_tail")}
     obs["cells"] = {}
