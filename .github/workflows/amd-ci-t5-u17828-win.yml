@@ -148,7 +148,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit u17828 --state-repo unsloth --transformers 5.17.0 --trl 1.15.0 --cells env,flm16,flm4,vision,moe,rl_decode --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 51c7c9b9d85afc0acfd8a2d59c1e10d17bba320b --companion-head 51c7c9b9d85afc0acfd8a2d59c1e10d17bba320b --use-current --tests tests/test_decode_cuda_graphs.py tests/test_decode_cuda_graphs_default.py tests/test_decode_graphs_memory.py tests/test_fast_lora_cast_cache.py tests/test_generic_decode_graphs.py tests/test_switch_training_mode.py
+            --python "$env:AMD_CI_PY" -- --unit u17828 --state-repo unsloth --transformers 5.17.0 --trl 1.15.0 --cells env,flm16,flm4,gcmem,vision,moe,rl_decode --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 51c7c9b9d85afc0acfd8a2d59c1e10d17bba320b --companion-head 51c7c9b9d85afc0acfd8a2d59c1e10d17bba320b --use-current --tests tests/test_decode_cuda_graphs.py tests/test_decode_cuda_graphs_default.py tests/test_decode_graphs_memory.py tests/test_fast_lora_cast_cache.py tests/test_generic_decode_graphs.py tests/test_switch_training_mode.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

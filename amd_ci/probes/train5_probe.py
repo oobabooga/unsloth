@@ -145,11 +145,12 @@ def state_env(paths: list, extra: dict | None = None) -> dict:
     return env
 
 
-def run_cell(py, cell, tag, paths, out_dir: Path, timeout):
+def run_cell(py, cell, tag, paths, out_dir: Path, timeout, model_dir: Path):
     out, log = out_dir / f"cell_{tag}.json", out_dir / f"cell_{tag}.log"
     cdir = out_dir / f"run_{tag}"
     cdir.mkdir(parents = True, exist_ok = True)
-    rc = sh([py, "-u", str(HERE / "train5_cell.py"), "--cell", cell, "--out", str(out)], log, timeout = timeout,
+    rc = sh([py, "-u", str(HERE / "train5_cell.py"), "--cell", cell, "--out", str(out), "--model-dir", str(model_dir)],
+            log, timeout = timeout,
             env = state_env(paths, {"UNSLOTH_COMPILE_LOCATION": str(cdir / "unsloth_compiled_cache")}), cwd = str(cdir))
     rec: dict = {"rc": rc}
     if out.is_file():
@@ -203,7 +204,8 @@ def run_pytest(py, checkout, tests, paths, out_dir: Path, state, prefix, timeout
     obs: dict = {"selected": present, "absent_at_this_state": [t for t in tests if t not in present], "files": {},
                  "passed": [], "failed": [], "errors": [], "skipped": {}, "fail_msgs": {}}
     for i, t in enumerate(present):
-        r = pytest_one(py, checkout, t, paths, out_dir, f"{state}_{prefix}{i}", timeout)
+        # File tag: no ":" (NTFS and upload-artifact refuse it); the test-ID prefix keeps it.
+        r = pytest_one(py, checkout, t, paths, out_dir, f"{state}_{'comp' if prefix else ''}{i}", timeout)
         obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "stderr_tail", "junit_error") if r.get(k) is not None}
         for k in ("passed", "failed", "errors"):
             obs[k] += [f"{prefix}{x}" for x in r[k]]
@@ -269,12 +271,17 @@ def main() -> int:
     obs["paths"] = {"unsloth": unsloth_ck, "zoo": zoo_ck}
     paths = [p for p in (unsloth_ck, zoo_ck) if p]
     dump()
+    # The tiny Llama, built once per job (seeded, no unsloth import): the same bytes for every state.
+    model_dir = work / "tiny_llama"
+    obs["model_build"] = {k: v for k, v in run_cell(py, "build", f"{args.state}_build", paths, out_dir, 900,
+                                                    model_dir).items() if k in ("rc", "stage", "error", "model_dir")}
     obs["cells"] = {}
     for cell in [c for c in args.cells.split(",") if c]:
-        obs["cells"][cell] = run_cell(py, cell, f"{args.state}_{cell}", paths, out_dir, args.cell_timeout)
+        obs["cells"][cell] = run_cell(py, cell, f"{args.state}_{cell}", paths, out_dir, args.cell_timeout, model_dir)
         dump()
         if args.state == "base" and cell in args.repeat.split(","):
-            obs["cells"][cell + "@aa"] = run_cell(py, cell, f"{args.state}_{cell}_aa", paths, out_dir, args.cell_timeout)
+            obs["cells"][cell + "@aa"] = run_cell(py, cell, f"{args.state}_{cell}_aa", paths, out_dir, args.cell_timeout,
+                                                  model_dir)
             dump()
     if args.tests:
         obs["pytest"] = run_pytest(py, args.checkout, args.tests, paths, out_dir, args.state, "", args.test_timeout)
