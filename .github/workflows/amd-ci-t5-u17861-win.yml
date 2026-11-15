@@ -152,7 +152,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit u17861 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,seqcls --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 15d7c59ca45f401e8ec80bb6fe7ec11584bf5b40 --companion-head 15d7c59ca45f401e8ec80bb6fe7ec11584bf5b40 --use-current --tests tests/test_ddp_find_unused_default.py --repeat flm16
+            --python "$env:AMD_CI_PY" -- --unit u17861 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,seqcls --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 15d7c59ca45f401e8ec80bb6fe7ec11584bf5b40 --companion-head 15d7c59ca45f401e8ec80bb6fe7ec11584bf5b40 --use-current --tests tests/test_ddp_find_unused_default.py --repeat flm16,seqcls
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
