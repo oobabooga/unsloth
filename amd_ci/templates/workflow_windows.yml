@@ -41,6 +41,9 @@ env:
   UPSTREAM: "https://github.com/unslothai/unsloth"
   # Set to "1" for a PR already merged: compares the merge commit to its parent.
   MERGED: "__MERGED__"
+  # Set by scaffold.py --patch: base = PATCH_BASE, head = PATCH_BASE plus this diff (relative to the checkout).
+  PATCH_BASE: "__PATCH_BASE__"
+  PATCH_FILE: "__PATCH_FILE__"
 
 jobs:
 
@@ -112,6 +115,7 @@ jobs:
           $ErrorActionPreference = "Continue"
           $extra = @()
           if ($env:MERGED -eq "1") { $extra += "--merged" }
+          if ($env:PATCH_FILE) { $extra += @("--patch-base", $env:PATCH_BASE, "--patch", "$env:GITHUB_WORKSPACE\$env:PATCH_FILE") }
           & $env:AMD_CI_PY "$env:GITHUB_WORKSPACE\amd_ci\lib\states.py" `
             --repo "$env:UPSTREAM" --pr "$env:PR" @extra `
             --root "$env:AMD_CI_WORK" --out "$env:AMD_CI_WORK\out\states.json"
