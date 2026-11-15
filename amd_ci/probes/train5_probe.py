@@ -145,13 +145,14 @@ def state_env(paths: list, extra: dict | None = None) -> dict:
     return env
 
 
-def run_cell(py, cell, tag, paths, out_dir: Path, timeout, model_dir: Path):
+def run_cell(py, cell, tag, paths, out_dir: Path, timeout, model_dir: Path, extra_env: dict | None = None):
     out, log = out_dir / f"cell_{tag}.json", out_dir / f"cell_{tag}.log"
     cdir = out_dir / f"run_{tag}"
     cdir.mkdir(parents = True, exist_ok = True)
     rc = sh([py, "-u", str(HERE / "train5_cell.py"), "--cell", cell, "--out", str(out), "--model-dir", str(model_dir)],
             log, timeout = timeout,
-            env = state_env(paths, {"UNSLOTH_COMPILE_LOCATION": str(cdir / "unsloth_compiled_cache")}), cwd = str(cdir))
+            env = state_env(paths, {"UNSLOTH_COMPILE_LOCATION": str(cdir / "unsloth_compiled_cache"), **(extra_env or {})}),
+            cwd = str(cdir))
     rec: dict = {"rc": rc}
     if out.is_file():
         try:
@@ -193,10 +194,38 @@ def pytest_one(py, checkout, test, paths, out_dir: Path, tag, timeout):
                     rec["passed"].append(tid)
         except Exception as e:  # noqa: BLE001
             rec["junit_error"] = repr(e)
-    if not (isinstance(rc, int) and rc in (0, 1, 5)):
+    # No junit = the process died before pytest's summary (a native abort, os._exit), whatever rc says.
+    if not (isinstance(rc, int) and rc in (0, 1, 5)) or not junit.is_file():
         rec["crashed"] = True
         rec["stderr_tail"], rec["stdout_tail"] = err[-2500:], out[-1500:]
     return rec
+
+
+def _per_test(py, checkout, test, paths, out_dir: Path, tag, timeout, first):
+    c = subprocess.run([py, "-m", "pytest", "-q", "--collect-only", "-p", "no:cacheprovider", "-o", "addopts=", test],
+                       cwd = checkout, env = state_env(paths), capture_output = True, text = True, encoding = "utf-8",
+                       errors = "replace", timeout = 900)
+    ids = [ln.strip() for ln in (c.stdout or "").splitlines() if "::" in ln and not ln.startswith(("<", " "))]
+    merged = {"rc": first.get("rc"), "passed": [], "failed": [], "errors": [], "skipped": {}, "fail_msgs": {},
+              "per_test": True, "n_ids": len(ids)}
+    killers = []
+    for j, tid in enumerate(ids):
+        r = pytest_one(py, checkout, tid, paths, out_dir, f"{tag}_t{j}", min(timeout, 900))
+        if r.get("crashed"):
+            name = tid.replace("/", ".").removesuffix(".py") if "::" not in tid else \
+                tid.split("::")[0].replace("/", ".").replace("\\", ".").removesuffix(".py") + "::" + tid.split("::", 1)[1]
+            merged["errors"].append(name)
+            merged["fail_msgs"][name] = f"process died (rc {r.get('rc')}): " + str(r.get("stderr_tail") or r.get("stdout_tail"))[-1200:]
+            killers.append(tid)
+            continue
+        for k in ("passed", "failed", "errors"):
+            merged[k] += r[k]
+        merged["skipped"].update(r["skipped"])
+        merged["fail_msgs"].update(r["fail_msgs"])
+    merged["killers"] = killers
+    if not ids:
+        merged.update(crashed = True, stderr_tail = first.get("stderr_tail"), stdout_tail = first.get("stdout_tail"))
+    return merged
 
 
 def run_pytest(py, checkout, tests, paths, out_dir: Path, state, prefix, timeout):
@@ -205,8 +234,13 @@ def run_pytest(py, checkout, tests, paths, out_dir: Path, state, prefix, timeout
                  "passed": [], "failed": [], "errors": [], "skipped": {}, "fail_msgs": {}}
     for i, t in enumerate(present):
         # File tag: no ":" (NTFS and upload-artifact refuse it); the test-ID prefix keeps it.
-        r = pytest_one(py, checkout, t, paths, out_dir, f"{state}_{'comp' if prefix else ''}{i}", timeout)
-        obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "stderr_tail", "junit_error") if r.get(k) is not None}
+        tag = f"{state}_{'comp' if prefix else ''}{i}"
+        r = pytest_one(py, checkout, t, paths, out_dir, tag, timeout)
+        if r.get("crashed"):
+            # The file killed its process: one process per test, so the killer is named and the rest still count.
+            r = _per_test(py, checkout, t, paths, out_dir, tag, timeout, r)
+        obs["files"][t] = {k: r.get(k) for k in ("rc", "crashed", "stderr_tail", "junit_error", "per_test", "n_ids", "killers")
+                           if r.get(k) is not None}
         for k in ("passed", "failed", "errors"):
             obs[k] += [f"{prefix}{x}" for x in r[k]]
         obs["skipped"].update({f"{prefix}{k}": v for k, v in r["skipped"].items()})
@@ -280,7 +314,7 @@ def main() -> int:
         # Same bytes for every state: quantized with the PAIRED zoo head's packed_experts (base zoo may lack it).
         builder = companion(args, work, "head") if args.state_repo == "unsloth" else args.checkout
         obs["ct_build"] = {k: v for k, v in run_cell(py, "build_ct", f"{args.state}_build_ct", [builder, unsloth_ck], out_dir, 900,
-                                                     model_dir).items()
+                                                     model_dir, {"UNSLOTH_IS_PRESENT": "1"}).items()
                            if k in ("rc", "stage", "error", "ct_dirs", "builder_zoo", "log_tail")}
     obs["cells"] = {}
     for cell in [c for c in args.cells.split(",") if c]:
