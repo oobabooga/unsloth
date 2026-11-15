@@ -200,7 +200,7 @@ def head_is_worse(base, head):
         if cell == "bswap" and b.get("bswap_equal") and not h.get("bswap_equal"):
             worse.append(f"bswap: offload 2 equal to offload 0 at base, not at head (grad maxdiff "
                          f"{h.get('bswap_grad_maxdiff')}, losses {h.get('bswap_loss_ref_vs_swap')})")
-        if cell == "bswap" and not b.get("bswap_grew") and h.get("bswap_grew"):
+        if cell == "bswap" and not any((b.get("bswap_grew") or {}).values()) and any((h.get("bswap_grew") or {}).values()):
             worse.append("bswap: slot pool grows at head, not at base")
         if cell == "bclens" and (h.get("recompile_logs") or 0) > (b.get("recompile_logs") or 0):
             worse.append(f"bclens: more recompiles at head ({h.get('recompile_logs')}) than base ({b.get('recompile_logs')})")
@@ -258,7 +258,7 @@ def _fmt(c):
         s += f" lh_patch={c['large_head_patch_returns']}"
     if c.get("varlen_hits"):
         s += f" varlen={c['varlen_hits']}"
-    for k in ("bswap_equal", "bswap_grad_maxdiff", "bswap_grads_compared", "bswap_grew", "slot_pool_message", "ckpt_in_forward", "unsloth_offload_refusal", "swapped_indices", "recompile_logs", "unique_graphs_per_step", "reload_ok", "reload_loss_rel", "ddp_find_unused_default", "loader", "block_modes", "block_compile_failed_msgs", "lora_out_dtypes", "lora_grads_nonzero", "lora_tensors",
+    for k in ("bswap_equal", "bswap_grad_maxdiff", "n_layers", "layer_forward_names", "block_modes_",  "bswap_grads_compared", "bswap_grew", "slot_pool_message", "ckpt_in_forward", "unsloth_offload_refusal", "swapped_indices", "recompile_logs", "unique_graphs_per_step", "reload_ok", "reload_loss_rel", "ddp_find_unused_default", "loader", "block_modes", "block_compile_failed_msgs", "lora_out_dtypes", "lora_grads_nonzero", "lora_tensors",
               "packing_installed", "lean_lora_layers", "prefetch_loader", "engaged", "grpo_fused_engaged", "dpo_chunked_engaged", "grouped_available", "fwd_rel", "bwd_rel",
               "triton_version", "dpo_chunked_calls", "trl_has_concatenated_forward", "expert_param_types",
               "packed_expert_stats_delta", "fused_calls_delta"):
