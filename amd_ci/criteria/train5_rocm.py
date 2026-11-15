@@ -202,8 +202,10 @@ def head_is_worse(base, head):
             worse.append(f"{cell}: layer gradient checkpointing ran at base ({b.get('gc_calls')} calls), 0 at head")
         if cell.startswith("moeaux_gc") and b.get("aux_gc_ok") and not h.get("aux_gc_ok"):
             worse.append(f"{cell}: aux-loss grad norm GC vs no GC within 2e-2 at base, not at head ({h.get('aux_gc_rel')})")
-        if cell == "gkd" and h.get("teacher_trainable"):
-            worse.append(f"gkd: teacher has {h.get('teacher_trainable')} trainable params at head")
+        if cell == "gkd" and (h.get("teacher_trainable") or 0) > (b.get("teacher_trainable") or 0):
+            worse.append(f"gkd: teacher trainable params {b.get('teacher_trainable')} at base, {h.get('teacher_trainable')} at head")
+        if cell == "gkd" and b.get("teacher_device") and h.get("teacher_device") != b.get("teacher_device"):
+            worse.append(f"gkd: teacher on {h.get('teacher_device')} at head, {b.get('teacher_device')} at base")
         if cell.startswith("dec_"):
             for tag in ("default", "forced"):
                 rb, rh = (b.get("decode_runs") or {}).get(tag), (h.get("decode_runs") or {}).get(tag)
