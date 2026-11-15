@@ -1203,6 +1203,7 @@ def cell_seqcls():
     versions()
     stage("load")
     from unsloth import FastModel
+    torch.manual_seed(0)  # the new `score` head is randomly initialised: same weights at every state
     model, tok = FastModel.from_pretrained(MODELS["seqcls"], max_seq_length = 256, dtype = torch.bfloat16,
                                            load_in_4bit = False, num_labels = 2,
                                            auto_model = transformers.AutoModelForSequenceClassification)
@@ -1219,10 +1220,20 @@ def cell_seqcls():
                                              random_state = 0)
     lora_stats(model)
     try:
-        from unsloth.models._ddp_defaults import unsloth_default_ddp_find_unused_parameters as f
-        res["ddp_find_unused_default"] = safe(lambda: f(model))
+        import tempfile
+        import unsloth.models._ddp_defaults as ddd
+        targs = transformers.TrainingArguments(output_dir = tempfile.mkdtemp(), gradient_checkpointing = True,
+                                               ddp_find_unused_parameters = None, report_to = "none")
+        orig = ddd._is_distributed
+        ddd._is_distributed = lambda *a, **k: True  # decide as a world>1 run would; single process here
+        try:
+            ret = ddd.unsloth_default_ddp_find_unused_parameters(targs, model)
+        finally:
+            ddd._is_distributed = orig
+        res["ddp_find_unused_default"] = f"{targs.ddp_find_unused_parameters}"
+        res["ddp_default_ret"] = str(ret)[:80]
     except Exception as e:  # noqa: BLE001
-        res["ddp_find_unused_default"] = f"absent: {type(e).__name__}"
+        res["ddp_find_unused_default"] = f"ERR {type(e).__name__}: {e}"[:200]
     enc = tt(DOCS, return_tensors = "pt", padding = True)
     dev = model.get_input_embeddings().weight.device
     batch = {"input_ids": enc["input_ids"].to(dev), "attention_mask": enc["attention_mask"].to(dev),
@@ -1272,6 +1283,7 @@ def cell_tok_save():
 
 
 CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cell_hd512("gemma4"),
+         "hd512_gemma4_nc": lambda: cell_hd512("gemma4"),
          "seqcls": cell_seqcls, "tok_save": cell_tok_save,
          "gcnr_qwen3": lambda: cell_gc(True), "gcdef_qwen3": lambda: cell_gc(False),
          "gcnr_gemma3": lambda: cell_gc(True), "gcdef_gemma3": lambda: cell_gc(False), "lora_noac": cell_lora_noac,
@@ -1286,6 +1298,8 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
 def main():
     if args.cell == "moe":
         os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
+    if args.cell.endswith("_nc"):
+        os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"  # diagnostic twin: same cell, no Unsloth compile
     if args.cell == "grpo_vl":
         os.environ["UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY"] = "1"
     t0 = time.time()
