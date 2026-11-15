@@ -140,20 +140,30 @@ def _bench_op(torch, gcc, iters):
             "torch_rel": {n: ((a - r).norm() / r.norm()).item() for n, a, r in zip(names, tor, ref)},
         }
     timing = {}
-    for name, fn in (("triton", triton_path), ("torch", torch_path)):
-        x, w, b = (t.detach().to(torch.bfloat16).clone().requires_grad_() for t in (x0, w0, b0))
-        d = dy.to(torch.bfloat16)
-        for _ in range(3):
-            fn(x, w, b).backward(d)
-        _sync(torch)
-        ts = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            fn(x, w, b).backward(d)
+    # channel_last = the model's layout: in_proj_qkv(h).transpose(1, 2), a (B, T, D) buffer viewed as (B, D, T).
+    for layout in ("channel_first", "channel_last"):
+        for name, fn in (("triton", triton_path), ("torch", torch_path)):
+            if layout == "channel_first":
+                leaf = x0.detach().to(torch.bfloat16).clone().requires_grad_()
+                view = lambda: leaf
+                d = dy.to(torch.bfloat16)
+            else:
+                leaf = x0.detach().to(torch.bfloat16).transpose(1, 2).contiguous().requires_grad_()
+                view = lambda: leaf.transpose(1, 2)
+                d = dy.to(torch.bfloat16).transpose(1, 2).contiguous().transpose(1, 2)
+            w, b = (t.detach().to(torch.bfloat16).clone().requires_grad_() for t in (w0, b0))
+            for _ in range(3):
+                fn(view(), w, b).backward(d)
             _sync(torch)
-            ts.append(time.perf_counter() - t0)
-        ts.sort()
-        timing[name] = {"median_ms": ts[len(ts) // 2] * 1e3, "min_ms": ts[0] * 1e3, "max_ms": ts[-1] * 1e3}
+            ts = []
+            for _ in range(iters):
+                t0 = time.perf_counter()
+                fn(view(), w, b).backward(d)
+                _sync(torch)
+                ts.append(time.perf_counter() - t0)
+            ts.sort()
+            key = name if layout == "channel_first" else f"{name}_channel_last"
+            timing[key] = {"median_ms": ts[len(ts) // 2] * 1e3, "min_ms": ts[0] * 1e3, "max_ms": ts[-1] * 1e3}
     out["timing_bf16_fwd_bwd"] = timing
     return out
 

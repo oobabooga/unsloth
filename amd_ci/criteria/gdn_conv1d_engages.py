@@ -55,8 +55,10 @@ def table(obs):
     row("bf16 4B-width model, B=1 T=2048, counters", lambda o: str(o["model_bench"]["stats"]))
     row("bf16 4B-width model, median s per fwd+bwd step", lambda o: f"{o['model_bench']['median_s']:.3f} "
         f"(min {o['model_bench']['step_s'][0]:.3f}, max {o['model_bench']['step_s'][-1]:.3f})")
-    row("conv op D=8192 T=2048 bf16 fwd+bwd, Triton ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['triton']['median_ms']:.2f}")
-    row("conv op D=8192 T=2048 bf16 fwd+bwd, torch ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['torch']['median_ms']:.2f}")
+    row("conv op D=8192 T=2048 bf16 fwd+bwd, channel-first, Triton ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['triton']['median_ms']:.2f}")
+    row("conv op D=8192 T=2048 bf16 fwd+bwd, channel-first, torch ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['torch']['median_ms']:.2f}")
+    row("conv op, model layout (channel-last), Triton ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['triton_channel_last']['median_ms']:.2f}")
+    row("conv op, model layout (channel-last), torch ms", lambda o: f"{o['op']['timing_bf16_fwd_bwd']['torch_channel_last']['median_ms']:.2f}")
     for dt in OP_RTOL:
         row(f"conv op {dt} rel err vs fp64 (Triton / torch)", lambda o, dt = dt: ", ".join(
             f"{k} {o['op'][dt]['triton_rel'][k]:.1e} / {o['op'][dt]['torch_rel'][k]:.1e}" for k in ("y", "dx", "dw", "db")))
