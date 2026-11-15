@@ -1,0 +1,387 @@
+diff --git a/tests/test_block_compile.py b/tests/test_block_compile.py
+index 6e368cfb5c..476d3b35c7 100644
+--- a/tests/test_block_compile.py
++++ b/tests/test_block_compile.py
+@@ -771,6 +771,26 @@ def test_kill_switch(monkeypatch):
+     assert M._torch_supported()
+ 
+ 
++@pytest.mark.parametrize("version", ["2.6.0+cu124", "2.5.1"])
++def test_old_torch_installs_nothing(monkeypatch, version):
++    """#10744: torch < 2.7 keeps every layer on the stock forward (no class wrapped, nothing compiled)."""
++    M = _load()
++    calls = []
++    monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(1) or fn)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch, "__version__", version)
++    cls = _toy_class()
++    model = torch.nn.Module()
++    model.layers = torch.nn.ModuleList([cls(), cls()])
++    original = cls.forward
++    assert M.patch_block_compile(model) == []
++    assert cls.forward is original
++    model.layers[0](torch.randn(2, 4, 8, requires_grad = True)).sum().backward()
++    assert calls == []
++    monkeypatch.setattr(torch, "__version__", "2.7.1+cu126")
++    assert M.patch_block_compile(model) == [cls.__name__]
++
++
+ def test_forced_float32_is_decided_per_model(monkeypatch):
+     M = _load()
+     calls = []
+@@ -1129,6 +1149,7 @@ def test_short_gqa_flex_block_stays_compiled():
+ @pytest.mark.skipif(not has_real_cuda(), reason = "fla kernels need CUDA")
+ def test_qwen3_5_gdn_block_has_no_break():
+     pytest.importorskip("unsloth")
++    pytest.importorskip("transformers.models.qwen3_5")  # transformers >= 5.2
+     pytest.importorskip("fla.ops.gated_delta_rule")
+     from transformers.models.qwen3_5 import modeling_qwen3_5 as modeling
+     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+@@ -1175,6 +1196,13 @@ def test_qwen3_5_gdn_block_has_no_break():
+         counters.clear()
+         got = [_grads_after_step(layers, run, xi.clone().requires_grad_()) for xi in x]
+         assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
++        # A layer that fell back to the stock forward also has no break: the block must have run (the
++        # grouped value heads, 4 q / k vs 16 v heads, demoted it on transformers 5.23 before the fix).
++        for layer in layers:
++            assert layer.__dict__.get("_unsloth_block_mode") == M._FULL, layer.__dict__.get(
++                "_unsloth_block_mode"
++            )
++            assert layer.__dict__.get("_unsloth_block_checked", 0) & 2
+     finally:
+         cls.forward = original
+         torch._dynamo.reset()
+@@ -1189,14 +1217,35 @@ def test_qwen3_5_gdn_block_has_no_break():
+             )
+ 
+ 
++def test_gdn_op_name_pins_its_fake_meta():
++    """Inductor's on-disk caches key on the graph, which names the op but not its fake meta: a changed fake under
++    the same name replays the old output shapes (A with the q / k heads), so every grouped value head layer was
++    demoted to the stock forward wherever an older Unsloth had compiled it. One op name, one fake meta."""
++    M = _load("_gdn_op")
++    if M._gdn_chunk is None:
++        pytest.skip("torch without torch.library.custom_op")
++    q = torch.empty(2, 64, 4, 32, device = "meta", dtype = torch.bfloat16)
++    v = torch.empty(2, 64, 16, 32, device = "meta", dtype = torch.bfloat16)
++    g = torch.empty(2, 64, 16, device = "meta")
++    A = [tuple(shape) for shape, _ in M._chunk_meta(q, q, v, g)][-1]
++    published = {
++        "unsloth::qwen3_5_gdn_chunk": (2, 64, 4, 64),
++        "unsloth::qwen3_5_gdn_chunk_v2": (2, 64, 16, 64),
++    }
++    assert published[M._gdn_chunk._qualname] == A, (M._gdn_chunk._qualname, A)
++
++
+ @pytest.mark.skipif(not has_real_cuda(), reason = "fla kernels need a GPU")
+-def test_opaque_fla_op_matches_fla_function():
++@pytest.mark.parametrize("qk_heads", [4, 2], ids = ["equal_heads", "grouped_value_heads"])
++def test_opaque_fla_op_matches_fla_function(qk_heads):
++    """grouped_value_heads: transformers 5.23 passes q / k unrepeated (huggingface/transformers#49141); the fake
++    meta of A had the q / k head count, so Inductor's output check failed and every GVA layer ran stock."""
+     pytest.importorskip("fla.ops.gated_delta_rule.chunk")
+     M = _load("_gdn_op")
+     gen = torch.Generator(device = "cuda").manual_seed(0)
+     B, T, H, D = 2, 150, 4, 128
+     mk = lambda *s, dt = torch.bfloat16: torch.randn(*s, device = "cuda", dtype = dt, generator = gen)
+-    q, k, v = mk(B, T, H, D), mk(B, T, H, D), mk(B, T, H, D)
++    q, k, v = mk(B, T, qk_heads, D), mk(B, T, qk_heads, D), mk(B, T, H, D)
+     g = -mk(B, T, H, dt = torch.float32).abs() * 0.1
+     beta = mk(B, T, H).sigmoid()
+     assert M._fla_ops(lambda: (q, k, v, g, beta))
+@@ -1219,7 +1268,7 @@ def test_gdn_adapter_routes_only_the_self_checked_call(monkeypatch):
+     monkeypatch.setattr(
+         torch.ops,
+         "unsloth",
+-        types.SimpleNamespace(qwen3_5_gdn_chunk = lambda *a: seen.append("op") or ("out",)),
++        types.SimpleNamespace(qwen3_5_gdn_chunk_v2 = lambda *a: seen.append("op") or ("out",)),
+         raising = False,
+     )
+     adapter = M._gdn_chunk_adapter(lambda *a, **kw: seen.append("fla") or ("fla", None))
+@@ -1253,7 +1302,7 @@ def test_gdn_adapter_routes_packed_batches_once_self_checked(monkeypatch):
+         return ("out",)
+ 
+     monkeypatch.setattr(
+-        torch.ops, "unsloth", types.SimpleNamespace(qwen3_5_gdn_chunk = op), raising = False
++        torch.ops, "unsloth", types.SimpleNamespace(qwen3_5_gdn_chunk_v2 = op), raising = False
+     )
+     adapter = M._gdn_chunk_adapter(lambda *a, **kw: seen.append(("fla", None)) or ("fla", None))
+     stock = dict(use_qk_l2norm_in_kernel = True, initial_state = None, output_final_state = False)
+@@ -1291,7 +1340,7 @@ def test_gdn_adapter_ignores_kwargs_the_hub_wrapper_drops(monkeypatch):
+     monkeypatch.setattr(
+         torch.ops,
+         "unsloth",
+-        types.SimpleNamespace(qwen3_5_gdn_chunk = lambda *a: seen.append("op") or ("out",)),
++        types.SimpleNamespace(qwen3_5_gdn_chunk_v2 = lambda *a: seen.append("op") or ("out",)),
+         raising = False,
+     )
+     fla = lambda *a, **kw: seen.append("fla") or ("fla", None)
+@@ -1400,6 +1449,51 @@ def test_causal_depthwise_conv_matches_conv1d():
+     torch.testing.assert_close(M._causal_depthwise_conv(x, w), want, rtol = 1e-5, atol = 1e-5)
+ 
+ 
++@pytest.mark.parametrize("call", ["positional", "x_keyword"])
++def test_causal_conv_adapter_takes_both_call_conventions(call):
++    """transformers < 5.15 GatedDeltaNet calls self.causal_conv1d_fn(x = ..., weight = ..., ...): the adapter
++    required `hidden_states`, so a Qwen3-Next model built after the first block forward raised TypeError."""
++    M = _load()
++    G = _load("_gdn_op")
++    seen = []
++
++    def legacy(
++        x,
++        weight,
++        bias = None,
++        activation = None,
++        seq_idx = None,
++        **kwargs,
++    ):
++        seen.append(sorted(kwargs) + (["seq_idx"] if seq_idx is not None else []))
++        out = torch.nn.functional.conv1d(
++            x, weight[:, None], bias, groups = x.shape[1], padding = weight.shape[-1] - 1
++        )
++        out = out[..., : x.shape[-1]]
++        return torch.nn.functional.silu(out) if activation else out
++
++    fn = M._causal_conv1d_adapter(legacy, G._causal_depthwise_conv)
++    torch.manual_seed(0)
++    x, w, b = torch.randn(2, 6, 17), torch.randn(6, 4), torch.randn(6)
++
++    def call_it(f):
++        if call == "positional":
++            return f(x, w, b, activation = "silu")
++        return f(x = x, weight = w, bias = b, activation = "silu", seq_idx = None)
++
++    want = call_it(legacy)
++    torch.testing.assert_close(call_it(fn), want)  # eager: passes through unchanged
++    M._IN_BLOCK[0] = M._FULL
++    try:
++        seen.clear()
++        got = torch.compile(lambda: call_it(fn), backend = "eager", fullgraph = True)()
++    finally:
++        M._IN_BLOCK[0] = M._OFF
++        torch._dynamo.reset()
++    assert seen == []  # in-block: the traceable depthwise conv, not the legacy kernel
++    torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
++
++
+ def test_disable_unless_decode_keeps_original_traceable_on_old_torch(monkeypatch):
+     # torch < 2.8: compiler.disable(fn, recursive = False) marks fn itself and returns it.
+     import unsloth.import_fixes as F
+@@ -1661,6 +1755,40 @@ def test_router_logits_after_a_forward_without_them(request, monkeypatch):
+     torch._dynamo.reset()
+ 
+ 
++@pytest.mark.parametrize("registry_kind", ["dict", "model_keyed"])
++def test_router_hooks_install_with_either_registry_api(monkeypatch, registry_kind):
++    """transformers 5.23 (huggingface/transformers#49594) made _CAN_RECORD_REGISTRY a dict subclass whose
++    .get takes the model and stringifies its class, so .get(<class string>) answered {} and no router hook
++    was installed up front (the IndexError above came back). Keys are still the class strings."""
++    M = _load()
++
++    class Registry(dict):
++        def get(self, model):
++            return super().get(str(model.__class__)) or {}
++
++    class Collector:
++        _unsloth_eager_mirror = True
++
++    class MoeModel(torch.nn.Module):
++        pass
++
++    registry = (dict if registry_kind == "dict" else Registry)()
++    dict.__setitem__(registry, str(MoeModel), {"router_logits": object()})
++    installed = []
++    fake = types.ModuleType("transformers.utils.output_capturing")
++    fake._CAN_RECORD_REGISTRY = registry
++    fake.maybe_install_capturing_hooks = installed.append
++    fake.CompileableContextVar = Collector
++    monkeypatch.setitem(sys.modules, "transformers.utils.output_capturing", fake)
++    import transformers.utils
++
++    monkeypatch.setattr(transformers.utils, "output_capturing", fake, raising = False)
++    model = MoeModel()
++    model.inner = torch.nn.Linear(2, 2)
++    assert M._install_router_capture_hooks(model) == 1
++    assert installed == [model]
++
++
+ def test_router_hooks_are_not_installed_twice_after_an_eager_capture(request, monkeypatch):
+     """Failing before: an eager capturing forward hooks the inner model; installing on the unflagged outer
+     CausalLM recursed into it again and every captured tuple held each layer twice."""
+diff --git a/tests/test_compressed_tensors_int4.py b/tests/test_compressed_tensors_int4.py
+index e8be8994b6..7914a927e0 100644
+--- a/tests/test_compressed_tensors_int4.py
++++ b/tests/test_compressed_tensors_int4.py
+@@ -308,6 +308,34 @@ def _repacked_linear():
+     return lin, packed, ref
+ 
+ 
++@needs_gpu
++@needs_ct
++def test_weight_property_traces_without_a_graph_break():
++    """PEFT's LoRA forward reads base_layer.weight inside Unsloth's compiled block, under the gradient
++    checkpoint's higher-order op. The property read the packed parameter's __dict__, which Dynamo cannot put in
++    that subgraph: one graph break per LoRA layer (compressed-tensors QLoRA, transformers 5.x)."""
++    import torch.utils.checkpoint as cp
++    from torch._dynamo.utils import counters
++
++    lin, _, _ = _repacked_linear()
++    x = torch.randn(4, 8, device = "cuda", requires_grad = True)
++
++    def body(t):
++        w = lin.weight
++        return t * w.shape[0] + (w.quant_state is not None)
++
++    torch._dynamo.reset()
++    counters.clear()
++    try:
++        got = torch.compile(lambda t: cp.checkpoint(body, t, use_reentrant = False), backend = "eager")(
++            x
++        )
++    finally:
++        torch._dynamo.reset()
++    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
++    torch.testing.assert_close(got, x * 256 + 1)
++
++
+ @needs_gpu
+ @needs_ct
+ @needs_sm80
+diff --git a/unsloth/models/_block_compile.py b/unsloth/models/_block_compile.py
+index ebe2cdb776..bd3faccc1f 100644
+--- a/unsloth/models/_block_compile.py
++++ b/unsloth/models/_block_compile.py
+@@ -925,9 +925,9 @@ def _gdn_chunk_adapter(original):
+             q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+             scale = q.shape[-1] ** -0.5
+             if cu_seqlens is None:
+-                out = torch.ops.unsloth.qwen3_5_gdn_chunk(q, k, v, g, beta, scale)
++                out = torch.ops.unsloth.qwen3_5_gdn_chunk_v2(q, k, v, g, beta, scale)
+             else:
+-                out = torch.ops.unsloth.qwen3_5_gdn_chunk(
++                out = torch.ops.unsloth.qwen3_5_gdn_chunk_v2(
+                     q, k, v, g, beta, scale, cu_seqlens.contiguous()
+                 )
+             return out[0], None
+@@ -1005,17 +1005,23 @@ def _route_fla_callers(gc):
+ 
+ def _causal_conv1d_adapter(original, depthwise_conv):
+     # Inductor's conv backward guards on the exact sequence length: recompile per length.
++    # transformers 5.x calls (hidden_states, weight, bias, activation = ...); the < 5.15 GatedDeltaNet calls
++    # self.causal_conv1d_fn(x = ..., weight = ..., bias = ..., activation = ..., seq_idx = None) (the
++    # causal-conv1d package API). Arguments pass through to `original` exactly as given.
+     @functools.wraps(original, updated = ())
+-    def causal_conv1d_fn(
+-        hidden_states,
+-        weight,
+-        bias = None,
+-        activation = None,
+-        **kwargs,
+-    ):
++    def causal_conv1d_fn(*args, **kwargs):
++        named = dict(zip(("hidden_states", "weight", "bias", "activation"), args))
++        x_key = "x" if "x" in kwargs else "hidden_states"
++        hidden_states = named.get("hidden_states", kwargs.get(x_key))
++        weight = named.get("weight", kwargs.get("weight"))
++        bias = named.get("bias", kwargs.get("bias"))
++        activation = named.get("activation", kwargs.get("activation"))
+         if (
+             _IN_BLOCK[0]
+             and torch.compiler.is_compiling()
++            and len(args) <= 4
++            and hidden_states is not None
++            and weight is not None
+             and weight.dim() == 2
+             and activation in (None, "silu", "swish")
+             and all(kwargs.get(key) is None for key in ("seq_idx", "cu_seqlens", "initial_states"))
+@@ -1027,7 +1033,7 @@ def _causal_conv1d_adapter(original, depthwise_conv):
+             if activation is not None:
+                 out = torch.nn.functional.silu(out)
+             return out.to(hidden_states.dtype)
+-        return original(hidden_states, weight, bias, activation = activation, **kwargs)
++        return original(*args, **kwargs)
+ 
+     causal_conv1d_fn._unsloth_block_adapter = True
+     return causal_conv1d_fn
+@@ -1130,6 +1136,11 @@ def _prepare_gdn(layer, hidden_states):
+         from ._gdn_op import _fla_ops, varlen_ok
+ 
+         heads, dk, dv = gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim
++        # transformers >= 5.23 passes q / k unrepeated (grouped value heads, huggingface/transformers#49141):
++        # check with that layout, the general case of the fake metas.
++        qk_heads = getattr(gdn, "num_k_heads", heads)
++        if not qk_heads or heads % qk_heads:
++            qk_heads = heads
+         B, T = hidden_states.shape[0], hidden_states.shape[1]
+         dev, dt = hidden_states.device, hidden_states.dtype
+ 
+@@ -1138,8 +1149,8 @@ def _prepare_gdn(layer, hidden_states):
+             r = lambda *s, dtype = dt: torch.randn(*s, device = dev, dtype = dtype, generator = gen)
+             g = -torch.rand(B, T, heads, device = dev, generator = gen) * 0.1
+             return (
+-                r(B, T, heads, dk),
+-                r(B, T, heads, dk),
++                r(B, T, qk_heads, dk),
++                r(B, T, qk_heads, dk),
+                 r(B, T, heads, dv),
+                 g,
+                 r(B, T, heads).sigmoid(),
+@@ -2021,7 +2032,9 @@ def _install_router_capture_hooks(model):
+     # recursion does not check that flag, so a module with an already hooked descendant (an earlier eager
+     # capturing forward) is skipped: installing it would hook that descendant twice (duplicated outputs).
+     for module in model.modules():
+-        flags = registry.get(str(type(module))) or {}
++        # dict.get: transformers 5.23's _CanRecordRegistry.get takes the model and stringifies its class itself
++        # (huggingface/transformers#49594), so its .get on our class string always answered {}. Keys stay strings.
++        flags = dict.get(registry, str(type(module))) or {}
+         if "router_logits" not in flags or any(
+             getattr(m, "_output_capturing_hooks_installed", False) for m in module.modules()
+         ):
+diff --git a/unsloth/models/_gdn_op.py b/unsloth/models/_gdn_op.py
+index d0bc526579..1dd5a400d7 100644
+--- a/unsloth/models/_gdn_op.py
++++ b/unsloth/models/_gdn_op.py
+@@ -77,20 +77,24 @@ def _varlen_kwargs(fn, cu_seqlens):
+ 
+ 
+ def _chunk_meta(q, k, v, g):
+-    # (qn, q_rstd, kn, k_rstd, g_cumsum, A), as fla 0.5 allocates them
++    # (qn, q_rstd, kn, k_rstd, g_cumsum, A), as fla 0.5 allocates them. A is per value head: with grouped
++    # value heads (q / k with fewer heads than v, passed unrepeated since transformers 5.23) it is [B, T, HV, 64].
+     return (
+         (q.shape, q.dtype),
+         (q.shape[:-1], torch.float32),
+         (k.shape, k.dtype),
+         (k.shape[:-1], torch.float32),
+         (g.shape, torch.float32),
+-        ((*k.shape[:-1], 64), k.dtype),
++        ((*v.shape[:-1], 64), k.dtype),
+     )
+ 
+ 
++# Inductor's on-disk FX graph / AOTAutograd caches key on the graph, which names the op but not its fake: a fake
++# meta change under the same name replays the old output shapes and demotes every layer. Rename on each change
++# (_v2: A per value head, transformers 5.23 grouped value heads).
+ try:
+ 
+-    @torch.library.custom_op("unsloth::qwen3_5_gdn_chunk", mutates_args = ())
++    @torch.library.custom_op("unsloth::qwen3_5_gdn_chunk_v2", mutates_args = ())
+     def _gdn_chunk(
+         q: torch.Tensor,
+         k: torch.Tensor,
+diff --git a/unsloth/models/compressed_tensors_int4.py b/unsloth/models/compressed_tensors_int4.py
+index 8a92d11c03..2dc4c4f4ca 100644
+--- a/unsloth/models/compressed_tensors_int4.py
++++ b/unsloth/models/compressed_tensors_int4.py
+@@ -132,7 +132,9 @@ class Int4PackedLinear(nn.Linear):
+     def weight(self):
+         # The packed int32 words with `.quant_state`: the bitsandbytes contract Unsloth's kernels read.
+         packed = self._parameters["weight_packed"]
+-        if packed.__dict__.get("quant_state") is None:
++        # getattr, not packed.__dict__: Dynamo cannot put a tensor's __dict__ in a graph, so reading it
++        # broke every compiled block once per LoRA layer (PEFT's forward reads base_layer.weight).
++        if getattr(packed, "quant_state", None) is None:
+             self.quant_state
+         return packed
+ 
