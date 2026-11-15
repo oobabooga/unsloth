@@ -40,6 +40,11 @@ MODELS = {
     "flm4": "built:llama",
     "rl_decode": "built:llama",
     "gcmem": "built:llama",
+    "ctnvfp4": "built:ct-nvfp4-qwen3moe",
+    "ctmxfp8": "built:ct-mxfp8-qwen3moe",
+    "mxfp4probe": None,
+    "grpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
+    "dpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     "vision": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     "moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
     "gemma4": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
@@ -60,7 +65,7 @@ COUNTER_MODULES = (
 )
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--cell", required = True, choices = ["env", "build", *MODELS])
+ap.add_argument("--cell", required = True, choices = ["env", "build", "build_ct", *MODELS])
 ap.add_argument("--out", required = True)
 ap.add_argument("--steps", type = int, default = 5)
 ap.add_argument("--lr", type = float, default = 5e-3)
@@ -637,8 +642,241 @@ def cell_gcmem():
     res["finite"] = all(math.isfinite(v["loss"]) for v in out.values())
     res["decreasing"] = None
 
+CT_E, CT_H, CT_I = 4, 64, 32
 
-CELLS = {"gcmem": cell_gcmem, "env": cell_env, "flm16": lambda: cell_flm(False), "flm4": lambda: cell_flm(True), "vision": cell_vision,
+
+def ct_dir(fmt):
+    return os.path.abspath(os.path.join(os.path.dirname(args.model_dir or args.out), f"ct_{fmt}_qwen3moe"))
+
+
+def build_ct():
+    """Tiny Qwen3-MoE with per-expert compressed-tensors NVFP4 / MXFP8 experts (the layout of #17848's test), quantized
+    with unsloth_zoo.packed_experts from the PAIRED zoo head (the probe puts it on PYTHONPATH), so every state loads the
+    same bytes. Needs compressed_tensors."""
+    import torch
+    import transformers
+    from compressed_tensors.quantization import QuantizationConfig, preset_name_to_scheme
+    from safetensors.torch import save_file
+    import unsloth_zoo.packed_experts as pe
+    res["builder_zoo"] = pe.__file__
+    for fmt, (preset, ct_format) in {"nvfp4": ("NVFP4A16", "nvfp4-pack-quantized"),
+                                     "mxfp8": ("MXFP8A16", "mxfp8-quantized")}.items():
+        d = ct_dir(fmt)
+        if os.path.isfile(os.path.join(d, "config.json")):
+            continue
+        tmp = f"{d}.tmp{os.getpid()}"
+        os.makedirs(tmp, exist_ok = True)
+        cfg = transformers.Qwen3MoeConfig(vocab_size = 32000, hidden_size = CT_H, intermediate_size = 128,
+                                          moe_intermediate_size = CT_I, num_experts = CT_E, num_experts_per_tok = 2,
+                                          num_hidden_layers = 2, num_attention_heads = 2, num_key_value_heads = 1,
+                                          head_dim = 32, decoder_sparse_step = 1, mlp_only_layers = [],
+                                          tie_word_embeddings = False)
+        torch.manual_seed(0)
+        model = transformers.Qwen3MoeForCausalLM(cfg).to(torch.bfloat16)
+        state = {k: v.contiguous() for k, v in model.state_dict().items()
+                 if ".mlp.experts.gate_up_proj" not in k and ".mlp.experts.down_proj" not in k}
+        for layer in range(2):
+            ex = model.model.layers[layer].mlp.experts
+            for e in range(CT_E):
+                for proj, w in (("gate_proj", ex.gate_up_proj.data[e, :CT_I]), ("up_proj", ex.gate_up_proj.data[e, CT_I:]),
+                                ("down_proj", ex.down_proj.data[e])):
+                    q = (pe.quantize_experts_nvfp4 if fmt == "nvfp4" else pe.quantize_experts_mxfp8)(w[None].float())
+                    if fmt == "nvfp4":
+                        packed = {"weight_packed": q.data[0], "weight_scale": q.packed_scales[0].view(torch.float8_e4m3fn),
+                                  "weight_global_scale": q.packed_global[0].reshape(1).clone()}
+                    else:
+                        packed = {"weight": q.data[0].view(torch.float8_e4m3fn), "weight_scale": q.packed_scales[0]}
+                    for suffix, t in packed.items():
+                        state[f"model.layers.{layer}.mlp.experts.{e}.{proj}.{suffix}"] = t.contiguous()
+        save_file(state, os.path.join(tmp, "model.safetensors"), metadata = {"format": "pt"})
+        config = model.config.to_dict()
+        scheme = preset_name_to_scheme(preset, [r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$"])
+        quant = QuantizationConfig(config_groups = {"group_0": scheme}, format = ct_format,
+                                   quantization_status = "compressed", ignore = ["lm_head"])
+        q = json.loads(json.dumps(quant.model_dump(exclude_none = False), default = str))
+        q["quant_method"] = "compressed-tensors"
+        config["quantization_config"] = q
+        with open(os.path.join(tmp, "config.json"), "w", encoding = "utf-8") as fh:
+            json.dump(config, fh)
+        transformers.AutoTokenizer.from_pretrained(LLAMA_TOKENIZER).save_pretrained(tmp)
+        try:
+            os.rename(tmp, d)
+        except OSError:
+            pass
+    res["ct_dirs"] = [ct_dir("nvfp4"), ct_dir("mxfp8")]
+
+
+def cell_ct(fmt):
+    """compressed-tensors NVFP4 / MXFP8 MoE through FastLanguageModel, LoRA on attention + experts, 5 steps.
+    Engagement: packed expert parameters installed and the packed op called (zoo PACKED_EXPERT_STATS)."""
+    import torch
+    from unsloth import FastLanguageModel
+    versions()
+    d = ct_dir(fmt)
+    if not os.path.isfile(os.path.join(d, "config.json")):
+        raise RuntimeError(f"tiny {fmt} checkpoint missing ({d}): build_ct failed")
+    stage("load")
+    model, tok = FastLanguageModel.from_pretrained(d, max_seq_length = 256, dtype = torch.bfloat16, load_in_4bit = False)
+    res["expert_param_types"] = sorted({type(p).__name__ for n, p in model.named_parameters() if ".experts." in n})
+    res["expert_param_dtypes"] = sorted({str(p.dtype) for n, p in model.named_parameters() if ".experts." in n})
+    model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none",
+                                             target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
+                                             random_state = 0)
+    lora_stats(model)
+    gc = GCCounter(model)
+    try:
+        import unsloth_zoo.packed_experts as pe
+        before = dict(pe.PACKED_EXPERT_STATS)
+    except Exception as e:  # noqa: BLE001
+        pe, before = None, {}
+        res["packed_experts_module"] = f"absent: {type(e).__name__}"
+    batch = text_batch(tok, model.get_input_embeddings().weight.device)
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    manual_loop(model, batch, args.steps, gc)
+    peak()
+    res["gc_calls"] = gc.calls
+    if pe is not None:
+        after = dict(pe.PACKED_EXPERT_STATS)
+        res["packed_expert_stats_delta"] = {k: after.get(k, 0) - before.get(k, 0) for k in after
+                                            if isinstance(after.get(k), (int, float))}
+
+
+def cell_mxfp4probe():
+    """zoo #2528: does the fused MXFP4 grouped GEMM still probe / engage here? Availability flags, then a direct
+    fwd + bwd through mxfp4_expert_grouped_mm against dequantize + matmul."""
+    import torch
+    import triton
+    versions()
+    import unsloth_zoo.mxfp4_gemm as mg
+    from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
+    res["triton_version"] = triton.__version__
+    res["triton_too_old_gate"] = safe(lambda: mg._triton_too_old()) if hasattr(mg, "_triton_too_old") else "<absent>"
+    res["grouped_available"] = safe(lambda: mg.mxfp4_grouped_mm_available())
+    res["gemm_available"] = safe(lambda: mg.mxfp4_gemm_available())
+    dev = torch.device("cuda", 0)
+    gen = torch.Generator(device = dev).manual_seed(0)
+    E, R, G = 4, 128, 4
+    blocks = torch.randint(0, 256, (E, R, G, 16), dtype = torch.uint8, device = dev, generator = gen)
+    scales = torch.randint(118, 130, (E, R, G), dtype = torch.uint8, device = dev, generator = gen)
+    counts = torch.tensor([7, 0, 20, 5], dtype = torch.int32, device = dev)
+    x = torch.randn(32, G * 32, dtype = torch.bfloat16, device = dev, generator = gen).requires_grad_()
+    dense = mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16).float()
+    rows = torch.repeat_interleave(torch.arange(E, device = dev), counts.long())
+    y = mg.mxfp4_expert_grouped_mm(x, blocks, scales, counts, transpose_b = True)
+    gy = torch.randn_like(y)
+    (y.float() * gy.float()).sum().backward()
+    xr = x.detach().float().requires_grad_()
+    yr = torch.bmm(xr.unsqueeze(1), dense[rows].transpose(1, 2)).squeeze(1)
+    (yr * gy.float()).sum().backward()
+    res["fwd_rel"] = float((y.float() - yr).norm() / yr.norm())
+    res["bwd_rel"] = float((x.grad.float() - xr.grad).norm() / xr.grad.norm())
+    res["finite"] = bool(torch.isfinite(y).all() and torch.isfinite(x.grad).all())
+    res["engaged"] = bool(res["grouped_available"] is True and res["fwd_rel"] < 2e-2 and res["bwd_rel"] < 2e-2)
+    res["losses"], res["decreasing"] = [res["fwd_rel"]], None
+
+
+def _vl_dataset(kind):
+    from datasets import Dataset
+    from PIL import Image, ImageDraw
+    rows = []
+    for i in range(4):
+        img = Image.new("RGB", (32, 32), (255, 255, 255))
+        ImageDraw.Draw(img).rectangle([8, 8, 24, 24], fill = [(220, 40, 40), (40, 80, 220)][i % 2])
+        prompt = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": f"Color {i}?"}]}]
+        if kind == "dpo":
+            rows.append({"images": [img], "prompt": prompt,
+                         "chosen": [{"role": "assistant", "content": [{"type": "text", "text": "It is red, a warm color."}]}],
+                         "rejected": [{"role": "assistant", "content": [{"type": "text", "text": "Blue" * (1 + i)}]}]})
+        else:
+            rows.append({"image": img, "prompt": prompt})
+    return Dataset.from_list(rows)
+
+
+def _cfg(cls, **kw):
+    import inspect
+    names = set(inspect.signature(cls.__init__).parameters)
+    res["config_dropped"] = sorted(k for k in kw if k not in names)
+    return cls(**{k: v for k, v in kw.items() if k in names})
+
+
+def _vl_model():
+    import torch
+    from unsloth import FastVisionModel
+    model, proc = FastVisionModel.from_pretrained(MODELS["grpo_vl"], max_seq_length = 512, dtype = torch.bfloat16,
+                                                  load_in_4bit = False)
+    model = FastVisionModel.get_peft_model(model, finetune_vision_layers = True, finetune_language_layers = True,
+                                           r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none", random_state = 0,
+                                           use_gradient_checkpointing = "unsloth")
+    FastVisionModel.for_training(model)
+    return model, proc
+
+
+def cell_grpo_vl():
+    """zoo #2530: a vision GRPO step through Unsloth's GRPO trainer; counts fused_linear_grpo_loss forward-gradient
+    calls (UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1 so a frozen head without an entropy bonus may take the route)."""
+    import torch
+    from trl import GRPOConfig, GRPOTrainer
+    versions()
+    stage("load")
+    model, proc = _vl_model()
+    import unsloth_zoo.fused_losses.fused_linear as fl
+    before = dict(fl.CALLS)
+
+    def reward(completions, **kw):
+        return [float(len(str(c))) / 10.0 for c in completions]
+    cfg = _cfg(GRPOConfig, output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), "trainer_grpo_vl"),
+               per_device_train_batch_size = 2, num_generations = 2, max_completion_length = 8, max_prompt_length = None,
+               max_steps = 2, learning_rate = 5e-5, logging_steps = 1, report_to = "none", bf16 = True, seed = 0,
+               save_strategy = "no", temperature = 1.0, use_vllm = False, remove_unused_columns = False)
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    trainer = GRPOTrainer(model = model, reward_funcs = [reward], args = cfg, train_dataset = _vl_dataset("grpo"),
+                          processing_class = proc)
+    res["trainer_class"] = type(trainer).__name__
+    trainer.train()
+    peak()
+    after = dict(fl.CALLS)
+    res["fused_calls_delta"] = {k: after.get(k, 0) - before.get(k, 0) for k in after if after.get(k, 0) != before.get(k, 0)}
+    res["grpo_fused_engaged"] = res["fused_calls_delta"].get("grpo_fwd_grad", 0) > 0
+    logs = [h for h in trainer.state.log_history if "loss" in h]
+    finish_losses([float(h["loss"]) for h in logs])
+    res["decreasing"] = None  # 2 RL steps: finite and completed is the bar, not a falling loss
+    res["rewards"] = [h.get("reward") for h in logs]
+
+
+def cell_dpo_vl():
+    """unsloth #17850: a vision DPO run; counts the chunked DPO head (trainer._unsloth_dpo_chunked_calls). The chunked
+    head rewrites concatenated_forward, which TRL >= 0.29 no longer has: there it cannot engage."""
+    import torch
+    import trl
+    from trl import DPOConfig, DPOTrainer
+    versions()
+    res["trl_has_concatenated_forward"] = hasattr(DPOTrainer, "concatenated_forward")
+    stage("load")
+    model, proc = _vl_model()
+    cfg = _cfg(DPOConfig, output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), "trainer_dpo_vl"),
+               per_device_train_batch_size = 2, max_steps = args.steps, learning_rate = 5e-4, logging_steps = 1,
+               report_to = "none", bf16 = True, seed = 0, save_strategy = "no", max_length = None,
+               max_prompt_length = None, remove_unused_columns = False, dataset_num_proc = None,
+               lr_scheduler_type = "constant", warmup_steps = 0)
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    trainer = DPOTrainer(model = model, ref_model = None, args = cfg, train_dataset = _vl_dataset("dpo"),
+                         processing_class = proc)
+    res["trainer_class"] = type(trainer).__name__
+    trainer.train()
+    peak()
+    res["dpo_chunked_calls"] = getattr(trainer, "_unsloth_dpo_chunked_calls", None)
+    res["dpo_chunked_fallbacks"] = str(trainer.__dict__.get("_unsloth_dpo_chunked_fallbacks"))[:400]
+    res["dpo_chunked_engaged"] = bool(res["dpo_chunked_calls"])
+    logs = [h for h in trainer.state.log_history if "loss" in h]
+    finish_losses([float(h["loss"]) for h in logs])
+
+
+CELLS = {"ctnvfp4": lambda: cell_ct("nvfp4"), "ctmxfp8": lambda: cell_ct("mxfp8"), "mxfp4probe": cell_mxfp4probe,
+         "grpo_vl": cell_grpo_vl, "dpo_vl": cell_dpo_vl,
+         "gcmem": cell_gcmem, "env": cell_env, "flm16": lambda: cell_flm(False), "flm4": lambda: cell_flm(True), "vision": cell_vision,
          "moe": cell_moe, "gemma4": cell_gemma4, "qwen38": cell_qwen38, "dsv4": cell_dsv4, "mllama": cell_mllama,
          "rl_decode": cell_rl_decode}
 
@@ -646,10 +884,12 @@ CELLS = {"gcmem": cell_gcmem, "env": cell_env, "flm16": lambda: cell_flm(False),
 def main():
     if args.cell == "moe":
         os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
+    if args.cell == "grpo_vl":
+        os.environ["UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY"] = "1"
     t0 = time.time()
-    if args.cell == "build":
+    if args.cell in ("build", "build_ct"):
         try:
-            built_llama()  # before any `import unsloth`: plain transformers classes
+            built_llama() if args.cell == "build" else build_ct()  # before any `import unsloth`: plain transformers classes
             res["stage"], res["ok"] = "done", True
         except Exception as e:  # noqa: BLE001
             res["ok"], res["error"] = False, f"{type(e).__name__}: {e}"[:1500]

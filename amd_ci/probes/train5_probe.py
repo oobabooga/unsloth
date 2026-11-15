@@ -87,7 +87,7 @@ def build_env(args, work: Path) -> dict:
                                                   *args.torch_spec.split()]))
         steps.append(("stack", pip_cmd(py) + ["--extra-index-url", PYPI, f"transformers=={args.transformers}",
                                               f"trl=={args.trl}", f"peft=={args.peft}", *STACK,
-                                              *(["triton-windows<3.7"] if WIN else [])]))
+                                              *(["triton-windows<3.7"] if WIN else []), *args.extra_pip]))
         steps.append(("unsloth_meta", pip_cmd(py) + ["--extra-index-url", PYPI, "--no-deps", "unsloth", "unsloth_zoo"]))
         info["steps"] = {}
         for name, cmd in steps:
@@ -235,6 +235,7 @@ def main() -> int:
     ap.add_argument("--companion-base", default = None)
     ap.add_argument("--companion-head", default = None)
     ap.add_argument("--cells", default = "env,flm16,flm4,vision,moe")
+    ap.add_argument("--extra-pip", nargs = "*", default = [], help = "added to the stack install (e.g. compressed-tensors)")
     ap.add_argument("--repeat", default = "flm16,moe", help = "cells run twice at the base: the A/A spread")
     ap.add_argument("--tests", nargs = "*", default = [])
     ap.add_argument("--companion-tests", nargs = "*", default = [])
@@ -275,6 +276,12 @@ def main() -> int:
     model_dir = work / "tiny_llama"
     obs["model_build"] = {k: v for k, v in run_cell(py, "build", f"{args.state}_build", paths, out_dir, 900,
                                                     model_dir).items() if k in ("rc", "stage", "error", "model_dir")}
+    if any(c in args.cells.split(",") for c in ("ctnvfp4", "ctmxfp8")):
+        # Same bytes for every state: quantized with the PAIRED zoo head's packed_experts (base zoo may lack it).
+        builder = companion(args, work, "head") if args.state_repo == "unsloth" else args.checkout
+        obs["ct_build"] = {k: v for k, v in run_cell(py, "build_ct", f"{args.state}_build_ct", [builder], out_dir, 900,
+                                                     model_dir).items()
+                           if k in ("rc", "stage", "error", "ct_dirs", "builder_zoo", "log_tail")}
     obs["cells"] = {}
     for cell in [c for c in args.cells.split(",") if c]:
         obs["cells"][cell] = run_cell(py, cell, f"{args.state}_{cell}", paths, out_dir, args.cell_timeout, model_dir)
