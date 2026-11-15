@@ -21,7 +21,7 @@ MODE = "regression"
 NEEDS = ["rocm", "gpu", "nvidia", "multi_gpu", "windows"]
 RTOL = 2e-2
 MEM_RATIO, MEM_SLACK = 1.25, 32.0
-TRAIN = ("flm16", "flm4", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode")
+TRAIN = ("flm16", "flm4", "gcmem", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode")
 
 # Why a PR's own new path does or does not engage on ROCm; rendered with the table.
 NOTES = {
@@ -94,9 +94,10 @@ def gates(obs):
                 out.append((f"head {key} collected tests", n > 0 or not p.get("selected"),
                             f"selected={p.get('selected')} passed={p.get('n_passed')} failed={p.get('n_failed')} "
                             f"skipped={p.get('n_skipped')} crashed={p.get('crashed_files')}"[:300]))
-    b = _cells(obs.get("base")).get("flm16") or {}
-    out.append(("base flm16 (LoRA 16-bit SFT) reached a verdict", b.get("stage") == "done" or bool(b.get("error")),
-                str(b.get("losses") or b.get("error") or b.get("stage"))[:200]))
+    # Non-vacuity: the base actually trained something, so "no cell got worse" compared real runs. A cell that
+    # fails at BOTH states is a finding reported in the table and the verdict text, not a gate.
+    trained = sorted(n for n, c in _cells(obs.get("base")).items() if n in TRAIN and _trained(c))
+    out.append(("base trained at least one cell (finite losses)", bool(trained), ", ".join(trained) or "none"))
     return out
 
 
@@ -137,7 +138,7 @@ def head_is_worse(base, head):
         if not _trained(b) and not _trained(h):
             both.append(f"{cell} ({str((h or {}).get('error') or (h or {}).get('stage'))[:120]})")
             continue
-        if b.get("decreasing") and not h.get("decreasing"):
+        if b.get("decreasing") and h.get("decreasing") is False:
             worse.append(f"{cell}: loss decreasing at base, not at head {h.get('losses')}")
         lb, lh = b.get("losses") or [], h.get("losses") or []
         tol = _loss_tol(base, cell)
@@ -152,6 +153,9 @@ def head_is_worse(base, head):
             worse.append(f"{cell}: peak allocated {ph} MiB vs base {pb} MiB")
         if (b.get("gc_calls") or 0) > 0 and not (h.get("gc_calls") or 0) > 0:
             worse.append(f"{cell}: layer gradient checkpointing ran at base ({b.get('gc_calls')} calls), 0 at head")
+        if cell == "gcmem" and b.get("gc_engaged") and not h.get("gc_engaged"):
+            worse.append(f"gcmem: layer GC saved memory at base (ratio {b.get('gc_mem_ratio')}), not at head "
+                         f"(ratio {h.get('gc_mem_ratio')})")
         if cell == "rl_decode" and b.get("graphs_match_eager_after_step") and not h.get("graphs_match_eager_after_step"):
             worse.append(f"rl_decode: decode graphs diverge from eager after the step at head (rel {h.get('graphs_vs_eager_rel')})")
     pb_, fb, cb = _pyt(base)
@@ -180,7 +184,7 @@ def _fmt(c):
         return f"FAIL@{c.get('stage')} {str(c.get('error') or c.get('rc'))[:110]}"
     losses = c.get("losses") or []
     s = f"{losses[0]:.4f}->{losses[-1]:.4f}" if losses else "?"
-    s += " dec" if c.get("decreasing") else " NOT-dec"
+    s += "" if c.get("decreasing") is None else (" dec" if c.get("decreasing") else " NOT-dec")
     s += f" pk={c.get('peak_alloc_mb')}M gc={c.get('gc_calls')}"
     dy = c.get("dynamo") or {}
     if dy.get("graph_breaks") is not None:
@@ -196,6 +200,8 @@ def _fmt(c):
         s += f" lh_patch={c['large_head_patch_returns']}"
     if c.get("varlen_hits"):
         s += f" varlen={c['varlen_hits']}"
+    if "gc_mem_ratio" in c:
+        s += f" gc_engaged={c.get('gc_engaged')} mem_ratio(on/off)={c.get('gc_mem_ratio')}"
     if "graphs_match_eager_after_step" in c:
         s += f" graphs==eager:{c['graphs_match_eager_after_step']} rel={c.get('graphs_vs_eager_rel'):.2g}"
     if c.get("vision_layer_calls"):
