@@ -189,7 +189,8 @@ def cell_fused_ce(key):
     out = model(**b)
     fused = float(out.loss.detach())
     # The fused path hands back no logits (or a placeholder) unless UNSLOTH_RETURN_LOGITS=1.
-    returned = type(out.logits).__name__ + (str(tuple(out.logits.shape)) if hasattr(out.logits, "shape") else "")
+    shape = getattr(out.logits, "shape", None)
+    returned = type(out.logits).__name__ + (str(tuple(shape)) if isinstance(shape, torch.Size) else "")
     rel = abs(fused - ref) / max(abs(ref), 1e-12)
     free(model)
     return dict(ok = rel <= 2e-3, fused_loss = fused, ref_loss_fp32 = ref, rel = rel, gain = gain,

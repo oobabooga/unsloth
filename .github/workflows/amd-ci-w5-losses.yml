@@ -88,7 +88,7 @@ jobs:
             --probe amd_ci/probes/w5_probe.py \
             --criteria amd_ci/criteria/w5_losses_offload_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --venv "$AMD_CI_WORK/zvenv" --unsloth-ref f49006976fa9575f8072ddd0f08e7f5142ecfaef --timeout 1500
+            --python "$AMD_CI_PY" -- --head-checkout "$AMD_CI_WORK/states/head" --venv "$AMD_CI_WORK/zvenv" --unsloth-ref f49006976fa9575f8072ddd0f08e7f5142ecfaef --timeout 1500 --models gemma2
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"

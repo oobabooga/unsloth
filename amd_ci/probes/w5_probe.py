@@ -43,6 +43,7 @@ def main() -> int:
     ap.add_argument("--torch-index", default = "amd")
     ap.add_argument("--unsloth-ref", required = True)
     ap.add_argument("--corners", default = "B,A")
+    ap.add_argument("--models", default = "llama,qwen3,gemma2,qwen3moe,gptoss")
     ap.add_argument("--timeout", type = int, default = 1500)
     args = ap.parse_args()
     args.out = args.out.resolve()
@@ -90,7 +91,7 @@ def main() -> int:
         pp = args.checkout + ((":" + str(overlay)) if corner == "A" else "")
         log_c = out_dir / f"corner_{corner}.log"
         rc = zoo_venv.sh([py, "-u", str(HERE / "w5_run_all.py"), "--python", py, "--out-dir", str(cdir),
-                          "--pythonpath", pp, "--timeout", str(args.timeout)], log_c, timeout = 6 * args.timeout,
+                          "--pythonpath", pp, "--timeout", str(args.timeout), "--models", args.models], log_c, timeout = 6 * args.timeout,
                          env = zoo_venv.state_env(args.checkout), cwd = args.checkout)
         summ = cdir / "summary.json"
         obs["corners"][corner] = {"rc": rc, "summary": json.loads(summ.read_text(encoding = "utf-8")) if summ.is_file()

@@ -51,13 +51,22 @@ def gates(obs: dict) -> list[tuple[str, bool, str]]:
                     f or str(o.get("unsloth_zoo_import_error"))[:300]))
         out.append((f"{name} ran on gfx1151", "gfx1151" in _arch(o), _arch(o) or "no device recorded"))
     base = _cells(obs.get("base"))
-    for cell in ("fused_ce", "ga_norm", "offload"):
-        r = base.get(("B", "llama", cell))
-        out.append((f"base corner B llama {cell} reached a verdict", r is not None and r.get("ok") is not None,
+    lead = "llama" if ("B", "llama", "fused_ce") in base else "gemma2"
+    for cell in ("fused_ce",) + (("ga_norm",) if lead == "llama" else ()):
+        r = base.get(("B", lead, cell))
+        out.append((f"base corner B {lead} {cell} reached a verdict", r is not None and r.get("ok") is not None,
                     str(r)[:300]))
-    r = base.get(("B", "llama", "offload")) or {}
-    out.append(("base corner B llama offload swapped layers", bool(r.get("engaged")),
-                f"copies={r.get('copies_total')} host_bytes={r.get('host_bytes')} swapped={r.get('swapped')}"))
+    # gfx1151 is an integrated, unified-memory GPU: Unsloth refuses offload_layers there by design
+    # (_check_block_swap, "nothing to swap to on a unified-memory GPU"). A refusal must name that reason; a
+    # silent no-op or any other outcome fails the gate.
+    for name in ("base", "head"):
+        for corner in ("B", "A"):
+            r = _cells(obs.get(name)).get((corner, lead, "offload")) or {}
+            refused = str(r.get("refused") or "")
+            clear = "offload_layers" in refused and "unified-memory" in refused
+            out.append((f"{name} corner {corner} {lead} offload swapped or refused with the unified-memory reason",
+                        bool(r.get("engaged")) or clear,
+                        refused[:160] or f"copies={r.get('copies_total')} host_bytes={r.get('host_bytes')}"))
     return out
 
 
@@ -69,7 +78,7 @@ def _fmt(r) -> str:
     for k in ("rel", "loss_rel", "grad_rel", "logits_rel", "copies_total"):
         if k in r and isinstance(r[k], (int, float)):
             s += f" {k}={r[k]:.2g}"
-    if ok is False:
+    if ok is False or r.get("refused"):
         s += " " + str(r.get("error") or r.get("refused") or r.get("leftover_keys") or "")[:90]
     return s
 
