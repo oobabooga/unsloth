@@ -125,7 +125,7 @@ def _bench_op(torch, gcc, iters):
         return gcc.triton_causal_conv1d(x, w, b, "silu")
 
     def grads(fn, dtype):
-        x, w, b = (t.to(dtype).requires_grad_() for t in (x0, w0, b0))
+        x, w, b = (t.detach().to(dtype).clone().requires_grad_() for t in (x0, w0, b0))
         y = fn(x, w, b)
         y.backward(dy.to(dtype))
         return [y.float()] + [t.grad.float() for t in (x, w, b)]
@@ -141,7 +141,7 @@ def _bench_op(torch, gcc, iters):
         }
     timing = {}
     for name, fn in (("triton", triton_path), ("torch", torch_path)):
-        x, w, b = (t.to(torch.bfloat16).requires_grad_() for t in (x0, w0, b0))
+        x, w, b = (t.detach().to(torch.bfloat16).clone().requires_grad_() for t in (x0, w0, b0))
         d = dy.to(torch.bfloat16)
         for _ in range(3):
             fn(x, w, b).backward(d)
