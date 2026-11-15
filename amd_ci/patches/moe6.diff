@@ -1,9 +1,9 @@
 diff --git a/tests/test_moe_gc_keep_base.py b/tests/test_moe_gc_keep_base.py
 new file mode 100644
-index 0000000..c82bdc5
+index 0000000..de25a5d
 --- /dev/null
 +++ b/tests/test_moe_gc_keep_base.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,264 @@
 +# Unsloth Zoo - Utilities for Unsloth
 +# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 +#
@@ -87,6 +87,8 @@ index 0000000..c82bdc5
 +        super().__init__()
 +        g = torch.Generator().manual_seed(seed + 10)
 +        self.router = nn.Linear(H, E, bias = False).to("cuda", torch.bfloat16)
++        with torch.no_grad():   # seeded, so a routing pattern (and any failure) reproduces across processes
++            self.router.weight.copy_(torch.randn(E, H, generator = g) * H ** -0.5)
 +        self.experts = Experts(E, H, I, nf4, seed)
 +        self.k = k
 +        mk = lambda *s: nn.Parameter((torch.randn(*s, generator = g) * 0.05).cuda())
@@ -215,24 +217,33 @@ index 0000000..c82bdc5
 +@needs_gpu
 +@pytest.mark.parametrize("nf4", [False, True])
 +def test_with_lora_fold(monkeypatch, nf4):
-+    """Fold on (Triton forced): both passes add the folded LoRA onto the kept base the same way; gradients match
-+    keep off to bf16 rounding (the replay's values equal the first pass's, not the single-GEMM fold's)."""
++    """Fold on (Triton forced): both passes add the folded LoRA onto the kept base the same way. Two layers for the
++    engagement counts; gradients vs main's separated path (fold off, keep off) on one layer, to bf16 rounding. With
++    two layers a direct cosine is not a stable gate: rounding in layer 0 can flip a near-tied top-k in layer 1."""
 +    if nf4:
 +        pytest.importorskip("bitsandbytes")
 +    monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
 +    MU._TRITON_GROUPED_MM_POLICY.clear()
 +    if torch.cuda.get_device_capability() < (8, 0) or not MG.triton_grouped_available(torch.device("cuda")):
 +        pytest.skip("Triton grouped GEMM unavailable")
-+    layers = nn.ModuleList([Layer(seed = 0, nf4 = nf4), Layer(seed = 1, nf4 = nf4)]).train()
 +    x0 = _x()
-+    monkeypatch.setenv("UNSLOTH_MOE_GC_KEEP_BASE", "0")
-+    off = _step(layers, x0)
-+    monkeypatch.setenv("UNSLOTH_MOE_GC_KEEP_BASE", "1")
++
++    def run(mods, fold, keep):
++        monkeypatch.setenv("UNSLOTH_MOE_LORA_FOLD", fold)
++        monkeypatch.setenv("UNSLOTH_MOE_GC_KEEP_BASE", keep)
++        MU._TRITON_GROUPED_MM_POLICY.clear()
++        loss, dx, grads = _step(mods, x0)
++        return [loss, dx, *grads]
++
++    two = nn.ModuleList([Layer(seed = 0, nf4 = nf4), Layer(seed = 1, nf4 = nf4)]).train()
 +    LF.LORA_FOLD_STATS["accumulate"] = 0
-+    on = _step(layers, x0)
++    run(two, "1", "1")
 +    assert LF.LORA_FOLD_STATS["accumulate"] == 8   # 2 layers x 2 projections x (first pass + replay)
 +    assert KB.KEEP_BASE_STATS["reused"] == 4
-+    for a, b in zip([on[0], on[1], *on[2]], [off[0], off[1], *off[2]]):
++    one = nn.ModuleList([Layer(seed = 0, nf4 = nf4)]).train()
++    sep = run(one, "0", "0")
++    on = run(one, "1", "1")
++    for a, b in zip(on, sep):
 +        cos = torch.nn.functional.cosine_similarity(a.double().flatten(), b.double().flatten(), dim = 0)
 +        assert cos > 0.9999, cos
 +        assert ((a.double() - b.double()).norm() / b.double().norm()) < 2e-2
@@ -244,8 +255,8 @@ index 0000000..c82bdc5
 +    LoRA fold apply), at or below it the fused NF4 GEMM does."""
 +    pytest.importorskip("bitsandbytes")
 +    from unsloth_zoo.temporary_patches import moe_nf4_grouped as NF
-+    if torch.cuda.get_device_capability() < (8, 0):
-+        pytest.skip("auto needs sm80+")
++    if not NF._device_ok(torch.device("cuda"), "auto"):
++        pytest.skip("the fused NF4 GEMM needs CUDA sm80+ (not ROCm)")
 +    monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", "auto")
 +    layers = nn.ModuleList([Layer(nf4 = True)]).train()
 +    x0 = _x()
