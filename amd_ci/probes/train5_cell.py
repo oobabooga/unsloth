@@ -44,7 +44,8 @@ MODELS = {
     "ctmxfp8": "built:ct-mxfp8-qwen3moe",
     "mxfp4probe": None,
     "grpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
-    "dpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
+    # The PR test's model: on TRL 0.24, Qwen2.5-VL DPO drops image_grid_thw (fails at any state).
+    "dpo_vl": "trl-internal-testing/tiny-LlavaForConditionalGeneration",
     "vision": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     "moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
     "gemma4": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
@@ -800,10 +801,10 @@ def _cfg(cls, **kw):
     return cls(**{k: v for k, v in kw.items() if k in names})
 
 
-def _vl_model():
+def _vl_model(repo):
     import torch
     from unsloth import FastVisionModel
-    model, proc = FastVisionModel.from_pretrained(MODELS["grpo_vl"], max_seq_length = 512, dtype = torch.bfloat16,
+    model, proc = FastVisionModel.from_pretrained(repo, max_seq_length = 512, dtype = torch.bfloat16,
                                                   load_in_4bit = False)
     model = FastVisionModel.get_peft_model(model, finetune_vision_layers = True, finetune_language_layers = True,
                                            r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none", random_state = 0,
@@ -819,7 +820,7 @@ def cell_grpo_vl():
     from trl import GRPOConfig, GRPOTrainer
     versions()
     stage("load")
-    model, proc = _vl_model()
+    model, proc = _vl_model(MODELS[args.cell])
     import unsloth_zoo.fused_losses.fused_linear as fl
     before = dict(fl.CALLS)
 
@@ -854,7 +855,7 @@ def cell_dpo_vl():
     versions()
     res["trl_has_concatenated_forward"] = hasattr(DPOTrainer, "concatenated_forward")
     stage("load")
-    model, proc = _vl_model()
+    model, proc = _vl_model(MODELS[args.cell])
     cfg = _cfg(DPOConfig, output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), "trainer_dpo_vl"),
                per_device_train_batch_size = 2, max_steps = args.steps, learning_rate = 5e-4, logging_steps = 1,
                report_to = "none", bf16 = True, seed = 0, save_strategy = "no", max_length = None,
