@@ -56,7 +56,7 @@ MODELS = {
     "hd512_gemma4_nc": "built:gemma4-global-hd512 (UNSLOTH_COMPILE_DISABLE=1)",
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "bclens": "trl-internal-testing/tiny-Qwen3ForCausalLM",
-    "bswap": "built:llama (zoo BlockSwap, offload 2 of 4 layers)",
+    "bswap": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "tok_save": "built:llama",
     "grpo_vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     # The PR test's model: on TRL 0.24, Qwen2.5-VL DPO drops image_grid_thw (fails at any state).
@@ -1217,13 +1217,14 @@ def cell_bclens():
     except Exception as e:  # noqa: BLE001
         res["set_logs_error"] = repr(e)[:120]
     logging.getLogger("torch").addHandler(H())
+    from unsloth import FastModel
     torch.manual_seed(0)
-    model, tok = FastLanguageModel.from_pretrained(MODELS["bclens"], max_seq_length = 256, dtype = torch.bfloat16,
-                                                   load_in_4bit = False)
-    model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
-                                             target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
-                                             random_state = 0)
-    res["block_modes"] = _block_modes(model)
+    model, tok = FastModel.from_pretrained(MODELS["bclens"], max_seq_length = 256, dtype = torch.bfloat16,
+                                           load_in_4bit = False)
+    model = FastModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
+                                     finetune_vision_layers = False, finetune_language_layers = True,
+                                     finetune_attention_modules = True, finetune_mlp_modules = True,
+                                     use_gradient_checkpointing = "unsloth", random_state = 0)
     dev = model.get_input_embeddings().weight.device
     vocab = model.get_input_embeddings().weight.shape[0]
     params = [p for p in model.parameters() if p.requires_grad]
@@ -1244,6 +1245,7 @@ def cell_bclens():
         res["losses_so_far"] = losses
         dump()
     res["seq_lens"] = lens
+    res["block_modes"] = _block_modes(model)  # installed at the first forward
     res["unique_graphs_per_step"] = graphs
     res["recompile_logs"] = len(rec)
     res["recompile_reasons"] = [r[-200:] for r in rec[:6]]
@@ -1254,20 +1256,34 @@ def cell_bclens():
 
 
 def cell_bswap():
-    """unsloth-zoo #2536: zoo BlockSwap (offload 2 of 4 layers) on a LoRA model with Unsloth gradient checkpointing on
-    transformers 5.23: one fwd + bwd equal to offload 0 (loss and every LoRA grad), whether the slot pool grew (the
-    'needs per-layer gradient checkpointing' message), then 5 training steps with the swap installed."""
+    """unsloth-zoo #2536: zoo BlockSwap on a LoRA model (FastModel, block compile, Unsloth gradient checkpointing,
+    transformers 5.23) built as an 8-layer seeded tiny Qwen3. For offload 2 and 6: one fwd + bwd equal to offload 0
+    (loss and every LoRA grad) and whether the slot pool grew (the 'needs per-layer gradient checkpointing' message);
+    then 5 training steps with offload 2 installed."""
     import contextlib
     import io
     import torch
-    from unsloth import FastLanguageModel
+    import transformers
+    from unsloth import FastModel
     versions()
+    stage("build")
+    d = os.path.join(os.path.dirname(os.path.abspath(args.out)), "tiny_qwen3_8l")
+    if not os.path.isfile(os.path.join(d, "config.json")):
+        cfg = transformers.AutoConfig.from_pretrained(MODELS["bswap"])
+        cfg.num_hidden_layers = 8
+        if getattr(cfg, "layer_types", None):
+            cfg.layer_types = [cfg.layer_types[0]] * 8
+        torch.manual_seed(0)
+        m = transformers.AutoModelForCausalLM.from_config(cfg, torch_dtype = torch.bfloat16)
+        m.save_pretrained(d)
+        transformers.AutoTokenizer.from_pretrained(MODELS["bswap"]).save_pretrained(d)
+        del m
     stage("load")
-    model, tok = FastLanguageModel.from_pretrained(built_llama(), max_seq_length = 256, dtype = torch.bfloat16,
-                                                   load_in_4bit = False)
-    model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
-                                             target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
-                                             random_state = 0)
+    model, tok = FastModel.from_pretrained(d, max_seq_length = 256, dtype = torch.bfloat16, load_in_4bit = False)
+    model = FastModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
+                                     finetune_vision_layers = False, finetune_language_layers = True,
+                                     finetune_attention_modules = True, finetune_mlp_modules = True,
+                                     use_gradient_checkpointing = "unsloth", random_state = 0)
     try:
         from unsloth.models._utils import _check_block_swap
         _check_block_swap(model)
@@ -1276,8 +1292,7 @@ def cell_bswap():
         res["unsloth_offload_refusal"] = f"{type(e).__name__}: {e}"[:160]
     from unsloth_zoo import block_swap as bsm
     layers = bsm.find_decoder_layers(model)
-    cif = getattr(bsm, "_checkpoints_in_forward", None)
-    res["ckpt_in_forward"] = safe(lambda: cif(layers[0])) if cif else "n/a (base)"
+    res["n_layers"] = len(layers)
     batch = text_batch(tok, model.get_input_embeddings().weight.device)
     model.train()
 
@@ -1290,27 +1305,39 @@ def cell_bswap():
                                           if p.requires_grad and p.grad is not None}
     stage("ref")
     l0, g0 = fwd_bwd()
+    res["block_modes"] = _block_modes(model)
+    fwd_names = sorted({getattr(getattr(type(m).__dict__.get("forward", None) if "forward" not in m.__dict__ else
+                                        getattr(m.forward, "__func__", m.forward), "__code__", None), "co_name", "?")
+                        for m in layers})
+    res["layer_forward_names"] = fwd_names
+    cif = getattr(bsm, "_checkpoints_in_forward", None)
+    res["ckpt_in_forward"] = safe(lambda: sum(bool(cif(m)) for m in layers)) if cif else "n/a (base)"
     buf = io.StringIO()
     stage("swap")
+    eq, grew = {}, {}
     with contextlib.redirect_stdout(buf):
-        sw = bsm.BlockSwap(layers, 2, model = model)
-        res["swapped_indices"] = list(getattr(sw, "indices", []))
-        l1, g1 = fwd_bwd()
-        res["bswap_grew"] = bool(getattr(sw, "_grew", None))
-        diffs = [float((g0[n] - g1[n]).abs().max()) for n in g0 if n in g1]
-        res["bswap_loss_ref_vs_swap"] = [l0, l1]
-        res["bswap_grads_compared"] = f"{len(diffs)}/{len(g0)}"
-        res["bswap_grad_maxdiff"] = max(diffs) if diffs else None
-        res["bswap_equal"] = bool(l0 == l1 and diffs and len(diffs) == len(g0) and max(diffs) == 0.0)
-        stage("train")
-        torch.cuda.reset_peak_memory_stats()
-        manual_loop(model, batch, args.steps)
-        peak()
-        safe(sw.remove)
+        for n in (2, 6):
+            sw = bsm.BlockSwap(layers, n, model = model)
+            l1, g1 = fwd_bwd()
+            grew[n] = bool(getattr(sw, "_grew", None))
+            diffs = [float((g0[k] - g1[k]).abs().max()) for k in g0 if k in g1]
+            eq[n] = {"loss": [l0, l1], "grads": f"{len(diffs)}/{len(g0)}", "maxdiff": max(diffs) if diffs else None,
+                     "equal": bool(l0 == l1 and diffs and len(diffs) == len(g0) and max(diffs) == 0.0)}
+            if n == 2:
+                stage("train")
+                torch.cuda.reset_peak_memory_stats()
+                manual_loop(model, batch, args.steps)
+                peak()
+            sw.remove()
+            if n == 2:
+                l0, g0 = fwd_bwd()  # new reference after the training steps
     out = buf.getvalue()
     print(out)
+    res["bswap_detail"] = eq
+    res["bswap_equal"] = all(v["equal"] for v in eq.values())
+    res["bswap_grad_maxdiff"] = max((v["maxdiff"] or 0.0) for v in eq.values())
+    res["bswap_grew"] = grew
     res["slot_pool_message"] = "growing the slot pool" in out
-
 
 def cell_seqcls():
     """unsloth #17861: tiny Qwen3 sequence classifier LoRA, 5 steps, single process; the DDP find_unused default the
