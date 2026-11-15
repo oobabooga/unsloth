@@ -1,0 +1,1161 @@
+diff --git a/tests/_sparse_compose_worker.py b/tests/_sparse_compose_worker.py
+index 489e751d6..7e5069eed 100644
+--- a/tests/_sparse_compose_worker.py
++++ b/tests/_sparse_compose_worker.py
+@@ -14,10 +14,14 @@
+ # You should have received a copy of the GNU Affero General Public License
+ # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+-"""python _sparse_compose_worker.py {skip_first|flex_first} {model_type}: checks skip and flex patches compose."""
++"""python _sparse_compose_worker.py {skip_first|flex_first} [model_type ...]: checks skip and flex patches compose.
++
++One process per install order: every family's skip patch goes before (or after) its flex patch, the order under
++test; each family is then checked on its own (environment restored, a failure reported for that family only)."""
+ 
+ import os
+ import sys
++import traceback
+ 
+ import torch
+ 
+@@ -27,82 +31,105 @@ from unsloth_zoo.flex_attention import sparse as gates  # noqa: E402
+ from unsloth_zoo.temporary_patches import sparse_attention as skip  # noqa: E402
+ from unsloth_zoo.temporary_patches import sparse_attention_flex as flex  # noqa: E402
+ 
+-order, family = sys.argv[1], sys.argv[2]
++FAMILIES = ("deepseek_v32", "glm_moe_dsa", "minimax_m3_vl")
++order, families = sys.argv[1], tuple(sys.argv[2:]) or FAMILIES
+ install_skip = {
+     "deepseek_v32": skip.patch_deepseek_v32_sparse_skip,
+     "glm_moe_dsa": skip.patch_glm_moe_dsa_sparse_skip,
+     "minimax_m3_vl": skip.patch_minimax_m3_sparse_skip,
+-}[family]
+-install_flex = flex.patch_minimax_m3_sparse_flex if family == "minimax_m3_vl" else flex.patch_dsa_sparse_flex
+-steps = [install_skip, install_flex] if order == "skip_first" else [install_flex, install_skip]
++}
++install_flex = {"minimax_m3_vl": flex.patch_minimax_m3_sparse_flex, "deepseek_v32": flex.patch_dsa_sparse_flex,
++                "glm_moe_dsa": flex.patch_dsa_sparse_flex}
++skips = [install_skip[f] for f in families]
++flexes = list(dict.fromkeys(install_flex[f] for f in families))
++steps = skips + flexes if order == "skip_first" else flexes + skips
+ for fn in steps + steps:
+     fn()
+ 
+-modeling = __import__(f"transformers.models.{family}.modeling_{family}", fromlist = ["x"])
+-indexer_cls = getattr(modeling, {"deepseek_v32": "DeepseekV32Indexer", "glm_moe_dsa": "GlmMoeDsaIndexer",
+-                                 "minimax_m3_vl": "MiniMaxM3VLIndexer"}[family])
+-assert getattr(indexer_cls.forward, "_unsloth_sparse_flex", False), "sparse flex not installed"
+-key = f"{family}.indexer"
+-assert skip._is_transformers_function(skip._REFERENCE[key], family), "_REFERENCE is not upstream"
+-assert indexer_cls._unsloth_original_forward is skip._REFERENCE[key]
+-assert indexer_cls._unsloth_inner_forward is not skip._REFERENCE[key], "skip not composed"
+-
+ cuda = torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 0)
+ device = "cuda" if cuda else "cpu"
+-if family == "minimax_m3_vl":
+-    config = T._minimax_config(num_attention_heads = 8, num_key_value_heads = 2, head_dim = 64, hidden_size = 128,
+-                               num_hidden_layers = 1, layer_types = ["minimax_m3_sparse"], mlp_layer_types = ["dense"])
+-    budget = config.index_topk_blocks * config.index_block_size
+-else:
+-    config = T._dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
+-    budget = config.index_topk
+-torch.manual_seed(0)
+-model = {"minimax_m3_vl": "MiniMaxM3VLForCausalLM", "deepseek_v32": "DeepseekV32ForCausalLM",
+-         "glm_moe_dsa": "GlmMoeDsaForCausalLM"}[family]
+-model = getattr(modeling, model)(config).to(device).eval()
+-
+-
+-def stat(kind):
+-    return gates.SPARSE_ATTN_STATS.get(kind, {}).get(family, 0)
+-
+-
+-def logits(seq, dtype = torch.float32):
+-    torch.manual_seed(1)
+-    ids = torch.randint(0, config.vocab_size, (2, seq), device = device)
+-    with torch.no_grad():
+-        return model.to(dtype)(input_ids = ids).logits.float()
+-
+-
+-# The first CPU forward can differ from later ones in the last bits (about 6e-5 on MiniMax with 4 threads, even
+-# unpatched); warm it up here so the bitwise check compares the skip path with the reference.
+-logits(budget)
+-# Within the budget: skip engaged, bitwise equal to the skip-off (upstream indexer) run.
+-before = stat("skip_full")
+-on = logits(budget)
+-assert stat("skip_full") > before, gates.SPARSE_ATTN_STATS
+-os.environ["UNSLOTH_SPARSE_ATTN_SKIP_FULL"] = "0"
+-off = logits(budget)
+-assert torch.equal(on, off), (on - off).abs().max()
+-# UNSLOTH_SPARSE_ATTN_FLEX=0 keeps the skip.
+-os.environ["UNSLOTH_SPARSE_ATTN_SKIP_FULL"] = "1"
+-os.environ["UNSLOTH_SPARSE_ATTN_FLEX"] = "0"
+-before = stat("skip_full")
+-logits(budget)
+-assert stat("skip_full") > before
+-os.environ["UNSLOTH_SPARSE_ATTN_FLEX"] = "1"
+-
+-# Above the budget: chunked indexer, and flex where the device allows.
+-os.environ["UNSLOTH_SPARSE_INDEXER_Q_CHUNK"] = "64"
+-os.environ["UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS"] = str(budget + 1)
+-before_chunk = stat("indexer_chunked")
+-before_skip = stat("skip_full")
+-logits(2 * budget)
+-assert stat("indexer_chunked") > before_chunk, gates.SPARSE_ATTN_STATS
+-assert stat("skip_full") == before_skip
+-if cuda:
+-    # UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 keeps flex.
++if not cuda:
++    # No flex on CPU, so nothing to compile but zoo's mask builder (a cold Inductor C++ build, ~10 s): build masks
++    # eagerly; and two threads (the two order workers run side by side), which the bitwise checks compare within.
++    import torch._dynamo
++    torch._dynamo.config.disable = True
++    torch.set_num_threads(min(torch.get_num_threads(), 2))
++
++
++def check(family):
++    modeling = __import__(f"transformers.models.{family}.modeling_{family}", fromlist = ["x"])
++    indexer_cls = getattr(modeling, {"deepseek_v32": "DeepseekV32Indexer", "glm_moe_dsa": "GlmMoeDsaIndexer",
++                                     "minimax_m3_vl": "MiniMaxM3VLIndexer"}[family])
++    assert getattr(indexer_cls.forward, "_unsloth_sparse_flex", False), "sparse flex not installed"
++    key = f"{family}.indexer"
++    assert skip._is_transformers_function(skip._REFERENCE[key], family), "_REFERENCE is not upstream"
++    assert indexer_cls._unsloth_original_forward is skip._REFERENCE[key]
++    assert indexer_cls._unsloth_inner_forward is not skip._REFERENCE[key], "skip not composed"
++
++    if family == "minimax_m3_vl":
++        config = T._minimax_config(num_attention_heads = 8, num_key_value_heads = 2, head_dim = 64, hidden_size = 128,
++                                   num_hidden_layers = 1, layer_types = ["minimax_m3_sparse"], mlp_layer_types = ["dense"])
++        budget = config.index_topk_blocks * config.index_block_size
++    else:
++        config = T._dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
++        budget = config.index_topk
++    torch.manual_seed(0)
++    model = {"minimax_m3_vl": "MiniMaxM3VLForCausalLM", "deepseek_v32": "DeepseekV32ForCausalLM",
++             "glm_moe_dsa": "GlmMoeDsaForCausalLM"}[family]
++    model = getattr(modeling, model)(config).to(device).eval()
++
++    def stat(kind):
++        return gates.SPARSE_ATTN_STATS.get(kind, {}).get(family, 0)
++
++    def logits(seq, dtype = torch.float32):
++        torch.manual_seed(1)
++        ids = torch.randint(0, config.vocab_size, (2, seq), device = device)
++        with torch.no_grad():
++            return model.to(dtype)(input_ids = ids).logits.float()
++
++    # The first CPU forward can differ from later ones in the last bits (about 6e-5 on MiniMax with 4 threads, even
++    # unpatched); warm it up here so the bitwise check compares the skip path with the reference.
++    logits(budget)
++    # Within the budget: skip engaged, bitwise equal to the skip-off (upstream indexer) run.
++    before = stat("skip_full")
++    on = logits(budget)
++    assert stat("skip_full") > before, gates.SPARSE_ATTN_STATS
+     os.environ["UNSLOTH_SPARSE_ATTN_SKIP_FULL"] = "0"
+-    before = stat("flex")
+-    logits(2 * budget, torch.bfloat16)
+-    assert stat("flex") > before, gates.SPARSE_ATTN_STATS
+-print("COMPOSE_OK", order, family, "cuda" if cuda else "cpu", dict(gates.SPARSE_ATTN_STATS))
++    off = logits(budget)
++    assert torch.equal(on, off), (on - off).abs().max()
++    # UNSLOTH_SPARSE_ATTN_FLEX=0 keeps the skip.
++    os.environ["UNSLOTH_SPARSE_ATTN_SKIP_FULL"] = "1"
++    os.environ["UNSLOTH_SPARSE_ATTN_FLEX"] = "0"
++    before = stat("skip_full")
++    logits(budget)
++    assert stat("skip_full") > before
++    os.environ["UNSLOTH_SPARSE_ATTN_FLEX"] = "1"
++
++    # Above the budget: chunked indexer, and flex where the device allows.
++    os.environ["UNSLOTH_SPARSE_INDEXER_Q_CHUNK"] = "64"
++    os.environ["UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS"] = str(budget + 1)
++    before_chunk = stat("indexer_chunked")
++    before_skip = stat("skip_full")
++    logits(2 * budget)
++    assert stat("indexer_chunked") > before_chunk, gates.SPARSE_ATTN_STATS
++    assert stat("skip_full") == before_skip
++    if cuda:
++        # UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 keeps flex.
++        os.environ["UNSLOTH_SPARSE_ATTN_SKIP_FULL"] = "0"
++        before = stat("flex")
++        logits(2 * budget, torch.bfloat16)
++        assert stat("flex") > before, gates.SPARSE_ATTN_STATS
++
++
++start_env = {k: v for k, v in os.environ.items() if k.startswith("UNSLOTH_SPARSE_")}
++for family in families:
++    for k in [k for k in os.environ if k.startswith("UNSLOTH_SPARSE_")]:
++        del os.environ[k]
++    os.environ.update(start_env)
++    try:
++        check(family)
++    except BaseException:
++        print("COMPOSE_FAIL", order, family, flush = True)
++        traceback.print_exc(file = sys.stdout)
++    else:
++        print("COMPOSE_OK", order, family, device, flush = True)
+diff --git a/tests/test_qwen4_exp_sparse_attn.py b/tests/test_qwen4_exp_sparse_attn.py
+index 10d5118b7..4ca69a281 100644
+--- a/tests/test_qwen4_exp_sparse_attn.py
++++ b/tests/test_qwen4_exp_sparse_attn.py
+@@ -254,3 +254,86 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
+         mask[0, 0, 39, 0] = True  # an in-place edit bumps the version: rescanned
+         sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
+     assert len(calls) == 2
++
++
++def test_static_cache_decode_compiles_fullgraph(monkeypatch):
++    # A decode step keeps the reference attention; the shape checks reject it before the cache probe, whose
++    # StaticCache answer is a tensor: comparing it in Python broke fullgraph capture (data-dependent branching) and
++    # cost a host sync per layer per eager decode token.
++    from transformers import StaticCache
++    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
++    config, attention, rotary = _module("sdpa")
++    first, first_pe = _inputs(1, 1, rotary, seed = 2)
++    hidden, pe = _inputs(1, 1, rotary)
++    mask = torch.zeros((1, 1, 1, 16), dtype = torch.bool)
++    mask[..., :2] = True
++
++    def warm():
++        cache = StaticCache(config, max_cache_len = 16)
++        with torch.no_grad():
++            _reference_forward()(attention, first, first_pe, mask, cache)
++        return cache
++
++    with torch.no_grad():
++        want = _reference_forward()(attention, hidden, pe, mask, warm())[0]
++        cache = warm()
++        torch._dynamo.reset()
++        got = torch.compile(lambda x: zoo_qwen4_exp.qwen4_exp_attention_forward(attention, x, pe, mask, cache)[0],
++                            backend = "eager", fullgraph = True)(hidden)
++    # fp64 rounding only: transformers 5.23's compiled SDPA dispatch differs from eager in the last bit.
++    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-14)
++
++
++def _text_model_run(model, ids, use_cache):
++    # Prefill, then (with a cache) two decode steps through the model's own cache, which keeps the mRoPE position
++    # history (5.17 on the cache object, 5.22+ on the first indexed layer).
++    with torch.no_grad():
++        if not use_cache:
++            return model(input_ids = ids, use_cache = False).last_hidden_state
++        out = model(input_ids = ids[:, :-2], use_cache = True)
++        hidden, past = [out.last_hidden_state], out.past_key_values
++        for t in (-2, -1):
++            out = model(input_ids = ids[:, t:][:, :1], past_key_values = past, use_cache = True)
++            hidden.append(out.last_hidden_state)
++            past = out.past_key_values
++        return torch.cat(hidden, dim = 1)
++
++
++@pytest.fixture
++def _few_threads():
++    # A loaded many-core host otherwise spends the fp64 CPU text model on thread contention (minutes, not seconds).
++    threads = torch.get_num_threads()
++    torch.set_num_threads(min(threads, 4))
++    yield
++    torch.set_num_threads(threads)
++
++
++@pytest.mark.parametrize("use_cache", [False, True], ids = ["no_cache", "prefill_then_decode"])
++def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache, _few_threads):
++    # The whole text model builds its own position ids and rotary tables (3-D mRoPE ids; transformers 5.17's rotary
++    # takes nothing else) and, with a cache, its own position history: the patched attention through that path equals
++    # the untouched attention, and engages on the prefill.
++    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
++    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")
++    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
++    zoo_qwen4_exp.patch_qwen4_exp()
++    # The model runs on CPU: on a GPU host the kernel-hub wrappers send the linear-attention layers to (vendored)
++    # Triton fla / causal-conv1d kernels, and the MoE backend picks Triton too, neither taking CPU tensors. Torch
++    # originals and each layer's dense shared expert instead: the same in both arms, and not what is tested here.
++    for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
++                 "causal_conv1d_update"):
++        original = getattr(getattr(modeling, name, None), "__wrapped__", None)
++        if original is not None:
++            monkeypatch.setattr(modeling, name, original)
++    config, _, _ = _module("sdpa")
++    torch.manual_seed(0)
++    model = modeling.Qwen4ExpTextModel(config).double().eval()
++    for layer in model.layers:
++        layer.mlp = layer.mlp.shared_expert
++    ids = torch.randint(0, config.vocab_size, (2, 45), generator = torch.Generator().manual_seed(3))
++    before = dict(zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS)
++    got = _text_model_run(model, ids, use_cache)
++    assert zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS["sparse"] > before["sparse"]
++    monkeypatch.setattr(modeling.Qwen4ExpTextAttention, "forward", _reference_forward())
++    want = _text_model_run(model, ids, use_cache)
++    torch.testing.assert_close(got, want, rtol = 1e-10, atol = 1e-12)
+diff --git a/tests/test_sparse_attention.py b/tests/test_sparse_attention.py
+index defc7bdec..43609a369 100644
+--- a/tests/test_sparse_attention.py
++++ b/tests/test_sparse_attention.py
+@@ -373,6 +373,10 @@ def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
+     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
+     q, kv, idxs = _all_pad_inputs("cuda", dtype)
++    if backend == "flex" and not sa._flex_eligible(q, kv.shape[1]):
++        # Forcing flex where the dispatch never picks it (sm75; T4's 64 KB shared memory at this head dim) only
++        # measures flex_attention's own limits there.
++        pytest.skip("flex is not eligible on this device")
+     sink = (torch.randn(16) if with_sink else torch.full((16,), float("-inf"))).cuda()
+     q, kv = q.requires_grad_(), kv.requires_grad_()
+     sink.requires_grad_(with_sink)
+@@ -458,25 +462,37 @@ print("INTERP_WORST", worst)
+ """
+ 
+ 
+-def test_triton_kernel_math_in_the_interpreter():
+-    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
+-    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
++@pytest.fixture(scope = "module")
++def _interpreter_run():
++    # Both interpreter scripts in one subprocess (window first: the index script patches _configs at its end): the
++    # process start (torch + unsloth_zoo init, 10-25 s on a loaded host) is paid once, not per test.
+     import subprocess, sys
+     from pathlib import Path
++    # 4 intra-op threads: the tensors are tiny, and a full-width pool spent ~50 of 58 CPU seconds spinning.
+     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+-    proc = subprocess.run([sys.executable, "-c", _INTERP], env = env, capture_output = True, text = True, timeout = 600)
+-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("INTERP_WORST")), None)
++               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4")
++    return subprocess.run([sys.executable, "-c", _WINDOW_INTERP + _INTERP], env = env, capture_output = True, text = True,
++                          timeout = 900)
++
++
++def _interpreter_worst(proc, tag):
++    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(tag + " ")), None)
+     assert line is not None, proc.stderr[-3000:]
+     assert float(line.split()[1]) < 1e-5, line
+ 
+ 
++def test_triton_kernel_math_in_the_interpreter(_interpreter_run):
++    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
++    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
++    _interpreter_worst(_interpreter_run, "INTERP_WORST")
++
++
+ @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+ def test_flex_gate_follows_shared_memory():
+     # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked;
+     # sm75 never gets flex at any head_dim (it failed to compile there).
+     q = torch.empty(1, 4, 16, 512, device = "cuda", dtype = _cuda_dtypes()[-1])
+-    sm80 = torch.cuda.get_device_capability()[0] >= 8
++    sm80 = torch.cuda.get_device_capability()[0] >= 8 and sa._HAS_FLEX   # torch < 2.5: no flex_attention
+     big_enough = sm80 and sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
+     assert sa._flex_eligible(q) == big_enough
+     assert ("flex" in sa._order(q, 8)) == big_enough
+@@ -590,7 +606,7 @@ torch.manual_seed(0)
+ worst = 0.0
+ # (b, s, h, d, nc, k, window, sink): heads not a multiple of 16, no compressed slots, window 1, window > s.
+ for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 17, 32, 11, 0, 5, False),
+-                                        (1, 40, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
++                                        (1, 20, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
+     q = torch.randn(b, s, h, d, requires_grad = True)
+     win = torch.randn(b, s, d, requires_grad = True)
+     comp = torch.randn(b, nc, d, requires_grad = True)
+@@ -612,7 +628,7 @@ for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 1
+     want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
+     worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
+ # One index row shared by g consecutive batches (the GQA fold) == the repeated rows.
+-b, g, s, h, d, n, k = 2, 3, 7, 4, 16, 10, 6
++b, g, s, h, d, n, k = 2, 2, 5, 4, 16, 10, 6
+ q = torch.randn(b * g, s, h, d, requires_grad = True)
+ kv = torch.randn(b * g, n, d, requires_grad = True)
+ idx = torch.stack([torch.stack([torch.randperm(n)[:k] for _ in range(s)]) for _ in range(b)]).int()
+@@ -626,15 +642,8 @@ print("WINDOW_INTERP_WORST", worst)
+ """
+ 
+ 
+-def test_window_kernel_and_shared_index_rows_in_the_interpreter():
+-    import subprocess, sys
+-    from pathlib import Path
+-    env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+-    proc = subprocess.run([sys.executable, "-c", _WINDOW_INTERP], env = env, capture_output = True, text = True, timeout = 900)
+-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("WINDOW_INTERP_WORST")), None)
+-    assert line is not None, proc.stderr[-3000:]
+-    assert float(line.split()[1]) < 1e-5, line
++def test_window_kernel_and_shared_index_rows_in_the_interpreter(_interpreter_run):
++    _interpreter_worst(_interpreter_run, "WINDOW_INTERP_WORST")
+ 
+ 
+ @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@@ -649,6 +658,8 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, cap, smem,
+     real_cap = torch.cuda.get_device_capability()
+     if want == "flex" and real_cap[0] < 8:
+         pytest.skip("flex needs a real sm80+ device")
++    if want == "flex" and not sa._HAS_FLEX:   # torch < 2.5: no flex_attention, the fold runs
++        want = "triton"
+     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
+     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
+     monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
+diff --git a/tests/test_sparse_attention_flex.py b/tests/test_sparse_attention_flex.py
+index fed095f3e..c113036fe 100644
+--- a/tests/test_sparse_attention_flex.py
++++ b/tests/test_sparse_attention_flex.py
+@@ -432,17 +432,46 @@ def test_tiny_model_cached_decode_after_flex_prefill(monkeypatch, family):
+     assert _rel(got, ref) < 5e-2, _rel(got, ref)
+ 
+ 
+-@needs_models
+-@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
+-@pytest.mark.parametrize("order", ["skip_first", "flex_first"])
+-def test_skip_and_flex_compose(order, family):
+-    """Both patch sets in either order: exact skip within the budget, chunked / flex above it."""
++_COMPOSE_ORDERS = ("skip_first", "flex_first")
++
++
++@pytest.fixture(scope = "module", autouse = True)
++def _compose_workers(request):
++    """One fresh interpreter per install order (all families each, see the worker), started when this module starts
++    so their cold imports overlap the other tests; only when a compose test is selected."""
++    wanted = any(getattr(item, "originalname", "") == "test_skip_and_flex_compose" for item in request.session.items)
++    if not wanted or needs_models.args[0]:
++        yield None
++        return
+     import subprocess
+     import sys
+     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sparse_compose_worker.py")
+     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_SPARSE_")}
+-    proc = subprocess.run([sys.executable, worker, order, family], capture_output = True, text = True, env = env, timeout = 600)
+-    assert "COMPOSE_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
++    env["HF_HUB_OFFLINE"] = "1"  # tiny random models: nothing to download
++    procs = {order: subprocess.Popen([sys.executable, worker, order], stdout = subprocess.PIPE, stderr = subprocess.PIPE,
++                                     text = True, env = env) for order in _COMPOSE_ORDERS}
++    results = {}
++
++    def result(order):
++        if order not in results:
++            results[order] = procs[order].communicate(timeout = 900)
++        return results[order]
++
++    yield result
++    for proc in procs.values():
++        if proc.poll() is None:
++            proc.kill()
++            proc.communicate()
++
++
++@needs_models
++@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
++@pytest.mark.parametrize("order", list(_COMPOSE_ORDERS))
++def test_skip_and_flex_compose(order, family, _compose_workers):
++    """Both patch sets in either order: exact skip within the budget, chunked / flex above it."""
++    stdout, stderr = _compose_workers(order)
++    assert any(line.startswith(f"COMPOSE_OK {order} {family} ") for line in stdout.splitlines()), (
++        stdout[-3000:] + stderr[-3000:])
+ 
+ 
+ @needs_models
+@@ -641,8 +670,8 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
+ )
+ @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
+ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
+-    """Attention under an enclosing fullgraph dynamic torch.compile: BlockMask build plus flex call miscompiled (MiniMax
+-    95% off, silently); compiled flex must match compiled upstream, eager stays close."""
++    """Attention under an enclosing fullgraph torch.compile, dynamic in the sequence length: BlockMask build plus flex
++    call miscompiled (MiniMax 95% off, silently); compiled flex must match compiled upstream, eager stays close."""
+     import torch._dynamo
+     _patched()
+     torch.manual_seed(0)
+@@ -669,12 +698,19 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
+         attn.zero_grad(set_to_none = True)
+         xx = x.detach().clone().requires_grad_()
+ 
+-        def fn(t):
+-            return attn(t, rope, mask, position_ids = pos)[0]
++        def fn(t, cos, sin, mask, pos):
++            return attn(t, (cos, sin), mask, position_ids = pos)[0]
+ 
++        args = (xx, *rope, mask, pos)
+         if compiled:
+-            fn = torch.compile(fn, fullgraph = True, dynamic = True)
+-        out = fn(xx)
++            # Dynamic in the sequence length only, as a training compile sees it: every input's sequence dims are
++            # symbolic (dynamic = True would also make the hidden / head dims symbolic, 2-3x the trace time).
++            fn = torch.compile(fn, fullgraph = True)
++            args = tuple(t.detach() if t is not xx else t for t in args)
++            for t, dims in zip(args, ((1,), (1,), (1,), (2, 3), (1,))):
++                for dim in dims:
++                    torch._dynamo.mark_dynamic(t, dim)
++        out = fn(*args)
+         out.float().square().mean().backward()
+         return out.detach().float(), xx.grad.float()
+ 
+diff --git a/tests/test_sparse_attention_floor.py b/tests/test_sparse_attention_floor.py
+new file mode 100644
+index 000000000..95585ec2e
+--- /dev/null
++++ b/tests/test_sparse_attention_floor.py
+@@ -0,0 +1,281 @@
++# Unsloth Zoo - Utilities for Unsloth
++# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Affero General Public License as published
++# by the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++"""Sparse attention dispatch across Triton / torch versions and under torch.compile: gather is only selected where
++its Triton kernels import, and traced dispatch does not recompile on lazily-filled state."""
++
++import os
++import sys
++
++import pytest
++import torch
++
++os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
++
++from unsloth_zoo import sparse_attention as sa  # noqa: E402
++
++_VENDORED_TRITON = ("unsloth_zoo._vendored.attn_gym._backends.triton",
++                    "unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton")
++
++
++def test_gather_needs_its_triton_kernels_not_only_the_api(monkeypatch):
++    # torch 2.4 - 2.8 bundle Triton 3.0 - 3.4, which lack triton.constexpr_function: the api and op registrations
++    # import there, the kernels (loaded on the first call) do not, so gather must not be selected.
++    triton = pytest.importorskip("triton")
++    monkeypatch.setattr(sa, "_GATHER", None)
++    if hasattr(triton, "constexpr_function"):
++        assert sa._gather_importable()   # api + ops cached; their op definitions never run twice below
++        monkeypatch.delattr(triton, "constexpr_function")
++        for name in [m for m in sys.modules if m.startswith(_VENDORED_TRITON)]:
++            monkeypatch.delitem(sys.modules, name)
++        monkeypatch.setattr(sa, "_GATHER", None)
++    assert sa._gather_importable() is False
++
++
++_COLD = r"""
++import sys, torch
++sys.path.insert(0, sys.argv[1])
++case = sys.argv[2]
++torch._dynamo.config.error_on_recompile = True
++if hasattr(torch.fx.experimental._config, "use_duck_shape"):   # torch >= 2.5
++    torch.fx.experimental._config.use_duck_shape = False
++if case != "import_in_trace":
++    from unsloth_zoo import sparse_attention as sa
++dev, dt, h, d = "cuda", torch.bfloat16, 16, 512
++
++def index_default(q, kv, sink, idx, ckv, cidx):
++    return sa.sparse_attn(q, kv, sink, idx, d ** -0.5)
++
++def window_triton(q, kv, sink, idx, ckv, cidx):
++    return sa.sparse_attn_window(q, kv, ckv, cidx, sink, d ** -0.5, 64, backend = "triton")
++
++def import_in_trace(q, kv, sink, idx, ckv, cidx):
++    from unsloth_zoo import sparse_attention as sa
++    return sa.sparse_attn_window(q, kv, ckv, cidx[..., :0], sink, d ** -0.5, 64)
++
++fn = torch.compile({"index_default": index_default, "window_triton": window_triton,
++                    "import_in_trace": import_in_trace}[case], backend = "eager", fullgraph = True, dynamic = True)
++# The guards under test are Dynamo's own: the eager backend sees the same recompile without Inductor compiles.
++for s in (64, 80):
++    g = torch.Generator(device = dev).manual_seed(s)
++    r = lambda *shape: (torch.randn(*shape, device = dev, generator = g) * 0.3).to(dt).requires_grad_()
++    q, kv, ckv = r(1, s, h, d), r(1, s, d), r(1, s // 4 + 3, d)
++    sink = torch.randn(h, device = dev, generator = g).requires_grad_()
++    idx = torch.randint(-1, s, (1, s, 64), device = dev, dtype = torch.int32, generator = g)
++    cidx = torch.randint(-1, s // 4 + 3, (1, s, 32), device = dev, dtype = torch.int32, generator = g)
++    fn(q, kv, sink, idx, ckv, cidx).float().square().mean().backward()
++from unsloth_zoo import sparse_mqa_kernel as sk
++print("COLD_OK", sk.SPARSE_MQA_STATS["fwd"] + sk.SPARSE_MQA_STATS["window_fwd"])
++"""
++
++
++@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
++@pytest.mark.parametrize("case", ["index_default", "window_triton", "import_in_trace"])
++def test_cold_compiled_dispatch_does_not_recompile_across_lengths(case):
++    # A fresh process whose first sparse call is compiled (dynamic shapes, two lengths): dispatch state filled during
++    # the first trace (shared-memory caches, the gather import) must not become a guard that recompiles the second.
++    import subprocess
++    from pathlib import Path
++    root = str(Path(__file__).resolve().parents[1])
++    proc = subprocess.run([sys.executable, "-c", _COLD, root, case], capture_output = True, text = True, timeout = 900,
++                          env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", ""),
++                                     OMP_NUM_THREADS = "4"))   # tiny host tensors: a full-width pool only spins
++    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("COLD_OK")), None)
++    assert line is not None, proc.stderr[-3000:]
++    if case == "index_default" and torch.cuda.get_device_capability()[0] in (10, 11):
++        # Blackwell picks gather first; a cold trace used to skip it (the import had not run yet) and take Triton.
++        assert int(line.split()[1]) == 0, line
++
++
++@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
++def test_triton_kernels_compile_once_across_lengths():
++    # 8 heads (QSA's folded groups): the lse batch stride s * 8 is 16-aligned for even s only, and Triton specializes
++    # integer arguments on % 16; every kernel must keep one compiled variant across even / odd lengths and batch.
++    import triton
++    from unsloth_zoo import sparse_mqa_kernel as sk
++    names = ("_sparse_mqa_fwd", "_sparse_mqa_bwd", "_window_fwd", "_window_bwd_dq", "_window_bwd_dkv")
++
++    def jit(k):
++        while not isinstance(k, triton.runtime.jit.JITFunction):
++            k = k.fn
++        return k
++
++    def caches(n):   # Triton >= 3.3: device_caches {device: (kernels, ...)}; older: cache {device: kernels}
++        k = jit(getattr(sk, n))
++        return k.device_caches if hasattr(k, "device_caches") else k.cache
++
++    def variants():
++        return {n: sum(len(c[0] if isinstance(c, tuple) else c) for c in caches(n).values()) for n in names}
++
++    for n in names:   # earlier tests may have compiled the same signatures
++        caches(n).clear()
++    before = variants()
++    h, d, dt = 8, 64, torch.bfloat16
++    for s, b in ((256, 1), (301, 1), (256, 2), (77, 2)):
++        g = torch.Generator(device = "cuda").manual_seed(s)
++        r = lambda *shape: (torch.randn(*shape, device = "cuda", generator = g) * 0.3).to(dt).requires_grad_()
++        q, kv, wkv, ckv = r(b, s, h, d), r(b, s, d), r(b, s, d), r(b, s // 4 + 3, d)
++        sink = torch.randn(h, device = "cuda", generator = g).requires_grad_()
++        idx = torch.randint(-1, s, (b, s, 40), device = "cuda", dtype = torch.int32, generator = g)
++        cidx = torch.randint(-1, s // 4 + 3, (b, s, 24), device = "cuda", dtype = torch.int32, generator = g)
++        sk.sparse_mqa_attention(q, kv, sink, idx, d ** -0.5).float().square().mean().backward()
++        sk.sparse_mqa_window_attention(q, wkv, ckv, cidx, sink, d ** -0.5, 32).float().square().mean().backward()
++    grown = {n: variants()[n] - before[n] for n in names}
++    # index fwd: with the sink, and without it for the window's compressed part; window fwd / dq: one with prior.
++    assert grown == {"_sparse_mqa_fwd": 2, "_sparse_mqa_bwd": 1, "_window_fwd": 1, "_window_bwd_dq": 1,
++                     "_window_bwd_dkv": 1}, grown
++
++
++@pytest.mark.parametrize("form", ["index", "window"])
++def test_dispatch_traces_fullgraph_with_env_reads(monkeypatch, form):
++    # The backend override is an environment variable read during dispatch; torch 2.4 cannot inline os.environ.get
++    # under fullgraph. The CPU path (torch reference) traces the same dispatch code.
++    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
++    torch._dynamo.reset()
++    q, kv = torch.randn(1, 9, 2, 16), torch.randn(1, 11, 16)
++    sink, idx = torch.randn(2), torch.randint(-1, 11, (1, 9, 4)).int()
++    wkv = torch.randn(1, 9, 16)
++    if form == "index":
++        fn = lambda q, kv, sink, idx: sa.sparse_attn(q, kv, sink, idx, 0.25)
++    else:
++        fn = lambda q, kv, sink, idx: sa.sparse_attn_window(q, wkv, kv, idx, sink, 0.25, 4)
++    got = torch.compile(fn, backend = "eager", fullgraph = True)(q, kv, sink, idx)
++    torch.testing.assert_close(got, fn(q, kv, sink, idx))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
++def test_window_support_check_traces_with_symbolic_head_dim():
++    # dynamic=True makes the head dim a SymInt; torch 2.4 SymInts have no bitwise and, so a power-of-two test
++    # written d & (d - 1) failed every compiled window call there (TorchRuntimeError, Colab L4 torch 2.4.0).
++    from unsloth_zoo import sparse_mqa_kernel as sk
++    torch._dynamo.reset()
++    fn = torch.compile(lambda q, kv: q.sum() if sk.sparse_mqa_window_supported(q, kv) else q.sum() * 0,
++                       backend = "eager", fullgraph = True, dynamic = True)
++    # Traced, the decision equals the eager one (ROCm declines the window kernel at every head dim); 48 is not a power
++    # of two, so no device takes it.
++    for d in (64, 128, 48):
++        q = torch.randn(1, 8, 16, d, device = "cuda", dtype = torch.bfloat16)
++        kv = torch.randn(1, 8, d, device = "cuda", dtype = torch.bfloat16)
++        supported = sk.sparse_mqa_window_supported(q, kv)
++        assert supported == (d != 48 and torch.version.hip is None), (d, supported)
++        assert fn(q, kv).item() == pytest.approx((q.sum() if supported else q.sum() * 0).item(), rel = 1e-2)
++
++
++def test_flex_is_never_eligible_without_flex_attention(monkeypatch):
++    # torch 2.4 has no torch.nn.attention.flex_attention: QSA tried flex first, failed, warned and latched it per
++    # shape class instead of going straight to the kernel fold.
++    import importlib.util
++    assert sa._HAS_FLEX == (importlib.util.find_spec("torch.nn.attention.flex_attention") is not None)
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("flex eligibility needs sm80+")
++    q = torch.empty(1, 256, 8, 128, device = "cuda", dtype = torch.bfloat16)
++    if sa._HAS_FLEX:
++        assert sa._flex_eligible(q)
++        monkeypatch.setattr(sa, "_HAS_FLEX", False)
++    assert not sa._flex_eligible(q)
++
++
++def _backend_compiler_failed(inner):
++    from torch._dynamo.exc import BackendCompilerFailed
++    try:
++        return BackendCompilerFailed(lambda *args: None, inner, None)   # torch >= 2.7: + first_useful_frame
++    except TypeError:
++        return BackendCompilerFailed(lambda *args: None, inner)
++
++
++def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
++    # Eager QSA tries flex first and compiles it; on torch 2.6 (Colab L4) Inductor could not lower flex at the QSA
++    # shape and raised BackendCompilerFailed, which _latch re-raised as a trace-time error: the eager step crashed
++    # instead of falling back to the kernel fold. Real trace-time and memory failures still propagate.
++    import torch._dynamo.exc
++    monkeypatch.setattr(sa, "_FAILED", {})
++    q = torch.randn(1, 4, 2, 16)
++    sa._latch("flex", q, 4, _backend_compiler_failed(RuntimeError("No valid triton configs")))
++    assert sa._failure_key("flex", q, 4) in sa._FAILED
++    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed):
++        sa._latch("flex", q, 5, _backend_compiler_failed(torch.OutOfMemoryError("out of memory")))
++    with pytest.raises(torch._dynamo.exc.Unsupported):
++        sa._latch("flex", q, 6, torch._dynamo.exc.Unsupported("trace-time"))
++    assert list(sa._FAILED) == [sa._failure_key("flex", q, 4)]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None
++                    or torch.cuda.get_device_capability()[0] not in (10, 11),
++                    reason = "gather runs on datacenter Blackwell only (never ROCm, whose gfx11 reads as 11.x)")
++@pytest.mark.parametrize("form", ["index", "window"])
++def test_gather_compiles_one_variant_set_per_width_bucket(form):
++    # DeepSeek's selection width is min(index_topk, s // ratio): it changes with the length below the cap. The vendored
++    # kernels take TOPK as a constexpr (and a tuner key), so every width compiled and tuned a new variant set.
++    import triton
++    from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton import forward
++
++    def variants():
++        k = forward._gather_attn_fwd_shared
++        while not isinstance(k, triton.runtime.jit.JITFunction):
++            k = k.fn
++        caches = k.device_caches if hasattr(k, "device_caches") else k.cache
++        return sum(len(c[0] if isinstance(c, tuple) else c) for c in caches.values())
++
++    h, d, s = 16, 64, 96
++    grown = []
++    for width in (40, 50, 61):   # one power-of-two bucket (64)
++        g = torch.Generator(device = "cuda").manual_seed(width)
++        r = lambda *shape: (torch.randn(*shape, device = "cuda", generator = g) * 0.3).to(torch.bfloat16).requires_grad_()
++        q, kv, ckv = r(1, s, h, d), r(1, s, d), r(1, 70, d)
++        sink = torch.randn(h, device = "cuda", generator = g).requires_grad_()
++        before = variants()
++        if form == "index":
++            idx = torch.randint(-1, s, (1, s, width), device = "cuda", dtype = torch.int32, generator = g)
++            fn = lambda q, kv, ckv, sink: sa.sparse_attn(q, kv, sink, idx, d ** -0.5, backend = "gather")
++            ref = lambda q, kv, ckv, sink: sa.sparse_attn(q, kv, sink, idx, d ** -0.5, backend = "torch")
++        else:
++            idx = torch.randint(-1, 70, (1, s, width), device = "cuda", dtype = torch.int32, generator = g)
++            fn = lambda q, kv, ckv, sink: sa.sparse_attn_window(q, kv, ckv, idx, sink, d ** -0.5, 32, backend = "gather")
++            ref = lambda q, kv, ckv, sink: sa.sparse_attn_window(q, kv, ckv, idx, sink, d ** -0.5, 32, backend = "torch")
++        go = torch.randn(1, s, h, d, device = "cuda", dtype = torch.bfloat16)
++
++        def run(f, *xs):
++            xs = [x.detach().clone().requires_grad_() for x in xs]
++            out = f(*xs)
++            return [out, *torch.autograd.grad(out, (xs[0], xs[1], xs[3]), go.to(out.dtype))]
++
++        got = run(fn, q, kv, ckv, sink)
++        exact = run(ref, q.double(), kv.double(), ckv.double(), sink.double())
++        low = run(ref, q, kv, ckv, sink)
++        # Within twice the same-dtype torch path's error vs fp64, plus 4 bf16 ulp (as test_cuda_backend_matches_fp64).
++        for x, r, lo in zip(got, exact, low):
++            err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
++            assert err <= 2 * base + 4 * torch.finfo(torch.bfloat16).eps * max(1.0, r.abs().max().item()), (width, err, base)
++        grown.append(variants() - before)
++    assert grown[1:] == [0, 0], grown
++
++
++def test_torch_path_compiles_once_across_lengths():
++    # The torch path is what T4 (no tensor-core Triton), CPU and ROCm run under torch.compile. Its query-chunk loop
++    # ran over the length, so dynamic=True still specialised on it and recompiled for every new length.
++    torch._dynamo.reset()
++    fn = torch.compile(lambda q, kv, sink, idx: sa.sparse_attn(q, kv, sink, idx, 0.1, backend = "torch"),
++                       backend = "eager", fullgraph = True, dynamic = True)
++    from torch._dynamo.utils import counters
++    counters.clear()
++    for s in (40, 52, 77):
++        g = torch.Generator().manual_seed(s)
++        q, kv = torch.randn(1, s, 4, 16, generator = g).requires_grad_(), torch.randn(1, s, 16, generator = g).requires_grad_()
++        sink, idx = torch.randn(4, generator = g).requires_grad_(), torch.randint(-1, s, (1, s, 8), generator = g).int()
++        got = fn(q, kv, sink, idx)
++        torch.testing.assert_close(got, sa.sparse_attn_reference(q, kv, sink, idx, 0.1))
++        got.square().sum().backward()
++    assert counters["stats"]["unique_graphs"] == 1, dict(counters["stats"])
+diff --git a/tests/test_sparse_attention_skip.py b/tests/test_sparse_attention_skip.py
+index 470bdacf2..8e3398d12 100644
+--- a/tests/test_sparse_attention_skip.py
++++ b/tests/test_sparse_attention_skip.py
+@@ -31,6 +31,19 @@ _REAL_CUDA = torch.cuda.is_available() and not getattr(torch.cuda, "_unsloth_con
+ DEVICES = ["cpu"] + (["cuda"] if _REAL_CUDA else [])
+ 
+ 
++@pytest.fixture(autouse=True, scope="module")
++def _eager_masks_and_few_threads():
++    # Nothing here is about torch.compile: the only compiled code these models reach is zoo's mask builder, whose
++    # cold Inductor build (C++ on CPU) cost ~15 s per process. Build masks eagerly, and cap CPU threads, which an
++    # oversubscribed host otherwise spends on contention (the checks are bitwise within one thread setting).
++    import torch._dynamo
++    threads = torch.get_num_threads()
++    torch.set_num_threads(min(threads, 4))
++    with torch._dynamo.config.patch(disable=True):
++        yield
++    torch.set_num_threads(threads)
++
++
+ def _has(model_type):
+     return (
+         importlib.util.find_spec(f"transformers.models.{model_type}") is not None
+diff --git a/tests/test_vendor_fla_qwen4_exp.py b/tests/test_vendor_fla_qwen4_exp.py
+index eae4d38f9..b2113d6a9 100644
+--- a/tests/test_vendor_fla_qwen4_exp.py
++++ b/tests/test_vendor_fla_qwen4_exp.py
+@@ -57,38 +57,61 @@ _SUB = textwrap.dedent(
+ )
+ 
+ 
+-def test_qwen4_exp_imported_first_gets_vendored_kernels():
++_KILL_SWITCH = textwrap.dedent(
++    """
++    import importlib.util, sys
++    if importlib.util.find_spec("fla") is not None and "unsloth_zoo" not in (importlib.util.find_spec("fla").origin or ""):
++        print("SKIP_REAL_FLA_INSTALLED"); raise SystemExit(0)
++    import unsloth_zoo  # noqa: F401
++    import transformers.models.qwen4_exp.modeling_qwen4_exp as m
++    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
++    impl = _resolved_implementation(m.torch_chunk_gated_delta_rule)
++    assert getattr(impl, "__module__", "").startswith("transformers."), impl
++    print("KILL_SWITCH_OK")
++    """
++)
++
++
++@pytest.fixture(scope="module")
++def _processes():
++    # Each check needs a fresh interpreter (import order is the subject); the cold torch + transformers import
++    # dominates, so both start at once instead of one after the other. Nothing here downloads.
+     pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+-    env = dict(os.environ)
+-    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
++    base = dict(os.environ)
++    base["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + base.get("PYTHONPATH", "")
++    base["HF_HUB_OFFLINE"] = "1"
+     for k in ("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "UNSLOTH_DISABLE_VENDORED_FLA"):
+-        env.pop(k, None)
+-    proc = subprocess.run([sys.executable, "-c", _SUB], env=env, capture_output=True, text=True)
+-    if "SKIP_" in proc.stdout:
+-        pytest.skip(proc.stdout.strip())
+-    assert "QWEN4_EXP_REPAIRED_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-3000:]}"
++        base.pop(k, None)
++    kill = dict(base, UNSLOTH_DISABLE_VENDORED_FLA="1")
++    procs = {
++        name: subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE,
++                               stderr=subprocess.PIPE, text=True)
++        for name, code, env in (("imported_first", _SUB, base), ("kill_switch", _KILL_SWITCH, kill))
++    }
++    results = {}
+ 
++    def result(name):
++        if name not in results:
++            results[name] = procs[name].communicate(timeout=600)
++        return results[name]
+ 
+-def test_qwen4_exp_kill_switch_keeps_torch():
+-    pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+-    env = dict(os.environ)
+-    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+-    env["UNSLOTH_DISABLE_VENDORED_FLA"] = "1"
+-    env.pop("UNSLOTH_VENDORED_FLA_NO_AUTORUN", None)
+-    code = textwrap.dedent(
+-        """
+-        import importlib.util, sys
+-        if importlib.util.find_spec("fla") is not None and "unsloth_zoo" not in (importlib.util.find_spec("fla").origin or ""):
+-            print("SKIP_REAL_FLA_INSTALLED"); raise SystemExit(0)
+-        import unsloth_zoo  # noqa: F401
+-        import transformers.models.qwen4_exp.modeling_qwen4_exp as m
+-        from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+-        impl = _resolved_implementation(m.torch_chunk_gated_delta_rule)
+-        assert getattr(impl, "__module__", "").startswith("transformers."), impl
+-        print("KILL_SWITCH_OK")
+-        """
+-    )
+-    proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+-    if "SKIP_" in proc.stdout:
+-        pytest.skip(proc.stdout.strip())
+-    assert "KILL_SWITCH_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-3000:]}"
++    yield result
++    for proc in procs.values():
++        if proc.poll() is None:
++            proc.kill()
++            proc.communicate()
++
++
++def _check(result, ok):
++    stdout, stderr = result
++    if "SKIP_" in stdout:
++        pytest.skip(stdout.strip())
++    assert ok in stdout, f"stdout=\n{stdout}\nstderr=\n{stderr[-3000:]}"
++
++
++def test_qwen4_exp_imported_first_gets_vendored_kernels(_processes):
++    _check(_processes("imported_first"), "QWEN4_EXP_REPAIRED_OK")
++
++
++def test_qwen4_exp_kill_switch_keeps_torch(_processes):
++    _check(_processes("kill_switch"), "KILL_SWITCH_OK")
+diff --git a/unsloth_zoo/sparse_attention.py b/unsloth_zoo/sparse_attention.py
+index 0d7dec3c3..a6f088601 100644
+--- a/unsloth_zoo/sparse_attention.py
++++ b/unsloth_zoo/sparse_attention.py
+@@ -61,17 +61,26 @@ SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "hd512": 0
+ QSA_TIE_STATS = {"chunks": 0, "tied_rows": 0}
+ 
+ 
++@torch.compiler.assume_constant_result
++def _env(name, default):
++    """os.environ lookup that traces on every supported torch: torch 2.4 cannot inline os.environ.get under
++    fullgraph ("Mapping.get" in skipfiles). Traced calls bake the value read at trace time, as 2.6+ already do."""
++    return os.environ.get(name, default)
++
++
+ def _exact_ties():
+     """UNSLOTH_QWEN4_EXP_EXACT_TIES=1: rows whose k-th and (k+1)-th block scores tie are recomputed exactly as
+     transformers' indexer does (its matmul and topk over that row's candidates), so the kept tokens are the
+     reference's. Off by default: it needs a host sync per query chunk and one small topk per tied row (L4, medium
+     Qwen at 4k: ~300 tied rows per step, 756 vs 641 ms per step). Without it a tied row may keep a different,
+     equally-scored block (torch.topk's tie order is unspecified); the score multiset is the reference's."""
+-    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
++    return _env("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
+ 
+ _BACKENDS = ("gather", "triton", "flex", "torch")
+ _FAILED = {}
+ _HAS_TRITON = importlib.util.find_spec("triton") is not None
++# flex_attention first ships in torch 2.5; without it the flex backend is never eligible (not tried, failed, latched).
++_HAS_FLEX = importlib.util.find_spec("torch.nn.attention.flex_attention") is not None
+ _GATHER = None
+ _FLEX = None
+ _BLOCK = 128
+@@ -91,7 +100,7 @@ def _count(key):
+ 
+ def _forced_backend(window = False):
+     """UNSLOTH_SPARSE_ATTN_BACKEND; "hd512" only where it exists (the window-only form)."""
+-    value = os.environ.get("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
++    value = _env("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
+     return value if value in (_BACKENDS + ("hd512",) if window else _BACKENDS) else None
+ 
+ 
+@@ -99,6 +108,10 @@ def _gather_fn():
+     global _GATHER
+     if not _GATHER:   # None (not tried) or False (failed: re-raise the real import error for a forced call)
+         from unsloth_zoo._vendored.attn_gym.sparse.gather_attn import gather_attn
++        # The api loads its Triton kernels only on the first call; import them now so a Triton without
++        # constexpr_function (< 3.5: torch 2.4 - 2.8) is found here, not inside a compiled step.
++        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward  # noqa: F401
++        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.forward  # noqa: F401
+         _GATHER = gather_attn
+     return _GATHER
+ 
+@@ -114,6 +127,16 @@ def _gather_importable():
+     return bool(_GATHER)
+ 
+ 
++def _resolve_gather():
++    """Once at import: traced dispatch then only reads _GATHER (a cold trace skipped gather: _gather_importable does
++    not import while compiling, so the first compiled step on Blackwell ran the Triton kernel instead)."""
++    global _GATHER
++    try:
++        _gather_fn()
++    except Exception:
++        _GATHER = False
++
++
+ def _gather_eligible(q, window = 0):
+     """gather_attn's shared-KV schedule only: k-tiled tl.dot over the gathered rows, every head sharing one KV
+     load. Its other Triton kernels unroll tl.static_range(TOPK) one row at a time (TOPK a compile key; a TOPK of
+@@ -145,15 +168,22 @@ _FLEX_D256_MIN_SHARED_MEMORY = 96 * 1024
+ _SHARED_MEMORY = {}
+ 
+ 
++def _query_shared_memory(index):
++    try:
++        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
++    except Exception:
++        return 0
++
++
+ def _shared_memory(device):
+     if device.type != "cuda":
+         return 0
+     index = device.index if device.index is not None else torch.cuda.current_device()
++    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
++    if torch.compiler.is_compiling():
++        return _query_shared_memory(index)
+     if index not in _SHARED_MEMORY:
+-        try:
+-            _SHARED_MEMORY[index] = getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
+-        except Exception:
+-            _SHARED_MEMORY[index] = 0
++        _SHARED_MEMORY[index] = _query_shared_memory(index)
+     return _SHARED_MEMORY[index]
+ 
+ 
+@@ -174,7 +204,7 @@ def _triton_eligible(q, forced = False, kv = None):
+ 
+ 
+ def _flex_eligible(q, kv_len = None):
+-    if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
++    if not (q.is_cuda and _HAS_TRITON and _HAS_FLEX and q.dtype in (torch.float16, torch.bfloat16)):
+         return False
+     # sm75 (T4): flex_attention failed to compile at head_dim 64 and 256 ("No valid triton configs") and the flex
+     # training arm failed; sm80+ only.
+@@ -278,6 +308,10 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
+         probs = torch.where(empty, 0, probs)
+         return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
+ 
++    if s <= _TORCH_CHUNK_ELEMS // max(1, k * d * b):
++        # One chunk: no Python loop over the length, which a compiled call (the T4 / CPU / ROCm path) would
++        # specialise on, recompiling for every new length even under dynamic=True.
++        return block(q, kv_pad, sink, safe, valid)
+     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
+     recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
+     outs = []
+@@ -311,6 +345,14 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
+     if heads != h:
+         q = torch.cat([q, q.new_zeros((b, s, heads - h, d))], dim = 2)
+         sink = torch.cat([sink, sink.new_full((heads - h,), float("-inf"))])
++    # TOPK is a tl.constexpr and a tuner key of the shared-KV kernels (each new width: a new variant set and ~10 s of
++    # tuning on B200). DeepSeek's width follows the length (min(index_topk, s // ratio)): pad it with skipped -1 slots
++    # to the next power of two (at least 16), so a run compiles a handful of buckets. A symbolic width stays as is.
++    k = idxs.shape[-1]
++    if isinstance(k, int) and k:
++        width = max(16, 1 << (k - 1).bit_length())
++        if width != k:
++            idxs = torch.cat([idxs, idxs.new_full((*idxs.shape[:-1], width - k), -1)], dim = -1)
+     # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
+     # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
+     out = _gather_fn()(
+@@ -424,8 +466,12 @@ def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
+ 
+ 
+ def _latch(backend, q, k, error):
+-    # Never swallow trace-time, capture or memory failures: the shape class is not at fault.
+-    if isinstance(error, torch.OutOfMemoryError) or type(error).__module__.startswith("torch._dynamo"):
++    # Never swallow trace-time, capture or memory failures: the shape class is not at fault. A backend's own compile
++    # failure is (flex compiles flex_attention eagerly; torch 2.6 wraps an Inductor lowering failure for the shape,
++    # e.g. on L4, in BackendCompilerFailed): latch it unless the inner error is a memory failure.
++    from torch._dynamo.exc import BackendCompilerFailed
++    inner = getattr(error, "inner_exception", error) if isinstance(error, BackendCompilerFailed) else error
++    if isinstance(inner, torch.OutOfMemoryError) or (inner is error and type(error).__module__.startswith("torch._dynamo")):
+         raise error
+     if q.is_cuda and torch.cuda.is_current_stream_capturing():
+         raise error
+@@ -769,3 +815,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
+                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
+                                       top_blocks, ratio, dim)
+     return out
++
++
++if _HAS_TRITON:
++    _resolve_gather()
+diff --git a/unsloth_zoo/sparse_mqa_kernel.py b/unsloth_zoo/sparse_mqa_kernel.py
+index 164ce0728..8d2c1b4c7 100644
+--- a/unsloth_zoo/sparse_mqa_kernel.py
++++ b/unsloth_zoo/sparse_mqa_kernel.py
+@@ -28,8 +28,9 @@ deterministic). d(sink) is a reduction over the saved log-sum-exp in torch.
+ 
+ Ops are versioned custom ops with fakes and autograd (no graph break under torch.compile; bump _V on any schema or
+ formula change: Inductor caches key the op name). Sequence length, slot count and pool length are runtime
+-arguments (do_not_specialize); the compile key is (head_dim, tile sizes, has_sink, dtype). Head dims are powers of
+-two from 16 to 512. Configs are fixed per shared-memory tier of the operand's device, never autotuned; a launch
++arguments (do_not_specialize), and so is the log-sum-exp batch stride s * h (its % 16 alignment flips with the
++length when h is not a multiple of 16); the compile key is (head_dim, tile sizes, has_sink, dtype). Head dims are
++powers of two from 16 to 512. Configs are fixed per shared-memory tier of the operand's device, never autotuned; a launch
+ refused for shared memory steps down to the next config (on 64 KB parts the head_dim 512 backward splits D across
+ two programs, each recomputing the full-D logits), and the last refusal propagates.
+ """
+@@ -51,7 +52,7 @@ SPARSE_MQA_STATS = {"fwd": 0, "bwd": 0, "window_fwd": 0, "window_bwd": 0, "hd512
+ _V = "v3"
+ 
+ 
+-@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is"])
++@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is", "stride_lb"])
+ def _sparse_mqa_fwd(
+     Q, KV, IDX, SINK, OUT, LSE,
+     S, N, TOPK, H, IDX_GROUP,
+@@ -114,7 +115,7 @@ def _sparse_mqa_fwd(
+     tl.store(LSE + b * stride_lb + t * stride_ls + offs_h, lse, mask = h_ok)
+ 
+ 
+-@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is"])
++@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is", "stride_lb"])
+ def _sparse_mqa_bwd(
+     Q, KV, IDX, DO, LSE, DELTA, DQ, DKV,
+     S, N, TOPK, H, IDX_GROUP,
+@@ -180,7 +181,7 @@ def _sparse_mqa_bwd(
+     tl.store(DQ + q_row + offs_d[None, :], (dq * scale).to(DQ.dtype.element_ty), mask = h_ok[:, None])
+ 
+ 
+-@triton.jit(do_not_specialize = ["S", "H", "W"])
++@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
+ def _window_fwd(
+     Q, KV, OC, LSEC, SINK, OUT, LSE,
+     S, H, W,
+@@ -252,7 +253,7 @@ def _window_fwd(
+     tl.store(LSE + lrow, lse, mask = ok)
+ 
+ 
+-@triton.jit(do_not_specialize = ["S", "H", "W"])
++@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
+ def _window_bwd_dq(
+     Q, KV, DO, LSE, DELTA, DQ_IN, DQ,
+     S, H, W,
+@@ -301,7 +302,7 @@ def _window_bwd_dq(
+     tl.store(DQ + row[:, None] + offs_d[None, :], dq.to(DQ.dtype.element_ty), mask = ok[:, None])
+ 
+ 
+-@triton.jit(do_not_specialize = ["S", "H", "W"])
++@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
+ def _window_bwd_dkv(
+     Q, KV, DO, LSE, DELTA, DKV,
+     S, H, W,
+@@ -355,6 +356,9 @@ def _shared_memory(device):
+     if device.type != "cuda":  # TRITON_INTERPRET=1 tests on CPU
+         return 48 * 1024
+     index = device.index if device.index is not None else torch.cuda.current_device()
++    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
++    if torch.compiler.is_compiling():
++        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 48 * 1024)
+     if index not in _SMEM:
+         props = torch.cuda.get_device_properties(index)
+         _SMEM[index] = getattr(props, "shared_memory_per_block_optin", 48 * 1024)
+@@ -423,7 +427,7 @@ def sparse_mqa_supported(q, kv):
+     if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
+         return False
+     d = q.shape[-1]
+-    if d < 16 or d > 512 or d & (d - 1):
++    if d not in (16, 32, 64, 128, 256, 512):   # not d & (d - 1): torch 2.4 SymInts (dynamic=True) have no &
+         return False
+     if q.dtype == torch.bfloat16 and torch.cuda.get_device_capability(q.device)[0] < 8:
+         return False
+diff --git a/unsloth_zoo/temporary_patches/qwen4_exp.py b/unsloth_zoo/temporary_patches/qwen4_exp.py
+index 9dd920be4..9678c5144 100644
+--- a/unsloth_zoo/temporary_patches/qwen4_exp.py
++++ b/unsloth_zoo/temporary_patches/qwen4_exp.py
+@@ -81,14 +81,6 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
+         output_attentions = getattr(module.config, "output_attentions", False)
+     if not _sparse_attn_enabled() or output_attentions:
+         return None
+-    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
+-    # attention; decode steps and chunked prefill over cached tokens keep the reference.
+-    if past_key_values is not None:
+-        try:
+-            if past_key_values.get_seq_length(module.layer_idx) != 0:
+-                return None
+-        except Exception:
+-            return None
+     # One selection is shared by every head: a per-head mask ([b, h > 1, s, n]) keeps the reference.
+     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
+         return None
+@@ -97,6 +89,15 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
+         return None
+     if module.training and module.attention_dropout:
+         return None
++    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
++    # attention; decode steps and chunked prefill over cached tokens keep the reference. Probed after the shape
++    # checks, which already reject decode: a StaticCache answers with a tensor (a data-dependent branch, a host sync).
++    if past_key_values is not None:
++        try:
++            if past_key_values.get_seq_length(module.layer_idx) != 0:
++                return None
++        except Exception:
++            return None
+     import sys
+     from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn, sparse_gqa_fast_path
+     # No kernel for QSA on this device (T4 / sm75: no flex, Triton without tensor cores): transformers' own path.
