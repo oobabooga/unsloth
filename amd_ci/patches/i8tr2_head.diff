@@ -1,0 +1,348 @@
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_triton.py b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+index aa89d57040..7bd6ec607f 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention_triton.py
++++ b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+@@ -46,6 +46,24 @@ try:
+ except Exception:  # noqa: BLE001 -- no Triton: the module imports, nothing here runs
+     triton = None
+ 
++
++def _rocm_build() -> bool:
++    try:
++        import torch
++
++        from .rocm_bf16 import is_rocm_torch
++        return bool(is_rocm_torch(torch))
++    except Exception:  # noqa: BLE001 -- read as an NVIDIA build: sizes stay out of the compile key
++        return False
++
++
++# Sequence lengths kept out of the attention kernel's compile key, except on ROCm: there the % 16 facts on sq / sk are
++# worth 3% at 75k tokens on gfx1151 (Wan 2.2 A14B 720p), and a run keeps one resolution, so they cost one compile per
++# shape class, not per step. NVIDIA times the same either way.
++_ATTN_NO_SPECIALIZE = (
++    ["n_heads"] if triton is not None and _rocm_build() else ["sq", "sk", "n_heads"]
++)
++
+ if triton is not None:
+ 
+     @triton.jit
+@@ -634,7 +652,7 @@ if triton is not None:
+         m_i = m_new
+         return acc, l_i, m_i
+ 
+-    @triton.jit
++    @triton.jit(do_not_specialize = _ATTN_NO_SPECIALIZE)
+     def attn_kernel(
+         q_ptr,
+         qs_ptr,
+@@ -1011,10 +1029,8 @@ def _quantise(plan: dict, q: Any, k: Any, v: Any) -> dict:
+     if not plan["fused"]:
+         _quantise_unfused(kk, plan, q, k, v, out, kc)
+         return out
+-    kk.prep[plan["prep_grid"]](
+-        q, k, v, qi, qs, kc, vc, vg, vh, *plan["prep_args"], **plan["prep_meta"]
+-    )
+-    kk.kv[plan["kv_grid"]](k, kc, ki, ks, v, vc, vg, vi, vs, *plan["kv_args"], **plan["kv_meta"])
++    _launch(kk.prep, plan, "prep", (q, k, v, qi, qs, kc, vc, vg, vh))
++    _launch(kk.kv, plan, "kv", (k, kc, ki, ks, v, vc, vg, vi, vs))
+     return out
+ 
+ 
+@@ -1077,6 +1093,110 @@ def _quantise_unfused(kk: Any, plan: dict, q: Any, k: Any, v: Any, out: dict, kc
+         )
+ 
+ 
++FAST_LAUNCH_ENV = "UNSLOTH_DIFFUSION_INT8_TRITON_FAST_LAUNCH"
++_FAST_LAUNCH: dict = {"ok": None}
++
++
++def _fast_launch_ok() -> bool:
++    if _FAST_LAUNCH["ok"] is None:
++        import os
++        _FAST_LAUNCH["ok"] = os.environ.get(FAST_LAUNCH_ENV, "1").strip() != "0"
++    return bool(_FAST_LAUNCH["ok"])
++
++
++def _launch_hooks() -> tuple:
++    knobs = getattr(triton, "knobs", None)
++    rt = getattr(knobs, "runtime", None) if knobs is not None else None
++    if rt is not None and hasattr(rt, "launch_enter_hook"):
++        return rt.launch_enter_hook, rt.launch_exit_hook
++    from triton.compiler.compiler import CompiledKernel
++
++    return CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook
++
++
++def _launcher(
++    kernel: Any, compiled: Any, tensors: tuple, scalars: tuple, meta: dict
++) -> Optional[tuple]:
++    """(compiled kernel, every argument in parameter order with the tensors' positions left open) for the launch
++    JITFunction.run makes, or None when this Triton does not expose it (the call keeps kernel[grid](...))."""
++    try:
++        if compiled is None or not all(
++            hasattr(compiled, x) for x in ("run", "function", "packed_metadata")
++        ):
++            return None
++        given = iter((*tensors, *scalars))
++        template, slots = [], []
++        for i, param in enumerate(kernel.params):
++            if param.is_constexpr:
++                template.append(meta[param.name] if param.name in meta else param.default)
++            else:
++                value = next(given)
++                if i < len(tensors):
++                    # an open slot, not the tensor: the plan outlives the call, and holding this call's buffers
++                    # would keep them allocated next to the following call's
++                    slots.append(i)
++                    value = None
++                template.append(value)
++        if next(given, None) is not None or slots != list(range(len(tensors))):
++            return None
++        return compiled, template
++    except Exception:  # noqa: BLE001 -- an unexpected Triton layout keeps the regular launch
++        return None
++
++
++def _launch(kernel: Any, plan: dict, name: str, tensors: tuple) -> None:
++    """``kernel[grid](*tensors, *scalars, **meta)`` of the plan. The first call per device goes through Triton's
++    launch (compile or cache lookup, argument specialisation); later calls on that device hand the same arguments
++    straight to the compiled kernel's launcher, as JITFunction.run does after its lookup, so a short call does not
++    pay the per-argument specialisation again. Taken only while every tensor is 16-byte aligned, as at the first
++    call (the alignment is part of what was compiled); any failure falls back to the regular launch for good."""
++    grid, scalars, meta = plan[name + "_grid"], plan[name + "_args"], plan[name + "_meta"]
++    # the interpreter (TRITON_INTERPRET) runs kernels in Python: nothing compiled to hand arguments to
++    if _fast_launch_ok() and isinstance(kernel, triton.runtime.jit.JITFunction):
++        from triton.runtime.driver import driver
++
++        # keyed by the card the launch runs on (the operands' card: the public calls hold it via _on_card); a call
++        # whose operands sit on another card takes the regular launch, never another card's compiled kernel
++        dev = driver.active.get_current_device()
++        fast = plan.setdefault("fast", {}).get((name, dev))
++        if fast and tensors[0].get_device() == dev and all(t.data_ptr() % 16 == 0 for t in tensors):
++            compiled, template = fast
++            args = list(template)
++            args[: len(tensors)] = tensors
++            try:
++                stream = driver.active.get_current_stream(dev)
++                enter, leave = _launch_hooks()
++                metadata = (
++                    compiled.launch_metadata(grid, stream, *args)
++                    if hasattr(compiled, "launch_metadata")
++                    else None
++                )
++                compiled.run(
++                    grid[0],
++                    grid[1],
++                    grid[2] if len(grid) > 2 else 1,
++                    stream,
++                    compiled.function,
++                    compiled.packed_metadata,
++                    metadata,
++                    enter,
++                    leave,
++                    *args,
++                )
++                return
++            except Exception:  # noqa: BLE001 -- this Triton's launcher wants something else: regular launches
++                _FAST_LAUNCH["ok"] = False
++        compiled = kernel[grid](*tensors, *scalars, **meta)
++        if (
++            fast is None
++            and tensors[0].get_device() == dev
++            and all(t.data_ptr() % 16 == 0 for t in tensors)
++        ):
++            plan["fast"][(name, dev)] = _launcher(kernel, compiled, tensors, scalars, meta) or False
++        return
++    kernel[grid](*tensors, *scalars, **meta)
++
++
+ def quantise(
+     q: Any,
+     k: Any,
+@@ -1106,18 +1226,21 @@ def _attend(p: dict) -> Any:
+     mode = plan["mode"]
+     vv = v if mode == 0 else p["vh"] if mode in (1, 3) else p["vi"]
+     dummy = p["qs"]
+-    kk.attn[plan["attn_grid"]](
+-        p["qi"],
+-        p["qs"],
+-        p["ki"],
+-        p["ks"],
+-        vv,
+-        p.get("vs", dummy),
+-        p.get("vc", dummy),
+-        p.get("vg", dummy),
+-        out,
+-        *plan["attn_args"],
+-        **plan["attn_meta"],
++    _launch(
++        kk.attn,
++        plan,
++        "attn",
++        (
++            p["qi"],
++            p["qs"],
++            p["ki"],
++            p["ks"],
++            vv,
++            p.get("vs", dummy),
++            p.get("vc", dummy),
++            p.get("vg", dummy),
++            out,
++        ),
+     )
+     return out
+ 
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_rocm.py b/studio/backend/tests/test_diffusion_int8_attention_rocm.py
+index 8a5b45d063..d6f1a6d8fb 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_rocm.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_rocm.py
+@@ -329,6 +329,29 @@ def test_fused_launches_match_one_launch_per_quantiser_interpreted():
+     assert len(res) == 6 and all(all(v) for v in res.values()), res
+ 
+ 
++def test_varying_sizes_stay_out_of_the_compile_key():
++    """Sequence lengths, head counts and block counts are not specialised on (% 16, == 1), so a new shape does not
++    compile another variant of a kernel (at most the EVEN_K pair per config and head dim)."""
++    pytest.importorskip("triton")
++    from core.inference import diffusion_int8_attention_triton as T
++
++    if T.triton is None:
++        pytest.skip("no Triton")
++    for kernel, names in (
++        # ROCm keeps sq / sk specialised in the attention kernel (3% at 75k tokens on gfx1151)
++        (T.attn_kernel, {"n_heads"} if T._rocm_build() else {"sq", "sk", "n_heads"}),
++        (T.prep_kernel, {"sq", "sk", "n_heads", "n_qblk"}),
++        (T.kv_kernel, {"sk", "n_heads", "n_kblk"}),
++    ):
++        # names or positions, by Triton version
++        skipped = {
++            kernel.arg_names[i] if isinstance(i, int) else i for i in kernel.do_not_specialize
++        }
++        assert names <= skipped, (kernel.fn.__name__, skipped)
++        if kernel is T.attn_kernel and T._rocm_build():
++            assert not {"sq", "sk"} & skipped, skipped
++
++
+ def test_launch_plan_is_made_once_per_call_signature(monkeypatch):
+     from core.inference import diffusion_int8_attention_triton as T
+ 
+@@ -461,3 +484,117 @@ def test_long_sequences_take_the_long_config():
+     assert T.select_config(plain, 10**6) == plain
+     assert T._launch_options(plain) == {"num_warps": 4, "num_stages": 1}
+     assert T._launch_options(dict(plain, waves_per_eu = 2))["waves_per_eu"] == 2
++
++
++def test_direct_launch_passes_every_argument_in_parameter_order():
++    """The arguments handed to a compiled kernel's launcher after the first call are the ones JITFunction.run binds:
++    every parameter in order, constexprs from the launch keywords or their defaults, launch options left out; an
++    unexpected layout means no direct launch."""
++    from core.inference import diffusion_int8_attention_triton as T
++
++    P = types.SimpleNamespace
++    kernel = P(
++        params = [
++            P(name = "x", is_constexpr = False, default = None),
++            P(name = "y", is_constexpr = False, default = None),
++            P(name = "n", is_constexpr = False, default = None),
++            P(name = "BM", is_constexpr = True, default = None),
++            P(name = "Q", is_constexpr = True, default = 7),
++        ]
++    )
++    compiled = P(run = 1, function = 2, packed_metadata = 3)
++    got = T._launcher(kernel, compiled, ("tx", "ty"), (5,), {"BM": 64, "num_warps": 4})
++    assert got == (compiled, [None, None, 5, 64, 7])
++    # the cached template must not hold the first call's tensors: the plan outlives the call, and a held buffer
++    # stays allocated next to the following call's (one extra set of quantised tensors per cached plan)
++    import gc
++    import weakref
++
++    class Buf:
++        pass
++
++    a, b = Buf(), Buf()
++    refs = (weakref.ref(a), weakref.ref(b))
++    kept = T._launcher(kernel, compiled, (a, b), (5,), {"BM": 64})
++    del a, b
++    gc.collect()
++    assert kept is not None and all(r() is None for r in refs)
++    assert T._launcher(kernel, compiled, ("tx", "ty"), (5, 6), {"BM": 64}) is None
++    assert T._launcher(kernel, None, ("tx", "ty"), (5,), {"BM": 64}) is None
++    assert T._launcher(kernel, P(run = 1), ("tx", "ty"), (5,), {"BM": 64}) is None
++
++
++def test_direct_launch_never_crosses_cards(monkeypatch):
++    """The cached direct launcher belongs to the card it was compiled on: a call on another card (or with operands on
++    another card than the current one) takes the regular launch, and each card gets its own cached launcher."""
++    pytest.importorskip("triton")
++    from core.inference import diffusion_int8_attention_triton as T
++
++    if T.triton is None:
++        pytest.skip("no Triton")
++    from triton.runtime.driver import driver
++
++    P = types.SimpleNamespace
++    current = {"dev": 0}
++    log = []
++
++    class Compiled:
++        def __init__(self, dev):
++            self.dev, self.function, self.packed_metadata = dev, dev, None
++
++        def run(self, *a):
++            log.append(("direct", self.dev, current["dev"]))
++
++    class Kernel:
++        params = [
++            P(name = "x", is_constexpr = False, default = None),
++            P(name = "n", is_constexpr = False, default = None),
++        ]
++
++        def __getitem__(self, grid):
++            def launch(*a, **k):
++                log.append(("regular", current["dev"]))
++                return Compiled(current["dev"])
++
++            return launch
++
++    class Buf:
++        def __init__(self, dev):
++            self.dev = dev
++
++        def data_ptr(self):
++            return 4096
++
++        def get_device(self):
++            return self.dev
++
++    class Driver:
++        def get_current_device(self):
++            return current["dev"]
++
++        def get_current_stream(self, dev):
++            return 0
++
++    monkeypatch.setattr(T.triton.runtime.jit, "JITFunction", Kernel)
++    monkeypatch.setattr(T, "_FAST_LAUNCH", {"ok": True})
++    monkeypatch.setattr(
++        driver, "_active", Driver()
++    )  # restored after the test, no real driver is created
++    plan = {"k_grid": (1, 1, 1), "k_args": (5,), "k_meta": {}}
++    kernel = Kernel()
++    T._launch(
++        kernel, plan, "k", (Buf(0),)
++    )  # first call on card 0: regular, caches card 0's launcher
++    T._launch(kernel, plan, "k", (Buf(0),))  # card 0 again: direct, card 0's kernel
++    current["dev"] = 1
++    T._launch(kernel, plan, "k", (Buf(1),))  # card 1: regular, never card 0's kernel
++    T._launch(kernel, plan, "k", (Buf(1),))  # card 1 again: direct, card 1's kernel
++    T._launch(kernel, plan, "k", (Buf(0),))  # operands on card 0 while card 1 is current: regular
++    assert log == [
++        ("regular", 0),
++        ("direct", 0, 0),
++        ("regular", 1),
++        ("direct", 1, 1),
++        ("regular", 1),
++    ], log
++    assert T._FAST_LAUNCH["ok"] is True
