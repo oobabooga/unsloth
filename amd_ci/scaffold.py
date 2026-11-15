@@ -71,7 +71,7 @@ def main() -> int:
     ap.add_argument("--branch", default = None)
     ap.add_argument("--merged", action = "store_true")
     ap.add_argument("--patch", type = Path, default = None,
-                    help = "Linux: head = --patch-base plus this git diff (a fix that is not a PR yet); base = "
+                    help = "Linux and --windows: head = --patch-base plus this git diff (a fix that is not a PR yet); base = "
                            "--patch-base. The diff rides in the branch under amd_ci/patches/.")
     ap.add_argument("--patch-base", default = None, help = "full commit SHA the --patch applies to")
     ap.add_argument("--tests", nargs = "*", default = ["tests/"])
@@ -129,8 +129,8 @@ def main() -> int:
     out = args.out
     if bool(args.patch) != bool(args.patch_base):
         raise SystemExit("--patch and --patch-base go together")
-    if args.patch and (args.windows or args.merged):
-        raise SystemExit("--patch is Linux-only and compares a commit with itself plus a diff (no --merged)")
+    if args.patch and args.merged:
+        raise SystemExit("--patch compares a commit with itself plus a diff (no --merged)")
     if args.patch and not args.patch.is_file():
         raise SystemExit(f"--patch {args.patch}: no such file")
     # Both land unescaped in the workflow's YAML env block and in an unquoted shell word.
@@ -208,6 +208,8 @@ def main() -> int:
     if args.patch:
         (dest / "patches").mkdir(exist_ok = True)
         shutil.copy(args.patch, dest / "patches" / args.patch.name)
+        # Git for Windows checks text out with CRLF (core.autocrlf): a CRLF diff no longer applies.
+        (dest / "patches" / ".gitattributes").write_text("* -text\n", encoding = "utf-8")
 
     template = ROOT / "templates" / ("workflow_windows.yml" if args.windows else "workflow.yml")
 

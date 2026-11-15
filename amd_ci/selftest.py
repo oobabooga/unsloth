@@ -1233,6 +1233,15 @@ def test_patch_mode_renders_applies_and_refuses() -> None:
         check("scaffold: PATCH_BASE / PATCH_FILE rendered and the diff copied",
               f'PATCH_BASE: "{"a" * 40}"' in text and 'PATCH_FILE: "amd_ci/patches/fix.diff"' in text
               and (td / "o1" / "amd_ci" / "patches" / "fix.diff").is_file(), r.stdout[-300:] + r.stderr[-300:])
+        r = subprocess.run([*sc[:-1], "--windows", "--out", str(td / "o3"), "--patch", str(good), "--patch-base", "a" * 40],
+                           capture_output = True, text = True)
+        wf = next((td / "o3" / ".github" / "workflows").glob("*.yml"), None) if r.returncode == 0 else None
+        text = wf.read_text(encoding = "utf-8") if wf else ""
+        check("scaffold --windows: PATCH env rendered, forwarded to states.py, diff kept LF (-text)",
+              f'PATCH_BASE: "{"a" * 40}"' in text and 'PATCH_FILE: "amd_ci/patches/fix.diff"' in text
+              and '"--patch", "$env:GITHUB_WORKSPACE\\$env:PATCH_FILE"' in text
+              and (td / "o3" / "amd_ci" / "patches" / ".gitattributes").read_text(encoding = "utf-8") == "* -text\n",
+              r.stdout[-300:] + r.stderr[-300:])
         spaced = td / "my fix.diff"
         spaced.write_text(good.read_text(encoding = "utf-8"), encoding = "utf-8")
         for name, extra in (("a non-SHA base", ["--patch", str(good), "--patch-base", 'abc" ; x']),
