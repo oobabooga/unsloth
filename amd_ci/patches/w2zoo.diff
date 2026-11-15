@@ -223,10 +223,27 @@ index 000000000..48c514560
 +    fla_vendor.patch_vendor_fla()
 +    assert "FLA_FLASH_QLA" not in os.environ
 diff --git a/tests/test_gdn_causal_conv1d.py b/tests/test_gdn_causal_conv1d.py
-index 1e8f3e77d..303aedca1 100644
+index 1e8f3e77d..ede27dae9 100644
 --- a/tests/test_gdn_causal_conv1d.py
 +++ b/tests/test_gdn_causal_conv1d.py
-@@ -830,3 +830,23 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
+@@ -255,9 +255,13 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
+         if fn is None:
+             continue
+         if gcc._is_marked(fn):
+-            # Patched at import on a CUDA host: rebuild the unpatched hub function.
+-            dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
+-            fn = decorator(attr, "causal_conv1d")(dispatch.__wrapped__)
++            # Patched at import on a CUDA host, possibly more than once (earlier tests re-patch a module they never
++            # restore): rebuild the hub function from the first layer that carries no patch. functools.wraps copies
++            # the mark, so rebuilding from a still-patched layer would stay marked.
++            base = fn
++            while gcc._is_marked(base) and getattr(base, "__wrapped__", None) is not None:
++                base = base.__wrapped__
++            fn = decorator(attr, "causal_conv1d")(base)
+         monkeypatch.setattr(modeling, attr, fn)
+     monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
+     return modeling
+@@ -830,3 +834,23 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
          gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
      ], dim = -1)
      torch.testing.assert_close(y, expected)
