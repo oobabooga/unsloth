@@ -1,0 +1,840 @@
+diff --git a/tests/test_block_swap.py b/tests/test_block_swap.py
+index f88023f70..a8df2e2cf 100644
+--- a/tests/test_block_swap.py
++++ b/tests/test_block_swap.py
+@@ -76,6 +76,7 @@ def _scheduler(n, depth = 2, sigs = None, start = 0):
+     sw.indices = list(range(start, start + n))
+     sw.pos = {li: k for k, li in enumerate(sw.indices)}
+     sw._input_hooked = [False] * n
++    sw._forward_task = [-1] * n
+     sw._grew = False
+     sw._new_slot = lambda sig: object()
+     for b in sw.blocks:
+@@ -632,6 +633,55 @@ def test_cross_fed_tensor_grads_are_bitwise_with_swap():
+             assert live == 1, (mode, idx, live)
+ 
+ 
++class _IdsBranchBlock(nn.Module):
++    """A block with a branch fed only by a no-grad input (per-layer token-id embeddings, as Qwen4Exp's PLE keys or
++    Gemma-3n's per-layer inputs): its backward reads the frozen norm weight `n` (saved as the parameter itself, as an
++    RMSNorm's is) to reach the adapter `lora_k`, never the block input."""
++
++    def __init__(self, d):
++        super().__init__()
++        self.w = nn.Linear(d, d, bias = False).requires_grad_(False)
++        self.k = nn.Linear(d, d, bias = False).requires_grad_(False)
++        self.n = nn.Parameter(torch.rand(d) + 0.5, requires_grad = False)
++        self.lora = nn.Parameter(torch.randn(d, d) * 0.01)
++        self.lora_k = nn.Parameter(torch.randn(d, d) * 0.01)
++
++    def forward(self, x, ids_emb):
++        key = (self.k(ids_emb) + ids_emb @ self.lora_k) * self.n
++        return x + torch.tanh(self.w(x) + x @ self.lora) * torch.sigmoid(key)
++
++
++def test_reentrant_recompute_keeps_weights_until_the_whole_block_backward_ran():
++    # The input's grad lands before the ids-only branch's backward has read `n`: releasing the block right there left
++    # that backward reading an evicted weight (eager Qwen4Exp + offload_layers: illegal memory access).
++    if not torch.cuda.is_available():
++        __import__("pytest").skip("needs CUDA")
++    import torch.utils.checkpoint as cp
++    torch.manual_seed(0)
++    blocks = nn.ModuleList([_IdsBranchBlock(128) for _ in range(4)]).cuda()
++
++    def run(swap):
++        torch.manual_seed(1)
++        x = torch.randn(4, 128, device = "cuda", requires_grad = True)
++        ids_emb = torch.randn(4, 128, device = "cuda")
++        sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1, device = "cuda") if swap else None
++        for b in blocks:
++            b.lora.grad = b.lora_k.grad = None
++        h = x
++        for b in blocks:
++            h = cp.checkpoint(b, h, ids_emb, use_reentrant = True)
++        h.square().sum().backward()
++        torch.cuda.synchronize()
++        out = [x.grad.clone()] + [g.clone() for b in blocks for g in (b.lora.grad, b.lora_k.grad)]
++        if sw is not None:
++            sw.remove()
++        return out
++
++    ref = run(False)
++    got = run(True)
++    assert all(torch.equal(a, b) for a, b in zip(ref, got))
++
++
+ def test_block_without_grad_input_is_released_after_backward():
+     if not torch.cuda.is_available():
+         __import__("pytest").skip("needs CUDA")
+diff --git a/tests/test_fla_fp32_ieee_dots.py b/tests/test_fla_fp32_ieee_dots.py
+new file mode 100644
+index 000000000..48c514560
+--- /dev/null
++++ b/tests/test_fla_fp32_ieee_dots.py
+@@ -0,0 +1,150 @@
++# Unsloth Zoo - Utilities for Unsloth
++# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Affero General Public License as published
++# by the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++"""float32 gated delta takes IEEE float32 dots: with Triton's default TF32 the decay gradient (dg -> A_log, dt_bias,
++in_proj_a) of fla's chunk_gated_delta_rule was wrong on strongly decaying heads (32x the fp64 value on B200)."""
++
++import os
++import types
++
++import pytest
++
++os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
++os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
++
++try:
++    import unsloth_zoo  # noqa: F401
++    from unsloth_zoo.temporary_patches import fla_vendor
++except ImportError as _e:
++    pytest.skip(f"unsloth_zoo unavailable: {_e}", allow_module_level=True)
++
++
++class _Tensor:
++    def __init__(self, dtype, is_cuda=True):
++        self.dtype = dtype
++        self.is_cuda = is_cuda
++
++
++def _install_on(fake_fwd, fake_bwd):
++    import sys
++    mod = types.ModuleType("fla.ops.gated_delta_rule.chunk")
++    mod.chunk_gated_delta_rule_fwd = fake_fwd
++    mod.chunk_gated_delta_rule_bwd = fake_bwd
++    saved = sys.modules.get(mod.__name__)
++    sys.modules[mod.__name__] = mod
++    try:
++        assert fla_vendor._install_fp32_ieee_dots()
++        assert fla_vendor._install_fp32_ieee_dots()   # idempotent: wrapped once
++        return mod
++    finally:
++        if saved is None:
++            sys.modules.pop(mod.__name__, None)
++        else:
++            sys.modules[mod.__name__] = saved
++
++
++def test_wrapper_sets_ieee_only_for_cuda_float32(monkeypatch):
++    import torch
++    monkeypatch.delenv("TRITON_F32_DEFAULT", raising=False)
++    monkeypatch.delenv("UNSLOTH_FLA_FP32_TF32", raising=False)
++    seen = []
++
++    def fwd(q, *args, **kwargs):
++        seen.append(os.environ.get("TRITON_F32_DEFAULT"))
++        return "out"
++
++    mod = _install_on(fwd, fwd)
++    assert getattr(mod.chunk_gated_delta_rule_fwd, "__wrapped__", None) is fwd
++    assert mod.chunk_gated_delta_rule_fwd(_Tensor(torch.float32)) == "out"
++    assert mod.chunk_gated_delta_rule_bwd(q=_Tensor(torch.float32)) == "out"
++    mod.chunk_gated_delta_rule_fwd(_Tensor(torch.bfloat16))
++    mod.chunk_gated_delta_rule_fwd(_Tensor(torch.float32, is_cuda=False))
++    assert seen == ["ieee", "ieee", None, None]
++    assert "TRITON_F32_DEFAULT" not in os.environ   # restored after the call
++    monkeypatch.setenv("TRITON_F32_DEFAULT", "tf32x3")   # an explicit choice wins
++    mod.chunk_gated_delta_rule_fwd(_Tensor(torch.float32))
++    monkeypatch.delenv("TRITON_F32_DEFAULT")
++    monkeypatch.setenv("UNSLOTH_FLA_FP32_TF32", "1")     # opt out
++    mod.chunk_gated_delta_rule_fwd(_Tensor(torch.float32))
++    assert seen[-2:] == ["tf32x3", None]
++
++
++def _recurrent_reference(q, k, v, g, beta):
++    """Gated delta rule, token by token, in float64 (q / k L2-normalised, q scaled by 1/sqrt(K))."""
++    import torch
++    q = torch.nn.functional.normalize(q, dim=-1) * q.shape[-1] ** -0.5
++    k = torch.nn.functional.normalize(k, dim=-1)
++    B, T, H, K = q.shape
++    S = q.new_zeros(B, H, K, v.shape[-1])
++    out = []
++    for t in range(T):
++        S = S * g[:, t].exp()[..., None, None]
++        delta = (v[:, t] - (S * k[:, t, ..., None]).sum(-2)) * beta[:, t, ..., None]
++        S = S + k[:, t, ..., None] * delta[..., None, :]
++        out.append((S * q[:, t, ..., None]).sum(-2))
++    return torch.stack(out, 1)
++
++
++def test_float32_decay_gradient_matches_float64():
++    import torch
++    import torch.nn.functional as F
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("needs a CUDA GPU with TF32 (sm80+)")
++    if not fla_vendor._vendored_injection_supported():
++        pytest.skip("vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3")
++    fla_vendor.patch_vendor_fla()   # what importing unsloth_zoo runs: inject + install the call-site patches
++    import fla
++    if getattr(fla, fla_vendor._VENDORED_MARK, False) is not True:
++        pytest.skip("vendored fla injection failed on this host")
++    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
++
++    gen = torch.Generator(device="cuda").manual_seed(0)
++    B, T, H, K, V = 1, 128, 2, 32, 32
++    q, k, v = (torch.randn(B, T, H, D, device="cuda", dtype=torch.float64, generator=gen) for D in (K, K, V))
++    a = 0.5 * torch.randn(B, T, H, device="cuda", dtype=torch.float64, generator=gen)
++    beta = torch.rand(B, T, H, device="cuda", dtype=torch.float64, generator=gen)
++    w = torch.randn(B, T, H, V, device="cuda", dtype=torch.float64, generator=gen)
++    A = torch.tensor([7.0, 15.0], device="cuda", dtype=torch.float64)   # strong decay, as Qwen3.8 layer 1
++
++    def grads(fn, dtype):
++        a_ = a.clone().to(dtype).requires_grad_()
++        g = -A.to(dtype) * F.softplus(a_ + 1.0)
++        o = fn(*(x.to(dtype) for x in (q, k, v)), g, beta.to(dtype))
++        (o.double() * w).sum().backward()
++        return o.detach().double(), a_.grad.double()
++
++    o_ref, da_ref = grads(_recurrent_reference, torch.float64)
++    o, da = grads(lambda q_, k_, v_, g_, b_: chunk_gated_delta_rule(
++        q_, k_, v_, g=g_, beta=b_, use_qk_l2norm_in_kernel=True)[0], torch.float32)
++    o_rel = ((o - o_ref).norm() / o_ref.norm()).item()
++    da_rel = ((da - da_ref).norm() / da_ref.norm()).item()
++    # TF32 dots: o about 1.5e-3, da about 1 to 30 (strong decay); IEEE: o about 1e-6, da about 1e-3.
++    assert o_rel < 1e-4 and da_rel < 1e-2, {"o_rel": o_rel, "da_rel": da_rel}
++
++
++def test_fla_flash_qla_dispatch_defaults_off(monkeypatch):
++    # fla >= 0.6 sends grad-free SM120 calls (a no-grad checkpoint forward) to FlashQLA and the recompute to Triton.
++    for key in ("FLA_FLASH_QLA", "UNSLOTH_GDN_BACKEND"):
++        monkeypatch.delenv(key, raising=False)
++    fla_vendor.patch_vendor_fla()
++    assert os.environ.get("FLA_FLASH_QLA") == "0"
++    monkeypatch.setenv("FLA_FLASH_QLA", "1")   # an explicit choice wins
++    fla_vendor.patch_vendor_fla()
++    assert os.environ["FLA_FLASH_QLA"] == "1"
++    monkeypatch.delenv("FLA_FLASH_QLA")
++    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")   # Unsloth's own FlashQLA routing: left alone
++    fla_vendor.patch_vendor_fla()
++    assert "FLA_FLASH_QLA" not in os.environ
+diff --git a/tests/test_gdn_causal_conv1d.py b/tests/test_gdn_causal_conv1d.py
+index 1e8f3e77d..303aedca1 100644
+--- a/tests/test_gdn_causal_conv1d.py
++++ b/tests/test_gdn_causal_conv1d.py
+@@ -830,3 +830,23 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
+         gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
+     ], dim = -1)
+     torch.testing.assert_close(y, expected)
++
++
++def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
++    # Qwen3.8-Flash-Next's GatedDeltaNet calls the same hub conv. On the torch fallback seq_idx is dropped, so
++    # Unsloth's hybrid packing gate refuses padding-free rows ("causal_conv1d_fn has no accelerated kernel").
++    pytest.importorskip("triton")
++    modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.version, "hip", None)
++    assert not gcc._is_marked(modeling.causal_conv1d_fn)
++    gcc.patch_gdn_causal_conv1d()
++    assert gcc._is_marked(modeling.causal_conv1d_fn)
++    assert gcc._is_marked(modeling.causal_conv1d_update)
++    g = torch.Generator().manual_seed(0)
++    x, w, b = torch.randn(1, 8, 12, generator = g), torch.randn(8, 4, generator = g), torch.randn(8, generator = g)
++    cuts = ((0, 1), (1, 6), (6, 12))   # a 1-token document, one wider than the kernel, the rest
++    seq_idx = torch.cat([torch.full((e - s,), i, dtype = torch.int32) for i, (s, e) in enumerate(cuts)])[None]
++    y = modeling.causal_conv1d_fn(x, w, b, activation = "silu", seq_idx = seq_idx)
++    expected = torch.cat([gcc.causal_conv1d_reference(x[..., s:e], w, b, "silu") for s, e in cuts], dim = -1)
++    torch.testing.assert_close(y, expected)
+diff --git a/tests/test_qwen4_exp_fast_qsa.py b/tests/test_qwen4_exp_fast_qsa.py
+index f051bdfcb..1ef90dac5 100644
+--- a/tests/test_qwen4_exp_fast_qsa.py
++++ b/tests/test_qwen4_exp_fast_qsa.py
+@@ -25,7 +25,7 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
+ def transformers_forward():
+     from unsloth_zoo.temporary_patches import qwen4_exp as patch
+     fwd = modeling.Qwen4ExpTextQSAIndexer.forward
+-    if fwd is patch.qwen4_exp_qsa_indexer_forward:
++    if fwd in (patch.qwen4_exp_qsa_indexer_forward, getattr(patch, "qwen4_exp_qsa_indexer_forward_guarded", None)):
+         fwd = patch._reference_qsa_forward
+     assert fwd.__module__.startswith("transformers."), fwd
+     return fwd
+@@ -122,13 +122,15 @@ def test_patch_installed_and_kill_switch(monkeypatch):
+     from unsloth_zoo.temporary_patches import qwen4_exp as patch
+     cls = modeling.Qwen4ExpTextQSAIndexer
+     original = cls.forward
+-    if original is patch.qwen4_exp_qsa_indexer_forward:
++    if original in (patch.qwen4_exp_qsa_indexer_forward, patch.qwen4_exp_qsa_indexer_forward_guarded):
+         original = patch._reference_qsa_forward
+     try:
+         cls.forward = original
+         monkeypatch.setenv("UNSLOTH_QWEN4_EXP_FAST_QSA", "0")
+         patch.patch_qwen4_exp()
+-        assert cls.forward is original  # kill switch: untouched
++        # kill switch: no fast path, only the filled-slot guard in front of the reference
++        assert cls.forward is patch.qwen4_exp_qsa_indexer_forward_guarded
++        assert patch._reference_qsa_forward is original
+         monkeypatch.delenv("UNSLOTH_QWEN4_EXP_FAST_QSA")
+         patch.patch_qwen4_exp()
+         assert cls.forward is patch.qwen4_exp_qsa_indexer_forward
+@@ -180,3 +182,75 @@ def test_grouped_mm_experts_take_fp32_input_under_autocast():
+         with torch.autocast("cuda", dtype=torch.bfloat16):
+             out = moe_utils.forward_native_grouped_mm(experts, x, idx, w)
+     torch.testing.assert_close(out.float(), ref.float())
++
++
++class StaticIndexerCache:
++    """StaticIndexedLayer's contract: keys written in place, the whole max_cache_len buffer returned."""
++
++    def __init__(self, batch, max_cache_len, dim):
++        self.keys = torch.zeros(batch, max_cache_len, dim)
++        self.length = 0
++
++    def update_indexer(self, raw_keys, layer_idx):
++        n = raw_keys.shape[1]
++        self.keys[:, self.length:self.length + n] = raw_keys
++        self.length += n
++        return self.keys
++
++
++def static_left_pad_inputs(T=40, max_len=56, pad=5):
++    m = torch.zeros(2, 1, T, max_len, dtype=torch.bool)
++    m[..., :T] = torch.ones(T, T, dtype=torch.bool).tril()
++    m[1, :, :, :pad] = False
++    return m | ~m.any(dim=-1, keepdim=True)    # unsloth.import_fixes._unmask_rows_attending_to_nothing
++
++
++def test_static_cache_left_pad_kill_switch_keeps_guard(monkeypatch):
++    """UNSLOTH_QWEN4_EXP_FAST_QSA=0 must not bring the batched static-cache crash back."""
++    from unsloth_zoo.temporary_patches import qwen4_exp as patch
++    cls = modeling.Qwen4ExpTextQSAIndexer
++    saved = cls.forward
++    reference = transformers_forward()
++    try:
++        cls.forward = reference
++        monkeypatch.setenv("UNSLOTH_QWEN4_EXP_FAST_QSA", "0")
++        patch.patch_qwen4_exp()
++        idx = make_indexer()
++        T, max_len = 40, 56
++        m = static_left_pad_inputs(T, max_len)
++        torch.manual_seed(2)
++        h = torch.randn(2, T, 64)
++        with torch.no_grad():
++            got = idx(h, rope(T), m, StaticIndexerCache(2, max_len, 16))
++            want = reference(idx, h, rope(T), m[..., :T], StaticIndexerCache(2, T, 16))
++        assert not bool(got[..., T:].any()) and torch.equal(got[..., :T], want)
++    finally:
++        cls.forward = saved
++
++
++@pytest.mark.parametrize("floaty", [False, True])
++def test_static_cache_left_pad_rows_given_every_slot(floaty):
++    """Batched generate with a static cache: the mask spans max_cache_len, and Unsloth's sdpa_mask fix gives a left-pad
++    query row (which attends to nothing) every slot, unfilled ones included. The reference indexes the position table
++    by kv slot, so it read past it; real rows must select exactly what a mask cut to the filled slots selects."""
++    from unsloth_zoo.temporary_patches.qwen4_exp import _make_fast_indexer_forward
++    idx = make_indexer()
++    reference = transformers_forward()
++    fast = _make_fast_indexer_forward(reference)
++    T, max_len, pad = 40, 56, 5            # > budget + ratio = 20: the reference path; 16 unfilled slots
++    m = torch.zeros(2, 1, T, max_len, dtype=torch.bool)
++    m[..., :T] = torch.ones(T, T, dtype=torch.bool).tril()
++    m[1, :, :, :pad] = False                # row 1 is left padded
++    m = m | ~m.any(dim=-1, keepdim=True)    # unsloth.import_fixes._unmask_rows_attending_to_nothing
++    assert bool(m[1, 0, :pad, T:].all())    # the pad rows now see the unfilled slots
++    torch.manual_seed(2)
++    h = torch.randn(2, T, 64)
++    pe = rope(T)
++    with torch.no_grad():
++        got = fast(idx, h, pe, as_float(m) if floaty else m, StaticIndexerCache(2, max_len, 16))
++        cut = m[..., :T]
++        want = reference(idx, h, pe, as_float(cut) if floaty else cut, StaticIndexerCache(2, T, 16))
++    sel = got if got.dtype == torch.bool else got == 0
++    sel_want = want if want.dtype == torch.bool else want == 0
++    assert sel.shape[-1] == max_len and not bool(sel[..., T:].any())
++    assert torch.equal(sel[..., :T], sel_want)
+diff --git a/tests/test_qwen4_exp_sparse_attn.py b/tests/test_qwen4_exp_sparse_attn.py
+index 238a979a9..0b55855e0 100644
+--- a/tests/test_qwen4_exp_sparse_attn.py
++++ b/tests/test_qwen4_exp_sparse_attn.py
+@@ -252,3 +252,43 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
+         mask[0, 0, 39, 0] = True  # an in-place edit bumps the version: rescanned
+         sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
+     assert len(calls) == 2
++
++
++@pytest.mark.parametrize("kind", ["causal", "packed"])
++def test_compiled_attention_keeps_the_eager_dispatch(monkeypatch, kind):
++    # Under torch.compile (Unsloth's block compile traces the decoder layer) the attention leaves the graph together
++    # with the selection: the eager dispatch picks the backend (flex first on GPU; flex is excluded from traced
++    # calls), the eager-side counter moves, the break count stays the selection's one, and results match eager.
++    import torch._dynamo
++    from torch._dynamo.utils import counters
++    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
++    config, attention, rotary = _module("sdpa")
++    b, s = 2, 41
++    hidden, pe = _inputs(b, s, rotary)
++    mask = _masks(kind, b, s)
++    params = [p for p in attention.parameters() if p.requires_grad]
++    go = torch.randn(b, s, 64, dtype = torch.float64)
++
++    def fn(x):
++        return zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, x, pe, mask, None, {})[0]
++
++    def run(f):
++        x = hidden.clone().requires_grad_()
++        out = f(x)
++        return out.detach(), torch.autograd.grad(out, [x] + params, go, allow_unused = True)
++
++    ref_out, ref_g = run(fn)
++    torch._dynamo.reset()
++    counters.clear()
++    before = sa.SPARSE_ATTN_STATS["torch"]
++    out, grads = run(torch.compile(fn, backend = "aot_eager"))
++    assert sa.SPARSE_ATTN_STATS["torch"] == before + 1, "the attention was traced, not dispatched eagerly"
++    # One break site, as before the change (there: the selection; here: selection + attention).
++    assert len(counters["graph_break"]) == 1, dict(counters["graph_break"])
++    torch.testing.assert_close(out, ref_out, rtol = 1e-10, atol = 1e-10)
++    for x, y in zip(grads, ref_g):
++        if x is None or y is None:
++            assert x is None and y is None
++            continue
++        torch.testing.assert_close(x, y, rtol = 1e-9, atol = 1e-10)
++    torch._dynamo.reset()
+diff --git a/tests/test_sparse_attention.py b/tests/test_sparse_attention.py
+index defc7bdec..2e9854d47 100644
+--- a/tests/test_sparse_attention.py
++++ b/tests/test_sparse_attention.py
+@@ -799,3 +799,50 @@ def test_window_only_hd512_compiles_fullgraph(with_sink):
+     compiled = _grads(torch.compile(layer, fullgraph = True), q, win, sink, go)
+     for x, y in zip(compiled, eager):
+         torch.testing.assert_close(x.float(), y.float(), atol = 1e-2, rtol = 1e-2)
++
++
++def _bool_membership(topk_idxs, kv_len, block = 128):
++    """The [b, s, n] bool table the flex path used to keep for backward: the allowed-key oracle."""
++    b, s, k = topk_idxs.shape
++    nq, nk = -(-s // block), -(-kv_len // block)
++    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
++    cols = torch.where(valid, topk_idxs, nk * block).long()
++    table = torch.zeros((b, nq * block, nk * block + 1), dtype = torch.bool)
++    table[:, :s].scatter_(-1, cols, True)
++    table = table[..., : nk * block]
++    tiles = table.view(b, nq, block, nk, block)
++    return table, tiles.any(dim = 4).any(dim = 2), tiles.all(dim = 4).all(dim = 2)
++
++
++@pytest.mark.parametrize("s,n,k", [(300, 300, 40), (130, 517, 200), (256, 256, 256), (77, 1, 1)])
++def test_bit_packed_membership_mask_allows_exactly_the_listed_keys(s, n, k):
++    # The flex BlockMask reads one bit per key (QSA at 8k: 8 MB per layer kept for backward, not 64 MB as a bool
++    # table, and 32k fits the flex budget instead of falling to the 17x slower Triton fold on L4).
++    g = torch.Generator().manual_seed(s + n)
++    b = 2
++    idxs = _unique_idxs(b, s, min(k, n), n, 0.2, g, empty_rows = [(0, 3), (1, s - 1)])
++    if k >= n:   # rows that list every key: fully visible tiles
++        idxs[1, : min(s, 128)] = torch.arange(n, dtype = torch.int32)
++    idxs[0, 5, 0] = n + 7   # out of range: ignored, as before
++    table, any_ref, all_ref = _bool_membership(idxs, n)
++    mask = sa._membership_block_mask(idxs, n)
++    kept = [t for t in mask.mask_mod.__closure__ or () if isinstance(t.cell_contents, torch.Tensor)]
++    held = sum(t.cell_contents.numel() * t.cell_contents.element_size() for t in kept)
++    assert held * 8 <= table.numel() + 32 * 8 * table.shape[0] * table.shape[1], (held, table.numel())
++    bi, qi, ki = (x.reshape(-1) for x in torch.meshgrid(
++        torch.arange(b), torch.arange(table.shape[1]), torch.arange(table.shape[2]), indexing = "ij"))
++    got = mask.mask_mod(bi, torch.zeros_like(bi), qi, ki).view(table.shape)
++    assert torch.equal(got, table)
++    # Tiles: visible = partial + full, as the bool table's any(); full as its all().
++    assert torch.equal(mask.to_dense()[:, 0].bool(), any_ref)
++    full = torch.zeros_like(all_ref)
++    for bb in range(b):
++        for qq in range(any_ref.shape[1]):
++            c = int(mask.full_kv_num_blocks[bb, 0, qq])
++            full[bb, qq, mask.full_kv_indices[bb, 0, qq, :c].long()] = True
++    assert torch.equal(full, all_ref)
++
++
++def test_flex_budget_admits_32k_tokens():
++    # At 1 bit per entry the same 256 MB budget holds QSA at 32k tokens (b = 1); 64k still falls back.
++    assert 32768 * 32768 <= sa._FLEX_MAX_TABLE < 65536 * 65536
+diff --git a/unsloth_zoo/block_swap.py b/unsloth_zoo/block_swap.py
+index 64fc77565..9cda0da86 100644
+--- a/unsloth_zoo/block_swap.py
++++ b/unsloth_zoo/block_swap.py
+@@ -430,6 +430,12 @@ def _autograd_keeps_weights():
+     return True
+ 
+ 
++def _graph_task_id():
++    """Id of the backward running on this thread, -1 outside one (or on a torch without the query)."""
++    get = getattr(torch._C, "_current_graph_task_id", None)
++    return get() if get is not None else -1
++
++
+ def _swappable(module):
+     kept = {id(p) for m in module.modules() if getattr(m, "_unsloth_host_kept", False) for p in m.parameters()}
+     out = []
+@@ -617,6 +623,8 @@ class BlockSwap:
+         self.pos = {li: k for k, li in enumerate(self.indices)}
+         self.start = self.indices[0] if self.indices else len(layers)
+         self._input_hooked = [False] * len(self.indices)
++        # Graph task a grad-on forward of each block ran in (-1: not inside a backward).
++        self._forward_task = [-1] * len(self.indices)
+         self.spans_devices, self.layer_device = False, None
+         if not self.indices:
+             # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
+@@ -928,6 +936,7 @@ class BlockSwap:
+             if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and x.requires_grad:
+                 x.register_hook(self._bwd(i))
+                 hooked = True
++                self._forward_task[i] = _graph_task_id()
+             self._input_hooked[i] = hooked
+             return moved
+         return _opaque(hook)
+@@ -964,7 +973,18 @@ class BlockSwap:
+         def hook(grad):
+             if self._auto and not self._settled:
+                 self._note_block_peak(self.blocks[i])
+-            self._release(self.blocks[i])
++            # A reentrant checkpoint recomputes the block inside the outer backward and runs its backward as an inner
++            # one. The input's grad can land there before a branch that never reaches the input (one fed by the token
++            # ids only, e.g. Qwen4Exp's per-layer n-gram keys into an adapter) has read its frozen weights: release
++            # once that inner backward is done, not mid-way.
++            task = _graph_task_id()
++            if grad is not None and task != -1 and self._forward_task[i] not in (-1, task):
++                try:
++                    torch.autograd.Variable._execution_engine.queue_callback(lambda: self._release(self.blocks[i]))
++                except RuntimeError:
++                    self._release(self.blocks[i])
++            else:
++                self._release(self.blocks[i])
+             # The output's grad hook already queued the step end from the outer graph (see _output_peak). Without
+             # one (a bare layer list), queue it here, once: a non-reentrant checkpoint hooks the same input in the
+             # forward and again in the recompute, so this runs twice per backward.
+diff --git a/unsloth_zoo/sparse_attention.py b/unsloth_zoo/sparse_attention.py
+index 0d7dec3c3..e70c43f15 100644
+--- a/unsloth_zoo/sparse_attention.py
++++ b/unsloth_zoo/sparse_attention.py
+@@ -32,7 +32,7 @@ Backends, first eligible wins (UNSLOTH_SPARSE_ATTN_BACKEND=gather|flex|torch for
+   triton  Unsloth's index-gather kernel (unsloth_zoo/sparse_mqa_kernel.py): every other CUDA part, fp16 / bf16 (bf16 on
+           sm80+), head_dim a power of two up to 512; tiled gather, online softmax, fp32 atomics for dKV.
+   flex    torch flex_attention over a membership block mask, sink applied exactly from the logsumexp; eager only,
+-          and only while the [b, s, n] membership table stays under 2^28 entries. A membership table counts a
++          and only while the bit-packed [b, s, n] membership table stays under 2^31 entries. A membership table counts a
+           repeated index once, the reference and gather count every listed slot: rows must not repeat an index
+           (DeepSeek's top-k and QSA's block lists never do).
+   torch   gather + softmax in fp32, chunked over queries, each chunk recomputed in backward (one [chunk, k, d]
+@@ -131,9 +131,9 @@ def _gather_eligible(q, window = 0):
+     return torch.cuda.get_device_capability(q.device)[0] in (10, 11) and _gather_importable()
+ 
+ 
+-# The flex fallback reads a [b, s, n] membership table (S x S for QSA); above this many entries the chunked torch
+-# path, which never holds more than one [chunk, k, d] slab, runs instead.
+-_FLEX_MAX_TABLE = 1 << 28
++# The flex path reads a bit-packed [b, s, n] membership table (S x S for QSA, 256 MB at this cap: s = 46k for b = 1);
++# above this many entries the kernel fold / chunked torch path runs instead.
++_FLEX_MAX_TABLE = 1 << 31
+ 
+ 
+ # head_dim 512 flex (32 x 32 tiles, 1 stage) needs about 160 KB of shared memory per block: T4 (64 KB), L4 / sm86 /
+@@ -363,25 +363,34 @@ def _pack(selected, num_blocks):
+ 
+ 
+ def _membership_block_mask(topk_idxs, kv_len):
+-    """BlockMask whose mask_mod reads a [b, s, n] membership table built from the index lists."""
++    """BlockMask whose mask_mod reads a bit-packed [b, s, n / 32] int32 membership table built from the index lists
++    (one bit per key: 8x less than a bool table, kept for backward: 8 MB instead of 64 MB per layer at 8k)."""
+     from torch.nn.attention.flex_attention import BlockMask
+ 
+     b, s, k = topk_idxs.shape
+     nq, nk = -(-s // _BLOCK), -(-kv_len // _BLOCK)
++    words = nk * _BLOCK // 32
+     valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
+-    # Invalid slots scatter into a spare column that is cut off below.
+-    cols = torch.where(valid, topk_idxs, nk * _BLOCK).long()
+-    table = torch.zeros((b, nq * _BLOCK, nk * _BLOCK + 1), dtype = torch.bool, device = topk_idxs.device)
+-    table[:, :s].scatter_(-1, cols, True)
+-    table = table[..., : nk * _BLOCK]
+-    tiles = table.view(b, nq, _BLOCK, nk, _BLOCK)
+-    any_visible = tiles.any(dim = 4).any(dim = 2)
+-    all_visible = tiles.all(dim = 4).all(dim = 2)
++    # Invalid slots land in a spare word / tile that is cut off below.
++    safe = torch.where(valid, topk_idxs, nk * _BLOCK).long()
++    rows = (b, nq * _BLOCK)
++    # Rows never repeat an index (see the module docstring), so adding distinct bits is an OR; int32 wraps bit 31.
++    bit = torch.where(valid, torch.ones((), dtype = torch.int32, device = safe.device) << (safe & 31).int(), 0)
++    bits = torch.zeros((*rows, words + 1), dtype = torch.int32, device = safe.device)
++    bits[:, :s].scatter_add_(-1, safe >> 5, bit)
++    bits = bits[..., :words]
++    # Keys per (query row, kv tile): a tile is visible to a query tile if any row sees a key in it, fully visible if
++    # every row sees all of its keys.
++    counts = torch.zeros((*rows, nk + 1), dtype = torch.int32, device = safe.device)
++    counts[:, :s].scatter_add_(-1, safe // _BLOCK, valid.int())
++    tiles = counts[..., :nk].view(b, nq, _BLOCK, nk)
++    any_visible = (tiles > 0).any(dim = 2)
++    all_visible = (tiles == _BLOCK).all(dim = 2)
+     partial_count, partial_index = _pack(any_visible & ~all_visible, nk)
+     full_count, full_index = _pack(all_visible, nk)
+ 
+     def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+-        return table[b_idx, q_idx, kv_idx]
++        return ((bits[b_idx, q_idx, kv_idx >> 5] >> (kv_idx & 31)) & 1) != 0
+ 
+     return BlockMask.from_kv_blocks(
+         partial_count, partial_index, full_count, full_index,
+diff --git a/unsloth_zoo/temporary_patches/fla_vendor.py b/unsloth_zoo/temporary_patches/fla_vendor.py
+index 8ea051b35..752a05ea5 100644
+--- a/unsloth_zoo/temporary_patches/fla_vendor.py
++++ b/unsloth_zoo/temporary_patches/fla_vendor.py
+@@ -20,6 +20,7 @@ Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untou
+ an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
+ ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
+ ``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
++otherwise fla's own FlashQLA dispatch (fla >= 0.6) is defaulted off with ``FLA_FLASH_QLA=0``;
+ on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
+ ``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
+ On ROCm gfx11 float32 chunk_gated_delta_rule calls take transformers' pure-torch reference
+@@ -1454,6 +1455,52 @@ def _install_rocm_fp32_torch_path(torch_mod=None):
+     return True
+ 
+ 
++_FP32_IEEE_MARK = "_unsloth_fp32_ieee_dots"
++
++
++def _make_fp32_ieee_dots(original):
++    """float32 gated delta runs its tl.dot calls in IEEE float32. Triton's default for float32 operands is TF32,
++    which rounds them to 10 mantissa bits inside each dot while the kernels' elementwise terms keep all 23: the decay
++    gradient dg = sum(dq * q) - sum(dk * k) cancels to far below either term, so it came out wrong (B200, tiny
++    Qwen3.8-Flash-Next: dA_log 32x the fp64 value on strongly decaying heads, cos 0.3 in a model), while dq / dk / dv
++    and bfloat16 inputs (exact in every dot) were fine. TRITON_F32_DEFAULT is read when a kernel compiles and is part
++    of Triton's cache key, and float32 kernel specializations only compile here. An explicit TRITON_F32_DEFAULT wins;
++    UNSLOTH_FLA_FP32_TF32=1 keeps TF32."""
++
++    @functools.wraps(original)
++    def wrapped(*args, **kwargs):
++        q = args[0] if args else kwargs.get("q")
++        if (
++            getattr(q, "dtype", None) is not None
++            and str(q.dtype) == "torch.float32"
++            and getattr(q, "is_cuda", False)
++            and os.environ.get("TRITON_F32_DEFAULT") is None
++            and not _flag("UNSLOTH_FLA_FP32_TF32")
++        ):
++            os.environ["TRITON_F32_DEFAULT"] = "ieee"
++            try:
++                return original(*args, **kwargs)
++            finally:
++                os.environ.pop("TRITON_F32_DEFAULT", None)
++        return original(*args, **kwargs)
++
++    setattr(wrapped, _FP32_IEEE_MARK, True)
++    return wrapped
++
++
++def _install_fp32_ieee_dots():
++    """Wrap the live fla's chunk_gated_delta_rule_fwd / _bwd (module globals its autograd Function and unsloth's
++    opaque gated-delta op both call) so float32 inputs take IEEE dots. Idempotent."""
++    chunk_mod = sys.modules.get("fla.ops.gated_delta_rule.chunk")
++    if chunk_mod is None:
++        return False
++    for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
++        fn = getattr(chunk_mod, name, None)
++        if fn is not None and not getattr(fn, _FP32_IEEE_MARK, False):
++            setattr(chunk_mod, name, _make_fp32_ieee_dots(fn))
++    return True
++
++
+ _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
+ 
+ 
+@@ -1527,11 +1574,28 @@ def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
+     return tuple(forced)
+ 
+ 
++def _pin_fla_flash_qla_off():
++    """fla >= 0.6 dispatches chunk_gated_delta_rule to its FlashQLA backend by default when flash_qla is installed. On
++    SM120 it takes only grad-free calls, so a no-grad checkpoint forward ran FlashQLA while its recompute (and the
++    opaque op's self-check reference) ran the Triton kernels: forward and replay on different kernels. fla reads
++    FLA_FLASH_QLA at every call, so it is defaulted to 0 for the process; an explicit FLA_FLASH_QLA or
++    UNSLOTH_GDN_BACKEND=flashqla (Unsloth's own FlashQLA routing) is left alone."""
++    if "FLA_FLASH_QLA" in os.environ or _gdn_backend() == "flashqla":
++        return False
++    os.environ["FLA_FLASH_QLA"] = "0"
++    return True
++
++
+ def patch_vendor_fla(phase=None):
+     """Register the bundled fla kernels and advertise availability.
+ 
+     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
+     """
++    try:
++        _pin_fla_flash_qla_off()
++    except Exception as e:
++        if UNSLOTH_ENABLE_LOGGING:
++            logger.warning(f"Unsloth: could not turn off fla's FlashQLA dispatch: {e}")
+     try:
+         return _patch_vendor_fla(phase)
+     finally:
+@@ -1563,6 +1627,10 @@ def patch_vendor_fla(phase=None):
+                 _install_rocm_fp32_torch_path()
+             except Exception as e:
+                 logger.warning(f"Unsloth: could not route float32 gated delta to pure torch on ROCm gfx11: {e}")
++            try:
++                _install_fp32_ieee_dots()
++            except Exception as e:
++                logger.warning(f"Unsloth: could not make float32 gated delta use IEEE float32 dots: {e}")
+             try:
+                 _install_gdn_backend()
+             except Exception as e:
+diff --git a/unsloth_zoo/temporary_patches/gdn_causal_conv1d.py b/unsloth_zoo/temporary_patches/gdn_causal_conv1d.py
+index 1b1055929..aed35bad9 100644
+--- a/unsloth_zoo/temporary_patches/gdn_causal_conv1d.py
++++ b/unsloth_zoo/temporary_patches/gdn_causal_conv1d.py
+@@ -16,9 +16,9 @@
+ 
+ """Triton causal depthwise conv (+ SiLU) for GatedDeltaNet and Mamba2 when `causal_conv1d` is missing.
+ 
+-Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next; on transformers >= 5.15
+-also the Mamba2 mixers of Nemotron-H, Falcon-H1, Granite-4.0-H, Bamba, Zamba2), reading and
+-writing channel-last directly to skip the transpose copies. Layout follows fla's
++Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next; on
++transformers >= 5.15 also the Mamba2 mixers of Nemotron-H, Falcon-H1, Granite-4.0-H, Bamba, Zamba2),
++reading and writing channel-last directly to skip the transpose copies. Layout follows fla's
+ `causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
+ (B, T) keeps taps inside one packed sequence.
+ Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
+@@ -51,7 +51,7 @@ _KILL_SWITCH = "UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D"
+ _MARK = "_unsloth_triton_causal_conv1d"
+ _HUB_MARK = "_unsloth_triton_causal_conv1d_hub"
+ 
+-_GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
++_GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
+ # Mamba2 mixers call the same depthwise causal conv (x (B, D, T), weight (D, W), SiLU) through the
+ # same hub decorator, so they share the dispatch on transformers >= 5.15. Older releases gate the
+ # whole Mamba2 fast path on the causal_conv1d package itself, so there is nothing to rebind there.
+diff --git a/unsloth_zoo/temporary_patches/qwen4_exp.py b/unsloth_zoo/temporary_patches/qwen4_exp.py
+index 9dd920be4..fa329ca8e 100644
+--- a/unsloth_zoo/temporary_patches/qwen4_exp.py
++++ b/unsloth_zoo/temporary_patches/qwen4_exp.py
+@@ -60,6 +60,27 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
+         return torch.where(
+             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
+         )
++    from unsloth_zoo.temporary_patches.qwen4_exp import qwen4_exp_qsa_indexer_forward_guarded
++    return qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask, past_key_values)
++
++
++def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
++                                          past_key_values=None):
++    """transformers' indexer on the filled cache slots only; installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0.
++
++    The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
++    mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
++    sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
++    batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read."""
++    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
++    if attention_mask is not None and attention_mask.dim() == 4:
++        n_positions = position_embeddings[0].shape[-2]
++        if attention_mask.shape[-1] > n_positions:
++            filled = torch.arange(attention_mask.shape[-1], device=attention_mask.device) < n_positions
++            if attention_mask.dtype == torch.bool:
++                attention_mask = attention_mask & filled
++            elif attention_mask.is_floating_point():
++                attention_mask = attention_mask.masked_fill(~filled, torch.finfo(attention_mask.dtype).min)
+     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_qsa_forward
+     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+ 
+@@ -112,11 +133,16 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
+         from transformers.models.qwen4_exp import modeling_qwen4_exp
+         rope = modeling_qwen4_exp.apply_rotary_pos_emb
+     position_embeddings = tuple(position_embeddings)
+-    with torch.no_grad():
+-        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
+-                                     past_key_values = past_key_values)
+-    if selected is None:
+-        return None
++    # Traced (Unsloth's decoder-layer block compile, or any torch.compile): the selection already leaves the graph,
++    # so the attention leaves with it in one region and keeps the eager dispatch (flex first, latched fallbacks)
++    # instead of the traced one (no flex: the Triton fold, 16x slower on L4 at 4k). Same break count as before.
++    fused = torch.compiler.is_compiling() and past_key_values is None
++    if not fused:
++        with torch.no_grad():
++            selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
++                                         past_key_values = past_key_values)
++        if selected is None:
++            return None
+ 
+     cos, sin = (x[:, -seq:, :] for x in position_embeddings)
+     input_shape = hidden_states.shape[:-1]
+@@ -134,12 +160,29 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
+         key_states = key_states.to(value_states.dtype)
+     if past_key_values is not None:
+         key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
+-    attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
++    if fused:
++        attn_output = _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope,
++                                         query_states, key_states, value_states, module.scaling)
++        if attn_output is None:   # not interval-shaped: the reference (projections recomputed there)
++            return None
++    else:
++        attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
+     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+     attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
+     return module.o_proj(attn_output), None
+ 
+ 
++@torch.compiler.disable
++def _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope, query, key, value, scaling):
++    """QSA selection + sparse attention outside any trace (eager dispatch); None when the mask is not interval-shaped."""
++    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn
++    with torch.no_grad():
++        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope)
++    if selected is None:
++        return None
++    return sparse_gqa_attn(query, key, value, selected, scaling)
++
++
+ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+     from unsloth_zoo.temporary_patches.qwen4_exp import (
+@@ -218,7 +261,7 @@ def _reference_returns_float_mask(function):
+ def _make_fast_indexer_forward(original_forward):
+     """Test hook: bind `original_forward` as the long-context reference."""
+     global _reference_qsa_forward, _qsa_returns_float_mask
+-    if original_forward is not qwen4_exp_qsa_indexer_forward:
++    if original_forward not in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
+         _reference_qsa_forward = original_forward
+         _qsa_returns_float_mask = _reference_returns_float_mask(original_forward)
+     return qwen4_exp_qsa_indexer_forward
+@@ -314,16 +357,18 @@ def patch_qwen4_exp():
+ 
+ def _patch_qwen4_exp_rest(modeling):
+     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
+-    if (
+-        indexer_cls is not None
+-        and _fast_qsa_enabled()
+-        and indexer_cls.forward is not qwen4_exp_qsa_indexer_forward
+-        # Never take the compiler's copy (which calls us) as the reference.
+-        and _is_transformers_indexer_forward(indexer_cls.forward)
+-    ):
++    if indexer_cls is not None:
++        # The kill switch drops the fast within-budget path but keeps the filled-slot guard.
++        wanted = qwen4_exp_qsa_indexer_forward if _fast_qsa_enabled() else qwen4_exp_qsa_indexer_forward_guarded
++        current = indexer_cls.forward
+         try:
+-            _make_fast_indexer_forward(indexer_cls.forward)
+-            indexer_cls.forward = qwen4_exp_qsa_indexer_forward
++            if current in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
++                if _reference_qsa_forward is not None:
++                    indexer_cls.forward = wanted
++            # Never take the compiler's copy (which calls us) as the reference.
++            elif _is_transformers_indexer_forward(current):
++                _make_fast_indexer_forward(current)
++                indexer_cls.forward = wanted
+         except Exception as e:
+             if UNSLOTH_ENABLE_LOGGING:
+                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")
