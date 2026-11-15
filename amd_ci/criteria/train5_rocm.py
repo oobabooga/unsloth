@@ -21,7 +21,12 @@ MODE = "regression"
 NEEDS = ["rocm", "gpu", "nvidia", "multi_gpu", "windows"]
 RTOL = 2e-2
 MEM_RATIO, MEM_SLACK = 1.25, 32.0
-TRAIN = ("flm16", "flm4", "gcmem", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode")
+TRAIN = ("flm16", "flm4", "gcmem", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode", "ctnvfp4",
+         "ctmxfp8", "mxfp4probe", "grpo_vl", "dpo_vl")
+# Cells whose numbers the PR changes by design (the CT loader fixes the expert values; RL sampling / the fused GRPO
+# route; the probe's numbers are errors, not losses): no per-step loss / memory equality, the rest still applies.
+NO_LOSS_EQ = ("ctnvfp4", "ctmxfp8", "mxfp4probe", "grpo_vl")
+ENGAGED = {"mxfp4probe": "engaged", "grpo_vl": "grpo_fused_engaged", "dpo_vl": "dpo_chunked_engaged"}
 
 # Why a PR's own new path does or does not engage on ROCm; rendered with the table.
 NOTES = {
@@ -44,6 +49,18 @@ NOTES = {
     "z2522": "triton.use_block_ptr gated on Triton having block pointers: env cell records the inductor flag and "
              "whether this Triton has make_block_ptr.",
     "z2523": "Mllama vision layer accepts hidden_states=: mllama cell calls the patched layer both ways on the GPU.",
+    "p17848_2529": "compressed-tensors NVFP4 / MXFP8 MoE experts packed for LoRA: ctnvfp4 / ctmxfp8 load a tiny CT "
+                   "checkpoint through FastLanguageModel and train LoRA on attention + experts; engagement = packed "
+                   "expert parameter types and zoo PACKED_EXPERT_STATS. Base losses differ by design (the fix changes "
+                   "the loaded expert values).",
+    "z2528": "MXFP4 fused grouped GEMM gated on Triton >= 3.1: mxfp4probe records the gate, availability, and a direct "
+             "fwd + bwd against dequantize + matmul on gfx1151.",
+    "p17850_2530": "Vision GRPO fused loss (zoo) + chunked VLM DPO head (unsloth): grpo_vl counts fused_linear_grpo_loss "
+                   "calls, dpo_vl counts trainer._unsloth_dpo_chunked_calls (the chunked head needs TRL < 0.29, see the "
+                   "_trl024 corner). Mllama block CUDA graphs: block CUDA graphs are off on ROCm, so that part does not "
+                   "engage here.",
+    "p17850_2530_trl024": "The TRL 0.24 / transformers 4.57.6 corner of #17850 + zoo #2530, where DPOTrainer still has "
+                          "concatenated_forward and the chunked vision DPO head can engage.",
     "z2524": "DeepSeek-V4.1 FP4 experts through the fused MXFP4 grouped GEMM: needs an MXFP4 checkpoint and a "
              "native-FP4 GPU; gfx1151 has neither, so the route does not engage here (dsv4 cell trains bf16).",
 }
@@ -142,6 +159,8 @@ def head_is_worse(base, head):
             worse.append(f"{cell}: loss decreasing at base, not at head {h.get('losses')}")
         lb, lh = b.get("losses") or [], h.get("losses") or []
         tol = _loss_tol(base, cell)
+        if cell in NO_LOSS_EQ:
+            lb = lh = []
         if len(lb) == len(lh) and lb:
             d = max(abs(x - y) / max(1.0, abs(x)) for x, y in zip(lb, lh))
             if d > tol:
@@ -149,7 +168,9 @@ def head_is_worse(base, head):
         elif lb or lh:
             worse.append(f"{cell}: {len(lb)} base vs {len(lh)} head loss steps")
         pb, ph = b.get("peak_alloc_mb"), h.get("peak_alloc_mb")
-        if isinstance(pb, (int, float)) and isinstance(ph, (int, float)) and ph > pb * MEM_RATIO + MEM_SLACK:
+        if cell in ENGAGED and b.get(ENGAGED[cell]) and not h.get(ENGAGED[cell]):
+            worse.append(f"{cell}: engaged at base, not at head")
+        if cell not in NO_LOSS_EQ and isinstance(pb, (int, float)) and isinstance(ph, (int, float)) and ph > pb * MEM_RATIO + MEM_SLACK:
             worse.append(f"{cell}: peak allocated {ph} MiB vs base {pb} MiB")
         if (b.get("gc_calls") or 0) > 0 and not (h.get("gc_calls") or 0) > 0:
             worse.append(f"{cell}: layer gradient checkpointing ran at base ({b.get('gc_calls')} calls), 0 at head")
@@ -200,6 +221,11 @@ def _fmt(c):
         s += f" lh_patch={c['large_head_patch_returns']}"
     if c.get("varlen_hits"):
         s += f" varlen={c['varlen_hits']}"
+    for k in ("engaged", "grpo_fused_engaged", "dpo_chunked_engaged", "grouped_available", "fwd_rel", "bwd_rel",
+              "triton_version", "dpo_chunked_calls", "trl_has_concatenated_forward", "expert_param_types",
+              "packed_expert_stats_delta", "fused_calls_delta"):
+        if k in c:
+            s += f" {k}={c[k]}"
     if "gc_mem_ratio" in c:
         s += f" gc_engaged={c.get('gc_engaged')} mem_ratio(on/off)={c.get('gc_mem_ratio')}"
     if "graphs_match_eager_after_step" in c:
