@@ -1,0 +1,10 @@
+{
+ "default": {
+  "128": [{"bm": 64}, {"bm": 64, "stages": 2}, {"bm": 64, "warps": 2}, {"bm": 128, "warps": 8}, {"stages": 2}, {"stages": 4}, {"bm": 64, "stages": 4}],
+  "64": [{"bm": 64}, {"bm": 128}, {"bm": 64, "warps": 2}, {"stages": 2}, {"stages": 4}, {"bm": 128, "warps": 8}]
+ },
+ "gfx1151": {
+  "128": [{"bm": 32, "warps": 2}, {"bm": 64, "warps": 2}, {"bm": 128, "warps": 4}, {"bm": 128, "warps": 8}, {"bm": 64, "warps": 4, "waves_per_eu": 2}, {"bm": 64, "stages": 2}, {"bm": 128, "warps": 8, "stages": 2}],
+  "64": [{"bm": 64}, {"bm": 64, "warps": 2}, {"bm": 128, "warps": 8}, {"bm": 32, "warps": 2}, {"stages": 2}, {"bm": 256, "warps": 8}]
+ }
+}
