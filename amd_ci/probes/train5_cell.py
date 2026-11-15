@@ -32,10 +32,14 @@ import sys
 import time
 import traceback
 
+# flm16 / flm4 / rl_decode use a Llama built here (--model-dir, seeded, same bytes for every state): the trl tiny
+# Llama 3.2 has head_dim 8 with hidden 8 / 4 heads, which FastLlama rebuilds as head_dim 2 (load MISMATCH).
+LLAMA_TOKENIZER = "trl-internal-testing/tiny-MistralForCausalLM-0.1"
 MODELS = {
-    "flm16": "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
-    "flm4": "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
-    "rl_decode": "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
+    "flm16": "built:llama",
+    "flm4": "built:llama",
+    "rl_decode": "built:llama",
+    "gcmem": "built:llama",
     "vision": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     "moe": "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
     "gemma4": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
@@ -56,12 +60,37 @@ COUNTER_MODULES = (
 )
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--cell", required = True, choices = ["env", *MODELS])
+ap.add_argument("--cell", required = True, choices = ["env", "build", *MODELS])
 ap.add_argument("--out", required = True)
 ap.add_argument("--steps", type = int, default = 5)
 ap.add_argument("--lr", type = float, default = 5e-3)
+ap.add_argument("--model-dir", default = None, help = "where the built tiny Llama lives (built once if absent)")
 args = ap.parse_args()
 res: dict = {"cell": args.cell, "stage": "start", "model": MODELS.get(args.cell)}
+
+
+def built_llama():
+    """Tiny Llama with consistent shapes (hidden 256, 4 heads x 64, 2 kv heads), seeded on CPU, saved bf16."""
+    d = os.path.abspath(args.model_dir or os.path.join(os.path.dirname(os.path.abspath(args.out)), "tiny_llama"))
+    if not os.path.isfile(os.path.join(d, "config.json")):
+        import torch
+        import transformers
+        tok = transformers.AutoTokenizer.from_pretrained(LLAMA_TOKENIZER)
+        torch.manual_seed(0)
+        cfg = transformers.LlamaConfig(vocab_size = len(tok), hidden_size = 256, intermediate_size = 512,
+                                       num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
+                                       head_dim = 64, max_position_embeddings = 2048, bos_token_id = tok.bos_token_id,
+                                       eos_token_id = tok.eos_token_id, tie_word_embeddings = False)
+        model = transformers.LlamaForCausalLM(cfg).to(torch.bfloat16)
+        tmp = f"{d}.tmp{os.getpid()}"
+        model.save_pretrained(tmp)
+        tok.save_pretrained(tmp)
+        try:
+            os.rename(tmp, d)
+        except OSError:
+            pass  # another state built it first: same seed, same bytes
+    res["model_dir"] = d
+    return d
 
 
 def dump():
@@ -143,6 +172,11 @@ class GCCounter:
     def __init__(self, model):
         self.calls = 0
         self.layers = 0
+        self.install(model)
+
+    def install(self, model):
+        """Idempotent; re-run after anything that re-binds the function (Trainer.train's
+        gradient_checkpointing_enable does)."""
         for m in model.modules():
             f = m.__dict__.get("_gradient_checkpointing_func")
             if f is None or getattr(f, "_amd_ci_counted", False):
@@ -154,6 +188,15 @@ class GCCounter:
                 return _f(*a, **k)
             wrapped._amd_ci_counted = True
             m._gradient_checkpointing_func = wrapped
+
+
+def gc_callback(gc, model):
+    from transformers import TrainerCallback
+
+    class _ReinstallGC(TrainerCallback):
+        def on_step_begin(self, *a, **k):
+            gc.install(model)
+    return _ReinstallGC()
 
 
 def profile_counts(fn):
@@ -293,7 +336,7 @@ def cell_flm(four_bit):
     from trl import SFTConfig, SFTTrainer
     versions()
     stage("load")
-    model, tok = FastLanguageModel.from_pretrained(MODELS[args.cell], max_seq_length = 256, dtype = torch.bfloat16,
+    model, tok = FastLanguageModel.from_pretrained(built_llama(), max_seq_length = 256, dtype = torch.bfloat16,
                                                    load_in_4bit = four_bit)
     res["n_linear4bit"] = sum(1 for m in model.modules() if type(m).__name__ == "Linear4bit")
     model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
@@ -314,6 +357,7 @@ def cell_flm(four_bit):
     stage("train")
     torch.cuda.reset_peak_memory_stats()
     trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
+    trainer.add_callback(gc_callback(gc, model))
     res["trainer_class"] = type(trainer).__name__
     trainer.train()
     peak()
@@ -433,6 +477,7 @@ def cell_qwen38():
     stage("train")
     torch.cuda.reset_peak_memory_stats()
     trainer = SFTTrainer(model = model, train_dataset = ds, processing_class = tt, args = cfg)
+    trainer.add_callback(gc_callback(gc, model))
     trainer.train()
     peak()
     res["gc_calls"] = gc.calls
@@ -506,7 +551,7 @@ def cell_rl_decode():
     from unsloth import FastLanguageModel
     versions()
     stage("load")
-    model, tok = FastLanguageModel.from_pretrained(MODELS["rl_decode"], max_seq_length = 256, dtype = torch.bfloat16,
+    model, tok = FastLanguageModel.from_pretrained(built_llama(), max_seq_length = 256, dtype = torch.bfloat16,
                                                    load_in_4bit = False)
     model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
                                              target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
@@ -552,7 +597,48 @@ def cell_rl_decode():
     peak()
 
 
-CELLS = {"env": cell_env, "flm16": lambda: cell_flm(False), "flm4": lambda: cell_flm(True), "vision": cell_vision,
+def cell_gcmem():
+    """Layer gradient checkpointing engaged? The same model, GC "unsloth" vs off, one fwd+bwd at 4 x 1024 tokens:
+    peak allocated memory (process-local) must drop with GC on, and the layer checkpoint function must be called."""
+    import gc as pygc
+    import torch
+    from unsloth import FastLanguageModel
+    versions()
+    out = {}
+    for mode in ("unsloth", False):
+        stage(f"gcmem_{mode}")
+        model, tok = FastLanguageModel.from_pretrained(built_llama(), max_seq_length = 1024, dtype = torch.bfloat16,
+                                                       load_in_4bit = False)
+        model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
+                                                 target_modules = TARGETS, use_gradient_checkpointing = mode,
+                                                 random_state = 0)
+        counter = GCCounter(model)
+        model.train()
+        vocab = model.get_input_embeddings().weight.shape[0]
+        ids = torch.randint(10, vocab, (4, 1024), generator = torch.Generator().manual_seed(0)).to(model.device)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base_alloc = torch.cuda.memory_allocated()
+        loss = model(input_ids = ids, labels = ids).loss
+        loss.backward()
+        torch.cuda.synchronize()
+        out[str(mode)] = {"peak_over_resident_mb": round((torch.cuda.max_memory_allocated() - base_alloc) / 2**20, 1),
+                          "gc_calls": counter.calls, "gc_layers": counter.layers, "loss": float(loss.detach()),
+                          "layer_flags": sum(1 for m in model.modules() if getattr(m, "gradient_checkpointing", False) is True)}
+        del model, loss
+        pygc.collect()
+        torch.cuda.empty_cache()
+    res["gcmem"] = out
+    on, off = out["unsloth"]["peak_over_resident_mb"], out["False"]["peak_over_resident_mb"]
+    res["gc_mem_ratio"] = round(on / off, 3) if off else None
+    res["gc_engaged"] = bool(off and on / off < 0.85)
+    res["gc_calls"] = out["unsloth"]["gc_calls"]
+    finish_losses([out["unsloth"]["loss"]])
+    res["finite"] = all(math.isfinite(v["loss"]) for v in out.values())
+    res["decreasing"] = None
+
+
+CELLS = {"gcmem": cell_gcmem, "env": cell_env, "flm16": lambda: cell_flm(False), "flm4": lambda: cell_flm(True), "vision": cell_vision,
          "moe": cell_moe, "gemma4": cell_gemma4, "qwen38": cell_qwen38, "dsv4": cell_dsv4, "mllama": cell_mllama,
          "rl_decode": cell_rl_decode}
 
@@ -561,6 +647,14 @@ def main():
     if args.cell == "moe":
         os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
     t0 = time.time()
+    if args.cell == "build":
+        try:
+            built_llama()  # before any `import unsloth`: plain transformers classes
+            res["stage"], res["ok"] = "done", True
+        except Exception as e:  # noqa: BLE001
+            res["ok"], res["error"] = False, f"{type(e).__name__}: {e}"[:1500]
+        dump()
+        return 0
     try:
         if args.cell != "env":
             import unsloth  # noqa: F401  (before transformers / peft / trl)
