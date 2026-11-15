@@ -1,0 +1,1072 @@
+diff --git a/tests/test_block_compile.py b/tests/test_block_compile.py
+index 572fa8a7..c68476ca 100644
+--- a/tests/test_block_compile.py
++++ b/tests/test_block_compile.py
+@@ -9,6 +9,7 @@ GPU: compiled Qwen3 and Qwen3.5 layers match the stock forward and gradients wit
+ (Qwen3.5's fla kernel runs as the opaque op inside the block).
+ """
+ 
++import functools
+ import importlib.util
+ import os
+ import sys
+@@ -755,6 +756,249 @@ def test_gemma4_band_fast_path_in_blocks(monkeypatch):
+     assert routed == [short] and plain_calls == [long]
+ 
+ 
++def _fake_gemma4_router_stack(M, monkeypatch, scans):
++    """zoo's gemma-4 router wrapped by another router from a module without _ORIG_SDPA (unsloth's
++    head_dim 512 kernel is installed on top at load, before the block hook runs)."""
++    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++
++    band = types.ModuleType("fake_banded_attention_2")
++    band._mask_is_plain_band = lambda mask, S, w: scans.append((S, w)) or bool(
++        getattr(mask, "_ok", True)
++    )
++    zoo = types.ModuleType("fake_flash_sliding_2")
++    top_mod = types.ModuleType("fake_large_head_2")
++    calls = {"plain": [], "top": []}
++
++    def plain(module, q, k, v, mask, **kw):
++        calls["plain"].append(mask)
++        return "plain", None
++
++    def top(module, q, k, v, mask, **kw):
++        calls["top"].append(mask)
++        return "top", None
++
++    top._unsloth_gemma4_flash = True  # forwarded sentinels, like the real wrappers do
++    top.__module__ = top_mod.__name__
++    zoo._ORIG_SDPA = [plain]
++    for mod in (band, zoo, top_mod):
++        monkeypatch.setitem(sys.modules, mod.__name__, mod)
++    monkeypatch.setattr(M, "_BAND_MODULE", band.__name__)
++    monkeypatch.setattr(M, "_FLASH_MODULE", zoo.__name__)
++    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, "sdpa", top)
++    return calls, top
++
++
++def test_gemma4_hook_installs_beneath_a_wrapping_router(monkeypatch):
++    M = _load()
++    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++
++    scans = []
++    calls, top = _fake_gemma4_router_stack(M, monkeypatch, scans)
++    M._gemma4_router_hook()
++    wrapped = ALL_ATTENTION_FUNCTIONS["sdpa"]
++    assert wrapped is not top and wrapped._unsloth_block_band and M._BAND_CHECK[0] is not None
++
++
++def test_gemma4_global_layer_mask_gets_a_causal_verdict(monkeypatch):
++    M = _load()
++    scans = []
++    _fake_gemma4_router_stack(M, monkeypatch, scans)
++    M._gemma4_router_hook()
++
++    class Gemma4TextAttention(torch.nn.Module):
++        is_sliding, sliding_window, head_dim = False, None, 512
++
++    layer = torch.nn.Module()
++    layer.self_attn = Gemma4TextAttention()
++    plain_causal, padded = torch.zeros(1, 1, 96, 96), torch.zeros(1, 1, 96, 96)
++    padded._ok = False
++    M._precheck_band(layer, 96, (plain_causal,), {})
++    M._precheck_band(layer, 96, (), {"attention_mask": padded})
++    assert scans == [(96, 96), (96, 96)]
++    assert plain_causal._unsloth_plain_causal is True and padded._unsloth_plain_causal is False
++    assert plain_causal._unsloth_block_long_band is False
++
++
++def _sliding_layer(window = 64, head_dim = 256):
++    class Gemma4TextAttention(torch.nn.Module):
++        is_sliding, sliding_window, is_causal, training = True, window, True, True
++
++    attn = Gemma4TextAttention()
++    attn.head_dim = head_dim
++    layer = torch.nn.Module()
++    layer.self_attn = attn
++    return layer, attn
++
++
++def test_gemma4_long_band_verdict_needs_the_kernel(monkeypatch):
++    M = _load()
++    scans = []
++    _fake_gemma4_router_stack(M, monkeypatch, scans)
++    M._gemma4_router_hook()
++    layer, _ = _sliding_layer()
++    hidden = torch.zeros(1, 96, 8, dtype = torch.bfloat16)
++    ready = []
++    monkeypatch.setattr(M, "_band_kernel_ready", lambda layer, h: ready.append(h) or True)
++    long = torch.zeros(1, 1, 96, 96)
++    M._precheck_band(layer, 96, (long,), {}, hidden)
++    assert scans == [(96, 64)] and long._unsloth_block_long_band is True
++    assert long._unsloth_block_band is False and long._unsloth_plain_causal is False
++    monkeypatch.setattr(M, "_band_kernel_ready", lambda layer, h: False)
++    other = torch.zeros(1, 1, 96, 96)
++    M._precheck_band(layer, 96, (other,), {}, hidden)
++    assert other._unsloth_block_long_band is False and scans == [(96, 64)]
++    # Within the window the existing is_causal route decides; no long-band scan.
++    short = torch.zeros(1, 1, 32, 32)
++    M._precheck_band(layer, 32, (short,), {}, hidden)
++    assert short._unsloth_block_long_band is False and short._unsloth_block_band is True
++
++
++def test_gemma4_band_kernel_kill_switch(monkeypatch):
++    M = _load()
++    layer, _ = _sliding_layer()
++    monkeypatch.setenv("UNSLOTH_BLOCK_SLIDING_KERNEL", "0")
++    assert M._band_kernel_ready(layer, torch.zeros(1, 4, 8)) is False
++    monkeypatch.delenv("UNSLOTH_BLOCK_SLIDING_KERNEL")
++    assert M._band_kernel_ready(layer, torch.zeros(1, 4, 8)) is False  # CPU tensor
++
++
++def test_gemma4_long_band_routes_to_the_interval_kernel(monkeypatch):
++    M = _load()
++    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++
++    scans = []
++    calls, _ = _fake_gemma4_router_stack(M, monkeypatch, scans)
++    M._gemma4_router_hook()
++    wrapped = ALL_ATTENTION_FUNCTIONS["sdpa"]
++    _, attn = _sliding_layer(window = 16, head_dim = 32)
++    kernel = []
++    monkeypatch.setattr(
++        M,
++        "_band_kernel_attention",
++        lambda q, k, v, w, s: kernel.append((q.shape, w, s)) or "kernel",
++    )
++    monkeypatch.setattr(M, "_band_kernel_checked", lambda q: True)
++    q = torch.randn(1, 4, 48, 32, dtype = torch.bfloat16)
++    kv = torch.randn(1, 2, 48, 32, dtype = torch.bfloat16)
++    mask = torch.zeros(1, 1, 48, 48)
++    mask._unsloth_block_long_band = True
++    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
++    M._IN_BLOCK[0] = M._FULL
++    try:
++        assert wrapped(attn, q, kv, kv, mask, scaling = 1.0)[0] == "kernel"
++        assert kernel == [(q.shape, 16, 1.0)]
++        mask._unsloth_block_long_band = False
++        assert wrapped(attn, q, kv, kv, mask, scaling = 1.0)[0] == "plain"
++        mask._unsloth_block_long_band = True
++        assert (
++            wrapped(attn, q, kv, kv, mask, dropout = 0.1, scaling = 1.0)[0] == "plain"
++        )  # training dropout
++        assert wrapped(attn, q.float(), kv.float(), kv.float(), mask, scaling = 1.0)[0] == "plain"
++    finally:
++        M._IN_BLOCK[0] = M._OFF
++    assert len(kernel) == 1 and len(calls["plain"]) == 3
++
++
++def _like_transformers_5_23(forward):
++    """GradientCheckpointingLayer.__init_subclass__ (transformers >= 5.23): checkpoint in `forward`."""
++
++    @functools.wraps(forward)
++    def forward_with_checkpointing(self, *args, **kwargs):
++        if (
++            self.gradient_checkpointing
++            and self.training
++            and type(self).forward is forward_with_checkpointing
++        ):
++            return self._gradient_checkpointing_func(
++                functools.partial(forward, self, **kwargs), *args
++            )
++        return forward(self, *args, **kwargs)
++
++    return forward_with_checkpointing
++
++
++def _checkpointed_layer(cls, reentrant = False):
++    layer = cls()
++    layer.gradient_checkpointing = True
++    calls = []
++
++    def checkpoint(fn, *args):
++        calls.append(len(args))
++        if reentrant:  # the forward of a reentrant checkpoint runs without grad
++            with torch.no_grad():
++                return fn(*args)
++        return fn(*args)
++
++    layer._gradient_checkpointing_func = checkpoint
++    return layer, calls
++
++
++def test_block_keeps_transformers_layer_checkpointing(monkeypatch):
++    # The block replaced the class forward, so transformers' wrapper ended up inside it, never saw
++    # itself as type(self).forward and every layer trained without checkpointing.
++    M = _load()
++    monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
++    cls = _toy_class()
++    stock = cls.forward
++    cls.forward = _like_transformers_5_23(stock)
++    assert M._is_hf_checkpoint_wrapper(cls.forward) and not M._is_hf_checkpoint_wrapper(stock)
++    M._wrap(cls, {})
++    assert getattr(cls.forward, M._MARK) and cls.forward._unsloth_block_original is stock
++    layer, calls = _checkpointed_layer(cls)
++    x = torch.randn(1, 4, 8, requires_grad = True)
++    out = layer(x, attention_mask = None)
++    torch.testing.assert_close(out, layer.proj(x) + x)
++    assert calls == [1]
++    layer.eval()(x)
++    assert calls == [1]
++    # Wrapping again (a second model load) keeps one checkpoint.
++    M._wrap(cls, {})
++    layer.train()(x)
++    assert calls == [1, 1]
++    # A reentrant checkpoint's no-grad first call runs the block's grad-mode trial, which must call
++    # the block, not the checkpoint shim again (that recursed until RecursionError).
++    fresh, fresh_calls = _checkpointed_layer(cls, reentrant = True)
++    out = fresh(x)
++    torch.testing.assert_close(out, fresh.proj(x) + x)
++    assert fresh_calls == [1]
++
++
++def test_block_leaves_call_level_checkpointing_alone(monkeypatch):
++    M = _load()
++    monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
++    cls = _toy_class()
++    M._wrap(cls, {})
++    assert not cls.forward._unsloth_block_checkpoint_outside
++    layer, calls = _checkpointed_layer(cls)
++    layer(torch.randn(1, 4, 8))
++    assert calls == []  # transformers <= 5.22 checkpoints in __call__, outside the block already
++
++
++def test_block_keeps_real_transformers_checkpointing(monkeypatch):
++    modeling_layers = pytest.importorskip("transformers.modeling_layers")
++    M = _load()
++
++    class ToyGCDecoderLayer(modeling_layers.GradientCheckpointingLayer):
++        def __init__(self):
++            super().__init__()
++            self.proj = torch.nn.Linear(8, 8)
++
++        def forward(
++            self,
++            hidden_states,
++            attention_mask = None,
++        ):
++            return self.proj(hidden_states) + hidden_states
++
++    if not M._is_hf_checkpoint_wrapper(ToyGCDecoderLayer.forward):
++        pytest.skip("this transformers checkpoints in __call__")
++    monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
++    M._wrap(ToyGCDecoderLayer, {})
++    layer, calls = _checkpointed_layer(ToyGCDecoderLayer)
++    layer(torch.randn(1, 4, 8, requires_grad = True))
++    assert calls == [1]
++
++
+ def test_kill_switch(monkeypatch):
+     M = _load()
+     monkeypatch.setenv("UNSLOTH_BLOCK_COMPILE", "0")
+diff --git a/tests/test_ddp_find_unused_default.py b/tests/test_ddp_find_unused_default.py
+index de3c1baf..b7adee75 100644
+--- a/tests/test_ddp_find_unused_default.py
++++ b/tests/test_ddp_find_unused_default.py
+@@ -393,3 +393,35 @@ def test_full_finetune_vlm_text_only_batches_train_under_ddp(tmp_path):
+ def _free_port():
+     from tests._rendezvous_port import free_port
+     return free_port()
++
++
++def _gemma4_like(**text_extra):
++    # vision.py checkpoints Gemma 4 reentrantly even under DDP; only the model_type matters to the helper.
++    model = _llava(**text_extra)
++    model.config.model_type = "gemma4_unified"
++    model._unsloth_vlm_gc_non_reentrant = False
++    return model
++
++
++def test_gemma4_language_lora_defaults_to_false(ddp_env):
++    # transformers' True crashes on the first backward under reentrant checkpointing ("mark a variable ready
++    # only once"); every language-layer adapter gets a gradient on a text-only batch, so False trains.
++    args = _args()
++    model = _lora(_gemma4_like(), target_modules = r".*language_model.*\.(q_proj|v_proj)")
++    assert _helper()(args, model) is False
++    assert args.ddp_find_unused_parameters is False
++
++
++@pytest.mark.parametrize("case", ["tower_lora", "moe", "not_gemma4", "no_checkpointing"])
++def test_gemma4_lora_rule_needs_text_only_dense_adapters(ddp_env, case):
++    kwargs, extra, targets = {}, {}, r".*language_model.*\.(q_proj|v_proj)"
++    if case == "tower_lora":
++        targets = ["q_proj", "v_proj"]  # also the CLIP tower's projections
++    elif case == "moe":
++        extra = {"num_local_experts": 4}
++    elif case == "no_checkpointing":
++        kwargs["gradient_checkpointing"] = False
++    model = _gemma4_like(**extra)
++    if case == "not_gemma4":
++        model.config.model_type = "llava"
++    assert _helper()(_args(**kwargs), _lora(model, target_modules = targets)) is None
+diff --git a/tests/test_large_head_attention.py b/tests/test_large_head_attention.py
+index b9bd2cef..4ff9c6d5 100644
+--- a/tests/test_large_head_attention.py
++++ b/tests/test_large_head_attention.py
+@@ -825,3 +825,95 @@ def test_router_captures_into_a_cuda_graph_with_an_inference_mask():
+     assert LH._SELF_CHECK[(str(device), dtype)] is True
+     torch.testing.assert_close(masked, eager_masked, atol = 2e-2, rtol = 2e-2)
+     torch.testing.assert_close(dense, eager_dense)
++
++
++@pytest.mark.skipif(not has_real_cuda(), reason = "needs CUDA")
++@pytest.mark.parametrize("S", [70, 200])
++@pytest.mark.parametrize("heads", [(8, 4), (8, 8)])
++@pytest.mark.parametrize("window", [16, 64])
++def test_kernel_sliding_band_head_dim_256(S, heads, window):
++    # Gemma-4 sliding layers (head_dim 256) longer than the window: rows attend (i - w, i].
++    H, HKV = heads
++    dtype = _cuda_dtype()
++    torch.manual_seed(S + H + window)
++    B, D = 2, 256
++    i = torch.arange(S)
++    allowed = (
++        (_causal(S) & (i[None, :] > i[:, None] - window)).cuda()[None, None].expand(B, 1, S, S)
++    )
++    q = torch.randn(B, S, H, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    k = torch.randn(B, S, HKV, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    v = torch.randn(B, S, HKV, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    grad = torch.randn(B, S, H, D, device = "cuda", dtype = dtype)
++    lo, hi = LH.intervals_from_mask(allowed, B, S)
++    assert int(lo[0, -1]) == S - window and int(hi[0, -1]) == S - 1
++    ours_in = [x.detach().clone().requires_grad_() for x in (q, k, v)]
++    out = LH.large_head_attention(*ours_in, lo, hi)
++    out.backward(grad)
++    ref_in = [x.detach().float().requires_grad_() for x in (q, k, v)]
++    ref = _reference(*ref_in, allowed)
++    ref.backward(grad.float())
++    for a, b in zip([out] + [x.grad for x in ours_in], [ref] + [x.grad for x in ref_in]):
++        assert torch.isfinite(a).all()
++        err = (a.float() - b).abs()
++        assert err.max() <= 0.03 * b.abs().max() + 0.02
++        assert err.mean() <= 0.01 * b.abs().mean() + 2e-3
++
++
++@pytest.mark.skipif(not _SM80, reason = "the router engages on sm80+ only")
++def test_self_check_per_head_dim():
++    dtype = _cuda_dtype()
++    device = torch.device("cuda", torch.cuda.current_device())
++    assert LH._self_check(device, dtype, 256) is True
++    assert (str(device), dtype, 256) in LH._SELF_CHECK
++    assert LH._self_check(device, dtype) is True and (str(device), dtype) in LH._SELF_CHECK
++
++
++@pytest.mark.skipif(not _SM80, reason = "the router engages on sm80+ only")
++def test_router_compiled_takes_a_block_verified_causal_mask(monkeypatch):
++    # Block compile scans the mask eagerly and marks it plain causal; the compiled graph then runs
++    # the kernel instead of masked SDPA (which repeats the single kv head 16 times at head_dim 512).
++    calls, original = _sentinel()
++    router = LH._make_router(original)
++    dtype = _cuda_dtype()
++    device = torch.device("cuda", torch.cuda.current_device())
++    assert LH._self_check(device, dtype) is True
++    q = torch.randn(1, 8, 40, 512, device = "cuda", dtype = dtype)
++    kv = torch.randn(1, 1, 40, 512, device = "cuda", dtype = dtype)
++    mask = _causal(40).cuda()[None, None]
++    want = LH.large_head_attention(q, kv, kv, *LH._dense_intervals(1, 40, True, q.device), 1.0)
++    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
++    assert router(_Module(), q, kv, kv, mask, scaling = 1.0)[0] == "original"  # unverified
++    setattr(mask, LH.PLAIN_CAUSAL_ATTR, False)
++    assert router(_Module(), q, kv, kv, mask, scaling = 1.0)[0] == "original"
++    setattr(mask, LH.PLAIN_CAUSAL_ATTR, True)
++    out, _ = router(_Module(), q, kv, kv, mask, scaling = 1.0)
++    torch.testing.assert_close(out, want, rtol = 0, atol = 0)
++    assert len(calls) == 2
++
++
++@pytest.mark.skipif(not has_real_cuda(), reason = "needs CUDA")
++@pytest.mark.parametrize("heads", [(16, 1), (8, 2)])
++def test_dkdv_head_split_matches_unsplit(monkeypatch, heads):
++    # One kv head over a short sequence left most SMs idle in the dK / dV pass; the split sums
++    # per-group fp32 partials, so it matches the single pass to fp32 summation order.
++    H, HKV = heads
++    dtype = _cuda_dtype()
++    torch.manual_seed(H)
++    B, S, D = 1, 96, 512
++    device = torch.device("cuda", torch.cuda.current_device())
++    assert LH._dkdv_splits(device, B * HKV, S, H // HKV) > 1
++    q = torch.randn(B, S, H, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    k = torch.randn(B, S, HKV, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    v = torch.randn(B, S, HKV, D, device = "cuda", dtype = dtype).transpose(1, 2)
++    grad = torch.randn(B, S, H, D, device = "cuda", dtype = dtype)
++    lo, hi = LH._dense_intervals(B, S, True, q.device)
++    grads = []
++    for split in ("1", "0"):
++        monkeypatch.setenv("UNSLOTH_LH_DKDV_SPLIT", split)
++        ins = [x.detach().clone().requires_grad_() for x in (q, k, v)]
++        LH.large_head_attention(*ins, lo, hi).backward(grad)
++        grads.append([x.grad.float() for x in ins])
++    assert LH._dkdv_splits(device, B * HKV, S, H // HKV) == 1
++    for a, b in zip(*grads):
++        torch.testing.assert_close(a, b, rtol = 2e-2, atol = 2e-2 * b.abs().max().item())
+diff --git a/tests/test_tp_native_gemma4_per_layer.py b/tests/test_tp_native_gemma4_per_layer.py
+new file mode 100644
+index 00000000..59b13dfa
+--- /dev/null
++++ b/tests/test_tp_native_gemma4_per_layer.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team.
++
++"""Tensor parallel plan for Gemma 4 (gemma4_unified): per-layer head counts and values computed from the keys.
++
++The text config is heterogeneous (sliding layers 2 key / value heads, the full attention layer 1 key / value head
++of width 512 and attention_k_eq_v, so no v_proj). A global config.num_key_value_heads read raises transformers'
++AmbiguousGlobalPerLayerAttributeError (not an AttributeError), which escaped derive_tp_plan as a crash; at tp = 2
++the full layer's single key head is replicated, and its values come from k_proj, so k_proj alone is replicated.
++CPU only, no process group."""
++
++import os
++import sys
++
++import pytest
++import torch
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from test_tp_native_oracle import tpn  # noqa: E402
++
++gemma4_unified = pytest.importorskip("transformers.models.gemma4_unified")
++
++
++def _tiny():
++    from transformers.models.gemma4_unified import Gemma4UnifiedForCausalLM, Gemma4UnifiedTextConfig
++
++    config = Gemma4UnifiedTextConfig(
++        vocab_size = 128,
++        vocab_size_per_layer_input = 128,
++        hidden_size = 64,
++        intermediate_size = 128,
++        num_hidden_layers = 3,
++        num_attention_heads = 4,
++        num_key_value_heads = 2,
++        head_dim = 16,
++        layer_types = ["sliding_attention", "sliding_attention", "full_attention"],
++        per_layer_config = {"2": {"head_dim": 32, "num_key_value_heads": 1}},
++        sliding_window = 8,
++        attention_k_eq_v = True,
++        hidden_size_per_layer_input = 0,
++        num_kv_shared_layers = 0,
++    )
++    torch.manual_seed(0)
++    return Gemma4UnifiedForCausalLM(config).eval()
++
++
++def test_per_layer_config_read_does_not_escape():
++    model = _tiny()
++    text = model.config
++    try:
++        text.num_key_value_heads
++    except AttributeError:
++        pytest.skip("this transformers has no heterogeneous config guard")
++    except Exception:
++        pass  # the guard this test is about
++    assert tpn._config_value(text, "num_key_value_heads") in (None, 2)
++
++
++def test_gemma4_tp2_plan_replicates_the_one_global_key_head():
++    model = _tiny()
++    plan = tpn.derive_tp_plan(model, 2)
++    attn = {r.path: r for r in plan.regions if r.kind == "attention"}
++    assert len(attn) == 3
++    full = next(r for p, r in attn.items() if p.endswith("layers.2.self_attn"))
++    assert (full.heads, full.kv_heads, full.head_dim, full.kv_replicated) == (4, 1, 32, True)
++    styles = {p.name: p.style for p in full.projs}
++    assert styles == {
++        "q_proj": tpn.COLWISE,
++        "k_proj": tpn.KV_REPLICATED,
++        "o_proj": tpn.ROWWISE,
++    }, styles
++    for path, region in attn.items():
++        if path.endswith(("layers.0.self_attn", "layers.1.self_attn")):
++            assert (region.heads, region.kv_heads, region.head_dim) == (4, 2, 16)
++            assert not region.kv_replicated
++            assert {p.name for p in region.projs} == {"q_proj", "k_proj", "v_proj", "o_proj"}
++
++
++def test_gemma4_tp4_shards_sliding_kv_by_replication_too():
++    # tp 4 > 2 sliding key heads: replicated there as well (separate k / v), and the full layer as at tp 2.
++    plan = tpn.derive_tp_plan(_tiny(), 4)
++    attn = [r for r in plan.regions if r.kind == "attention"]
++    assert all(r.kv_replicated for r in attn)
++
++
++def test_missing_value_projection_without_k_eq_v_is_still_refused():
++    model = _tiny()
++    attn = model.model.layers[0].self_attn
++    del attn.v_proj  # neither a v_proj nor v_proj = None: values have no known source
++    with pytest.raises(ValueError, match = "no separate key and value projections"):
++        tpn.derive_tp_plan(model, 4)
+diff --git a/unsloth/kernels/large_head_attention.py b/unsloth/kernels/large_head_attention.py
+index 20540906..65bffa08 100644
+--- a/unsloth/kernels/large_head_attention.py
++++ b/unsloth/kernels/large_head_attention.py
+@@ -24,6 +24,9 @@ __all__ = [
+ 
+ # calls: kernel ran; fallback: a qualifying call went back to SDPA after an error.
+ LARGE_HEAD_ENGAGED = {"calls": 0, "fallback": 0}
++# Set to True on a 4D mask by unsloth/models/_block_compile.py (eager scan before the compiled
++# block) when the mask is exactly causal with no padding; compiled graphs cannot scan a mask.
++PLAIN_CAUSAL_ATTR = "_unsloth_plain_causal"
+ _SUPPORTED_HEAD_DIMS = (512,)
+ _INT32_MAX = 2**31 - 1
+ 
+@@ -288,24 +291,29 @@ def _lh_bwd_dkdv(
+     sdvb,
+     sdvh,
+     sdvn,
++    sds,
+     HKV,
+     G,
+     S,
++    NSPLIT,
+     HEAD_DIM: tl.constexpr,  # hd
+     BLOCK_M: tl.constexpr,  # query rows per program
+     BLOCK_N: tl.constexpr,  # key rows per step
+ ):
+-    # One program owns a kv block of one kv head and loops over its G query heads,
+-    # so GQA needs no atomics and no repeated K / V.
++    # One program owns a kv block of one kv head and loops over its query heads (all G, or G / NSPLIT
++    # of them into an fp32 partial summed afterwards when B * HKV * kv blocks would leave SMs idle,
++    # e.g. Gemma-4 global layers: one kv head), so GQA needs no atomics and no repeated K / V.
+     start_n = tl.program_id(0)
+-    off_bkh = tl.program_id(1)
++    off_split = tl.program_id(1) % NSPLIT
++    off_bkh = tl.program_id(1) // NSPLIT
+     off_b = (off_bkh // HKV).to(tl.int64)
+     off_hk = (off_bkh % HKV).to(tl.int64)
+     H = HKV * G
++    GS = G // NSPLIT
+     K += off_b * skb + off_hk * skh
+     V += off_b * svb + off_hk * svh
+-    DK += off_b * sdkb + off_hk * sdkh
+-    DV += off_b * sdvb + off_hk * sdvh
++    DK += off_b * sdkb + off_hk * sdkh + off_split.to(tl.int64) * sds
++    DV += off_b * sdvb + off_hk * sdvh + off_split.to(tl.int64) * sds
+     LO += off_b * S
+     HI += off_b * S
+     QLO += off_b * S
+@@ -322,8 +330,8 @@ def _lh_bwd_dkdv(
+     m_end = tl.load(QHI + tl.minimum(start_n * BLOCK_N + BLOCK_N, S) - 1) + 1
+     dk = tl.zeros([BLOCK_N, HEAD_DIM], tl.float32)
+     dv = tl.zeros([BLOCK_N, HEAD_DIM], tl.float32)
+-    for g in range(G):
+-        off_h = off_hk * G + g
++    for g in range(GS):
++        off_h = off_hk * G + off_split * GS + g
+         Qh = Q + off_b * sqb + off_h * sqh
+         DOh = DO + off_b * sdob + off_h * sdoh
+         row_base = (off_b * H + off_h) * S
+@@ -426,6 +434,25 @@ def _fwd_impl(q, k, v, lo, hi, scale):
+     return o, lse
+ 
+ 
++_SM_COUNT = {}
++
++
++def _dkdv_splits(device, bkh, S, G):
++    """Query-head groups the dK / dV pass splits into, so that kv blocks x kv heads x splits fill the
++    GPU about twice over (1 = no split: one kv head over a short sequence ran on 64 programs)."""
++    if os.environ.get("UNSLOTH_LH_DKDV_SPLIT", "1") == "0" or G == 1:
++        return 1
++    index = device.index if device.index is not None else torch.cuda.current_device()
++    sms = _SM_COUNT.get(index)
++    if sms is None:
++        sms = _SM_COUNT[index] = torch.cuda.get_device_properties(index).multi_processor_count
++    programs = triton.cdiv(S, 32) * bkh
++    split = 1
++    while split * 2 <= G and G % (split * 2) == 0 and programs * split < 2 * sms:
++        split *= 2
++    return split
++
++
+ def _bwd_impl(do, q, k, v, o, lse, lo, hi, scale):
+     B, H, S, D = q.shape
+     HKV = k.shape[1]
+@@ -435,6 +462,12 @@ def _bwd_impl(do, q, k, v, o, lse, lo, hi, scale):
+     dq = torch.empty_like(q)
+     dk = torch.empty_like(k)
+     dv = torch.empty_like(v)
++    nsplit = _dkdv_splits(q.device, B * HKV, S, G)
++    if nsplit > 1:
++        dk_out = torch.empty((nsplit, B, HKV, S, D), device = q.device, dtype = torch.float32)
++        dv_out = torch.empty_like(dk_out)
++    else:
++        dk_out, dv_out = dk, dv
+     delta = torch.empty((B, H, S), device = q.device, dtype = torch.float32)
+     positions = (
+         torch.arange(S, device = q.device, dtype = torch.int32).expand(lo.shape[0], S).contiguous()
+@@ -460,13 +493,13 @@ def _bwd_impl(do, q, k, v, o, lse, lo, hi, scale):
+             num_warps = 4,
+             enable_fp_fusion = True,
+         )
+-        _lh_bwd_dkdv[lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * HKV)](
++        _lh_bwd_dkdv[lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * HKV * nsplit)](
+             q,
+             k,
+             v,
+             do,
+-            dk,
+-            dv,
++            dk_out,
++            dv_out,
+             lse,
+             delta,
+             lo,
+@@ -487,18 +520,23 @@ def _bwd_impl(do, q, k, v, o, lse, lo, hi, scale):
+             do.stride(0),
+             do.stride(1),
+             do.stride(2),
+-            dk.stride(0),
+-            dk.stride(1),
+-            dk.stride(2),
+-            dv.stride(0),
+-            dv.stride(1),
+-            dv.stride(2),
++            dk_out.stride(-4),
++            dk_out.stride(-3),
++            dk_out.stride(-2),
++            dv_out.stride(-4),
++            dv_out.stride(-3),
++            dv_out.stride(-2),
++            dk_out.stride(0) if nsplit > 1 else 0,
+             HKV,
+             G,
+             S,
++            nsplit,
+             HEAD_DIM = D,
+             enable_fp_fusion = True,
+         )
++        if nsplit > 1:
++            dk.copy_(dk_out.sum(0))
++            dv.copy_(dv_out.sum(0))
+         _lh_bwd_dq[lambda meta: (triton.cdiv(S, meta["BLOCK_M"]), B * H)](
+             q,
+             k,
+@@ -759,9 +797,13 @@ def _measured_faster_on(device):
+         return False
+ 
+ 
+-def _self_check(device, dtype):
+-    """One small fwd + bwd against SDPA math per (device, dtype) before first use."""
+-    key = (str(device), dtype)
++def _self_check(
++    device,
++    dtype,
++    head_dim = 512,
++):
++    """One small fwd + bwd against SDPA math per (device, dtype[, head_dim]) before first use."""
++    key = (str(device), dtype) if head_dim == 512 else (str(device), dtype, head_dim)
+     if key in _SELF_CHECK:
+         return _SELF_CHECK[key]
+     passed = False
+@@ -779,11 +821,16 @@ def _self_check(device, dtype):
+         with torch.inference_mode(False), torch.enable_grad(), hooks:
+             q, k, v, g = [
+                 torch.randn(shape, device = device, dtype = dtype, generator = gen)
+-                for shape in ((1, 4, 80, 512), (1, 2, 80, 512), (1, 2, 80, 512), (1, 80, 4, 512))
++                for shape in (
++                    (1, 4, 80, head_dim),
++                    (1, 2, 80, head_dim),
++                    (1, 2, 80, head_dim),
++                    (1, 80, 4, head_dim),
++                )
+             ]
+             q, k, v = [x.requires_grad_() for x in (q, k, v)]
+             lo, hi = _dense_intervals(1, 80, True, device)
+-            out = large_head_attention(q, k, v, lo, hi, 512**-0.5)
++            out = large_head_attention(q, k, v, lo, hi, head_dim**-0.5)
+             grads = torch.autograd.grad(out, (q, k, v), g)
+             qf, kf, vf = [x.detach().float().requires_grad_() for x in (q, k, v)]
+             ref = torch.nn.functional.scaled_dot_product_attention(
+@@ -901,6 +948,15 @@ def _make_router(original):
+             if attention_mask is None:
+                 causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
+                 intervals = _dense_intervals(B, S, bool(causal), query.device)
++            elif (
++                compiling
++                and getattr(attention_mask, PLAIN_CAUSAL_ATTR, None) is True
++                and attention_mask.shape[-2] == S
++                and attention_mask.shape[-1] == S
++            ):
++                # Block compile scanned this mask eagerly (no padding, plain causal), so the
++                # graph needs no host sync; the masked SDPA it replaces repeats the kv heads.
++                intervals = _dense_intervals(B, S, True, query.device)
+             elif (
+                 not compiling
+                 and not capturing
+diff --git a/unsloth/models/_block_compile.py b/unsloth/models/_block_compile.py
+index aa32c02c..86f84d96 100644
+--- a/unsloth/models/_block_compile.py
++++ b/unsloth/models/_block_compile.py
+@@ -1198,6 +1198,10 @@ def _stable_parametrized_classes():
+ # zoo's Gemma-4 sliding router scans the mask (data dependent) and declines while compiling, so
+ # the block runs the scan eagerly and a router wrapper reads the verdict stored on the mask.
+ _BAND_MODULE = "unsloth_zoo.temporary_patches.gemma4_banded_attention"
++_FLASH_MODULE = "unsloth_zoo.temporary_patches.gemma4_flash_sliding"
++# Read by unsloth/kernels/large_head_attention.py (PLAIN_CAUSAL_ATTR): a compiled head_dim 512 layer
++# takes the kernel over a causal mask the block verified here, instead of masked SDPA.
++_PLAIN_CAUSAL_ATTR = "_unsloth_plain_causal"
+ _BAND_CHECK = [None]
+ 
+ 
+@@ -1214,8 +1218,13 @@ def _gemma4_router_hook():
+         router, "_unsloth_block_band", False
+     ):
+         return
+-    zoo = sys.modules.get(router.__module__)
+-    plain = getattr(zoo, "_ORIG_SDPA", [None])[0]
++    # Other routers wrap zoo's (unsloth's head_dim 512 kernel, installed at load before this runs, has no
++    # _ORIG_SDPA), so fall back to zoo's module: without it the hook never installed for Gemma-4.
++    plain = None
++    for name in (router.__module__, _FLASH_MODULE):
++        plain = getattr(sys.modules.get(name), "_ORIG_SDPA", [None])[0]
++        if plain is not None:
++            break
+     check = getattr(sys.modules.get(_BAND_MODULE), "_mask_is_plain_band", None)
+     if plain is None or not callable(check):
+         return
+@@ -1264,6 +1273,23 @@ def _gemma4_router_hook():
+                     enable_gqa = True,
+                 )
+                 return out.transpose(1, 2).contiguous(), None
++            if (
++                window
++                and attention_mask is not None
++                and query.shape[2] == key.shape[2]
++                and query.shape[2] > window
++                and not (dropout and module.training)
++                and kwargs.get("softcap", None) is None
++                and getattr(attention_mask, _LONG_BAND_ATTR, False) is True
++                and query.dtype == key.dtype == value.dtype
++                and query.dtype in (torch.float16, torch.bfloat16)
++                and query.shape[-1] == key.shape[-1] == value.shape[-1]
++                and query.shape[1] % key.shape[1] == 0
++                and _band_kernel_checked(query)
++            ):
++                # Longer than the window: masked SDPA computes all S x S scores (and repeats the kv
++                # heads); the interval kernel reads only each row's window (O(S * w)).
++                return _band_kernel_attention(query, key, value, window, scaling), None
+             return plain(
+                 module,
+                 query,
+@@ -1291,6 +1317,66 @@ def _gemma4_router_hook():
+     ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward
+ 
+ 
++# Set on a sliding layer's 4D mask when it is the plain band, the sequence is longer than the window and
++# the interval kernel passed its self check at this head_dim / dtype; read by the router above.
++_LONG_BAND_ATTR = "_unsloth_block_long_band"
++_BAND_KERNEL_ENV = "UNSLOTH_BLOCK_SLIDING_KERNEL"
++_LH_MODULE = "unsloth.kernels.large_head_attention"
++
++
++def _band_kernel_attention(query, key, value, window, scaling):
++    lh = sys.modules[_LH_MODULE]
++    B, S = query.shape[0], query.shape[2]
++    rows = torch.arange(S, device = query.device, dtype = torch.int32)
++    lo = (rows - (window - 1)).clamp_min(0).expand(B, S).contiguous()
++    hi = rows.expand(B, S).contiguous()
++    scale = scaling if scaling is not None else query.shape[-1] ** -0.5
++    return lh.large_head_attention(query, key, value, lo, hi, scale).contiguous()
++
++
++def _band_kernel_ready(layer, hidden_states):
++    """Eager: the interval kernel may serve this sliding layer (CUDA sm80+, passed its self check at the
++    layer's head_dim). Checked per dtype; the router also reads the verdict for the call's dtype."""
++    if os.environ.get(_BAND_KERNEL_ENV, "1") == "0" or hidden_states is None:
++        return False
++    if not hidden_states.is_cuda or torch.version.hip is not None:
++        return False
++    key = str(hidden_states.device)
++    cached = layer.__dict__.get("_unsloth_band_kernel_ready")
++    if cached is not None and cached[0] == key:
++        return cached[1]
++    ready = _band_kernel_check(layer, hidden_states.device)
++    layer.__dict__["_unsloth_band_kernel_ready"] = (key, ready)
++    return ready
++
++
++def _band_kernel_check(layer, device):
++    head_dim = None
++    for module in layer.modules():
++        if getattr(module, "is_sliding", False) and getattr(module, "sliding_window", None):
++            head_dim = getattr(module, "head_dim", None)
++            break
++    if head_dim not in (64, 128, 256):
++        return False
++    try:
++        import importlib
++
++        lh = importlib.import_module(_LH_MODULE)
++        if not lh._enabled() or not lh._measured_faster_on(device):
++            return False
++        dtypes = [torch.float16] + ([torch.bfloat16] if torch.cuda.is_bf16_supported() else [])
++        return any([bool(lh._self_check(device, dtype, head_dim)) for dtype in dtypes])
++    except Exception:
++        return False
++
++
++def _band_kernel_checked(query):
++    lh = sys.modules.get(_LH_MODULE)
++    if lh is None:
++        return False
++    return lh._SELF_CHECK.get((str(query.device), query.dtype, query.shape[-1]), False) is True
++
++
+ def _sliding_window(layer):
+     window = layer.__dict__.get("_unsloth_block_window", 0)
+     if window == 0:
+@@ -1303,7 +1389,13 @@ def _sliding_window(layer):
+     return window
+ 
+ 
+-def _precheck_band(layer, seq_len, args, kwargs):
++def _precheck_band(
++    layer,
++    seq_len,
++    args,
++    kwargs,
++    hidden_states = None,
++):
+     # Every 4D mask gets a verdict: a missing attribute would recompile.
+     check = _BAND_CHECK[0]
+     if check is None:
+@@ -1318,6 +1410,26 @@ def _precheck_band(layer, seq_len, args, kwargs):
+                     obj._unsloth_block_band = False
+             elif not hasattr(obj, "_unsloth_block_band"):
+                 obj._unsloth_block_band = False
++            # Full-attention layers: a band as wide as the sequence is the plain causal mask
++            # (scan cached on the mask by version, one per forward for every global layer).
++            if window is None:
++                try:
++                    causal = bool(check(obj, seq_len, seq_len))
++                except Exception:
++                    causal = False
++                setattr(obj, _PLAIN_CAUSAL_ATTR, causal)
++            elif not hasattr(obj, _PLAIN_CAUSAL_ATTR):
++                setattr(obj, _PLAIN_CAUSAL_ATTR, False)
++            if window is not None:
++                long_band = False
++                if seq_len > window and _band_kernel_ready(layer, hidden_states):
++                    try:
++                        long_band = bool(check(obj, seq_len, window))
++                    except Exception:
++                        long_band = False
++                setattr(obj, _LONG_BAND_ATTR, long_band)
++            elif not hasattr(obj, _LONG_BAND_ATTR):
++                setattr(obj, _LONG_BAND_ATTR, False)
+ 
+ 
+ # Mode of the block being traced (_SPLIT: flex_attention outside); dynamo guards on it.
+@@ -1466,6 +1578,46 @@ def _layer_kind(layer):
+     )
+ 
+ 
++def _is_hf_checkpoint_wrapper(fn):
++    """transformers >= 5.23 checkpoints in a wrapper GradientCheckpointingLayer.__init_subclass__ puts on
++    each layer class's `forward` (it was `__call__`); it checkpoints only while it is `type(self).forward`."""
++    code = getattr(fn, "__code__", None)
++    return (
++        code is not None
++        and code.co_name == "forward_with_checkpointing"
++        and callable(getattr(fn, "__wrapped__", None))
++    )
++
++
++# The cache arguments transformers' wrapper clears before it checkpoints (unless _can_checkpoint_with_cache).
++_CHECKPOINT_CACHE_KWARGS = ("past_key_values", "layer_past")
++
++
++def _checkpointing(forward):
++    """transformers' layer checkpoint wrapper around the block forward. The block replaces the class
++    forward, so transformers' own wrapper (now inside the block) never saw itself as outermost and
++    every layer ran without gradient checkpointing (gemma-4-12b QLoRA 2048: 16 GB kept, 8192: OOM)."""
++
++    @functools.wraps(forward)
++    def forward_with_checkpointing(self, *args, **kwargs):
++        outermost = type(self).forward is forward_with_checkpointing or (
++            getattr(self.__dict__.get("forward"), "__func__", None) is forward_with_checkpointing
++        )
++        if self.gradient_checkpointing and self.training and outermost:
++            if kwargs.get("use_cache"):
++                kwargs["use_cache"] = False
++            if not getattr(self, "_can_checkpoint_with_cache", False):
++                for name in _CHECKPOINT_CACHE_KWARGS:
++                    if kwargs.get(name) is not None:
++                        kwargs[name] = None
++            return self._gradient_checkpointing_func(
++                functools.partial(forward, self, **kwargs), *args
++            )
++        return forward(self, *args, **kwargs)
++
++    return forward_with_checkpointing
++
++
+ def _wrap(
+     cls,
+     compile_options,
+@@ -1474,6 +1626,10 @@ def _wrap(
+     install = True,
+ ):
+     original = getattr(cls.forward, "_unsloth_block_original", cls.forward)
++    checkpoint_outside = getattr(cls.forward, "_unsloth_block_checkpoint_outside", False)
++    if _is_hf_checkpoint_wrapper(original):
++        # Compile the layer's own forward; checkpointing goes back outside the block (below).
++        original, checkpoint_outside = original.__wrapped__, True
+     # Host-read packed lengths / PrefixGrouper segments stay stock.
+     unsloth_forward = getattr(original, "__module__", "").startswith("unsloth.models.")
+     try:
+@@ -1684,7 +1840,7 @@ def _wrap(
+             _mark_seq_dynamic(hidden_states.shape[1], (hidden_states, args, kwargs))
+             if _DYNAMIC_BATCH and hidden_states.shape[0] > 1:
+                 _mark_batch_dynamic(hidden_states.shape[0], (hidden_states, args, kwargs))
+-            _precheck_band(self, hidden_states.shape[1], args, kwargs)
++            _precheck_band(self, hidden_states.shape[1], args, kwargs, hidden_states)
+         bit = 2 if torch.is_grad_enabled() else 1
+         checked = self.__dict__.get("_unsloth_block_checked", 0)
+         if bit == 1 and not checked & 2:
+@@ -1740,10 +1896,13 @@ def _wrap(
+ 
+     forward._unsloth_block_original = original
+     forward._unsloth_block_state = state
++    forward._unsloth_block_checkpoint_outside = checkpoint_outside
+     setattr(forward, _MARK, True)
++    # A new name: `forward` is also the closure the grad-mode trial above calls (the shim would recurse).
++    installed = _checkpointing(forward) if checkpoint_outside else forward
+     if install:
+-        cls.forward = forward
+-    return forward
++        cls.forward = installed
++    return installed
+ 
+ 
+ _TOWER_SEGMENTS = (
+diff --git a/unsloth/models/_ddp_defaults.py b/unsloth/models/_ddp_defaults.py
+index d3a31d47..d20ed0f7 100644
+--- a/unsloth/models/_ddp_defaults.py
++++ b/unsloth/models/_ddp_defaults.py
+@@ -221,12 +221,60 @@ def _vlm_tower_needs_unused_search(args, model):
+     )
+ 
+ 
++def _reentrant_vlm_text_lora(model):
++    """A LoRA adapter on the language layers only of a VLM that vision.py checkpoints reentrantly (Gemma 4).
++
++    Under reentrant checkpointing transformers' True crashes on the first backward ("mark a variable ready only
++    once"), and a text-only adapter gets a gradient on every step, so False is the setting that trains. A
++    dense model only: routed experts, tower / embedding / head adapters and extra trainable tensors keep the default."""
++    from transformers import PreTrainedModel
++
++    if isinstance(model, PreTrainedModel):
++        return False
++    models = _unwrapped_models(model)
++    config = getattr(models[-1], "config", None)
++    model_type = str(getattr(config, "model_type", "") or "").lower()
++    if not model_type.startswith("gemma4"):
++        return False
++    peft_config = getattr(model, "peft_config", None)
++    if not isinstance(peft_config, dict) or len(peft_config) != 1:
++        return False
++    cfg = next(iter(peft_config.values()))
++    if (
++        str(getattr(getattr(cfg, "peft_type", None), "value", getattr(cfg, "peft_type", "")))
++        != "LORA"
++    ):
++        return False
++    for attr in ("modules_to_save", "target_parameters", "trainable_token_indices"):
++        if getattr(cfg, attr, None):
++            return False
++    for c in _configs(config):
++        if getattr(c, "enable_moe_block", False) is True:
++            return False
++        for key in _MOE_CONFIG_KEYS:
++            value = getattr(c, key, None)
++            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
++                return False
++    n_trainable = 0
++    for name, param in model.named_parameters():
++        if not param.requires_grad:
++            continue
++        n_trainable += 1
++        if not any(m in name for m in _LORA_PARAM_MARKERS):
++            return False
++        lowered = name.lower()
++        if any(m in lowered for m in _SKIPPABLE_NAME_MARKERS):
++            return False
++    return n_trainable > 0
++
++
+ def unsloth_default_ddp_find_unused_parameters(args, model):
+     """Set ``args.ddp_find_unused_parameters = False`` for a plain LoRA model under DDP with gradient
+     checkpointing when the user left it None.
+ 
+     Kept at None (transformers' True) for anything a step may skip: MoE / expert LoRA, vision or audio
+     towers, MTP heads, lm_head / embedding adapters, modules_to_save, several adapters, non-LoRA PEFT.
++    False too for a language-layers-only LoRA on Gemma 4, which checkpoints reentrantly (True crashes there).
+     Set to True for a VLM with a trainable tower under non-reentrant checkpointing. Returns the value now on ``args``.
+     """
+     if args is None or not hasattr(args, "ddp_find_unused_parameters"):
+@@ -245,7 +293,9 @@ def unsloth_default_ddp_find_unused_parameters(args, model):
+         return None
+     try:
+         gc_on = _gradient_checkpointing_on(args, model)
+-        safe = gc_on and _lora_uses_every_trainable_param(model)
++        safe = gc_on and (
++            _lora_uses_every_trainable_param(model) or _reentrant_vlm_text_lora(model)
++        )
+         tower = gc_on and not safe and _vlm_tower_needs_unused_search(args, model)
+     except Exception:
+         safe = tower = False
+diff --git a/unsloth/models/tp_native.py b/unsloth/models/tp_native.py
+index be3f69dd..a6d934ae 100644
+--- a/unsloth/models/tp_native.py
++++ b/unsloth/models/tp_native.py
+@@ -420,13 +420,22 @@ def _elementwise_scalars(module):
+     return not _FEATURE_REDUCTIONS.search(_drop_init(source))
+ 
+ 
++def _config_value(config, name):
++    """config.<name>, or None when the config does not hold one global value: transformers' heterogeneous
++    configs (Gemma 4) raise AmbiguousGlobalPerLayerAttributeError, not AttributeError, for a per-layer attribute."""
++    try:
++        return getattr(config, name, None)
++    except Exception:
++        return None
++
++
+ def _attention_sizes(module, projs, text):
+     """(heads, kv_heads, head_dim) of one attention module, from its own projections."""
+-    heads_cfg = getattr(text, "num_attention_heads", None)
+-    kv_cfg = getattr(text, "num_key_value_heads", None) or heads_cfg
++    heads_cfg = _config_value(text, "num_attention_heads")
++    kv_cfg = _config_value(text, "num_key_value_heads") or heads_cfg
+     head_dim = getattr(module, "head_dim", None)
+     if not isinstance(head_dim, int):
+-        head_dim = getattr(text, "head_dim", None) or (text.hidden_size // heads_cfg)
++        head_dim = _config_value(text, "head_dim") or (text.hidden_size // heads_cfg)
+     by_name = {p.name: p for p in projs}
+     q = next((by_name[n] for n in _Q if n in by_name), None)
+     k = next((by_name[n] for n in _K if n in by_name), None)
+@@ -626,7 +635,11 @@ def _replicate_kv_heads(region, path, tp):
+             f"projections. Use tp <= {kv_heads}."
+         )
+     kv = [p for p in region.projs if p.name in _K + _V]
+-    if not any(p.name in _K for p in kv) or not any(p.name in _V for p in kv):
++    # Values computed from the keys (Gemma 4 attention_k_eq_v: v_proj = None, value_states = key_states).
++    values_from_keys = any(
++        n in region.module.__dict__ and region.module.__dict__[n] is None for n in _V
++    ) or any(n in region.module._modules and region.module._modules[n] is None for n in _V)
++    if not any(p.name in _K for p in kv) or not (any(p.name in _V for p in kv) or values_from_keys):
+         raise ValueError(
+             f"Unsloth: tensor parallel size {tp} is larger than num_key_value_heads = {kv_heads} ({path}), and "
+             f"no separate key and value projections ({_K + _V}) were found to replicate."
+@@ -1731,7 +1744,7 @@ def _set_local_heads(module, region, tp):
+         # Per-module config copy with local counts (Phi3 fused qkv); the shared config is left alone.
+         local = copy.copy(config)
+         local.num_attention_heads = heads
+-        if getattr(config, "num_key_value_heads", None) is not None:
++        if _config_value(config, "num_key_value_heads") is not None:
+             local.num_key_value_heads = kv_heads
+         module.__dict__["config"] = local
+ 
