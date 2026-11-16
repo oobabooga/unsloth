@@ -88,7 +88,7 @@ jobs:
             --probe amd_ci/probes/train5_probe.py \
             --criteria amd_ci/criteria/train5_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --unit u17942 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,aol_qwen25vl,aol_gemma3_unsloth --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 705f2ee17370843ed2f2d045b39709d565d4fa4b --companion-head 705f2ee17370843ed2f2d045b39709d565d4fa4b --venv "$AMD_CI_WORK/tvenv" --tests tests/version_compat/test_vision_collator_assistant_only_loss.py --repeat flm16,aol_qwen25vl
+            --python "$AMD_CI_PY" -- --unit u17942 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,aol_qwen25vl,aol_gemma3_unsloth,aol_qwen25vl_none,aol_gemma3_none --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 705f2ee17370843ed2f2d045b39709d565d4fa4b --companion-head 705f2ee17370843ed2f2d045b39709d565d4fa4b --venv "$AMD_CI_WORK/tvenv" --tests tests/version_compat/test_sft_assistant_only_loss_vision_routing.py tests/version_compat/test_vision_collator_assistant_only_loss.py --repeat flm16,aol_qwen25vl_none
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
