@@ -1,0 +1,91 @@
+{
+ "name": "amd_i8_wan",
+ "description": "Studio INT8 attention end to end on gfx1151: Wan 2.2 TI2V 5B, 832x480x33 frames (9 latent frames x 30 x 52 = 14040 tokens), native attention vs unsloth_int8 forced (UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL=1), LPIPS of the INT8 frames vs the native frames of the same state.",
+ "models": {
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "speed_mode": "default",
+   "memory_mode": "auto",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 33,
+   "fps": null,
+   "steps": 12,
+   "short_steps": 2,
+   "guidance": null,
+   "save_frames_every": 1,
+   "warmup": 1,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "none"
+   },
+   "tag": "i8e_wan_native",
+   "ref": "i8e_wan_native",
+   "note": "reference: Studio's native attention"
+  },
+  {
+   "model": "@wan22_5b",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 832,
+   "height": 480,
+   "frames": 33,
+   "fps": null,
+   "steps": 12,
+   "short_steps": 2,
+   "guidance": null,
+   "save_frames_every": 1,
+   "warmup": 1,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "none",
+    "attention_backend": "unsloth_int8"
+   },
+   "tag": "i8e_wan_int8",
+   "ref": "i8e_wan_native",
+   "env": {
+    "UNSLOTH_DIFFUSION_INT8_ATTENTION_KERNEL": "1"
+   },
+   "note": "INT8 attention forced on every block"
+  }
+ ]
+}

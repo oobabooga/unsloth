@@ -1,0 +1,1003 @@
+{
+ "name": "bench_vs_comfy_video_b200",
+ "description": "Studio (unsloth main 0cc9ed2d3a + unsloth-zoo main d51efea13b) vs ComfyUI latest master, video families at family-default resolution/frames/steps/CFG, prompts video_3 (seeds 11-13). *_default = Studio defaults (no load options); *_bf16 = explicit transformer_quant none (Studio reference); *_fp8 = explicit fp8. Every Studio cell gets a fresh studio_home and TORCHINDUCTOR_CACHE_DIR so cold_s includes compile. Score each cell against the SAME framework's bf16 cell only. Comfy cells and H3/A14B cells run n=2 new prompts (v0, v1) to fit the time budget. GPU 2 is shared with other workspaces: every cell carries its gate reading; contended renders are flagged in the report.",
+ "models": {
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "/mnt/disks/unslothai/ubuntu/workspace_81/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  },
+  "h3": {
+   "repo": "MiniMaxAI/MiniMax-H3"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/venvs/studio-py3.12-d8917b0e77/bin/python",
+  "kind": "video"
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 3600
+ },
+ "reference": null,
+ "cells": [
+  {
+   "tag": "w5_s_default",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_s_default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_s_default"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  },
+  {
+   "tag": "w5_s_bf16",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_s_bf16",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_s_bf16"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  },
+  {
+   "tag": "w5_s_fp8",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_s_fp8",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_s_fp8"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  },
+  {
+   "tag": "w5_c_bf16",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "w5_c_bf16",
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 5.0,
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/vae/wan2.2_vae.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/text_encoders/umt5_xxl_fp16.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "shift": 5.0
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "w5_c_default",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "w5_c_bf16",
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 5.0,
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/vae/wan2.2_vae.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "shift": 5.0
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "w5_c_fp8",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "w5_c_bf16",
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 5.0,
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/vae/wan2.2_vae.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "weight_dtype": "fp8_e4m3fn",
+    "shift": 5.0
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "h3_s_default",
+   "backend": "studio",
+   "model": "@h3",
+   "ref": "h3_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": false,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/h3_s_default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/h3_s_default"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "guidance": null,
+   "steps": 30,
+   "short_steps": 6,
+   "save_frames_every": 4,
+   "note": "local_files_only False: every file is cached, but transformers 5.5.0 resolves the Qwen3VL processor tokenizer class through processor/config.json (absent), which only a Hub lookup tolerates"
+  },
+  {
+   "tag": "h3_s_bf16",
+   "backend": "studio",
+   "model": "@h3",
+   "ref": "h3_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": false,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/h3_s_bf16",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/h3_s_bf16"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "guidance": null,
+   "steps": 30,
+   "short_steps": 6,
+   "save_frames_every": 4,
+   "note": "local_files_only False: every file is cached, but transformers 5.5.0 resolves the Qwen3VL processor tokenizer class through processor/config.json (absent), which only a Hub lookup tolerates"
+  },
+  {
+   "tag": "h3_s_fp8",
+   "backend": "studio",
+   "model": "@h3",
+   "ref": "h3_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": false,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/h3_s_fp8",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/h3_s_fp8"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "guidance": null,
+   "steps": 30,
+   "short_steps": 6,
+   "save_frames_every": 4,
+   "note": "local_files_only False: every file is cached, but transformers 5.5.0 resolves the Qwen3VL processor tokenizer class through processor/config.json (absent), which only a Hub lookup tolerates"
+  },
+  {
+   "tag": "h3_c_bf16",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "h3_c_bf16",
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "steps": 30,
+   "guidance": 1.0,
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_video_vae_fp16.safetensors",
+     "audio_vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 6
+  },
+  {
+   "tag": "h3_c_int8",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "h3_c_bf16",
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "steps": 30,
+   "guidance": 1.0,
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 6
+  },
+  {
+   "tag": "h3_c_template_pruned",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "h3_c_template_pruned",
+   "width": 1344,
+   "height": 768,
+   "frames": 124,
+   "fps": null,
+   "steps": 30,
+   "guidance": 1.0,
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 6
+  },
+  {
+   "tag": "l23_s_default",
+   "backend": "studio",
+   "model": "Lightricks/LTX-2.3",
+   "ref": "l23_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/l23_s_default",
+    "model_kind": "single_file",
+    "gguf_filename": "ltx-2.3-22b-distilled.safetensors"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/l23_s_default"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 768,
+   "height": 512,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 8,
+   "short_steps": 4,
+   "note": "transformers 5.10.4 overlay: diffusers 80c7ed26 (Studio diffusers-main.txt) imports Gemma4UnifiedForConditionalGeneration in pipelines/ltx2, absent from Studio-pinned transformers 5.5.0; without it the LTX-2/2.3 load fails",
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_pywrap/python_tf510"
+  },
+  {
+   "tag": "l23_s_fp8",
+   "backend": "studio",
+   "model": "Lightricks/LTX-2.3",
+   "ref": "l23_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/l23_s_fp8",
+    "model_kind": "single_file",
+    "gguf_filename": "ltx-2.3-22b-distilled.safetensors",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/l23_s_fp8"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 768,
+   "height": 512,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 8,
+   "short_steps": 4,
+   "note": "transformers 5.10.4 overlay: diffusers 80c7ed26 (Studio diffusers-main.txt) imports Gemma4UnifiedForConditionalGeneration in pipelines/ltx2, absent from Studio-pinned transformers 5.5.0; without it the LTX-2/2.3 load fails",
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_pywrap/python_tf510"
+  },
+  {
+   "tag": "l23_c_bf16",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "l23_c_bf16",
+   "width": 768,
+   "height": 512,
+   "frames": 121,
+   "fps": null,
+   "steps": 8,
+   "guidance": 1.0,
+   "options": {
+    "family": "ltx-2.3",
+    "files": {
+     "checkpoint": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Lightricks--LTX-2.3/snapshots/5948be4ced3a4493d1f836df64378ff136ddb770/ltx-2.3-22b-distilled.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--ltx-2/snapshots/ccde4ba417d7900669fd56dd292a883cee11ff37/split_files/text_encoders/gemma_3_12B_it.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "graph_extra": {
+     "sigmas": [
+      1.0,
+      0.99375,
+      0.9875,
+      0.98125,
+      0.975,
+      0.909375,
+      0.725,
+      0.421875,
+      0.0
+     ]
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 4
+  },
+  {
+   "tag": "l23_c_default",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "l23_c_bf16",
+   "width": 768,
+   "height": 512,
+   "frames": 121,
+   "fps": null,
+   "steps": 8,
+   "guidance": 1.0,
+   "options": {
+    "family": "ltx-2.3",
+    "files": {
+     "checkpoint": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Lightricks--LTX-2.3-fp8/snapshots/1d756cd27fa11c0896c4dfee093cd1bf36c7f7a1/ltx-2.3-22b-distilled-fp8.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--ltx-2/snapshots/ccde4ba417d7900669fd56dd292a883cee11ff37/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "graph_extra": {
+     "sigmas": [
+      1.0,
+      0.99375,
+      0.9875,
+      0.98125,
+      0.975,
+      0.909375,
+      0.725,
+      0.421875,
+      0.0
+     ]
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 4
+  },
+  {
+   "tag": "hv_s_default",
+   "backend": "studio",
+   "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+   "ref": "hv_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/hv_s_default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/hv_s_default"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10
+  },
+  {
+   "tag": "hv_s_bf16",
+   "backend": "studio",
+   "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+   "ref": "hv_s_bf16",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/hv_s_bf16",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/hv_s_bf16"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10
+  },
+  {
+   "tag": "hv_s_fp8",
+   "backend": "studio",
+   "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+   "ref": "hv_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/hv_s_fp8",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/hv_s_fp8"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10
+  },
+  {
+   "tag": "hv_c_bf16",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "hv_c_bf16",
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 6.0,
+   "options": {
+    "family": "hunyuanvideo-1.5",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/diffusion_models/hunyuanvideo1.5_480p_t2v_fp16.safetensors",
+     "te": [
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/byt5_small_glyphxl_fp16.safetensors"
+     ],
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/vae/hunyuanvideo15_vae_fp16.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "hv_c_default",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "hv_c_default",
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 6.0,
+   "options": {
+    "family": "hunyuanvideo-1.5",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/diffusion_models/hunyuanvideo1.5_480p_t2v_fp16.safetensors",
+     "te": [
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/byt5_small_glyphxl_fp16.safetensors"
+     ],
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/vae/hunyuanvideo15_vae_fp16.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    }
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "hv_c_fp8",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "hv_c_default",
+   "width": 832,
+   "height": 480,
+   "frames": 121,
+   "fps": null,
+   "steps": 50,
+   "guidance": 6.0,
+   "options": {
+    "family": "hunyuanvideo-1.5",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/diffusion_models/hunyuanvideo1.5_480p_t2v_fp16.safetensors",
+     "te": [
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/text_encoders/byt5_small_glyphxl_fp16.safetensors"
+     ],
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--HunyuanVideo_1.5_repackaged/snapshots/1405a2b738c29b890cf6d03fc038d8d3e92eeed7/split_files/vae/hunyuanvideo15_vae_fp16.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "weight_dtype": "fp8_e4m3fn"
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "a14_s_default",
+   "backend": "studio",
+   "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+   "ref": "a14_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/a14_s_default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/a14_s_default"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 1280,
+   "height": 720,
+   "frames": 81,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10
+  },
+  {
+   "tag": "a14_s_fp8",
+   "backend": "studio",
+   "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+   "ref": "a14_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/a14_s_fp8",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/a14_s_fp8"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "width": 1280,
+   "height": 720,
+   "frames": 81,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10
+  },
+  {
+   "tag": "a14_c_bf16",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "a14_c_bf16",
+   "width": 1280,
+   "height": 720,
+   "frames": 81,
+   "fps": null,
+   "steps": 50,
+   "guidance": 5.0,
+   "options": {
+    "family": "wan2.2-a14b",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors",
+     "dit2": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/vae/wan_2.1_vae.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "shift": 3.0,
+    "graph_extra": {
+     "boundary": 0.875
+    },
+    "sampler": "uni_pc",
+    "scheduler": "simple"
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "a14_c_default",
+   "backend": "comfyui",
+   "kind": "video",
+   "ref": "a14_c_bf16",
+   "width": 1280,
+   "height": 720,
+   "frames": 81,
+   "fps": null,
+   "steps": 50,
+   "guidance": 5.0,
+   "options": {
+    "family": "wan2.2-a14b",
+    "files": {
+     "dit": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+     "dit2": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+     "te": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+     "vae": "/mnt/disks/unslothai/ubuntu/.cache/huggingface/hub/models--Comfy-Org--Wan_2.2_ComfyUI_Repackaged/snapshots/ee6f4a40737a995bf5818954cfce6d59443b0f04/split_files/vae/wan_2.1_vae.safetensors"
+    },
+    "comfy": {
+     "commit": "a7169322485d0049380fb207fa17e9fb3ec40486"
+    },
+    "shift": 3.0,
+    "graph_extra": {
+     "boundary": 0.875
+    },
+    "sampler": "uni_pc",
+    "scheduler": "simple"
+   },
+   "venv": "/mnt/disks/unslothai/ubuntu/workspace_81/bin/python3",
+   "env": {
+    "DIFFUSION_BENCH_COMFY_PYTHON": "/mnt/disks/unslothai/ubuntu/workspace_81/venv_comfy/bin/python",
+    "DIFFUSION_BENCH_COMFY_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/ComfyUI@a716932248"
+   },
+   "prompts": "video_3",
+   "n": 2,
+   "warmup": 1,
+   "short_n": 1,
+   "save_frames_every": 4,
+   "short_steps": 10
+  },
+  {
+   "tag": "w5_ab_base",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_ab_base",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_ab_base"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_ab_base"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  },
+  {
+   "tag": "w5_ab_head",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_ab_base",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/wt_perf_video",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_ab_head"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_ab_head"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  },
+  {
+   "tag": "w5_s_eager",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_s_default",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/diffusion_bench/src/worktrees/main-0cc9ed2d3a",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_s_eager",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_s_eager"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "note": "eager-vs-compiled floor for Wan 5B (speed_mode eager vs default)"
+  },
+  {
+   "tag": "w5_ab_temb",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "w5_ab_base",
+   "options": {
+    "studio_src": "/mnt/disks/unslothai/ubuntu/workspace_81/wt_perf_video_temb",
+    "local_files_only": true,
+    "studio_home": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_homes/w5_ab_temb"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "/mnt/disks/unslothai/ubuntu/workspace_81/temp/bvcv_inductor/w5_ab_temb"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "warmup": 1,
+   "short_n": 1,
+   "width": 1280,
+   "height": 704,
+   "frames": 121,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4
+  }
+ ]
+}

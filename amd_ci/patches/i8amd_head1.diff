@@ -1,0 +1,224 @@
+diff --git a/studio/backend/core/inference/diffusion_int8_attention.py b/studio/backend/core/inference/diffusion_int8_attention.py
+index 19397ac489..faf7bca9bb 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention.py
++++ b/studio/backend/core/inference/diffusion_int8_attention.py
+@@ -125,8 +125,17 @@ ROCM_KERNEL_CONFIGS: dict = {
+             "kscale": "tile",
+             "long_keys": 8000,
+             "long": {"bm": 128, "warps": 8},
++            "tail_first": True,
++        },
++        64: {
++            "bm": 128,
++            "bn": 32,
++            "warps": 4,
++            "stages": 1,
++            "pv": "f16_t",
++            "kscale": "tile",
++            "tail_first": True,
+         },
+-        64: {"bm": 128, "bn": 32, "warps": 4, "stages": 1, "pv": "f16_t", "kscale": "tile"},
+     },
+ }
+ # Triton stand-in when the CUDA kernel cannot load, tuned on sm80 / sm89 / sm120 (sm86 = sm80, fits its 99 KB smem).
+diff --git a/studio/backend/core/inference/diffusion_int8_attention_triton.py b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+index 9180bd2c05..79ecdbc87a 100644
+--- a/studio/backend/core/inference/diffusion_int8_attention_triton.py
++++ b/studio/backend/core/inference/diffusion_int8_attention_triton.py
+@@ -689,6 +689,7 @@ if triton is not None:
+         EVEN_K: tl.constexpr,
+         ACC_IN_DOT: tl.constexpr,
+         PREFETCH_FIX: tl.constexpr,  # cache key only: compiled with the sm_8x 8-bit prefetch fix
++        TAIL_FIRST: tl.constexpr = False,
+     ):
+         # PV_MODE 0: 16-bit P.V, V read from the strided input; 1: 16-bit P.V, V from a heads-major padded copy;
+         # 2: INT8 P.V, P as 0..127 relative to each (row, key tile) maximum, V centred / gained, one scale per tile;
+@@ -718,6 +719,45 @@ if triton is not None:
+         l_i = tl.zeros([BM], tl.float32)
+         acc = tl.zeros([BM, D], tl.float32)
+         n_full = sk // BN
++        # TAIL_FIRST: the masked partial key tile before the full ones. After the loop its masks and pointers
++        # stay live beside the loop state, which on RDNA3 WMMA costs registers and waves per SIMD
++        if not EVEN_K and TAIL_FIRST:
++            acc, l_i, m_i = _attn_tile(
++                acc,
++                l_i,
++                m_i,
++                n_full,
++                q,
++                qs,
++                q_ptr,
++                k_ptr,
++                ks_ptr,
++                v_ptr,
++                vs_ptr,
++                b,
++                h,
++                bh,
++                kbase,
++                n_ktiles,
++                n_kpad,
++                sk,
++                qk_mul,
++                k_sb,
++                k_ss,
++                k_sh,
++                v_sb,
++                v_ss,
++                v_sh,
++                offs_n,
++                cols,
++                BN,
++                D,
++                QK_INT8,
++                K_TILE,
++                PV_MODE,
++                ACC_IN_DOT,
++                True,
++            )
+         for t in range(0, n_full):
+             acc, l_i, m_i = _attn_tile(
+                 acc,
+@@ -755,7 +795,7 @@ if triton is not None:
+                 ACC_IN_DOT,
+                 False,
+             )
+-        if not EVEN_K:
++        if not EVEN_K and not TAIL_FIRST:
+             acc, l_i, m_i = _attn_tile(
+                 acc,
+                 l_i,
+@@ -945,6 +985,7 @@ def _make_plan(
+             "EVEN_K": Sk % bn == 0,
+             "ACC_IN_DOT": bool(config.get("acc_in_dot", False)),
+             "PREFETCH_FIX": prefetch_fix(),
++            "TAIL_FIRST": bool(config.get("tail_first", False)),
+             **_launch_options(config),
+         },
+         "config": config,
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_rocm.py b/studio/backend/tests/test_diffusion_int8_attention_rocm.py
+index 8998da8e53..ce1123c9fd 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_rocm.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_rocm.py
+@@ -329,6 +329,69 @@ def test_fused_launches_match_one_launch_per_quantiser_interpreted():
+     assert len(res) == 6 and all(all(v) for v in res.values()), res
+ 
+ 
++_TAIL_FIRST = textwrap.dedent(
++    """
++    import json, torch, torch.nn.functional as F
++    from core.inference import diffusion_int8_attention as I
++    from core.inference import diffusion_int8_attention_triton as T
++    out = {}
++    for tokens, D in ((131, 64), (200, 128), (192, 128)):
++        q, k, v = I.probe_inputs("cpu", torch.float16, tokens, 2, D, seed = tokens)
++        ref = F.scaled_dot_product_attention(*(t.double().permute(0, 2, 1, 3) for t in (q, k, v))).permute(0, 2, 1, 3)
++        for pv in ("f16_t", "int8"):
++            got = {}
++            for first in (False, True):
++                cfg = {"bm": 64, "bn": 32, "warps": 4, "stages": 1, "kscale": "tile", "tail_first": first}
++                got[first] = T.int8_attention(q, k, v, cfg, pv = pv)
++            out[f"{tokens}/{D}/{pv}"] = {
++                "ragged": tokens % 32 != 0,
++                "same": torch.equal(got[False], got[True]),
++                "cos": [float(F.cosine_similarity(g.double().flatten(), ref.flatten(), 0)) for g in got.values()],
++                "rel_l1": [float((g.double() - ref).abs().mean() / ref.abs().mean()) for g in got.values()],
++            }
++    print("RESULT " + json.dumps(out))
++    """
++)
++
++
++@pytest.mark.skipif(not _interpreter_ok(), reason = "needs the Triton >= 3.7 interpreter")
++def test_partial_key_tile_first_keeps_the_numerics_interpreted():
++    """``tail_first`` (the ROCm tables) runs the masked partial key tile before the full ones: same accuracy vs fp64,
++    and with no partial tile (keys a multiple of bn) the same bits (Triton interpreter, CPU)."""
++    env = dict(os.environ, TRITON_INTERPRET = "1")
++    r = subprocess.run(
++        [sys.executable, "-c", _TAIL_FIRST],
++        cwd = BACKEND_DIR,
++        env = env,
++        capture_output = True,
++        text = True,
++        timeout = 900,
++    )
++    line = [x for x in r.stdout.splitlines() if x.startswith("RESULT ")]
++    assert line, (r.stdout[-2000:], r.stderr[-3000:])
++    res = json.loads(line[0][7:])
++    assert len(res) == 6
++    for key, m in res.items():
++        if not m["ragged"]:
++            assert m["same"], key
++        assert min(m["cos"]) >= I.MIN_COSINE and max(m["rel_l1"]) <= I.MAX_REL_L1 / 2, (key, m)
++        assert abs(m["rel_l1"][0] - m["rel_l1"][1]) <= 0.002, (key, m)
++
++
++def test_rocm_tables_take_the_partial_key_tile_first():
++    from core.inference import diffusion_int8_attention_triton as T
++    for table in I.ROCM_KERNEL_CONFIGS.values():
++        for cfg in table.values():
++            assert cfg.get("tail_first") is True
++            plan = T._make_plan(
++                *(torch.empty(1, 77, 2, 64, dtype = torch.bfloat16),) * 3, cfg, None, None
++            )
++            assert plan["attn_meta"]["TAIL_FIRST"] is True and plan["attn_meta"]["EVEN_K"] is False
++    for table in I.TRITON_KERNEL_CONFIGS.values():
++        for cfg in table.values():
++            assert not cfg.get("tail_first")
++
++
+ def test_launch_plan_is_made_once_per_call_signature(monkeypatch):
+     from core.inference import diffusion_int8_attention_triton as T
+ 
+@@ -403,6 +466,25 @@ def test_kernel_matches_fp64_on_the_card(tokens, head_dim):
+             assert float((got.double() - ref).abs().mean() / ref.abs().mean()) <= I.MAX_REL_L1
+ 
+ 
++@needs_rocm_kernel
++@pytest.mark.parametrize("tokens", [1039, 1056, 9000])
++def test_partial_key_tile_first_on_the_card(tokens):
++    """The table's tail_first against the kernel without it: both meet the fp64 gate; with no partial key tile
++    (1056 = 33 x 32 keys) the same bits."""
++    from core.inference import diffusion_int8_attention_triton as T
++
++    cfg = _rocm_config(128)
++    q, k, v = I.probe_inputs("cuda", torch.bfloat16, tokens, 3, 128, seed = tokens)
++    ref = _fp64(q, k, v)
++    first = T.int8_attention(q, k, v, dict(cfg, tail_first = True))
++    last = T.int8_attention(q, k, v, dict(cfg, tail_first = False))
++    for got in (first, last):
++        assert _cos(got, ref) >= I.MIN_COSINE
++        assert float((got.double() - ref).abs().mean() / ref.abs().mean()) <= I.MAX_REL_L1
++    if tokens % int(T.select_config(cfg, tokens)["bn"]) == 0:
++        assert torch.equal(first, last)
++
++
+ @needs_rocm_kernel
+ def test_strided_views_batch_and_cross_attention():
+     """[B, S, H, D] views cut from a fused qkv projection, batch 2, and Sq != Sk all match fp64."""
+diff --git a/studio/backend/tests/test_diffusion_int8_attention_triton_fallback.py b/studio/backend/tests/test_diffusion_int8_attention_triton_fallback.py
+index 594a111895..f34d4f9406 100644
+--- a/studio/backend/tests/test_diffusion_int8_attention_triton_fallback.py
++++ b/studio/backend/tests/test_diffusion_int8_attention_triton_fallback.py
+@@ -331,13 +331,18 @@ def test_the_attention_kernel_compiles_through_the_8bit_prefetch_fix(monkeypatch
+     installed = []
+     monkeypatch.setattr(P, "fix_triton_sm8x_8bit_prefetch", lambda: installed.append(1) or True)
+     monkeypatch.setattr(T, "_PREFETCH_FIX_ON", None)
++    # an NVIDIA build: no HIP version and no ROCm tag (a ROCm host's own torch.__version__ carries "+rocm")
+     monkeypatch.setattr(torch.version, "hip", None)
++    monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
+     T.kernels()
+     assert installed == [1] and T.prefetch_fix() is True and installed == [1]
+     assert "PREFETCH_FIX" in T.kernels().attn.arg_names
+-    monkeypatch.setattr(T, "_PREFETCH_FIX_ON", None)
+-    monkeypatch.setattr(torch.version, "hip", "6.4")
+-    assert T.prefetch_fix() is False and installed == [1]
++    # ROCm builds never install it: a HIP version, or only the tag (AMD SDK / Radeon wheels leave hip unset)
++    for hip, version in (("6.4", "2.11.0+rocm6.4"), (None, "2.11.0+rocm7.13.0")):
++        monkeypatch.setattr(T, "_PREFETCH_FIX_ON", None)
++        monkeypatch.setattr(torch.version, "hip", hip)
++        monkeypatch.setattr(torch, "__version__", version)
++        assert T.prefetch_fix() is False and installed == [1]
+ 
+ 
+ def _triton_card() -> bool:
