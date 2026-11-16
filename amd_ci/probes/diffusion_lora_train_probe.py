@@ -362,7 +362,25 @@ def _lpips_fn():
     try:
         import lpips  # noqa: F401
     except Exception:  # noqa: BLE001
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "lpips"], check = False)
+        # The Studio venv may be uv-made without pip: try pip, then ensurepip + pip, then uv.
+        attempts = [[sys.executable, "-m", "pip", "install", "-q", "--no-deps", "lpips"],
+                    [sys.executable, "-m", "ensurepip", "-q"],
+                    [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "lpips"]]
+        uv = shutil.which("uv") or next((str(c) for c in (Path.home() / ".local" / "bin" / "uv",
+                                                         Path.home() / ".cargo" / "bin" / "uv") if c.is_file()), None)
+        if uv:
+            attempts.append([uv, "pip", "install", "-q", "--no-deps", "--python", sys.executable, "lpips"])
+        for cmd in attempts:
+            subprocess.run(cmd, check = False, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+            try:
+                import importlib
+
+                importlib.invalidate_caches()
+                import lpips  # noqa: F401
+
+                break
+            except Exception:  # noqa: BLE001
+                continue
     import lpips
     import torch
 
