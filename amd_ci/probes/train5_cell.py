@@ -55,6 +55,7 @@ MODELS = {
     "hd512_gemma4": "built:gemma4-global-hd512",
     "hd512_gemma4_nc": "built:gemma4-global-hd512 (UNSLOTH_COMPILE_DISABLE=1)",
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "dpo_txt": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "pfree_llama": "built:llama (FastLanguageModel, SFT padding_free=True)",
     "pfree_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "sftdef_steps": "built:llama (SFT, packing unset, max_steps)",
@@ -129,9 +130,18 @@ def built_llama():
     return d
 
 
+def _jsonable(x):
+    """Stringify non-JSON dict keys (counters keyed by tuples) so one odd counter cannot lose the cell's record."""
+    if isinstance(x, dict):
+        return {(k if isinstance(k, (str, int, float, bool)) or k is None else str(k)): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    return x
+
+
 def dump():
     with open(args.out, "w", encoding = "utf-8") as fh:
-        json.dump(res, fh, indent = 1, default = str)
+        json.dump(_jsonable(res), fh, indent = 1, default = str)
 
 
 def stage(name):
@@ -1734,12 +1744,15 @@ def cell_grpo_txt():
 def _pack_stats():
     out = {}
     try:
-        import unsloth.models._block_compile as bc
-        out["packed_block"] = dict(getattr(bc, "PACKED_BLOCK_STATS", {}) or {}) or "absent"
+        import importlib
+        ad = importlib.import_module("unsloth.utils.attention_dispatch")  # unsloth.utils re-exports a same-named function
+        stats = getattr(ad, "PACKED_BLOCK_STATS", None)
+        out["packed_block"] = dict(stats) if stats is not None else "absent"
     except Exception as e:  # noqa: BLE001
         out["packed_block"] = f"ERR {type(e).__name__}"
     try:
-        import unsloth.utils.hf_packed_attention as hp
+        import importlib
+        hp = importlib.import_module("unsloth.utils.hf_packed_attention")
         out["hf_packed_attention"] = dict(getattr(hp, "HF_PACKED_ATTENTION_STATS", {}) or {}) or "absent"
     except Exception as e:  # noqa: BLE001
         out["hf_packed_attention"] = f"ERR {type(e).__name__}"
@@ -1811,6 +1824,42 @@ def cell_sft_pack(kind, mode):
     res["global_steps"] = trainer.state.global_step
     finish_losses([float(h["loss"]) for h in logs])
     res["decreasing"] = None
+
+
+def cell_dpo_txt():
+    """unsloth #17886: single-GPU text DPO through Unsloth's DPO trainer (tiny Qwen3 LoRA, PEFT reference = adapter
+    disabled, 3 steps): losses / rewards, chosen-rejected margins."""
+    import tempfile
+    import torch
+    from unsloth import FastLanguageModel
+    from datasets import Dataset
+    from trl import DPOConfig, DPOTrainer
+    versions()
+    stage("load")
+    model, tok = FastLanguageModel.from_pretrained(MODELS["dpo_txt"], max_seq_length = 256, dtype = torch.bfloat16,
+                                                   load_in_4bit = False)
+    model = FastLanguageModel.get_peft_model(model, r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
+                                             target_modules = TARGETS, use_gradient_checkpointing = "unsloth",
+                                             random_state = 0)
+    tt = getattr(tok, "tokenizer", tok)
+    if tt.pad_token is None:
+        tt.pad_token = tt.eos_token
+    rows = [{"prompt": d[:30], "chosen": d[30:], "rejected": d[30:][::-1]} for d in DOCS] * 4
+    cfg = _cfg(DPOConfig, output_dir = tempfile.mkdtemp(), per_device_train_batch_size = 2, gradient_accumulation_steps = 1,
+               max_steps = 3, learning_rate = 1e-3, logging_steps = 1, report_to = "none", bf16 = True, seed = 0,
+               save_strategy = "no", max_length = 128, beta = 0.1)
+    trainer = DPOTrainer(model = model, ref_model = None, args = cfg, train_dataset = Dataset.from_list(rows),
+                         processing_class = tt)
+    res["trainer_class"] = type(trainer).__name__
+    res["ref_model_is_none"] = getattr(trainer, "ref_model", None) is None
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    trainer.train()
+    peak()
+    logs = [h for h in trainer.state.log_history if "loss" in h]
+    finish_losses([float(h["loss"]) for h in logs])
+    res["decreasing"] = None
+    res["reward_margins"] = [h.get("rewards/margins") for h in logs]
 
 
 def cell_seqcls():
@@ -1910,6 +1959,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "granite_gc": cell_granite_gc,
          "padmix_qwen3": lambda: cell_padmix("padmix_qwen3"), "padmix_gemma4": lambda: cell_padmix("padmix_gemma4"),
          "grpo_txt": cell_grpo_txt,
+         "dpo_txt": cell_dpo_txt,
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
          "plelens": lambda: cell_bclens("plelens", (37, 91, 150, 203, 64, 177, 119), "float32"),

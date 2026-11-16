@@ -88,7 +88,7 @@ jobs:
             --probe amd_ci/probes/train5_probe.py \
             --criteria amd_ci/criteria/train5_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --unit p17884_2543 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,sftdef_steps,sftdef_epoch --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 9313f8be8e1874604badd4cb64e9a829ad22215e --companion-head 6df7ed1cfe7538431e5704c6fd3f524682bdf229 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_sft_default_packing.py tests/test_warnings_issued_guard.py --repeat sftdef_steps,sftdef_epoch --companion-tests tests/test_responses_only_packed_rows.py
+            --python "$AMD_CI_PY" -- --unit p17884_2543 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,sftdef_steps,sftdef_epoch --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 9313f8be8e1874604badd4cb64e9a829ad22215e --companion-head 23e2beb3a8482140f876e381c7a1850d8ce84d37 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_sft_default_packing.py tests/test_warnings_issued_guard.py --repeat sftdef_steps,sftdef_epoch --companion-tests tests/test_responses_only_packed_rows.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
