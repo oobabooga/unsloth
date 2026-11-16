@@ -1,0 +1,821 @@
+diff --git a/studio/backend/core/_rocm_windows_sdpa.py b/studio/backend/core/_rocm_windows_sdpa.py
+index 546b9d9372..6842e3e255 100644
+--- a/studio/backend/core/_rocm_windows_sdpa.py
++++ b/studio/backend/core/_rocm_windows_sdpa.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ import functools
+ import logging
++import threading
+ from typing import Any
+ 
+ WIDEST_FUSED_HEAD_DIM = 256
+@@ -20,6 +21,30 @@ _GUARD_ATTR = "_unsloth_windows_rocm_wide_head_guard"
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Backend flags are process-wide: the first wide-head call in flight saves them and pins math, the last restores them,
++# so an overlapping call (another thread) never sees the fused kernels back early nor saves the math-only state.
++_HELD = [0, None]
++_LOCK = threading.Lock()
++
++
++def _math_on() -> None:
++    from torch.nn.attention import SDPBackend, _cur_sdpa_kernel_backends, _sdpa_kernel
++    with _LOCK:
++        if _HELD[0] == 0:
++            _HELD[1] = _cur_sdpa_kernel_backends()
++        # Re-pinned on every entry: another thread's sdpa_kernel may have changed the flags since the first.
++        _sdpa_kernel([SDPBackend.MATH])
++        _HELD[0] += 1
++
++
++def _math_off() -> None:
++    from torch.nn.attention import _sdpa_kernel
++    with _LOCK:
++        _HELD[0] -= 1
++        if _HELD[0] == 0:
++            _sdpa_kernel(_HELD[1])
++            _HELD[1] = None
++
+ 
+ def _wide_cuda_head(query: Any) -> bool:
+     shape = getattr(query, "shape", None) or ()
+@@ -34,13 +59,15 @@ def guard_sdpa(sdpa: Any) -> Any:
+     """``sdpa`` with every call whose head is wider than 256 pinned to the math backend."""
+     if getattr(sdpa, _GUARD_ATTR, False):
+         return sdpa
+-    from torch.nn.attention import SDPBackend, sdpa_kernel
+ 
+     @functools.wraps(sdpa)
+     def guarded(query: Any, key: Any, value: Any, *args: Any, **kwargs: Any) -> Any:
+         if _wide_cuda_head(query):
+-            with sdpa_kernel([SDPBackend.MATH]):
++            _math_on()
++            try:
+                 return sdpa(query, key, value, *args, **kwargs)
++            finally:
++                _math_off()
+         return sdpa(query, key, value, *args, **kwargs)
+ 
+     setattr(guarded, _GUARD_ATTR, True)
+diff --git a/studio/backend/core/inference/diffusion_vae_attn_chunked.py b/studio/backend/core/inference/diffusion_vae_attn_chunked.py
+index f3ee4484eb..a6bf10fc0e 100644
+--- a/studio/backend/core/inference/diffusion_vae_attn_chunked.py
++++ b/studio/backend/core/inference/diffusion_vae_attn_chunked.py
+@@ -212,6 +212,8 @@ def _mode_class() -> Any:
+     import torch.nn.functional as F
+     from torch.overrides import TorchFunctionMode
+ 
++    _BUILTIN_SDPA = torch._C._nn.scaled_dot_product_attention
++
+     class ChunkedVaeAttentionMode(TorchFunctionMode):
+         def __init__(self, budget: int):
+             super().__init__()
+@@ -227,7 +229,8 @@ def _mode_class() -> Any:
+             kwargs: Any = None,
+         ) -> Any:
+             kwargs = kwargs or {}
+-            if func is F.scaled_dot_product_attention:
++            # A non-redispatching wrapper leaves the mode seeing torch's builtin: match both.
++            if func is F.scaled_dot_product_attention or func is _BUILTIN_SDPA:
+                 call = _plain_call(args, kwargs)
+                 if call is not None:
+                     q, k, v, scale = call
+diff --git a/studio/backend/tests/test_diffusion_vae_attn_chunked.py b/studio/backend/tests/test_diffusion_vae_attn_chunked.py
+index f2865cd795..a3c7838f1a 100644
+--- a/studio/backend/tests/test_diffusion_vae_attn_chunked.py
++++ b/studio/backend/tests/test_diffusion_vae_attn_chunked.py
+@@ -438,3 +438,29 @@ def test_half_math_gates(monkeypatch):
+     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+     monkeypatch.setattr(torch, "__version__", _CUDA_TORCH_VERSION)
+     assert not C._half_math_call(cuda_bf16)
++
++
++@pytest.mark.parametrize("redispatch", [False, True])
++def test_mode_matches_through_an_sdpa_wrapper(rocm, monkeypatch, redispatch):
++    """Something replaced F.scaled_dot_product_attention (Unsloth core's Windows ROCm wide-head guard, a
++    cuDNN workaround): the mode must still chunk, whether the wrapper re-dispatches torch functions
++    (func = the wrapper) or just calls torch's builtin (func = the builtin)."""
++    from torch.overrides import handle_torch_function, has_torch_function
++
++    builtin = torch._C._nn.scaled_dot_product_attention
++
++    def wrapper(query, key, value, *args, **kwargs):
++        if redispatch and has_torch_function((query, key, value)):
++            return handle_torch_function(
++                wrapper, (query, key, value), query, key, value, *args, **kwargs
++            )
++        return builtin(query, key, value, *args, **kwargs)
++
++    monkeypatch.setattr(F, "scaled_dot_product_attention", wrapper)
++    q = torch.randn(1, 1, 512, 32)
++    with _math():
++        ref = builtin(q, q, q)
++        with C.chunked_attention_mode(512 * 512 * 4 // 8) as mode:
++            out = F.scaled_dot_product_attention(q, q, q)
++    assert mode.chunked == 1
++    torch.testing.assert_close(out, ref, atol = 1e-5, rtol = 1e-5)
+diff --git a/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py b/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
+index 60a364a26b..625e2f0d44 100644
+--- a/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
++++ b/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
+@@ -4,7 +4,6 @@
+ """Windows ROCm: SDPA calls with a head wider than 256 (Gemma 4's global layers) must run on the math backend, since
+ the fused kernels that take them there compute them wrong. Heads up to 256 and every other platform are untouched."""
+ 
+-import contextlib
+ import sys
+ import types
+ 
+@@ -26,12 +25,11 @@ def _q(head_dim, device = "cuda"):
+ def recorder(monkeypatch):
+     entered = []
+ 
+-    @contextlib.contextmanager
+-    def fake_kernel(backends):
++    def fake_set(backends):
+         entered.append(list(backends))
+-        yield
+ 
+-    monkeypatch.setattr(attention, "sdpa_kernel", fake_kernel)
++    monkeypatch.setattr(attention, "_sdpa_kernel", fake_set)
++    monkeypatch.setattr(attention, "_cur_sdpa_kernel_backends", lambda: ["saved"])
+     calls = []
+ 
+     def sdpa(q, k, v, *args, **kwargs):
+@@ -46,7 +44,7 @@ def test_wide_cuda_head_runs_on_math(recorder, head_dim):
+     entered, calls, sdpa = recorder
+     q = _q(head_dim)
+     assert G.guard_sdpa(sdpa)(q, q, q, is_causal = True, enable_gqa = True) == "out"
+-    assert entered == [[attention.SDPBackend.MATH]]
++    assert entered == [[attention.SDPBackend.MATH], ["saved"]]
+     assert calls[0][1] == {"is_causal": True, "enable_gqa": True}
+ 
+ 
+@@ -89,3 +87,43 @@ def test_llm_workers_install_the_guard(worker):
+     assert src.index("install_windows_rocm_wide_head_sdpa_guard(") > src.index(
+         "install_torchao_windows_rocm_stub()"
+     )
++
++
++def test_overlapping_wide_head_calls_restore_the_callers_backends_once():
++    """The first of two overlapping wide-head calls returning first must not put the fused kernels back under the
++    second; the caller's backends come back once, after the last returns."""
++    import threading
++
++    seen = {}
++    inside = {n: threading.Event() for n in "ab"}
++    release = {n: threading.Event() for n in "ab"}
++
++    def sdpa(
++        q,
++        k,
++        v,
++        *args,
++        name = None,
++        **kwargs,
++    ):
++        inside[name].set()
++        release[name].wait(5)
++        seen[name] = set(attention._cur_sdpa_kernel_backends())
++        return "out"
++
++    guarded = G.guard_sdpa(sdpa)
++    before = set(attention._cur_sdpa_kernel_backends())
++    q = _q(512)
++    threads = {
++        n: threading.Thread(target = guarded, args = (q, q, q), kwargs = {"name": n}) for n in "ab"
++    }
++    threads["a"].start()
++    assert inside["a"].wait(5)
++    threads["b"].start()
++    assert inside["b"].wait(5)
++    release["a"].set()
++    threads["a"].join(5)
++    release["b"].set()
++    threads["b"].join(5)
++    assert seen == {"a": {attention.SDPBackend.MATH}, "b": {attention.SDPBackend.MATH}}
++    assert set(attention._cur_sdpa_kernel_backends()) == before
+diff --git a/tests/test_rocm_windows_wide_head_sdpa.py b/tests/test_rocm_windows_wide_head_sdpa.py
+new file mode 100644
+index 0000000000..44def89eb0
+--- /dev/null
++++ b/tests/test_rocm_windows_wide_head_sdpa.py
+@@ -0,0 +1,427 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
++
++"""Windows ROCm: SDPA with a head wider than 256 (Gemma 4's global layers) must run on math there,
++since that torch's flash / efficient kernels take it and compute it wrong. Heads up to 256, other
++platforms and compiled graphs keep their stock dispatch; Studio's own guard and this one never nest."""
++
++import functools
++import sys
++import threading
++from pathlib import Path
++
++import pytest
++
++torch = pytest.importorskip("torch")
++attention = pytest.importorskip("torch.nn.attention")
++
++import unsloth.import_fixes as fixes  # noqa: E402
++
++F = torch.nn.functional
++FLAG = "_unsloth_windows_rocm_wide_head_guard"  # Studio's #17960 module checks this same name
++
++
++@pytest.fixture
++def stock_sdpa(monkeypatch):
++    """Restore whatever F.scaled_dot_product_attention was, whatever a test installs."""
++    stock = F.scaled_dot_product_attention
++    monkeypatch.setattr(F, "scaled_dot_product_attention", stock)
++    monkeypatch.delenv("UNSLOTH_ALLOW_ROCM_WIDE_HEAD_FUSED_SDPA", raising = False)
++    return stock
++
++
++@pytest.fixture
++def windows_rocm(monkeypatch):
++    monkeypatch.setattr(sys, "platform", "win32")
++    monkeypatch.setattr(torch.version, "hip", "7.14.0", raising = False)
++
++
++@pytest.fixture
++def cpu_counts_as_gpu(monkeypatch):
++    """Let real CPU tensors take the GPU branch, so the numerics and compile checks run anywhere."""
++    monkeypatch.setattr(fixes, "_ROCM_WINDOWS_WIDE_HEAD_DEVICE_TYPES", ("cuda", "cpu"))
++
++
++@pytest.fixture
++def recorder(monkeypatch):
++    entered, calls = [], []
++
++    def fake_set(backends):
++        entered.append(list(backends))
++
++    monkeypatch.setattr(attention, "_sdpa_kernel", fake_set)
++    monkeypatch.setattr(attention, "_cur_sdpa_kernel_backends", lambda: ["saved"])
++
++    def sdpa(q, k, v, *args, **kwargs):
++        calls.append((args, kwargs))
++        return "out"
++
++    return entered, calls, sdpa
++
++
++def _meta(head_dim, v_head_dim = None):
++    # Meta tensors stand in for GPU ones: the tests add "meta" to the guarded device types.
++    q = torch.empty(1, 8, 128, head_dim, device = "meta")
++    v = torch.empty(1, 1, 128, v_head_dim or head_dim, device = "meta")
++    return q, v
++
++
++@pytest.mark.parametrize("head_dim, v_head_dim", [(512, None), (384, None), (256, 512)])
++def test_wide_head_runs_on_math(recorder, monkeypatch, head_dim, v_head_dim):
++    entered, calls, sdpa = recorder
++    monkeypatch.setattr(fixes, "_ROCM_WINDOWS_WIDE_HEAD_DEVICE_TYPES", ("meta",))
++    q, v = _meta(head_dim, v_head_dim)
++    guarded = fixes.rocm_windows_wide_head_sdpa(sdpa)
++    assert guarded(q, v, v, None, 0.0, True, scale = 0.1, enable_gqa = True) == "out"
++    assert entered == [[attention.SDPBackend.MATH], ["saved"]]
++    assert calls == [((None, 0.0, True), {"scale": 0.1, "enable_gqa": True})]
++
++
++@pytest.mark.parametrize("head_dim", [64, 128, 256])
++def test_heads_up_to_256_keep_fused_kernels(recorder, monkeypatch, head_dim):
++    entered, calls, sdpa = recorder
++    monkeypatch.setattr(fixes, "_ROCM_WINDOWS_WIDE_HEAD_DEVICE_TYPES", ("meta",))
++    q, v = _meta(head_dim)
++    assert fixes.rocm_windows_wide_head_sdpa(sdpa)(q, v, v) == "out"
++    assert entered == [] and len(calls) == 1
++
++
++def test_non_gpu_tensors_keep_stock_dispatch(recorder):
++    entered, calls, sdpa = recorder
++    q = torch.empty(1, 2, 4, 512)  # CPU: not a guarded device type
++    assert fixes.rocm_windows_wide_head_sdpa(sdpa)(q, q, q) == "out"
++    assert entered == [] and len(calls) == 1
++
++
++def test_install_on_windows_rocm_only(stock_sdpa, monkeypatch):
++    monkeypatch.setattr(torch.version, "hip", "7.14.0", raising = False)
++    monkeypatch.setattr(sys, "platform", "linux")  # Linux ROCm refuses the kernels: math already
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is False
++    assert F.scaled_dot_product_attention is stock_sdpa
++
++    monkeypatch.setattr(sys, "platform", "win32")
++    monkeypatch.setattr(torch.version, "hip", None, raising = False)
++    monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")  # Windows NVIDIA
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is False
++    assert F.scaled_dot_product_attention is stock_sdpa
++
++
++@pytest.mark.parametrize(
++    "hip, version", [("7.14.0", "2.11.0+rocm7.14.0"), (None, "2.11.0+rocm7.14.0")]
++)
++def test_install_wraps_once(stock_sdpa, monkeypatch, hip, version):
++    monkeypatch.setattr(sys, "platform", "win32")
++    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
++    monkeypatch.setattr(torch, "__version__", version)  # some AMD wheels tag only the version
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    wrapped = F.scaled_dot_product_attention
++    assert wrapped is not stock_sdpa and getattr(wrapped, FLAG) is True
++    assert wrapped.__wrapped__ is stock_sdpa
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    assert F.scaled_dot_product_attention is wrapped  # idempotent: no double wrap
++
++
++def test_opt_out(stock_sdpa, windows_rocm, monkeypatch):
++    monkeypatch.setenv("UNSLOTH_ALLOW_ROCM_WIDE_HEAD_FUSED_SDPA", "1")
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is False
++    assert F.scaled_dot_product_attention is stock_sdpa
++
++
++def _studio_style_guard(sdpa):
++    """Shape of Studio's core/_rocm_windows_sdpa.guard_sdpa: functools.wraps + the shared flag."""
++
++    @functools.wraps(sdpa)
++    def guarded(q, k, v, *a, **kw):
++        return sdpa(q, k, v, *a, **kw)
++
++    setattr(guarded, FLAG, True)
++    return guarded
++
++
++def test_studio_guard_first_makes_core_a_noop(stock_sdpa, windows_rocm):
++    studio = _studio_style_guard(stock_sdpa)
++    F.scaled_dot_product_attention = studio
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    assert F.scaled_dot_product_attention is studio
++
++    # Still a no-op when another wrapper (functools.wraps) sits on top of Studio's guard.
++    on_top = functools.wraps(studio)(lambda *a, **kw: studio(*a, **kw))
++    F.scaled_dot_product_attention = on_top
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    assert F.scaled_dot_product_attention is on_top
++
++
++def test_core_guard_first_makes_studio_a_noop(stock_sdpa, windows_rocm):
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    core = F.scaled_dot_product_attention
++    # Studio's guard_sdpa returns its input unchanged when the input carries the flag.
++    assert getattr(core, FLAG, False) is True
++
++
++def test_wide_head_matches_math_and_small_head_is_untouched(stock_sdpa, cpu_counts_as_gpu):
++    """Real CPU tensors: the guard's output is bitwise math's; under 256 it is bitwise stock."""
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    guarded = fixes.rocm_windows_wide_head_sdpa(stock_sdpa)
++    g = torch.Generator().manual_seed(0)
++    for head_dim in (64, 512):
++        q = torch.randn(1, 4, 64, head_dim, generator = g, requires_grad = True)
++        k = torch.randn(1, 2, 64, head_dim, generator = g, requires_grad = True)
++        v = torch.randn(1, 2, 64, head_dim, generator = g, requires_grad = True)
++        out = guarded(q, k, v, is_causal = True, enable_gqa = True)
++        grads = torch.autograd.grad(out.sum(), (q, k, v))
++        if head_dim > 256:
++            with sdpa_kernel([SDPBackend.MATH]):
++                ref = stock_sdpa(q, k, v, is_causal = True, enable_gqa = True)
++        else:
++            ref = stock_sdpa(q, k, v, is_causal = True, enable_gqa = True)
++        ref_grads = torch.autograd.grad(ref.sum(), (q, k, v))
++        assert torch.equal(out, ref)
++        assert all(torch.equal(a, b) for a, b in zip(grads, ref_grads))
++
++
++def _attend(q, k, v):
++    return F.scaled_dot_product_attention(q, k, v, is_causal = True) * 2
++
++
++def _frames(seq_lens, head_dim, dynamic):
++    from torch._dynamo.testing import CompileCounter
++
++    torch._dynamo.reset()
++    counter = CompileCounter()
++    fn = torch.compile(_attend, backend = counter, fullgraph = True, dynamic = dynamic)
++    for n in seq_lens:
++        q = torch.randn(1, 2, n, head_dim)
++        fn(q, q, q)
++    return counter.frame_count
++
++
++def _aten_targets(head_dim):
++    from functorch.compile import make_boxed_func
++    from torch._dynamo.backends.common import aot_autograd
++
++    torch._dynamo.reset()
++    seen = []
++
++    def fw(gm, _):
++        seen.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
++        return make_boxed_func(gm.forward)
++
++    fn = torch.compile(_attend, backend = aot_autograd(fw_compiler = fw), fullgraph = True)
++    q = torch.randn(1, 2, 16, head_dim, requires_grad = True)
++    fn(q, q, q).sum().backward()
++    return seen
++
++
++@pytest.mark.parametrize("dynamic", [None, True])
++def test_compiled_graph_has_no_break_no_extra_recompile_and_runs_math(
++    stock_sdpa, windows_rocm, cpu_counts_as_gpu, dynamic
++):
++    seq_lens = (8, 8, 9, 16, 33)
++    baseline = {d: _frames(seq_lens, d, dynamic) for d in (64, 512)}
++    assert all(
++        n > 0 for n in baseline.values()
++    ), baseline  # something compiled, so equality means something
++    stock_512 = _aten_targets(512)
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    # fullgraph=True raises on any graph break; frame counts equal stock = no recompile added.
++    assert {d: _frames(seq_lens, d, dynamic) for d in (64, 512)} == baseline
++    guarded_512 = _aten_targets(512)
++    guarded_64 = _aten_targets(64)
++    fused = "_scaled_dot_product_flash_attention_for_cpu"
++    if not any(fused in t for t in stock_512):
++        pytest.skip(reason = "this torch's CPU SDPA never picks its fused kernel at head 512")
++    assert not any(fused in t for t in guarded_512), guarded_512  # traced under the math pin
++    assert any(fused in t for t in guarded_64), guarded_64  # small heads keep the fused kernel
++    torch._dynamo.reset()
++
++
++def test_import_time_install_is_wired():
++    src = (Path(fixes.__file__).resolve().parent / "_gpu_init.py").read_text(encoding = "utf-8")
++    call = "\nfix_rocm_windows_wide_head_sdpa()\n"
++    assert call in src
++    # Before anything later in _gpu_init can bind SDPA by value (model modules load after it).
++    assert src.index(call) < src.index("\nfix_triton_compiled_kernel_missing_attrs()\n")
++
++
++def test_torch_function_modes_still_match_f_sdpa(stock_sdpa, windows_rocm, cpu_counts_as_gpu):
++    """Matchers written `func is F.scaled_dot_product_attention` (diffusers layer_skip, Studio's VAE
++    chunking, tp_native) see the wrapper itself, and their fallthrough still runs on math."""
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++    from torch.overrides import TorchFunctionMode
++
++    class Seen(TorchFunctionMode):
++        hits = 0
++
++        def __torch_function__(
++            self,
++            func,
++            types,
++            args = (),
++            kwargs = None,
++        ):
++            if func is F.scaled_dot_product_attention:
++                Seen.hits += 1
++            return func(*args, **(kwargs or {}))
++
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    q = torch.randn(1, 2, 16, 512)
++    with Seen():
++        out = F.scaled_dot_product_attention(q, q, q, is_causal = True)
++        F.scaled_dot_product_attention(query = q, key = q, value = q)
++    assert Seen.hits == 2
++    with sdpa_kernel([SDPBackend.MATH]):
++        ref = stock_sdpa(q, q, q, is_causal = True)
++    assert torch.equal(out, ref)
++
++
++def test_compiled_call_restores_the_callers_backends(stock_sdpa, windows_rocm, cpu_counts_as_gpu):
++    """The math switch is one graph node: its exit restores the backends live at run time, not the
++    ones Dynamo saw while tracing (an inlined sdpa_kernel bakes those in as constants)."""
++    from torch._dynamo.testing import EagerAndRecordGraphs
++
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    torch._dynamo.reset()
++    recorder = EagerAndRecordGraphs()
++    fn = torch.compile(_attend, backend = recorder, fullgraph = True)
++    q = torch.randn(1, 2, 16, 512)
++    fn(q, q, q)  # traced with every backend enabled
++    cuda = torch.backends.cuda
++    saved = cuda.flash_sdp_enabled()
++    try:
++        cuda.enable_flash_sdp(False)
++        fn(q, q, q)
++        assert cuda.flash_sdp_enabled() is False
++    finally:
++        cuda.enable_flash_sdp(saved)
++        torch._dynamo.reset()
++    targets = [
++        str(n.target) for g in recorder.graphs for n in g.graph.nodes if n.op == "call_function"
++    ]
++    assert not any("sdpa_kernel" in t or "_backend_from_string" in t for t in targets), targets
++
++
++def test_overlapping_wide_head_calls_restore_the_callers_backends_once(
++    windows_rocm, cpu_counts_as_gpu
++):
++    """Two wide-head calls in flight (two threads), the first returning first: the second must not see the fused
++    kernels back, and the caller's backends come back only after the last one returns."""
++    from torch.nn.attention import _cur_sdpa_kernel_backends
++
++    seen = {}
++    inside = {"a": threading.Event(), "b": threading.Event()}
++    release = {"a": threading.Event(), "b": threading.Event()}
++
++    def sdpa(
++        q,
++        k,
++        v,
++        *args,
++        name = None,
++        **kwargs,
++    ):
++        inside[name].set()
++        release[name].wait(5)
++        seen[name] = set(_cur_sdpa_kernel_backends())
++        return q
++
++    guarded = fixes.rocm_windows_wide_head_sdpa(sdpa)
++    before = set(_cur_sdpa_kernel_backends())
++    q = torch.zeros(1, 1, 4, 512)
++    threads = {
++        n: threading.Thread(target = guarded, args = (q, q, q), kwargs = {"name": n}) for n in "ab"
++    }
++    threads["a"].start()
++    assert inside["a"].wait(5)
++    threads["b"].start()
++    assert inside["b"].wait(5)
++    release["a"].set()
++    threads["a"].join(5)
++    release["b"].set()
++    threads["b"].join(5)
++    assert seen == {"a": {attention.SDPBackend.MATH}, "b": {attention.SDPBackend.MATH}}
++    assert set(_cur_sdpa_kernel_backends()) == before
++
++
++def _jagged(head_dim):
++    g = torch.Generator().manual_seed(0)
++    seqs = [torch.randn(2, n, head_dim, generator = g) for n in (5, 7)]  # (heads, seq, head_dim)
++    nt = torch.nested.nested_tensor([s.transpose(0, 1) for s in seqs], layout = torch.jagged)
++    return seqs, nt.transpose(1, 2)  # (batch, heads, jagged seq, head_dim)
++
++
++@pytest.mark.parametrize("head_dim", [64, 512])
++def test_nested_jagged_tensors_keep_working(stock_sdpa, windows_rocm, cpu_counts_as_gpu, head_dim):
++    """Nested jagged tensors route SDPA only when their __torch_function__ sees torch's builtin: re-dispatching
++    with func = the wrapper falls through to the dense kernel, which refuses them."""
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    seqs, nt = _jagged(head_dim)
++    out = F.scaled_dot_product_attention(nt, nt, nt)
++    for got, s in zip(out.transpose(1, 2).unbind(), seqs):
++        with sdpa_kernel([SDPBackend.MATH]):
++            ref = stock_sdpa(s[None], s[None], s[None])[0]
++        torch.testing.assert_close(got.transpose(0, 1), ref, atol = 1e-5, rtol = 1e-5)
++
++
++def test_nested_jagged_tensors_under_a_mode(stock_sdpa, windows_rocm, cpu_counts_as_gpu):
++    from torch.overrides import TorchFunctionMode
++
++    class Seen(TorchFunctionMode):
++        hits = 0
++
++        def __torch_function__(
++            self,
++            func,
++            types,
++            args = (),
++            kwargs = None,
++        ):
++            if func is F.scaled_dot_product_attention:
++                Seen.hits += 1
++            return func(*args, **(kwargs or {}))
++
++    assert fixes.fix_rocm_windows_wide_head_sdpa() is True
++    _, nt = _jagged(512)
++    with Seen():
++        out = F.scaled_dot_product_attention(nt, nt, nt)
++    assert Seen.hits == 1 and out.is_nested
++
++
++def test_a_wide_call_entering_after_another_thread_moved_the_flags_still_runs_math(
++    windows_rocm, cpu_counts_as_gpu
++):
++    """Flags are process-wide: if another thread's sdpa_kernel changes them while a wide call holds the pin, a wide call
++    starting after that is pinned to math again rather than running under the other thread's choice."""
++    from torch.nn.attention import SDPBackend, _cur_sdpa_kernel_backends, _sdpa_kernel
++
++    seen = {}
++    inside, release = threading.Event(), threading.Event()
++
++    def sdpa(
++        q,
++        k,
++        v,
++        *args,
++        name = None,
++        **kwargs,
++    ):
++        if name == "held":
++            inside.set()
++            release.wait(5)
++        seen[name] = set(_cur_sdpa_kernel_backends())
++        return q
++
++    guarded = fixes.rocm_windows_wide_head_sdpa(sdpa)
++    before = _cur_sdpa_kernel_backends()
++    q = torch.zeros(1, 1, 4, 512)
++    held = threading.Thread(target = guarded, args = (q, q, q), kwargs = {"name": "held"})
++    held.start()
++    assert inside.wait(5)
++    _sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])  # another thread's choice
++    guarded(q, q, q, name = "late")
++    release.set()
++    held.join(5)
++    assert seen["late"] == {SDPBackend.MATH}
++    assert set(_cur_sdpa_kernel_backends()) == set(before)
+diff --git a/unsloth/_gpu_init.py b/unsloth/_gpu_init.py
+index f80682f9a8..5407298ef7 100644
+--- a/unsloth/_gpu_init.py
++++ b/unsloth/_gpu_init.py
+@@ -374,6 +374,7 @@ from .import_fixes import (
+     fix_cudnn_sdpa_backward_grad_layout,
+     fix_cudnn_sdpa_known_bad_shapes,
+     fix_rocm_windows_fused_sdpa,
++    fix_rocm_windows_wide_head_sdpa,
+     fix_triton_compiled_kernel_missing_attrs,
+     fix_dynamo_config_thread_visibility,
+     fix_inductor_reduction_readback_race,
+@@ -469,6 +470,8 @@ fix_cudnn_sdpa_backward_grad_layout()
+ fix_cudnn_sdpa_known_bad_shapes()
+ # Windows ROCm only, probe-gated: fused attention fails on every call there (gfx1151, torch 2.11).
+ fix_rocm_windows_fused_sdpa()
++# Windows ROCm only: fused SDPA miscomputes heads wider than 256 (Gemma 4 global layers) there.
++fix_rocm_windows_wide_head_sdpa()
+ fix_triton_compiled_kernel_missing_attrs()
+ # Must run before unsloth_zoo's patch_torch_compile and the gpt-oss patches raise the dynamo
+ # recompile limits, so those settings reach the autograd worker threads on torch >= 2.12.
+@@ -538,6 +541,7 @@ del fix_cudnn_sdpa_d256_masked_backward
+ del fix_cudnn_sdpa_backward_grad_layout
+ del fix_cudnn_sdpa_known_bad_shapes
+ del fix_rocm_windows_fused_sdpa
++del fix_rocm_windows_wide_head_sdpa
+ del fix_triton_compiled_kernel_missing_attrs
+ del fix_dynamo_config_thread_visibility
+ del fix_inductor_reduction_readback_race
+diff --git a/unsloth/import_fixes.py b/unsloth/import_fixes.py
+index 8a75f277f6..f24f37a733 100644
+--- a/unsloth/import_fixes.py
++++ b/unsloth/import_fixes.py
+@@ -8440,6 +8440,155 @@ def fix_rocm_windows_fused_sdpa():
+     )
+ 
+ 
++# Shared with Studio's studio/backend/core/_rocm_windows_sdpa.py: whichever installs first wins.
++_ROCM_WINDOWS_WIDE_HEAD_FLAG = "_unsloth_windows_rocm_wide_head_guard"
++ROCM_WINDOWS_WIDEST_FUSED_HEAD_DIM = 256
++# Device types the guard pins; ROCm GPUs are "cuda" in torch. Tests add "cpu" to compile on CPU.
++_ROCM_WINDOWS_WIDE_HEAD_DEVICE_TYPES = ("cuda",)
++
++
++def _is_windows_rocm_torch():
++    """Windows host whose torch is a ROCm build (torch.version.hip, or only a +rocm version tag)."""
++    if sys.platform != "win32":
++        return False
++    try:
++        import torch
++    except Exception:
++        return False
++    if getattr(getattr(torch, "version", None), "hip", None):
++        return True
++    return "rocm" in str(getattr(torch, "__version__", "")).lower()
++
++
++def _sdpa_has_flag(fn, flag):
++    """``flag`` on ``fn`` or anything it wraps (later SDPA wrappers keep ``__wrapped__``)."""
++    for _ in range(32):
++        if fn is None:
++            return False
++        if getattr(fn, flag, False):
++            return True
++        fn = getattr(fn, "__wrapped__", None)
++    return False
++
++
++def _sdpa_head_too_wide(query, value):
++    """Shape and device reads only: a compiled graph specializes on them, no graph break."""
++    import torch
++    return (
++        isinstance(query, torch.Tensor)
++        and query.device.type in _ROCM_WINDOWS_WIDE_HEAD_DEVICE_TYPES
++        and max(
++            query.shape[-1], value.shape[-1] if isinstance(value, torch.Tensor) else 0
++        ) > ROCM_WINDOWS_WIDEST_FUSED_HEAD_DIM
++    )  # fmt: skip
++
++
++_ROCM_WINDOWS_WIDE_HEAD_ORIGINALS = {}  # str token -> wrapped SDPA (a graph constant, unlike a function)
++
++
++# Backend flags are process-wide: the first wide-head call in flight saves them and pins math, the last restores them,
++# so an overlapping call (another thread) never sees the fused kernels back early nor saves the math-only state.
++_ROCM_WINDOWS_WIDE_HEAD_HELD = [0, None]  # calls in flight, the backends saved by the first
++_ROCM_WINDOWS_WIDE_HEAD_LOCK = threading.Lock()
++
++
++def _rocm_windows_math_on():
++    from torch.nn.attention import SDPBackend, _cur_sdpa_kernel_backends, _sdpa_kernel
++    with _ROCM_WINDOWS_WIDE_HEAD_LOCK:
++        if _ROCM_WINDOWS_WIDE_HEAD_HELD[0] == 0:
++            _ROCM_WINDOWS_WIDE_HEAD_HELD[1] = _cur_sdpa_kernel_backends()
++        # Re-pinned on every entry: another thread's sdpa_kernel may have changed the flags since the first.
++        _sdpa_kernel([SDPBackend.MATH])
++        _ROCM_WINDOWS_WIDE_HEAD_HELD[0] += 1
++
++
++def _rocm_windows_math_off():
++    from torch.nn.attention import _sdpa_kernel
++    with _ROCM_WINDOWS_WIDE_HEAD_LOCK:
++        _ROCM_WINDOWS_WIDE_HEAD_HELD[0] -= 1
++        if _ROCM_WINDOWS_WIDE_HEAD_HELD[0] == 0:
++            _sdpa_kernel(_ROCM_WINDOWS_WIDE_HEAD_HELD[1])
++            _ROCM_WINDOWS_WIDE_HEAD_HELD[1] = None
++
++
++def _sdpa_math_only(token, query, key, value, *args, **kwargs):
++    """allow_in_graph so the restore uses run-time backends; inlined it would restore trace-time ones."""
++    _rocm_windows_math_on()
++    try:
++        return _ROCM_WINDOWS_WIDE_HEAD_ORIGINALS[token](query, key, value, *args, **kwargs)
++    finally:
++        _rocm_windows_math_off()
++
++
++def rocm_windows_wide_head_sdpa(sdpa):
++    """``sdpa`` with heads wider than 256 pinned to math; already guarded -> ``sdpa`` itself."""
++    if _sdpa_has_flag(sdpa, _ROCM_WINDOWS_WIDE_HEAD_FLAG):
++        return sdpa
++    import torch
++    import torch._dynamo
++    from torch.overrides import handle_torch_function, has_torch_function
++
++    torch._dynamo.allow_in_graph(_sdpa_math_only)
++    token = (
++        f"sdpa_{len(_ROCM_WINDOWS_WIDE_HEAD_ORIGINALS)}"  # a str: Dynamo may make an int symbolic
++    )
++    _ROCM_WINDOWS_WIDE_HEAD_ORIGINALS[token] = sdpa
++
++    @functools.wraps(sdpa)
++    def scaled_dot_product_attention(query, key, value, *args, **kwargs):
++        # Modes see func = this wrapper (is F.sdpa), so F-based matchers still match; tensor subclasses
++        # go to torch's builtin below, as nested jagged tensors only match that.
++        if (
++            not torch.compiler.is_compiling()
++            and torch._C._is_torch_function_mode_enabled()
++            and has_torch_function((query, key, value))
++        ):
++            return handle_torch_function(
++                scaled_dot_product_attention,
++                (query, key, value),
++                query,
++                key,
++                value,
++                *args,
++                **kwargs,
++            )
++        if _sdpa_head_too_wide(query, value):
++            return _sdpa_math_only(token, query, key, value, *args, **kwargs)
++        return sdpa(query, key, value, *args, **kwargs)
++
++    scaled_dot_product_attention.__wrapped__ = sdpa
++    setattr(scaled_dot_product_attention, _ROCM_WINDOWS_WIDE_HEAD_FLAG, True)
++    return scaled_dot_product_attention
++
++
++def fix_rocm_windows_wide_head_sdpa():
++    """Windows ROCm: run SDPA with a head wider than 256 on the math backend.
++
++    torch 2.11.0+rocm7.14.0 on gfx1151 runs head dim 512 through flash/efficient kernels and gets it
++    wrong; Linux ROCm refuses them. Not probe-gated: corruption depends on seq len, mask and GQA, so
++    one probe shape can pass. UNSLOTH_ALLOW_ROCM_WIDE_HEAD_FUSED_SDPA=1 opts out. True if installed.
++    """
++    if os.environ.get("UNSLOTH_ALLOW_ROCM_WIDE_HEAD_FUSED_SDPA", "0") == "1":
++        return False
++    if not _is_windows_rocm_torch():
++        return False
++    try:
++        import torch.nn.functional as F
++        current = F.scaled_dot_product_attention
++        guarded = rocm_windows_wide_head_sdpa(current)
++    except Exception as e:
++        logger.info(f"Unsloth: Skipping the Windows ROCm wide-head SDPA fix ({e})")
++        return False
++    if guarded is current:
++        return True
++    F.scaled_dot_product_attention = guarded
++    logger.info(
++        "Unsloth: Windows ROCm: attention heads wider than "
++        f"{ROCM_WINDOWS_WIDEST_FUSED_HEAD_DIM} run on the SDPA math backend"
++    )
++    return True
++
++
+ def patch_openspiel_env_async():
+     """Apply nest_asyncio for OpenEnv EnvClient async compatibility.
+ 
