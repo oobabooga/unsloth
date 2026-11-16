@@ -1,0 +1,62 @@
+{
+ "sm80": {
+  "128": [
+   {
+    "mask_all": true
+   }
+  ],
+  "64": [
+   {
+    "mask_all": true
+   }
+  ]
+ },
+ "sm89": {
+  "128": [
+   {
+    "mask_all": true
+   }
+  ],
+  "64": [
+   {
+    "mask_all": true
+   }
+  ]
+ },
+ "sm120": {
+  "128": [
+   {
+    "mask_all": true
+   }
+  ],
+  "64": [
+   {
+    "mask_all": true
+   }
+  ]
+ },
+ "gfx1151": {
+  "128": [
+   {
+    "mask_all": true
+   }
+  ],
+  "64": [
+   {
+    "mask_all": true
+   }
+  ]
+ },
+ "default": {
+  "128": [
+   {
+    "mask_all": true
+   }
+  ],
+  "64": [
+   {
+    "mask_all": true
+   }
+  ]
+ }
+}
