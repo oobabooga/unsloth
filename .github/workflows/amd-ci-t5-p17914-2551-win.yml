@@ -148,7 +148,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit p17914_2551 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,padmix_gemma3_flex,padmix_gemma3 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c52fed37971bed048a863972edb316351f1c71ed --companion-head 00418fcaf0b84523b1f12731ca042da1ed685b31 --use-current --tests tests/test_block_compile.py::test_trial_forward_graph_is_reused_by_the_real_call --repeat padmix_gemma3_flex --companion-tests tests/test_flex_mask_recompiles.py
+            --python "$env:AMD_CI_PY" -- --unit p17914_2551 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,padmix_gemma3_flex_ones,padmix_gemma3_flex,padmix_gemma4_ones --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c52fed37971bed048a863972edb316351f1c71ed --companion-head 00418fcaf0b84523b1f12731ca042da1ed685b31 --use-current --tests tests/test_block_compile.py::test_trial_forward_graph_is_reused_by_the_real_call --repeat padmix_gemma3_flex_ones --companion-tests tests/test_flex_mask_recompiles.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.

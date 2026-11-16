@@ -66,6 +66,8 @@ MODELS = {
     "padmix_qwen3": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "padmix_gemma4": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
     "padmix_gemma3": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
+    "padmix_gemma3_flex_ones": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration (flex, U = all-ones mask)",
+    "padmix_gemma4_ones": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration (U = all-ones mask)",
     "padmix_gemma3_flex": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration (attn_implementation=flex_attention)",
     "grpo_txt": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "plelens": "hf-tiny-v2/tiny-random-Qwen4ExpForCausalLM",
@@ -1643,7 +1645,7 @@ def cell_granite_gc():
     res["granite_grad_rel"] = abs(out["on"]["lora_grad_norm"] - out["off"]["lora_grad_norm"]) / max(out["off"]["lora_grad_norm"], 1e-12)
 
 
-def cell_padmix(key, attn = None):
+def cell_padmix(key, attn = None, u_mask = None):
     """unsloth #17880: block compile with a fixed P P U P U P micro-batch sequence (P = padded batch with an attention
     mask, U = no attention mask), same length; per step: loss, compiled-graph count, Dynamo guard failures."""
     import torch
@@ -1696,6 +1698,8 @@ def cell_padmix(key, attn = None):
             mask[1, -16:] = 0
             labels[1, -16:] = -100
             kw["attention_mask"] = mask
+        elif u_mask == "ones":  # an unpadded batch as a collator feeds it: an all-ones attention mask
+            kw["attention_mask"] = torch.ones_like(ids)
         out = model(**kw, labels = labels)
         out.loss.backward()
         opt.step()
@@ -1706,7 +1710,7 @@ def cell_padmix(key, attn = None):
         res.setdefault("flex_mask_calls_per_step", []).append(mask_calls[0])
         res["losses_so_far"] = losses
         dump()
-    res["pattern"] = pattern
+    res["pattern"] = pattern + (" (U = all-ones mask)" if u_mask == "ones" else " (U = no mask)")
     res["unique_graphs_per_step"] = graphs
     res["guard_failures_per_step"] = gfails
     res["guard_failure_reasons"] = [str(r)[:200] for v in list(guard_failures.values())[:3] for r in v[:2]]
@@ -2103,6 +2107,8 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "granite_gc": cell_granite_gc,
          "padmix_qwen3": lambda: cell_padmix("padmix_qwen3"), "padmix_gemma4": lambda: cell_padmix("padmix_gemma4"), "padmix_gemma3": lambda: cell_padmix("padmix_gemma3"),
          "padmix_gemma3_flex": lambda: cell_padmix("padmix_gemma3", "flex_attention"),
+         "padmix_gemma3_flex_ones": lambda: cell_padmix("padmix_gemma3", "flex_attention", "ones"),
+         "padmix_gemma4_ones": lambda: cell_padmix("padmix_gemma4", None, "ones"),
          "grpo_txt": cell_grpo_txt,
          "dpo_txt": cell_dpo_txt, "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt,
          "vision_gemma3": cell_vision,
