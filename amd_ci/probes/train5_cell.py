@@ -55,6 +55,9 @@ MODELS = {
     "hd512_gemma4": "built:gemma4-global-hd512",
     "hd512_gemma4_nc": "built:gemma4-global-hd512 (UNSLOTH_COMPILE_DISABLE=1)",
     "seqcls": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "aol_qwen25vl": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
+    "aol_gemma3_unsloth": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
+    "aol_gemma3_trl": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
     "cp_ring_kernels": "(no model: unsloth.context_parallel._ring_sdpa_backends on the GPU)",
     "gkd_proc_qwen35": "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink",
     "gkd_proc_gemma3": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
@@ -2091,6 +2094,67 @@ def cell_cp_ring_kernels():
     res["finite"], res["losses"], res["decreasing"] = True, [], None
 
 
+def cell_aol(key, collator):
+    """unsloth #17942 / zoo #2554: vision SFT with assistant_only_loss=True on a 2-turn image chat. collator = "unsloth"
+    (UnslothVisionDataCollator, inline image) or "trl" (TRL's own collator, images column). Records the decoded kept
+    labels, whether only assistant text is kept, image tokens among kept labels, then 3 training steps."""
+    import tempfile
+    import torch
+    from PIL import Image
+    from trl import SFTConfig, SFTTrainer
+    from unsloth import FastVisionModel
+    versions()
+    stage("load")
+    model, proc = FastVisionModel.from_pretrained(MODELS[key], max_seq_length = 512, dtype = torch.bfloat16, load_in_4bit = False)
+    model = FastVisionModel.get_peft_model(model, finetune_vision_layers = False, finetune_language_layers = True,
+                                           finetune_attention_modules = True, finetune_mlp_modules = True, r = 8,
+                                           lora_alpha = 16, lora_dropout = 0.0, bias = "none", random_state = 0,
+                                           use_gradient_checkpointing = "unsloth")
+    FastVisionModel.for_training(model)
+    image = Image.new("RGB", (32, 32), (255, 0, 0))
+    inline = collator == "unsloth"
+    part = {"type": "image", "image": image} if inline else {"type": "image"}
+    msgs = [{"role": "user", "content": [part, {"type": "text", "text": "What is in this picture?"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "A red square."}]},
+            {"role": "user", "content": [{"type": "text", "text": "What color is it?"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "It is red."}]}]
+    rows = [({"messages": msgs} if inline else {"messages": msgs, "images": [image]}) for _ in range(6)]
+    kw = dict(output_dir = tempfile.mkdtemp(), per_device_train_batch_size = 2, max_steps = 3, learning_rate = 1e-3,
+              logging_steps = 1, report_to = "none", save_strategy = "no", bf16 = True, seed = 0, max_length = None,
+              assistant_only_loss = True, remove_unused_columns = False)
+    if inline:
+        kw.update(dataset_text_field = "", dataset_kwargs = {"skip_prepare_dataset": True})
+    from datasets import Dataset
+    ds = rows if inline else Dataset.from_list(rows)
+    extra = {}
+    if inline:
+        from unsloth.trainer import UnslothVisionDataCollator
+        extra["data_collator"] = UnslothVisionDataCollator(model, proc)
+    stage("trainer")
+    trainer = SFTTrainer(model = model, processing_class = proc, args = SFTConfig(**kw), train_dataset = ds, **extra)
+    res["trainer_class"] = type(trainer).__name__
+    res["collator_class"] = type(trainer.data_collator).__name__
+    res["args_assistant_only_loss"] = getattr(trainer.args, "assistant_only_loss", None)
+    batch = next(iter(trainer.get_train_dataloader()))
+    ids, labels = batch["input_ids"][0].cpu(), batch["labels"][0].cpu()
+    tok = getattr(proc, "tokenizer", proc)
+    kept = tok.decode(ids[labels != -100])
+    res["kept_labels_text"] = kept[:400]
+    res["kept_tokens"] = int((labels != -100).sum())
+    res["total_tokens"] = int(ids.numel())
+    img_ids = {i for i in (getattr(proc, "image_token_id", None), getattr(getattr(model, "config", None), "image_token_id", None),
+                           getattr(getattr(model, "config", None), "image_token_index", None)) if isinstance(i, int)}
+    res["kept_image_tokens"] = int(sum(int((ids[labels != -100] == i).sum()) for i in img_ids))
+    res["assistant_only"] = ("A red square." in kept and "It is red." in kept and "What color is it?" not in kept
+                             and "What is in this picture?" not in kept)
+    stage("train")
+    torch.cuda.reset_peak_memory_stats()
+    trainer.train()
+    peak()
+    finish_losses([float(h["loss"]) for h in trainer.state.log_history if "loss" in h])
+    res["decreasing"] = None
+
+
 def cell_seqcls():
     """unsloth #17861: tiny Qwen3 sequence classifier LoRA, 5 steps, single process; the DDP find_unused default the
     head computes for it (absent at the base)."""
@@ -2191,7 +2255,9 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "padmix_gemma3_flex_ones": lambda: cell_padmix("padmix_gemma3", "flex_attention", "ones"),
          "padmix_gemma4_ones": lambda: cell_padmix("padmix_gemma4", None, "ones"),
          "grpo_txt": cell_grpo_txt,
-         "dpo_txt": cell_dpo_txt, "cp_ring_kernels": cell_cp_ring_kernels, "gkd_proc_qwen35": lambda: cell_gkd_proc("gkd_proc_qwen35"),
+         "dpo_txt": cell_dpo_txt, "aol_qwen25vl": lambda: cell_aol("aol_qwen25vl", "unsloth"),
+         "aol_gemma3_unsloth": lambda: cell_aol("aol_gemma3_unsloth", "unsloth"),
+         "aol_gemma3_trl": lambda: cell_aol("aol_gemma3_trl", "trl"), "cp_ring_kernels": cell_cp_ring_kernels, "gkd_proc_qwen35": lambda: cell_gkd_proc("gkd_proc_qwen35"),
          "gkd_proc_gemma3": lambda: cell_gkd_proc("gkd_proc_gemma3"), "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt,
          "vision_gemma3": cell_vision,
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),

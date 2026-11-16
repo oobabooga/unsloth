@@ -23,10 +23,10 @@ RTOL = 2e-2
 MEM_RATIO, MEM_SLACK = 1.25, 32.0
 TRAIN = ("flm16", "flm4", "gcmem", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode", "ctnvfp4",
          "ctmxfp8", "mxfp4probe", "grpo_vl", "dpo_vl", "gcnr_qwen3", "gcdef_qwen3", "gcnr_gemma3", "gcdef_gemma3",
-         "lora_noac", "st_minilm", "st_qwen3", "hd512_llama", "hd512_gemma4", "hd512_gemma4_nc", "bclens", "bswap", "dec_whisper", "dec_gemma3n", "moeaux_nr", "moeaux_gc_qwen3moe", "moeaux_gc_gptoss", "gkd", "granite_gc", "plelens", "padmix_qwen3", "padmix_gemma4", "padmix_gemma3", "padmix_gemma3_flex", "padmix_gemma3_flex_ones", "padmix_gemma4_ones", "grpo_txt", "pfree_llama", "pfree_qwen3", "sftdef_steps", "sftdef_epoch", "dpo_txt", "orpo_txt", "cp_ring_kernels", "gkd_proc_qwen35", "gkd_proc_gemma3", "vision_gemma3", "mrope_pack", "seqcls", "tok_save")
+         "lora_noac", "st_minilm", "st_qwen3", "hd512_llama", "hd512_gemma4", "hd512_gemma4_nc", "bclens", "bswap", "dec_whisper", "dec_gemma3n", "moeaux_nr", "moeaux_gc_qwen3moe", "moeaux_gc_gptoss", "gkd", "granite_gc", "plelens", "padmix_qwen3", "padmix_gemma4", "padmix_gemma3", "padmix_gemma3_flex", "padmix_gemma3_flex_ones", "padmix_gemma4_ones", "grpo_txt", "pfree_llama", "pfree_qwen3", "sftdef_steps", "sftdef_epoch", "dpo_txt", "orpo_txt", "aol_qwen25vl", "aol_gemma3_unsloth", "aol_gemma3_trl", "cp_ring_kernels", "gkd_proc_qwen35", "gkd_proc_gemma3", "vision_gemma3", "mrope_pack", "seqcls", "tok_save")
 # Cells whose numbers the PR changes by design (the CT loader fixes the expert values; RL sampling / the fused GRPO
 # route; the probe's numbers are errors, not losses): no per-step loss / memory equality, the rest still applies.
-NO_LOSS_EQ = ("ctnvfp4", "ctmxfp8", "mxfp4probe", "grpo_vl", "sftdef_epoch")
+NO_LOSS_EQ = ("ctnvfp4", "ctmxfp8", "mxfp4probe", "grpo_vl", "sftdef_epoch", "aol_qwen25vl", "aol_gemma3_unsloth", "aol_gemma3_trl")
 ENGAGED = {"mxfp4probe": "engaged", "grpo_vl": "grpo_fused_engaged", "dpo_vl": "dpo_chunked_engaged"}
 
 # Why a PR's own new path does or does not engage on ROCm; rendered with the table.
@@ -231,6 +231,8 @@ def head_is_worse(base, head):
             for dt, st in (b.get("ring_pinned_runs") or {}).items():
                 if st == "ok" and (h.get("ring_pinned_runs") or {}).get(dt) != "ok":
                     worse.append(f"cp_ring_kernels: {dt} ran at base under the ring kernel list, refused at head")
+        if cell.startswith("aol_") and b.get("assistant_only") and not h.get("assistant_only"):
+            worse.append(f"{cell}: assistant-only labels at base, not at head")
         if cell == "plelens":
             gb_, gh_ = b.get("unique_graphs_per_step") or [], h.get("unique_graphs_per_step") or []
             if gb_ and gh_ and gh_[-1] > gb_[-1]:
@@ -293,7 +295,7 @@ def _fmt(c):
         s += f" lh_patch={c['large_head_patch_returns']}"
     if c.get("varlen_hits"):
         s += f" varlen={c['varlen_hits']}"
-    for k in ("packed_rows_verdict", "text_prepended_hook", "leak", "leak_position_ids_shapes", "train_position_ids_shapes", "ring_backends", "ring_pinned_runs", "processing_class_type", "trainer_processing_class", "hs_fallback_wrapped", "reward_margins", "ref_model_is_none", "resolved_packing", "resolved_padding_free", "global_steps", "pack_stats_after", "uncompiled_msgs", "attn_implementation", "flex_mask_keeps_padding_marker", "flex_mask_calls_per_step", "pattern", "guard_failures_per_step", "seq_packing_grad_ok", "rewards", "granite_gc_calls_on", "granite_kept_mib", "granite_loss_eq", "granite_grad_rel", "layer_forward_name", "seq_lens", "aux_gc_ok", "aux_gc_rel", "aux_loss_step0", "teacher_device", "teacher_trainable", "trainer_class", "tokens", "decode_forced_eq_default", "graph_backend_available", "bswap_equal", "bswap_grad_maxdiff", "n_layers", "layer_forward_names", "block_modes_",  "bswap_grads_compared", "bswap_grew", "slot_pool_message", "ckpt_in_forward", "unsloth_offload_refusal", "swapped_indices", "recompile_logs", "unique_graphs_per_step", "reload_ok", "reload_loss_rel", "ddp_find_unused_default", "loader", "block_modes", "block_compile_failed_msgs", "lora_out_dtypes", "lora_grads_nonzero", "lora_tensors",
+    for k in ("packed_rows_verdict", "text_prepended_hook", "leak", "leak_position_ids_shapes", "train_position_ids_shapes", "assistant_only", "kept_tokens", "kept_image_tokens", "kept_labels_text", "collator_class", "ring_backends", "ring_pinned_runs", "processing_class_type", "trainer_processing_class", "hs_fallback_wrapped", "reward_margins", "ref_model_is_none", "resolved_packing", "resolved_padding_free", "global_steps", "pack_stats_after", "uncompiled_msgs", "attn_implementation", "flex_mask_keeps_padding_marker", "flex_mask_calls_per_step", "pattern", "guard_failures_per_step", "seq_packing_grad_ok", "rewards", "granite_gc_calls_on", "granite_kept_mib", "granite_loss_eq", "granite_grad_rel", "layer_forward_name", "seq_lens", "aux_gc_ok", "aux_gc_rel", "aux_loss_step0", "teacher_device", "teacher_trainable", "trainer_class", "tokens", "decode_forced_eq_default", "graph_backend_available", "bswap_equal", "bswap_grad_maxdiff", "n_layers", "layer_forward_names", "block_modes_",  "bswap_grads_compared", "bswap_grew", "slot_pool_message", "ckpt_in_forward", "unsloth_offload_refusal", "swapped_indices", "recompile_logs", "unique_graphs_per_step", "reload_ok", "reload_loss_rel", "ddp_find_unused_default", "loader", "block_modes", "block_compile_failed_msgs", "lora_out_dtypes", "lora_grads_nonzero", "lora_tensors",
               "packing_installed", "lean_lora_layers", "prefetch_loader", "engaged", "grpo_fused_engaged", "dpo_chunked_engaged", "grouped_available", "fwd_rel", "bwd_rel",
               "triton_version", "dpo_chunked_calls", "trl_has_concatenated_forward", "expert_param_types",
               "packed_expert_stats_delta", "fused_calls_delta"):
