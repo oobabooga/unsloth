@@ -23,7 +23,7 @@ RTOL = 2e-2
 MEM_RATIO, MEM_SLACK = 1.25, 32.0
 TRAIN = ("flm16", "flm4", "gcmem", "vision", "moe", "gemma4", "qwen38", "dsv4", "mllama", "rl_decode", "ctnvfp4",
          "ctmxfp8", "mxfp4probe", "grpo_vl", "dpo_vl", "gcnr_qwen3", "gcdef_qwen3", "gcnr_gemma3", "gcdef_gemma3",
-         "lora_noac", "st_minilm", "st_qwen3", "hd512_llama", "hd512_gemma4", "hd512_gemma4_nc", "bclens", "bswap", "dec_whisper", "dec_gemma3n", "moeaux_nr", "moeaux_gc_qwen3moe", "moeaux_gc_gptoss", "gkd", "granite_gc", "plelens", "padmix_qwen3", "padmix_gemma4", "padmix_gemma3", "padmix_gemma3_flex", "grpo_txt", "pfree_llama", "pfree_qwen3", "sftdef_steps", "sftdef_epoch", "dpo_txt", "orpo_txt", "vision_gemma3", "mrope_pack", "seqcls", "tok_save")
+         "lora_noac", "st_minilm", "st_qwen3", "hd512_llama", "hd512_gemma4", "hd512_gemma4_nc", "bclens", "bswap", "dec_whisper", "dec_gemma3n", "moeaux_nr", "moeaux_gc_qwen3moe", "moeaux_gc_gptoss", "gkd", "granite_gc", "plelens", "padmix_qwen3", "padmix_gemma4", "padmix_gemma3", "padmix_gemma3_flex", "padmix_gemma3_flex_ones", "padmix_gemma4_ones", "grpo_txt", "pfree_llama", "pfree_qwen3", "sftdef_steps", "sftdef_epoch", "dpo_txt", "orpo_txt", "vision_gemma3", "mrope_pack", "seqcls", "tok_save")
 # Cells whose numbers the PR changes by design (the CT loader fixes the expert values; RL sampling / the fused GRPO
 # route; the probe's numbers are errors, not losses): no per-step loss / memory equality, the rest still applies.
 NO_LOSS_EQ = ("ctnvfp4", "ctmxfp8", "mxfp4probe", "grpo_vl", "sftdef_epoch")

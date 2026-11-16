@@ -88,7 +88,7 @@ jobs:
             --probe amd_ci/probes/train5_probe.py \
             --criteria amd_ci/criteria/train5_rocm.py \
             --out-dir "$AMD_CI_WORK/out/gpu" \
-            --python "$AMD_CI_PY" -- --unit p17914_2551 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,padmix_gemma3_flex,padmix_gemma3 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c52fed37971bed048a863972edb316351f1c71ed --companion-head 00418fcaf0b84523b1f12731ca042da1ed685b31 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_block_compile.py::test_trial_forward_graph_is_reused_by_the_real_call --repeat padmix_gemma3_flex --companion-tests tests/test_flex_mask_recompiles.py
+            --python "$AMD_CI_PY" -- --unit p17914_2551 --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,padmix_gemma3_flex_ones,padmix_gemma3_flex,padmix_gemma4_ones --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base c52fed37971bed048a863972edb316351f1c71ed --companion-head 00418fcaf0b84523b1f12731ca042da1ed685b31 --venv "$AMD_CI_WORK/tvenv" --tests tests/test_block_compile.py::test_trial_forward_graph_is_reused_by_the_real_call --repeat padmix_gemma3_flex_ones --companion-tests tests/test_flex_mask_recompiles.py
           cat "$AMD_CI_WORK/out/gpu/VERDICT.md" >> "$GITHUB_STEP_SUMMARY"
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
           python3 "$GITHUB_WORKSPACE/amd_ci/lib/announce.py" "$AMD_CI_WORK/out/gpu"
