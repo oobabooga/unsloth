@@ -77,20 +77,23 @@ def _render_ok(render: dict, lid: str) -> tuple[bool, str]:
         if not (rs.get(tag) or {}).get("ok"):
             return False, f"render {tag}: {(rs.get(tag) or {}).get('error', 'missing')}"[:300]
     cmp = render.get("compare") or {}
-    aa = (cmp.get("aa_none_vs_repeat") or {}).get("lpips")
-    lv = (cmp.get(f"lora_vs_none::{lid}") or {}).get("lpips")
-    ex = (cmp.get(f"export_vs_lora::{lid}") or {}).get("lpips")
+    # LPIPS when the scorer installed; else mean abs pixel difference (0-255) with its own floors.
+    metric = "lpips" if (cmp.get("aa_none_vs_repeat") or {}).get("lpips") is not None else "mad"
+    floor, slack = (0.02, 0.01) if metric == "lpips" else (2.0, 0.5)
+    aa = (cmp.get("aa_none_vs_repeat") or {}).get(metric)
+    lv = (cmp.get(f"lora_vs_none::{lid}") or {}).get(metric)
+    ex = (cmp.get(f"export_vs_lora::{lid}") or {}).get(metric)
     if aa is None or lv is None or ex is None:
-        return False, f"LPIPS missing (aa={aa}, lora={lv}, export={ex}; {render.get('lpips_error', '')})"
-    if not lv > max(0.02, 3 * aa):
-        return False, f"LoRA does not change the render beyond noise: LPIPS {lv} vs A/A {aa}"
+        return False, f"{metric} missing (aa={aa}, lora={lv}, export={ex}; {render.get('lpips_error', '')})"
+    if not lv > max(floor, 3 * aa):
+        return False, f"LoRA does not change the render beyond noise: {metric} {lv} vs A/A {aa}"
     info = (render.get("loras") or {}).get(lid) or {}
     if not info.get("export_bytes_identical") or not info.get("rediscovered_id"):
         return False, f"export round trip: {info.get('export_error') or info}"[:300]
     if set(info.get("rediscovered_families") or []) != set((info.get("catalog_entry") or {}).get("families") or []):
         return False, "export lost the family tags"
-    if not ex <= aa + 0.01:
-        return False, f"exported copy renders differently: LPIPS {ex} vs A/A {aa}"
+    if not ex <= aa + slack:
+        return False, f"exported copy renders differently: {metric} {ex} vs A/A {aa}"
     return True, "ok"
 
 
@@ -185,6 +188,8 @@ def table(obs: dict) -> str:
             render = f.get("render") or {}
             cmp = render.get("compare") or {}
             aa = (cmp.get("aa_none_vs_repeat") or {}).get("lpips")
+            if aa is None:
+                aa = (cmp.get("aa_none_vs_repeat") or {}).get("mad")
             for p in ("bf16", "nf4", "int8", "fp8", "mxfp8", "auto"):
                 cell = (f.get("cells") or {}).get(p)
                 pf = pre.get(p)
@@ -200,6 +205,9 @@ def table(obs: dict) -> str:
                 lid = cell.get("catalog_id")
                 lv = (cmp.get(f"lora_vs_none::{lid}") or {}).get("lpips")
                 ex = (cmp.get(f"export_vs_lora::{lid}") or {}).get("lpips")
+                if lv is None:
+                    lv = (cmp.get(f"lora_vs_none::{lid}") or {}).get("mad")
+                    ex = (cmp.get(f"export_vs_lora::{lid}") or {}).get("mad")
                 rok, rwhy = _render_ok(render, lid) if lid else (False, "no adapter")
                 info = (render.get("loras") or {}).get(lid) or {}
                 exp = "-" if not info else (f"{'yes' if info.get('export_bytes_identical') and info.get('rediscovered_id') else 'NO'}"
@@ -222,7 +230,7 @@ def table(obs: dict) -> str:
                 parts.append(f"- {name} {role} deploy `{r.get('deploy')}`: load {r.get('load_s')} s, "
                              f"{r.get('load_status')}, renders "
                              f"{ {k: v.get('s') if v.get('ok') else 'FAILED' for k, v in (r.get('renders') or {}).items()} }, "
-                             f"max reserved {r.get('max_reserved_gb')} GB, "
+                             f"max reserved {r.get('max_reserved_gb')} GB, compare {r.get('compare')}, "
                              f"{str(r.get('stage_error') or r.get('lpips_error') or '')[:300]}")
             for p, cell in (_fam(o, role).get("cells") or {}).items():
                 if cell.get("warnings"):
