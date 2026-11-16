@@ -127,6 +127,10 @@ jobs:
           & $py -m pip install -q --upgrade pip
           & $py -m pip install -q pytest pytest-asyncio pytest-timeout
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A cancelled earlier run of this PR can leave python processes holding DLLs in this venv: stop them.
+          Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$env:AMD_CI_WORK*" } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
           # --windows-rocm-torch: ROCm torch from AMD's multi-arch index, then the gate WITH torch.
           # The gate exits 1 when HIP / gfx1151 is absent: a box without ROCm torch fails, never skips.
           & $py -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1151]==2.11.0+rocm7.14.0" "torchvision[device-gfx1151]==0.26.0+rocm7.14.0"
