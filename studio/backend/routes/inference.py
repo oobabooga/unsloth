@@ -3809,6 +3809,62 @@ from utils.current_date_prompt_settings import (
 if TYPE_CHECKING:
     import numpy as np
 
+
+def _raise_alias_configuration_conflict(request: Request) -> None:
+    raise HTTPException(
+        status_code = 409,
+        detail = error_body_for_path(
+            getattr(getattr(request, "url", None), "path", ""),
+            "The requested alias configuration is not loaded. Automatic switching "
+            "requires permission to load this model and a compatible, unshared runtime.",
+            status = 409,
+            code = "model_configuration_not_loaded",
+            param = "model",
+        ),
+    )
+
+
+async def _alias_config_for_request(
+    model: Any,
+    request: Request,
+    *,
+    external: bool = False,
+) -> dict:
+    from utils.model_aliases import request_alias_load_config
+
+    config = request_alias_load_config(getattr(request, "scope", None), model)
+    if not config:
+        return {}
+    from utils.multi_model_settings import get_multi_model_mode
+
+    path = getattr(getattr(request, "url", None), "path", "")
+    if (
+        external
+        or _connection_model_ref(model) is not None
+        or path.rstrip("/").endswith("/embeddings")
+        or await asyncio.to_thread(get_multi_model_mode) != "off"
+    ):
+        raise HTTPException(
+            status_code = 400,
+            detail = "Configured aliases require local GGUF text generation with Keep multiple models loaded Off.",
+        )
+    return config
+
+
+async def _validate_configured_alias_request(
+    request: Request, _subject: str = Depends(get_current_subject)
+) -> None:
+    from utils.model_aliases import MODEL_ALIAS_CONFIG_SCOPE_KEY
+    if request.scope.get(MODEL_ALIAS_CONFIG_SCOPE_KEY):
+        body = await request.json()
+        if isinstance(body, dict):
+            await _alias_config_for_request(
+                body.get("model"),
+                request,
+                external = bool(body.get("provider_id") or body.get("provider_type")),
+            )
+
+
 router = APIRouter()
 # Unsloth-only router (not mounted on /v1 OpenAI-compat).
 studio_router = APIRouter()
@@ -11443,6 +11499,19 @@ async def _maybe_auto_switch_model(
     the chat route, the only one an NPU model serves; ``npu_request_check``
     refuses a request an NPU target would reject once loaded, given its catalog entry.
     """
+    from utils.model_aliases import alias_config_matches
+
+    alias_config = await _alias_config_for_request(requested_model, fastapi_request)
+
+    def _config_matches() -> bool:
+        return alias_config_matches(get_llama_cpp_backend(), alias_config)
+
+    async def _config_requires_switch() -> None:
+        if alias_config and (
+            not _config_matches() or not await asyncio.to_thread(_loaded_satisfies, requested_model)
+        ):
+            _raise_alias_configuration_conflict(fastapi_request)
+
     # A text-only GGUF reads tool-result images as a note, so only audio or video needs its mmproj.
     gguf_requires_vision = (
         (require_audio_input or require_video) if tool_images_only else require_vision
@@ -11472,6 +11541,7 @@ async def _maybe_auto_switch_model(
         elif account_access.resident_hidden("chat", _loaded_slot_ident()):
             raise HTTPException(status_code = 404, detail = "Model not found")
     if routed is not None:
+        await _config_requires_switch()
         return
 
     async def _refuse_foreign_resident() -> None:
@@ -11558,6 +11628,7 @@ async def _maybe_auto_switch_model(
         return
     # Preview route opts out so callers cannot switch away from the pinned checkpoint.
     if _auto_switch_opted_out(fastapi_request):
+        await _config_requires_switch()
         return
     if (
         named_model
@@ -11569,6 +11640,7 @@ async def _maybe_auto_switch_model(
         if not await asyncio.to_thread(_loaded_identity_satisfies, named_model):
             raise HTTPException(status_code = 404, detail = "Model not found")
         await _refuse_foreign_resident()
+        await _config_requires_switch()
         if claim_resident:
             _claim_slot_for_non_preview(fastapi_request)
         return
@@ -11607,13 +11679,18 @@ async def _maybe_auto_switch_model(
         # Reject before claiming the slot.
         await _reject_unservable_model(requested_model, fastapi_request)
         await _refuse_foreign_resident()
+        await _config_requires_switch()
         # Auto-switch off: this non-preview turn uses the resident model, claim it.
         if claim_resident:
             _claim_slot_for_non_preview(fastapi_request)
         return
 
     # Check resident state before the filesystem index; rebuilding it can take seconds.
-    if auto_switch_on and await asyncio.to_thread(_loaded_identity_satisfies, requested_model):
+    if (
+        auto_switch_on
+        and _config_matches()
+        and await asyncio.to_thread(_loaded_identity_satisfies, requested_model)
+    ):
         await _refuse_foreign_resident()
         warm_index_soon()
         if claim_resident:
@@ -11625,11 +11702,23 @@ async def _maybe_auto_switch_model(
         auto_switch_on = False
         if not idle_unload_is_configured():
             await _reject_unservable_model(requested_model, fastapi_request)
+            await _config_requires_switch()
             return
+
+    if alias_config and not auto_switch_on:
+        await _refuse_foreign_resident()
+        await _config_requires_switch()
+        if claim_resident:
+            _claim_slot_for_non_preview(fastapi_request)
+        return
 
     from core.inference.npu_backend import is_npu_model_path
 
     if auto_switch_on and named_model and is_npu_model_path(named_model):
+        if alias_config:
+            raise HTTPException(
+                status_code = 400, detail = "Configured aliases require a local GGUF text model."
+            )
         # Refused before the switch, so a request the NPU cannot serve never evicts the resident model.
         await _refuse_unservable_npu_switch(
             named_model,
@@ -11684,6 +11773,10 @@ async def _maybe_auto_switch_model(
                     requested_model,
                     include_companion_scope = True,
                 )
+        if resolved is None and alias_config:
+            raise HTTPException(
+                status_code = 404, detail = "Configured alias target is not available locally."
+            )
         if resolved is None:
             # A "<run>/checkpoint-N" name looks like a Hub id; the reject below refuses it instead.
             trained = (
@@ -11766,6 +11859,10 @@ async def _maybe_auto_switch_model(
             and not looks_like_audio_cpp(target_id)
             and await asyncio.to_thread(local_target_is_gguf, target_id, override_id)
         )
+        if alias_config and not target_is_gguf:
+            raise HTTPException(
+                status_code = 400, detail = "Configured aliases require a local GGUF text model."
+            )
         gguf_companion_roots: tuple[str, ...] = ()
         if target_is_gguf:
             if resolved is None:
@@ -11810,6 +11907,8 @@ async def _maybe_auto_switch_model(
         )
 
         def _already_serving() -> bool:
+            if not _config_matches():
+                return False
             # Match the load path and advertised repo id, so either load style counts as already serving.
             if not target_is_gguf:
                 active = getattr(target_backend, "active_model_name", None)
@@ -12122,6 +12221,14 @@ async def _maybe_auto_switch_model(
                         _override_key, override = resolve_override_for_load(
                             target_id, override_id, variant
                         )
+                        if alias_config:
+                            override = {
+                                **override,
+                                "max_seq_length": alias_config["max_seq_length"],
+                                "custom_context_length": alias_config["max_seq_length"],
+                                "kv_cache_dtype": alias_config["cache_type_kv"],
+                                "speculative_type": alias_config["speculative_type"],
+                            }
                         if require_speech and resolved is not None and speech_budget is not None:
                             target_context = await asyncio.to_thread(
                                 _target_effective_context_length,
@@ -12157,6 +12264,13 @@ async def _maybe_auto_switch_model(
                         if stashed_intent is not None and target_is_gguf:
                             load_kwargs.update(_replay_load_kwargs(stashed_intent, override_kwargs))
                         load_kwargs.update(override_kwargs)
+                        if (
+                            alias_config
+                            and load_kwargs.get("llama_extra_args") is None
+                            and getattr(target_backend, "requested_extra_args", None)
+                        ):
+                            # Inherited flags must not deduplicate a configuration change.
+                            load_kwargs["force_reload"] = True
                         if caller_hf_token:
                             load_kwargs["hf_token"] = caller_hf_token
                         if remote_code_fingerprint:
@@ -12185,6 +12299,7 @@ async def _maybe_auto_switch_model(
                             )
                         # Call the impl directly: we hold the lifecycle gate the /load route takes (deadlock).
                         # Deferred claim: base preview ownership on what is actually resident, in a finally.
+                        _switch_prior_resident = _loaded_slot_ident()
                         _switch_prior_marker = _get_preview_resident()
                         _switch_loaded_ok = False
                         try:
@@ -12203,6 +12318,7 @@ async def _maybe_auto_switch_model(
 
                             async def _switch_load(load_request: LoadRequest) -> None:
                                 nonlocal target_backend
+                                load_request._required_alias_config = alias_config
                                 if not beside:
                                     await _load_model_impl(
                                         load_request,
@@ -12265,15 +12381,25 @@ async def _maybe_auto_switch_model(
                                 load_request._gguf_companion_roots_set = True
                                 load_request._override_alias_id = override_id
                                 await _switch_load(load_request)
-                            _switch_loaded_ok = True
                             # publish the completed load before a late cancellation is observed.
                             target_backend._openai_advertised_id = override_id
+                            # A shared-runtime join may intentionally ignore ordinary capacity defaults.
+                            # Explicit alias settings must still hold before this request can generate.
+                            await _config_requires_switch()
                             target_backend._loaded_by_user_action = False
+                            _switch_loaded_ok = True
                             _raise_if_generation_cancelled()
                         finally:
                             if not claim_resident:
-                                if _switch_loaded_ok or _loaded_slot_ident() == target_id:
-                                    _set_preview_resident(_loaded_slot_ident())
+                                resident = _loaded_slot_ident()
+                                # A failed same-model attempt cannot change existing ownership.
+                                if _switch_loaded_ok or (
+                                    resident == target_id
+                                    and not _same_loaded_identifier(
+                                        _switch_prior_resident, resident
+                                    )
+                                ):
+                                    _set_preview_resident(resident)
                                 else:
                                     _set_preview_resident(_switch_prior_marker)
                 finally:
@@ -19402,6 +19528,10 @@ async def _load_model_impl(
                 and getattr(llama_backend, "_audio_probed", True)
             ):
                 return None
+            if request._required_alias_config:
+                from utils.model_aliases import alias_config_matches
+                if not alias_config_matches(llama_backend, request._required_alias_config):
+                    _raise_alias_configuration_conflict(fastapi_request)
             api_monitor.discard(_load_event)
             logger.info("Model already loaded (GGUF): %s, skipping reload", model_log_label)
             # A no-op Unsloth load of a preview-owned checkpoint still claims it.
@@ -19616,6 +19746,12 @@ async def _load_model_impl(
 
         # Invalid GPU IDs must fail before the training coexistence guard.
         placement = await _prepare_load_placement(config, request, extra_llama_args)
+        if request._required_alias_config and placement.diffusion_kind is True:
+            # The diffusion runner records no load intent, so the alias could never match after loading.
+            raise HTTPException(
+                status_code = 400,
+                detail = "Configured aliases are not supported for DiffusionGemma models.",
+            )
         # Ahead of the diffusion drop: an explicit reasoning flag is a refusal, not a no-op.
         await _validate_reasoning_budget_preflight(
             config, placement.diffusion_kind, extra_llama_args, request
@@ -32206,7 +32342,7 @@ async def _collect_chat_completion(lines, model: str):
     return JSONResponse(body)
 
 
-@router.post("/chat/completions")
+@router.post("/chat/completions", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_chat_completions(
     payload: ChatCompletionRequest,
@@ -38317,6 +38453,12 @@ async def loaded_inference_models(current_subject: str = Depends(get_current_sub
     return {"object": "list", "data": [{**entry, "loaded": True} for entry in models]}
 
 
+def _alias_config_is_loaded(model: str, config: dict) -> bool:
+    from utils.model_aliases import alias_config_matches
+    backend = get_llama_cpp_backend()
+    return backend.is_loaded and _loaded_satisfies(model) and alias_config_matches(backend, config)
+
+
 async def _openai_catalog_with_aliases(quant_pins: bool = False) -> list[dict]:
     from utils.model_aliases import alias_model_objects
 
@@ -38324,7 +38466,9 @@ async def _openai_catalog_with_aliases(quant_pins: bool = False) -> list[dict]:
         objects = await _openai_catalog_objects(quant_pins = True)
     else:
         objects = await _openai_catalog_objects()
-    aliases = await asyncio.to_thread(alias_model_objects, objects, _pinned_quant_row)
+    aliases = await asyncio.to_thread(
+        alias_model_objects, objects, _pinned_quant_row, _alias_config_is_loaded
+    )
     # The rewrite gives an alias precedence, so a same-named model row would never be served.
     shadowed = {row["id"].lower() for row in aliases}
     return [o for o in objects if str(o.get("id", "")).lower() not in shadowed] + aliases
@@ -39151,7 +39295,7 @@ async def _mlx_completions(request, current_subject, backend, body: dict, refusa
     }
 
 
-@router.post("/completions")
+@router.post("/completions", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_completions(request: Request, current_subject: str = Depends(get_current_subject)):
     """
@@ -39997,7 +40141,7 @@ def _embeddings_input_present(body: dict) -> bool:
     return inp is not None
 
 
-@router.post("/embeddings")
+@router.post("/embeddings", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_embeddings(request: Request, current_subject: str = Depends(get_current_subject)):
     """OpenAI-compatible embeddings: the resident embedding GGUF when one is loaded,
@@ -42570,7 +42714,7 @@ async def _responses_stream(
     )
 
 
-@router.post("/responses")
+@router.post("/responses", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def openai_responses(
     payload: ResponsesRequest,
@@ -43903,7 +44047,7 @@ def _count_chat_context_tokens(backend, payload, messages, tools, template_kwarg
     return total, parts, rendered.get("prompt")
 
 
-@router.post("/chat/count_tokens")
+@router.post("/chat/count_tokens", dependencies = [Depends(_validate_configured_alias_request)])
 async def chat_count_tokens(
     payload: ChatCountTokensRequest,
     current_subject: str = Depends(get_current_subject),
@@ -44710,7 +44854,7 @@ async def _anthropic_messages_via_connection(
     return JSONResponse(_anthropic_message_from_events([event async for event in events]))
 
 
-@router.post("/messages/count_tokens")
+@router.post("/messages/count_tokens", dependencies = [Depends(_validate_configured_alias_request)])
 async def anthropic_count_tokens(
     payload: AnthropicMessagesRequest,
     request: Request,
@@ -45369,7 +45513,7 @@ async def _anthropic_in_process_messages(
     return _monitor_anthropic_response(response, monitor_id, context_length, cancel_event)
 
 
-@router.post("/messages")
+@router.post("/messages", dependencies = [Depends(_validate_configured_alias_request)])
 @account_access.gpu_busy_route
 async def anthropic_messages(
     payload: AnthropicMessagesRequest,

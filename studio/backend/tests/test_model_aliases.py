@@ -72,6 +72,7 @@ def _run_middleware(
         message = await receive()
         seen["body"] = message["body"]
         seen["headers"] = dict(scope["headers"])
+        seen["scope"] = scope
 
     sent = [{"type": "http.request", "body": body, "more_body": False}]
 
@@ -362,3 +363,284 @@ def test_saving_refuses_a_decision_model_id(store, monkeypatch):
     with pytest.raises(HTTPException) as err:
         asyncio.run(settings_routes.update_model_aliases_setting(payload, current_subject = "owner"))
     assert err.value.status_code == 400
+
+
+_CONFIG = {"max_seq_length": 98304, "cache_type_kv": "q5_1", "speculative_type": "ngram"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/chat/completions",
+        "/completions",
+        "/chat/count_tokens",
+        "/embeddings",
+        "/messages",
+        "/messages/count_tokens",
+        "/responses",
+    ],
+)
+def test_configured_connection_is_rejected_before_any_endpoint_dispatch(store, monkeypatch, path):
+    # Every alias-capable endpoint must reject unsupported configurations before its own shortcuts.
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from auth.authentication import authenticated_via_api_key, get_current_subject
+    from routes import inference
+    from utils.api_errors import install_api_error_handlers
+
+    set_model_aliases([{"name": "remote", "model": "external::c1::model", "load_config": _CONFIG}])
+    monkeypatch.setattr(
+        inference, "get_llama_cpp_backend", lambda: SimpleNamespace(is_loaded = False)
+    )
+    monkeypatch.setattr(inference, "_peek_inference_backend", lambda: None)
+    app = FastAPI()
+    app.include_router(inference.router, prefix = "/v1")
+    app.add_middleware(ModelAliasMiddleware)
+    app.dependency_overrides[get_current_subject] = lambda: "owner"
+    app.dependency_overrides[authenticated_via_api_key] = lambda: False
+    install_api_error_handlers(app)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1" + path,
+            json = {
+                "model": "remote",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8,
+                "prompt": "hello",
+                "input": "hello",
+            },
+        )
+    assert response.status_code == 400, response.text
+    assert "error" in response.json()
+
+
+def test_save_without_a_stored_load_config_is_refused(store, monkeypatch):
+    # A Web UI tab from before load_config renames a plain alias and PUTs the configured one bare.
+    from fastapi import HTTPException
+
+    import routes.inference as inference
+    import routes.settings as settings_routes
+
+    async def catalog():
+        return []
+
+    monkeypatch.setattr(inference, "_openai_catalog_objects", catalog)
+
+    def save(aliases):
+        payload = settings_routes.ModelAliasesPayload(aliases = aliases)
+        return asyncio.run(
+            settings_routes.update_model_aliases_setting(payload, current_subject = "owner")
+        ).model_dump()["aliases"]
+
+    configured = {"name": "long", "model": "org/model", "load_config": _CONFIG}
+    stored = save([configured, {"name": "fast", "model": "org/model"}])
+    with pytest.raises(HTTPException) as err:
+        save([{"name": "long", "model": "org/model"}, {"name": "quick", "model": "org/model"}])
+    assert err.value.status_code == 400
+    assert "Refresh the page" in err.value.detail
+    assert aliases_mod.get_model_aliases() == stored
+
+    # A current client sends the configuration back, or null to remove it on purpose.
+    assert save([configured, {"name": "quick", "model": "org/model"}])[0] == configured
+    assert save([{"name": "long", "model": "org/model", "load_config": None}]) == [
+        {"name": "long", "model": "org/model"}
+    ]
+    assert save([{"name": "long", "model": "org/other"}]) == [
+        {"name": "long", "model": "org/other"}
+    ]
+
+
+def test_configured_alias_roundtrips_settings_schema(store):
+    # Saving and returning an alias retains its independently selectable launch configuration.
+    from routes.settings import ModelAliasesPayload, ModelAliasesResponse, get_model_aliases_setting
+
+    entries = [{"name": "long", "model": "org/model:Q4_K_M", "load_config": _CONFIG}]
+    payload = ModelAliasesPayload(aliases = entries)
+    assert set_model_aliases([e.model_dump(exclude_none = True) for e in payload.aliases]) == entries
+    assert get_model_aliases_setting().model_dump() == {"aliases": entries}
+    assert ModelAliasesResponse(aliases = [{"name": "plain", "model": "org/model"}]).model_dump() == {
+        "aliases": [{"name": "plain", "model": "org/model"}]
+    }
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {**_CONFIG, "max_seq_length": True},
+        {**_CONFIG, "max_seq_length": "4096"},
+        {**_CONFIG, "max_seq_length": 0},
+        {**_CONFIG, "max_seq_length": 1048577},
+        {**_CONFIG, "max_seq_length": None},
+        {**_CONFIG, "cache_type_kv": "bogus"},
+        {**_CONFIG, "speculative_type": "eagle3"},
+        {**_CONFIG, "llama_extra_args": ["--port", "9"]},
+    ],
+)
+def test_configured_alias_rejects_invalid_config(config):
+    # Invalid or unsupported launch settings cannot be persisted as apparently usable configurations.
+    with pytest.raises(ValueError):
+        normalize_model_aliases([{"name": "long", "model": "org/model", "load_config": config}])
+
+
+def test_configured_alias_middleware_binds_trusted_config_to_target(store):
+    # Only a configured top-level alias carries server-side metadata for its rewritten target.
+    set_model_aliases([{"name": "long", "model": "org/model", "load_config": _CONFIG}])
+    seen = _run_middleware(b'{"model":"long","load_config":{"max_seq_length":1}}')
+    assert aliases_mod.request_alias_load_config(seen["scope"], "org/model") == _CONFIG
+    assert aliases_mod.request_alias_load_config(seen["scope"], "another/model") == {}
+    for body in (
+        b'{"model":"org/model","load_config":{"max_seq_length":1}}',
+        b'{"model":"org/model","nested":{"model":"long"}}',
+    ):
+        scope = _run_middleware(body)["scope"]
+        assert aliases_mod.request_alias_load_config(scope, "org/model") == {}
+
+
+def test_configured_alias_catalog_follows_visible_target(store):
+    # Different configurations remain separate choices without advertising hidden model targets.
+    set_model_aliases(
+        [
+            {"name": "long", "model": "org/model", "load_config": _CONFIG},
+            {
+                "name": "fast",
+                "model": "org/model",
+                "load_config": {**_CONFIG, "max_seq_length": 53248},
+            },
+            {"name": "hidden", "model": "private/model", "load_config": _CONFIG},
+        ]
+    )
+    rows = alias_model_objects([{"id": "org/model", "object": "model"}])
+    assert [row["id"] for row in rows] == ["long", "fast"]
+    assert all(row["alias_for"] == "org/model" for row in rows)
+
+
+def test_alias_config_compares_requested_launch_intent():
+    # Auto speculation is matched against the requested intent rather than its chosen runtime algorithm.
+    from types import SimpleNamespace
+    from dataclasses import replace
+    from core.inference.llama_cpp import GgufLoadIntent
+
+    intent = GgufLoadIntent(
+        model_identifier = "org/model", n_ctx = 98304, cache_type_kv = "q5_1", speculative_type = "auto"
+    )
+    backend = SimpleNamespace(last_load_intent = intent, speculative_type = "mtp")
+    config = {**_CONFIG, "speculative_type": "auto"}
+    assert aliases_mod.alias_config_matches(backend, config)
+    for changed in (
+        replace(intent, n_ctx = 4096),
+        replace(intent, cache_type_kv = "q4_0"),
+        replace(intent, speculative_type = "off"),
+        None,
+    ):
+        backend.last_load_intent = changed
+        assert not aliases_mod.alias_config_matches(backend, config)
+
+
+def test_configured_alias_uses_one_settings_snapshot(monkeypatch):
+    # An alias edit during body receipt cannot detach configuration from the rewritten target.
+    before = [{"name": "long", "model": "org/before", "load_config": _CONFIG}]
+    snapshots = iter([before, [{"name": "long", "model": "org/after"}]])
+    monkeypatch.setattr(aliases_mod, "get_model_aliases", lambda: next(snapshots))
+    seen = _run_middleware(b'{"model":"long"}')
+    assert json.loads(seen["body"])["model"] == "org/before"
+    assert aliases_mod.request_alias_load_config(seen["scope"], "org/before") == _CONFIG
+
+
+@pytest.mark.parametrize(
+    "extras",
+    [
+        ["--ctx-size", "2048"],
+        ["--cache-type-k", "q4_0"],
+        ["--cache-type-v=q4_0"],
+        ["--spec-type", "none"],
+    ],
+)
+def test_alias_config_does_not_trust_scalars_shadowed_by_extra_flags(extras):
+    # A manually loaded server's flags can disagree with the scalar intent it retained.
+    from types import SimpleNamespace
+    from core.inference.llama_cpp import GgufLoadIntent
+
+    intent = GgufLoadIntent(
+        model_identifier = "org/model",
+        n_ctx = 98304,
+        cache_type_kv = "q5_1",
+        speculative_type = "ngram",
+        extra_args = extras,
+    )
+    backend = SimpleNamespace(last_load_intent = intent, requested_extra_args = extras)
+    assert not aliases_mod.alias_config_matches(backend, _CONFIG)
+
+
+@pytest.mark.parametrize(
+    "extras",
+    [
+        ["--cache-type-k", "q5_1"],
+        ["--cache-type-k", "q5_1", "--cache-type-v=q5_1"],
+    ],
+)
+def test_alias_config_matches_cache_flags_that_agree_with_it(extras):
+    # Flags that produce the configured K/V pair are the configuration, not a conflict with it.
+    from types import SimpleNamespace
+    from core.inference.llama_cpp import GgufLoadIntent, _planned_main_cache_types
+
+    intent = GgufLoadIntent(
+        model_identifier = "org/model", n_ctx = 98304, speculative_type = "ngram", extra_args = extras
+    )
+    backend = SimpleNamespace(
+        last_load_intent = intent,
+        requested_extra_args = extras,
+        requested_spec_mode = "ngram",
+        _requested_cache_types = _planned_main_cache_types(None, extras),
+    )
+    assert backend._requested_cache_types == ("q5_1", "q5_1")
+    assert aliases_mod.alias_config_matches(backend, _CONFIG)
+
+
+def test_configured_alias_catalog_reports_only_matching_runtime_loaded(store, monkeypatch):
+    # An unloaded configuration cannot advertise another configuration's live context or residency.
+    import routes.inference as inf
+    from core.inference.llama_cpp import GgufLoadIntent
+    from types import SimpleNamespace
+
+    set_model_aliases(
+        [
+            {"name": "long", "model": "org/model", "load_config": _CONFIG},
+            {
+                "name": "short",
+                "model": "org/model",
+                "load_config": {**_CONFIG, "max_seq_length": 2048},
+            },
+        ]
+    )
+
+    async def catalog(**kwargs):
+        return [
+            {
+                "id": "org/model",
+                "object": "model",
+                "loaded": True,
+                "context_length": 98304,
+                "max_model_len": 98304,
+                "residency": {"loaded": True},
+            }
+        ]
+
+    backend = SimpleNamespace(
+        is_loaded = True,
+        last_load_intent = GgufLoadIntent(
+            model_identifier = "org/model",
+            n_ctx = 98304,
+            cache_type_kv = "q5_1",
+            speculative_type = "ngram",
+        ),
+    )
+    monkeypatch.setattr(inf, "_openai_catalog_objects", catalog)
+    monkeypatch.setattr(inf, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inf, "_loaded_satisfies", lambda model: model == "org/model")
+    rows = asyncio.run(inf._openai_catalog_with_aliases())
+    long = next(row for row in rows if row["id"] == "long")
+    short = next(row for row in rows if row["id"] == "short")
+    assert long["loaded"] is True and long["context_length"] == 98304
+    assert short == {"id": "short", "object": "model", "loaded": False, "alias_for": "org/model"}
