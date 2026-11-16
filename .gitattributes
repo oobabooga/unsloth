@@ -1,0 +1,3 @@
+amd_ci/patches/* -text
+*.diff -text
+*.patch -text
