@@ -129,9 +129,18 @@ def built_llama():
     return d
 
 
+def _jsonable(x):
+    """Stringify non-JSON dict keys (counters keyed by tuples) so one odd counter cannot lose the cell's record."""
+    if isinstance(x, dict):
+        return {(k if isinstance(k, (str, int, float, bool)) or k is None else str(k)): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    return x
+
+
 def dump():
     with open(args.out, "w", encoding = "utf-8") as fh:
-        json.dump(res, fh, indent = 1, default = str)
+        json.dump(_jsonable(res), fh, indent = 1, default = str)
 
 
 def stage(name):
@@ -1734,8 +1743,9 @@ def cell_grpo_txt():
 def _pack_stats():
     out = {}
     try:
-        import unsloth.models._block_compile as bc
-        out["packed_block"] = dict(getattr(bc, "PACKED_BLOCK_STATS", {}) or {}) or "absent"
+        import unsloth.utils.attention_dispatch as ad
+        stats = getattr(ad, "PACKED_BLOCK_STATS", None)
+        out["packed_block"] = dict(stats) if stats is not None else "absent"
     except Exception as e:  # noqa: BLE001
         out["packed_block"] = f"ERR {type(e).__name__}"
     try:
