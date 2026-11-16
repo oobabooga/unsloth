@@ -1743,13 +1743,15 @@ def cell_grpo_txt():
 def _pack_stats():
     out = {}
     try:
-        import unsloth.utils.attention_dispatch as ad
+        import importlib
+        ad = importlib.import_module("unsloth.utils.attention_dispatch")  # unsloth.utils re-exports a same-named function
         stats = getattr(ad, "PACKED_BLOCK_STATS", None)
         out["packed_block"] = dict(stats) if stats is not None else "absent"
     except Exception as e:  # noqa: BLE001
         out["packed_block"] = f"ERR {type(e).__name__}"
     try:
-        import unsloth.utils.hf_packed_attention as hp
+        import importlib
+        hp = importlib.import_module("unsloth.utils.hf_packed_attention")
         out["hf_packed_attention"] = dict(getattr(hp, "HF_PACKED_ATTENTION_STATS", {}) or {}) or "absent"
     except Exception as e:  # noqa: BLE001
         out["hf_packed_attention"] = f"ERR {type(e).__name__}"
