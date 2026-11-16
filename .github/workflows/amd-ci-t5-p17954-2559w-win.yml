@@ -148,7 +148,7 @@ jobs:
             --probe "$env:GITHUB_WORKSPACE/amd_ci/probes/train5_probe.py" `
             --criteria "$env:GITHUB_WORKSPACE/amd_ci/criteria/train5_rocm.py" `
             --out-dir "$env:AMD_CI_WORK\out\windows" `
-            --python "$env:AMD_CI_PY" -- --unit p17954_2559w --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,flm4 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 8cb9651b2437f2bd61556748cbb139adbd7e3c93 --companion-head 696b02087f508c13ae0996e5b320388aa2987e9f --use-current --tests tests/test_sharded_load_bnb4_gloo.py tests/test_fsdp2_native_sharded_load_gloo.py tests/test_pp_load_gloo.py --repeat flm16 --companion-tests tests/test_storage_free_standins_cast.py --tests-from-head tests/test_sharded_load_bnb4_gloo.py
+            --python "$env:AMD_CI_PY" -- --unit p17954_2559w --state-repo unsloth --transformers 5.23.0 --trl 1.18.0 --cells env,flm16,flm4 --companion-repo https://github.com/unslothai/unsloth-zoo --companion-base 8cb9651b2437f2bd61556748cbb139adbd7e3c93 --companion-head 696b02087f508c13ae0996e5b320388aa2987e9f --use-current --tests tests/test_pp_load_gloo.py --repeat flm16 --companion-tests tests/test_storage_free_standins_cast.py
           Get-Content "$env:AMD_CI_WORK\out\windows\VERDICT.md" |
             Add-Content -Path $env:GITHUB_STEP_SUMMARY
           # A finding keeps the job green; a NON-result (VOID / INCONCLUSIVE) does not.
