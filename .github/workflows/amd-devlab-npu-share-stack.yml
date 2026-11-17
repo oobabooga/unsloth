@@ -1,0 +1,136 @@
+name: AMD DevLab NPU share link, stacked build (Unsloth Studio over a Cloudflare quick tunnel)
+
+on:
+  push:
+    branches: [amd-devlab-npu-share-stack-2026-11-17]
+
+permissions: {}
+
+jobs:
+  share:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 720
+    env:
+      BASE_SHA: 3384411d336a5b43cf81e8fdbf73c010eee08e6b
+      STACK_SHA: 9bf03d55de8ecffef74af02b4ec64641b74aff96
+      MODEL: qwen3.6-moe-35b-a3b-FLM
+      HOLD_MINUTES: "690"
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+          cat /sys/module/amdxdna/version 2>/dev/null || true
+
+      - name: Fetch the bundle
+        run: curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/stack.bundle" -o "$RUNNER_TEMP/stack.bundle"
+
+      - name: Install Unsloth Studio from the stack
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-sharestack-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out" "$W/bin"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git checkout -q "$BASE_SHA"
+          git fetch -q "$RUNNER_TEMP/stack.bundle" "npu-stack-2026-11-17"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='installing %H %s'
+          git log --format='%H %s' --first-parent "$BASE_SHA..HEAD"
+          git log --format='%P' --first-parent "$BASE_SHA..HEAD" | awk '{print "merged PR head " $2}'
+          echo "skipped (conflict): #18064 #18050 #18059"
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+          # Default look for a fresh browser: mint palette, light, liquid glass (only where nothing is set yet).
+          IDX="$W/src/studio/frontend/dist/index.html"
+          python3 - "$IDX" <<'PY'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          js = ("<script>(function(){try{var d={theme:'light',palette:'mint',unsloth_window_material:"
+                "JSON.stringify({state:{material:'liquid-3d',style:'liquid-3d',menus:true,strength:{light:40,dark:15},lens:'off',scope:'all'},version:0})};"
+                "for(var k in d){if(localStorage.getItem(k)===null)localStorage.setItem(k,d[k]);}}catch(e){}})();</script>")
+          s = s.replace("<head>", "<head>" + js, 1)
+          open(p, "w").write(s)
+          print("theme seed injected:", js[:60])
+          PY
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18900-18999 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Open the tunnel
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          cat > "$W/pub.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAxb4V/UGTieHVhyTSARwL
+          cbuA2rwSgxqlApb7kkPGRQZtA50Lk1kGAJg8Vip9YxoVB1UxUzzg0JNflHDrZFR7
+          8A06c6fywtmHL/oMbNsBZIfC4WVoNjSxZcLCANcGUg9uZZkBoEcQdUwX7ZC72Sn7
+          /F4Util6MiSWTaiY4dNXim1OAqJXuWqzIEDpKb9hdx0BPTMiQrRWTSAtKLdB2ACA
+          ddy7iMqUvDxu/nQGqvf2bKqxwPnbbpPZ3P0M8z9oTeKMvD3xQrfh3aLf3dkzpYMJ
+          vke11TsYUCdkki4Uj70+VDfZwz/xPs2l3bGByx5Zx0mqrv88bQIp7J+MgyJu0Tan
+          /0aezxN7QTgngSrI+7Szxj62SbV/1k1FwZtT+VQJNPumYgViyNaou5kuTNLcqWyk
+          cFkppw34tQf4b/8xVOxcT5IusuoQgbbA67Kq7+F9TIdH3zb14KoLUS8tqExc70nR
+          UW/e5VnqGR0262IbX+whzpBq0Rzm6o3pDy2N+J9gglCfAgMBAAE=
+          -----END PUBLIC KEY-----
+          PEM
+          cd "$W/bin"
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" > "$W/cloudflared.log" 2>&1 &
+          echo $! > "$W/cloudflared.pid"
+          URL=""
+          for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cloudflared.log" | grep -v '//api\.' | head -1); [ -n "$URL" ] && break; sleep 2; done
+          [ -n "$URL" ] || { echo "no tunnel URL"; sed -E 's#https://[a-z0-9-]+\.trycloudflare\.com#<redacted>#g' "$W/cloudflared.log" | tail -30; exit 1; }
+          echo "::add-mask::$URL"
+          sleep 8; curl -s -o /dev/null -m 20 -w "tunnel check: HTTP %{http_code}\n" "$URL/api/health" || true
+          mkdir -p "$GITHUB_WORKSPACE/share"
+          printf 'url: %s\nuser: unsloth\npassword: %s\n' "$URL" "$PW" | openssl pkeyutl -encrypt -pubin -inkey "$W/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | base64 -w0 > "$GITHUB_WORKSPACE/share/link.b64"
+          echo "TUNNEL READY (sealed link written)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: share-link
+          path: share/link.b64
+
+      - name: Enable the NPU and download the model
+        continue-on-error: true
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/776c87ef15/rec.py" -o "$W/rec.py"
+          BASE="http://127.0.0.1:$PORT" OUT="$W/out" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tail -20
+
+      - name: Hold the link open
+        shell: bash {0}
+        run: |
+          echo "Holding for $HOLD_MINUTES min."
+          END=$(( $(date +%s) + HOLD_MINUTES*60 ))
+          N=0
+          while [ $(date +%s) -lt $END ]; do
+            kill -0 "$(cat "$W/studio.pid")" 2>/dev/null || { echo "Unsloth Studio exited"; break; }
+            kill -0 "$(cat "$W/cloudflared.pid")" 2>/dev/null || { echo "tunnel exited"; break; }
+            N=$(( N + 1 )); [ $(( N % 15 )) = 0 ] && echo "alive, $(( (END - $(date +%s)) / 60 )) min left"
+            sleep 60
+          done
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          for f in cloudflared.pid studio.pid; do [ -f "$W/$f" ] && kill -TERM "$(cat "$W/$f")" 2>/dev/null; done
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-sharestack-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-sharestack-$GITHUB_RUN_ID"
