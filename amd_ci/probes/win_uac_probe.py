@@ -149,7 +149,19 @@ def runner_identity() -> dict:
     return out
 
 
-def restricted_token():
+def safer_token():
+    import ctypes
+    from ctypes import wintypes
+    adv = ctypes.WinDLL("advapi32", use_last_error = True)
+    lvl, tok = wintypes.HANDLE(), wintypes.HANDLE()
+    if not adv.SaferCreateLevel(2, 0x20000, 1, ctypes.byref(lvl), None):
+        raise OSError(ctypes.get_last_error(), "SaferCreateLevel")
+    if not adv.SaferComputeTokenFromLevel(lvl, None, ctypes.byref(tok), 0, None):
+        raise OSError(ctypes.get_last_error(), "SaferComputeTokenFromLevel")
+    return tok
+
+
+def restricted_token(medium: bool = True):
     """A restricted copy of this process's token: Administrators deny-only, max privileges dropped, Medium IL."""
     import ctypes
     from ctypes import wintypes
@@ -167,6 +179,8 @@ def restricted_token():
     new = wintypes.HANDLE()
     if not adv.CreateRestrictedToken(tok, 0x1, 1, ctypes.byref(disable), 0, None, 0, None, ctypes.byref(new)):
         raise OSError(ctypes.get_last_error(), "CreateRestrictedToken")
+    if not medium:
+        return new
     medium = ctypes.c_void_p()
     adv.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     adv.GetLengthSid.argtypes = [ctypes.c_void_p]
@@ -213,7 +227,7 @@ def probe_desktop() -> str:
     return _DESKTOP[0]
 
 
-def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
+def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher, variant: str = "medium_desk") -> dict:
     import ctypes
     from ctypes import wintypes
 
@@ -232,12 +246,14 @@ def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
     adv = ctypes.WinDLL("advapi32", use_last_error = True)
     k = _k32()
     si = SI(); si.cb = ctypes.sizeof(SI)
-    desk = ctypes.create_unicode_buffer(probe_desktop())
-    si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
+    if variant.endswith("_desk"):
+        desk = ctypes.create_unicode_buffer(probe_desktop())
+        si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
     pi = PI()
     cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
     t0 = time.monotonic()
-    if not adv.CreateProcessAsUserW(restricted_token(), None, cmd, None, None, False, 0x08000000,
+    token = (safer_token() if variant.startswith("safer") else restricted_token(medium = not variant.startswith("high")))
+    if not adv.CreateProcessAsUserW(token, None, cmd, None, None, False, 0x08000000,
                                     None, None, ctypes.byref(si), ctypes.byref(pi)):
         return {"spawn_error": ctypes.get_last_error()}
     k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
@@ -273,12 +289,29 @@ def main() -> int:
             r = subprocess.run(["icacls", str(d), "/grant", "*S-1-1-0:(OI)(CI)M", "/T", "/C", "/Q"],
                                capture_output = True, text = True)
             obs.setdefault("icacls_rc", {})[str(d)] = r.returncode
+        diag = {}
+        for variant in ("high", "medium", "medium_desk", "safer", "safer_desk"):
+            for name, argv in (("cmd", ["cmd.exe", "/c", f"whoami /groups /fo csv > {work / ('diag_' + variant + '.txt')}"]),
+                               ("python", [sys.executable, "-c", "print(1)"])):
+                w = Watcher(); w.start()
+                try:
+                    diag[f"{variant}/{name}"] = run_restricted(argv, 60.0, w, variant)
+                except Exception as e:
+                    diag[f"{variant}/{name}"] = {"error": repr(e)}
+                w.stop.set(); w.join(2)
+            f = work / ("diag_" + variant + ".txt")
+            if f.exists():
+                txt = f.read_text(encoding = "utf-8", errors = "replace")
+                diag[f"{variant}/groups"] = [l for l in txt.splitlines() if "Administrators" in l or "Mandatory Label" in l]
+        obs["diag"] = diag
+        good = next((v for v in ("medium_desk", "medium", "safer_desk", "safer") if diag.get(f"{v}/python", {}).get("exit_code") == "0x0"), "medium_desk")
+        obs["variant"] = good
         for mode, timeout_s in (("readings", 240.0), ("amd_smi", 90.0)):
             res = work / f"uac_{args.state}_{mode}.json"
             res.unlink(missing_ok = True)
             w = Watcher(); w.start()
             run = run_restricted([sys.executable, str(child_py), mode, str(res),
-                                  str(args.checkout / "studio" / "backend")], timeout_s, w)
+                                  str(args.checkout / "studio" / "backend")], timeout_s, w, good)
             w.stop.set(); w.join(2)
             run["prompt_processes_anywhere"] = w.anywhere(("consent.exe", "diskpart.exe"))
             run["child"] = json.loads(res.read_text(encoding = "utf-8")) if res.exists() else None
