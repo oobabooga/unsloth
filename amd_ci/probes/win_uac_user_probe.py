@@ -74,6 +74,13 @@ try:
         out["shellexecute_lasterror"] = ctypes.get_last_error()
         time.sleep(15)
     else:
+        # A brand-new profile's first PowerShell starts are slow; time them, and the readings then run warm.
+        out["powershell_start_s"] = []
+        for _ in range(4):
+            t0 = time.monotonic()
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "1"], capture_output=True, timeout=120)
+            out["powershell_start_s"].append(round(time.monotonic() - t0, 2))
+        save()
         sys.path.insert(0, sys.argv[3])
         import utils.hardware.hardware as hw
         from utils.hardware import gpu_query
@@ -101,6 +108,13 @@ try:
         out["util_parent_luid"], out["temp_parent_luid"] = [], []
         if given is not None:
             for _ in range(3):
+                t0 = time.monotonic()
+                try:
+                    raw = hw._rocm_windows_counter_stdout_uncached(hw._rocm_windows_engine_counter_ps(
+                        f"*luid_0x{given >> 32:08x}_0x{given & 0xFFFFFFFF:08x}*")) if hasattr(hw, "_rocm_windows_engine_counter_ps") else None
+                    out.setdefault("narrowed_call", []).append({"s": round(time.monotonic() - t0, 2), "lines": len((raw or "").splitlines())})
+                except Exception as e:
+                    out.setdefault("narrowed_call", []).append({"s": round(time.monotonic() - t0, 2), "error": repr(e)[:200]})
                 out["util_parent_luid"].append(hw._rocm_windows_perf_counter_gpu_util_pct(given))
                 out["temp_parent_luid"].append(f0(given) if f0 else None)
                 time.sleep(3)
