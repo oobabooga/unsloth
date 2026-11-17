@@ -1,0 +1,105 @@
+name: AMD DevLab NPU blog stills, voxel kingdom (main 8c99caf + #18059)
+
+on:
+  push:
+    branches: [amd-devlab-npu-voxel-kingdom-2026-11-17]
+
+permissions: {}
+
+jobs:
+  shoot:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 240
+    env:
+      BASE_SHA: 8c99caf36cdfb8ddcce46e826c7caa641173ddcf
+      STACK_SHA: 89c07bd620fab829c965472c1c3ecc14d8502e80
+      MODEL: qwen3.6-moe-35b-a3b-FLM
+      NEW_NAME: Qwen3.6-35B-A3B-NPU2
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
+          ls -l /dev/accel* 2>/dev/null || true
+          cat /sys/module/amdxdna/version 2>/dev/null || true
+
+      - name: Fetch the bundle and script
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/stack.bundle" -o "$RUNNER_TEMP/stack.bundle"
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/shoot.py" -o "$RUNNER_TEMP/shoot.py"
+
+      - name: Install Unsloth Studio from the stack
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/npu-voxel-$GITHUB_RUN_ID"
+          mkdir -p "$W/tmp" "$W/hf" "$W/uv" "$W/out" "$W/prep"
+          { echo "W=$W"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "UV_CACHE_DIR=$W/uv"; echo "UNSLOTH_STUDIO_HOME=$W/studio"; } >> "$GITHUB_ENV"
+          export TMPDIR="$W/tmp" HF_HOME="$W/hf" UV_CACHE_DIR="$W/uv" UNSLOTH_STUDIO_HOME="$W/studio"
+          git clone -q https://github.com/unslothai/unsloth.git "$W/src"
+          cd "$W/src"
+          git checkout -q "$BASE_SHA"
+          git fetch -q "$RUNNER_TEMP/stack.bundle" npu-voxel-stack
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$STACK_SHA"
+          git log -1 --format='installing %H %s'
+          git log --format='%P' --first-parent "$BASE_SHA..HEAD" | awk '{print "merged PR head " $2}'
+          echo "skipped (conflicts with #18059 in composer-model-picker.tsx): #17636"
+          UNSLOTH_SKIP_AUTOSTART=1 bash install.sh --local --no-rollback > "$W/install.log" 2>&1 || { tail -150 "$W/install.log"; exit 1; }
+          tail -5 "$W/install.log"
+
+      - name: Start Unsloth Studio on localhost
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          PORT=$(shuf -i 18700-18799 -n 1)
+          PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+          echo "::add-mask::$PW"
+          cd "$W/src/studio/backend"
+          UNSLOTH_STUDIO_PASSWORD="$PW" nohup "$PY" run.py --port "$PORT" > "$W/studio.log" 2>&1 &
+          echo $! > "$W/studio.pid"
+          for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
+          curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null || { echo "Unsloth Studio did not start"; tail -80 "$W/studio.log" | grep -vF "$PW"; exit 1; }
+          { echo "PORT=$PORT"; echo "PW=$PW"; } >> "$GITHUB_ENV"
+
+      - name: Enable the NPU and download the model
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/oobabooga/unsloth/776c87ef15/rec.py" -o "$W/rec.py"
+          BASE="http://127.0.0.1:$PORT" OUT="$W/prep" python3 "$W/rec.py" prepare 2>&1 | grep -vF "$PW" | tail -20
+
+      - name: Playwright
+        run: |
+          python3 -m venv "$W/pwvenv"
+          "$W/pwvenv/bin/pip" -q install playwright pillow
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" "$W/pwvenv/bin/python" -m playwright install chromium > "$W/pw-install.log" 2>&1; tail -2 "$W/pw-install.log"
+
+      - name: Shoot
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH="$W/pw-browsers" BASE="http://127.0.0.1:$PORT" OUT="$W/out" \
+            "$W/pwvenv/bin/python" "$RUNNER_TEMP/shoot.py" 2>&1 | grep -vF "$PW"
+          exit "${PIPESTATUS[0]}"
+        shell: bash {0}
+
+      - name: Collect
+        if: always()
+        shell: bash {0}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/stills"
+          cp -r "$W/out/." "$GITHUB_WORKSPACE/stills/" 2>/dev/null
+          tail -300 "$W/studio.log" 2>/dev/null | grep -vF "$PW" > "$GITHUB_WORKSPACE/stills/studio-tail.log"
+          ls -la "$GITHUB_WORKSPACE/stills"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: voxel-kingdom-stills
+          path: stills/
+
+      - name: Clean up
+        if: always()
+        shell: bash {0}
+        run: |
+          [ -f "$W/studio.pid" ] && kill -TERM "$(cat "$W/studio.pid")" 2>/dev/null
+          sleep 5
+          pkill -KILL -f "$RUNNER_TEMP/npu-voxel-$GITHUB_RUN_ID" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/npu-voxel-$GITHUB_RUN_ID"
