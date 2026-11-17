@@ -65,5 +65,5 @@ def head_is_fixed(head: dict) -> bool:
     util, raw = head.get("load_util_fn_median"), head.get("load_raw_busiest_median")
     temp = head.get("load_temp_fn_median")
     return (util is not None and raw is not None and util >= 50 and abs(util - min(raw, 100.0)) <= 25
-            and (head.get("load_util_fn_s_max") or 99) < 5.0
+            and head.get("load_util_fn_s_max") is not None and head["load_util_fn_s_max"] < 5.0
             and temp is not None and 20 <= temp <= 110)
