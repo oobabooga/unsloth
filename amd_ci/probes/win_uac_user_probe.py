@@ -104,6 +104,53 @@ try:
             out["registry_records"] = repr(hw._windows_amd_adapter_records_by_luid())[:300]
         except Exception as e:
             out["registry_records"] = repr(e)
+        if given is not None:
+            path = f"\\GPU Engine(*luid_0x{given >> 32:08x}_0x{given & 0xFFFFFFFF:08x}*)\\Utilization Percentage"
+            out["getcounter_uncapped"] = []
+            for _ in range(3):
+                t0 = time.monotonic()
+                r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                    f"(Get-Counter '{path}' -ErrorAction SilentlyContinue).CounterSamples.Count"],
+                                   capture_output=True, text=True, timeout=120)
+                out["getcounter_uncapped"].append({"s": round(time.monotonic() - t0, 2), "n": r.stdout.strip()[:20]})
+            save()
+            try:
+                pdh = ctypes.WinDLL("pdh")
+                class V(ctypes.Structure):
+                    _fields_ = [("CStatus", wintypes.DWORD), ("pad", wintypes.DWORD), ("value", ctypes.c_double)]
+                class I(ctypes.Structure):
+                    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", V)]
+                pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+                pdh.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+                pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+                pdh.PdhGetFormattedCounterArrayW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+                pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+                t0 = time.monotonic()
+                q, c = wintypes.HANDLE(), wintypes.HANDLE()
+                st = [pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)), pdh.PdhAddEnglishCounterW(q, path, 0, ctypes.byref(c)),
+                      pdh.PdhCollectQueryData(q)]
+                t_first = time.monotonic() - t0
+                reads = []
+                for _ in range(3):
+                    time.sleep(1.0)
+                    t1 = time.monotonic()
+                    pdh.PdhCollectQueryData(q)
+                    size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+                    pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(count), None)
+                    buf = ctypes.create_string_buffer(size.value)
+                    rc = pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(count), buf)
+                    items = ctypes.cast(buf, ctypes.POINTER(I))
+                    by = {}
+                    for k in range(count.value):
+                        nm = items[k].szName.lower(); key = nm.rpartition("_eng_")[2]
+                        by[key] = by.get(key, 0.0) + items[k].FmtValue.value
+                    reads.append({"collect_ms": round((time.monotonic() - t1) * 1000, 1), "rc": hex(rc & 0xFFFFFFFF),
+                                  "instances": count.value, "busiest": round(max(by.values()), 1) if by else None})
+                pdh.PdhCloseQuery(q)
+                out["pdh_inprocess"] = {"status": [hex(x & 0xFFFFFFFF) for x in st], "open_add_first_s": round(t_first, 3), "reads": reads}
+            except Exception:
+                out["pdh_inprocess"] = {"error": traceback.format_exc()[-600:]}
+            save()
         f0 = getattr(hw, "_rocm_windows_d3dkmt_temperature_c", None)
         out["util_parent_luid"], out["temp_parent_luid"] = [], []
         if given is not None:

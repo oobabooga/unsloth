@@ -65,7 +65,8 @@ def table(obs):
         c = _c(v)
         rows.append(f"\n- {n}: raw counters as the user: adapter memory {c.get('raw_adapter_memory')}, engines {c.get('raw_engine_all')}; "
                     f"HIP adapter ids {c.get('hip_adapter_ids')}; powershell starts {c.get('powershell_start_s')} s; "
-                    f"narrowed engine call {c.get('narrowed_call')}")
+                    f"narrowed engine call {c.get('narrowed_call')}; Get-Counter uncapped {c.get('getcounter_uncapped')}; "
+                    f"in-process PDH {c.get('pdh_inprocess')}")
     return "\n".join(rows)
 
 
