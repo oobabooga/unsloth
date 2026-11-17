@@ -120,7 +120,8 @@ def open_picker(page):
     for loc in (page.locator('button[aria-label^="Model:"]'), page.get_by_role("button", name = "Select model"),
                 page.locator("button", has_text = "FLM"), page.locator("button", has_text = NEW_NAME)):
         if loc.count() and loc.first.is_visible():
-            loc.first.click()
+            loc.first.focus()
+            page.keyboard.press("Enter")
             page.wait_for_timeout(1500)
             return True
     return False
@@ -227,6 +228,18 @@ def frame_state(page):
     return out
 
 
+def flat_share(path):
+    """Share of the frame in its single most common colour: a loading screen is mostly one flat colour."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB").resize((240, 150))
+    px = list(im.getdata())
+    counts = {}
+    for r, g, b in px:
+        k = (r // 8, g // 8, b // 8)
+        counts[k] = counts.get(k, 0) + 1
+    return max(counts.values()) / len(px)
+
+
 def colour_spread(path):
     from PIL import Image
     im = Image.open(path).convert("RGB").resize((240, 150))
@@ -307,30 +320,36 @@ def attempt(page, n):
         allow.first.click()
         page.wait_for_timeout(1500)
     drag_splitter(page)
-    # SwiftShader WebGL is slow: give the scene time to build and draw
+    # SwiftShader WebGL is slow: wait for the loading screen to give way to the scene
+    ok = False
     state = {}
-    for i in range(30):
-        page.wait_for_timeout(2000)
+    t1 = time.time()
+    k = 0
+    while time.time() - t1 < 480:
+        page.wait_for_timeout(10000)
+        k += 1
+        probe = OUT / f"{tag}-canvas-probe.png"
+        page.locator("iframe").last.screenshot(path = str(probe))
+        flat, spread = flat_share(probe), colour_spread(probe)
         state = frame_state(page)
-        texts = " ".join(s.get("text", "") for s in state.get("inner", []))
         has_canvas = any(s.get("canvas") for s in state.get("inner", []))
-        if has_canvas and not any(w in texts for w in ("Building", "Loading", "loading")):
+        log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
+        if k % 6 == 0:
+            page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-probe-{k:02d}.png"))
+        if has_canvas and flat < 0.45 and spread > 60:
+            ok = True
             break
     log(tag, "PREVIEW_STATE", json.dumps(state)[:900])
-    page.wait_for_timeout(5000)
-    page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-canvas-probe.png"))
-    spread = colour_spread(OUT / f"{tag}-canvas-probe.png")
-    texts = " ".join(s.get("text", "") for s in state.get("inner", []))
-    has_canvas = any(s.get("canvas") for s in state.get("inner", []))
-    ok = has_canvas and spread > 40 and not any(w in texts for w in ("Building", "Error", "error"))
-    log(tag, f"RENDER_CHECK canvas={has_canvas} colour_buckets={spread} ok={ok}")
+    log(tag, f"RENDER_CHECK ok={ok}")
     if not ok:
         shot(page, f"{tag}-not-rendered")
         try:
-            (OUT / f"{tag}-page.html").write_text(page.content()[:400000], encoding = "utf-8")
-        except Exception:
-            pass
+            for i, f in enumerate(page.frames[1:]):
+                (OUT / f"{tag}-frame{i}.html").write_text(f.content()[:600000], encoding = "utf-8")
+        except Exception as exc:
+            log(tag, "frame dump failed", str(exc)[:200])
         return False
+    page.wait_for_timeout(4000)
 
     # the finished frame: chat with tok/s on the left, kingdom on the right
     orbit(page)
