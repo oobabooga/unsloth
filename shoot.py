@@ -85,7 +85,7 @@ def dismiss(page):
 
 def shot(page, name, **kw):
     try:
-        page.screenshot(path = str(OUT / f"{name}.png"), **kw)
+        page.screenshot(path = str(OUT / f"{name}.png"), timeout = 180000, **kw)
         log("shot", name)
     except Exception as exc:
         log("screenshot failed", name, str(exc)[:200])
@@ -329,17 +329,22 @@ def attempt(page, n):
         page.wait_for_timeout(10000)
         k += 1
         probe = OUT / f"{tag}-canvas-probe.png"
-        page.locator("iframe").last.screenshot(path = str(probe))
+        page.locator("iframe").last.screenshot(path = str(probe), timeout = 180000)
         flat, spread = flat_share(probe), colour_spread(probe)
         state = frame_state(page)
         has_canvas = any(s.get("canvas") for s in state.get("inner", []))
         log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
         if k % 6 == 0:
-            page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-probe-{k:02d}.png"))
+            page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-probe-{k:02d}.png"), timeout = 180000)
         if has_canvas and flat < 0.45 and spread > 60:
             ok = True
             break
     log(tag, "PREVIEW_STATE", json.dumps(state)[:900])
+    try:
+        for i, f in enumerate(page.frames[1:]):
+            (OUT / f"{tag}-frame{i}.html").write_text(f.content()[:600000], encoding = "utf-8")
+    except Exception as exc:
+        log(tag, "frame dump failed", str(exc)[:200])
     log(tag, f"RENDER_CHECK ok={ok}")
     if not ok:
         shot(page, f"{tag}-not-rendered")
@@ -356,13 +361,13 @@ def attempt(page, n):
     page.mouse.move(5, H - 5)
     page.wait_for_timeout(1500)
     shot(page, "1-final-chat-and-kingdom")
-    page.locator("iframe").last.screenshot(path = str(OUT / "2-canvas-closeup.png"))
+    page.locator("iframe").last.screenshot(path = str(OUT / "2-canvas-closeup.png"), timeout = 180000)
     log("shot 2-canvas-closeup")
     orbit(page, dx = -220, dy = 20)
     page.mouse.move(5, H - 5)
     page.wait_for_timeout(1500)
     shot(page, "1b-final-alt-angle")
-    page.locator("iframe").last.screenshot(path = str(OUT / "2b-canvas-closeup-alt-angle.png"))
+    page.locator("iframe").last.screenshot(path = str(OUT / "2b-canvas-closeup-alt-angle.png"), timeout = 180000)
     # the picker open over the finished chat, showing the Hub name
     if open_picker(page):
         name, _ = find_row(page)
@@ -378,18 +383,52 @@ def attempt(page, n):
     return True
 
 
+GL_CANDIDATES = [
+    ("chromium", ["--enable-gpu", "--ignore-gpu-blocklist", "--use-angle=vulkan", "--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE"]),
+    ("chromium", ["--enable-gpu", "--ignore-gpu-blocklist", "--use-gl=angle", "--use-angle=gl-egl"]),
+    ("chromium", ["--enable-gpu", "--ignore-gpu-blocklist", "--use-angle=gl"]),
+    (None, ["--enable-gpu", "--ignore-gpu-blocklist", "--use-angle=vulkan", "--enable-features=Vulkan"]),
+    (None, ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"]),
+]
+GL_JS = """()=>{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');
+if(!g)return 'no webgl';const e=g.getExtension('WEBGL_debug_renderer_info');
+return e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):g.getParameter(g.RENDERER)}"""
+
+
+def pick_browser(p):
+    """First launch whose WebGL runs on the real GPU; SwiftShader as the fallback."""
+    for channel, args in GL_CANDIDATES:
+        kw = {"headless": True, "args": args}
+        if channel:
+            kw["channel"] = channel
+        try:
+            b = p.chromium.launch(**kw)
+            pg = b.new_page()
+            pg.goto("about:blank")
+            r = pg.evaluate(GL_JS)
+            log("GL probe", channel, args, "->", r)
+            if r and "SwiftShader" not in r and "llvmpipe" not in r and r != "no webgl":
+                return b, kw, False
+            b.close()
+        except Exception as exc:
+            log("GL probe failed", channel, args, str(exc)[:200])
+    b = p.chromium.launch(**kw)
+    return b, kw, True
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless = True,
-            args = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--enable-webgl"],
-        )
-        ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = 2, color_scheme = "light")
+        browser, kw, software = pick_browser(p)
+        # software GL draws a shadowed scene at 2x too slowly to screenshot
+        dsf = 1 if software else 2
+        log("browser", kw, "software GL" if software else "GPU GL", "scale", dsf)
+        ctx = browser.new_context(viewport = {"width": W, "height": H}, device_scale_factor = dsf, color_scheme = "light")
         ctx.add_init_script(seed())
         page = ctx.new_page()
         page.on("console", lambda m: m.type in ("error", "warning") and log("console", m.type, m.text[:200]))
+        page.on("pageerror", lambda e: log("pageerror", str(e)[:300]))
         try:
             try:
                 network_setting(page)

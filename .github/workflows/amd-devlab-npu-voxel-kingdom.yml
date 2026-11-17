@@ -21,6 +21,7 @@ jobs:
           uname -a; lscpu | grep -E 'Model name|^CPU\(s\)'; free -h; df -h "$RUNNER_TEMP" | tail -1
           ls -l /dev/accel* 2>/dev/null || true
           cat /sys/module/amdxdna/version 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null || true; id
 
       - name: Fetch the bundle and script
         run: |
