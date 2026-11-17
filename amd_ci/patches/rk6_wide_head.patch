@@ -1,0 +1,73 @@
+diff --git a/studio/backend/core/_rocm_windows_sdpa.py b/studio/backend/core/_rocm_windows_sdpa.py
+index 6842e3e255..2fcd79e948 100644
+--- a/studio/backend/core/_rocm_windows_sdpa.py
++++ b/studio/backend/core/_rocm_windows_sdpa.py
+@@ -55,19 +55,35 @@ def _wide_cuda_head(query: Any) -> bool:
+     )
+ 
+ 
++_ORIGINALS: dict = {}  # str token -> wrapped SDPA (a graph constant, unlike a function)
++
++
++def _math_only(token: str, query: Any, key: Any, value: Any, *args: Any, **kwargs: Any) -> Any:
++    """allow_in_graph (as unsloth.import_fixes does): Dynamo cannot enter the lock, and the restore must use the
++    run-time backends, not the trace-time ones."""
++    _math_on()
++    try:
++        return _ORIGINALS[token](query, key, value, *args, **kwargs)
++    finally:
++        _math_off()
++
++
+ def guard_sdpa(sdpa: Any) -> Any:
+     """``sdpa`` with every call whose head is wider than 256 pinned to the math backend."""
+     if getattr(sdpa, _GUARD_ATTR, False):
+         return sdpa
++    try:
++        import torch._dynamo
++        torch._dynamo.allow_in_graph(_math_only)
++    except Exception:  # noqa: BLE001 -- eager calls still take the math backend
++        pass
++    token = f"sdpa_{len(_ORIGINALS)}"  # a str: Dynamo may make an int symbolic
++    _ORIGINALS[token] = sdpa
+ 
+     @functools.wraps(sdpa)
+     def guarded(query: Any, key: Any, value: Any, *args: Any, **kwargs: Any) -> Any:
+         if _wide_cuda_head(query):
+-            _math_on()
+-            try:
+-                return sdpa(query, key, value, *args, **kwargs)
+-            finally:
+-                _math_off()
++            return _math_only(token, query, key, value, *args, **kwargs)
+         return sdpa(query, key, value, *args, **kwargs)
+ 
+     setattr(guarded, _GUARD_ATTR, True)
+diff --git a/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py b/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
+index 625e2f0d44..e3dd148e9b 100644
+--- a/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
++++ b/studio/backend/tests/test_rocm_windows_wide_head_sdpa.py
+@@ -127,3 +127,23 @@ def test_overlapping_wide_head_calls_restore_the_callers_backends_once():
+     threads["b"].join(5)
+     assert seen == {"a": {attention.SDPBackend.MATH}, "b": {attention.SDPBackend.MATH}}
+     assert set(attention._cur_sdpa_kernel_backends()) == before
++
++
++@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
++def test_guarded_wide_head_compiles_fullgraph(monkeypatch, backend):
++    # Studio installs this guard before unsloth's, which then keeps it: its wide-head branch must trace with no break
++    F = torch.nn.functional
++    monkeypatch.setattr(G, "_wide_cuda_head", lambda q: q.shape[-1] > G.WIDEST_FUSED_HEAD_DIM)
++    guarded = G.guard_sdpa(F.scaled_dot_product_attention)
++    q, k, v = (torch.randn(1, 2, 8, 512) for _ in range(3))
++    before = attention._cur_sdpa_kernel_backends()
++    want = guarded(q, k, v, is_causal = True)
++    torch._dynamo.reset()
++    try:
++        got = torch.compile(
++            lambda q, k, v: guarded(q, k, v, is_causal = True), backend = backend, fullgraph = True
++        )(q, k, v)
++    finally:
++        torch._dynamo.reset()
++    assert torch.allclose(got, want, atol = 1e-6)
++    assert attention._cur_sdpa_kernel_backends() == before and G._HELD == [0, None]
