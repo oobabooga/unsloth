@@ -177,6 +177,42 @@ def restricted_token():
     return new
 
 
+_DESKTOP: list[str] = []
+
+
+def probe_desktop() -> str:
+    """A window station + desktop with an open DACL: a Medium-IL child cannot open the session-0 service's (0xC0000142)."""
+    if _DESKTOP:
+        return _DESKTOP[0]
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error = True)
+    adv = ctypes.WinDLL("advapi32", use_last_error = True)
+
+    class SA(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+    sd = ctypes.create_string_buffer(64)
+    adv.InitializeSecurityDescriptor(sd, 1)
+    adv.SetSecurityDescriptorDacl(sd, True, None, False)
+    sa = SA(ctypes.sizeof(SA), ctypes.cast(sd, ctypes.c_void_p), False)
+    u32.CreateWindowStationW.restype = u32.GetProcessWindowStation.restype = wintypes.HANDLE
+    u32.CreateDesktopW.restype = wintypes.HANDLE
+    u32.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
+    ws = u32.CreateWindowStationW("amdciuac", 0, 0x37F, ctypes.byref(sa))
+    if not ws:
+        raise OSError(ctypes.get_last_error(), "CreateWindowStationW")
+    old = u32.GetProcessWindowStation()
+    u32.SetProcessWindowStation(ws)
+    try:
+        if not u32.CreateDesktopW("default", None, None, 0, 0x10000000, ctypes.byref(sa)):
+            raise OSError(ctypes.get_last_error(), "CreateDesktopW")
+    finally:
+        u32.SetProcessWindowStation(old)
+    _DESKTOP.append("amdciuac\\default")
+    return _DESKTOP[0]
+
+
 def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
     import ctypes
     from ctypes import wintypes
@@ -196,8 +232,7 @@ def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
     adv = ctypes.WinDLL("advapi32", use_last_error = True)
     k = _k32()
     si = SI(); si.cb = ctypes.sizeof(SI)
-    # "" = its own window station: a restricted token cannot open a session-0 service's (DLL init 0xC0000142).
-    desk = ctypes.create_unicode_buffer("")
+    desk = ctypes.create_unicode_buffer(probe_desktop())
     si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
     pi = PI()
     cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
