@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from win_gpu_monitor_probe import LOAD, raw_engine_types  # noqa: E402
-from win_uac_probe import Watcher  # noqa: E402
+from win_uac_probe import Watcher, probe_desktop  # noqa: E402
 
 CHILD = r"""
 import json, os, sys, time, traceback, ctypes, subprocess
@@ -149,6 +149,9 @@ def run_as(user: str, pw: str, argv, timeout_s: float, watcher: Watcher, cwd: st
     k.WaitForSingleObject.restype = wintypes.DWORD
     k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     si = SI(); si.cb = ctypes.sizeof(SI)
+    # The service's window station never grants the new logon SID: user32 / OLE init fails in _ctypes.
+    desk = ctypes.create_unicode_buffer(probe_desktop())
+    si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
     pi = PI()
     cmd = ctypes.create_unicode_buffer(argv if isinstance(argv, str) else subprocess.list2cmdline(argv))
     t0 = time.monotonic()
