@@ -74,6 +74,8 @@ MODELS = {
     "gkd_proc_gemma3": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
     "mrope_pack": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
     "orpo_txt": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "orpo_txt_psoff": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "orpo_txt_unwrap": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "vision_gemma3": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
     "dpo_txt": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "pfree_llama": "built:llama (FastLanguageModel, SFT padding_free=True)",
@@ -87,6 +89,8 @@ MODELS = {
     "padmix_gemma4_ones": "trl-internal-testing/tiny-Gemma4ForConditionalGeneration (U = all-ones mask)",
     "padmix_gemma3_flex": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration (attn_implementation=flex_attention)",
     "grpo_txt": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "grpo_zadv": "trl-internal-testing/tiny-Qwen3ForCausalLM",
+    "grpo_zadv_zoff": "trl-internal-testing/tiny-Qwen3ForCausalLM",
     "grpo_pack": "trl-internal-testing/tiny-Qwen3ForCausalLM (GRPO, mixed-length prompts, packing verify state)",
     "warm": "built:llama, tiny compiled LoRA job twice on one TORCHINDUCTOR_CACHE_DIR",
     "fp32attn": "trl-internal-testing/tiny-Qwen3ForCausalLM in float32, no autocast, vs HF fp32 eager",
@@ -1762,7 +1766,7 @@ def _find_attr(model, name):
     return "unset"
 
 
-def cell_grpo_txt():
+def cell_grpo_txt(zadv = False):
     """unsloth #17875 + zoo #2540: single-GPU text GRPO (tiny Qwen3 LoRA, 2 steps, use_vllm False): losses, rewards,
     and whether sequence packing stayed on (_unsloth_seq_packing_grad_ok)."""
     import torch
@@ -1778,11 +1782,15 @@ def cell_grpo_txt():
                                              random_state = 0)
     ds = Dataset.from_list([{"prompt": [{"role": "user", "content": d}]} for d in DOCS * 4])
 
-    def reward(completions, **kw):
+    def reward(completions, prompts = None, **kw):
+        if zadv:  # zoo #2577: a constant reward for prompts of even length gives whole zero-advantage groups
+            return [1.0 if len(str(p)) % 2 == 0 else float(len(str(c))) / 10.0 for p, c in zip(prompts, completions)]
         return [float(len(str(c))) / 10.0 for c in completions]
+    if zadv:
+        res["zadv_prompt_parity"] = [len(str([{"role": "user", "content": d}])) % 2 for d in DOCS]
     cfg = _cfg(GRPOConfig, output_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), "trainer_grpo_txt"),
-               per_device_train_batch_size = 2, num_generations = 2, max_completion_length = 8, max_prompt_length = None,
-               max_steps = 2, learning_rate = 5e-5, logging_steps = 1, report_to = "none", bf16 = True, seed = 0,
+               per_device_train_batch_size = 4 if zadv else 2, num_generations = 2, max_completion_length = 8, max_prompt_length = None,
+               max_steps = 3 if zadv else 2, learning_rate = 5e-5, logging_steps = 1, report_to = "none", bf16 = True, seed = 0,
                save_strategy = "no", temperature = 1.0, use_vllm = False)
     trainer = GRPOTrainer(model = model, reward_funcs = [reward], args = cfg, train_dataset = ds, processing_class = tok)
     res["trainer_class"] = type(trainer).__name__
@@ -1795,6 +1803,10 @@ def cell_grpo_txt():
     finish_losses([float(h["loss"]) for h in logs])
     res["decreasing"] = None
     res["rewards"] = [h.get("reward") for h in logs]
+    res["zadv_rows_skipped"] = getattr(trainer, "_unsloth_zero_advantage_rows_skipped", None)  # zoo #2577
+    res["zadv_policy_ok"] = str(getattr(trainer, "_unsloth_zero_advantage_policy_ok", None))[:80]
+    res["zadv_metric"] = [h.get("unsloth/zero_advantage_rows_skipped") for h in logs]
+    res["zadv_env"] = os.environ.get("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE")
 
 
 def _pack_stats():
@@ -1939,7 +1951,7 @@ def cell_dpo_txt():
     _dpo_prefix_share_stats()
 
 
-def cell_orpo_txt():
+def cell_orpo_txt(unwrap = False):
     """unsloth #17906: single-GPU ORPO through Unsloth's ORPO trainer (tiny Qwen3 LoRA, 3 steps); whether the
     hidden-states fallback wrapper is installed on the trainer class."""
     import tempfile
@@ -1966,6 +1978,15 @@ def cell_orpo_txt():
                save_strategy = "no", max_length = 128, beta = 0.1)
     trainer = ORPOTrainer(model = model, args = cfg, train_dataset = Dataset.from_list(rows), processing_class = tt)
     res["trainer_class"] = type(trainer).__name__
+    if unwrap:  # unsloth #18169 diagnostic: restore the methods the shared-prefix wrapper replaced
+        undone = []
+        for _n in ("_compute_loss", "compute_ref_log_probs", "concatenated_forward"):
+            _f = type(trainer).__dict__.get(_n)
+            if _f is not None and getattr(_f, "_unsloth_dpo_prefix_share", False):
+                setattr(type(trainer), _n, _f.__wrapped__)
+                undone.append(_n)
+        res["prefix_share_unwrapped"] = undone
+    res["prefix_share_env"] = os.environ.get("UNSLOTH_DPO_PREFIX_SHARE")
     res["hs_fallback_wrapped"] = bool(getattr(type(trainer).__init__, "_unsloth_grpo_hidden_states_init_wrapped", False))
     stage("train")
     torch.cuda.reset_peak_memory_stats()
@@ -3030,7 +3051,7 @@ CELLS = {"hd512_llama": lambda: cell_hd512("llama"), "hd512_gemma4": lambda: cel
          "aol_gemma3_trl": lambda: cell_aol("aol_gemma3_trl", "trl"),
          "aol_qwen25vl_none": lambda: cell_aol("aol_qwen25vl", "trl"),
          "aol_gemma3_none": lambda: cell_aol("aol_gemma3_unsloth", "trl"), "cp_ring_kernels": cell_cp_ring_kernels, "gkd_proc_qwen35": lambda: cell_gkd_proc("gkd_proc_qwen35"),
-         "gkd_proc_gemma3": lambda: cell_gkd_proc("gkd_proc_gemma3"), "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt,
+         "gkd_proc_gemma3": lambda: cell_gkd_proc("gkd_proc_gemma3"), "mrope_pack": cell_mrope_pack, "orpo_txt": cell_orpo_txt, "grpo_zadv": lambda: cell_grpo_txt(True), "grpo_zadv_zoff": lambda: cell_grpo_txt(True), "orpo_txt_psoff": cell_orpo_txt, "orpo_txt_unwrap": lambda: cell_orpo_txt(True),
          "vision_gemma3": cell_vision,
          "pfree_llama": lambda: cell_sft_pack("llama", "pfree"), "pfree_qwen3": lambda: cell_sft_pack("qwen3", "pfree"),
          "sftdef_steps": lambda: cell_sft_pack("llama", "steps"), "sftdef_epoch": lambda: cell_sft_pack("llama", "epoch"),
@@ -3053,6 +3074,10 @@ def main():
         os.environ["UNSLOTH_GC_SAVE_ATTENTION"] = "1"  # before any import: zoo #2571 reads it at checkpoint time
     if args.cell.endswith("_nc"):
         os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"  # diagnostic twin: same cell, no Unsloth compile
+    if args.cell.endswith("_zoff"):
+        os.environ["UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE"] = "0"  # zoo #2577 kill switch
+    if args.cell.endswith("_psoff"):
+        os.environ["UNSLOTH_DPO_PREFIX_SHARE"] = "off"  # unsloth #18169 kill switch
     if args.cell == "grpo_vl":
         os.environ["UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY"] = "1"
     t0 = time.time()
