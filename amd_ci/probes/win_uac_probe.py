@@ -25,6 +25,9 @@ CHILD = r"""
 import json, sys, time, traceback, ctypes
 from ctypes import wintypes
 out = {"pid": __import__("os").getpid()}
+def save():
+    open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(out, default=str))
+save()
 try:
     out["is_admin"] = bool(ctypes.windll.shell32.IsUserAnAdmin())
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -41,6 +44,7 @@ try:
     elev = wintypes.DWORD()
     adv.GetTokenInformation(tok, 20, ctypes.byref(elev), 4, ctypes.byref(n))
     out["token_elevated"] = bool(elev.value)
+    save()
     mode = sys.argv[1]
     if mode == "amd_smi":
         import shutil
@@ -61,6 +65,7 @@ try:
         devices, _ = hw._rocm_windows_per_device_vram([0])
         luid = (devices or [{}])[0].get("luid")
         out["luid"] = luid
+        save()
         out["util"] = [hw._rocm_windows_perf_counter_gpu_util_pct(luid) for _ in range(2)]
         f = getattr(hw, "_rocm_windows_d3dkmt_temperature_c", None)
         out["temp_fn_present"] = f is not None
@@ -70,7 +75,7 @@ try:
         out["payload"] = {k: dev.get(k) for k in ("backend", "gpu_utilization_pct", "temperature_c", "vram_used_gb")}
 except Exception:
     out["error"] = traceback.format_exc()[-1500:]
-open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(out, default=str))
+save()
 """
 
 
@@ -191,6 +196,9 @@ def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
     adv = ctypes.WinDLL("advapi32", use_last_error = True)
     k = _k32()
     si = SI(); si.cb = ctypes.sizeof(SI)
+    # "" = its own window station: a restricted token cannot open a session-0 service's (DLL init 0xC0000142).
+    desk = ctypes.create_unicode_buffer("")
+    si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
     pi = PI()
     cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
     t0 = time.monotonic()
@@ -201,6 +209,10 @@ def run_restricted(argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
     k.WaitForSingleObject.restype = wintypes.DWORD
     rc = k.WaitForSingleObject(pi.hProcess, int(timeout_s * 1000))
     out = {"child_pid": pi.dwProcessId, "timed_out": rc != 0, "seconds": round(time.monotonic() - t0, 2)}
+    code = wintypes.DWORD()
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
+    out["exit_code"] = hex(code.value)
     if rc != 0:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(pi.dwProcessId)], capture_output = True)
     time.sleep(0.5)
