@@ -58,9 +58,13 @@ def table(obs):
         c, r, ctl = _c(v), v.get("readings") or {}, v.get("control") or {}
         cc = _c(v, "control")
         pay = "; ".join(f"{p.get('gpu_utilization_pct')} / {p.get('temperature_c')}" for p in c.get("payload") or [])
-        rows.append(f"| {n} | {v.get('user')} | {c.get('util')} | {c.get('temp')} | {pay} | {sorted(set(r.get('spawned') or []))} | "
+        rows.append(f"| {n} | {v.get('user')} | {c.get('util_parent_luid')} | {c.get('temp_parent_luid')} | {pay} (child LUID {c.get('luid')}) | {sorted(set(r.get('spawned') or []))} | "
                     f"{c.get('spawn_errors')} | {r.get('prompt_processes_anywhere')} | {cc.get('createprocess')} / "
                     f"rc={cc.get('shellexecute_rc')} err={cc.get('shellexecute_lasterror')} / {ctl.get('prompt_processes_anywhere')} |")
+    for n, v in _states(obs).items():
+        c = _c(v)
+        rows.append(f"\n- {n}: raw counters as the user: adapter memory {c.get('raw_adapter_memory')}, engines {c.get('raw_engine_all')}; "
+                    f"HIP adapter ids {c.get('hip_adapter_ids')}; registry {c.get('registry_records')}")
     return "\n".join(rows)
 
 
@@ -73,9 +77,11 @@ def head_is_worse(base, head):
     extra = sorted(set(r.get("spawned") or []) - ALLOWED - {"python.exe"})
     if extra:
         return True, f"head readings started unexpected processes: {extra}"
-    if c.get("temp_fn_present") and not any(t is not None for t in c.get("temp") or []):
+    # The PR's readings, on the LUID the runner resolved: the per-device LUID join is pre-existing code.
+    if c.get("temp_fn_present") and not any(t is not None for t in c.get("temp_parent_luid") or []):
         return True, "head temperature unreadable as a standard user"
-    utils = [u for u in c.get("util") or [] if u is not None]
+    utils = [u for u in c.get("util_parent_luid") or [] if u is not None]
     if not utils or max(utils) < 50:
-        return True, f"head utilization {c.get('util')} misses the load the counter saw"
-    return False, f"standard user under load: util {c.get('util')}, temp {c.get('temp')}, started {sorted(set(r.get('spawned') or []))}, no prompt"
+        return True, f"head utilization {c.get('util_parent_luid')} misses the load the counter saw"
+    return False, (f"standard user under load: util {c.get('util_parent_luid')}, temp {c.get('temp_parent_luid')}, "
+                   f"started {sorted(set(r.get('spawned') or []))}, no prompt, no elevation error")

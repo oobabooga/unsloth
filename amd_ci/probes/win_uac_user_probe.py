@@ -80,6 +80,31 @@ try:
         devices, _ = hw._rocm_windows_per_device_vram([0])
         luid = (devices or [{}])[0].get("luid")
         out["luid"] = luid
+        given = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else None
+        out["parent_luid"] = given
+        for name, path in (("adapter_memory", "\\GPU Adapter Memory(*)\\Dedicated Usage"),
+                           ("engine_all", "\\GPU Engine(*)\\Utilization Percentage")):
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                f"(Get-Counter '{path}' -ErrorAction SilentlyContinue).CounterSamples.Count; $Error[0]"],
+                               capture_output=True, text=True, timeout=60)
+            out["raw_" + name] = (r.stdout.strip()[:300], r.stderr.strip()[:300])
+        try:
+            import torch
+            out["hip_adapter_ids"] = repr(hw._rocm_windows_hip_adapter_ids([0], [torch.cuda.get_device_name(0)]))[:300]
+        except Exception as e:
+            out["hip_adapter_ids"] = repr(e)
+        try:
+            out["registry_records"] = repr(hw._windows_amd_adapter_records_by_luid())[:300]
+        except Exception as e:
+            out["registry_records"] = repr(e)
+        f0 = getattr(hw, "_rocm_windows_d3dkmt_temperature_c", None)
+        out["util_parent_luid"], out["temp_parent_luid"] = [], []
+        if given is not None:
+            for _ in range(3):
+                out["util_parent_luid"].append(hw._rocm_windows_perf_counter_gpu_util_pct(given))
+                out["temp_parent_luid"].append(f0(given) if f0 else None)
+                time.sleep(3)
+        save()
         out["util"], out["temp"], out["payload"] = [], [], []
         f = getattr(hw, "_rocm_windows_d3dkmt_temperature_c", None)
         out["temp_fn_present"] = f is not None
@@ -203,7 +228,7 @@ def main() -> int:
             import utils.hardware.hardware as hw
             luid = (hw._rocm_windows_per_device_vram([0])[0] or [{}])[0].get("luid")
             obs["luid"] = luid
-            load = subprocess.Popen([sys.executable, "-c", LOAD, "120"], stdout = subprocess.PIPE,
+            load = subprocess.Popen([sys.executable, "-c", LOAD, "180"], stdout = subprocess.PIPE,
                                     stderr = subprocess.DEVNULL, text = True)
             obs["load_ready"] = load.stdout.readline().strip() == "READY"
             time.sleep(6)
@@ -212,7 +237,7 @@ def main() -> int:
             w = Watcher(); w.start()
             # Every path here is space-free (runner temp, Public), so cmd needs no inner quoting.
             obs["readings"] = run_as(user, pw, "cmd.exe /d /c " + subprocess.list2cmdline(
-                [sys.executable, str(child_py), "readings", str(res), str(args.checkout / "studio" / "backend")])
+                [sys.executable, str(child_py), "readings", str(res), str(args.checkout / "studio" / "backend"), str(luid)])
                 + f" > {log} 2>&1", 240, w, str(pub))
             w.stop.set(); w.join(2)
             obs["raw_after"] = raw_engine_types(luid)
