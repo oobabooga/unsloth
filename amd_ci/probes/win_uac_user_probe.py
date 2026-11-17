@@ -105,10 +105,16 @@ def ps(cmd: str, timeout: float = 120) -> subprocess.CompletedProcess:
 def create_user() -> tuple[str, str]:
     name = "amdciuac" + secrets.token_hex(3)
     pw = "Aa1!" + secrets.token_urlsafe(18)
-    r = subprocess.run(["net", "user", name, pw, "/add", "/passwordchg:no", "/expires:never"],
-                       capture_output = True, text = True)
+    # Password over stdin, never argv; Users by SID so a localized group name cannot miss.
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "$p = ConvertTo-SecureString ([Console]::In.ReadLine()) -AsPlainText -Force;"
+                        f"New-LocalUser -Name {name} -Password $p -PasswordNeverExpires -UserMayNotChangePassword"
+                        " -AccountNeverExpires | Out-Null;"
+                        f"Add-LocalGroupMember -SID S-1-5-32-545 -Member {name}"],
+                       input = pw + "\n", capture_output = True, text = True, timeout = 120)
     if r.returncode != 0:
-        raise RuntimeError(f"net user /add failed: {r.stdout} {r.stderr}")
+        subprocess.run(["net", "user", name, "/delete"], capture_output = True)
+        raise RuntimeError(f"New-LocalUser failed: {r.stdout} {r.stderr}")
     return name, pw
 
 
