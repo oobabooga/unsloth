@@ -127,7 +127,7 @@ def delete_user(name: str) -> dict:
     return out
 
 
-def run_as(user: str, pw: str, argv: list[str], timeout_s: float, watcher: Watcher) -> dict:
+def run_as(user: str, pw: str, argv, timeout_s: float, watcher: Watcher, cwd: str) -> dict:
     import ctypes
     from ctypes import wintypes
 
@@ -150,11 +150,11 @@ def run_as(user: str, pw: str, argv: list[str], timeout_s: float, watcher: Watch
     k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     si = SI(); si.cb = ctypes.sizeof(SI)
     pi = PI()
-    cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+    cmd = ctypes.create_unicode_buffer(argv if isinstance(argv, str) else subprocess.list2cmdline(argv))
     t0 = time.monotonic()
     # LOGON_WITH_PROFILE; CREATE_NO_WINDOW. seclogon grants the new logon SID this window station and desktop.
     if not adv.CreateProcessWithLogonW(user, ".", pw, 1, None, cmd, 0x08000000, None,
-                                       str(Path(argv[1]).parent), ctypes.byref(si), ctypes.byref(pi)):
+                                       cwd, ctypes.byref(si), ctypes.byref(pi)):
         return {"spawn_error": ctypes.get_last_error()}
     rc = k.WaitForSingleObject(pi.hProcess, int(timeout_s * 1000))
     code = wintypes.DWORD()
@@ -187,6 +187,10 @@ def main() -> int:
     try:
         user, pw = create_user()
         obs["user"] = user
+        # Anything a standard user writes goes here: Users can create under Public, and the runner reads it back.
+        pub = Path(r"C:\Users\Public") / user
+        pub.mkdir(parents = True, exist_ok = True)
+        subprocess.run(["icacls", str(pub), "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q"], capture_output = True)
     except Exception:
         import traceback
         obs["error"] = traceback.format_exc()[-1500:]
@@ -201,19 +205,24 @@ def main() -> int:
             obs["load_ready"] = load.stdout.readline().strip() == "READY"
             time.sleep(6)
             obs["raw_before"] = raw_engine_types(luid)
-            res = work / "readings.json"
+            res, log = pub / "readings.json", pub / "readings.log"
             w = Watcher(); w.start()
-            obs["readings"] = run_as(user, pw, [sys.executable, str(child_py), "readings", str(res),
-                                                str(args.checkout / "studio" / "backend")], 240, w)
+            # Every path here is space-free (runner temp, Public), so cmd needs no inner quoting.
+            obs["readings"] = run_as(user, pw, "cmd.exe /d /c " + subprocess.list2cmdline(
+                [sys.executable, str(child_py), "readings", str(res), str(args.checkout / "studio" / "backend")])
+                + f" > {log} 2>&1", 240, w, str(pub))
             w.stop.set(); w.join(2)
             obs["raw_after"] = raw_engine_types(luid)
             obs["load_alive_after"] = load.poll() is None
             obs["readings"]["child"] = json.loads(res.read_text(encoding = "utf-8")) if res.exists() else None
-            res = work / "control.json"
+            obs["readings"]["log_tail"] = log.read_text(encoding = "utf-8", errors = "replace")[-1500:] if log.exists() else None
+            res, log = pub / "control.json", pub / "control.log"
             w = Watcher(); w.start()
-            obs["control"] = run_as(user, pw, [sys.executable, str(child_py), "control", str(res), "-"], 90, w)
+            obs["control"] = run_as(user, pw, "cmd.exe /d /c " + subprocess.list2cmdline(
+                [sys.executable, str(child_py), "control", str(res), "-"]) + f" > {log} 2>&1", 90, w, str(pub))
             w.stop.set(); w.join(2)
             obs["control"]["child"] = json.loads(res.read_text(encoding = "utf-8")) if res.exists() else None
+            obs["control"]["log_tail"] = log.read_text(encoding = "utf-8", errors = "replace")[-800:] if log.exists() else None
             subprocess.run(["taskkill", "/F", "/IM", "consent.exe"], capture_output = True)
             subprocess.run(["taskkill", "/F", "/IM", "diskpart.exe"], capture_output = True)
     except Exception:
@@ -224,6 +233,7 @@ def main() -> int:
             load.kill()
         if user:
             obs["cleanup"] = delete_user(user)
+            subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(Path(r"C:\Users\Public") / user)], capture_output = True)
     args.out.write_text(json.dumps(obs, indent = 1, default = str), encoding = "utf-8")
     return 0
 
