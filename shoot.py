@@ -320,6 +320,13 @@ def attempt(page, n):
         allow.first.click()
         page.wait_for_timeout(1500)
     drag_splitter(page)
+    # Reload so the page sizes itself at the new width: generated resize handlers are often broken.
+    for b in reversed(page.get_by_role("button", name = "Reload", exact = True).all()):
+        if b.is_visible():
+            b.click()
+            log(tag, "reloaded the preview at the new width")
+            break
+    page.wait_for_timeout(3000)
     # SwiftShader WebGL is slow: wait for the loading screen to give way to the scene
     ok = False
     state = {}
@@ -357,6 +364,14 @@ def attempt(page, n):
     page.wait_for_timeout(4000)
 
     # the finished frame: chat with tok/s on the left, kingdom on the right
+    errs = page.get_by_text("This page hit", exact = False)
+    if errs.count() and errs.first.is_visible():
+        log(tag, "WARNING: preview error banner:", " ".join(errs.first.locator("xpath=..").inner_text().split())[:300])
+    page.evaluate(
+        "()=>{document.querySelectorAll('#chat-thread *').forEach(e=>{const o=getComputedStyle(e).overflowY;"
+        "if(e.scrollHeight>e.clientHeight+10&&(o==='auto'||o==='scroll'))e.scrollTop=e.scrollHeight})}"
+    )
+    page.wait_for_timeout(800)
     orbit(page)
     page.mouse.move(5, H - 5)
     page.wait_for_timeout(1500)
