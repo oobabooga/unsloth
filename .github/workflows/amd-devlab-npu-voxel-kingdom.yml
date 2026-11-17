@@ -1,8 +1,8 @@
-name: AMD DevLab NPU blog stills, voxel kingdom (main 8c99caf + #18059)
+name: AMD DevLab NPU blog stills, voxel kingdom (main b48ca2e + #18059)
 
 on:
   push:
-    branches: [amd-devlab-npu-voxel-kingdom-2026-11-17]
+    branches: [amd-devlab-npu-voxel-kingdom-2-2026-11-17]
 
 permissions: {}
 
@@ -11,8 +11,8 @@ jobs:
     runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
     timeout-minutes: 240
     env:
-      BASE_SHA: 8c99caf36cdfb8ddcce46e826c7caa641173ddcf
-      STACK_SHA: 89c07bd620fab829c965472c1c3ecc14d8502e80
+      BASE_SHA: b48ca2e430ca567f917684ee710984e283d7de45
+      STACK_SHA: 7ceb567445d524855a5662099ddadda5854c8c7c
       MODEL: qwen3.6-moe-35b-a3b-FLM
       NEW_NAME: Qwen3.6-35B-A3B-NPU2
     steps:

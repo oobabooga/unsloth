@@ -20,8 +20,16 @@ PROMPT = (
     "using html with embedded JavaScript with 3js make a voxel art model of a medieval kingdom, please dont just "
     "make it out of blocks i want real voxels and a nice scene to demo with good lighting, good grass and trees "
     "and paths and the kingdom buildings."
+    " Make the scene big and rich: a stone castle with curtain walls, corner towers and a gatehouse on a low hill, "
+    "a clear dirt road from the gate down through a village of at least six houses with different roofs, a river "
+    "with a bridge or a pond, and lots of trees (at least 100) in varied greens, plus bushes, rocks and flowers. "
+    "Use one self-contained HTML file with three.js r128 and OrbitControls from a CDN, size the renderer from "
+    "window.innerWidth and window.innerHeight and update it correctly on resize, frame the camera so the whole "
+    "kingdom fills the view at a 3/4 angle, and keep any on-screen text small in a corner."
 )
 W, H = 1440, 900
+ERRORS = []
+BENIGN = ("localStorage", "Failed to load resource")
 TRIES = 3
 
 
@@ -276,16 +284,198 @@ def drag_splitter(page, frac = 0.58):
     log(f"canvas width after drag {pb['width']:.0f}px = {pb['width'] / W:.3f} of the page")
 
 
-def orbit(page, dx = 140, dy = -30):
+def drag(page, dx, dy, button = "left"):
     f = page.locator("iframe").last.bounding_box()
-    cx, cy = f["x"] + f["width"] / 2, f["y"] + f["height"] * 0.6
+    cx, cy = f["x"] + f["width"] / 2, f["y"] + f["height"] * 0.55
     page.mouse.move(cx, cy)
-    page.mouse.down()
-    for i in range(1, 41):
-        page.mouse.move(cx + dx * i / 40, cy + dy * i / 40)
-        page.wait_for_timeout(30)
-    page.mouse.up()
+    page.mouse.down(button = button)
+    for i in range(1, 31):
+        page.mouse.move(cx + dx * i / 30, cy + dy * i / 30)
+        page.wait_for_timeout(25)
+    page.mouse.up(button = button)
+    page.wait_for_timeout(1500)
+
+
+def wheel(page, dy):
+    f = page.locator("iframe").last.bounding_box()
+    page.mouse.move(f["x"] + f["width"] / 2, f["y"] + f["height"] * 0.55)
+    for _ in range(3):
+        page.mouse.wheel(0, dy / 3)
+        page.wait_for_timeout(120)
+    page.wait_for_timeout(1500)
+
+
+def overlays(page):
+    """Rects (css px, frame coords) of the page's own text overlays."""
+    f = preview_frame(page)
+    if not f:
+        return []
+    try:
+        return f.evaluate("""()=>[...document.querySelectorAll('body *')].filter(e=>{if(e.tagName==='CANVAS')return false;
+            const r=e.getBoundingClientRect(),st=getComputedStyle(e);return r.width>0&&r.height>0&&st.display!=='none'&&
+            st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0.05&&e.textContent.trim()&&r.width<innerWidth*0.95})
+            .map(e=>{const r=e.getBoundingClientRect();return [r.left,r.top,r.right,r.bottom]})""")
+    except Exception:
+        return []
+
+
+def measure(page, path):
+    """Scene box and coverage in a preview screenshot: background is whatever matches the row's edge pixels."""
+    from PIL import Image
+    page.locator("iframe").last.screenshot(path = str(path), timeout = 180000)
+    im = Image.open(path).convert("RGB")
+    fw, fh = page.locator("iframe").last.bounding_box()["width"], page.locator("iframe").last.bounding_box()["height"]
+    sw, sh = 160, 160
+    sm = im.resize((sw, sh))
+    px = sm.load()
+    masks = [[False] * sw for _ in range(sh)]
+    for (l, t, r, b) in overlays(page):
+        for y in range(max(0, int(t / fh * sh)), min(sh, int(b / fh * sh) + 1)):
+            for x in range(max(0, int(l / fw * sw)), min(sw, int(r / fw * sw) + 1)):
+                masks[y][x] = True
+    black = 0
+    xs, ys, n = [], [], 0
+    for y in range(sh):
+        refs = [px[0, y], px[1, y], px[sw - 1, y], px[sw - 2, y]]
+        for x in range(sw):
+            c = px[x, y]
+            if sum(c) < 30:
+                black += 1
+            if masks[y][x]:
+                continue
+            if min(sum(abs(c[i] - r[i]) for i in range(3)) for r in refs) > 40:
+                xs.append(x); ys.append(y); n += 1
+    cov = n / (sw * sh)
+    if n < 50:
+        return {"cov": cov, "black": black / (sw * sh), "box": None}
+    xs.sort(); ys.sort()
+    q = lambda v, f: v[min(len(v) - 1, int(len(v) * f))]
+    box = (q(xs, 0.02) / sw, q(ys, 0.02) / sh, q(xs, 0.98) / sw, q(ys, 0.98) / sh)
+    return {"cov": cov, "black": black / (sw * sh), "box": box}
+
+
+def frame_scene(page, tag):
+    """Zoom and pan until the kingdom fills most of the panel, centred."""
+    m = {}
+    zin = 0
+    f = page.locator("iframe").last.bounding_box()
+    for step in range(8):
+        m = measure(page, OUT / f"{tag}-measure.png")
+        box = m["box"]
+        log(tag, f"frame step {step}: cov={m['cov']:.2f} black={m['black']:.3f} box={box and [round(v, 2) for v in box]}")
+        if not box:
+            return m
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        clipped = box[0] < 0.01 and box[2] > 0.99
+        if abs(cx - 0.5) > 0.06 or abs(cy - 0.55) > 0.08:
+            drag(page, (0.5 - cx) * f["width"], (0.55 - cy) * f["height"], button = "right")
+            continue
+        if clipped or bw > 0.97 or bh > 0.9:
+            wheel(page, 240)
+            continue
+        if bw < 0.82 and bh < 0.75 and zin < 4:
+            zin += 1
+            wheel(page, -240 if bw < 0.6 else -120)
+            continue
+        break
+    return measure(page, OUT / f"{tag}-measure.png")
+
+
+def open_preview(page, tag):
+    btn = page.get_by_role("button", name = "Open HTML preview preview")
+    if not btn.count():
+        btn = page.get_by_role("button", name = "Open in")
+    if not btn.count():
+        return False
+    btn.last.click()
     page.wait_for_timeout(2500)
+    allow = page.get_by_role("button", name = "Allow for this page")
+    if allow.count() and allow.first.is_visible():
+        log(tag, "WARNING: the preview still asked for network access; allowing for this page")
+        allow.first.click()
+        page.wait_for_timeout(1500)
+    return True
+
+
+def present(page, tag):
+    """Open the preview at ~58% width with the page loaded at that size, wait for the scene, check it is clean."""
+    if not open_preview(page, tag):
+        log(tag, "no HTML preview card")
+        return None
+    drag_splitter(page)
+    # close and reopen: the page then starts at the new width, so a broken resize handler never runs
+    for b in page.get_by_role("button", name = "Close tab").all():
+        if b.is_visible():
+            b.click()
+            break
+    page.wait_for_timeout(1500)
+    e0 = len(ERRORS)
+    open_preview(page, tag)
+    pb = page.locator("#chat-artifact").first.bounding_box()
+    log(tag, f"reopened preview at {pb['width'] / W:.3f} of the page")
+    if abs(pb["width"] / W - 0.58) > 0.03:
+        drag_splitter(page)
+    ok = False
+    t1 = time.time()
+    while time.time() - t1 < 300:
+        page.wait_for_timeout(8000)
+        probe = OUT / f"{tag}-canvas-probe.png"
+        page.locator("iframe").last.screenshot(path = str(probe), timeout = 180000)
+        flat, spread = flat_share(probe), colour_spread(probe)
+        st = frame_state(page)
+        has_canvas = any(x.get("canvas") for x in st.get("inner", []))
+        log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
+        if has_canvas and flat < 0.45 and spread > 60:
+            ok = True
+            break
+    page.wait_for_timeout(5000)  # let title cards fade
+    try:
+        for i, fr in enumerate(page.frames[1:]):
+            (OUT / f"{tag}-frame{i}.html").write_text(fr.content()[:600000], encoding = "utf-8")
+    except Exception as exc:
+        log(tag, "frame dump failed", str(exc)[:200])
+    errs = [e for e in ERRORS[e0:] if not any(b in e for b in BENIGN)]
+    banner = page.get_by_text("This page hit", exact = False)
+    if banner.count() and banner.first.is_visible():
+        errs.append("banner: " + " ".join(banner.first.locator("xpath=..").inner_text().split())[:200])
+    m = measure(page, OUT / f"{tag}-measure.png")
+    clean = ok and not errs and m["black"] < 0.02
+    log(tag, f"CHECK rendered={ok} errors={errs[:3]} black={m['black']:.3f} cov={m['cov']:.2f} clean={clean}")
+    return {"ok": ok, "clean": clean, "errs": errs, "cov": m["cov"]}
+
+
+def scroll_chat_end(page):
+    page.evaluate(
+        "()=>{document.querySelectorAll('#chat-thread *').forEach(e=>{const o=getComputedStyle(e).overflowY;"
+        "if(e.scrollHeight>e.clientHeight+10&&(o==='auto'||o==='scroll'))e.scrollTop=e.scrollHeight})}"
+    )
+    page.wait_for_timeout(800)
+
+
+def park_mouse(page):
+    page.mouse.move(W * 0.2, 12)
+    page.wait_for_timeout(1200)
+
+
+VIEWS = [0, 70, -70]  # orbit offsets (px of drag) tried per candidate
+
+
+def pick_view(page, tag):
+    """Try a few orbit angles, frame each, keep the one with the fullest frame."""
+    best, cur = None, 0
+    for v in VIEWS:
+        drag(page, v - cur, 0)
+        cur = v
+        m = frame_scene(page, f"{tag}-v{v}")
+        score = m["cov"] if m["box"] else 0
+        page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-view{v:+d}.png"), timeout = 180000)
+        log(tag, f"view {v:+d}: cov={m['cov']:.2f}")
+        if best is None or score > best[1]:
+            best = (v, score)
+    drag(page, best[0] - cur, 0)
+    m = frame_scene(page, f"{tag}-best")
+    return best[0], m
 
 
 def attempt(page, n):
@@ -296,7 +486,7 @@ def attempt(page, n):
     collapse_sidebar(page)
     box = page.get_by_placeholder("Ask anything")
     box.click()
-    page.keyboard.type(PROMPT, delay = 8)
+    page.keyboard.type(PROMPT, delay = 6)
     page.wait_for_timeout(400)
     page.keyboard.press("Enter")
     log(tag, "sent")
@@ -304,86 +494,43 @@ def attempt(page, n):
     page.get_by_text("tok/s").first.wait_for(timeout = 1800 * 1000)
     log(tag, f"reply done in {time.time() - t0:.0f}s, badge", page.get_by_text("tok/s").first.inner_text())
     page.wait_for_timeout(800)
-    shot(page, f"{tag}-reply-done")
+    r = present(page, tag)
+    if not r or not r["clean"]:
+        shot(page, f"{tag}-rejected")
+        return {"clean": False, **(r or {})}
+    view, m = pick_view(page, tag)
+    scroll_chat_end(page)
+    park_mouse(page)
+    shot(page, f"{tag}-candidate")
+    return {"clean": True, "cov": m["cov"], "view": view}
 
-    btn = page.get_by_role("button", name = "Open HTML preview preview")
-    if not btn.count():
-        btn = page.get_by_role("button", name = "Open in")
-    if not btn.count():
-        log(tag, "no HTML preview card")
-        return False
-    btn.first.click()
-    page.wait_for_timeout(2500)
-    allow = page.get_by_role("button", name = "Allow for this page")
-    if allow.count() and allow.first.is_visible():
-        log(tag, "WARNING: the preview still asked for network access; the setting did not take. Allowing for this page.")
-        allow.first.click()
-        page.wait_for_timeout(1500)
-    drag_splitter(page)
-    # Reload so the page sizes itself at the new width: generated resize handlers are often broken.
-    for b in reversed(page.get_by_role("button", name = "Reload", exact = True).all()):
-        if b.is_visible():
-            b.click()
-            log(tag, "reloaded the preview at the new width")
-            break
+
+def final_shots(page, title, view):
+    page.goto(f"{BASE}/chat")
     page.wait_for_timeout(3000)
-    # SwiftShader WebGL is slow: wait for the loading screen to give way to the scene
-    ok = False
-    state = {}
-    t1 = time.time()
-    k = 0
-    while time.time() - t1 < 480:
-        page.wait_for_timeout(10000)
-        k += 1
-        probe = OUT / f"{tag}-canvas-probe.png"
-        page.locator("iframe").last.screenshot(path = str(probe), timeout = 180000)
-        flat, spread = flat_share(probe), colour_spread(probe)
-        state = frame_state(page)
-        has_canvas = any(s.get("canvas") for s in state.get("inner", []))
-        log(tag, f"t+{time.time() - t1:.0f}s canvas={has_canvas} flat={flat:.2f} buckets={spread}")
-        if k % 6 == 0:
-            page.locator("iframe").last.screenshot(path = str(OUT / f"{tag}-probe-{k:02d}.png"), timeout = 180000)
-        if has_canvas and flat < 0.45 and spread > 60:
-            ok = True
-            break
-    log(tag, "PREVIEW_STATE", json.dumps(state)[:900])
-    try:
-        for i, f in enumerate(page.frames[1:]):
-            (OUT / f"{tag}-frame{i}.html").write_text(f.content()[:600000], encoding = "utf-8")
-    except Exception as exc:
-        log(tag, "frame dump failed", str(exc)[:200])
-    log(tag, f"RENDER_CHECK ok={ok}")
-    if not ok:
-        shot(page, f"{tag}-not-rendered")
-        try:
-            for i, f in enumerate(page.frames[1:]):
-                (OUT / f"{tag}-frame{i}.html").write_text(f.content()[:600000], encoding = "utf-8")
-        except Exception as exc:
-            log(tag, "frame dump failed", str(exc)[:200])
+    dismiss(page)
+    expand_sidebar(page)
+    page.get_by_text(title[:30], exact = False).first.click()
+    page.wait_for_timeout(3500)
+    collapse_sidebar(page)
+    scroll_chat_end(page)
+    r = present(page, "final")
+    if not r or not r["clean"]:
+        log("final: the kept chat did not come back clean", json.dumps(r)[:300])
         return False
-    page.wait_for_timeout(4000)
-
-    # the finished frame: chat with tok/s on the left, kingdom on the right
-    errs = page.get_by_text("This page hit", exact = False)
-    if errs.count() and errs.first.is_visible():
-        log(tag, "WARNING: preview error banner:", " ".join(errs.first.locator("xpath=..").inner_text().split())[:300])
-    page.evaluate(
-        "()=>{document.querySelectorAll('#chat-thread *').forEach(e=>{const o=getComputedStyle(e).overflowY;"
-        "if(e.scrollHeight>e.clientHeight+10&&(o==='auto'||o==='scroll'))e.scrollTop=e.scrollHeight})}"
-    )
-    page.wait_for_timeout(800)
-    orbit(page)
-    page.mouse.move(5, H - 5)
-    page.wait_for_timeout(1500)
+    drag(page, view, 0)
+    m = frame_scene(page, "final")
+    scroll_chat_end(page)
+    park_mouse(page)
     shot(page, "1-final-chat-and-kingdom")
     page.locator("iframe").last.screenshot(path = str(OUT / "2-canvas-closeup.png"), timeout = 180000)
-    log("shot 2-canvas-closeup")
-    orbit(page, dx = -220, dy = 20)
-    page.mouse.move(5, H - 5)
-    page.wait_for_timeout(1500)
+    log("shot 2-canvas-closeup", f"cov={m['cov']:.2f}")
+    drag(page, 45, 0)
+    frame_scene(page, "final-b")
+    scroll_chat_end(page)
+    park_mouse(page)
     shot(page, "1b-final-alt-angle")
     page.locator("iframe").last.screenshot(path = str(OUT / "2b-canvas-closeup-alt-angle.png"), timeout = 180000)
-    # the picker open over the finished chat, showing the Hub name
     if open_picker(page):
         name, _ = find_row(page)
         log("PICKER_LABEL_FINAL", name)
@@ -391,8 +538,9 @@ def attempt(page, n):
         shot(page, "3-picker-open-new-name")
         page.keyboard.press("Escape")
         page.wait_for_timeout(600)
-    # the same frame with the sidebar out, to show Recents holds one chat
     expand_sidebar(page)
+    scroll_chat_end(page)
+    park_mouse(page)
     shot(page, "4-sidebar-recents-one-chat")
     collapse_sidebar(page)
     return True
@@ -443,7 +591,7 @@ def main():
         ctx.add_init_script(seed())
         page = ctx.new_page()
         page.on("console", lambda m: m.type in ("error", "warning") and log("console", m.type, m.text[:200]))
-        page.on("pageerror", lambda e: log("pageerror", str(e)[:300]))
+        page.on("pageerror", lambda e: (ERRORS.append(str(e)), log("pageerror", str(e)[:300])))
         try:
             try:
                 network_setting(page)
@@ -451,18 +599,27 @@ def main():
                 log("settings step failed, relying on the seeded value", str(exc)[:200])
             delete_threads([t["id"] for t in threads()])
             load_model(page)
-            good = False
+            results = {}
             for n in range(1, TRIES + 1):
                 before = {t["id"] for t in threads()}
                 try:
-                    good = attempt(page, n)
+                    r = attempt(page, n)
                 except Exception as exc:
                     log(f"try{n}", "FAILED", type(exc).__name__, str(exc)[:400])
                     shot(page, f"try{n}-failure")
-                if good:
-                    break
-                delete_threads([t["id"] for t in threads()])
-                log(f"try{n}", "did not render; chats left", [t["id"] for t in threads()], "had", sorted(before))
+                    r = {"clean": False}
+                new = [t for t in threads() if t["id"] not in before]
+                log(f"try{n}", "RESULT", json.dumps(r)[:300], "chats", [t["id"] for t in new])
+                if r.get("clean") and new:
+                    results[new[0]["id"]] = (r, new[0].get("title") or "")
+                else:
+                    delete_threads([t["id"] for t in new])
+            good = False
+            if results:
+                best = max(results, key = lambda k: results[k][0]["cov"])
+                log("BEST", best, json.dumps(results[best][0]))
+                delete_threads([t["id"] for t in threads() if t["id"] != best])
+                good = final_shots(page, results[best][1], results[best][0]["view"])
             left = threads()
             log("RECENTS", json.dumps([[t["id"], t.get("title")] for t in left]))
             log("RESULT", "rendered" if good else "not rendered")
